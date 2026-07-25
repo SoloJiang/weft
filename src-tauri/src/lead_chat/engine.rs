@@ -6,6 +6,7 @@
 //! tool protocol when available, with a kill fallback; a dead process resumes
 //! via the stored native session id on the next send.
 
+use crate::store::entities::lead_message;
 use crate::store::{repo, Db};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -421,6 +422,9 @@ fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> Option<Vec
     inner.clock.started = None;
     inner.current_origin_tag = None;
     inner.child = None;
+    // Dropping `child` kills it (kill_on_drop), so its session_gate slot must go
+    // with it — see `child_permit`'s doc for the leak this closes.
+    inner.child_permit = None;
     inner.stdin = None;
     inner.current = None;
     inner.interrupting = false;
@@ -1246,6 +1250,10 @@ async fn cleanup_disconnected_turn(
     let drained: Vec<i32> = inner.turn.queue.iter().filter_map(|o| o.queue_id).collect();
     inner.interrupting = false;
     inner.child = None;
+    // This reset carries STOP semantics (`stopped = true` below), so nothing
+    // will respawn a child until the human sends again — quite possibly never.
+    // The slot goes back with the process it belonged to.
+    inner.child_permit = None;
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
@@ -1476,6 +1484,27 @@ pub struct EngineInner {
     pub extra_args: Vec<String>,
     pub system_prompt: String,
     pub native_id: Option<String>,
+    /// A mechanical digest of the thread's history, staged by an engine/model
+    /// switch (issue #96, pitfall 2: "new engine can't see thread history") to
+    /// ride the NEXT outgoing turn's dispatched text. `send()` PEEKS this (never
+    /// `.take()`s it) to build that turn's dispatched text, and clears it only
+    /// once delivery is confirmed (queued, written to a live stdin, or handed
+    /// to a spawn) — a transient failure on the first attempt after a switch
+    /// leaves it in place for the retry, rather than discarding it permanently
+    /// (adversarial re-review of PR #139, P1: an earlier version used `.take()`
+    /// up front, before any of `send()`'s many failure paths had run). `None`
+    /// in the common case (no switch pending). Deliberately NOT persisted to
+    /// the DB, and NEVER written into `lead_message.content` either (`send()`
+    /// builds the row's persisted `content`/`dispatched` fields from the
+    /// digest-free text FIRST, and only prepends this digest to the outbound
+    /// copy as the very last step) — an app restart between a switch and the
+    /// next send already lost nothing durable (the switch already cleared
+    /// native_id in the DB, so the fresh engine starts a brand-new native
+    /// session either way); only this one best-effort context nudge would be
+    /// skipped, not any correctness guarantee, and definitely not something
+    /// that should ever land at rest in the database (issue #96 pitfall 2's
+    /// digest can carry up to 12 prior turns of raw conversation text).
+    pub pending_context_digest: Option<String>,
     pub slash_commands: Vec<super::proto::SlashCmd>,
     pub turn: TurnState,
     pub turn_id: i32,
@@ -1498,10 +1527,23 @@ pub struct EngineInner {
     /// only deregisters (never reclaims).
     pub child_reg: Option<crate::proc_registry::Registration>,
     /// Active-session slot permit for `child` (paired with `child_reg`). Set at
-    /// every spawn right after registration; dropped exactly when `child` is
-    /// cleared (respawn overwrite / invalidate_resident / stop_quiet), which
-    /// releases the slot so a queued session can proceed. `None` = ungated
-    /// (session_gate degraded / no permit was available). See [`crate::session_gate`].
+    /// every spawn right after registration; dropped at EVERY site that clears
+    /// or replaces `child`, which releases the slot so a queued session can
+    /// proceed. Those sites, exhaustively: the respawn overwrite
+    /// (`ensure_running_locked` / `spawn_turn`), `invalidate_resident`,
+    /// `stop_quiet`, `cleanup_disconnected_turn`, `reset_failed_hidden_turn`,
+    /// `reset_frozen_appserver_turn`, and BOTH of `spawn_reader`'s EOF branches
+    /// (per-turn exit and resident death). Miss one and the slot leaks for the
+    /// rest of the process: the gate is a `OnceLock` singleton, so a session
+    /// that was stopped hours ago keeps counting against the ceiling until the
+    /// app restarts — see `stop_quiet_releases_the_session_gate_slot`.
+    ///
+    /// The pairing is directional both ways: a respawn must also release the
+    /// DEAD child's permit *before* queuing for a new one, or a saturated gate
+    /// leaves the session waiting on a slot it is itself still holding.
+    ///
+    /// `None` = ungated (session_gate degraded / no permit was available).
+    /// See [`crate::session_gate`].
     pub child_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     pub stdin: Option<ChildStdin>,
     /// Streaming assistant row being built: (row id, accumulated text, last DB flush).
@@ -1950,6 +1992,10 @@ async fn ensure_running_locked(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    // 先还旧槽,再排队要新的。走到这里 `child` 要么是 None、要么已被上面的
+    // try_wait 判定为死进程,它的 permit 是陈的;若留着不放就去 await 新槽,gate
+    // 打满时这个会话会卡在等一个它自己占着的槽上(自锁),得等别的会话结束才解开。
+    inner.child_permit = None;
     // 活跃会话软上限:拿一个会话槽,已满则在此排队等某个在跑的会话结束(与上面
     // admit_new_work 的总进程数硬闸互补——那个拒绝、这个排队,不丢会话)。
     let session_permit = crate::session_gate::acquire_session_slot().await;
@@ -2024,6 +2070,10 @@ pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
     if let Some(mut child) = inner.child.take() {
         let _ = child.start_kill();
     }
+    // The killed child's session_gate slot goes with it. Unconditional (not
+    // folded into the `if let`): a permit with no child left to represent is
+    // exactly the leak, whichever way `child` came to be None.
+    inner.child_permit = None;
 }
 
 /// Undo the turn reservation made by `send` Phase 1 when later persistence
@@ -2461,6 +2511,29 @@ pub async fn send(
         snapshot_turn_checkpoint(app, db, ctx.session_id, ctx.turn, row_id).await;
     }
 
+    // A switch (issue #96) may have staged a history digest for exactly this
+    // next turn — read here (NOT `.take()`n — see the clear at the bottom of
+    // this function) so it rides the DISPATCHED text (agent-visible) without
+    // polluting `content` (the human-visible row built above from the raw
+    // `text`/`kind` a moment ago — the same asymmetry the "Attached files"
+    // appendix below already relies on). PEEK, don't consume, under a fresh
+    // lock: cheap, and Phase 1 already dropped its lock before this point.
+    //
+    // Adversarial re-review of PR #139, P1: an EARLIER version of this code
+    // used `.take()` right here, before ANY of this function's many failure
+    // paths (reservation invalidated, write_user, queue-full, spawn_turn,
+    // spawn_codex_turn_or_exec, …) had a chance to run — so a transient
+    // failure on the FIRST send attempt after a switch permanently discarded
+    // the digest with no way to re-stage it short of switching again. Cloning
+    // here and clearing ONLY at the bottom — the single point every success
+    // path in this function converges on (verified: every OTHER exit between
+    // here and there is a `return Err(...)`) — means a failed attempt leaves
+    // the field untouched for the retry to pick up.
+    let digest = eng.lock().await.pending_context_digest.clone();
+    // Deliberately digest-FREE through the attachment appendices and the
+    // `dispatched` persistence below — the digest is prepended as the very
+    // last step, right before `Outgoing` is built, so it can never reach
+    // anything written to the DB (see that step for why).
     let mut outbound = text.to_string();
     // Capture BEFORE images may be spilled to temp files below (per-turn dialects
     // clear out.images after spill; has_attachments must reflect the original inputs).
@@ -2494,7 +2567,14 @@ pub async fn send(
     // Persist the EXACT dispatched text for image-bearing per-turn rows: the
     // spill loop above omits a path when decode/write fails, and rewind's
     // native text match can't reconstruct that retroactively. (Text/files
-    // appendices are deterministic; only images need this.)
+    // appendices are deterministic; only images need this.) `outbound` here is
+    // STILL digest-free (see above) — adversarial re-review of PR #139, P1: an
+    // earlier version prepended the digest before this point, so a post-switch
+    // history digest (up to 12 prior turns, potentially containing paths,
+    // secrets pasted into chat, etc.) landed in `lead_message.content` here,
+    // directly contradicting `pending_context_digest`'s own "deliberately NOT
+    // persisted" doc. Only the human-typed `text` + attachment appendices are
+    // ever written to the row.
     if per_turn(&ctx.tool) && !image_uris.is_empty() {
         let with_dispatched = serde_json::json!({
             "text": text,
@@ -2503,6 +2583,11 @@ pub async fn send(
             "dispatched": &outbound,
         });
         let _ = repo::update_lead_message(db, row_id, &with_dispatched.to_string(), status).await;
+    }
+    // NOW prepend the digest (if any) — the very last transformation before the
+    // agent-bound `Outgoing`, strictly after every DB write above.
+    if let Some(d) = digest.as_deref().filter(|d| !d.is_empty()) {
+        outbound = format!("{d}\n\n{outbound}");
     }
     let out = Outgoing {
         text: outbound,
@@ -2704,6 +2789,20 @@ pub async fn send(
                 rollback_failed_visible_turn(app, db, eng, pturn, row_id, &content, status).await;
                 return Err(e);
             }
+        }
+    }
+    // The digest peeked above (if any) is now genuinely embedded in text that
+    // was written to a live stdin, handed to a queue, or handed to a spawn —
+    // this is the ONE point every success path converges on (every other exit
+    // between the peek and here is a `return Err(...)`), so it is safe to
+    // clear now. Only clear when it's still the SAME digest this send peeked
+    // (`Some(d) if cur.as_ref() == Some(d)`): a concurrent switch racing in
+    // between could have staged a NEW digest for a later turn, which belongs
+    // to that later turn, not this one.
+    if let Some(d) = &digest {
+        let mut inner = eng.lock().await;
+        if inner.pending_context_digest.as_ref() == Some(d) {
+            inner.pending_context_digest = None;
         }
     }
     Ok(())
@@ -4247,17 +4346,134 @@ fn stall_notice_text(stall_secs: u64) -> String {
 }
 
 /// Clear the native session id for whichever surface this engine drives — the
-/// DB half of the turn-freeze auto-recovery (issue #93). Mirrors
-/// `persist_activity`'s session/lead dispatch, but routes to the `_opt`
-/// setters (already shipped for `rewind`'s "back to before the first message"
-/// case) so the id can be cleared rather than merely overwritten: a cleared id
-/// means the next send starts a brand-new native session instead of resuming
-/// one whose transport may still be wedged.
-async fn clear_native_id(db: &Db, session_id: Option<i32>, thread_id: i32) -> anyhow::Result<()> {
+/// DB half of the turn-freeze auto-recovery (issue #93), reused as-is for an
+/// engine/model switch (issue #96, pitfall 1: a stale native id from the OLD
+/// engine handed to the NEW one as `--resume`/`resume` fails fast with "No
+/// conversation found"). Mirrors `persist_activity`'s session/lead dispatch,
+/// but routes to the `_opt` setters (already shipped for `rewind`'s "back to
+/// before the first message" case) so the id can be cleared rather than
+/// merely overwritten: a cleared id means the next send starts a brand-new
+/// native session instead of resuming one that belongs to a different engine
+/// (or whose transport may still be wedged). `pub(crate)`: also called from
+/// `lead_chat::commands`'s switch orchestration.
+pub(crate) async fn clear_native_id(
+    db: &Db,
+    session_id: Option<i32>,
+    thread_id: i32,
+) -> anyhow::Result<()> {
     match session_id {
         Some(sid) => repo::set_session_native_id_opt(db, sid, None).await,
         None => repo::set_lead_native_id_opt(db, thread_id, None).await,
     }
+}
+
+/// Cap on how many recent text turns [`build_switch_digest`] carries forward.
+const SWITCH_DIGEST_MAX_TURNS: usize = 12;
+/// Per-turn character cap inside the digest, so one very long message can't
+/// balloon the injected context.
+const SWITCH_DIGEST_MAX_CHARS: usize = 500;
+
+/// Truncate `s` to at most `max` chars (not bytes — safe on multi-byte UTF-8),
+/// appending an ellipsis when it actually cut something.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// A mechanical (non-LLM) digest of a thread's conversation, staged onto
+/// [`EngineInner::pending_context_digest`] so the NEXT turn's dispatched text
+/// carries it (issue #96, pitfall 2: "new engine can't see thread history").
+/// Deterministic and cheap — no extra agent call, no added latency/cost/risk
+/// of its own. Takes the last [`SWITCH_DIGEST_MAX_TURNS`] plain `kind:"text"`
+/// user/assistant rows (skipping tool calls, cards, and other structured
+/// content — a plain conversational summary, not a full transcript), each
+/// capped at [`SWITCH_DIGEST_MAX_CHARS`], oldest-first (the order the human
+/// actually said them in). Empty history (a thread that never said anything,
+/// or a `messages` slice already filtered to one session) → empty digest, so
+/// callers can treat "" as "nothing to inject" without a separate check.
+pub fn build_switch_digest(old_tool: &str, new_tool: &str, messages: &[lead_message::Model]) -> String {
+    let lines: Vec<String> = messages
+        .iter()
+        .filter(|m| m.kind == "text" && (m.role == "user" || m.role == "assistant"))
+        .filter_map(|m| {
+            let v: serde_json::Value = serde_json::from_str(&m.content).ok()?;
+            let text = v.get("text")?.as_str()?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let who = if m.role == "user" { "User" } else { "Assistant" };
+            Some(format!("{who}: {}", truncate_chars(text, SWITCH_DIGEST_MAX_CHARS)))
+        })
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let skipped = lines.len().saturating_sub(SWITCH_DIGEST_MAX_TURNS);
+    let tail: Vec<&str> = lines
+        .iter()
+        .rev()
+        .take(SWITCH_DIGEST_MAX_TURNS)
+        .rev()
+        .map(String::as_str)
+        .collect();
+    let change = if old_tool == new_tool {
+        format!("reloaded its engine ({new_tool}) — e.g. to pick up a CLI-side config/model change")
+    } else {
+        format!("switched engines ({old_tool} → {new_tool})")
+    };
+    let omitted = if skipped > 0 {
+        format!(" ({skipped} earlier turn(s) omitted)")
+    } else {
+        String::new()
+    };
+    format!(
+        "[weft: this thread just {change}. You have NO memory of the conversation below — it is \
+         real prior context from the human, not a new request. Condensed history, oldest first{omitted}:\n\
+         {}\n\
+         [end of switch digest — continue the conversation naturally from here]",
+        tail.join("\n")
+    )
+}
+
+/// Tear down the current engine for a tool/model switch (issue #96): same
+/// child-kill + row-finalization as [`stop`], but persists "idle" rather than
+/// [`STATUS_STOPPED`] — a switch replaces this engine outright (the caller
+/// constructs a fresh one right after, with the new tool identity), so there
+/// is nothing "stopped" left for a later resume to reconcile. Landing on
+/// `STATUS_STOPPED` would wrongly render the freshly-switched thread/worker as
+/// taken-over/dead the moment the switch finishes, undermining the "switch
+/// succeeded" feedback the caller is about to surface.
+pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) {
+    let (thread_id, session_id, texts, orphans) = stop_quiet(eng).await;
+    if let Some(db) = app.try_state::<Db>() {
+        persist_activity(&db, session_id, thread_id, "idle").await;
+        finalize_orphan_tool_rows(app, &db, thread_id, orphans, "interrupted").await;
+        for (id, text, agent_thread) in texts {
+            let _ = repo::update_lead_message(
+                &db,
+                id,
+                &text_row_content(&text, agent_thread.as_deref()),
+                "interrupted",
+            )
+            .await;
+            emit_finalize(app, thread_id, id, "interrupted");
+        }
+        mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
+    }
+    let _ = app.emit(
+        EVENT,
+        Push::Turn {
+            thread_id,
+            session_id,
+            state: "idle".into(),
+            recovered: false,
+            queue: Vec::new(),
+        },
+    );
 }
 
 /// Explains the auto-recovery on the Needs-you feed (issue #93). Unlike the
@@ -4335,6 +4551,11 @@ fn reset_frozen_appserver_turn(inner: &mut EngineInner, turn_id: i32) -> Option<
     inner.interrupting = false;
     inner.current_origin_tag = None;
     inner.child = None;
+    // Inside the turn_id+busy guard on purpose: only the caller that OWNS this
+    // frozen turn may hand its slot back. Releasing outside the guard would drop
+    // a NEWER turn's permit while its child is still running (issue #118's whole
+    // point is that this path can fire late), under-counting the live gate.
+    inner.child_permit = None;
     inner.stdin = None;
     Some(FrozenTurnDrain {
         current,
@@ -4456,22 +4677,28 @@ async fn take_frozen_turn(eng: &EngineRef, turn_id: i32) -> FreezeClaim {
 ///      [`reset_frozen_appserver_turn`] — finalizing whatever the frozen
 ///      turn left open (current/streaming rows, tool calls, queued
 ///      follow-ups) as `interrupted` below. A `Stale` claim means the turn
-///      already resolved itself during the wait: steps 3-5 below must NOT
+///      already resolved itself during the wait: steps 3-6 below must NOT
 ///      run — see [`FreezeClaim`].
-///   3. Clear the native session id, so the NEXT send opens a brand-new native
-///      session instead of resuming one whose transport may still be wedged
-///      (mirrors the "no native id ⇒ fresh session next send" contract
-///      `rewind` already ships).
-///   4. Stamp a `turn_freeze_recovered` marker (`repo::mark_turn_freeze_recovered`)
-///      — an invisible timeline row recording that this recovery happened.
-///      Despite an earlier version of this comment's claim, nothing today
-///      reads it back (review round 4, P2 — see the honest doc on
-///      `repo::mark_turn_freeze_recovered`): the marker is kept as a
-///      possible future grace-window signal, but issue #116's actual
-///      protection against immediately re-driving into the same wedge comes
-///      from step 3's `native_id` clear instead (see that doc for why that's
-///      an accidental, fragile side effect rather than a designed one).
-///   5. Post a Needs-you notice — this is a self-heal, but the user should
+///   3. Stamp a `turn_freeze_recovered` marker
+///      (`repo::mark_turn_freeze_recovered`) — an invisible timeline row
+///      recording that this recovery happened, and issue #116's coordination
+///      point: its `created_at` lets `revive::freeze_recovery_state` tell
+///      "just came back from a freeze auto-recovery" apart from an ordinary
+///      clean turn-end, and withhold this lead/worker from re-dispatch for a
+///      grace window instead of racing this self-heal. FIRST of the DB writes
+///      on purpose — before step 4 persists `idle` — so no sweep can observe a
+///      recoverable idle session whose marker is not visible yet.
+///   4. App-server dialect only: shut the taken connection down and finalize
+///      whatever the frozen turn left open, persisting the session `idle`.
+///   5. Clear the native session id — BOTH mirrors, and only if step 3
+///      actually landed. A cleared id means the next send opens a brand-new
+///      native session instead of resuming one whose transport may still be
+///      wedged (the "no native id ⇒ fresh session next send" contract `rewind`
+///      already ships). The gate matters because `revive` reads a missing id
+///      as "never ran" unless the marker says otherwise: clearing after a
+///      failed stamp would strand the session permanently. See the inline
+///      comment at the gate.
+///   6. Post a Needs-you notice — this is a self-heal, but the user should
 ///      still know their native context was reset.
 /// Returns false when the turn already ended in the gap (nothing to do) —
 /// including whenever [`take_frozen_turn`] reports [`FreezeClaim::Stale`].
@@ -4506,6 +4733,54 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
     let taken = match take_frozen_turn(eng, turn_id).await {
         FreezeClaim::Stale => return false,
         FreezeClaim::Owned(taken) => taken,
+    };
+    // Publish the grace marker BEFORE anything below exposes a recoverable
+    // idle state. Position is load-bearing, not stylistic: `persist_activity
+    // (.., "idle")` in the drain block writes session status = idle, and an
+    // idle session with a freeze marker that is not yet visible is EXACTLY the
+    // shape `revive::stalled_direction_ids` selects — so with the marker
+    // trailing it, a sweep interleaving there enqueues the immediate re-drive
+    // this whole mechanism exists to prevent.
+    //
+    // Still AFTER `take_frozen_turn`, deliberately: a `Stale` claim writes
+    // nothing (review round 4), so a declined recovery can't suppress a
+    // legitimate re-drive for a whole window.
+    //
+    // This marker is now the SOLE guard, and `marker_stamped` carries whether
+    // it landed all the way to the native-id clear below, which is GATED on
+    // it. That gate is not tidiness: `revive` reads a missing native id as
+    // "never ran" unless a marker says the recovery cleared it, so clearing
+    // after a failed insert would destroy the only evidence this session ever
+    // ran and strand it permanently — the very defect this PR removes, coming
+    // back through the error path. Skipping the clear leaves an ordinary,
+    // visible, re-drivable stall that self-heals (a still-wedged transport
+    // just trips the watchdog again, with a fresh chance to stamp). See the
+    // gate for the full reasoning.
+    //
+    // Aborting outright is not available as a fail-closed option: by this
+    // point `take_frozen_turn` has taken the app-server client and reset the
+    // turn in memory, so returning early would leak that connection, strand
+    // the drained rows as `streaming`, and leave the DB claiming `running`
+    // for a turn that is over.
+    //
+    // Residual, ordering: for non-app-server dialects `interrupt()` above
+    // kills the child and THEIR OWN reader task persists idle on EOF, which
+    // can land in the small gap before this write. That is also where the
+    // window has least to protect — the process is gone, so there is no
+    // surviving transport to be re-driven back into. For the app-server
+    // dialect no ordering window is left, since its only idle exposure is the
+    // `persist_activity` below.
+    let marker_stamped = match app.try_state::<Db>() {
+        None => false,
+        Some(db) => match repo::mark_turn_freeze_recovered(&db, thread_id, session_id).await {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!(
+                    "[weft] turn-freeze recovery: failed to stamp coordination marker for thread {thread_id}: {err}"
+                );
+                false
+            }
+        },
     };
     if let Some((c, drain)) = taken {
         c.shutdown().await;
@@ -4583,19 +4858,35 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
         // did. Here, we are that "whatever".
         emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
     }
-    if let Some(db) = app.try_state::<Db>() {
-        if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
-            eprintln!(
-                "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
-            );
+    // Gated on the marker, and the gate is the point. `revive` now reads a
+    // missing native id as "never ran" UNLESS a marker says the recovery
+    // cleared it (`has_resumable_context`). So clearing the id after a FAILED
+    // marker write would destroy the only evidence that this session ever ran
+    // and leave it permanently invisible to the re-drive — the exact defect
+    // this PR exists to remove, reintroduced through the error path.
+    //
+    // Skipping the clear instead leaves the session with its native id and no
+    // marker, i.e. an ordinary stall: visible, re-drivable, and if the
+    // transport really is still wedged the next turn simply trips the freeze
+    // watchdog again and retries this whole recovery — with a fresh chance to
+    // stamp the marker. That self-heals; permanent invisibility never does.
+    // Failing toward VISIBLE is deliberate: one extra re-drive is cheap, work
+    // silently stranded forever is not.
+    //
+    // Both mirrors are gated together so they cannot desync (an earlier
+    // revision split them and that was a P1). The connection was already
+    // dropped above regardless, so a resumed conversation reconnects fresh
+    // even on this path.
+    if marker_stamped {
+        if let Some(db) = app.try_state::<Db>() {
+            if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
+                eprintln!(
+                    "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
+                );
+            }
         }
-        if let Err(err) = repo::mark_turn_freeze_recovered(&db, thread_id, session_id).await {
-            eprintln!(
-                "[weft] turn-freeze recovery: failed to stamp coordination marker for thread {thread_id}: {err}"
-            );
-        }
+        eng.lock().await.native_id = None;
     }
-    eng.lock().await.native_id = None;
     if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
         bus.ask_human(thread_id, &dir, &freeze_recovery_text(freeze_secs));
     }
@@ -4889,6 +5180,13 @@ pub async fn stop_quiet(
         c.shutdown().await;
     }
     inner.child = None;
+    // Hand the session_gate slot back on the explicit stop, not on the next
+    // spawn. "Stop" is a high-frequency button and a stopped session may never
+    // send again — holding its slot until a respawn that never comes is a leak
+    // for the life of the process (the gate is a `OnceLock` singleton), and it
+    // is exactly what the resource dashboard (issue #112) surfaces as an
+    // active-session count that never falls back to zero.
+    inner.child_permit = None;
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
@@ -6279,6 +6577,12 @@ fn spawn_reader(
                 );
             }
             inner.child = None;
+            // Sibling of the per-turn EOF release above: the resident claude
+            // process just died (crash, or the kill an `interrupt()` issued) and
+            // nothing respawns it until the next send — which may never come. Its
+            // slot has to go back now, or a session the user interrupted and then
+            // left alone counts as active forever.
+            inner.child_permit = None;
             inner.stdin = None;
             inner.turn = TurnState::default();
             inner.clock = TurnClock::default();
@@ -6847,15 +7151,104 @@ mod tests {
         clear_native_id(&db, None, t.id).await.unwrap();
     }
 
+    fn text_msg(role: &str, text: &str) -> lead_message::Model {
+        text_msg_kind(role, "text", &serde_json::json!({ "text": text }).to_string())
+    }
+
+    fn text_msg_kind(role: &str, kind: &str, content: &str) -> lead_message::Model {
+        lead_message::Model {
+            id: 0,
+            thread_id: 1,
+            session_id: None,
+            turn_id: 0,
+            role: role.into(),
+            kind: kind.into(),
+            content: content.into(),
+            status: "complete".into(),
+            created_at: "0".into(),
+            seq: None,
+            native_anchor: None,
+            consumed_at: None,
+        }
+    }
+
+    #[test]
+    fn switch_digest_empty_history_is_empty() {
+        assert_eq!(build_switch_digest("claude", "codex", &[]), "");
+        // Only non-text/system rows → still empty, not a digest with nothing in it.
+        let rows = vec![text_msg_kind("system", "meta", "{}")];
+        assert_eq!(build_switch_digest("claude", "codex", &rows), "");
+    }
+
+    #[test]
+    fn switch_digest_carries_prior_turns_and_names_the_switch() {
+        let rows = vec![
+            text_msg("user", "please add login"),
+            text_msg("assistant", "sure, starting now"),
+        ];
+        let d = build_switch_digest("claude", "codex", &rows);
+        assert!(d.contains("claude → codex"), "names old and new tool: {d}");
+        assert!(d.contains("User: please add login"));
+        assert!(d.contains("Assistant: sure, starting now"));
+        // Oldest-first: the user's turn precedes the assistant's in the digest.
+        assert!(d.find("User: please add login") < d.find("Assistant: sure, starting now"));
+    }
+
+    #[test]
+    fn switch_digest_same_tool_reads_as_reload_not_switch() {
+        let rows = vec![text_msg("user", "hi")];
+        let d = build_switch_digest("claude", "claude", &rows);
+        assert!(d.contains("reloaded"), "same tool → reload phrasing: {d}");
+        assert!(!d.contains("→"), "no switch arrow when the tool didn't change: {d}");
+    }
+
+    #[test]
+    fn switch_digest_skips_non_text_and_empty_rows() {
+        let rows = vec![
+            text_msg("user", "  "), // blank text after trim → skipped
+            text_msg_kind("assistant", "tool", r#"{"name":"Bash","summary":"ls"}"#),
+            text_msg("assistant", "here is the plan"),
+        ];
+        let d = build_switch_digest("claude", "codex", &rows);
+        assert!(d.contains("here is the plan"));
+        assert!(!d.contains("Bash"), "tool-kind rows are not part of the conversational digest");
+    }
+
+    #[test]
+    fn switch_digest_caps_turn_count_and_marks_omission() {
+        let rows: Vec<_> = (0..20).map(|i| text_msg("user", &format!("turn {i}"))).collect();
+        let d = build_switch_digest("claude", "claude", &rows);
+        assert!(d.contains("turn 19"), "keeps the most recent turns: {d}");
+        assert!(!d.contains("turn 0\n"), "drops the oldest turns beyond the cap: {d}");
+        assert!(d.contains("earlier turn(s) omitted"), "says something was cut: {d}");
+    }
+
+    #[test]
+    fn switch_digest_caps_per_message_length() {
+        let long = "x".repeat(2000);
+        let rows = vec![text_msg("user", &long)];
+        let d = build_switch_digest("claude", "codex", &rows);
+        assert!(d.len() < long.len(), "a single huge message must be truncated: {}", d.len());
+        assert!(d.contains('…'));
+    }
+
+    #[test]
+    fn truncate_chars_is_utf8_safe_and_idempotent_under_the_limit() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        assert_eq!(truncate_chars("hello", 5), "hello");
+        // Multi-byte chars: must count chars, not bytes (would panic/mis-slice on bytes).
+        let s = "你好世界你好世界"; // 8 chars
+        assert_eq!(truncate_chars(s, 4).chars().count(), 5); // 4 + '…'
+        assert!(truncate_chars(s, 4).starts_with("你好世界"));
+    }
+
     #[tokio::test]
     async fn turn_freeze_recovered_marker_roundtrips_for_the_lead() {
-        // Review round 1: originally intended as the issue #116 coordination
-        // point (review round 4, P2: #116 never wired up that consult — see
-        // the honest doc on `repo::mark_turn_freeze_recovered` — so this is
-        // just the marker's own round-trip today). No marker yet → None;
-        // after `mark_turn_freeze_recovered`, the getter returns a plausible
-        // unix-seconds timestamp (same clock as `repo::now`/`created_at`)
-        // close to "now".
+        // The storage half of the issue #116 coordination point: no marker yet
+        // → None; after `mark_turn_freeze_recovered`, the getter returns a
+        // plausible unix-seconds timestamp (same clock as `repo::now`/
+        // `created_at`) close to "now". The grace window built on top of it
+        // lives in `revive::freeze_recovery_state` and is tested there.
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
@@ -7215,6 +7608,7 @@ mod tests {
             extra_args: vec![],
             system_prompt: String::new(),
             native_id: None,
+            pending_context_digest: None,
             slash_commands: vec![],
             turn: TurnState::default(),
             turn_id: 0,
@@ -7510,6 +7904,125 @@ mod tests {
         assert!(eng.lock().await.turn.busy);
     }
 
+    // ---- session_gate: a cleared `child` must hand its slot back ----
+    //
+    // `session_gate`'s own tests only cover the semaphore primitives; nothing
+    // asserted that the ENGINE actually releases what it acquires. That gap is
+    // what let `stop_quiet` / `invalidate_resident` / the resident-death and
+    // disconnect resets each keep a slot on a process they had just killed —
+    // permanently, since `gate()` is a process-wide `OnceLock` singleton.
+    // These tests measure the only thing a leak changes: whether the count
+    // comes back. They serialize on `gate_test_lock` because that shared static
+    // makes an exact before/after delta meaningless otherwise.
+
+    fn slots_used() -> usize {
+        crate::session_gate::active_session_slots().0
+    }
+
+    /// Take a real slot off the process-wide gate and park it exactly where a
+    /// spawn parks it, asserting the gate registered it — so a test that later
+    /// sees `baseline` is seeing a release, not a slot that was never taken.
+    async fn park_a_real_slot(inner: &mut EngineInner, baseline: usize) {
+        inner.child_permit = crate::session_gate::acquire_session_slot().await;
+        assert!(
+            inner.child_permit.is_some(),
+            "the gate must hand out a slot to test with"
+        );
+        assert_eq!(slots_used(), baseline + 1, "a live session holds a slot");
+    }
+
+    /// End-to-end, through the real `stop_quiet` that every explicit Stop
+    /// funnels into: after the stop, the gate is back where it started.
+    ///
+    /// The user-visible bug this pins: Stop is a high-frequency button, and a
+    /// stopped session may never send again. Holding its slot until a respawn
+    /// that never comes means the default ceiling of 8 erodes one ghost at a
+    /// time, and new sessions eventually queue behind sessions that ended
+    /// hours ago — with the resource dashboard (issue #112) reporting an
+    /// active-session count that never falls back.
+    #[tokio::test]
+    async fn stop_quiet_releases_the_session_gate_slot() {
+        let _serialized = crate::session_gate::gate_test_lock().lock().await;
+        let baseline = slots_used();
+        let mut inner = test_inner("claude");
+        park_a_real_slot(&mut inner, baseline).await;
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+
+        let _ = stop_quiet(&eng).await;
+
+        assert_eq!(
+            slots_used(),
+            baseline,
+            "an explicit stop must hand the slot back to the gate"
+        );
+        assert!(eng.lock().await.child_permit.is_none());
+    }
+
+    /// `invalidate_resident` kills a wedged resident so the next send respawns
+    /// clean. A resident whose stdin keeps timing out gets invalidated over and
+    /// over — one leaked slot per invalidation would exhaust the gate fastest
+    /// of all the leak sites.
+    #[tokio::test]
+    async fn invalidate_resident_releases_the_session_gate_slot() {
+        let _serialized = crate::session_gate::gate_test_lock().lock().await;
+        let baseline = slots_used();
+        let mut inner = test_inner("claude");
+        park_a_real_slot(&mut inner, baseline).await;
+
+        invalidate_resident(&mut inner);
+
+        assert_eq!(slots_used(), baseline, "the killed resident's slot comes back");
+        assert!(inner.child_permit.is_none());
+    }
+
+    /// A failed hidden turn drops `child` — which kills it, `kill_on_drop` —
+    /// so the slot goes too.
+    #[tokio::test]
+    async fn reset_failed_hidden_turn_releases_the_session_gate_slot() {
+        let _serialized = crate::session_gate::gate_test_lock().lock().await;
+        let baseline = slots_used();
+        let mut inner = test_inner("claude");
+        park_a_real_slot(&mut inner, baseline).await;
+        let turn_id = mark_hidden_turn_started(&mut inner);
+
+        assert!(reset_failed_hidden_turn(&mut inner, turn_id).is_some());
+
+        assert_eq!(slots_used(), baseline);
+        assert!(inner.child_permit.is_none());
+    }
+
+    /// The freeze recovery (#118) releases the slot INSIDE its turn_id+busy
+    /// guard. Both halves matter: the owned turn hands its slot back, and a
+    /// turn that advanced while the up-to-~120s `interrupt()` RPC was in flight
+    /// keeps its own — releasing outside the guard would free a slot whose
+    /// child is still running, under-counting the live gate instead of
+    /// over-counting it.
+    #[tokio::test]
+    async fn reset_frozen_appserver_turn_releases_the_slot_only_for_the_turn_it_owns() {
+        let _serialized = crate::session_gate::gate_test_lock().lock().await;
+        let baseline = slots_used();
+
+        let mut owned = test_inner("codex");
+        owned.turn.busy = true;
+        owned.turn_id = 5;
+        park_a_real_slot(&mut owned, baseline).await;
+        assert!(reset_frozen_appserver_turn(&mut owned, 5).is_some());
+        assert_eq!(slots_used(), baseline, "the frozen turn's slot comes back");
+        assert!(owned.child_permit.is_none());
+
+        let mut newer = test_inner("codex");
+        newer.turn.busy = true;
+        newer.turn_id = 6; // advanced past the turn_id=5 being recovered
+        park_a_real_slot(&mut newer, baseline).await;
+        assert!(reset_frozen_appserver_turn(&mut newer, 5).is_none());
+        assert_eq!(
+            slots_used(),
+            baseline + 1,
+            "a newer turn keeps the slot its child is still using"
+        );
+        assert!(newer.child_permit.is_some());
+    }
+
     #[tokio::test]
     async fn write_user_reports_missing_stdin() {
         let mut inner = test_inner("claude");
@@ -7762,6 +8275,7 @@ mod tests {
             extra_args: vec!["--mcp-config".into(), "x".into()],
             system_prompt: "be lead".into(),
             native_id: None,
+            pending_context_digest: None,
             slash_commands: vec![],
             turn: TurnState::default(),
             turn_id: 0,

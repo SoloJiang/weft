@@ -7,14 +7,17 @@ import { ToolIcon, toolFullName } from "../components/ToolIcon";
 type NamedSkill = { name: string; description: string };
 
 /**
- * 常驻右栏「会话信息」:Sub-tasks、Skills、MCP。Context(token/%/model)不在这里——
- * 它常驻 composer 工具条的 ContextGauge(ChatComposer),面板只管列表型信息。
- * Sub-tasks/MCP 是 <Section> 静态头 + <OverflowList>(head+show-more):头常驻只读,
- * 长列表用同一个 head + "Show N more" 控件折叠尾部。Skills 是两个独立口径的
- * <SkillGroup>(各自的头 + OverflowList)——workspace 静态注入 vs 引擎运行时探测,
- * 见该段内注释与 #108;运行时探测那组按 `tool` 门控(opencode 无此探测能力,
- * 见 {@link skillDiscoverySupported} 与 #114 review)。纯展示——数据由 store 的
- * leadMeta/workerMeta + workspaceSkills + directionsByThread 喂。
+ * 常驻右栏「会话信息」:Engine、Sub-tasks、Skills、MCP。Context 的 token/%
+ * 仍常驻 composer 工具条的 ContextGauge(ChatComposer);但 model 现也在这里
+ * 的 Engine 段重复一份——issue #98 明确要求「至少在 Session 面板显示当前模型」,
+ * 且这是切换入口(onSwitchEngine)自然的落点,与"哪个引擎在跑"这条最基础的
+ * 信息放在一起。Sub-tasks/MCP 是 <Section> 静态头 + <OverflowList>(head+
+ * show-more):头常驻只读,长列表用同一个 head + "Show N more" 控件折叠尾部。
+ * Skills 是两个独立口径的 <SkillGroup>(各自的头 + OverflowList)——workspace
+ * 静态注入 vs 引擎运行时探测,见该段内注释与 #108;运行时探测那组按 `tool`
+ * 门控(opencode 无此探测能力,见 {@link skillDiscoverySupported} 与 #114
+ * review)。纯展示 + 一个切换入口——数据由 store 的 leadMeta/workerMeta +
+ * workspaceSkills + directionsByThread 喂,切换的实际执行/确认交给调用方。
  */
 export function SessionInfoPanel({
   meta,
@@ -24,6 +27,7 @@ export function SessionInfoPanel({
   onOpenSubtask,
   onClose,
   onReload,
+  onSwitchEngine,
   busy,
 }: {
   meta: SessionMeta | undefined;
@@ -39,6 +43,10 @@ export function SessionInfoPanel({
   onClose: () => void;
   /** 重载会话:复用静默 re-spawn,拾取新加的 MCP / skill。 */
   onReload?: () => void;
+  /** 打开切换引擎/模型对话框(issue #96/#98)。省略 → Engine 段仅展示,不可点。
+   *  调用方(LeadTab/WorkerConversation)决定 scope(lead/worker)、执行实际的
+   *  switchLeadTool/switchWorkerTool 调用与成功/失败反馈。 */
+  onSwitchEngine?: () => void;
   /** turn 进行中:重载灰掉(re-spawn 在下次 send 生效)。 */
   busy?: boolean;
 }) {
@@ -90,6 +98,34 @@ export function SessionInfoPanel({
           permanently reserved, so expanding a list never changes the content
           width — scrollbar-gutter alone wasn't reliably honored here. */}
       <div className="min-h-0 flex-1 overflow-y-scroll">
+        {/* Engine — which tool (+ model, if known) is driving this surface, and
+            the switch entry point (issue #96/#98). The single most basic fact
+            about a session, so it sits above even Sub-tasks. Renders even with
+            `tool` unresolved (empty ToolIcon) rather than disappearing —
+            SessionInfoPanel's other sections tolerate the same transient gap. */}
+        <Section key="engine" title={t("sessionInfo.engine")}>
+          <div className="-mx-1.5 mt-1.5 flex items-center gap-2 rounded-[var(--radius-sm)] px-1.5 py-1">
+            <ToolIcon tool={tool ?? ""} size={14} />
+            <span className="min-w-0 truncate text-[12.5px] text-ink">
+              {tool ? toolFullName(tool) : t("sessionInfo.engineUnknown")}
+            </span>
+            {meta?.model && (
+              <span className="min-w-0 truncate font-mono text-[11px] text-ink-faint">
+                {meta.model}
+              </span>
+            )}
+            {onSwitchEngine && (
+              <button
+                type="button"
+                onClick={onSwitchEngine}
+                className="ml-auto shrink-0 whitespace-nowrap text-[11px] font-medium text-brand transition-colors hover:text-ink hover:underline"
+              >
+                {t("sessionInfo.switchEngine")}
+              </button>
+            )}
+          </div>
+        </Section>
+
         {/* Sub-tasks — created directions, newest first. Lead-only. The header
             stays put (most task-relevant → not hideable); the list caps at 3. */}
         {sortedSubtasks.length > 0 && (

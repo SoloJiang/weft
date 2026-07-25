@@ -81,7 +81,21 @@ export interface Thread {
   kind: string;
   /** The CLI the lead engine runs (claude | codex | opencode). */
   lead_tool: string;
+  /** Free-text `--model` override for the lead (issue #98); null = follow the
+   *  CLI's own configured default. claude/codex only — see EngineSwitchDialog. */
+  lead_model: string | null;
   created_at: string;
+}
+
+/** Result of switching a lead/worker's engine identity and/or model override
+ *  (issue #96/#98) — both success and failure are surfaced with the concrete
+ *  before/after values, never a bare boolean, so the UI can render an honest
+ *  "claude → codex" / "no override → gpt-5.5-high" confirmation. */
+export interface SwitchOutcome {
+  old_tool: string;
+  new_tool: string;
+  old_model: string | null;
+  new_model: string | null;
 }
 
 export interface FileDiff {
@@ -181,6 +195,10 @@ export interface ObserveRef {
   mcp_servers: { name: string; status: string }[];
   /** claude 引擎缓存的扁平 tools(`mcp__server__tool`);codex/opencode 为空。 */
   tools: string[];
+  /** This worker's `--model` override (issue #98) if one was set via
+   *  switchWorkerTool — distinct from `model` (the LIVE probed/reported
+   *  model). Prefills the switch dialog. */
+  model_override: string | null;
 }
 
 /** One MCP server row in the session info panel. */
@@ -263,7 +281,10 @@ export interface LeadMessage {
     | "settled"
     /** Marker row the backend inserts where a conversation rewind truncated the
      *  timeline; content is {"from_message_id": number, "deleted": number}. */
-    | "rewind";
+    | "rewind"
+    /** Marker row for an engine/model switch (issue #96/#98); content is
+     *  {"old_tool","new_tool","old_model","new_model"} (models nullable). */
+    | "engine_switch";
   /** kind-shaped JSON string, e.g. {"text": "..."} for kind=text */
   content: string;
   status: "streaming" | "complete" | "interrupted" | "error" | "queued";
@@ -361,7 +382,8 @@ export type LeadChatPush =
       /** A conversation rewind truncated this thread's rows for one session
        *  (null = lead console): reload the thread's messages. Carries the
        *  session's NEW native id (null = fresh native session on next send) so
-       *  live session state (Open App / Take Over) can't point at the
+       *  live session re-entry actions (Open in Codex / Copy resume command)
+       *  can't point at the
        *  abandoned pre-rewind conversation. */
       type: "rewound";
       thread_id: number;

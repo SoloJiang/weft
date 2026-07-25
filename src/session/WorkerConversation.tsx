@@ -13,8 +13,10 @@ import { SessionInfoPanel } from "./SessionInfoPanel";
 import { Inspect } from "../components/Inspect";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { ALL_REWIND_MODES, RewindDialog, RewindPickerDialog } from "./RewindDialog";
-import { appLink, resumeCommand } from "../lib/resume";
+import { EngineSwitchDialog } from "./EngineSwitchDialog";
+import { nativeSessionResumeTarget } from "../lib/resume";
 import { useImeComposition } from "../lib/useImeComposition";
+import { toast } from "../components/Toast";
 import {
   failChatHistoryLoad,
   workerChatHistoryStatus,
@@ -54,11 +56,14 @@ export function WorkerConversation() {
     markSkillsDirty,
     asks,
     setActiveSidePanel,
+    switchWorkerTool,
+    installedTools,
   } = useStore();
   const { t } = useTranslation();
   const directionId = viewing?.directionId ?? null;
   const repoId = viewing?.repoId ?? null;
   const slotKey = directionId == null || repoId == null ? null : `${directionId}:${repoId}`;
+  const [switchOpen, setSwitchOpen] = useState(false);
   const [sessionLookup, setSessionLookup] = useState<WorkerSessionLookup>({
     slotKey: null,
     status: "loading",
@@ -258,6 +263,31 @@ export function WorkerConversation() {
     void api.flagSessionSkillRefresh(sid).finally(() => markSkillsDirty());
   };
 
+  const sessionResumeAction = (() => {
+    if (!ref || !nativeId) return undefined;
+    const target = nativeSessionResumeTarget(ref.tool, ref.worktree, nativeId, ref.command);
+    switch (target.kind) {
+      case "open-codex":
+        return {
+          kind: "open-codex" as const,
+          onOpen: () => {
+            void api.openUrl(target.url).catch(() => {});
+          },
+        };
+      case "copy-terminal-command":
+        return {
+          kind: "copy-terminal-command" as const,
+          onCopy: async () => {
+            try {
+              await navigator.clipboard.writeText(target.command);
+              return true;
+            } catch {
+              return false;
+            }
+          },
+        };
+    }
+  })();
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
@@ -356,19 +386,7 @@ export function WorkerConversation() {
             onSend={(v, images, fs) => sendToWorker(directionId, repoId, v, images, fs)}
             onStop={() => sid != null && void api.chatInterrupt(sid)}
             onRewindPicker={canRewind ? () => setPickerOpen(true) : undefined}
-            onTakeOver={async () => {
-              if (!ref || !nativeId || sid == null) return false;
-              await api.chatStop(sid);
-              await navigator.clipboard.writeText(
-                resumeCommand(ref.tool, ref.worktree, nativeId, ref.command),
-              );
-              return true;
-            }}
-            onOpenApp={
-              ref && nativeId && appLink(ref.tool, nativeId)
-                ? () => void api.openUrl(appLink(ref.tool, nativeId)!)
-                : undefined
-            }
+            sessionResumeAction={sessionResumeAction}
           />
         </div>
       </section>
@@ -380,6 +398,7 @@ export function WorkerConversation() {
           tool={ref?.tool}
           onClose={() => setRail("none")}
           onReload={onReload}
+          onSwitchEngine={sid != null ? () => setSwitchOpen(true) : undefined}
           busy={busy}
         />
       )}
@@ -417,6 +436,32 @@ export function WorkerConversation() {
           setRewindId(id);
         }}
       />
+      {sid != null && threadId != null && ref && (
+        <EngineSwitchDialog
+          open={switchOpen}
+          onOpenChange={setSwitchOpen}
+          scope="worker"
+          currentTool={ref.tool}
+          currentModel={ref.model_override}
+          installedTools={installedTools}
+          onConfirm={async (tool, model) => {
+            const outcome = await switchWorkerTool(threadId, directionId, sid, tool, model);
+            toast(
+              outcome.old_tool === outcome.new_tool
+                ? t("session.switchReloadedToast", { tool: toolFullName(outcome.new_tool) })
+                : t("session.switchedToast", {
+                    from: toolFullName(outcome.old_tool),
+                    to: toolFullName(outcome.new_tool),
+                  }),
+            );
+            // The next `sessionFor` poll (≤2s) picks up the new tool/model —
+            // this immediate re-check just avoids a visible stale badge for
+            // the length of one poll interval.
+            setSessionLookupRetry((n) => n + 1);
+            return outcome;
+          }}
+        />
+      )}
     </div>
   );
 }

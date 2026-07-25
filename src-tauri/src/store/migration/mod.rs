@@ -52,6 +52,9 @@ impl MigratorTrait for Migrator {
             Box::new(M0038CodeCheckpointNestedRepos),
             Box::new(M0039CodeCheckpointIndexTree),
             Box::new(M0040LeadMessageConsumedAt),
+            Box::new(M0041LeadMessageThreadKindIdx),
+            Box::new(M0042ThreadLeadModel),
+            Box::new(M0043SessionModel),
         ]
     }
 }
@@ -1797,6 +1800,140 @@ impl MigrationTrait for M0040LeadMessageConsumedAt {
     }
 }
 
+/// Composite index for the single-row `lead_message` lookups the stall sweep
+/// (`lead_chat::revive`) repeats on every pass. They all shape up as
+/// `thread_id = ? AND kind = ? [AND session_id …]`, but M0007 only ever
+/// indexed `thread_id`, so each one had to walk that thread's ENTIRE message
+/// history — which on a long-lived thread is the whole chat — to return one
+/// row. Three callers ride this: `repo::last_turn_freeze_recovery_secs` (the
+/// turn-freeze grace window, per thread AND per stalled direction) plus the
+/// older `repo::lead_native_id` / `repo::lead_status` meta reads that already
+/// ran twice per thread per sweep.
+///
+/// `(thread_id, kind, session_id, id)` serves all of them: equality on the
+/// leading columns, with `id` last so `ORDER BY id DESC LIMIT 1` reads
+/// straight off the index instead of sorting. `lead_native_id`/`lead_status`
+/// use the `(thread_id, kind)` prefix. `idx_lead_message_thread` stays — the
+/// timeline reads that filter on `thread_id` alone are still served by the
+/// narrower index, and dropping it is a separate, riskier change.
+///
+/// Additive and idempotent: `if_not_exists` matches M0007's own index
+/// creation, so re-runs and fresh databases behave the same. Pure
+/// performance — no column, no data, no behavior change.
+pub struct M0041LeadMessageThreadKindIdx;
+impl MigrationName for M0041LeadMessageThreadKindIdx {
+    fn name(&self) -> &str {
+        "m0041_lead_message_thread_kind_idx"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0041LeadMessageThreadKindIdx {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_lead_message_thread_kind_session")
+                    .table(Alias::new("lead_message"))
+                    .col(Alias::new("thread_id"))
+                    .col(Alias::new("kind"))
+                    .col(Alias::new("session_id"))
+                    .col(Alias::new("id"))
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_index(
+                Index::drop()
+                    .name("idx_lead_message_thread_kind_session")
+                    .table(Alias::new("lead_message"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds the nullable thread.lead_model override (issue #98: model selection in
+/// the UI). NULL = follow the CLI's own configured default. M0001 reflects the
+/// current entity, so a fresh db already has the column; sqlite has no ADD
+/// COLUMN IF NOT EXISTS, so the duplicate is tolerated like M0019/M0020.
+pub struct M0042ThreadLeadModel;
+impl MigrationName for M0042ThreadLeadModel {
+    fn name(&self) -> &str {
+        "m0042_thread_lead_model"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0042ThreadLeadModel {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .add_column(ColumnDef::new(Alias::new("lead_model")).string().null())
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .drop_column(Alias::new("lead_model"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds the nullable session.model override. Same semantics/duplicate
+/// tolerance as M0042, scoped to chat-mode workers.
+pub struct M0043SessionModel;
+impl MigrationName for M0043SessionModel {
+    fn name(&self) -> &str {
+        "m0043_session_model"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0043SessionModel {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("session"))
+                    .add_column(ColumnDef::new(Alias::new("model")).string().null())
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("session"))
+                    .drop_column(Alias::new("model"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::gateway_components_to_backend;
@@ -1955,6 +2092,74 @@ mod tests {
             .unwrap();
         // Selecting the row back requires the column to exist.
         assert_eq!(m.consumed_at, None, "consumed_at must exist and default to NULL");
+    }
+
+    /// M0041: the composite index exists AND SQLite actually plans the stall
+    /// sweep's lookups through it. Asserting the query PLAN, not just
+    /// `sqlite_master`, is the point: an index that exists but doesn't match
+    /// the query's column order would still leave the sweep doing a full
+    /// per-thread scan, and only the plan can tell those apart. Covers both
+    /// shapes — the freeze marker (`kind` + `session_id`) and the older
+    /// `lead_native_id`/`lead_status` meta reads that use the leading prefix.
+    #[tokio::test]
+    async fn m0041_thread_kind_index_backs_the_sweep_lookups() {
+        use crate::store::Db;
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let plan_for = |sql: &'static str| {
+            let db = db.0.clone();
+            async move {
+                db.query_all(Statement::from_string(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    format!("EXPLAIN QUERY PLAN {sql}"),
+                ))
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| r.try_get::<String>("", "detail").ok())
+                .collect::<Vec<_>>()
+                .join(" | ")
+            }
+        };
+
+        // The freeze-marker lookup (repo::last_turn_freeze_recovery_secs),
+        // worker form: all three equality columns plus the ORDER BY.
+        let marker = plan_for(
+            "SELECT * FROM lead_message WHERE thread_id = 1 AND kind = 'turn_freeze_recovered' \
+             AND session_id = 2 ORDER BY id DESC LIMIT 1",
+        )
+        .await;
+        assert!(
+            marker.contains("idx_lead_message_thread_kind_session"),
+            "marker lookup must use the composite index, got: {marker}"
+        );
+        // …and it must not fall back to sorting, which is the whole reason `id`
+        // is the trailing column.
+        assert!(
+            !marker.contains("TEMP B-TREE"),
+            "ORDER BY id DESC should read off the index, got: {marker}"
+        );
+
+        // The lead form keys `session_id IS NULL` instead.
+        let lead_marker = plan_for(
+            "SELECT * FROM lead_message WHERE thread_id = 1 AND kind = 'turn_freeze_recovered' \
+             AND session_id IS NULL ORDER BY id DESC LIMIT 1",
+        )
+        .await;
+        assert!(
+            lead_marker.contains("idx_lead_message_thread_kind_session"),
+            "lead marker lookup must use the composite index, got: {lead_marker}"
+        );
+
+        // The pre-existing per-sweep meta reads ride the (thread_id, kind) prefix.
+        let meta =
+            plan_for("SELECT * FROM lead_message WHERE thread_id = 1 AND kind = 'meta' LIMIT 1")
+                .await;
+        assert!(
+            meta.contains("idx_lead_message_thread_kind_session"),
+            "meta lookup must use the composite index prefix, got: {meta}"
+        );
     }
 
     /// M0037: code_checkpoint exists after migration and round-trips a row.

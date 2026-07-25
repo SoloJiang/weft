@@ -10,6 +10,12 @@
 //! permit 与会话的 agent 进程生命周期 RAII 绑定:acquire 到的槽存进
 //! `EngineInner.child_permit`,和 `child_reg` 挨着,进程被 take/overwrite/stop 清掉
 //! 时一并 drop=自动释放槽,无需显式 release 调用。
+//!
+//! RAII 只保证「drop 即释放」,不保证「该 drop 时真的 drop 了」——`gate()` 是进程级
+//! `OnceLock` 单例,漏掉任何一处清 `child` 却不清 `child_permit` 的地方,那个槽就一直
+//! 占到应用重启为止(而「点 Stop」是高频操作)。所以清点是**穷举**的,清单见
+//! `EngineInner.child_permit` 的字段文档;端到端回归见 engine.rs 的
+//! `stop_quiet_releases_the_session_gate_slot`(本模块自己的测试只覆盖信号量原语)。
 
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -75,6 +81,18 @@ pub fn active_session_slots() -> (usize, usize) {
     slots_from_available(gate().available_permits(), configured_max())
 }
 
+/// Serializes the tests that assert an EXACT before/after slot count on the
+/// process-wide `gate()`. A leak is only observable as a delta ("the slot came
+/// back"), and `gate()` is one static shared by every test in this binary, so
+/// any test measuring that delta has to be the only one holding or acquiring a
+/// slot while it does. Tokio mutexes don't poison, so a panicking test releases
+/// this without cascading into the others.
+#[cfg(test)]
+pub(crate) fn gate_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,9 +138,35 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_session_slot_yields_a_permit() {
+        // Holds a slot on the shared static gate → serialize against the tests
+        // that measure exact slot deltas (see `gate_test_lock`).
+        let _serialized = gate_test_lock().lock().await;
         // Smoke: the real gate hands out at least one slot.
         let permit = acquire_session_slot().await;
         assert!(permit.is_some());
+    }
+
+    /// The leak's shape, on a local semaphore: a permit parked in a long-lived
+    /// struct field (what `EngineInner.child_permit` is) keeps its slot until
+    /// that field is cleared. Overwriting the *neighbouring* field — the
+    /// engine's `child` — releases nothing, which is precisely why every
+    /// `child = None` site has to clear `child_permit` too.
+    #[tokio::test]
+    async fn a_parked_permit_holds_its_slot_until_the_field_is_cleared() {
+        let sem = Arc::new(Semaphore::new(1));
+        struct Session {
+            child: Option<&'static str>,
+            permit: Option<OwnedSemaphorePermit>,
+        }
+        let mut s = Session {
+            child: Some("agent"),
+            permit: sem.clone().acquire_owned().await.ok(),
+        };
+        assert_eq!(sem.available_permits(), 0);
+        s.child = None; // "stop" that only clears the child …
+        assert_eq!(sem.available_permits(), 0, "… leaks the slot");
+        s.permit = None; // … and the same stop done right
+        assert_eq!(sem.available_permits(), 1);
     }
 
     #[test]
