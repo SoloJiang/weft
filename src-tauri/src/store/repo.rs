@@ -652,25 +652,53 @@ pub async fn rename_thread(db: &Db, thread_id: i32, title: &str) -> Result<threa
 /// this stays a plain, independently-testable field update. No-op fields
 /// (same tool, same model) still write through — callers may use this to
 /// force-reload an engine so an externally-edited CLI config takes effect.
-pub async fn switch_thread_tool(
+pub async fn switch_lead_engine_txn(
     db: &Db,
     thread_id: i32,
     tool: &str,
     model: Option<&str>,
 ) -> Result<thread::Model> {
-    // Seam point: `commands::switch_lead_tool` must RETRACT its grace marker
+    // Seam point: `commands::persist_switch` must RETRACT its grace marker
     // when this write fails, and that path has no other way to be reached from
     // a test. See `fail_write`'s doc for the boundary.
-    fail_write!("switch_thread_tool");
+    fail_write!("switch_lead_engine_txn");
+    use sea_orm::TransactionTrait;
+    let txn = db.0.begin().await?;
     let m = thread::Entity::find_by_id(thread_id)
-        .one(&db.0)
+        .one(&txn)
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
     let mut a: thread::ActiveModel = m.into();
     a.lead_tool = Set(tool.to_string());
     a.lead_command = Set(None);
     a.lead_model = Set(model.map(str::to_string));
-    Ok(a.update(&db.0).await?)
+    let updated = a.update(&txn).await?;
+
+    // The native-id clear, in the SAME transaction — the identical strip
+    // `set_lead_native_id_opt(.., None)` performs, against `txn`. The lead's
+    // native id lives in a `kind = "meta"` row rather than a column, which is
+    // why this is spelled out here instead of reusing that function.
+    if let Some(meta) = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("meta"))
+        .one(&txn)
+        .await?
+    {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&meta.content).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("native_id");
+        }
+        if v.as_object().is_some_and(|o| o.is_empty()) {
+            lead_message::Entity::delete_by_id(meta.id).exec(&txn).await?;
+        } else {
+            let mut ma: lead_message::ActiveModel = meta.into();
+            ma.content = Set(v.to_string());
+            ma.update(&txn).await?;
+        }
+    }
+    txn.commit().await?;
+    Ok(updated)
 }
 
 pub async fn get_plan(db: &Db, thread_id: i32) -> Result<Option<plan::Model>> {
@@ -1256,7 +1284,7 @@ pub async fn rename_direction(db: &Db, direction_id: i32, name: &str) -> Result<
 /// the caller's lookup and this write — moot, not a failure, same posture as
 /// the old `switch_session_tool`); the direction half is required (not found
 /// is a real error, same as before).
-pub async fn switch_worker_tool_txn(
+pub async fn switch_worker_engine_txn(
     db: &Db,
     direction_id: i32,
     session_id: i32,
@@ -1278,6 +1306,13 @@ pub async fn switch_worker_tool_txn(
         sa.tool = Set(tool.to_string());
         sa.command = Set(None);
         sa.model = Set(model.map(str::to_string));
+        // The native-id clear rides the SAME row update (issue #96 pitfall 1).
+        // It used to be a separate write after this transaction committed,
+        // which meant a failure there left the new tool paired with the OLD
+        // engine's native id — a pair `worker_engine` would then try to resume
+        // across engines, and one that no grace window repairs (adversarial
+        // re-review of PR #140, round 6). Atomic here, that pair cannot exist.
+        sa.native_session_id = Set(None);
         sa.update(&txn).await?;
     }
     txn.commit().await?;
@@ -5151,16 +5186,16 @@ mod tests {
         set_tool_command(&db, "claude", "cc-claude", false).await.unwrap();
         assert_eq!(get_thread(&db, t.id).await.unwrap().unwrap().lead_command.as_deref(), Some("claude"));
 
-        let switched = switch_thread_tool(&db, t.id, "codex", Some("gpt-5.5-high")).await.unwrap();
+        let switched = switch_lead_engine_txn(&db, t.id, "codex", Some("gpt-5.5-high")).await.unwrap();
         assert_eq!(switched.lead_tool, "codex");
         assert_eq!(switched.lead_model.as_deref(), Some("gpt-5.5-high"));
         assert_eq!(switched.lead_command, None, "stale claude alias pin must be cleared");
 
         // A model override clears the same way when the caller passes None.
-        let cleared = switch_thread_tool(&db, t.id, "codex", None).await.unwrap();
+        let cleared = switch_lead_engine_txn(&db, t.id, "codex", None).await.unwrap();
         assert_eq!(cleared.lead_model, None);
 
-        assert!(switch_thread_tool(&db, 9999, "codex", None).await.is_err());
+        assert!(switch_lead_engine_txn(&db, 9999, "codex", None).await.is_err());
     }
 
     #[tokio::test]
@@ -5183,7 +5218,7 @@ mod tests {
             a.update(&db.0).await.unwrap();
         }
 
-        switch_worker_tool_txn(&db, d.id, s.id, "opencode", Some("kimi-for-coding/k2p6"))
+        switch_worker_engine_txn(&db, d.id, s.id, "opencode", Some("kimi-for-coding/k2p6"))
             .await
             .unwrap();
 
@@ -5193,14 +5228,60 @@ mod tests {
         assert_eq!(s2.tool, "opencode");
         assert_eq!(s2.model.as_deref(), Some("kimi-for-coding/k2p6"));
         assert_eq!(s2.command, None, "stale claude alias pin must be cleared");
-        // Switching direction/session tool does not itself touch native id —
-        // that is the caller's (lead_chat::commands) job, layered separately.
-        assert_eq!(s2.native_session_id.as_deref(), Some("native-1"));
+        // The native-id clear rides this same transaction as of PR #140 round
+        // 6. It used to be a separate write the caller made afterwards, which
+        // could fail on its own and leave the new tool paired with the OLD
+        // engine's native id — a pair `worker_engine` would then try to resume
+        // across engines. Atomic here, that pair cannot exist.
+        assert_eq!(s2.native_session_id, None, "the switch clears it in the same write");
 
-        assert!(switch_worker_tool_txn(&db, 9999, s.id, "codex", None).await.is_err());
+        assert!(switch_worker_engine_txn(&db, 9999, s.id, "codex", None).await.is_err());
         // A missing session is tolerated (not an error) on the session half —
         // see the function doc — as long as the direction is real.
-        assert!(switch_worker_tool_txn(&db, d.id, 9999, "codex", None).await.is_ok());
+        assert!(switch_worker_engine_txn(&db, d.id, 9999, "codex", None).await.is_ok());
+    }
+
+    /// PR #140 round 6: the lead's tool/model write and its native-id clear are
+    /// ONE transaction, so they cannot half-apply.
+    ///
+    /// Same technique as the worker test below — force the SECOND half to fail
+    /// with a genuine DB error while the first is perfectly healthy, then
+    /// assert the first rolled back. The lead's native id lives in a
+    /// `kind = "meta"` lead_message row rather than a column, so renaming that
+    /// table away is what breaks the clear specifically.
+    ///
+    /// Without the transaction this leaves `lead_tool = "codex"` next to the
+    /// old engine's native id — the pair the next send would try to resume
+    /// across engines, and one no grace window repairs.
+    #[tokio::test]
+    async fn switch_lead_engine_txn_rolls_back_the_tool_when_the_native_clear_fails() {
+        use sea_orm::ConnectionTrait;
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        set_lead_native_id(&db, t.id, "lead-native-1").await.unwrap();
+
+        db.0.execute_unprepared("ALTER TABLE lead_message RENAME TO lead_message_renamed_for_test")
+            .await
+            .unwrap();
+        let err = switch_lead_engine_txn(&db, t.id, "codex", Some("gpt-5.5-high")).await;
+        assert!(err.is_err(), "the native-id half must fail (table renamed away)");
+        db.0.execute_unprepared("ALTER TABLE lead_message_renamed_for_test RENAME TO lead_message")
+            .await
+            .unwrap();
+
+        let t2 = get_thread(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(
+            t2.lead_tool, "claude",
+            "lead_tool must be ROLLED BACK — a committed tool next to the old native id is \
+             exactly the half-applied pair this transaction exists to prevent"
+        );
+        assert_eq!(t2.lead_model, None);
+        assert_eq!(
+            lead_native_id(&db, t.id).await.unwrap().as_deref(),
+            Some("lead-native-1"),
+            "and the id is untouched, so the surface is still coherently on the OLD engine"
+        );
     }
 
     /// Adversarial re-review of PR #139, P1: the direction/session writes used
@@ -5215,7 +5296,7 @@ mod tests {
     /// a busy-snapshot race) while the direction half is perfectly healthy,
     /// then asserts the direction was rolled back too.
     #[tokio::test]
-    async fn switch_worker_tool_txn_rolls_back_direction_when_session_write_fails() {
+    async fn switch_worker_engine_txn_rolls_back_direction_when_session_write_fails() {
         use sea_orm::ConnectionTrait;
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
@@ -5234,7 +5315,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = switch_worker_tool_txn(&db, d.id, s.id, "opencode", Some("gpt-5.5-high")).await;
+        let err = switch_worker_engine_txn(&db, d.id, s.id, "opencode", Some("gpt-5.5-high")).await;
         assert!(err.is_err(), "the session-table write must fail (table renamed away)");
 
         // Restore the table so the read-back below (and any other test using

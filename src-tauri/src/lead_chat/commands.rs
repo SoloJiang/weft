@@ -1648,11 +1648,6 @@ impl SwitchTarget {
 ///
 /// The stamp could not be written: nothing happened at all.
 pub const SWITCH_MARKER_ERROR_CODE: &str = "switch_marker_stamp_failed";
-/// The tool/model write landed but the native-id clear did not, so the session
-/// is half-switched: new tool, old engine's native id. Reporting a plain
-/// failure here would be untrue in the direction that matters — the user's
-/// engine identity really did change.
-pub const SWITCH_HALF_APPLIED_ERROR_CODE: &str = "switch_half_applied";
 /// The switch failed AND its grace marker could not be retracted, leaving a
 /// stray marker that can cost one spurious re-drive prompt later. Distinct
 /// from a clean abort because it is not, in fact, clean.
@@ -1800,8 +1795,8 @@ use switch_gate::{refresh_switch_grace, stamp_switch_marker, MarkerStamped};
 /// enforces on its own copy of this sequence (see the long comment at its
 /// `if marker_stamped`).
 ///
-///   1. the tool/model persist (`repo::switch_thread_tool` /
-///      `repo::switch_worker_tool_txn`).
+///   1. the tool/model persist (`repo::switch_lead_engine_txn` /
+///      `repo::switch_worker_engine_txn`).
 ///   2. `engine::clear_native_id` — issue #96 pitfall 1: a native id minted by
 ///      the OLD engine, handed to the NEW one as `--resume`/`resume`, fails
 ///      fast with "No conversation found".
@@ -1846,48 +1841,19 @@ use switch_gate::{refresh_switch_grace, stamp_switch_marker, MarkerStamped};
 /// The caller-visible switch sequence is unchanged (persist tool/model → clear
 /// native id); only the auxiliary grace stamp moved, and its one prior
 /// ordering constraint — "before the clear" — still holds.
-/// Which of [`persist_switch_writes`]' two writes failed — the ONE
-/// discriminator the retraction decision keys on, because "is it still safe to
-/// retract?" is precisely "has anything durable landed yet?" (review round 4).
-enum SwitchWriteFailure {
-    /// The tool/model write failed, so NOTHING durable landed: the surface
-    /// still has its old tool and its old native id. The marker describes a
-    /// reset that never happened and is safe to retract.
-    NothingLanded(anyhow::Error),
-    /// The tool/model write landed and the native-id CLEAR failed. The switch
-    /// is half-applied — new tool, old engine's native id — and the marker
-    /// must be KEPT: it is the only thing holding the stall sweep off a
-    /// surface whose next send would otherwise attempt an invalid
-    /// cross-engine resume (issue #96 pitfall 1). Round 3 placed the
-    /// retraction boundary at "the native id is gone"; this is the same rule
-    /// read more carefully — the FIRST durable write is already enough to make
-    /// retraction wrong.
-    ToolLandedButClearFailed(anyhow::Error),
-}
-
 async fn persist_switch(
     db: &Db,
     stamped: MarkerStamped,
     tool: &str,
     model: Option<&str>,
 ) -> anyhow::Result<()> {
-    let failure = match persist_switch_writes(db, &stamped, tool, model).await {
+    let err = match persist_switch_writes(db, &stamped, tool, model).await {
         Ok(()) => return Ok(()),
-        Err(failure) => failure,
-    };
-    let err = match failure {
-        // Half-applied: keep the marker, it is now load-bearing. Rejects with
-        // its OWN code — "the switch failed" is an incomplete description of
-        // this state (the tool really did change), and telling the user only
-        // that would be the same dishonesty this PR keeps correcting.
-        SwitchWriteFailure::ToolLandedButClearFailed(err) => {
-            eprintln!(
-                "[weft] engine switch half-applied: the tool/model write landed but the \
-                 native-id clear failed; the grace marker is deliberately kept: {err}"
-            );
-            return Err(anyhow::anyhow!(SWITCH_HALF_APPLIED_ERROR_CODE));
-        }
-        SwitchWriteFailure::NothingLanded(err) => err,
+        // ONE atomic write per axis, so a failure means nothing landed: the
+        // surface still has its old tool AND its old native id, and the marker
+        // describes a reset that never happened. There is no longer a
+        // half-applied case to distinguish — see `persist_switch_writes`.
+        Err(err) => err,
     };
     match stamped.retract(db).await {
         // Nothing landed and the marker is gone: an ordinary failed switch.
@@ -1910,33 +1876,38 @@ async fn persist_switch(
     }
 }
 
-/// The writes themselves. Split out only so [`persist_switch`] can own the
-/// retraction on the error path without duplicating them.
+/// The durable write itself — ONE transaction per axis, covering BOTH the
+/// tool/model change and the native-id clear.
+///
+/// It was two separate writes until review round 6. Naming the half-applied
+/// state (new tool + old engine's native id) and holding the stall sweep off
+/// it with the grace marker only DELAYED it: the marker expires, and the
+/// user's next send never consults it at all — `worker_engine` reads the
+/// mismatched pair directly and tries to resume the old engine's conversation
+/// with the new one. Atomicity removes the state instead of describing it,
+/// which is why this fix deleted a variant, an error code, a translation and a
+/// test rather than adding any.
+///
+/// Split from [`persist_switch`] only so that function can own the retraction
+/// on the error path without duplicating the call.
 async fn persist_switch_writes(
     db: &Db,
     stamped: &MarkerStamped,
     tool: &str,
     model: Option<&str>,
-) -> Result<(), SwitchWriteFailure> {
-    let target = stamped.target();
-    let thread_id = target.thread_id();
-    let session_id = target.session_id();
-    let tool_write = match target {
-        SwitchTarget::Lead { thread_id } => repo::switch_thread_tool(db, thread_id, tool, model)
-            .await
-            .map(|_| ()),
+) -> anyhow::Result<()> {
+    match stamped.target() {
+        SwitchTarget::Lead { thread_id } => {
+            repo::switch_lead_engine_txn(db, thread_id, tool, model).await.map(|_| ())
+        }
         SwitchTarget::Worker {
             direction_id,
             session_id,
             ..
-        } => repo::switch_worker_tool_txn(db, direction_id, session_id, tool, model)
+        } => repo::switch_worker_engine_txn(db, direction_id, session_id, tool, model)
             .await
             .map(|_| ()),
-    };
-    tool_write.map_err(SwitchWriteFailure::NothingLanded)?;
-    engine::clear_native_id(db, session_id, thread_id)
-        .await
-        .map_err(SwitchWriteFailure::ToolLandedButClearFailed)
+    }
 }
 
 /// Switch the LEAD's engine identity and/or model override for `thread_id` —
@@ -1961,7 +1932,7 @@ async fn persist_switch_writes(
 ///      `STATUS_STOPPED` (`engine::teardown_for_switch`), since this is a
 ///      replacement, not a stop the user needs to explicitly resume from.
 ///   3. make the switch durable via [`persist_switch`]: persist the new
-///      tool/model (`repo::switch_thread_tool`, which also clears any stale
+///      tool/model (`repo::switch_lead_engine_txn`, which also clears any stale
 ///      command-alias pin) and clear the native session id
 ///      (`engine::clear_native_id` — the SAME contract turn-freeze recovery
 ///      and rewind already rely on: dogfooding pitfall #1, a stale native id
@@ -2069,7 +2040,7 @@ pub async fn switch_lead_tool(
 /// semantics as `switch_lead_tool` — including step 0's marker gate, shared
 /// verbatim through [`stamp_switch_marker`]/[`persist_switch`] rather than
 /// restated here — with two worker-specific differences:
-///   - the tool/model write is `repo::switch_worker_tool_txn` — ONE transaction
+///   - the tool/model write is `repo::switch_worker_engine_txn` — ONE transaction
 ///     covering BOTH `direction.tool` (the durable side: `chat_open_worker_impl`'s
 ///     cold-recreate path, which fires the very next time this worker is
 ///     opened since the native id this switch just cleared makes that
@@ -2529,7 +2500,7 @@ mod live_slot_tests {
 mod switch_gate_tests {
     use super::{
         persist_switch, refresh_switch_grace, stamp_switch_marker, SwitchTarget,
-        SWITCH_CLEANUP_ERROR_CODE, SWITCH_HALF_APPLIED_ERROR_CODE, SWITCH_MARKER_ERROR_CODE,
+        SWITCH_CLEANUP_ERROR_CODE, SWITCH_MARKER_ERROR_CODE,
     };
     use crate::lead_chat::revive::has_resumable_context;
     use crate::store::{repo, Db};
@@ -2617,7 +2588,7 @@ mod switch_gate_tests {
             .await
             .unwrap();
 
-        // BOTH halves of switch_worker_tool_txn — the durable side a cold
+        // BOTH halves of switch_worker_engine_txn — the durable side a cold
         // reopen reads and the live side every send reads.
         assert_eq!(repo::get_direction(&db, dir).await.unwrap().unwrap().tool, "codex");
         let s = repo::get_session(&db, sess).await.unwrap().unwrap();
@@ -2742,7 +2713,7 @@ mod switch_gate_tests {
 
         let stamped = stamp_switch_marker(&db, target).await.unwrap();
         let failed = repo::fail_write::while_failing(
-            "switch_thread_tool",
+            "switch_lead_engine_txn",
             persist_switch(&db, stamped, "codex", None),
         )
         .await;
@@ -2787,7 +2758,7 @@ mod switch_gate_tests {
         let freeze_marker = repo::mark_turn_freeze_recovered(&db, th.id, None).await.unwrap();
 
         let failed = repo::fail_write::while_failing(
-            "switch_thread_tool",
+            "switch_lead_engine_txn",
             persist_switch(&db, stamped, "codex", None),
         )
         .await;
@@ -2861,11 +2832,7 @@ mod switch_gate_tests {
     /// renaming one here without updating the map goes red on this side too.
     #[test]
     fn the_switch_error_codes_are_distinct_and_stable() {
-        let codes = [
-            SWITCH_MARKER_ERROR_CODE,
-            SWITCH_HALF_APPLIED_ERROR_CODE,
-            SWITCH_CLEANUP_ERROR_CODE,
-        ];
+        let codes = [SWITCH_MARKER_ERROR_CODE, SWITCH_CLEANUP_ERROR_CODE];
         for (i, a) in codes.iter().enumerate() {
             for (j, b) in codes.iter().enumerate() {
                 assert!(i == j || !b.contains(a), "{a} is a substring of {b}");
@@ -2873,51 +2840,39 @@ mod switch_gate_tests {
         }
         assert_eq!(
             codes,
-            ["switch_marker_stamp_failed", "switch_half_applied", "switch_cleanup_failed"],
+            ["switch_marker_stamp_failed", "switch_cleanup_failed"],
             "spellings are mirrored in src/session/engineSwitch.ts — update both"
         );
     }
 
-    /// Review round 4, finding 1 — the retraction boundary is the FIRST durable
-    /// write, not the native-id clear.
+    /// Review round 6 — the half-applied state is GONE, not merely described.
     ///
-    /// `persist_switch_writes` persists the tool and then clears the native id.
-    /// If the clear is what fails, the switch is half-applied: new tool, OLD
-    /// engine's native id. Retracting there would drop the only thing holding
-    /// the stall sweep off a surface whose next send would attempt an invalid
-    /// cross-engine resume (issue #96 pitfall 1). Round 3 read the boundary as
-    /// "the native id is gone"; this is the same rule read more carefully.
+    /// Until this round the tool/model write and the native-id clear were two
+    /// writes, and a failure between them left new tool + old engine's native
+    /// id. Rounds 4 and 5 kept the grace marker and gave that state its own
+    /// error code, which only DELAYED it: the window expires, and the user's
+    /// next send never consults the marker at all — `worker_engine` reads the
+    /// mismatched pair directly. They are one transaction now, so the pair
+    /// cannot be observed at all; this asserts that, on the axis where the two
+    /// values live in the same row.
+    ///
+    /// The transaction's own rollback is covered from the other side, in
+    /// `store::repo`'s tests, where the failure can be injected between the
+    /// two halves.
     #[tokio::test]
-    async fn a_half_applied_switch_keeps_its_grace_marker() {
+    async fn a_switch_never_leaves_a_new_tool_paired_with_an_old_native_id() {
         let db = mem().await;
         let (th, dir, sess) = fixture(&db).await;
         let target = SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess };
 
         let stamped = stamp_switch_marker(&db, target).await.unwrap();
-        let failed = repo::fail_write::while_failing(
-            "set_session_native_id_opt",
-            persist_switch(&db, stamped, "codex", None),
-        )
-        .await;
-        assert_eq!(
-            failed.expect_err("the clear must fail (armed seam)").to_string(),
-            SWITCH_HALF_APPLIED_ERROR_CODE,
-            "half-applied gets its OWN code: reporting a plain failure would be untrue in              the direction that matters, since the tool really did change"
-        );
+        persist_switch(&db, stamped, "codex", None).await.unwrap();
 
         let s = repo::get_session(&db, sess).await.unwrap().unwrap();
-        assert_eq!(s.tool, "codex", "the tool write DID land — this is the half-applied state");
+        assert_eq!(s.tool, "codex");
         assert_eq!(
-            s.native_session_id.as_deref(),
-            Some("worker-nat-1"),
-            "and the clear did not, so the old engine's id is still there"
-        );
-        assert!(
-            repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
-                .await
-                .unwrap()
-                .is_some(),
-            "so the marker must be KEPT: it is what holds the sweep off a half-switched surface"
+            s.native_session_id, None,
+            "the tool change and the id clear are one write — they cannot disagree"
         );
     }
 
@@ -2934,7 +2889,7 @@ mod switch_gate_tests {
         // Two writes have to fail at once, but `while_failing` arms ONE name
         // per task by design (#144), and nesting just lets the inner scope win.
         // So the tool write is failed by other means — a direction id that does
-        // not exist, which `switch_worker_tool_txn` rejects — leaving the seam
+        // not exist, which `switch_worker_engine_txn` rejects — leaving the seam
         // free for the cleanup. The stamp itself only touches thread/session,
         // both real, so the marker genuinely lands first.
         let target = SwitchTarget::Worker {

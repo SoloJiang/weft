@@ -27,7 +27,7 @@ export function switchKindOf(oldTool: string, newTool: string): SwitchKind {
 
 /** The switch outcomes the backend names with a stable code instead of an
  *  English sentence (Rust: `SWITCH_MARKER_ERROR_CODE` /
- *  `SWITCH_HALF_APPLIED_ERROR_CODE` / `SWITCH_CLEANUP_ERROR_CODE`). It sends
+ *  `SWITCH_CLEANUP_ERROR_CODE`). It sends
  *  the CODE and logs the database detail, so this locale's copy comes from
  *  `src/i18n/*.ts`.
  *
@@ -36,7 +36,6 @@ export function switchKindOf(oldTool: string, newTool: string): SwitchKind {
  *  `switchErrorCodeOf` returning null is a normal result, not a gap. */
 export const SWITCH_ERROR_I18N: Record<string, string> = {
   switch_marker_stamp_failed: "session.switchMarkerFailed",
-  switch_half_applied: "session.switchHalfApplied",
   switch_cleanup_failed: "session.switchCleanupFailed",
 };
 
