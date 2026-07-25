@@ -184,6 +184,10 @@ fn commands(update: &Value) -> UpdateOut {
     else {
         return UpdateOut::Ignore;
     };
+    // Empty array is authoritative: clear the engine's cached slash list.
+    if arr.is_empty() {
+        return UpdateOut::Commands(Vec::new());
+    }
     let mut out = Vec::new();
     for c in arr {
         let Some(name) = c.get("name").and_then(|n| n.as_str()) else {
@@ -349,6 +353,15 @@ mod tests {
                 assert_eq!(w, 500000);
             }
             o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_available_commands_clears() {
+        let u = json!({"sessionUpdate":"available_commands_update","availableCommands":[]});
+        match update_to_out(&u) {
+            UpdateOut::Commands(c) => assert!(c.is_empty()),
+            other => panic!("expected empty Commands, got {other:?}"),
         }
     }
 

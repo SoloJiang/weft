@@ -87,6 +87,12 @@ struct Inner {
     /// session/update events that arrived before subscribe() installed a route
     /// (OMP often emits available_commands_update right after session/new).
     pending_updates: std::collections::HashMap<String, Vec<SessionEvent>>,
+    /// Sessions currently between session/new|resume and subscribe — only these
+    /// may buffer pre-subscribe updates. Explicit unsubscribe drops the key.
+    opening_sessions: std::collections::HashSet<String>,
+    /// Generation of this child connection; read_loop only clears inner when
+    /// its generation still owns the slot (writer-fail reconnect race).
+    connection_gen: u64,
     _child: tokio::process::Child,
     _reg: crate::proc_registry::Registration,
 }
@@ -251,6 +257,10 @@ impl ClientHandle {
             }
         });
 
+        let connection_gen = {
+            static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
         *g = Some(Inner {
             write_tx,
             next_id: 1,
@@ -259,13 +269,15 @@ impl ClientHandle {
             pending_permission_ids: std::collections::HashMap::new(),
             permission_gen: 0,
             pending_updates: std::collections::HashMap::new(),
+            opening_sessions: std::collections::HashSet::new(),
+            connection_gen,
             _child: child,
             _reg: reg,
         });
         drop(g); // request() needs this mutex — never hold across initialize.
 
         let me = self.clone();
-        tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
+        tauri::async_runtime::spawn(async move { me.read_loop(stdout, connection_gen).await });
 
         // initialize
         let init_params = json!({
@@ -288,17 +300,18 @@ impl ClientHandle {
             for (_, tx) in inner.pending.drain() {
                 let _ = tx.send(Err(message.to_string()));
             }
-            let _ = inner._child.kill().await;
+            // Tree-aware: OMP may have shell/tool descendants in their own groups.
+            crate::proc_registry::reap(&mut inner._child, &inner._reg).await;
         }
     }
 
     pub async fn shutdown_and_reap(&self) {
         if let Some(mut inner) = self.inner.lock().await.take() {
-            let _ = inner._child.kill().await;
+            crate::proc_registry::reap(&mut inner._child, &inner._reg).await;
         }
     }
 
-    async fn read_loop(&self, stdout: tokio::process::ChildStdout) {
+    async fn read_loop(&self, stdout: tokio::process::ChildStdout, connection_gen: u64) {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             match classify(&line) {
@@ -325,7 +338,12 @@ impl ClientHandle {
                 Incoming::Skip => {}
             }
         }
-        *self.inner.lock().await = None;
+        // Only clear if we still own the slot — writer-fail may have taken
+        // inner and a reconnect spawned a newer generation on this handle.
+        let mut g = self.inner.lock().await;
+        if g.as_ref().is_some_and(|i| i.connection_gen == connection_gen) {
+            *g = None;
+        }
     }
 
     async fn resolve(&self, id: i64, res: Result<Value, String>) {
@@ -359,9 +377,10 @@ impl ClientHandle {
         if let Some(inner) = self.inner.lock().await.as_mut() {
             if let Some(route) = inner.sessions.get(sid) {
                 let _ = route.events.send(ev);
-            } else if !sid.is_empty() {
-                // Buffer until subscribe installs the route (commands/meta often
-                // race ahead of spawn_acp_turn's subscribe call).
+            } else if !sid.is_empty() && inner.opening_sessions.contains(sid) {
+                // Buffer ONLY while open→subscribe is in flight. After explicit
+                // unsubscribe the session is not opening — drop late updates so
+                // a cancelled prompt cannot replay into the next turn.
                 const MAX_BUFFERED: usize = 64;
                 let buf = inner.pending_updates.entry(sid.to_string()).or_default();
                 if buf.len() < MAX_BUFFERED {
@@ -629,6 +648,7 @@ impl ClientHandle {
         let inner = g
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("ACP not connected"))?;
+        inner.opening_sessions.remove(session_id);
         let buffered = inner
             .pending_updates
             .remove(session_id)
@@ -652,6 +672,14 @@ impl ClientHandle {
     pub async fn unsubscribe(&self, session_id: &str) {
         if let Some(inner) = self.inner.lock().await.as_mut() {
             inner.sessions.remove(session_id);
+            inner.opening_sessions.remove(session_id);
+            inner.pending_updates.remove(session_id);
+        }
+    }
+
+    async fn mark_opening(&self, session_id: &str) {
+        if let Some(inner) = self.inner.lock().await.as_mut() {
+            inner.opening_sessions.insert(session_id.to_string());
         }
     }
 
@@ -675,6 +703,7 @@ impl ClientHandle {
             .and_then(|s| s.as_str())
             .map(str::to_string)
             .ok_or_else(|| anyhow::anyhow!("session/new missing sessionId"))?;
+        self.mark_opening(&session_id).await;
         Ok(SessionOpen {
             session_id,
             model: config_option_current(&result, "model"),
@@ -705,6 +734,7 @@ impl ClientHandle {
             .and_then(|s| s.as_str())
             .unwrap_or(session_id)
             .to_string();
+        self.mark_opening(&sid).await;
         Ok(SessionOpen {
             session_id: sid,
             model: config_option_current(&result, "model"),
@@ -730,11 +760,13 @@ impl ClientHandle {
                 }),
             )
             .await?;
-        Ok(result
+        let sid = result
             .get("sessionId")
             .and_then(|s| s.as_str())
             .unwrap_or(session_id)
-            .to_string())
+            .to_string();
+        self.mark_opening(&sid).await;
+        Ok(sid)
     }
 
     pub async fn fork_session(

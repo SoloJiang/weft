@@ -2971,18 +2971,23 @@ async fn spawn_acp_turn(
     };
 
     let had_native = native.is_some();
+    // Keep mcp specs for Session Info seeding (moved into open calls via clone).
+    let mcp_for_meta = mcp.clone();
     let (session_id, open_model, open_thinking) = match native {
         Some(id) => {
             // Prefer resume; fall back to load (hand-cut rewind files).
+            // Do NOT keep a stale id when both fail — next send would target an
+            // unopened session forever.
             match client.resume_session(&id, &cwd, mcp.clone()).await {
                 Ok(open) => (open.session_id, open.model, open.thinking),
-                Err(_) => {
-                    let sid = client
-                        .load_session(&id, &cwd, mcp.clone())
-                        .await
-                        .unwrap_or(id);
-                    (sid, None, None)
-                }
+                Err(resume_err) => match client.load_session(&id, &cwd, mcp.clone()).await {
+                    Ok(sid) => (sid, None, None),
+                    Err(load_err) => {
+                        return Err(anyhow::anyhow!(
+                            "ACP resume failed ({resume_err}); load also failed ({load_err})"
+                        ));
+                    }
+                },
             }
         }
         None => {
@@ -2990,13 +2995,24 @@ async fn spawn_acp_turn(
             (open.session_id, open.model, open.thinking)
         }
     };
-    if open_model.is_some() || open_thinking.is_some() {
+    {
         let mut g = eng.lock().await;
         if let Some(model) = open_model {
             g.last_model = Some(model);
         }
         if let Some(thinking) = open_thinking {
             g.last_reasoning = Some(thinking);
+        }
+        // Seed MCP list from what we injected so Session Info is not empty after
+        // the first turn (OMP has no separate mcp discovery event).
+        if g.last_mcp_servers.is_empty() && !mcp_for_meta.is_empty() {
+            g.last_mcp_servers = mcp_for_meta
+                .into_iter()
+                .map(|s| super::proto::McpServer {
+                    name: s.name,
+                    status: "connected".into(),
+                })
+                .collect();
         }
     }
 
