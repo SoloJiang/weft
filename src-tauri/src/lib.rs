@@ -23,6 +23,7 @@ mod commands_backup;
 pub mod config;
 mod coordinator;
 mod curator;
+mod deps_bootstrap;
 mod detect;
 /// issue #97 额度感知:claude `rate_limit_event` / codex app-server
 /// `account/rateLimits/*` 的结构化解析结果落在这里(tool-keyed 全局快照),供
