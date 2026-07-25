@@ -104,6 +104,7 @@ export function LeadTab({
   // The lead's working dir — resolves relative file paths it mentions in chat.
   const [leadCwd, setLeadCwd] = useState<string | undefined>(undefined);
   const [leadResumeTarget, setLeadResumeTarget] = useState<LeadResumeTarget | null>(null);
+  const [leadResumeRefreshNonce, setLeadResumeRefreshNonce] = useState(0);
   // Live test-case count for the plan card, sourced from the test_plan table so
   // it matches what the panel's View opens. Bumped by a user panel edit (which
   // rewrites the table WITHOUT a test_cases card); lead re-emits refetch via the
@@ -221,7 +222,7 @@ export function LeadTab({
     return () => {
       alive = false;
     };
-  }, [tid, leadTurnState, leadSlashCommands]);
+  }, [tid, leadTurnState, leadSlashCommands, leadResumeRefreshNonce]);
 
   // The latest test_cases card id only grows (append-only timeline). The lead
   // ALWAYS emits a test_cases card when it (re)writes the test_plan table, so
@@ -293,12 +294,6 @@ export function LeadTab({
         };
     }
   })();
-  let onStopEngine: (() => void) | undefined;
-  if (sessionResumeAction?.kind === "copy-terminal-command") {
-    onStopEngine = () => {
-      void api.leadStop(tid);
-    };
-  }
   // Rewind is scoped to claude/codex/opencode leads — the tools with native
   // fork support (same gate as the worker); the lead rewinds conversation-only.
   const canRewind = leadTool === "claude" || leadTool === "codex" || leadTool === "opencode";
@@ -312,6 +307,15 @@ export function LeadTab({
     // would otherwise stick the lead to the default "en" for this run.
     const r = await api.leadRewind(tid, rewindId, currentLang());
     setPrefill((p) => ({ text: r.rewound_text, seq: p.seq + 1 }));
+    setLeadResumeTarget((current) => {
+      if (current?.threadId !== tid) return current;
+      if (r.native_id == null) return null;
+      return { ...current, nativeId: r.native_id };
+    });
+    // The immediate update above prevents an old native id from being used
+    // while the fresh state fetch is in flight; the fetch also covers a target
+    // that was not yet hydrated when rewind completed.
+    setLeadResumeRefreshNonce((nonce) => nonce + 1);
   };
 
   // 重载会话:先注入新启用的 skill 到 lead cwd(并标记静默 re-spawn,claude 下条消息拾取),
@@ -391,7 +395,6 @@ export function LeadTab({
             sendLeadChat(tid, text, images, files)
           }
           onStop={() => void interruptLead(tid)}
-          onStopEngine={onStopEngine}
           onNeedSlashCommands={() => discoverLeadSlash(tid)}
           onRewindPicker={canRewind ? () => setPickerOpen(true) : undefined}
           sessionResumeAction={sessionResumeAction}

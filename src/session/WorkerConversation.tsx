@@ -283,13 +283,6 @@ export function WorkerConversation() {
         };
     }
   })();
-  let onStopEngine: (() => void) | undefined;
-  if (sessionResumeAction?.kind === "copy-terminal-command" && sid != null) {
-    onStopEngine = () => {
-      void api.chatStop(sid);
-    };
-  }
-
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
@@ -387,7 +380,6 @@ export function WorkerConversation() {
             placeholder={loadError ?? t("session.message")}
             onSend={(v, images, fs) => sendToWorker(directionId, repoId, v, images, fs)}
             onStop={() => sid != null && void api.chatInterrupt(sid)}
-            onStopEngine={onStopEngine}
             onRewindPicker={canRewind ? () => setPickerOpen(true) : undefined}
             sessionResumeAction={sessionResumeAction}
           />
