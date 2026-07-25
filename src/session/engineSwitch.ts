@@ -33,12 +33,33 @@ export function switchKindOf(oldTool: string, newTool: string): SwitchKind {
  *  Same shape as `isProcessQuotaDegradedError`: tauri commands reject with
  *  strings today, while tests and future adapters may surface an `Error` or a
  *  `{ code }` object. Anything else falls through to the caller's generic
- *  handling, so an unrelated failure is never explained away as this one. */
-export const SWITCH_FAILED_ERROR_CODE = "switch_failed";
+ *  handling, so an unrelated failure is never explained away as this one.
+ *
+ *  Two codes, keyed on what the user is LEFT with rather than on how the write
+ *  failed: switching an idle or never-opened surface interrupts nothing, so
+ *  claiming a turn was cut short would be as wrong as claiming nothing changed
+ *  after a real teardown.
+ *
+ *  Longest match wins, since `switch_failed` is a prefix of
+ *  `switch_failed_interrupted` and these are matched by substring. */
+export const SWITCH_ERROR_I18N: Record<string, string> = {
+  switch_failed_interrupted: "session.switchFailedInterrupted",
+  switch_failed: "session.switchFailed",
+};
 
-export function isSwitchFailedError(error: unknown): boolean {
-  if (typeof error === "string") return error.includes(SWITCH_FAILED_ERROR_CODE);
-  if (error instanceof Error) return error.message.includes(SWITCH_FAILED_ERROR_CODE);
-  if (typeof error !== "object" || error === null || !("code" in error)) return false;
-  return String(error.code) === SWITCH_FAILED_ERROR_CODE;
+/** The ONE discriminated value the dialog maps from — a code, or null when the
+ *  rejection is an ordinary one to render verbatim. */
+export function switchErrorCodeOf(error: unknown): string | null {
+  const text = (() => {
+    if (typeof error === "string") return error;
+    if (error instanceof Error) return error.message;
+    if (typeof error === "object" && error !== null && "code" in error) return String(error.code);
+    return null;
+  })();
+  if (text === null) return null;
+  return (
+    Object.keys(SWITCH_ERROR_I18N)
+      .sort((a, b) => b.length - a.length)
+      .find((code) => text.includes(code)) ?? null
+  );
 }

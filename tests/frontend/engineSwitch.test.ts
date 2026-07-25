@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  isSwitchFailedError,
   modelSupported,
+  switchErrorCodeOf,
   switchKindOf,
-  SWITCH_FAILED_ERROR_CODE,
+  SWITCH_ERROR_I18N,
 } from "../../src/session/engineSwitch.ts";
 
 test("modelSupported: only claude/codex accept the --model override", () => {
@@ -33,23 +33,39 @@ test("switchKindOf: an unresolved prior tool (empty string) never reads as a rel
   assert.equal(switchKindOf("", "claude"), "switch");
 });
 
-test("isSwitchFailedError: matches the stable code across the shapes a reject can take", () => {
+test("switchErrorCodeOf: every code resolves, across the shapes a reject can take", () => {
   // Tauri rejects with a bare string today; Error and { code } are the shapes
-  // tests and future adapters produce.
-  assert.equal(isSwitchFailedError(SWITCH_FAILED_ERROR_CODE), true);
-  assert.equal(isSwitchFailedError(`invoke failed: ${SWITCH_FAILED_ERROR_CODE}`), true);
-  assert.equal(isSwitchFailedError(new Error(SWITCH_FAILED_ERROR_CODE)), true);
-  assert.equal(isSwitchFailedError({ code: SWITCH_FAILED_ERROR_CODE }), true);
+  // tests and future adapters produce. Driven off the map, so a third code
+  // cannot be added untested.
+  for (const code of Object.keys(SWITCH_ERROR_I18N)) {
+    assert.equal(switchErrorCodeOf(code), code, code);
+    assert.equal(switchErrorCodeOf(`invoke failed: ${code}`), code, code);
+    assert.equal(switchErrorCodeOf(new Error(code)), code, code);
+    assert.equal(switchErrorCodeOf({ code }), code, code);
+  }
 });
 
-test("isSwitchFailedError: every other failure falls through to the raw message", () => {
+test("switchErrorCodeOf: a prefix code never shadows the longer one", () => {
+  // `switch_failed` IS a prefix of `switch_failed_interrupted`, and matching is
+  // by substring — so without longest-first ordering an interrupted switch
+  // would silently render the un-interrupted copy, telling the user nothing was
+  // affected right after their turn was killed. The Rust side pins the same
+  // prefix relationship.
+  assert.equal(switchErrorCodeOf("switch_failed_interrupted"), "switch_failed_interrupted");
+  assert.equal(switchErrorCodeOf("switch_failed"), "switch_failed");
+  for (const code of Object.keys(SWITCH_ERROR_I18N)) {
+    assert.ok(SWITCH_ERROR_I18N[code].startsWith("session."), code);
+  }
+});
+
+test("switchErrorCodeOf: every other failure falls through to the raw message", () => {
   // The dialog's fallback keeps an unrelated error from being explained with
   // the wrong sentence — a wrong explanation is worse than an untranslated one.
-  assert.equal(isSwitchFailedError('unknown tool "gemini"'), false);
-  assert.equal(isSwitchFailedError("thread 7 not found"), false);
-  assert.equal(isSwitchFailedError(new Error("database is locked")), false);
-  assert.equal(isSwitchFailedError({ code: "process_quota_degraded" }), false);
-  assert.equal(isSwitchFailedError(null), false);
-  assert.equal(isSwitchFailedError(undefined), false);
-  assert.equal(isSwitchFailedError({}), false);
+  assert.equal(switchErrorCodeOf('unknown tool "gemini"'), null);
+  assert.equal(switchErrorCodeOf("thread 7 not found"), null);
+  assert.equal(switchErrorCodeOf(new Error("database is locked")), null);
+  assert.equal(switchErrorCodeOf({ code: "process_quota_degraded" }), null);
+  assert.equal(switchErrorCodeOf(null), null);
+  assert.equal(switchErrorCodeOf(undefined), null);
+  assert.equal(switchErrorCodeOf({}), null);
 });

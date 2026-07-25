@@ -5360,10 +5360,14 @@ mod tests {
         // block), pinning a snapshot that B's commit then invalidates — and the
         // busy timeout cannot repair a stale snapshot.
         //
-        // The 150ms is a margin, not a synchronisation point, and it fails
-        // SAFE: if A somehow has not started by then it simply runs
-        // uncontended and the test passes for both shapes. It cannot go red
-        // spuriously.
+        // Everything the spawned side needs is prepared HERE, in the main task
+        // (review round 12): opening the file and running migrations inside
+        // the spawn put them in the timing window, so on a loaded runner the
+        // writer below could commit while the switch was still migrating —
+        // leaving it to run uncontended and pass even against the read-first
+        // regression it exists to reject. The spawn now does nothing but issue
+        // the call, and a barrier confirms it is running before the writer
+        // commits.
         let held = b.0.begin().await.unwrap();
         thread::Entity::update_many()
             .col_expr(thread::Column::Title, Expr::value("held by another connection"))
@@ -5372,15 +5376,23 @@ mod tests {
             .await
             .unwrap();
 
+        let (a2, _b2) = shared_file_db(dir.path()).await;
+        let (started, running) = tokio::sync::oneshot::channel::<()>();
         let switching = {
-            let path = dir.path().to_path_buf();
             let tid = t.id;
             tokio::spawn(async move {
-                let (a2, _b2) = shared_file_db(&path).await;
+                let _ = started.send(());
                 switch_lead_engine_txn(&a2, tid, "codex", Some("opus")).await
             })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        running.await.expect("switch task started");
+        // Residual, stated rather than implied: this proves the task is
+        // RUNNING, not that its first statement has reached SQLite — no hook
+        // exposes that. The remaining window is one statement dispatch rather
+        // than an open-plus-migrate, and it still fails safe (an early commit
+        // just means an uncontended run, which passes either way), so the
+        // failure mode is a mutation slipping through, never a spurious red.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         held.commit().await.unwrap();
 
         switching

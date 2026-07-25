@@ -1607,22 +1607,36 @@ async fn insert_switch_marker(
 /// `src/i18n/{en,zh}.ts` instead of raw SQLite text. Same contract as
 /// `process_quota::DEGRADED_ERROR_CODE`: reject with the CODE, log the detail.
 ///
-/// ONE code, because the atomic write leaves exactly one failure mode — the
-/// transaction did not commit, so no tool change, no cleared native id, no
-/// marker. Earlier revisions of this PR carried three, one per failure mode of
-/// a multi-step design; that count is a good smell test for whether the design
-/// underneath has too many states.
+/// The atomic write leaves exactly ONE failure mode — the transaction did not
+/// commit, so no tool change, no cleared native id, no marker. Two codes all
+/// the same, because the user-visible STATE differs by something the failure
+/// mode does not capture: whether the switch had already torn a live engine
+/// down before it failed. `teardown_for_switch` only runs when
+/// `LeadChatState::remove` returns one, and switching an idle or never-opened
+/// surface — the common case — interrupts nothing at all.
 ///
-/// COPY RULE: this is raised AFTER `engine::teardown_for_switch`, so the copy
-/// must NOT say nothing changed. The live turn has been killed and its open and
-/// queued rows finalized as `interrupted`; only the engine identity is
-/// untouched. Getting that wrong was the most repeated mistake in this PR's
-/// review history.
+/// That distinction is the whole reason for the split. Copy that claims an
+/// interruption on an idle switch is as wrong as copy that claims nothing
+/// changed after a real one; this PR's review history contains four instances
+/// of the second mistake and one of the first, which is what a single
+/// unconditional sentence buys.
+///
+/// Earlier revisions carried three codes, one per failure mode of a multi-step
+/// design. That count remains a decent smell test — but count the states the
+/// USER can be left in, not the ways the code can fail.
 pub const SWITCH_FAILED_ERROR_CODE: &str = "switch_failed";
+/// As above, when a live engine WAS torn down first: its turn was killed and
+/// its open and queued rows finalized as `interrupted`.
+pub const SWITCH_FAILED_INTERRUPTED_ERROR_CODE: &str = "switch_failed_interrupted";
 
-/// Reject with [`SWITCH_FAILED_ERROR_CODE`] and log the cause.
-fn switch_failure(surface: &str, err: impl std::fmt::Display) -> String {
+/// Reject with the code matching what the user is actually left with, and log
+/// the cause. `interrupted` is whether this command tore a live engine down
+/// before the write failed.
+fn switch_failure(surface: &str, interrupted: bool, err: impl std::fmt::Display) -> String {
     eprintln!("[weft] engine switch failed for {surface}; nothing was persisted: {err}");
+    if interrupted {
+        return SWITCH_FAILED_INTERRUPTED_ERROR_CODE.to_string();
+    }
     SWITCH_FAILED_ERROR_CODE.to_string()
 }
 
@@ -1703,8 +1717,12 @@ async fn switch_lead_tool_inner(
     if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
         asks.cancel_for(thread_id, "lead");
     }
+    // Whether a live engine was actually torn down decides which failure the
+    // user is shown if the write below does not commit — see `switch_failure`.
+    let mut interrupted = false;
     if let Some(eng) = app.state::<LeadChatState>().remove(lead_key(thread_id)) {
         engine::teardown_for_switch(app, &eng).await;
+        interrupted = true;
     }
 
     // The lead's OWN timeline only — `list_lead_messages` returns every row for
@@ -1727,7 +1745,7 @@ async fn switch_lead_tool_inner(
     // structurally impossible rather than merely guarded.
     repo::switch_lead_engine_txn(db, thread_id, &tool, model.as_deref())
         .await
-        .map_err(|e| switch_failure(&format!("thread {thread_id}"), e))?;
+        .map_err(|e| switch_failure(&format!("thread {thread_id}"), interrupted, e))?;
 
     let lang = lang.unwrap_or_else(|| "en".to_string());
     let eng = lead_engine(app, db, thread_id, &lang)
@@ -1806,8 +1824,10 @@ async fn switch_worker_tool_inner(
     if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
         asks.cancel_for(dir.thread_id, &sess.direction_id.to_string());
     }
+    let mut interrupted = false;
     if let Some(eng) = app.state::<LeadChatState>().remove(session_id as i64) {
         engine::teardown_for_switch(app, &eng).await;
+        interrupted = true;
     }
 
     let messages = repo::list_lead_messages(db, dir.thread_id).await.unwrap_or_default();
@@ -1823,7 +1843,7 @@ async fn switch_worker_tool_inner(
     // why the marker and the native-id clear simply joined it.
     repo::switch_worker_engine_txn(db, sess.direction_id, session_id, &tool, model.as_deref())
         .await
-        .map_err(|e| switch_failure(&format!("session {session_id}"), e))?;
+        .map_err(|e| switch_failure(&format!("session {session_id}"), interrupted, e))?;
 
     let eng = worker_engine(app, db, session_id)
         .await
@@ -2594,11 +2614,30 @@ mod switch_write_tests {
     #[test]
     fn a_failed_switch_rejects_with_the_stable_code_only() {
         assert_eq!(
-            super::switch_failure("thread 7", "database is locked"),
+            super::switch_failure("thread 7", false, "database is locked"),
             "switch_failed",
             "spelling is mirrored in src/session/engineSwitch.ts — update both"
         );
+        assert_eq!(
+            super::switch_failure("thread 7", true, "database is locked"),
+            "switch_failed_interrupted",
+            "a switch that tore a live engine down first must say so"
+        );
         assert_eq!(super::SWITCH_FAILED_ERROR_CODE, "switch_failed");
+        assert_eq!(
+            super::SWITCH_FAILED_INTERRUPTED_ERROR_CODE,
+            "switch_failed_interrupted"
+        );
+        // One IS a prefix of the other, and the frontend matches by substring
+        // — so `switchErrorCodeOf` must try the longest code first or an
+        // interrupted switch silently renders the un-interrupted copy. Pinned
+        // here because nothing checks that ordering across the boundary; if
+        // this assertion ever has to change, that sort goes with it.
+        assert!(
+            super::SWITCH_FAILED_INTERRUPTED_ERROR_CODE
+                .starts_with(super::SWITCH_FAILED_ERROR_CODE),
+            "SWITCH_ERROR_I18N in src/session/engineSwitch.ts sorts by length for this reason"
+        );
     }
 
     #[tokio::test]

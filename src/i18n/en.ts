@@ -414,6 +414,8 @@ export const en = {
     switchedToast: "Switched {{from}} → {{to}}",
     switchReloadedToast: "{{tool}} reloaded",
     switchFailed:
+      "The switch didn't go through — this session is still on its current engine, and nothing it was doing was affected. Try again.",
+    switchFailedInterrupted:
       "The switch didn't go through — this session is still on its current engine, but the turn that was running was interrupted. Try again.",
     engineSwitchedMarker: "Engine switched",
     engineReloadedMarker: "Engine reloaded",
