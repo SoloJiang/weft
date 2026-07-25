@@ -1713,28 +1713,35 @@ pub async fn set_session_native_id_opt(
 /// deletion-fenced insert as the rest of the timeline (`insert_lead_message`),
 /// so a thread deleted mid-recovery can't leave an orphaned row.
 ///
-/// Honesty note (review round 4, P2): this row was originally meant to
-/// double as an issue #116 coordination point — its `created_at`, read back
-/// via [`last_turn_freeze_recovery_secs`], was meant to let #116's idle
-/// re-drive hold off re-dispatching into the same wedge for a grace window.
-/// #116 landed WITHOUT wiring that consult up: `revive.rs`'s
-/// `stalled_direction_ids` never reads this marker, and a repo-wide grep
-/// confirms [`last_turn_freeze_recovery_secs`] has no caller outside this
-/// file's own round-trip test. The marker is stamped and readable but
-/// currently has NO consumer. What actually keeps #116 from immediately
-/// re-driving a just-recovered direction into the same wedge is an unrelated
-/// side effect: `recover_from_freeze` also clears the session's
-/// `native_session_id` (see `set_session_native_id_opt` /
-/// `set_lead_native_id_opt`), and `stalled_direction_ids` only selects a
-/// direction whose `native_session_id.is_some()` — so the just-recovered
-/// direction is (accidentally) invisible to #116 until its next native
-/// session is established. That protection is fragile: it depends entirely
-/// on THAT field staying cleared at THAT moment, and would silently vanish if
-/// either side changes — a future refactor that stops clearing
-/// `native_session_id` here, or a redrive path that stops gating on it, would
-/// reopen a redrive storm with nothing left to prevent it. Wiring this marker
-/// into a real grace window (or removing it if that's judged unnecessary) is
-/// open follow-up work, not done here.
+/// This row IS the issue #116 coordination point: its `created_at`, read back
+/// via [`last_turn_freeze_recovery_secs`], is what
+/// `lead_chat::revive::freeze_recovery_state` consults to withhold a
+/// just-self-healed lead/worker from the idle re-drive for one grace window,
+/// rather than racing this recovery straight back into the same wedge.
+///
+/// History, because the shape here only makes sense with it (review round 4,
+/// P2): #116 originally landed WITHOUT that consult — `revive.rs` never read
+/// this marker, and the getter had no caller outside this file's own
+/// round-trip test. What kept the re-drive off a just-recovered direction in
+/// the meantime was an unrelated SIDE EFFECT: `recover_from_freeze` also
+/// clears the session's `native_session_id` (see `set_session_native_id_opt` /
+/// `set_lead_native_id_opt`), and `revive::stalled_direction_ids` only selects
+/// a direction whose `native_session_id.is_some()`. Real protection, but
+/// accidental — it depended entirely on THAT field staying cleared at THAT
+/// moment, and would have vanished silently under a refactor that stopped
+/// clearing it, or a re-drive path that stopped gating on it. The grace window
+/// no longer RIDES on that: it reads this marker directly, and has tests that
+/// go red if the read is removed.
+///
+/// The native-id clear is still there, but it is NOT a second guard — `revive`
+/// deliberately stopped treating a missing native id as "not selectable",
+/// because that is what made a freeze-recovered session invisible to the
+/// re-drive forever instead of for one window. The dependency now runs the
+/// other way: `recover_from_freeze` clears the id ONLY if this row was
+/// stamped, since this row is the sole evidence separating "never ran" from
+/// "ran, and the recovery cleared its id" (`revive::has_resumable_context`).
+/// Clearing after a failed stamp would erase that evidence and strand the
+/// session permanently.
 pub async fn mark_turn_freeze_recovered(
     db: &Db,
     thread_id: i32,
