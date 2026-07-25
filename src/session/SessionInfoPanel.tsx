@@ -16,7 +16,7 @@ import { ToolIcon, toolFullName } from "../components/ToolIcon";
 export function SessionInfoPanel({
   meta,
   skills,
-  tool: _tool,
+  tool,
   subtasks,
   onOpenSubtask,
   onClose,
@@ -57,15 +57,27 @@ export function SessionInfoPanel({
 
   const servers = meta?.mcpServers ?? [];
 
-  // Flat list of workspace-enabled skills only. Engine "discovered" scans for
-  // omp just re-read Weft-materialized builtins (not real engine discovery) and
-  // must not surface here. Codex/claude still expose engineSkills via other UI
-  // if needed later — this panel stays one simple list.
-  const unifiedSkills = useMemo(
-    () => skills.map((s) => ({ name: s.name, description: s.description })),
-    [skills],
-  );
-  const skillsPending = false;
+  // One flat chip list (no 注入/发现 subgroups).
+  // - codex/claude: workspace-enabled ∪ engine-discovered (name-deduped)
+  // - omp/opencode: workspace-enabled only — engine "discovery" is either
+  //   absent (opencode) or just a cwd re-scan of Weft-materialized builtins (omp)
+  const mergeEngineSkills = tool !== "omp" && tool !== "opencode";
+  const unifiedSkills = useMemo(() => {
+    const byName = new Map<string, { name: string; description?: string }>();
+    for (const s of skills) {
+      byName.set(s.name, { name: s.name, description: s.description });
+    }
+    if (mergeEngineSkills) {
+      for (const s of meta?.engineSkills ?? []) {
+        if (!byName.has(s.name)) {
+          byName.set(s.name, { name: s.name, description: s.description });
+        }
+      }
+    }
+    return [...byName.values()];
+  }, [skills, meta?.engineSkills, mergeEngineSkills]);
+  const skillsPending =
+    mergeEngineSkills && skills.length === 0 && meta?.engineSkills == null;
 
   return (
     <aside className="flex h-full w-[270px] shrink-0 flex-col overflow-hidden border-l border-border bg-bg">
