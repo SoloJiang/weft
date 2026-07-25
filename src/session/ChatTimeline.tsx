@@ -22,6 +22,7 @@ import {
   toolLabelKey,
   toolAllowsFileTarget,
 } from "./transcriptBits";
+import { groupTimeline, nodeKey, topLevelRows, type TimelineNode } from "./collabBranches";
 import { ActionCardBlock, type ActionCardAction } from "./blocks/ActionCardBlock";
 import { PlanCardBlock, type PlanCardSplitItem } from "./blocks/PlanCardBlock";
 import { TestCasesCard } from "./blocks/TestCasesCard";
@@ -133,6 +134,18 @@ export function ChatTimeline({
   // Pending queued messages live in the bottom QueueStack, not the timeline.
   const visible = messages.filter((m) => m.kind !== "meta" && m.status !== "queued");
 
+  // Fold each sub-agent's own interleaved output into a collapsible branch
+  // hanging off whichever row first revealed its thread id (issue #99) — see
+  // collabBranches.ts for the backend signal this groups on (deterministic,
+  // not arrival order) and why a dialect without that signal degrades to
+  // exactly today's flat rendering with no special-casing here.
+  const roots = groupTimeline(visible);
+  // What isLastAssistant / isTail / isLatestProposal / hasPendingUserReply
+  // scan: the top-level view only — a row a reader would have to expand a
+  // collapsed branch to even see must never count as "the newest thing on
+  // screen" (review [P1]; see topLevelRows's doc).
+  const topLevel = topLevelRows(roots);
+
   const growthLen = visible
     .filter((m) => m.kind === "text" || m.kind === "tool")
     .reduce((n, m) => n + m.content.length, 0);
@@ -240,7 +253,7 @@ export function ChatTimeline({
 
   return (
     <div ref={rootRef} className="flex min-h-0 flex-1 flex-col">
-      <Virtuoso<LeadMessage>
+      <Virtuoso<TimelineNode>
         key={timelineKey}
         ref={virtuosoRef}
         scrollerRef={setScrollerElement}
@@ -249,22 +262,22 @@ export function ChatTimeline({
         // sideways. The timeline never pans — wide content (code, tables)
         // scrolls inside its own block (see .weft-md pre/table).
         className="weft-chat-virtualizer min-h-0 flex-1 overflow-x-hidden"
-        data={visible}
-        computeItemKey={(_index, m) => m.id}
+        data={roots}
+        computeItemKey={(_index, node) => nodeKey(node)}
         initialTopMostItemIndex={
-          visible.length > 0 ? { index: visible.length - 1, align: "end" } : undefined
+          roots.length > 0 ? { index: roots.length - 1, align: "end" } : undefined
         }
         increaseViewportBy={{ top: 600, bottom: 600 }}
         components={{ Header }}
-        itemContent={(_index, m) => (
+        itemContent={(_index, node) => (
           // Every row keeps its bottom padding — INCLUDING the last one, which
           // is what separates the streaming tail from the composer / bottom
           // stack. The old `index < length-1` gate left the final message flush
           // against the input box.
           <div className="mx-auto w-full min-w-0 max-w-[820px] px-4 pb-2.5">
-            <TimelineRow
-              m={m}
-              all={visible}
+            <TimelineNodeRow
+              node={node}
+              all={topLevel}
               onReviewProposal={onReviewProposal}
               proposal={proposal ?? null}
               runAction={runAction}
@@ -540,23 +553,13 @@ function ReceiptLine({ state }: { state: ReceiptState }) {
   );
 }
 
-function TimelineRow({
-  m,
-  all,
-  onReviewProposal,
-  proposal,
-  runAction,
-  actionsBusy,
-  threadId,
-  workspaceId,
-  promptText,
-  cwd,
-  queuedCount = 0,
-  onOpenTestPlan,
-  testCaseCount = 0,
-  onRewind,
-}: {
-  m: LeadMessage;
+/** Everything a row needs to render EXCEPT which row it is — shared by
+ *  `TimelineRow` (a single LeadMessage) and, since issue #99, a
+ *  `CollabBranchRow`'s nested children (rendered through the same
+ *  `TimelineNodeRow` dispatcher, unchanged prop-for-prop from before branches
+ *  existed). `all` is always the TOP-LEVEL row list (`topLevelRows`), never
+ *  the raw flat array — see that function's doc. */
+interface TimelineRowProps {
   all: LeadMessage[];
   onReviewProposal: () => void;
   proposal: ResolvedProposal | null;
@@ -574,7 +577,35 @@ function TimelineRow({
   testCaseCount?: number;
   /** Rewind affordance for completed user text rows (worker hosts only). */
   onRewind?: (id: number) => void;
-}) {
+}
+
+/** Dispatches one virtualized timeline entry: a plain row renders exactly as
+ *  before, a branch (issue #99) renders as a collapsible sub-agent container
+ *  whose nested rows recurse back through this same dispatcher. */
+function TimelineNodeRow({
+  node,
+  ...rest
+}: { node: TimelineNode } & TimelineRowProps) {
+  if (node.kind === "row") return <TimelineRow m={node.row} {...rest} />;
+  return <CollabBranchRow anchor={node.anchor} branchChildren={node.children} {...rest} />;
+}
+
+function TimelineRow({
+  m,
+  all,
+  onReviewProposal,
+  proposal,
+  runAction,
+  actionsBusy,
+  threadId,
+  workspaceId,
+  promptText,
+  cwd,
+  queuedCount = 0,
+  onOpenTestPlan,
+  testCaseCount = 0,
+  onRewind,
+}: { m: LeadMessage } & TimelineRowProps) {
   const { t } = useTranslation();
   const c = parse(m.content);
 
@@ -924,6 +955,81 @@ function TimelineRow({
       )}
     </Message>
   );
+}
+
+/**
+ * Collapsed by default (issue #99): a sub-agent's branch keeps the main
+ * timeline to "delegated → conclusion" while its own transcript — everything
+ * `groupTimeline` placed under this anchor row — sits one click away, indented
+ * like `FileTree`'s nested rows. Built on the SAME `Tool` expand/collapse
+ * toggle PR #19 gave ordinary tool rows (no second collapse semantic): the
+ * nested list gets `max-h-80 overflow-auto`, IDENTICAL to how `ToolBlock`
+ * already bounds a tool row's own input/output (`Tool.tsx`) — a sub-agent that
+ * ran dozens of tool calls scrolls inside its own box instead of inserting
+ * every child synchronously into the page (review [P2]).
+ */
+function CollabBranchRow({
+  anchor,
+  branchChildren,
+  ...rest
+}: { anchor: LeadMessage; branchChildren: TimelineNode[] } & TimelineRowProps) {
+  const { t } = useTranslation();
+  const content = parse(anchor.content);
+  const name = typeof content.name === "string" ? content.name : "tool";
+  const rawSummary = typeof content.summary === "string" ? content.summary : "";
+  const status = deriveToolStatus(anchor, content);
+  const Icon = toolIcon(name);
+  const labelKey = status === "streaming" ? toolLabelKey(name) : toolDoneLabelKey(name);
+  const generic = labelKey === "session.toolCalling" || labelKey === "session.toolCalled";
+  const { target } = compactToolTarget(name, rawSummary);
+  // "结论摘要": prefer the branch's own latest words over the generic backend
+  // summary — much more informative once the sub-agent has said anything at
+  // all, and freshens live as it keeps streaming.
+  const preview = latestTextPreview(branchChildren) ?? target;
+
+  return (
+    <Tool
+      icon={Icon}
+      label={generic ? cleanToolName(name) : t(labelKey)}
+      summary={preview}
+      status={status}
+      cwd={rest.cwd}
+      input={formatToolValue(content.input)}
+      output={typeof content.output === "string" ? content.output : ""}
+      inputLabel={t("tool.input")}
+      outputLabel={t("tool.output")}
+      showMoreLabel={(hiddenLineCount) => t("tool.showMore", { n: hiddenLineCount })}
+      showLessLabel={t("tool.showLess")}
+    >
+      <div className="max-h-80 space-y-1.5 overflow-auto border-l border-border py-0.5 pl-2.5">
+        {branchChildren.map((child) => (
+          <TimelineNodeRow key={nodeKey(child)} node={child} {...rest} />
+        ))}
+      </div>
+    </Tool>
+  );
+}
+
+// The collapsed branch header's "结论摘要": the most recent non-empty text
+// anywhere in the branch's subtree, searched depth-first from the end so a
+// still-running delegation shows its latest line and a finished one shows its
+// conclusion — exactly "起止 + 结论摘要" while collapsed (issue #99).
+function latestTextPreview(nodes: TimelineNode[]): string | undefined {
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const node = nodes[i];
+    if (node.kind === "branch") {
+      const nested = latestTextPreview(node.children);
+      if (nested) return nested;
+      continue;
+    }
+    if (node.row.kind !== "text") continue;
+    const text = String(parse(node.row.content).text ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text) continue;
+    return text.length > 100 ? `${text.slice(0, 100)}…` : text;
+  }
+  return undefined;
 }
 
 function isActionCardAction(value: unknown): value is ActionCardAction {

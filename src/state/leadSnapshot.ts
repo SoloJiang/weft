@@ -8,6 +8,33 @@ export function orderLeadMessages(rows: LeadMessage[]): LeadMessage[] {
   return [...rows].sort((a, b) => deliveryOrder(a) - deliveryOrder(b) || a.id - b.id);
 }
 
+/**
+ * Rebuild a `kind:"text"` row's content with a new `text`, preserving any
+ * OTHER top-level field already on it — issue #99's `agentThread` in
+ * particular. The backend stamps that tag once at row creation and re-embeds
+ * it into every later content rewrite it makes (engine.rs's own
+ * `text_row_content` helper does the same merge, on its side); every LIVE
+ * content rewrite the frontend makes to the same row (a streamed delta, a
+ * finalize push) must do likewise, or the tag would vanish from the live view
+ * on the very next rewrite while a cold reload — which re-fetches the row
+ * verbatim from the DB — would still show it. That live/cold disagreement is
+ * exactly the failure mode this feature's design explicitly rules out.
+ * Malformed/non-object existing content (a fresh row with no content yet)
+ * degrades to a bare `{text}` object, matching pre-#99 behavior.
+ */
+export function withText(existingContent: string, text: string): string {
+  let rest: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(existingContent);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      rest = parsed as Record<string, unknown>;
+    }
+  } catch {
+    /* not JSON yet (fresh row) — start bare */
+  }
+  return JSON.stringify({ ...rest, text });
+}
+
 /** Apply one engine finalize push atomically. A queued row receives its delivery
  *  seq at the same moment it becomes visible, so it never flashes at the older
  *  enqueue-time position before moving to the end of the completed turn. */
@@ -23,7 +50,7 @@ export function applyLeadFinalize(
     return {
       ...row,
       status,
-      ...(content != null ? { content: JSON.stringify({ text: content }) } : {}),
+      ...(content != null ? { content: withText(row.content, content) } : {}),
       ...(seq != null ? { seq } : {}),
     };
   });
