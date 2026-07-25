@@ -179,28 +179,29 @@ pub(crate) fn detect_package_manager(dir: &Path) -> Option<PackageManager> {
 }
 
 
-/// True when at least one package.json dependency name exists under node_modules.
-/// Fallback readiness signal when a package manager leaves no integrity file.
-fn top_level_dep_present(dir: &Path, node_modules: &Path) -> bool {
+/// True when every non-optional declared dependency exists under node_modules.
+/// Used as a Bun completion fallback so a partial install cannot look ready.
+fn all_top_level_deps_present(dir: &Path, node_modules: &Path) -> bool {
     let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) else {
         return false;
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return false;
     };
-    for key in ["dependencies", "devDependencies", "optionalDependencies"] {
+    let mut any = false;
+    for key in ["dependencies", "devDependencies"] {
         let Some(obj) = json.get(key).and_then(|v| v.as_object()) else {
             continue;
         };
         for name in obj.keys() {
+            any = true;
             // Scoped packages live at node_modules/@scope/name
-            let path = node_modules.join(name);
-            if path.is_dir() {
-                return true;
+            if !node_modules.join(name).is_dir() {
+                return false;
             }
         }
     }
-    false
+    any
 }
 
 /// True when the worktree already has a usable dependency install.
@@ -239,12 +240,11 @@ pub(crate) fn node_modules_ready(dir: &Path) -> bool {
             nm.is_dir() && nm.join(".package-lock.json").is_file()
         }
         PackageManager::Bun => {
-            // Bun leaves `.bun` metadata under node_modules when install completes.
+            // Prefer Bun's own metadata; otherwise require EVERY declared
+            // top-level dependency so a partial install cannot look ready.
             let nm = dir.join("node_modules");
             nm.is_dir()
-                && (nm.join(".bun").exists()
-                    || nm.join(".package-lock.json").is_file()
-                    || top_level_dep_present(dir, &nm))
+                && (nm.join(".bun").exists() || all_top_level_deps_present(dir, &nm))
         }
     }
 }
@@ -254,6 +254,10 @@ pub(crate) fn node_modules_ready(dir: &Path) -> bool {
 /// (`yarnPath` / `yarn-path` / Berry plugins). Automatic bootstrap must not
 /// invoke Yarn in that case — the worker can still install itself later.
 fn yarn_config_executes_repo_code(dir: &Path) -> bool {
+    // yarn.config.cjs is loaded for constraints checks / hooks.
+    if dir.join("yarn.config.cjs").is_file() || dir.join("yarn.config.js").is_file() {
+        return true;
+    }
     for name in [".yarnrc.yml", ".yarnrc.yaml", ".yarnrc"] {
         let Ok(raw) = std::fs::read_to_string(dir.join(name)) else {
             continue;
@@ -263,6 +267,16 @@ fn yarn_config_executes_repo_code(dir: &Path) -> bool {
             || lower.contains("yarn-path")
             || lower.contains("plugins:")
             || lower.contains("pluginpath")
+            || lower.contains("enableconstraintschecks")
+            || lower.contains("constraints")
+            || lower.contains("installstatepath")
+            || lower.contains("pnpunpluggedfolder")
+            || lower.contains("pnppath")
+            || lower.contains("pnpcachedatapath")
+            || lower.contains("globalfolder")
+            || lower.contains("cachedir")
+            || lower.contains("cachefolder")
+            || lower.contains("virtualfolder")
         {
             return true;
         }
@@ -308,6 +322,9 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
                 "--prefer-offline".to_string(),
                 "--ignore-scripts".to_string(),
                 "--ignore-pnpmfile".to_string(),
+                // Isolated worktree under <repo>/.worktrees/weft/... — never adopt
+                // the parent canonical workspace.
+                "--ignore-workspace".to_string(),
                 "--modules-dir".to_string(),
                 "node_modules".to_string(),
                 "--virtual-store-dir".to_string(),
@@ -330,7 +347,8 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
             ("pnpm".to_string(), args)
         }
         PackageManager::YarnClassic => {
-            // Skip when the project can load repo-controlled Yarn code.
+            // Skip when the project can load repo-controlled Yarn code or
+            // redirect install artifacts outside the worktree.
             if yarn_config_executes_repo_code(dir) {
                 return None;
             }
@@ -339,9 +357,12 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
                 "--prefer-offline".to_string(),
                 "--ignore-scripts".to_string(),
             ];
-            // Keep classic installs immutable when a lockfile exists.
             if dir.join("yarn.lock").is_file() {
+                // Immutable when a lockfile exists.
                 args.push("--frozen-lockfile".to_string());
+            } else {
+                // Lockless: never create yarn.lock in the worker checkout.
+                args.push("--no-lockfile".to_string());
             }
             ("yarn".to_string(), args)
         }
@@ -369,6 +390,14 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
             )
         }
         PackageManager::Npm => {
+            // Force local install into this worktree. Project .npmrc can set
+            // global=true / prefix=../../../... and otherwise write into the
+            // canonical repo above .worktrees/.
+            env.push(("npm_config_global".to_string(), "false".to_string()));
+            env.push((
+                "npm_config_prefix".to_string(),
+                dir.to_string_lossy().into_owned(),
+            ));
             if dir.join("package-lock.json").is_file() || dir.join("npm-shrinkwrap.json").is_file() {
                 (
                     "npm".to_string(),
@@ -376,6 +405,7 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
                         "ci".to_string(),
                         "--prefer-offline".to_string(),
                         "--ignore-scripts".to_string(),
+                        "--no-global".to_string(),
                     ],
                 )
             } else {
@@ -387,14 +417,18 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
                         "--prefer-offline".to_string(),
                         "--ignore-scripts".to_string(),
                         "--no-package-lock".to_string(),
+                        "--no-global".to_string(),
                     ],
                 )
             }
         }
         PackageManager::Bun => {
             let mut args = vec!["install".to_string(), "--ignore-scripts".to_string()];
-            // Without a lockfile, prevent bun.lock creation in the worker tree.
-            if !(dir.join("bun.lock").is_file() || dir.join("bun.lockb").is_file()) {
+            if dir.join("bun.lock").is_file() || dir.join("bun.lockb").is_file() {
+                // Immutable when a lockfile exists.
+                args.push("--frozen-lockfile".to_string());
+            } else {
+                // Without a lockfile, prevent bun.lock creation in the worker tree.
                 args.push("--no-save".to_string());
             }
             ("bun".to_string(), args)
@@ -456,11 +490,41 @@ fn run_plan(plan: &InstallPlan, overall_timeout: Option<Duration>) -> Result<(),
     ))
 }
 
+
+/// Drop relative PATH entries (especially ".") so child resolution cannot pick
+/// up a package-manager binary planted in the untrusted worktree.
+fn sanitize_path_for_bootstrap(path: &str) -> String {
+    path.split(':')
+        .filter(|e| !e.is_empty())
+        .filter(|e| Path::new(e).is_absolute())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Resolve `program` against the sanitized tool PATH to an absolute path.
+fn resolve_package_manager_program(program: &str) -> Result<PathBuf, String> {
+    let path = sanitize_path_for_bootstrap(&crate::detect::tool_path());
+    for dir in path.split(':').filter(|e| !e.is_empty()) {
+        let candidate = Path::new(dir).join(program);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        // macOS/Linux may need execute-bit check; existence is enough for spawn.
+    }
+    // Fall back to bare name only if nothing absolute was found — still safer
+    // than resolving relative entries inside the worktree because PATH is sanitized.
+    Ok(PathBuf::from(program))
+}
+
 fn run_command(plan: &InstallPlan, timeout: Option<Duration>) -> Result<Output, String> {
-    let mut cmd = Command::new(&plan.program);
+    // Resolve to an absolute executable BEFORE entering the worktree so a
+    // relative PATH entry (e.g. ".") cannot pick up a repo-provided binary.
+    let program = resolve_package_manager_program(&plan.program)?;
+    let path = sanitize_path_for_bootstrap(&crate::detect::tool_path());
+    let mut cmd = Command::new(&program);
     cmd.args(&plan.args)
         .current_dir(&plan.cwd)
-        .env("PATH", crate::detect::tool_path())
+        .env("PATH", path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -734,6 +798,7 @@ mod tests {
         assert!(plan.args.iter().any(|a| a == "--frozen-lockfile"));
         assert!(plan.args.iter().any(|a| a == "--ignore-scripts"));
         assert!(plan.args.iter().any(|a| a == "--ignore-pnpmfile"));
+        assert!(plan.args.iter().any(|a| a == "--ignore-workspace"));
         assert!(plan
             .args
             .windows(2)
@@ -763,6 +828,16 @@ mod tests {
         assert_eq!(plan.program, "npm");
         assert!(plan.args.iter().any(|a| a == "--no-package-lock"));
         assert!(plan.args.iter().any(|a| a == "--ignore-scripts"));
+    }
+
+    #[test]
+    fn plan_install_yarn_classic_lockless_uses_no_lockfile() {
+        let d = tmp();
+        write(&d, "package.json", r#"{ "packageManager": "yarn@1.22.0" }"#);
+        let plan = plan_install_with(&d, &test_cfg(true, false)).expect("plan");
+        assert_eq!(plan.program, "yarn");
+        assert!(plan.args.iter().any(|a| a == "--no-lockfile"));
+        assert!(!plan.args.iter().any(|a| a == "--frozen-lockfile"));
     }
 
     #[test]
@@ -796,6 +871,18 @@ mod tests {
     }
 
     #[test]
+    fn plan_install_yarn_skips_when_yarn_config_cjs_present() {
+        let d = tmp();
+        write(&d, "package.json", r#"{ "packageManager": "yarn@4.1.0" }"#);
+        write(&d, "yarn.lock", "__metadata:
+  version: 8
+");
+        write(&d, "yarn.config.cjs", "module.exports = {};
+");
+        assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
+    }
+
+    #[test]
     fn plan_install_bun_without_lock_uses_no_save() {
         let d = tmp();
         write(&d, "package.json", r#"{ "packageManager": "bun@1.2.0" }"#);
@@ -803,6 +890,17 @@ mod tests {
         assert_eq!(plan.program, "bun");
         assert!(plan.args.iter().any(|a| a == "--no-save"));
         assert!(plan.args.iter().any(|a| a == "--ignore-scripts"));
+    }
+
+    #[test]
+    fn plan_install_bun_with_lock_is_frozen() {
+        let d = tmp();
+        write(&d, "package.json", r#"{ "packageManager": "bun@1.2.0" }"#);
+        write(&d, "bun.lock", "");
+        let plan = plan_install_with(&d, &test_cfg(true, false)).expect("plan");
+        assert_eq!(plan.program, "bun");
+        assert!(plan.args.iter().any(|a| a == "--frozen-lockfile"));
+        assert!(!plan.args.iter().any(|a| a == "--no-save"));
     }
 
     #[test]
@@ -831,6 +929,12 @@ mod tests {
         assert!(s.starts_with('…') || s.chars().all(|c| !c.is_control()));
         // Must not panic and must be valid UTF-8 string content.
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn sanitize_path_drops_relative_entries() {
+        let s = sanitize_path_for_bootstrap(".:/usr/bin:foo/bar:/opt/bin");
+        assert_eq!(s, "/usr/bin:/opt/bin");
     }
 
     #[test]
