@@ -253,6 +253,133 @@ pub(crate) fn node_modules_ready(dir: &Path) -> bool {
 /// True when the worktree's Yarn config can load repository-controlled code
 /// (`yarnPath` / `yarn-path` / Berry plugins). Automatic bootstrap must not
 /// invoke Yarn in that case — the worker can still install itself later.
+
+/// True when `child` is the same as or under `parent` after canonicalize.
+fn path_is_under(parent: &Path, child: &Path) -> bool {
+    let Ok(p) = parent.canonicalize() else {
+        return false;
+    };
+    let Ok(c) = child.canonicalize() else {
+        // For non-existent paths, compare components after absolute join.
+        let c = if child.is_absolute() {
+            child.to_path_buf()
+        } else {
+            parent.join(child)
+        };
+        return c.starts_with(&p);
+    };
+    c.starts_with(p)
+}
+
+/// True when a relative path component could escape the worktree (../).
+#[allow(dead_code)]
+fn relative_path_escapes(s: &str) -> bool {
+    let p = Path::new(s);
+    for c in p.components() {
+        if matches!(c, std::path::Component::ParentDir) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when package-manager output trees are gitignored in this worktree.
+/// Bootstrap creates large untracked trees; if they are not ignored they leak
+/// into worker diffs via `git ls-files --others --exclude-standard`.
+fn output_tree_is_gitignored(dir: &Path, rel: &str) -> bool {
+    // Prefer git check-ignore when available.
+    let out = std::process::Command::new("git")
+        .args(["check-ignore", "-q", "--", rel])
+        .current_dir(dir)
+        .status();
+    match out {
+        Ok(st) if st.success() => true,
+        _ => {
+            // Fallback: look for a plain ignore rule in .gitignore / .git/info/exclude.
+            for name in [".gitignore", ".git/info/exclude"] {
+                if let Ok(raw) = std::fs::read_to_string(dir.join(name)) {
+                    for line in raw.lines() {
+                        let l = line.trim();
+                        if l.is_empty() || l.starts_with('#') {
+                            continue;
+                        }
+                        if l == rel
+                            || l == format!("/{rel}")
+                            || l == format!("{rel}/")
+                            || l == format!("/{rel}/")
+                            || l == format!("**/{rel}")
+                            || l == format!("**/{rel}/")
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Scan worktree + ancestor dirs (up to repo root / filesystem root, bounded)
+/// for Yarn configs that can execute code or redirect install artifacts.
+fn yarn_risky_config_in_scope(dir: &Path) -> bool {
+    // Local first.
+    if yarn_config_executes_repo_code(dir) {
+        return true;
+    }
+    // Ancestors: Yarn walks up for .yarnrc.yml.
+    let mut cur = dir.to_path_buf();
+    for _ in 0..8 {
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        if parent == cur {
+            break;
+        }
+        // Stop after leaving a git worktree root if we can detect it.
+        if cur.join(".git").exists() {
+            // already scanned local; ancestors beyond the git root still matter
+            // for yarn, but keep bounded.
+        }
+        if yarn_config_executes_repo_code(parent) {
+            return true;
+        }
+        cur = parent.to_path_buf();
+    }
+    false
+}
+
+/// Ensure critical output roots are real directories inside the worktree (not
+/// symlinks that escape to the canonical repo).
+fn ensure_contained_output_dirs(dir: &Path, rels: &[&str]) -> bool {
+    for rel in rels {
+        let path = dir.join(rel);
+        if path.exists() || path.symlink_metadata().is_ok() {
+            // If it's a symlink, require the target to stay under the worktree.
+            if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                if meta.file_type().is_symlink() {
+                    if !path_is_under(dir, &path) {
+                        return false;
+                    }
+                }
+            }
+            if path.exists() && !path_is_under(dir, &path) {
+                return false;
+            }
+        } else {
+            // Create a real directory so package managers cannot follow a
+            // later-created escape symlink planted mid-install.
+            if std::fs::create_dir_all(&path).is_err() {
+                return false;
+            }
+            if !path_is_under(dir, &path) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn yarn_config_executes_repo_code(dir: &Path) -> bool {
     // yarn.config.cjs is loaded for constraints checks / hooks.
     if dir.join("yarn.config.cjs").is_file() || dir.join("yarn.config.js").is_file() {
@@ -332,6 +459,22 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
     if project_config_interpolates_env_secrets(dir) {
         return None;
     }
+    // Bootstrap output must not become worker-visible git changes.
+    if !output_tree_is_gitignored(dir, "node_modules") {
+        return None;
+    }
+    // Prevent symlink escape of install outputs into the canonical repo.
+    if !ensure_contained_output_dirs(
+        dir,
+        &[
+            "node_modules",
+            "node_modules/.pnpm",
+            "node_modules/.weft-pnpm-store",
+            "node_modules/.weft-npm-cache",
+        ],
+    ) {
+        return None;
+    }
 
     let mut env = Vec::new();
     // Automatic bootstrap must NOT run lifecycle scripts (untrusted repos / agent
@@ -347,9 +490,6 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
                 "--prefer-offline".to_string(),
                 "--ignore-scripts".to_string(),
                 "--ignore-pnpmfile".to_string(),
-                // Isolated worktree under <repo>/.worktrees/weft/... — never adopt
-                // the parent canonical workspace.
-                "--ignore-workspace".to_string(),
                 "--modules-dir".to_string(),
                 "node_modules".to_string(),
                 "--virtual-store-dir".to_string(),
@@ -360,6 +500,13 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
                 "--store-dir".to_string(),
                 "node_modules/.weft-pnpm-store".to_string(),
             ];
+            // Only ignore a *parent* workspace. If this worktree itself is a
+            // pnpm workspace, we must install all packages.
+            if !(dir.join("pnpm-workspace.yaml").is_file()
+                || dir.join("pnpm-workspace.yml").is_file())
+            {
+                args.push("--ignore-workspace".to_string());
+            }
             // Immutable only: never rewrite the tracked lockfile from bootstrap.
             if dir.join("pnpm-lock.yaml").is_file() {
                 args.push("--frozen-lockfile".to_string());
@@ -379,7 +526,7 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
         PackageManager::YarnClassic => {
             // Skip when the project can load repo-controlled Yarn code or
             // redirect install artifacts outside the worktree.
-            if yarn_config_executes_repo_code(dir) {
+            if yarn_risky_config_in_scope(dir) {
                 return None;
             }
             let mut args = vec![
@@ -400,7 +547,7 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
         PackageManager::YarnBerry => {
             // yarnPath / plugins in .yarnrc.yml execute repo JS before install.
             // Do not auto-bootstrap those trees.
-            if yarn_config_executes_repo_code(dir) {
+            if yarn_risky_config_in_scope(dir) {
                 return None;
             }
             // Without a lockfile, Berry would create/update yarn.lock — skip.
@@ -427,6 +574,14 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
             env.push((
                 "npm_config_prefix".to_string(),
                 dir.to_string_lossy().into_owned(),
+            ));
+            // Pin cache inside the worktree so relative cache=../../../... in
+            // project .npmrc cannot write into the canonical repository.
+            env.push((
+                "npm_config_cache".to_string(),
+                dir.join("node_modules/.weft-npm-cache")
+                    .to_string_lossy()
+                    .into_owned(),
             ));
             if dir.join("package-lock.json").is_file() || dir.join("npm-shrinkwrap.json").is_file() {
                 (
@@ -870,6 +1025,8 @@ mod tests {
     #[test]
     fn plan_install_pnpm_uses_frozen_ignore_scripts_and_prefer_offline() {
         let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
         write(&d, "package.json", r#"{"name":"x"}"#);
         write(&d, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
         let plan = plan_install_with(&d, &test_cfg(true, true)).expect("plan");
@@ -897,6 +1054,8 @@ mod tests {
     #[test]
     fn plan_install_npm_ci_when_lock_present() {
         let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
         write(&d, "package.json", "{}");
         write(&d, "package-lock.json", "{}");
         let plan = plan_install_with(&d, &test_cfg(true, false)).expect("plan");
@@ -908,6 +1067,8 @@ mod tests {
     #[test]
     fn plan_install_npm_without_lock_does_not_create_lockfile() {
         let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
         write(&d, "package.json", "{}");
         let plan = plan_install_with(&d, &test_cfg(true, false)).expect("plan");
         assert_eq!(plan.program, "npm");
@@ -918,6 +1079,8 @@ mod tests {
     #[test]
     fn plan_install_yarn_classic_lockless_uses_no_lockfile() {
         let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
         write(&d, "package.json", r#"{ "packageManager": "yarn@1.22.0" }"#);
         let plan = plan_install_with(&d, &test_cfg(true, false)).expect("plan");
         assert_eq!(plan.program, "yarn");
@@ -928,6 +1091,8 @@ mod tests {
     #[test]
     fn plan_install_yarn_berry_is_immutable_and_skips_classic_flags() {
         let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
         write(&d, "package.json", r#"{ "packageManager": "yarn@4.1.0" }"#);
         write(&d, "yarn.lock", "__metadata:
   version: 8
@@ -970,6 +1135,8 @@ mod tests {
     #[test]
     fn plan_install_bun_without_lock_uses_no_save() {
         let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
         write(&d, "package.json", r#"{ "packageManager": "bun@1.2.0" }"#);
         let plan = plan_install_with(&d, &test_cfg(true, false)).expect("plan");
         assert_eq!(plan.program, "bun");
@@ -980,6 +1147,8 @@ mod tests {
     #[test]
     fn plan_install_bun_with_lock_is_frozen() {
         let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
         write(&d, "package.json", r#"{ "packageManager": "bun@1.2.0" }"#);
         write(&d, "bun.lock", "");
         let plan = plan_install_with(&d, &test_cfg(true, false)).expect("plan");
@@ -1000,6 +1169,33 @@ mod tests {
 ",
         );
         assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
+    }
+
+
+    #[test]
+    fn plan_install_skips_when_node_modules_not_ignored() {
+        let d = tmp();
+        write(&d, "package.json", "{}");
+        write(&d, "package-lock.json", "{}");
+        // no gitignore → skip
+        assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
+    }
+
+    #[test]
+    fn plan_install_pnpm_ignores_workspace_only_without_local_manifest() {
+        let d = tmp();
+        // minimal git repo so check-ignore works if used; also add ignore rule
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
+        write(&d, "package.json", r#"{"name":"x"}"#);
+        write(&d, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        let plan = plan_install_with(&d, &test_cfg(true, true)).expect("plan");
+        assert!(plan.args.iter().any(|a| a == "--ignore-workspace"));
+
+        // local workspace manifest → do not ignore workspace
+        write(&d, "pnpm-workspace.yaml", "packages: ['packages/*']\n");
+        let plan2 = plan_install_with(&d, &test_cfg(true, true)).expect("plan2");
+        assert!(!plan2.args.iter().any(|a| a == "--ignore-workspace"));
     }
 
     #[test]
