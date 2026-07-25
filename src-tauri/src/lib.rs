@@ -27,6 +27,10 @@ mod deps_bootstrap;
 mod detect;
 mod gc;
 pub mod git;
+/// Test-only: shared driver for the generated ask-hook scripts (see the module
+/// docs — one copy so claude's and codex's hook tests can't drift apart).
+#[cfg(test)]
+mod hook_test_support;
 pub mod im;
 mod inspect;
 pub mod lead_chat;
