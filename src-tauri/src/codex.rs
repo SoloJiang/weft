@@ -734,35 +734,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A 127.0.0.1 port with nothing listening: bind an ephemeral port, learn its
-    /// number, then drop the listener. Beats hardcoding a port some service on a
-    /// dev box might actually be serving.
-    #[cfg(unix)]
-    fn closed_port() -> u16 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        drop(l);
-        port
-    }
-
     #[cfg(unix)]
     const HOOK_PAYLOAD: &str = r#"{"tool_name":"shell","tool_input":{"command":"rm -rf /"}}"#;
 
-    /// Write the global helper, then run it from `run_in` exactly as Codex does:
-    /// PreToolUse JSON on stdin, decision JSON on stdout. Returns `(stdout, code)`.
+    /// Every run below is bounded by the shared runner, which KILLS the script at
+    /// the deadline (see `hook_test_support::run_hook_script`).
     #[cfg(unix)]
-    fn run_helper(tag: &str, route_url: Option<&str>, nested: bool) -> (String, Option<i32>) {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
+    const HOOK_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+    /// Write the global helper, then run it from a stand-in worktree exactly as
+    /// Codex does: PreToolUse JSON on stdin, decision JSON on stdout. Shares one
+    /// runner with claude's hook test so the two can't drift.
+    #[cfg(unix)]
+    async fn run_helper(tag: &str, route_url: Option<&str>, nested: bool) -> (String, Option<i32>) {
         let base = fresh_dir(tag);
         let cfg = base.join("config.toml");
         let helper = base.join("weft-codex-hook.sh");
         std::fs::write(&cfg, "model = \"gpt-5\"\n").unwrap();
         ensure_codex_hook_in(&cfg, &helper);
 
-        // A stand-in worktree: the route file (when any) sits at its root, and the
-        // hook runs from a nested dir so the walk-up path is exercised too.
+        // The route file (when any) sits at the worktree root, and the hook runs
+        // from a nested dir so the walk-up path is exercised too.
         let wt = base.join("wt");
         let run_in = if nested {
             wt.join("pkg").join("src")
@@ -774,48 +766,22 @@ mod tests {
             std::fs::write(wt.join(".weft-codex-ask-url"), url).unwrap();
         }
 
-        let mut child = Command::new("bash")
-            .arg(&helper)
-            .current_dir(&run_in)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(HOOK_PAYLOAD.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
+        let out =
+            crate::hook_test_support::run_hook_script(&helper, &run_in, HOOK_PAYLOAD, HOOK_LIMIT)
+                .await;
         let _ = std::fs::remove_dir_all(&base);
-        (
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            out.status.code(),
-        )
-    }
-
-    /// Same assertions as the claude hook's: one well-formed decision, exit 0
-    /// (Codex reports a NON-zero exit as a hook error and continues the call, so
-    /// "crash to deny" would still be fail-open).
-    #[cfg(unix)]
-    fn decision_of(stdout: &str, code: Option<i32>) -> serde_json::Value {
-        assert_eq!(code, Some(0), "hook must exit 0; stdout={stdout:?}");
-        let body: serde_json::Value = serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|e| panic!("hook must print one decision JSON, got {stdout:?}: {e}"));
-        assert_eq!(body["hookSpecificOutput"]["hookEventName"], "PreToolUse");
-        body["hookSpecificOutput"].clone()
+        out
     }
 
     /// Codex's own hook contract: "exit 0 with no output is treated as success and
     /// Codex continues." So the pre-existing `[ -n "$resp" ] && printf …; exit 0`
     /// ALLOWED every tool call whenever weft wasn't answering. It must deny.
-    #[test]
+    #[tokio::test]
     #[cfg(unix)]
-    fn codex_hook_denies_when_weft_is_unreachable() {
+    async fn codex_hook_denies_when_weft_is_unreachable() {
+        use crate::hook_test_support::{closed_port, decision_of};
         let url = format!("http://127.0.0.1:{}/ask/2/30?tool=codex", closed_port());
-        let (stdout, code) = run_helper("hook-down", Some(&url), true);
+        let (stdout, code) = run_helper("hook-down", Some(&url), true).await;
         let out = decision_of(&stdout, code);
         assert_eq!(
             out["permissionDecision"], "deny",
@@ -836,6 +802,7 @@ mod tests {
     #[cfg(unix)]
     async fn codex_hook_passes_a_real_weft_decision_through() {
         use crate::ask::{Answer, AskRegistry};
+        use crate::hook_test_support::{answer_first_ask, decision_of};
         let asks = AskRegistry::new();
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let (base, _h) =
@@ -843,29 +810,14 @@ mod tests {
                 .await
                 .unwrap();
 
+        // One task, two concurrent futures: the hook runs while the "human"
+        // answers. No detached task to outlive the test, and the runner kills the
+        // script if it somehow never exits.
         let url = format!("{base}/ask/2/30?tool=codex");
-        let poll = asks.clone();
-        let run = tokio::task::spawn_blocking(move || run_helper("hook-live", Some(&url), true));
-
-        let step = std::time::Duration::from_millis(20);
-        let mut waited = std::time::Duration::ZERO;
-        while poll.open().is_empty() {
-            tokio::time::sleep(step).await;
-            waited += step;
-            assert!(
-                waited < std::time::Duration::from_secs(20),
-                "the hook never reached weft's /ask endpoint"
-            );
-        }
-        let id = poll.open()[0].id;
-        assert!(poll.answer(id, Answer::Allow));
-
-        // Bounded: the hook's own curl timeout is an hour, so a regression that
-        // never resolves the request must fail the test, not hang the suite.
-        let (stdout, code) = tokio::time::timeout(std::time::Duration::from_secs(30), run)
-            .await
-            .expect("hook did not exit after the human answered")
-            .unwrap();
+        let ((stdout, code), ()) = tokio::join!(
+            run_helper("hook-live", Some(&url), true),
+            answer_first_ask(&asks, Answer::Allow),
+        );
         let out = decision_of(&stdout, code);
         assert_eq!(
             out["permissionDecision"], "allow",
@@ -878,10 +830,10 @@ mod tests {
     /// (`~/.codex/config.toml`), so it also runs for the user's own hand-started
     /// Codex sessions; with no `.weft-codex-ask-url` anywhere up the tree, weft
     /// isn't involved and the session must be left completely alone.
-    #[test]
+    #[tokio::test]
     #[cfg(unix)]
-    fn codex_hook_stays_silent_outside_a_weft_worktree() {
-        let (stdout, code) = run_helper("hook-foreign", None, true);
+    async fn codex_hook_stays_silent_outside_a_weft_worktree() {
+        let (stdout, code) = run_helper("hook-foreign", None, true).await;
         assert_eq!(code, Some(0));
         assert!(
             stdout.is_empty(),
@@ -896,15 +848,16 @@ mod tests {
     /// guard regressed, curl would fail against a closed port and the fail-closed
     /// tail would print a deny — making this assertion fail instead of silently
     /// posting the payload off-box.
-    #[test]
+    #[tokio::test]
     #[cfg(unix)]
-    fn codex_hook_ignores_a_non_loopback_route_without_posting() {
+    async fn codex_hook_ignores_a_non_loopback_route_without_posting() {
+        use crate::hook_test_support::closed_port;
         let url = format!(
             "http://127.0.0.1:{}@127.0.0.2:{}/ask/2/30?tool=codex",
             closed_port(),
             closed_port()
         );
-        let (stdout, code) = run_helper("hook-planted", Some(&url), false);
+        let (stdout, code) = run_helper("hook-planted", Some(&url), false).await;
         assert_eq!(code, Some(0));
         assert!(
             stdout.is_empty(),

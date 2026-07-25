@@ -55,6 +55,16 @@ fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
 /// body) denies instead of being forwarded as garbage the consumer then ignores.
 /// Both passthrough tests fail loudly if that serialization ever changes.
 ///
+/// The two reasons are BILINGUAL in one string rather than locale-selected. The
+/// frontend `src/i18n/*.ts` tables are unreachable from here (they are TS modules
+/// bundled into the webview), and codex's copy of this tail lives in ONE global
+/// `~/.weft/weft-codex-hook.sh` shared by every session and locale — written by
+/// `ensure_codex_hook()`, which has no session and no locale to key off. Asking
+/// weft for the localized text is self-defeating too: this text exists precisely
+/// for the case where weft can't be reached. So both languages ship inline, the
+/// same "embed the pair in Rust" shape `im::outbound::t` already uses for
+/// human-facing Rust text.
+///
 /// Authored flush-left with NO trailing newline; codex's copy is re-indented by
 /// its own writer.
 pub(crate) const HOOK_DECIDE_OR_DENY: &str = r#"case "$resp" in
@@ -64,9 +74,9 @@ pub(crate) const HOOK_DECIDE_OR_DENY: &str = r#"case "$resp" in
     ;;
 esac
 if [ "$rc" -eq 0 ] && [ -n "$resp" ]; then
-  reason="weft's permission bridge answered without a decision, so this tool call was not reviewed by a human and is denied."
+  reason="weft's permission bridge answered without a decision, so this tool call was not reviewed by a human and is denied. / weft 的授权桥没有返回决定，这次工具调用未经人工确认，已拒绝。"
 else
-  reason="weft could not be reached, so nobody can approve this tool call - denied by default. Start weft again (or check that its local ask bridge is up), then retry."
+  reason="weft could not be reached, so nobody can approve this tool call - denied by default. Start weft again (or check that its local ask bridge is up), then retry. / 无法连接 weft，没人能批准这次工具调用，已按默认拒绝。请重新启动 weft（或确认本地授权桥仍在监听）后重试。"
 fi
 printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}' "$reason"
 exit 0"#;
@@ -378,70 +388,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A 127.0.0.1 port with nothing listening: bind an ephemeral port, learn its
-    /// number, then drop the listener. Beats hardcoding a port some service on a
-    /// dev box might actually be serving.
-    #[cfg(unix)]
-    fn closed_port() -> u16 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        drop(l);
-        port
-    }
-
     #[cfg(unix)]
     const HOOK_PAYLOAD: &str = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#;
 
-    /// Run a generated hook script the way the engine does: PreToolUse JSON on
-    /// stdin, decision JSON on stdout. Returns `(stdout, exit code)`.
+    /// Both hook tests below are bounded by the shared runner, which KILLS the
+    /// script at the deadline (see `hook_test_support::run_hook_script`).
     #[cfg(unix)]
-    fn run_hook_script(script: &Path, cwd: &Path, payload: &str) -> (String, Option<i32>) {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-        let mut child = Command::new("bash")
-            .arg(script)
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(payload.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
-        (
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            out.status.code(),
-        )
-    }
-
-    /// Assert a hook script emitted exactly one well-formed PreToolUse decision
-    /// and exited 0 (a NON-zero exit is reported as a hook error and the tool
-    /// call CONTINUES — so a "crash to deny" would still be fail-open).
-    #[cfg(unix)]
-    fn decision_of(stdout: &str, code: Option<i32>) -> serde_json::Value {
-        assert_eq!(code, Some(0), "hook must exit 0; stdout={stdout:?}");
-        let body: serde_json::Value = serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|e| panic!("hook must print one decision JSON, got {stdout:?}: {e}"));
-        assert_eq!(
-            body["hookSpecificOutput"]["hookEventName"], "PreToolUse",
-            "decision must carry the PreToolUse envelope: {body}"
-        );
-        body["hookSpecificOutput"].clone()
-    }
+    const HOOK_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// The Ask Bridge is the ONLY thing that surfaces a tool call to the human,
     /// so a weft that can't be reached (app quit/crashed, port moved) must DENY,
     /// not fall through. Before this, the script printed nothing and exited 0,
     /// which claude treats as "no decision → normal permission flow" (a user
     /// allowlist can auto-approve) — an unsupervised agent ran unreviewed.
-    #[test]
+    #[tokio::test]
     #[cfg(unix)]
-    fn claude_ask_hook_denies_when_weft_is_unreachable() {
+    async fn claude_ask_hook_denies_when_weft_is_unreachable() {
+        use crate::hook_test_support::{closed_port, decision_of, run_hook_script};
         let dir = std::env::temp_dir().join(format!("weft-askh-down-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -450,8 +413,13 @@ mod tests {
         let inj = inject_ask_hook(&base, 1, "10", "claude", &dir);
         assert_eq!(inj.args[0], "--settings");
 
-        let (stdout, code) =
-            run_hook_script(&dir.join(".weft-ask-hook.sh"), &dir, HOOK_PAYLOAD);
+        let (stdout, code) = run_hook_script(
+            &dir.join(".weft-ask-hook.sh"),
+            &dir,
+            HOOK_PAYLOAD,
+            HOOK_LIMIT,
+        )
+        .await;
         let out = decision_of(&stdout, code);
         assert_eq!(
             out["permissionDecision"], "deny",
@@ -474,6 +442,7 @@ mod tests {
     #[cfg(unix)]
     async fn claude_ask_hook_passes_a_real_weft_decision_through() {
         use crate::ask::{Answer, AskRegistry};
+        use crate::hook_test_support::{answer_first_ask, decision_of, run_hook_script};
         let asks = AskRegistry::new();
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let (base, _h) =
@@ -486,32 +455,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _ = inject_ask_hook(&base, 1, "10", "claude", &dir);
 
+        // One task, two concurrent futures: the hook runs while the "human"
+        // answers. No detached task to outlive the test, and the runner kills the
+        // script if it somehow never exits.
         let script = dir.join(".weft-ask-hook.sh");
-        let run_dir = dir.clone();
-        let run =
-            tokio::task::spawn_blocking(move || run_hook_script(&script, &run_dir, HOOK_PAYLOAD));
-
-        // Poll for the ask to register (bounded, so a regression fails fast
-        // instead of hanging on the hook's 3600s curl timeout).
-        let step = std::time::Duration::from_millis(20);
-        let mut waited = std::time::Duration::ZERO;
-        while asks.open().is_empty() {
-            tokio::time::sleep(step).await;
-            waited += step;
-            assert!(
-                waited < std::time::Duration::from_secs(20),
-                "the hook never reached weft's /ask endpoint"
-            );
-        }
-        let id = asks.open()[0].id;
-        assert!(asks.answer(id, Answer::Allow));
-
-        // Bounded: the hook's own curl timeout is an hour, so a regression that
-        // never resolves the request must fail the test, not hang the suite.
-        let (stdout, code) = tokio::time::timeout(std::time::Duration::from_secs(30), run)
-            .await
-            .expect("hook did not exit after the human answered")
-            .unwrap();
+        let ((stdout, code), ()) = tokio::join!(
+            run_hook_script(&script, &dir, HOOK_PAYLOAD, HOOK_LIMIT),
+            answer_first_ask(&asks, Answer::Allow),
+        );
         let out = decision_of(&stdout, code);
         assert_eq!(
             out["permissionDecision"], "allow",
@@ -520,6 +471,7 @@ mod tests {
         assert_eq!(out["permissionDecisionReason"], "Approved in weft");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
 
     #[test]
     fn planner_codex_override_targets_planner_server() {
