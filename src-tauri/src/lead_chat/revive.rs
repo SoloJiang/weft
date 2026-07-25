@@ -201,12 +201,26 @@ async fn run_stall_pass(
     };
     let db = Db(db.0.clone(), db.1);
 
-    // ONE clock read for the whole pass — the same value gates the per-thread
-    // redrive cooldown below and the freeze-recovery grace window inside the
-    // selection, so a slow scan can never have the two disagree about "now".
-    let now = now_secs();
-    match collect_stalled_leads(&db, now, cooldown_secs).await {
+    // TWO readings, because the two gates measure different things and a slow
+    // pass must not blur them.
+    //
+    // `scan_started` gates the freeze-recovery grace window, which is evaluated
+    // INSIDE the scan against marker rows read during it. Reading it up front
+    // keeps that comparison against a time no later than the rows it judges: a
+    // slow pass can then only widen the hold-off, never shorten it — the safe
+    // direction for a guard whose whole job is to not re-drive too early.
+    let scan_started = now_secs();
+    match collect_stalled_leads(&db, scan_started, cooldown_secs).await {
         Ok(stalled) => {
+            // The cooldown, by contrast, measures the gap between two DISPATCHES,
+            // so it needs the clock as of now — after the scan. Stamping
+            // `last_redrive` with the pre-scan reading would let the scan's own
+            // duration count against the window it is about to open: a pass
+            // slowed by SQLite contention could burn most of the cooldown before
+            // dispatching anything, and the next pass would re-drive the same
+            // unresolved thread a sweep later instead of a cooldown later —
+            // exactly the redrive storm the window exists to bound.
+            let now = now_secs();
             // Prune threads that recovered on their own so a stale cooldown
             // from long ago can't shadow a genuinely fresh stall episode much
             // later.
