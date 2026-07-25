@@ -636,25 +636,83 @@ fn json_keys(haystack: &str) -> Vec<&str> {
 /// plural) do not.
 const CRED_KEY_WORDS: &[&str] = &["token", "network"];
 
+/// Keys whose value is a TRANSPORT ENVELOPE — a slot where a caller puts a
+/// whole serialized request rather than domain data of its own. Matched with
+/// `words`, so `requestBody`/`request_headers`/`Payload` all reduce correctly.
+///
+/// This list is what SCOPES the encoded-JSON unwrap, and it is deliberately
+/// tiny. Round-5 review, P2: unwrapping every string value indiscriminately
+/// re-created #138's cried-wolf false positive through yet another door —
+/// `{"path":"config.json","content":"{\"network\":{\"timeout\":10}}"}` is an
+/// ordinary JSON file write with no credential anywhere in it, and it came out
+/// `NetworkOrCredential`. The distinction that matters is not "is this string
+/// JSON" but "is this field a place a REQUEST gets serialized into": an
+/// envelope's keys are the call's own parameters, whereas a `content` field's
+/// keys belong to a document the agent happens to be writing.
+///
+/// `data` is a considered OMISSION, not an oversight — some HTTP clients do
+/// name the body that, but it is generic enough to hold arbitrary domain
+/// documents, and the failure direction here is asymmetric: missing a hint
+/// costs a lower badge on a call whose full args the human still reads, while
+/// a false top-tier badge is the trust erosion #138 existed to stop.
+const TRANSPORT_KEY_WORDS: &[&str] = &["header", "headers", "body", "payload"];
+
 /// Whether any OBJECT KEY anywhere in `value` is credential/network-shaped.
 /// Recurses into nested objects and arrays; a string VALUE is never a key,
 /// however key-shaped its contents look. Recursion is bounded because
 /// `serde_json` enforces its own nesting limit while parsing, so a `Value`
 /// that exists at all is shallow enough to walk.
 ///
-/// `unwrap_encoded_json` permits ONE further layer of decoding: a string value
-/// that is itself an encoded JSON object/array is re-parsed and ITS keys
-/// walked. See `embedded_json_has_cred_key` for why, and for why exactly one.
-fn json_value_has_cred_key(value: &serde_json::Value, unwrap_encoded_json: bool) -> bool {
+/// How the key walk should treat a string VALUE it reaches. ONE discriminated
+/// state rather than a pair of booleans, because the three cases are genuinely
+/// distinct and `Exhausted` must not be re-derivable from the other two: a
+/// transport-named key sitting INSIDE an already-decoded document would
+/// otherwise switch decoding back on and make the unwrap depth unbounded after
+/// all (`{"body":"{\"body\":\"{\\\"apiToken\\\"…\"}"}`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EncodedJson {
+    /// Not inside a transport envelope — a string is just a string.
+    Opaque,
+    /// Inside one: a string that is an encoded JSON document gets ONE re-parse.
+    Decodable,
+    /// Already inside a re-parsed document — no further decoding, ever.
+    Exhausted,
+}
+
+/// Whether any OBJECT KEY anywhere in `value` is credential/network-shaped.
+/// Recurses into nested objects and arrays; a string VALUE is never a key,
+/// however key-shaped its contents look. Recursion is bounded because
+/// `serde_json` enforces its own nesting limit while parsing, so a `Value`
+/// that exists at all is shallow enough to walk.
+///
+/// `encoded` carries the string-value policy down the walk. It starts `Opaque`
+/// at the args root and becomes `Decodable` when the walk descends through a
+/// `TRANSPORT_KEY_WORDS` key — so the same encoded document is inspected under
+/// `body` and ignored under `content`. It never climbs back out of `Exhausted`.
+/// See `embedded_json_has_cred_key` for why, and for why exactly one layer.
+fn json_value_has_cred_key(value: &serde_json::Value, encoded: EncodedJson) -> bool {
     match value {
         serde_json::Value::Object(map) => map.iter().any(|(key, child)| {
-            has_word(&words(key), CRED_KEY_WORDS)
-                || json_value_has_cred_key(child, unwrap_encoded_json)
+            let key_words = words(key);
+            if has_word(&key_words, CRED_KEY_WORDS) {
+                return true;
+            }
+            let child_encoded = match encoded {
+                EncodedJson::Exhausted => EncodedJson::Exhausted,
+                EncodedJson::Decodable => EncodedJson::Decodable,
+                EncodedJson::Opaque if has_word(&key_words, TRANSPORT_KEY_WORDS) => {
+                    EncodedJson::Decodable
+                }
+                EncodedJson::Opaque => EncodedJson::Opaque,
+            };
+            json_value_has_cred_key(child, child_encoded)
         }),
         serde_json::Value::Array(items) => items
             .iter()
-            .any(|item| json_value_has_cred_key(item, unwrap_encoded_json)),
-        serde_json::Value::String(text) if unwrap_encoded_json => embedded_json_has_cred_key(text),
+            .any(|item| json_value_has_cred_key(item, encoded)),
+        serde_json::Value::String(text) if encoded == EncodedJson::Decodable => {
+            embedded_json_has_cred_key(text)
+        }
         _ => false,
     }
 }
@@ -685,26 +743,31 @@ fn looks_like_encoded_json(text: &str) -> bool {
 /// forwarded as a string), which is precisely where a credential rides, and
 /// the pre-#138 whole-blob scan did catch it.
 ///
-/// This does not walk back #138: a KEY is still the only thing that counts, in
-/// both layers, and that — not the pre-filter below — is what holds the line.
-/// What made the old blob scan cry wolf was matching VALUES and PATHS
-/// (`{"path":"src/token_bucket.rs"}`, a `content` value that merely mentions a
-/// network key); an encoded object's keys are keys, and a path or a code
-/// snippet is not a parseable JSON document in the first place.
+/// This does not walk back #138, and TWO things keep it from doing so. A KEY is
+/// still the only thing that counts, in both layers — what made the old blob
+/// scan cry wolf was matching VALUES and PATHS (`{"path":"src/token_bucket.rs"}`,
+/// a `content` value that merely mentions a network key). And the unwrap only
+/// runs inside a TRANSPORT ENVELOPE (`TRANSPORT_KEY_WORDS`), so an encoded
+/// document reached through `content` is never opened at all. Round-5 review
+/// caught that the second guard was missing: without it, writing an ordinary
+/// `config.json` whose contents have a `network` key landed on the top tier —
+/// the same harm, one more door. The pre-filter below is NOT one of the two
+/// guards; it only saves the parser a pointless attempt.
 ///
-/// EXACTLY ONE extra layer, hence the `false` passed down. Triple encoding
-/// stays undetected, and that is a deliberate, pinned boundary (see
-/// `double_encoded_json_credential_keys_are_found`) rather than an unbounded
-/// unwrap loop over server-controlled text. One layer also keeps the cost
-/// linear, which round-4's P1 makes non-negotiable on this path: each string
-/// is parsed at most once and never re-entered, and the strings are disjoint
-/// slices of the blob, so the total parse work stays O(blob).
+/// EXACTLY ONE extra layer, which is what `EncodedJson::Exhausted` enforces —
+/// a transport-named key inside the decoded document cannot switch decoding
+/// back on. Triple encoding therefore stays undetected, a deliberate, pinned
+/// boundary (see `double_encoded_json_credential_keys_are_found`) rather than an
+/// unbounded unwrap loop over server-controlled text. One layer also keeps the
+/// cost linear, which round-4's P1 makes non-negotiable on this path: each
+/// string is parsed at most once and never re-entered, and the strings are
+/// disjoint slices of the blob, so the total parse work stays O(blob).
 fn embedded_json_has_cred_key(text: &str) -> bool {
     if !looks_like_encoded_json(text) {
         return false;
     }
     serde_json::from_str::<serde_json::Value>(text)
-        .is_ok_and(|value| json_value_has_cred_key(&value, false))
+        .is_ok_and(|value| json_value_has_cred_key(&value, EncodedJson::Exhausted))
 }
 
 /// Whether a credential/network-shaped KEY appears in this call, in two
@@ -715,9 +778,10 @@ fn embedded_json_has_cred_key(text: &str) -> bool {
 ///    keys. This is exact: a key is a key, a string value's contents are
 ///    never keys, escapes are the parser's problem, and it is linear.
 ///    Production traffic always lands here — `bus::server::summarize` builds
-///    `args_text` with `serde_json::to_string`. One exception to "a string
-///    value's contents are never keys": a value that is itself an encoded
-///    JSON object gets one re-parse, because its keys ARE keys — see
+///    `args_text` with `serde_json::to_string`. One narrow exception to "a
+///    string value's contents are never keys": inside a TRANSPORT ENVELOPE
+///    (`TRANSPORT_KEY_WORDS`) an encoded JSON document gets one re-parse,
+///    because there its keys are the call's own parameters — see
 ///    `embedded_json_has_cred_key`.
 /// 2. Otherwise fall back to the textual quote scan (`json_keys`), which
 ///    covers non-JSON haystacks (a shell command, a file path) and the
@@ -742,7 +806,9 @@ fn embedded_json_has_cred_key(text: &str) -> bool {
 fn has_cred_key(text: &str, payload: Option<&str>) -> bool {
     let parsed = payload.and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok());
     if let Some(value) = parsed {
-        return json_value_has_cred_key(&value, true);
+        // `Opaque`: the args ROOT is not itself an envelope. Only descending
+        // through a `TRANSPORT_KEY_WORDS` key turns decoding on.
+        return json_value_has_cred_key(&value, EncodedJson::Opaque);
     }
     json_keys(text)
         .iter()
@@ -2400,12 +2466,11 @@ mod tests {
         // positive this change exists to remove. Parsing the payload settles
         // it structurally.
         //
-        // Read the name as shorthand for what these cases are: PROSE and CODE
-        // in a value are never keys. There is one exception, added by the
-        // post-#138 review, and it does not weaken these: a value that is a
-        // whole encoded JSON DOCUMENT is re-parsed and its keys do count, since
-        // they are keys. See `double_encoded_json_credential_keys_are_found`.
-        // Nothing below is such a document — a code snippet does not parse.
+        // The one exception added post-#138 does not reach these: an encoded
+        // JSON document is re-parsed for keys only inside a TRANSPORT ENVELOPE
+        // (`TRANSPORT_KEY_WORDS`), and `content` is not one. So a file's
+        // contents are never opened for keys no matter what they hold — see
+        // `encoded_json_unwrap_is_scoped_to_transport_fields`.
         for args_text in [
             r#"{"path":"src/config.ts","content":"const c = {'networkMode': true};"}"#,
             r#"{"path":"src/a.ts","content":"const c = {\"accessToken\": x};"}"#,
@@ -2546,14 +2611,21 @@ mod tests {
 
         // KNOWN, ACCEPTED residual — pinned deliberately, exactly like
         // `github_token_file=…` in `has_anchored_token`'s doc. The unwrap is
-        // ONE layer, so TRIPLE encoding is still invisible. An unbounded
-        // unwrap loop over server-controlled text is the thing not worth
-        // buying, and this tier is a glance-level hint, never the gate — the
-        // human still sees the full args via `DetailPreview` before allowing.
+        // ONE layer, so TRIPLE encoding is still invisible. An unbounded unwrap
+        // loop over server-controlled text is the thing not worth buying, and
+        // this tier is a glance-level hint, never the gate — the human still
+        // sees the full args via `DetailPreview` before allowing.
+        //
+        // `body` at EVERY layer on purpose. With a neutral outer key this would
+        // pass for the wrong reason — the transport scoping alone would stop it
+        // at layer 1, and the one-layer rule would go untested. Naming a
+        // transport field all the way down is what forces `EncodedJson` to be
+        // the thing under test: layer 1 decodes, and the inner `body` must NOT
+        // re-enable decoding.
         assert_eq!(
             classify_risk(RiskSignal::Other {
                 tool_name: "call_api",
-                args_text: r#"{"a":"{\"b\":\"{\\\"apiToken\\\":\\\"sk-1\\\"}\"}"}"#
+                args_text: r#"{"body":"{\"body\":\"{\\\"apiToken\\\":\\\"sk-1\\\"}\"}"}"#
             }),
             RiskLevel::Unknown,
             "triple encoding is the documented boundary; update the doc if this changes"
@@ -2575,12 +2647,28 @@ mod tests {
             ),
             // The motivating regression, untouched.
             ("write_file", r#"{"path":"src/token_bucket.rs","content":"x"}"#),
-            // Writing a real JSON file: the embedded document IS parsed, and
-            // correctly finds nothing — benign keys stay benign.
+            // Writing a real JSON file with benign keys.
             (
                 "write_file",
                 r#"{"path":"tsconfig.json","content":"{\"compilerOptions\":{\"strict\":true}}"}"#,
             ),
+            // Round-5 review P2, verbatim: a JSON file whose contents DO carry a
+            // credential-shaped key. This is the case the first cut of this
+            // change got wrong, and the one the `tsconfig.json` line above could
+            // not catch — its keys happen not to match, so it passed either way.
+            // Testing only the benign-key half tested nothing about scoping.
+            (
+                "write_file",
+                r#"{"path":"config.json","content":"{\"network\":{\"timeout\":10}}"}"#,
+            ),
+            (
+                "write_file",
+                r#"{"path":"src/fixtures/auth.json","content":"{\"apiToken\":\"sk-test\"}"}"#,
+            ),
+            // Same document, reached through the other content-ish field names a
+            // file-editing MCP tool uses.
+            ("edit_file", r#"{"path":"a.json","new_string":"{\"apiToken\":\"x\"}"}"#),
+            ("write_file", r#"{"path":"a.json","text":"{\"network\":true}"}"#),
             // An encoded document whose credential-shaped text sits in a VALUE
             // is still not a key, one layer down just as at the top.
             ("call_api", r#"{"body":"{\"comment\":\"rotate the api token\"}"}"#),
@@ -2601,6 +2689,57 @@ mod tests {
         assert!(!looks_like_encoded_json("src/token_bucket.rs"));
         assert!(looks_like_encoded_json(r#"{"apiToken":"sk-1"}"#));
         assert!(looks_like_encoded_json("  [1,2]"));
+    }
+
+    #[test]
+    fn encoded_json_unwrap_is_scoped_to_transport_fields() {
+        // The sharpest statement of round-5's fix: ONE encoded document, and the
+        // verdict turns entirely on the name of the field holding it. Under a
+        // transport envelope its keys are the call's own parameters; under a
+        // content field they belong to a document the agent is merely writing.
+        // Asserting both halves against the SAME payload is what makes this a
+        // test of the discriminator rather than of two unrelated inputs.
+        let doc = r#"{\"apiToken\":\"sk-1\"}"#;
+        for envelope in ["headers", "header", "body", "payload", "requestBody", "request_headers"] {
+            let args_text = format!(r#"{{"{envelope}":"{doc}"}}"#);
+            assert_eq!(
+                classify_risk(RiskSignal::Other {
+                    tool_name: "call_api",
+                    args_text: &args_text
+                }),
+                RiskLevel::NetworkOrCredential,
+                "{envelope:?} is a transport envelope and should be unwrapped"
+            );
+        }
+        for plain in ["content", "contents", "text", "new_string", "source", "data", "note"] {
+            let args_text = format!(r#"{{"{plain}":"{doc}"}}"#);
+            assert_ne!(
+                classify_risk(RiskSignal::Other {
+                    tool_name: "call_api",
+                    args_text: &args_text
+                }),
+                RiskLevel::NetworkOrCredential,
+                "{plain:?} is not a transport envelope and must not be unwrapped"
+            );
+        }
+        // The envelope flag propagates DOWN, so an encoded document nested
+        // inside a transport field's own structure is still reached.
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: r#"{"body":{"raw":["{\"apiToken\":\"sk-1\"}"]}}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+        // And it does not leak UPWARD: a sibling of a transport field is not
+        // itself inside one.
+        assert_ne!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: r#"{"body":"{\"ok\":1}","content":"{\"apiToken\":\"sk-1\"}"}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
     }
 
     #[test]
