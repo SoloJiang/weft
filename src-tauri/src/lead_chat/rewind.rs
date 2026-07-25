@@ -517,6 +517,27 @@ fn strip_outer_quotes(s: &str) -> &str {
 
 
 
+
+/// Whether an omp jsonl user-message body matches the rewind target.
+///
+/// Exact whitespace-normalized equality always matches. The first user message
+/// may also match when Weft prepended `{system}\n\n{user}` on session start —
+/// but only that first turn, so a later ordinary prompt containing a blank
+/// paragraph cannot steal the ordinal.
+fn omp_user_body_matches(body: &str, want_norm: &str, is_first_user: bool) -> bool {
+    let got = normalize_ws(body);
+    if got == want_norm {
+        return true;
+    }
+    if !is_first_user {
+        return false;
+    }
+    match body.split_once("\n\n") {
+        Some((prefix, rest)) if !prefix.is_empty() => normalize_ws(rest) == want_norm,
+        _ => false,
+    }
+}
+
 /// Cut-before rewind for omp ACP sessions.
 ///
 /// ACP `session/fork` only does full-history copy. We rewrite the on-disk
@@ -563,16 +584,7 @@ pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> 
                     .join("\n")
             })
             .unwrap_or_default();
-        // First-turn system-prompt prepend stores `{system}\n\n{user}`.
-        // Accept a match only when the body is exactly that shape: non-empty
-        // prefix + separator + user text (normalized). A bare blank paragraph
-        // inside ordinary user prose must not steal the ordinal.
-        let got = normalize_ws(&body);
-        let prepended = match body.split_once("\n\n") {
-            Some((prefix, rest)) if !prefix.is_empty() => normalize_ws(rest) == want,
-            _ => false,
-        };
-        if got != want && !prepended {
+        if !omp_user_body_matches(&body, &want, user_hits == 0) {
             continue;
         }
         user_hits += 1;
@@ -1197,5 +1209,32 @@ mod tests {
             dispatched_text(true, 7, stamped),
             "look\n\nAttached images (read them as needed):\n- /tmp/weft-attachments/msg7-0.png\n"
         );
+    }
+
+    #[test]
+    fn omp_user_body_matches_system_prepend_only_on_first() {
+        let want = normalize_ws("run tests");
+        // First user: system prepend OK
+        assert!(omp_user_body_matches(
+            "You are helpful.\n\nrun tests",
+            &want,
+            true
+        ));
+        // First user: exact OK
+        assert!(omp_user_body_matches("run tests", &want, true));
+        // Later user with blank paragraph must NOT match as prepend
+        assert!(!omp_user_body_matches(
+            "notes\n\nrun tests",
+            &want,
+            false
+        ));
+        // Later user exact still matches
+        assert!(omp_user_body_matches("run tests", &want, false));
+        // Leading blank lines collapse under normalize_ws → exact match path.
+        assert!(omp_user_body_matches("\n\nrun tests", &want, true));
+        // Non-empty prefix that is NOT a system prompt but shares a blank
+        // paragraph: only allowed on the first user turn.
+        assert!(omp_user_body_matches("sys\n\nrun tests", &want, true));
+        assert!(!omp_user_body_matches("sys\n\nrun tests", &want, false));
     }
 }
