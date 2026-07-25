@@ -127,32 +127,32 @@
   --c-danger: oklch(0.655 0.200 25);
 }
 
-/* ── LIGHT — LOOM: warm cream paper (editorial), teal/coral deepened for AA ── */
+/* ── LIGHT — cool-white canvas, graphite controls + a focused orange accent ── */
 :root[data-theme="light"] {
   color-scheme: light;
-  --c-bg: oklch(0.940 0.022 88);
-  --c-surface: oklch(0.958 0.018 88);
-  --c-raised: oklch(0.978 0.012 88);
-  --c-border: oklch(0.860 0.022 86);
-  --c-border-strong: oklch(0.760 0.026 84);
-  --c-hover: oklch(0.915 0.024 88);
-  --c-ink: oklch(0.275 0.020 75);
-  --c-ink-muted: oklch(0.455 0.018 75);
-  --c-ink-faint: oklch(0.575 0.016 75);
-  --c-brand: oklch(0.520 0.120 214);
-  --c-brand-press: oklch(0.470 0.120 214);
-  --c-brand-ink: oklch(0.990 0.006 212);
-  --c-brand-ghost: oklch(0.560 0.120 212 / 0.12);
-  --c-warp-line: oklch(0.560 0.120 212 / 0.38);
-  --c-accent: oklch(0.585 0.175 38);
-  --c-accent-ghost: oklch(0.585 0.175 38 / 0.12);
-  --c-running: oklch(0.580 0.150 158);
-  --c-success: oklch(0.510 0.160 145);
-  --c-waiting: oklch(0.620 0.130 75);
-  --c-approval: oklch(0.585 0.150 52);
-  --c-inject: oklch(0.560 0.110 222);
-  --c-idle: oklch(0.600 0.012 75);
-  --c-danger: oklch(0.560 0.200 27);
+  --c-bg: oklch(0.982 0.003 255);
+  --c-surface: oklch(0.992 0.002 255);
+  --c-raised: oklch(1 0 0);
+  --c-border: oklch(0.900 0.006 255);
+  --c-border-strong: oklch(0.720 0.011 255);
+  --c-hover: oklch(0.958 0.005 255);
+  --c-ink: oklch(0.300 0.018 260);
+  --c-ink-muted: oklch(0.480 0.016 260);
+  --c-ink-faint: oklch(0.510 0.014 260);
+  --c-brand: oklch(0.300 0.018 260);
+  --c-brand-press: oklch(0.240 0.016 260);
+  --c-brand-ink: oklch(0.985 0.002 260);
+  --c-brand-ghost: oklch(0.300 0.018 260 / 0.075);
+  --c-warp-line: oklch(0.370 0.016 260 / 0.42);
+  --c-accent: oklch(0.560 0.190 38);
+  --c-accent-ghost: oklch(0.560 0.190 38 / 0.11);
+  --c-running: oklch(0.500 0.150 158);
+  --c-success: oklch(0.460 0.160 145);
+  --c-waiting: oklch(0.500 0.130 75);
+  --c-approval: oklch(0.540 0.150 52);
+  --c-inject: oklch(0.480 0.110 222);
+  --c-idle: oklch(0.500 0.012 260);
+  --c-danger: oklch(0.520 0.200 27);
 }
 
 @layer base {

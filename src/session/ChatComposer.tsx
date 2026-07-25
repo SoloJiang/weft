@@ -16,7 +16,6 @@ import { useClickOutside } from "../lib/useClickOutside";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { Tooltip } from "../components/ui/Tooltip";
 import {
-  InputGroup,
   PromptInput,
   PromptInputActions,
   PromptInputAttachment,
@@ -53,6 +52,15 @@ export type LocalSlashSpec =
   | { name: string; label: string; act: "action" }
   | { name: string; label: string; act: "prompt"; prompt: string };
 
+/** One safe way to re-enter the native agent session from the composer.
+ *
+ * Copying a CLI command and taking over an engine are deliberately different
+ * operations. The composer only exposes the non-destructive re-entry action;
+ * an explicit engine stop remains a separate lifecycle operation. */
+export type SessionResumeAction =
+  | { kind: "copy-terminal-command"; onCopy: () => Promise<boolean> }
+  | { kind: "open-codex"; onOpen: () => void };
+
 const IME_ENTER_GRACE_MS = 100;
 
 /** Max messages that can wait in the queue while a turn runs. */
@@ -70,8 +78,7 @@ export function ChatComposer({
   queued,
   onSend,
   onStop,
-  onTakeOver,
-  onOpenApp,
+  sessionResumeAction,
   extraActions,
   placeholder,
   onNeedSlashCommands,
@@ -95,10 +102,8 @@ export function ChatComposer({
     files: string[],
   ) => void | Promise<unknown>;
   onStop: () => void;
-  /** Stop the engine + copy the terminal resume command; false = unavailable. */
-  onTakeOver?: () => Promise<boolean>;
-  /** Open the vendor's own app on this session (codex deep link). */
-  onOpenApp?: () => void;
+  /** Copy a terminal command or open Codex, never both or an implicit stop. */
+  sessionResumeAction?: SessionResumeAction;
   /** Host-injected action icons (diff, inspect …) for the toolbar row. */
   extraActions?: React.ReactNode;
   /** Input placeholder — defaults to the lead's; workers pass their own. */
@@ -127,8 +132,7 @@ export function ChatComposer({
         queued={queued}
         onSend={onSend}
         onStop={onStop}
-        onTakeOver={onTakeOver}
-        onOpenApp={onOpenApp}
+        sessionResumeAction={sessionResumeAction}
         extraActions={extraActions}
         placeholder={placeholder}
         onNeedSlashCommands={onNeedSlashCommands}
@@ -152,8 +156,7 @@ interface ChatComposerBodyProps {
     files: string[],
   ) => void | Promise<unknown>;
   onStop: () => void;
-  onTakeOver?: () => Promise<boolean>;
-  onOpenApp?: () => void;
+  sessionResumeAction?: SessionResumeAction;
   extraActions?: React.ReactNode;
   placeholder?: string;
   onNeedSlashCommands?: () => void;
@@ -170,8 +173,7 @@ function ChatComposerBody({
   queued,
   onSend,
   onStop,
-  onTakeOver,
-  onOpenApp,
+  sessionResumeAction,
   extraActions,
   placeholder,
   onNeedSlashCommands,
@@ -184,7 +186,6 @@ function ChatComposerBody({
   const [images, setImages] = useState<PendingImage[]>([]);
   const [files, setFiles] = useState<string[]>([]);
   const [slashIdx, setSlashIdx] = useState(0);
-  const [copied, setCopied] = useState(false);
   const [dismissed, setDismissed] = useState(false);
 
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -380,14 +381,6 @@ function ChatComposerBody({
     ref.current?.focus();
   };
 
-  const takeOver = async () => {
-    if (!onTakeOver) return;
-    if (await onTakeOver()) {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2500);
-    }
-  };
-
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (shouldBlockImeEnter(e)) {
       blockImeEnter(e);
@@ -483,6 +476,7 @@ function ChatComposerBody({
         canSubmit={text.trim().length > 0 || images.length > 0 || files.length > 0}
         loadingLabel={t("lead.loading")}
         title={t("lead.send")}
+        className="rounded-full"
       >
         <Send size={14} />
       </PromptInputSubmit>
@@ -490,10 +484,10 @@ function ChatComposerBody({
   }
 
   return (
-    <div className="border-t border-border bg-bg px-4 py-3">
+    <div className="border-t border-border/70 bg-bg px-4 pb-4 pt-3 sm:px-6">
       <PromptInput
         onSubmit={submitComposer}
-        className="relative mx-auto max-w-[820px] rounded-[var(--radius-lg)] border border-border bg-surface p-2 shadow-[0_12px_40px_-28px_rgba(0,0,0,0.65)]"
+        className="relative mx-auto w-full max-w-[880px] gap-0 rounded-[16px] border border-border bg-raised p-0 shadow-[0_4px_8px_-6px_rgb(15_23_42/0.18)] transition-[border-color,box-shadow] duration-150 ease-[var(--ease-out-quint)] hover:border-border-strong focus-within:border-brand focus-within:shadow-[0_4px_8px_-5px_rgb(15_23_42/0.20)]"
       >
         <div ref={wrapRef} className="relative">
           {paletteOpen && (
@@ -542,7 +536,7 @@ function ChatComposerBody({
           )}
 
           {allAttachments.length > 0 && (
-            <div className="flex flex-wrap items-center gap-1.5 px-1.5 pb-1.5">
+            <div className="flex flex-wrap items-center gap-1.5 px-4 pb-1.5 pt-3">
               {allAttachments.map((att) => (
                 <PromptInputAttachment
                   key={att.id}
@@ -554,35 +548,32 @@ function ChatComposerBody({
             </div>
           )}
 
-          <InputGroup className="min-h-[42px]">
-            <PromptInputTextarea
-              ref={ref}
-              autoFocus
-              onFocus={() => setDismissed(false)}
-              onCompositionStart={() => {
-                composingRef.current = true;
-                lastCompositionEndRef.current = null;
-              }}
-              onCompositionEnd={() => {
-                composingRef.current = false;
-                lastCompositionEndRef.current = performance.now();
-              }}
-              onKeyDownCapture={(e) => {
-                if (shouldBlockImeEnter(e)) {
-                  blockImeEnter(e);
-                }
-              }}
-              onPaste={onPaste}
-              onKeyDown={handleKeyDown}
-              placeholder={placeholder ?? t("lead.compose")}
-              className="max-h-[150px] min-h-[42px] py-2"
-            />
-            {renderSubmitButton()}
-          </InputGroup>
+          <PromptInputTextarea
+            ref={ref}
+            autoFocus
+            onFocus={() => setDismissed(false)}
+            onCompositionStart={() => {
+              composingRef.current = true;
+              lastCompositionEndRef.current = null;
+            }}
+            onCompositionEnd={() => {
+              composingRef.current = false;
+              lastCompositionEndRef.current = performance.now();
+            }}
+            onKeyDownCapture={(e) => {
+              if (shouldBlockImeEnter(e)) {
+                blockImeEnter(e);
+              }
+            }}
+            onPaste={onPaste}
+            onKeyDown={handleKeyDown}
+            placeholder={placeholder ?? t("lead.compose")}
+            className="block max-h-[160px] min-h-[84px] w-full px-4 pb-3 pt-4 leading-5"
+          />
         </div>
 
-        <PromptInputActions className="flex items-center gap-2 border-t border-border/70 px-1.5 pt-2">
-          <PromptInputTools>
+        <PromptInputActions className="min-h-11 flex-wrap border-t border-border/70 px-2.5 py-1.5 sm:flex-nowrap">
+          <PromptInputTools className="min-w-0">
             {tool && (
               <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-sm)] bg-bg px-1.5 py-0.5 text-[11px] font-medium text-ink-muted">
                 <ToolIcon tool={tool} size={11} />
@@ -592,7 +583,7 @@ function ChatComposerBody({
             <ContextGauge meta={contextMeta} />
           </PromptInputTools>
 
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex shrink-0 items-center gap-1">
             {extraActions}
             <PromptInputButton
               onClick={() => void attachFiles()}
@@ -601,35 +592,49 @@ function ChatComposerBody({
             >
               <Paperclip size={13} />
             </PromptInputButton>
-            {onOpenApp && (
-              <PromptInputButton
-                onClick={onOpenApp}
-                tooltip={t("lead.openInApp")}
-                tooltipAlign="end"
-              >
-                <ExternalLink size={13} />
-              </PromptInputButton>
-            )}
-            {onTakeOver && (
-              <PromptInputButton
-                onClick={() => void takeOver()}
-                tooltipAlign="end"
-                tooltip={
-                  copied ? t("lead.takeOverCopied") : t("lead.takeOverTip")
-                }
-              >
-                {copied ? (
-                  <Check size={13} className="text-running" />
-                ) : (
-                  <SquareTerminal size={13} />
-                )}
-              </PromptInputButton>
-            )}
+            {sessionResumeAction && <ComposerSessionResumeAction action={sessionResumeAction} />}
+            {renderSubmitButton()}
           </div>
         </PromptInputActions>
       </PromptInput>
     </div>
   );
+}
+
+function ComposerSessionResumeAction({ action }: { readonly action: SessionResumeAction }) {
+  const { t } = useTranslation();
+  const [copied, setCopied] = useState(false);
+
+  const copyCommand = async () => {
+    if (action.kind !== "copy-terminal-command") return;
+    const didCopy = await action.onCopy();
+    if (!didCopy) return;
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 2500);
+  };
+
+  switch (action.kind) {
+    case "copy-terminal-command":
+      return (
+        <PromptInputButton
+          onClick={() => void copyCommand()}
+          tooltip={copied ? t("resume.copied") : t("resume.copyCommand")}
+          tooltipAlign="end"
+        >
+          {copied ? <Check size={13} className="text-running" /> : <SquareTerminal size={13} />}
+        </PromptInputButton>
+      );
+    case "open-codex":
+      return (
+        <PromptInputButton
+          onClick={action.onOpen}
+          tooltip={t("resume.openInCodex")}
+          tooltipAlign="end"
+        >
+          <ExternalLink size={13} />
+        </PromptInputButton>
+      );
+  }
 }
 
 /** Context readout for the composer toolbar: usage, the model, AND the

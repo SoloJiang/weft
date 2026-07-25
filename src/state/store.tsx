@@ -1196,8 +1196,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // ALL workers run on the chat engine — one product-native conversation UI
   // per vendor dialect (claude stream-json, codex exec --json, opencode run
-  // --format json). Escape hatches per tool: codex app deep link, terminal
-  // takeover command for all three.
+  // --format json). Non-destructive re-entry is tool-specific: Codex uses its
+  // app deep link; other tools expose their terminal resume command.
 
   // Single entry to a worker's conversation surface. All "open/focus a worker"
   // paths route here → `viewing` → WorkerConversation (no separate activeSessionId).
@@ -1758,7 +1758,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } else if (p.type === "rewound") {
         // The backend truncated this thread's rows (a conversation rewind):
         // reload so every open surface drops the removed tail at once, and
-        // adopt the forked native id so Open App / Take Over can't resume the
+        // adopt the forked native id so the re-entry action can't resume the
         // abandoned pre-rewind conversation.
         void loadLeadChatRef.current(p.thread_id);
         if (p.session_id != null) {

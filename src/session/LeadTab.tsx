@@ -13,14 +13,19 @@ import { Button } from "../components/ui/Button";
 import { RewindDialog, RewindPickerDialog } from "./RewindDialog";
 import { useRepoActions } from "./useRepoActions";
 import { api } from "../lib/api";
-import type { EnabledSkill } from "../lib/types";
-import { resumeCommand } from "../lib/resume";
+import type { EnabledSkill, LeadStateInfo } from "../lib/types";
+import { nativeSessionResumeTarget } from "../lib/resume";
 
 type PromptState = {
   title: string;
   placeholder?: string;
   value: string;
   resolve: (v: string | null) => void;
+};
+
+type LeadResumeTarget = Pick<LeadStateInfo, "command" | "cwd"> & {
+  readonly nativeId: string;
+  readonly threadId: number;
 };
 
 // Host-owned local slash items, mapped to the composer's LocalSlashSpec below.
@@ -98,6 +103,7 @@ export function LeadTab({
   const [skills, setSkills] = useState<EnabledSkill[]>([]);
   // The lead's working dir — resolves relative file paths it mentions in chat.
   const [leadCwd, setLeadCwd] = useState<string | undefined>(undefined);
+  const [leadResumeTarget, setLeadResumeTarget] = useState<LeadResumeTarget | null>(null);
   // Live test-case count for the plan card, sourced from the test_plan table so
   // it matches what the panel's View opens. Bumped by a user panel edit (which
   // rewrites the table WITHOUT a test_cases card); lead re-emits refetch via the
@@ -168,23 +174,38 @@ export function LeadTab({
     };
   }, [tid, leadTurn[tid ?? -1]?.state, skillsDirtyAt, mergeLeadMeta]);
 
+  const leadTurnState = tid == null ? undefined : leadTurn[tid]?.state;
+  const leadSlashCommands = tid == null ? undefined : leadSlash[tid];
+
   useEffect(() => {
     // Drop the previous thread's cwd immediately — otherwise a relative file
     // ref clicked during the fetch window would resolve against the old lead
     // workspace. Undefined cwd fails safe (relative paths report not-found).
     setLeadCwd(undefined);
+    setLeadResumeTarget(null);
     if (tid == null) return;
     let alive = true;
     void api
       .leadState(tid)
       .then((st) => {
-        if (alive) setLeadCwd(st.cwd);
+        if (!alive) return;
+        setLeadCwd(st.cwd);
+        if (!st.native_id) {
+          setLeadResumeTarget(null);
+          return;
+        }
+        setLeadResumeTarget({
+          threadId: tid,
+          nativeId: st.native_id,
+          cwd: st.cwd,
+          command: st.command,
+        });
       })
       .catch(() => {});
     return () => {
       alive = false;
     };
-  }, [tid]);
+  }, [tid, leadTurnState, leadSlashCommands]);
 
   // The latest test_cases card id only grows (append-only timeline). The lead
   // ALWAYS emits a test_cases card when it (re)writes the test_plan table, so
@@ -225,6 +246,37 @@ export function LeadTab({
   const turn = leadTurn[tid] ?? { state: "stopped" as const, queue: [] };
   // The lead engine runs the thread's lead_tool (not always claude).
   const leadTool = threads.find((th) => th.id === tid)?.lead_tool ?? "claude";
+  const resumeTarget = leadResumeTarget?.threadId === tid ? leadResumeTarget : null;
+  const sessionResumeAction = (() => {
+    if (!resumeTarget) return undefined;
+    const target = nativeSessionResumeTarget(
+      leadTool,
+      resumeTarget.cwd,
+      resumeTarget.nativeId,
+      resumeTarget.command,
+    );
+    switch (target.kind) {
+      case "open-codex":
+        return {
+          kind: "open-codex" as const,
+          onOpen: () => {
+            void api.openUrl(target.url).catch(() => {});
+          },
+        };
+      case "copy-terminal-command":
+        return {
+          kind: "copy-terminal-command" as const,
+          onCopy: async () => {
+            try {
+              await navigator.clipboard.writeText(target.command);
+              return true;
+            } catch {
+              return false;
+            }
+          },
+        };
+    }
+  })();
   // Rewind is scoped to claude/codex/opencode leads — the tools with native
   // fork support (same gate as the worker); the lead rewinds conversation-only.
   const canRewind = leadTool === "claude" || leadTool === "codex" || leadTool === "opencode";
@@ -319,15 +371,7 @@ export function LeadTab({
           onStop={() => void interruptLead(tid)}
           onNeedSlashCommands={() => discoverLeadSlash(tid)}
           onRewindPicker={canRewind ? () => setPickerOpen(true) : undefined}
-          onTakeOver={async () => {
-            const st = await api.leadState(tid);
-            if (!st.native_id) return false;
-            await api.leadStop(tid);
-            await navigator.clipboard.writeText(
-              resumeCommand(leadTool, st.cwd, st.native_id, st.command),
-            );
-            return true;
-          }}
+          sessionResumeAction={sessionResumeAction}
         />
         <Dialog
           open={promptState != null}
