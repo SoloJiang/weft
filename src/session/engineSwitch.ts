@@ -24,3 +24,22 @@ export type SwitchKind = "switch" | "reload";
 export function switchKindOf(oldTool: string, newTool: string): SwitchKind {
   return oldTool !== "" && oldTool === newTool ? "reload" : "switch";
 }
+
+/** Stable code `switch_lead_tool`/`switch_worker_tool` reject with when the
+ *  freeze-recovery grace marker can't be stamped (Rust:
+ *  `SWITCH_MARKER_ERROR_CODE`). The backend deliberately sends the CODE and
+ *  logs the database detail, so this locale's copy comes from `src/i18n/*.ts`
+ *  rather than an English sentence built in Rust. */
+export const SWITCH_MARKER_ERROR_CODE = "switch_marker_stamp_failed";
+
+/** Recognize that rejection without coupling UI copy to the backend message.
+ *  Same shape as `isProcessQuotaDegradedError`: tauri commands currently
+ *  reject with strings, while tests and future adapters may surface an Error
+ *  or a `{ code }` object. Anything else falls through to the caller's generic
+ *  handling, so this never swallows an unrelated failure. */
+export function isSwitchMarkerError(error: unknown): boolean {
+  if (typeof error === "string") return error.includes(SWITCH_MARKER_ERROR_CODE);
+  if (error instanceof Error) return error.message.includes(SWITCH_MARKER_ERROR_CODE);
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  return String(error.code) === SWITCH_MARKER_ERROR_CODE;
+}

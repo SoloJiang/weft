@@ -394,6 +394,7 @@ export const zh = {
     switchReloadConfirm: "重新加载",
     switchedToast: "已切换：{{from}} → {{to}}",
     switchReloadedToast: "{{tool}} 已重新加载",
+    switchMarkerFailed: "这次切换没能记录下来，已原样保留——会话还在原来的引擎上。请重试。",
     engineSwitchedMarker: "引擎已切换",
     engineReloadedMarker: "引擎已重新加载",
     engineModelCleared: "无覆盖",

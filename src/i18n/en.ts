@@ -408,6 +408,8 @@ export const en = {
     switchReloadConfirm: "Reload",
     switchedToast: "Switched {{from}} → {{to}}",
     switchReloadedToast: "{{tool}} reloaded",
+    switchMarkerFailed:
+      "Couldn't record this switch, so nothing was changed — the session is still on its current engine. Try again.",
     engineSwitchedMarker: "Engine switched",
     engineReloadedMarker: "Engine reloaded",
     engineModelCleared: "no override",
