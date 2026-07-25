@@ -961,6 +961,10 @@ async fn run_streaming_agent<F: FnMut(AnalysisEvent)>(
     prompt: &str,
     on_event: &mut F,
 ) -> Result<String> {
+    // Curator is exec/app-server only. ACP tools (omp) have no argv dialect —
+    // fall back to the next installed non-ACP CLI so repo analysis still runs
+    // when the user default is omp.
+    let tool = curator_exec_tool(tool);
     if tool == "codex" && crate::adapters::codex_prefers_appserver() {
         match run_codex_appserver(cwd, prompt, on_event).await {
             Ok(text) => return Ok(text),
@@ -970,6 +974,27 @@ async fn run_streaming_agent<F: FnMut(AnalysisEvent)>(
         }
     }
     run_exec(tool, cwd, prompt, on_event).await
+}
+
+/// Pick a tool the curator runner can actually drive. ACP-only defaults (omp)
+/// resolve to the next installed non-ACP CLI by TOOL_PRIORITY; if none, keep
+/// the original so the call surfaces a clear error.
+fn curator_exec_tool(preferred: &str) -> &str {
+    if !crate::lead_chat::engine::is_acp_tool(preferred) {
+        return preferred;
+    }
+    for t in crate::detect::TOOL_PRIORITY {
+        if crate::lead_chat::engine::is_acp_tool(t) {
+            continue;
+        }
+        if crate::detect::resolve_tool_path(t).is_some() {
+            eprintln!(
+                "[weft][curator] default tool {preferred} is ACP-only; using {t} for analysis"
+            );
+            return t;
+        }
+    }
+    preferred
 }
 
 /// codex app-server transport: spawn a per-run app-server in `cwd` with read-only

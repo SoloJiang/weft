@@ -85,6 +85,33 @@ struct Inner {
     _child: tokio::process::Child,
     _reg: crate::proc_registry::Registration,
 }
+/// Result of `session/new` / `session/resume`, including config metadata
+/// OMP returns under `configOptions` (model / thinking).
+#[derive(Debug, Clone)]
+pub struct SessionOpen {
+    pub session_id: String,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+}
+
+/// Read `currentValue` for a named entry in `result.configOptions`.
+fn config_option_current(result: &Value, id: &str) -> Option<String> {
+    let opts = result.get("configOptions")?.as_array()?;
+    for opt in opts {
+        let oid = opt.get("id").or_else(|| opt.get("configId")).and_then(|v| v.as_str());
+        if oid != Some(id) {
+            continue;
+        }
+        if let Some(v) = opt.get("currentValue").and_then(|v| v.as_str()) {
+            return Some(v.to_string());
+        }
+        if let Some(v) = opt.get("value").and_then(|v| v.as_str()) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 pub struct ClientHandle {
     backend_id: &'static str,
@@ -583,7 +610,7 @@ impl ClientHandle {
         &self,
         cwd: &Path,
         mcp: Vec<McpServerSpec>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<SessionOpen> {
         let mcp_v = Self::paint_mcp(self.backend_id, mcp);
         let result = self
             .request(
@@ -594,11 +621,17 @@ impl ClientHandle {
                 }),
             )
             .await?;
-        result
+        let session_id = result
             .get("sessionId")
             .and_then(|s| s.as_str())
             .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("session/new missing sessionId"))
+            .ok_or_else(|| anyhow::anyhow!("session/new missing sessionId"))?;
+        Ok(SessionOpen {
+            session_id,
+            model: config_option_current(&result, "model"),
+            thinking: config_option_current(&result, "thinking")
+                .or_else(|| config_option_current(&result, "reasoning")),
+        })
     }
 
     pub async fn resume_session(
@@ -606,7 +639,7 @@ impl ClientHandle {
         session_id: &str,
         cwd: &Path,
         mcp: Vec<McpServerSpec>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<SessionOpen> {
         let mcp_v = Self::paint_mcp(self.backend_id, mcp);
         let result = self
             .request(
@@ -618,11 +651,17 @@ impl ClientHandle {
                 }),
             )
             .await?;
-        Ok(result
+        let sid = result
             .get("sessionId")
             .and_then(|s| s.as_str())
             .unwrap_or(session_id)
-            .to_string())
+            .to_string();
+        Ok(SessionOpen {
+            session_id: sid,
+            model: config_option_current(&result, "model"),
+            thinking: config_option_current(&result, "thinking")
+                .or_else(|| config_option_current(&result, "reasoning")),
+        })
     }
 
     pub async fn load_session(
@@ -737,6 +776,21 @@ fn _pathbuf_ty(_: PathBuf) {}
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn config_options_from_session_new_fixture() {
+        let result = serde_json::json!({
+            "sessionId": "s-1",
+            "configOptions": [
+                {"id": "model", "currentValue": "gpt-5"},
+                {"id": "thinking", "currentValue": "high"}
+            ]
+        });
+        assert_eq!(config_option_current(&result, "model").as_deref(), Some("gpt-5"));
+        assert_eq!(config_option_current(&result, "thinking").as_deref(), Some("high"));
+        assert_eq!(config_option_current(&result, "missing"), None);
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -745,7 +799,10 @@ mod tests {
         let c = client("omp", "omp").await.expect("client");
         let cwd = std::env::temp_dir();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sid = c.new_session(&cwd, vec![]).await.expect("new");
+        let open = c.new_session(&cwd, vec![]).await.expect("new");
+        let sid = open.session_id;
+        // OMP returns model via configOptions on session/new.
+        let _ = open.model;
         c.subscribe(&sid, tx).await.unwrap();
         c.set_auto_want(&sid, Some(Want::AllowOnce)).await;
         let outcome = c

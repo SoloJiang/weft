@@ -1491,6 +1491,9 @@ pub struct EngineInner {
     /// underlying child is process-global per backend; this Option means "this
     /// engine has subscribed at least one session on that client".
     pub acp_client: Option<crate::acp::runtime::ClientHandle>,
+    /// In-flight AskRegistry ids for ACP `session/request_permission` cards.
+    /// Cancelled on hard stop so a late Always/Full cannot grant after takeover.
+    pub acp_pending_asks: Vec<u64>,
     /// Rewind anchor bookkeeping for the in-flight turn: the user row that
     /// opened it. Written with the turn's native anchor at a clean TurnEnd
     /// (claude: `last_assistant_uuid`; codex app-server: the turn id).
@@ -2211,7 +2214,12 @@ pub async fn send(
         )
     };
     if skill_pending || cmd_now {
-        let (tid, _sid, _texts, orphans) = stop_quiet(eng).await;
+        let (tid, _sid, _texts, orphans, acp_asks) = stop_quiet(eng).await;
+        if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
+            for id in acp_asks {
+                asks.inner().cancel(id);
+            }
+        }
         {
             let mut g = eng.lock().await;
             g.pending_skill_refresh = false;
@@ -2880,7 +2888,7 @@ fn codex_first_turn_text(system_prompt: &str, message: &str, had_native: bool) -
 }
 
 
-fn is_acp_tool(tool: &str) -> bool {
+pub(crate) fn is_acp_tool(tool: &str) -> bool {
     crate::acp::backend_for(tool).is_some()
 }
 
@@ -2953,16 +2961,29 @@ async fn spawn_acp_turn(
     };
 
     let had_native = native.is_some();
-    let session_id = match native {
+    let (session_id, open_model) = match native {
         Some(id) => {
             // Prefer resume; fall back to load (hand-cut rewind files).
             match client.resume_session(&id, &cwd, mcp.clone()).await {
-                Ok(s) => s,
-                Err(_) => client.load_session(&id, &cwd, mcp.clone()).await.unwrap_or(id),
+                Ok(open) => (open.session_id, open.model),
+                Err(_) => {
+                    let sid = client
+                        .load_session(&id, &cwd, mcp.clone())
+                        .await
+                        .unwrap_or(id);
+                    (sid, None)
+                }
             }
         }
-        None => client.new_session(&cwd, mcp).await?,
+        None => {
+            let open = client.new_session(&cwd, mcp).await?;
+            (open.session_id, open.model)
+        }
     };
+    if let Some(model) = open_model {
+        let mut g = eng.lock().await;
+        g.last_model = Some(model);
+    }
 
     // Always resubscribe when the runtime lost the route (child restart /
     // shutdown clears sessions) even if the engine still holds acp_client.
@@ -3019,10 +3040,21 @@ async fn spawn_acp_turn(
         session_id.clone(),
         text,
     );
+    let prompt_epoch = eng.lock().await.reset_epoch;
     tauri::async_runtime::spawn(async move {
         match c.prompt(&s, &txt).await {
             Ok(outcome) => {
-                let cancelled = outcome.cancelled || e.lock().await.interrupting;
+                let (cancelled, stopped) = {
+                    let g = e.lock().await;
+                    (
+                        outcome.cancelled || g.interrupting || g.stopped,
+                        g.stopped || g.reset_epoch != prompt_epoch,
+                    )
+                };
+                if stopped {
+                    // Hard stop already owns terminal state — do not emit idle.
+                    return;
+                }
                 acp_emit_turn_end(
                     a.clone(),
                     d.clone(),
@@ -3030,13 +3062,32 @@ async fn spawn_acp_turn(
                     outcome.is_error,
                     cancelled,
                     outcome.usage.clone(),
+                    prompt_epoch,
                 )
                 .await;
             }
             Err(err) => {
                 eprintln!("[weft][acp] prompt failed: {err}");
-                let interrupting = e.lock().await.interrupting;
-                acp_emit_turn_end(a.clone(), d.clone(), e.clone(), true, interrupting, None).await;
+                let (interrupting, stopped) = {
+                    let g = e.lock().await;
+                    (
+                        g.interrupting,
+                        g.stopped || g.reset_epoch != prompt_epoch,
+                    )
+                };
+                if stopped {
+                    return;
+                }
+                acp_emit_turn_end(
+                    a.clone(),
+                    d.clone(),
+                    e.clone(),
+                    true,
+                    interrupting,
+                    None,
+                    prompt_epoch,
+                )
+                .await;
             }
         }
     });
@@ -3054,6 +3105,7 @@ async fn acp_emit_turn_end(
     is_error: bool,
     cancelled: bool,
     usage: Option<crate::acp::runtime::UsageBits>,
+    prompt_epoch: u64,
 ) {
     let mut pending_usage = usage;
     let mut pending_error = is_error;
@@ -3089,6 +3141,12 @@ async fn acp_emit_turn_end(
         }
 
         let mut inner = eng.lock().await;
+        // Hard stop / takeover already wrote STATUS_STOPPED and bumped
+        // reset_epoch. A late cancelled prompt must not overwrite that with idle.
+        if inner.stopped || inner.reset_epoch != prompt_epoch {
+            drop(inner);
+            break;
+        }
         let thread_id = inner.thread_id;
         let session_id = inner.session_id;
         if let Some(u) = pending_usage.as_ref() {
@@ -3314,10 +3372,16 @@ async fn acp_consumer(
                 intent_key,
                 options,
             } => {
-                let (thread_id, tool, dir) = {
+                let (thread_id, tool, dir, already_stopped) = {
                     let i = eng.lock().await;
-                    (i.thread_id, i.tool.clone(), i.ask_dir.clone())
+                    (i.thread_id, i.tool.clone(), i.ask_dir.clone(), i.stopped)
                 };
+                if already_stopped {
+                    client
+                        .reply_permission(&request_id, &options, crate::acp::Want::RejectOnce)
+                        .await;
+                    continue;
+                }
                 // Precise Always key (issue #89): ACP family + session intent +
                 // raw detail so two different commands never share a grant.
                 let action_key = crate::ask::action_key(&["Acp", &intent_key, &detail]);
@@ -3338,7 +3402,9 @@ async fn acp_consumer(
                                 &detail,
                                 &action_key,
                             );
-                            match tokio::time::timeout(
+                            // Track so stop() can cancel the Needs-you card.
+                            eng.lock().await.acp_pending_asks.push(id);
+                            let decided = match tokio::time::timeout(
                                 std::time::Duration::from_secs(3600),
                                 rx,
                             )
@@ -3350,6 +3416,17 @@ async fn acp_consumer(
                                     asks.cancel(id);
                                     crate::acp::Want::RejectOnce
                                 }
+                            };
+                            // Drop tracking whether answered or cancelled.
+                            {
+                                let mut g = eng.lock().await;
+                                g.acp_pending_asks.retain(|x| *x != id);
+                            }
+                            // If stop landed while we waited, reject regardless of answer.
+                            if eng.lock().await.stopped {
+                                crate::acp::Want::RejectOnce
+                            } else {
+                                decided
                             }
                         }
                     }
@@ -4734,6 +4811,7 @@ pub async fn stop_quiet(
     Option<i32>,
     Vec<(i32, String)>,
     Vec<(i32, serde_json::Value)>,
+    Vec<u64>,
 ) {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
@@ -4767,6 +4845,7 @@ pub async fn stop_quiet(
     // acp_emit_turn_end cannot overwrite stopped → idle after takeover.
     let acp = inner.acp_client.take();
     let acp_sid = inner.native_id.clone();
+    let acp_asks = std::mem::take(&mut inner.acp_pending_asks);
     // Drop the engine lock before awaiting ACP cancel/unsubscribe (they take
     // the runtime mutex). Re-lock afterwards for the remaining field clears.
     drop(inner);
@@ -4792,7 +4871,7 @@ pub async fn stop_quiet(
     // stop-then-restart (which resets `stopped`/`busy` and would otherwise slip
     // past those flags). send_reservation_valid compares the captured reset_epoch.
     inner.reset_epoch += 1;
-    (target.0, target.1, texts, orphan_tools)
+    (target.0, target.1, texts, orphan_tools, acp_asks)
 }
 
 /// Stop the engine outright (e.g. before a terminal takeover or by the runaway
@@ -4802,10 +4881,16 @@ pub async fn stop_quiet(
 /// (which skips "stopped"). Distinct from "idle" so a cleanly-idle session can
 /// still be driven by a bus post.
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
-    let (thread_id, session_id, texts, orphans) = stop_quiet(eng).await;
+    let (thread_id, session_id, texts, orphans, acp_asks) = stop_quiet(eng).await;
     let mut inner = eng.lock().await;
     inner.stopped = true;
     drop(inner);
+    // Drop open ACP permission cards so Always/Full cannot land after takeover.
+    if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
+        for id in acp_asks {
+            asks.inner().cancel(id);
+        }
+    }
     if let Some(db) = app.try_state::<Db>() {
         persist_activity(&db, session_id, thread_id, STATUS_STOPPED).await;
         // Stop is now visible to the engine, so finalizing here can't race a
@@ -6863,6 +6948,7 @@ mod tests {
             stopped: false,
             codex_client: None,
             acp_client: None,
+            acp_pending_asks: Vec::new(),
             turn_user_row: None,
             last_assistant_uuid: None,
             rewinding: false,
@@ -7212,6 +7298,7 @@ mod tests {
             stopped: false,
             codex_client: None,
             acp_client: None,
+            acp_pending_asks: Vec::new(),
             turn_user_row: None,
             last_assistant_uuid: None,
             rewinding: false,

@@ -564,10 +564,14 @@ pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> 
             })
             .unwrap_or_default();
         // First-turn system-prompt prepend stores `{system}\n\n{user}`.
-        // Allow suffix match only when the raw body contains the prepend
-        // separator, so an earlier shorter prompt cannot steal the ordinal.
+        // Accept a match only when the body is exactly that shape: non-empty
+        // prefix + separator + user text (normalized). A bare blank paragraph
+        // inside ordinary user prose must not steal the ordinal.
         let got = normalize_ws(&body);
-        let prepended = body.contains("\n\n") && got.ends_with(&want);
+        let prepended = match body.split_once("\n\n") {
+            Some((prefix, rest)) if !prefix.is_empty() => normalize_ws(rest) == want,
+            _ => false,
+        };
         if got != want && !prepended {
             continue;
         }
@@ -661,21 +665,43 @@ fn find_omp_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>
 
 fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
     use std::collections::HashSet;
+    /// Hard caps so a huge/unexpected `~/.omp/agent/sessions` tree cannot pin
+    /// the async command thread or blow memory. Prefer the encoded-cwd bucket
+    /// (caller); this walk is only the fallback.
+    const MAX_DIRS: usize = 256;
+    const MAX_FILES_SCANNED: usize = 4_096;
+    const MAX_DEPTH: usize = 6;
+    const MAX_HITS: usize = 32;
+    const SKIP_DIR_NAMES: &[&str] = &[
+        "node_modules", "target", ".git", "dist", "build", "cache", ".cache",
+    ];
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
     let mut seen = HashSet::new();
-    while let Some(dir) = stack.pop() {
+    let mut dirs_visited = 0usize;
+    let mut files_scanned = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        if dirs_visited >= MAX_DIRS || files_scanned >= MAX_FILES_SCANNED {
+            break;
+        }
+        if depth > MAX_DEPTH {
+            continue;
+        }
         let Ok(canon) = dir.canonicalize() else {
             continue;
         };
         if !seen.insert(canon) {
             continue; // cycle / revisit
         }
+        dirs_visited += 1;
         let rd = match std::fs::read_dir(&dir) {
             Ok(r) => r,
             Err(_) => continue,
         };
         for e in rd.flatten() {
+            if files_scanned >= MAX_FILES_SCANNED || out.len() >= MAX_HITS {
+                break;
+            }
             let p = e.path();
             let Ok(meta) = std::fs::symlink_metadata(&p) else {
                 continue;
@@ -684,8 +710,13 @@ fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
                 continue; // never follow symlink dirs/files into the walk
             }
             if meta.is_dir() {
-                stack.push(p);
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if SKIP_DIR_NAMES.iter().any(|s| name.eq_ignore_ascii_case(s)) {
+                    continue;
+                }
+                stack.push((p, depth + 1));
             } else {
+                files_scanned += 1;
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if name.contains(session_id) && name.ends_with(".jsonl") {
                     out.push(p);

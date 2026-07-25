@@ -265,7 +265,8 @@ function OverflowList<T>({
  *  LeadTab/WorkerConversation), so there's no real window where this default
  *  would show a reading that never arrives. */
 function skillDiscoverySupported(tool: string | undefined): boolean {
-  return tool !== "opencode";
+  // OpenCode has no engine-skills probe; OMP/ACP session_meta returns skills:None.
+  return tool !== "opencode" && tool !== "omp";
 }
 
 /** One Skills reading's tri-state: `undefined` means no authoritative result
