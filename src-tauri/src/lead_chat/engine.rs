@@ -521,20 +521,28 @@ fn finalize_text(
     Some(out.text.clone())
 }
 
+/// Returns how many queued rows were finalized — `teardown_for_switch` needs
+/// it to answer "did this actually interrupt anything"; every other caller
+/// ignores it.
 async fn mark_queued_status(
     app: &AppHandle,
     db: &Db,
     thread_id: i32,
     session_id: Option<i32>,
     status: &str,
-) {
+) -> usize {
     match repo::set_queued_status(db, thread_id, session_id, status).await {
         Ok(rows) => {
+            let n = rows.len();
             for m in rows {
                 emit_finalize(app, thread_id, m.id, status);
             }
+            n
         }
-        Err(e) => eprintln!("[weft] queued message {status} finalize failed: {e}"),
+        Err(e) => {
+            eprintln!("[weft] queued message {status} finalize failed: {e}");
+            0
+        }
     }
 }
 
@@ -2333,7 +2341,7 @@ pub async fn send(
         )
     };
     if skill_pending || cmd_now {
-        let (tid, _sid, _texts, orphans) = stop_quiet(eng).await;
+        let (tid, _sid, _texts, orphans, _was_busy) = stop_quiet(eng).await;
         {
             let mut g = eng.lock().await;
             g.pending_skill_refresh = false;
@@ -4491,8 +4499,18 @@ pub fn build_switch_digest(old_tool: &str, new_tool: &str, messages: &[lead_mess
 /// `STATUS_STOPPED` would wrongly render the freshly-switched thread/worker as
 /// taken-over/dead the moment the switch finishes, undermining the "switch
 /// succeeded" feedback the caller is about to surface.
-pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) {
-    let (thread_id, session_id, texts, orphans) = stop_quiet(eng).await;
+/// Returns whether this teardown actually interrupted work.
+///
+/// Not "was an engine cached" (PR #140 review round 13): a resident-but-idle
+/// engine — `revive::collect_stalled_leads` documents these, e.g. one the
+/// frontend opened for slash discovery — is removed and torn down with no turn
+/// to cut short. The switch's failure copy keys on this, and claiming an
+/// interruption that did not happen is the same class of lie as the "nothing
+/// changed" claims earlier rounds removed, pointing the other way.
+pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) -> bool {
+    let (thread_id, session_id, texts, orphans, was_busy) = stop_quiet(eng).await;
+    let had_open_rows = !texts.is_empty() || !orphans.is_empty();
+    let mut drained_queue = 0usize;
     if let Some(db) = app.try_state::<Db>() {
         persist_activity(&db, session_id, thread_id, "idle").await;
         finalize_orphan_tool_rows(app, &db, thread_id, orphans, "interrupted").await;
@@ -4506,7 +4524,7 @@ pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) {
             .await;
             emit_finalize(app, thread_id, id, "interrupted");
         }
-        mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
+        drained_queue = mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
     }
     let _ = app.emit(
         EVENT,
@@ -4518,6 +4536,7 @@ pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) {
             queue: Vec::new(),
         },
     );
+    was_busy || had_open_rows || drained_queue > 0
 }
 
 /// Explains the auto-recovery on the Needs-you feed (issue #93). Unlike the
@@ -4739,7 +4758,9 @@ pub(super) async fn stamp_freeze_marker(
 ) -> Option<FreezeMarkerStamped> {
     let db = db?;
     match repo::mark_turn_freeze_recovered(db, thread_id, session_id).await {
-        Ok(()) => Some(FreezeMarkerStamped(())),
+        // The row id is the switch path's business (it may need to undo its own
+        // stamp); freeze recovery never retracts one, so it drops it here.
+        Ok(_) => Some(FreezeMarkerStamped(())),
         Err(err) => {
             eprintln!(
                 "[weft] turn-freeze recovery: failed to stamp coordination marker for thread {thread_id}: {err}"
@@ -5336,6 +5357,12 @@ pub fn spawn_watchdog(app: AppHandle) {
 /// Kill the live child + reset turn state WITHOUT emitting a "stopped" event —
 /// the UI keeps its last (idle) state. Used by the skill-refresh restart so the
 /// bounce is invisible; `stop` wraps this and then emits "stopped".
+/// The trailing `bool` is whether a turn was BUSY at the moment this reset it,
+/// captured inside the same critical section (PR #140 review round 14). Read
+/// through a separate `eng.lock()` beforehand it describes a different state
+/// from the one actually reset — a send admitted in the gap gets interrupted
+/// while the flag says `false`, a turn that finished cleanly reports `true` —
+/// and `teardown_for_switch` turns that flag into a sentence shown to the user.
 pub async fn stop_quiet(
     eng: &EngineRef,
 ) -> (
@@ -5343,9 +5370,11 @@ pub async fn stop_quiet(
     Option<i32>,
     Vec<(i32, String, Option<String>)>,
     Vec<(i32, serde_json::Value)>,
+    bool,
 ) {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
+    let was_busy = inner.turn.busy;
     // Open text rows: the anonymous slot PLUS the item-keyed app-server rows.
     // Hard stops also shut the codex client down, so the consumer's disconnect
     // cleanup never runs for them — without this drain an item row would stay
@@ -5394,7 +5423,7 @@ pub async fn stop_quiet(
     // stop-then-restart (which resets `stopped`/`busy` and would otherwise slip
     // past those flags). send_reservation_valid compares the captured reset_epoch.
     inner.reset_epoch += 1;
-    (target.0, target.1, texts, orphan_tools)
+    (target.0, target.1, texts, orphan_tools, was_busy)
 }
 
 /// Stop the engine outright (e.g. before a terminal takeover or by the runaway
@@ -5404,7 +5433,7 @@ pub async fn stop_quiet(
 /// (which skips "stopped"). Distinct from "idle" so a cleanly-idle session can
 /// still be driven by a bus post.
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
-    let (thread_id, session_id, texts, orphans) = stop_quiet(eng).await;
+    let (thread_id, session_id, texts, orphans, _was_busy) = stop_quiet(eng).await;
     let mut inner = eng.lock().await;
     inner.stopped = true;
     drop(inner);
@@ -5423,7 +5452,7 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
             .await;
             emit_finalize(app, thread_id, id, "interrupted");
         }
-        mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
+        let _ = mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
     }
     let _ = app.emit(
         EVENT,
@@ -6818,7 +6847,7 @@ fn spawn_reader(
                 },
             );
             drop(inner);
-            mark_queued_status(&app, &db, thread_id, session_id, queued_status).await;
+            let _ = mark_queued_status(&app, &db, thread_id, session_id, queued_status).await;
         }
     });
 }

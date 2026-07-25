@@ -641,6 +641,48 @@ pub async fn rename_thread(db: &Db, thread_id: i32, title: &str) -> Result<threa
     Ok(a.update(&db.0).await?)
 }
 
+/// Test-only rendezvous immediately after a switch transaction's FIRST
+/// statement — the point where "did this take the write lock yet?" is
+/// answerable (PR #140 review round 15).
+///
+/// A barrier rather than a signal, and placed AFTER the statement rather than
+/// before, because neither alternative works: a probe before the first
+/// statement leaves a scheduling gap and cannot discriminate, and a plain
+/// signal after it would let the test race ahead. Note also why the test does
+/// not simply hold the write lock and watch the switch block — with the lock
+/// held, a write-first transaction's opening statement blocks INSIDE the
+/// critical section, so a rendezvous placed after it could never be reached
+/// and the correct implementation would deadlock. Nothing is held while the
+/// probe runs; the test asks a third connection whether the lock is taken.
+///
+/// `#[cfg(test)]` throughout, like `fail_write` (#144): production builds
+/// contain no expansion at all.
+#[cfg(test)]
+pub(crate) mod txn_probe {
+    tokio::task_local! {
+        pub static AFTER_FIRST_STATEMENT: std::sync::Arc<tokio::sync::Barrier>;
+    }
+}
+
+/// Rendezvous with an armed [`txn_probe`], or nothing at all.
+macro_rules! probe_after_first_statement {
+    () => {
+        #[cfg(test)]
+        {
+            let armed = crate::store::repo::txn_probe::AFTER_FIRST_STATEMENT
+                .try_with(std::sync::Arc::clone)
+                .ok();
+            if let Some(barrier) = armed {
+                // TWICE: the first rendezvous tells the test the statement has
+                // run, the second holds the transaction here while the test
+                // probes the lock. Between them it touches nothing.
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
+    };
+}
+
 /// Switch a thread's lead engine identity + model override (issue #96/#98).
 /// `model=None` clears any override (follow the CLI's own default). Also
 /// clears `lead_command`: a per-tool alias pin (e.g. `claude` → `cc-claude`)
@@ -652,21 +694,73 @@ pub async fn rename_thread(db: &Db, thread_id: i32, title: &str) -> Result<threa
 /// this stays a plain, independently-testable field update. No-op fields
 /// (same tool, same model) still write through — callers may use this to
 /// force-reload an engine so an externally-edited CLI config takes effect.
-pub async fn switch_thread_tool(
+pub async fn switch_lead_engine_txn(
     db: &Db,
     thread_id: i32,
     tool: &str,
     model: Option<&str>,
-) -> Result<thread::Model> {
-    let m = thread::Entity::find_by_id(thread_id)
-        .one(&db.0)
+) -> Result<()> {
+    fail_write!("switch_lead_engine_txn");
+    use sea_orm::TransactionTrait;
+    let txn = db.0.begin().await?;
+    // The FIRST statement is a write, deliberately. `begin()` opens a DEFERRED
+    // transaction, and under WAL a deferred read→write upgrade fails with
+    // SQLITE_BUSY_SNAPSHOT whenever ANY other writer commits after the
+    // snapshot — a stale snapshot the busy timeout cannot repair, unlike
+    // ordinary writer contention. `insert_lead_message` documents the same
+    // hazard and is why it is not a transaction at all. Weft's background
+    // activity/status writes make it reachable here, and the cost is high: the
+    // command has already torn the live engine down by this point, so a
+    // spurious abort is not a no-op. Taking the write lock with the opening
+    // statement means every read below runs under it.
+    //
+    // An UPDATE … WHERE rather than find-then-update for that reason:
+    // `rows_affected` carries the "thread is gone" case that the read used to.
+    let touched = thread::Entity::update_many()
+        .col_expr(thread::Column::LeadTool, Expr::value(tool))
+        .col_expr(thread::Column::LeadCommand, Expr::value(Option::<String>::None))
+        .col_expr(thread::Column::LeadModel, Expr::value(model.map(str::to_string)))
+        .filter(thread::Column::Id.eq(thread_id))
+        .exec(&txn)
+        .await?;
+    if touched.rows_affected == 0 {
+        anyhow::bail!("thread {thread_id} not found");
+    }
+    probe_after_first_statement!();
+
+    // The native-id clear, in the SAME transaction — the identical strip
+    // `set_lead_native_id_opt(.., None)` performs, against `txn`. The lead's
+    // native id lives in a `kind = "meta"` row rather than a column, which is
+    // why this is spelled out here instead of reusing that function.
+    if let Some(meta) = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("meta"))
+        .one(&txn)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
-    let mut a: thread::ActiveModel = m.into();
-    a.lead_tool = Set(tool.to_string());
-    a.lead_command = Set(None);
-    a.lead_model = Set(model.map(str::to_string));
-    Ok(a.update(&db.0).await?)
+    {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&meta.content).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("native_id");
+        }
+        if v.as_object().is_some_and(|o| o.is_empty()) {
+            lead_message::Entity::delete_by_id(meta.id).exec(&txn).await?;
+        } else {
+            let mut ma: lead_message::ActiveModel = meta.into();
+            ma.content = Set(v.to_string());
+            ma.update(&txn).await?;
+        }
+    }
+    // …and the grace marker is written in the SAME commit. This is the whole
+    // fix: "the native id is gone" and "there is evidence this surface ran"
+    // are two halves of one invariant (`revive::has_resumable_context`), and a
+    // transaction is what makes them unable to disagree. Everything else this
+    // PR tried — stamping first and gating, retracting on failure, a pending
+    // kind promoted later — existed only to make an EARLIER stamp safe, and
+    // none of it is needed once the two writes are atomic.
+    insert_marker_row(&txn, thread_id, None, MARKER_KIND_RECOVERED).await?;
+    txn.commit().await?;
+    Ok(())
 }
 
 pub async fn get_plan(db: &Db, thread_id: i32) -> Result<Option<plan::Model>> {
@@ -1252,32 +1346,50 @@ pub async fn rename_direction(db: &Db, direction_id: i32, name: &str) -> Result<
 /// the caller's lookup and this write — moot, not a failure, same posture as
 /// the old `switch_session_tool`); the direction half is required (not found
 /// is a real error, same as before).
-pub async fn switch_worker_tool_txn(
+pub async fn switch_worker_engine_txn(
     db: &Db,
     direction_id: i32,
     session_id: i32,
     tool: &str,
     model: Option<&str>,
-) -> Result<direction::Model> {
+) -> Result<()> {
     use sea_orm::TransactionTrait;
     let txn = db.0.begin().await?;
-    let d = direction::Entity::find_by_id(direction_id)
+    // Write first — see `switch_lead_engine_txn` for why a deferred
+    // read→write upgrade is not safe under WAL.
+    let touched = direction::Entity::update_many()
+        .col_expr(direction::Column::Tool, Expr::value(tool))
+        .filter(direction::Column::Id.eq(direction_id))
+        .exec(&txn)
+        .await?;
+    if touched.rows_affected == 0 {
+        anyhow::bail!("direction {direction_id} not found");
+    }
+    probe_after_first_statement!();
+    let thread_id = direction::Entity::find_by_id(direction_id)
         .one(&txn)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
-    let mut da: direction::ActiveModel = d.into();
-    da.tool = Set(tool.to_string());
-    let updated = da.update(&txn).await?;
+        .map(|d| d.thread_id)
+        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} vanished mid-transaction"))?;
 
     if let Some(s) = session::Entity::find_by_id(session_id).one(&txn).await? {
         let mut sa: session::ActiveModel = s.into();
         sa.tool = Set(tool.to_string());
         sa.command = Set(None);
         sa.model = Set(model.map(str::to_string));
+        // The native-id clear rides the SAME row update (issue #96 pitfall 1).
+        // It used to be a separate write after this transaction committed,
+        // which meant a failure there left the new tool paired with the OLD
+        // engine's native id — a pair `worker_engine` would then try to resume
+        // across engines, and one that no grace window repairs (adversarial
+        // re-review of PR #140, round 6). Atomic here, that pair cannot exist.
+        sa.native_session_id = Set(None);
         sa.update(&txn).await?;
     }
+    // Same commit as the writes above — see the lead twin.
+    insert_marker_row(&txn, thread_id, Some(session_id), MARKER_KIND_RECOVERED).await?;
     txn.commit().await?;
-    Ok(updated)
+    Ok(())
 }
 
 /// A direction's diff "vs target" config: `(stored, base_ref)` where `stored`
@@ -1841,6 +1953,49 @@ pub async fn set_session_native_id_opt(
 /// gain); read it as "the native context was deliberately reset and the next
 /// automated re-drive should back off for one grace window", of which a
 /// self-healed freeze is one cause and a human-initiated switch is another.
+///
+/// The switch path gates on this row the same way `recover_from_freeze` does,
+/// only harder: `lead_chat::commands::persist_switch` stamps it FIRST and
+/// aborts the entire switch if it fails, because a switch cannot fall back on
+/// "skip the clear and let it stall again" — by then the id belongs to an
+/// engine the thread no longer runs. Both writers therefore honour the same
+/// contract: this row exists before the native id is allowed to go missing.
+/// The grace marker's kind. Written by a freeze auto-recovery
+/// ([`mark_turn_freeze_recovered`]) and by an engine/model switch — the latter
+/// from inside its own transaction, so the row and the native-id clear it
+/// vouches for commit together.
+pub const MARKER_KIND_RECOVERED: &str = "turn_freeze_recovered";
+/// One grace-marker row, deletion-fenced like every other timeline insert.
+/// Generic over the connection so the switch transactions can use it
+/// inside the switch's transaction.
+async fn insert_marker_row<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    thread_id: i32,
+    session_id: Option<i32>,
+    kind: &str,
+) -> Result<i32> {
+    let res = conn
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO lead_message \
+             (thread_id, session_id, turn_id, role, kind, content, status, created_at) \
+             SELECT ?, ?, 0, 'system', ?, '{}', 'complete', ? \
+             WHERE EXISTS (SELECT 1 FROM thread WHERE id = ?)",
+            [
+                thread_id.into(),
+                session_id.into(),
+                kind.into(),
+                now().into(),
+                thread_id.into(),
+            ],
+        ))
+        .await?;
+    if res.rows_affected() == 0 {
+        anyhow::bail!("thread {thread_id} no longer exists (deleted)");
+    }
+    i32::try_from(res.last_insert_id()).map_err(|_| anyhow::anyhow!("marker id out of i32 range"))
+}
+
 pub async fn mark_turn_freeze_recovered(
     db: &Db,
     thread_id: i32,
@@ -1856,7 +2011,7 @@ pub async fn mark_turn_freeze_recovered(
         session_id,
         0,
         "system",
-        "turn_freeze_recovered",
+        MARKER_KIND_RECOVERED,
         "{}",
         "complete",
     )
@@ -1873,9 +2028,19 @@ pub async fn last_turn_freeze_recovery_secs(
     thread_id: i32,
     session_id: Option<i32>,
 ) -> Result<Option<u64>> {
+    last_marker_secs(db, thread_id, session_id, MARKER_KIND_RECOVERED).await
+}
+
+/// Newest marker of one kind for a (thread, session), as unix-seconds.
+async fn last_marker_secs(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    kind: &str,
+) -> Result<Option<u64>> {
     let q = lead_message::Entity::find()
         .filter(lead_message::Column::ThreadId.eq(thread_id))
-        .filter(lead_message::Column::Kind.eq("turn_freeze_recovered"))
+        .filter(lead_message::Column::Kind.eq(kind))
         .order_by_desc(lead_message::Column::Id);
     let q = match session_id {
         Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
@@ -5111,16 +5276,21 @@ mod tests {
         set_tool_command(&db, "claude", "cc-claude", false).await.unwrap();
         assert_eq!(get_thread(&db, t.id).await.unwrap().unwrap().lead_command.as_deref(), Some("claude"));
 
-        let switched = switch_thread_tool(&db, t.id, "codex", Some("gpt-5.5-high")).await.unwrap();
+        switch_lead_engine_txn(&db, t.id, "codex", Some("gpt-5.5-high"))
+            .await
+            .unwrap();
+        // Read back rather than trusting a returned model: what matters is
+        // what COMMITTED, and the transaction no longer hands one out.
+        let switched = get_thread(&db, t.id).await.unwrap().unwrap();
         assert_eq!(switched.lead_tool, "codex");
         assert_eq!(switched.lead_model.as_deref(), Some("gpt-5.5-high"));
         assert_eq!(switched.lead_command, None, "stale claude alias pin must be cleared");
 
         // A model override clears the same way when the caller passes None.
-        let cleared = switch_thread_tool(&db, t.id, "codex", None).await.unwrap();
-        assert_eq!(cleared.lead_model, None);
+        switch_lead_engine_txn(&db, t.id, "codex", None).await.unwrap();
+        assert_eq!(get_thread(&db, t.id).await.unwrap().unwrap().lead_model, None);
 
-        assert!(switch_thread_tool(&db, 9999, "codex", None).await.is_err());
+        assert!(switch_lead_engine_txn(&db, 9999, "codex", None).await.is_err());
     }
 
     #[tokio::test]
@@ -5143,7 +5313,7 @@ mod tests {
             a.update(&db.0).await.unwrap();
         }
 
-        switch_worker_tool_txn(&db, d.id, s.id, "opencode", Some("kimi-for-coding/k2p6"))
+        switch_worker_engine_txn(&db, d.id, s.id, "opencode", Some("kimi-for-coding/k2p6"))
             .await
             .unwrap();
 
@@ -5153,14 +5323,145 @@ mod tests {
         assert_eq!(s2.tool, "opencode");
         assert_eq!(s2.model.as_deref(), Some("kimi-for-coding/k2p6"));
         assert_eq!(s2.command, None, "stale claude alias pin must be cleared");
-        // Switching direction/session tool does not itself touch native id —
-        // that is the caller's (lead_chat::commands) job, layered separately.
-        assert_eq!(s2.native_session_id.as_deref(), Some("native-1"));
+        // The native-id clear rides this same transaction as of PR #140 round
+        // 6. It used to be a separate write the caller made afterwards, which
+        // could fail on its own and leave the new tool paired with the OLD
+        // engine's native id — a pair `worker_engine` would then try to resume
+        // across engines. Atomic here, that pair cannot exist.
+        assert_eq!(s2.native_session_id, None, "the switch clears it in the same write");
 
-        assert!(switch_worker_tool_txn(&db, 9999, s.id, "codex", None).await.is_err());
+        assert!(switch_worker_engine_txn(&db, 9999, s.id, "codex", None).await.is_err());
         // A missing session is tolerated (not an error) on the session half —
         // see the function doc — as long as the direction is real.
-        assert!(switch_worker_tool_txn(&db, d.id, 9999, "codex", None).await.is_ok());
+        assert!(switch_worker_engine_txn(&db, d.id, 9999, "codex", None).await.is_ok());
+    }
+
+    /// Two `Db` handles onto one WAL file, so a concurrent commit is a real
+    /// event rather than a simulated one. Migrations run once; the second
+    /// handle just opens the same file.
+    async fn shared_file_db(dir: &std::path::Path) -> (Db, Db) {
+        use sea_orm::ConnectionTrait;
+        let url = format!("sqlite://{}?mode=rwc", dir.join("weft.db").to_string_lossy());
+        let open = |url: String| async move {
+            let conn = sea_orm::Database::connect(url).await.unwrap();
+            conn.execute_unprepared("PRAGMA journal_mode=WAL;").await.unwrap();
+            conn.execute_unprepared("PRAGMA busy_timeout=2000;").await.unwrap();
+            conn
+        };
+        let a = open(url.clone()).await;
+        use sea_orm_migration::MigratorTrait;
+        crate::store::migration::Migrator::up(&a, None).await.unwrap();
+        let b = open(url).await;
+        (Db(a, false), Db(b, false))
+    }
+
+    /// PR #140 rounds 11/15: the switch transactions take the write lock with
+    /// their FIRST statement, because a deferred read→write upgrade is not
+    /// safe under WAL — `insert_lead_message` documents the same hazard and is
+    /// why it is not a transaction at all. The busy timeout cannot repair a
+    /// stale snapshot, and by the time this runs the command has already torn
+    /// the live engine down, so a spurious abort is not a harmless retry.
+    ///
+    /// DETERMINISTIC, with no sleeps: the transaction rendezvouses with the
+    /// test immediately after its first statement (`probe_after_first_statement!`),
+    /// and while it is parked there a THIRD connection asks the only question
+    /// that separates the two shapes — is the write lock already held?
+    ///
+    ///   - write-first: the opening `UPDATE` took it, so the probe is refused.
+    ///   - read-first:  the opening `SELECT` took nothing, so the probe wins,
+    ///                  and its commit then poisons the transaction's snapshot.
+    ///
+    /// Two earlier versions of this test were timing-based and could silently
+    /// stop discriminating on a loaded runner; this one has no timing in it.
+    #[tokio::test]
+    async fn the_switch_transaction_holds_the_write_lock_from_its_first_statement() {
+        use sea_orm::ConnectionTrait;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (a, probe) = shared_file_db(dir.path()).await;
+        let ws = create_workspace(&a, "ws").await.unwrap();
+        let t = create_thread(&a, ws.id, "Issue", "feature", "claude").await.unwrap();
+        // The probe must fail fast rather than wait for the lock, or it would
+        // block until the parked transaction commits.
+        probe.0.execute_unprepared("PRAGMA busy_timeout=0;").await.unwrap();
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        // A third handle for the transaction itself, so `a` stays available
+        // here for the read-back at the end.
+        let (writer, _spare) = shared_file_db(dir.path()).await;
+        let switching = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let tid = t.id;
+            tokio::spawn(async move {
+                txn_probe::AFTER_FIRST_STATEMENT
+                    .scope(barrier, switch_lead_engine_txn(&writer, tid, "codex", Some("opus")))
+                    .await
+            })
+        };
+
+        // Parked after its first statement — no clock involved, the barrier is
+        // what orders this.
+        barrier.wait().await;
+        let contended = probe
+            .0
+            .execute_unprepared("UPDATE thread SET title = 'probe' WHERE id = 1;")
+            .await;
+        assert!(
+            contended.is_err(),
+            "the transaction must already hold the write lock after its FIRST statement; a \
+             read-first shape would leave it free here and then abort on the stale snapshot"
+        );
+
+        barrier.wait().await;
+        switching.await.expect("join").expect("the switch itself must succeed");
+        let after = get_thread(&a, t.id).await.unwrap().unwrap();
+        assert_eq!(after.lead_tool, "codex");
+        assert_eq!(after.lead_model.as_deref(), Some("opus"));
+        assert!(last_turn_freeze_recovery_secs(&a, t.id, None).await.unwrap().is_some());
+    }
+
+    /// PR #140 round 6: the lead's tool/model write and its native-id clear are
+    /// ONE transaction, so they cannot half-apply.
+    ///
+    /// Same technique as the worker test below — force the SECOND half to fail
+    /// with a genuine DB error while the first is perfectly healthy, then
+    /// assert the first rolled back. The lead's native id lives in a
+    /// `kind = "meta"` lead_message row rather than a column, so renaming that
+    /// table away is what breaks the clear specifically.
+    ///
+    /// Without the transaction this leaves `lead_tool = "codex"` next to the
+    /// old engine's native id — the pair the next send would try to resume
+    /// across engines, and one no grace window repairs.
+    #[tokio::test]
+    async fn switch_lead_engine_txn_rolls_back_the_tool_when_the_native_clear_fails() {
+        use sea_orm::ConnectionTrait;
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        set_lead_native_id(&db, t.id, "lead-native-1").await.unwrap();
+
+        // Claimed BEFORE the table goes away — this is the switch's own step 0,
+        // and the transaction below is what would have promoted it.
+        db.0.execute_unprepared("ALTER TABLE lead_message RENAME TO lead_message_renamed_for_test")
+            .await
+            .unwrap();
+        let err = switch_lead_engine_txn(&db, t.id, "codex", Some("gpt-5.5-high")).await;
+        assert!(err.is_err(), "the native-id half must fail (table renamed away)");
+        db.0.execute_unprepared("ALTER TABLE lead_message_renamed_for_test RENAME TO lead_message")
+            .await
+            .unwrap();
+
+        let t2 = get_thread(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(
+            t2.lead_tool, "claude",
+            "lead_tool must be ROLLED BACK — a committed tool next to the old native id is \
+             exactly the half-applied pair this transaction exists to prevent"
+        );
+        assert_eq!(t2.lead_model, None);
+        assert_eq!(
+            lead_native_id(&db, t.id).await.unwrap().as_deref(),
+            Some("lead-native-1"),
+            "and the id is untouched, so the surface is still coherently on the OLD engine"
+        );
     }
 
     /// Adversarial re-review of PR #139, P1: the direction/session writes used
@@ -5175,7 +5476,7 @@ mod tests {
     /// a busy-snapshot race) while the direction half is perfectly healthy,
     /// then asserts the direction was rolled back too.
     #[tokio::test]
-    async fn switch_worker_tool_txn_rolls_back_direction_when_session_write_fails() {
+    async fn switch_worker_engine_txn_rolls_back_direction_when_session_write_fails() {
         use sea_orm::ConnectionTrait;
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
@@ -5194,7 +5495,8 @@ mod tests {
             .await
             .unwrap();
 
-        let err = switch_worker_tool_txn(&db, d.id, s.id, "opencode", Some("gpt-5.5-high")).await;
+        let err =
+            switch_worker_engine_txn(&db, d.id, s.id, "opencode", Some("gpt-5.5-high")).await;
         assert!(err.is_err(), "the session-table write must fail (table renamed away)");
 
         // Restore the table so the read-back below (and any other test using

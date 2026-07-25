@@ -1602,6 +1602,44 @@ async fn insert_switch_marker(
     }
 }
 
+/// Stable, locale-independent code a failed switch rejects with, matched by
+/// `src/session/engineSwitch.ts` so the dialog renders translated copy from
+/// `src/i18n/{en,zh}.ts` instead of raw SQLite text. Same contract as
+/// `process_quota::DEGRADED_ERROR_CODE`: reject with the CODE, log the detail.
+///
+/// The atomic write leaves exactly ONE failure mode — the transaction did not
+/// commit, so no tool change, no cleared native id, no marker. Two codes all
+/// the same, because the user-visible STATE differs by something the failure
+/// mode does not capture: whether the switch had already torn a live engine
+/// down before it failed. `teardown_for_switch` only runs when
+/// `LeadChatState::remove` returns one, and switching an idle or never-opened
+/// surface — the common case — interrupts nothing at all.
+///
+/// That distinction is the whole reason for the split. Copy that claims an
+/// interruption on an idle switch is as wrong as copy that claims nothing
+/// changed after a real one; this PR's review history contains four instances
+/// of the second mistake and one of the first, which is what a single
+/// unconditional sentence buys.
+///
+/// Earlier revisions carried three codes, one per failure mode of a multi-step
+/// design. That count remains a decent smell test — but count the states the
+/// USER can be left in, not the ways the code can fail.
+pub const SWITCH_FAILED_ERROR_CODE: &str = "switch_failed";
+/// As above, when a live engine WAS torn down first: its turn was killed and
+/// its open and queued rows finalized as `interrupted`.
+pub const SWITCH_FAILED_INTERRUPTED_ERROR_CODE: &str = "switch_failed_interrupted";
+
+/// Reject with the code matching what the user is actually left with, and log
+/// the cause. `interrupted` is whether this command tore a live engine down
+/// before the write failed.
+fn switch_failure(surface: &str, interrupted: bool, err: impl std::fmt::Display) -> String {
+    eprintln!("[weft] engine switch failed for {surface}; nothing was persisted: {err}");
+    if interrupted {
+        return SWITCH_FAILED_INTERRUPTED_ERROR_CODE.to_string();
+    }
+    SWITCH_FAILED_ERROR_CODE.to_string()
+}
+
 /// Switch the LEAD's engine identity and/or model override for `thread_id` —
 /// issue #96 layer 1 of 3 (independent of any worker's tool and of the global
 /// default; see `switch_worker_tool` / `set_default_tool`). Semantics:
@@ -1612,15 +1650,18 @@ async fn insert_switch_marker(
 ///      finalization as Stop, but landing on "idle" rather than
 ///      `STATUS_STOPPED` (`engine::teardown_for_switch`), since this is a
 ///      replacement, not a stop the user needs to explicitly resume from.
-///   3. persist the new tool/model (`repo::switch_thread_tool`, which also
-///      clears any stale command-alias pin), re-stamp the freeze-recovery
-///      grace marker (`repo::mark_turn_freeze_recovered` — see its doc for
-///      why a switch reuses it: prevents `revive`'s stall sweep from
-///      auto-redriving this freshly-switched lead within the next tick), and
-///      clear the native session id (`engine::clear_native_id` — the SAME
-///      contract turn-freeze recovery and rewind already rely on: dogfooding
-///      pitfall #1, a stale native id handed to a different engine's
-///      `--resume`/`resume` fails fast with "No conversation found").
+///   3. make the switch durable in ONE transaction
+///      (`repo::switch_lead_engine_txn`): the new tool/model (which also
+///      clears any stale command-alias pin), the native session id
+///      cleared (dogfooding pitfall #1: a stale native id handed to a
+///      different engine's `--resume`/`resume` fails fast with "No
+///      conversation found"), and the freeze-recovery grace marker that
+///      vouches for that clear. The marker and the clear are the two halves of
+///      `revive::has_resumable_context`; committing them together is what makes
+///      the defect this fixes impossible rather than merely guarded, and is
+///      why none of the gating/retraction machinery earlier revisions of this
+///      PR carried is present. See `repo::mark_turn_freeze_recovered` for why a
+///      switch writes that marker at all.
 ///   4. reconstruct the engine fresh via `lead_engine` — the exact construction
 ///      path a cold app boot uses (re-injects the ask-hook/MCP servers/
 ///      system-prompt for the NEW tool identity), never a hand-patched partial
@@ -1676,8 +1717,14 @@ async fn switch_lead_tool_inner(
     if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
         asks.cancel_for(thread_id, "lead");
     }
+    // Whether real work was interrupted decides which failure the user is
+    // shown if the write below does not commit — see `switch_failure`. The
+    // answer comes from the teardown itself, NOT from whether an engine was
+    // cached: a resident-but-idle engine is torn down with nothing to cut
+    // short (review round 13).
+    let mut interrupted = false;
     if let Some(eng) = app.state::<LeadChatState>().remove(lead_key(thread_id)) {
-        engine::teardown_for_switch(app, &eng).await;
+        interrupted = engine::teardown_for_switch(app, &eng).await;
     }
 
     // The lead's OWN timeline only — `list_lead_messages` returns every row for
@@ -1693,23 +1740,14 @@ async fn switch_lead_tool_inner(
         .collect();
     let digest = engine::build_switch_digest(&before.lead_tool, &tool, &messages);
 
-    repo::switch_thread_tool(db, thread_id, &tool, model.as_deref())
+    // ONE transaction: the new tool/model, the native-id clear (issue #96
+    // pitfall 1) and the grace marker that vouches for it. The marker and the
+    // clear are the two halves of `revive::has_resumable_context`, and
+    // committing them together is what makes the defect this PR fixes
+    // structurally impossible rather than merely guarded.
+    repo::switch_lead_engine_txn(db, thread_id, &tool, model.as_deref())
         .await
-        .map_err(|e| e.to_string())?;
-    // Re-stamp the freeze-recovery grace marker BEFORE clearing native id —
-    // same ordering discipline `recover_from_freeze` uses, and see
-    // `repo::mark_turn_freeze_recovered`'s doc for why a switch reuses it:
-    // without this, `revive`'s stall sweep could read a much-older, unrelated
-    // freeze-recovery marker as "resumable" once ITS OWN grace window had
-    // elapsed and auto-redrive this freshly-switched lead within one sweep
-    // tick. Best-effort (logged, not fatal) — the switch's own correctness
-    // does not depend on it.
-    if let Err(err) = repo::mark_turn_freeze_recovered(db, thread_id, None).await {
-        eprintln!("[weft] switch_lead_tool: failed to stamp the freeze-recovery grace marker for thread {thread_id}: {err}");
-    }
-    engine::clear_native_id(db, None, thread_id)
-        .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| switch_failure(&format!("thread {thread_id}"), interrupted, e))?;
 
     let lang = lang.unwrap_or_else(|| "en".to_string());
     let eng = lead_engine(app, db, thread_id, &lang)
@@ -1733,8 +1771,10 @@ async fn switch_lead_tool_inner(
 /// Switch a WORKER's engine identity and/or model override for `session_id` —
 /// issue #96 layer 2 of 3 (independent of the thread's lead and of the global
 /// default; see `switch_lead_tool` / `set_default_tool`). Same six-step
-/// semantics as `switch_lead_tool`, with two worker-specific differences:
-///   - the durable write is `repo::switch_worker_tool_txn` — ONE transaction
+/// semantics as `switch_lead_tool` — including step 3's single transaction,
+/// which `repo::switch_worker_engine_txn` provides rather than this restating
+/// it — with two worker-specific differences:
+///   - the tool/model write is `repo::switch_worker_engine_txn` — ONE transaction
 ///     covering BOTH `direction.tool` (the durable side: `chat_open_worker_impl`'s
 ///     cold-recreate path, which fires the very next time this worker is
 ///     opened since the native id this switch just cleared makes that
@@ -1786,8 +1826,10 @@ async fn switch_worker_tool_inner(
     if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
         asks.cancel_for(dir.thread_id, &sess.direction_id.to_string());
     }
+    // Same as switch_lead_tool: the teardown reports, cache presence does not.
+    let mut interrupted = false;
     if let Some(eng) = app.state::<LeadChatState>().remove(session_id as i64) {
-        engine::teardown_for_switch(app, &eng).await;
+        interrupted = engine::teardown_for_switch(app, &eng).await;
     }
 
     let messages = repo::list_lead_messages(db, dir.thread_id).await.unwrap_or_default();
@@ -1797,17 +1839,13 @@ async fn switch_worker_tool_inner(
         .collect();
     let digest = engine::build_switch_digest(&sess.tool, &tool, &own);
 
-    repo::switch_worker_tool_txn(db, sess.direction_id, session_id, &tool, model.as_deref())
+    // ONE transaction, worker axis — see switch_lead_tool. It already covered
+    // both halves of the tool write itself (`direction.tool` for the
+    // cold-recreate path, `session.tool`/`model` for the live one), which is
+    // why the marker and the native-id clear simply joined it.
+    repo::switch_worker_engine_txn(db, sess.direction_id, session_id, &tool, model.as_deref())
         .await
-        .map_err(|e| e.to_string())?;
-    // See switch_lead_tool's identical call for why — same grace-window reuse,
-    // same best-effort posture, ordered before the native-id clear.
-    if let Err(err) = repo::mark_turn_freeze_recovered(db, dir.thread_id, Some(session_id)).await {
-        eprintln!("[weft] switch_worker_tool: failed to stamp the freeze-recovery grace marker for session {session_id}: {err}");
-    }
-    engine::clear_native_id(db, Some(session_id), dir.thread_id)
-        .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| switch_failure(&format!("session {session_id}"), interrupted, e))?;
 
     let eng = worker_engine(app, db, session_id)
         .await
@@ -2512,5 +2550,191 @@ mod live_slot_tests {
         let slots = build_worker_slots(&db, vec![snap(sess.id, th.id, true)]).await;
 
         assert!(slots.is_empty());
+    }
+}
+
+/// The engine/model switch's durable write — issue #96/#98, adversarial
+/// re-review of PR #139 (P2).
+///
+/// The defect: `mark_turn_freeze_recovered` and `clear_native_id` were two
+/// independent writes, so a failed marker write followed by a successful clear
+/// left the surface at `native_id = None && marker = None` — the one
+/// combination `revive::has_resumable_context` reads as "never ran", which
+/// silently drops it out of the automated re-drive pool.
+///
+/// The fix is ONE transaction per axis (`repo::switch_lead_engine_txn` /
+/// `switch_worker_engine_txn`) covering the tool/model change, the native-id
+/// clear and the marker. They commit together or not at all, so the bad
+/// combination cannot be observed. Nine rounds of review went into the
+/// alternatives — stamping early and gating, retracting on failure, a pending
+/// marker kind promoted at commit — and every one of them existed only to make
+/// an EARLIER stamp safe. Atomicity removes the need for all of it.
+///
+/// SCOPE: these cover the `&Db` core. The `#[tauri::command]` wrappers are out
+/// of reach (this crate has no `AppHandle` harness), so ask cancellation,
+/// `teardown_for_switch`, the engine rebuild and the digest are NOT claimed as
+/// covered — including which failure code a switch picks, since that keys on
+/// `teardown_for_switch`'s return and both need a live `LeadChatState` — and neither are the concurrency windows between this command and
+/// `revive`'s sweep or a concurrent `rewind`, which are pre-existing and
+/// tracked separately. The transactions' own rollback proofs live in
+/// `store::repo`'s tests, where a failure can be injected between the halves.
+#[cfg(test)]
+mod switch_write_tests {
+    use crate::lead_chat::revive::has_resumable_context;
+    use crate::store::{repo, Db};
+
+    async fn mem() -> Db {
+        Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    /// (thread_id, direction_id, session_id) with a native id on BOTH axes, so
+    /// each test can prove the clear happened.
+    async fn fixture(db: &Db) -> (i32, i32, i32) {
+        let ws = repo::create_workspace(db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-switch", "main", "", true)
+            .await
+            .unwrap();
+        let th = repo::create_thread(db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        let dir = repo::create_direction(db, th.id, "alpha", "claude", repo_ref.id, "why", "impl-only", "")
+            .await
+            .unwrap();
+        let sess = repo::create_session(db, dir.id, repo_ref.id, "claude", "/tmp/wt")
+            .await
+            .unwrap();
+        repo::set_lead_native_id(db, th.id, "lead-nat-1").await.unwrap();
+        repo::set_session_native_id(db, sess.id, "worker-nat-1").await.unwrap();
+        (th.id, dir.id, sess.id)
+    }
+
+    /// The code is a cross-language contract with
+    /// `src/session/engineSwitch.ts`'s `SWITCH_FAILED_ERROR_CODE`, which no
+    /// compiler checks across the boundary. Pins the Rust half: the rejection
+    /// is the CODE alone, with the cause going to the log — renaming it here
+    /// without updating the matcher and both locale files goes red on this
+    /// side too.
+    #[test]
+    fn a_failed_switch_rejects_with_the_stable_code_only() {
+        assert_eq!(
+            super::switch_failure("thread 7", false, "database is locked"),
+            "switch_failed",
+            "spelling is mirrored in src/session/engineSwitch.ts — update both"
+        );
+        assert_eq!(
+            super::switch_failure("thread 7", true, "database is locked"),
+            "switch_failed_interrupted",
+            "a switch that tore a live engine down first must say so"
+        );
+        assert_eq!(super::SWITCH_FAILED_ERROR_CODE, "switch_failed");
+        assert_eq!(
+            super::SWITCH_FAILED_INTERRUPTED_ERROR_CODE,
+            "switch_failed_interrupted"
+        );
+        // One IS a prefix of the other, and the frontend matches by substring
+        // — so `switchErrorCodeOf` must try the longest code first or an
+        // interrupted switch silently renders the un-interrupted copy. Pinned
+        // here because nothing checks that ordering across the boundary; if
+        // this assertion ever has to change, that sort goes with it.
+        assert!(
+            super::SWITCH_FAILED_INTERRUPTED_ERROR_CODE
+                .starts_with(super::SWITCH_FAILED_ERROR_CODE),
+            "SWITCH_ERROR_I18N in src/session/engineSwitch.ts sorts by length for this reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lead_switch_lands_tool_clear_and_marker_together() {
+        let db = mem().await;
+        let (th, _dir, _sess) = fixture(&db).await;
+
+        repo::switch_lead_engine_txn(&db, th, "codex", Some("gpt-5.5-high"))
+            .await
+            .unwrap();
+
+        let t = repo::get_thread(&db, th).await.unwrap().unwrap();
+        assert_eq!(t.lead_tool, "codex");
+        assert_eq!(t.lead_model.as_deref(), Some("gpt-5.5-high"));
+        let native = repo::lead_native_id(&db, th).await.unwrap();
+        let recovered = repo::last_turn_freeze_recovery_secs(&db, th, None).await.unwrap();
+        assert_eq!(native, None, "issue #96 pitfall 1: the old engine's id must not survive");
+        assert!(recovered.is_some(), "and the marker that vouches for it is in the same commit");
+        assert!(
+            has_resumable_context(native.is_some(), recovered),
+            "id-gone-AND-marker-gone is the silent-strand shape the transaction rules out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_switch_lands_tool_clear_and_marker_together() {
+        let db = mem().await;
+        let (th, dir, sess) = fixture(&db).await;
+
+        repo::switch_worker_engine_txn(&db, dir, sess, "codex", Some("gpt-5.5-high"))
+            .await
+            .unwrap();
+
+        // BOTH halves of the tool write: `direction.tool` is what
+        // `chat_open_worker_impl`'s cold-recreate path reads, `session.tool`
+        // what the live path reads.
+        assert_eq!(repo::get_direction(&db, dir).await.unwrap().unwrap().tool, "codex");
+        let s = repo::get_session(&db, sess).await.unwrap().unwrap();
+        assert_eq!(s.tool, "codex");
+        assert_eq!(s.model.as_deref(), Some("gpt-5.5-high"));
+        let recovered = repo::last_turn_freeze_recovery_secs(&db, th, Some(sess)).await.unwrap();
+        assert_eq!(s.native_session_id, None);
+        assert!(recovered.is_some());
+        assert!(has_resumable_context(s.native_session_id.is_some(), recovered));
+    }
+
+    /// The worker's marker is session-scoped. A worker switch must not stamp
+    /// the LEAD's grace window and mute its independent re-drive.
+    #[tokio::test]
+    async fn a_worker_switch_does_not_stamp_the_leads_window() {
+        let db = mem().await;
+        let (th, dir, sess) = fixture(&db).await;
+
+        repo::switch_worker_engine_txn(&db, dir, sess, "codex", None)
+            .await
+            .unwrap();
+
+        assert!(repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            repo::last_turn_freeze_recovery_secs(&db, th, None).await.unwrap(),
+            None,
+            "the lead's own marker is a separate row and must stay unstamped"
+        );
+    }
+
+    /// A failed switch changes nothing — the transaction is the guarantee, and
+    /// the surface stays coherently on its old engine. Driven through #144's
+    /// seam on the lead write.
+    #[tokio::test]
+    async fn a_failed_switch_leaves_the_surface_on_its_old_engine() {
+        let db = mem().await;
+        let (th, _dir, _sess) = fixture(&db).await;
+
+        let failed = repo::fail_write::while_failing(
+            "switch_lead_engine_txn",
+            repo::switch_lead_engine_txn(&db, th, "codex", Some("opus")),
+        )
+        .await;
+        assert!(failed.is_err());
+
+        let t = repo::get_thread(&db, th).await.unwrap().unwrap();
+        assert_eq!(t.lead_tool, "claude");
+        assert_eq!(t.lead_model, None);
+        assert_eq!(
+            repo::lead_native_id(&db, th).await.unwrap().as_deref(),
+            Some("lead-nat-1")
+        );
+        assert_eq!(
+            repo::last_turn_freeze_recovery_secs(&db, th, None).await.unwrap(),
+            None,
+            "and no marker vouching for a reset that never happened"
+        );
     }
 }

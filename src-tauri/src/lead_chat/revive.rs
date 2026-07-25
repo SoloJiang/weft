@@ -458,7 +458,16 @@ async fn stalled_direction_ids(
 /// Reads only — the marker is written by the engine's recovery path. This file
 /// still persists nothing of its own (stall/redrive state stays in memory).
 ///
-/// Depends on TWO contracts on the writer's side, both in `recover_from_freeze`:
+/// Depends on TWO contracts on the writer's side, and there are exactly two
+/// writers, which satisfy them in different ways:
+///   - the freeze auto-recovery — `engine::stamp_freeze_marker` →
+///     `FreezeMarkerStamped` → `engine::clear_native_context_after_freeze`.
+///     Two writes, so the dependency is carried by a witness type (PR #144).
+///   - the engine/model switch (issue #96/#98) — `repo::switch_lead_engine_txn`
+///     / `switch_worker_engine_txn` write the marker and clear the native id
+///     in ONE transaction, so there is no ordering to enforce and no window to
+///     gate: they commit together or not at all (PR #140).
+/// A third writer that clears a native id owes the same two, by either means:
 ///
 /// 1. Write order — the marker is stamped before any write that exposes a
 ///    recoverable idle session. The session row and the marker are read in two
@@ -489,7 +498,13 @@ async fn stalled_direction_ids(
 /// axis, which had been patched separately and kept the old rule. Two call sites
 /// encoding the same rule independently is how the second one got missed; a
 /// third axis should reuse this rather than re-derive it.
-fn has_resumable_context(native_id_present: bool, recovered: Option<u64>) -> bool {
+///
+/// `pub(crate)` for the same reason: `lead_chat::commands`'s switch-write tests
+/// assert the post-switch state against THIS predicate rather than restating
+/// "id present or marker present" a third time, so a future change to the rule
+/// moves those tests with it instead of leaving them quietly asserting the old
+/// one. Nothing outside tests calls it from another module.
+pub(crate) fn has_resumable_context(native_id_present: bool, recovered: Option<u64>) -> bool {
     native_id_present || recovered.is_some()
 }
 
