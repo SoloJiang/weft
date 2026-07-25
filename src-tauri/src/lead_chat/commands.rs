@@ -1717,12 +1717,14 @@ async fn switch_lead_tool_inner(
     if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
         asks.cancel_for(thread_id, "lead");
     }
-    // Whether a live engine was actually torn down decides which failure the
-    // user is shown if the write below does not commit — see `switch_failure`.
+    // Whether real work was interrupted decides which failure the user is
+    // shown if the write below does not commit — see `switch_failure`. The
+    // answer comes from the teardown itself, NOT from whether an engine was
+    // cached: a resident-but-idle engine is torn down with nothing to cut
+    // short (review round 13).
     let mut interrupted = false;
     if let Some(eng) = app.state::<LeadChatState>().remove(lead_key(thread_id)) {
-        engine::teardown_for_switch(app, &eng).await;
-        interrupted = true;
+        interrupted = engine::teardown_for_switch(app, &eng).await;
     }
 
     // The lead's OWN timeline only — `list_lead_messages` returns every row for
@@ -1824,10 +1826,10 @@ async fn switch_worker_tool_inner(
     if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
         asks.cancel_for(dir.thread_id, &sess.direction_id.to_string());
     }
+    // Same as switch_lead_tool: the teardown reports, cache presence does not.
     let mut interrupted = false;
     if let Some(eng) = app.state::<LeadChatState>().remove(session_id as i64) {
-        engine::teardown_for_switch(app, &eng).await;
-        interrupted = true;
+        interrupted = engine::teardown_for_switch(app, &eng).await;
     }
 
     let messages = repo::list_lead_messages(db, dir.thread_id).await.unwrap_or_default();
@@ -2571,7 +2573,8 @@ mod live_slot_tests {
 /// SCOPE: these cover the `&Db` core. The `#[tauri::command]` wrappers are out
 /// of reach (this crate has no `AppHandle` harness), so ask cancellation,
 /// `teardown_for_switch`, the engine rebuild and the digest are NOT claimed as
-/// covered — and neither are the concurrency windows between this command and
+/// covered — including which failure code a switch picks, since that keys on
+/// `teardown_for_switch`'s return and both need a live `LeadChatState` — and neither are the concurrency windows between this command and
 /// `revive`'s sweep or a concurrent `rewind`, which are pre-existing and
 /// tracked separately. The transactions' own rollback proofs live in
 /// `store::repo`'s tests, where a failure can be injected between the halves.

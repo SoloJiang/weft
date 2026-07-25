@@ -521,20 +521,28 @@ fn finalize_text(
     Some(out.text.clone())
 }
 
+/// Returns how many queued rows were finalized — `teardown_for_switch` needs
+/// it to answer "did this actually interrupt anything"; every other caller
+/// ignores it.
 async fn mark_queued_status(
     app: &AppHandle,
     db: &Db,
     thread_id: i32,
     session_id: Option<i32>,
     status: &str,
-) {
+) -> usize {
     match repo::set_queued_status(db, thread_id, session_id, status).await {
         Ok(rows) => {
+            let n = rows.len();
             for m in rows {
                 emit_finalize(app, thread_id, m.id, status);
             }
+            n
         }
-        Err(e) => eprintln!("[weft] queued message {status} finalize failed: {e}"),
+        Err(e) => {
+            eprintln!("[weft] queued message {status} finalize failed: {e}");
+            0
+        }
     }
 }
 
@@ -4491,8 +4499,19 @@ pub fn build_switch_digest(old_tool: &str, new_tool: &str, messages: &[lead_mess
 /// `STATUS_STOPPED` would wrongly render the freshly-switched thread/worker as
 /// taken-over/dead the moment the switch finishes, undermining the "switch
 /// succeeded" feedback the caller is about to surface.
-pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) {
+/// Returns whether this teardown actually interrupted work.
+///
+/// Not "was an engine cached" (PR #140 review round 13): a resident-but-idle
+/// engine — `revive::collect_stalled_leads` documents these, e.g. one the
+/// frontend opened for slash discovery — is removed and torn down with no turn
+/// to cut short. The switch's failure copy keys on this, and claiming an
+/// interruption that did not happen is the same class of lie as the "nothing
+/// changed" claims earlier rounds removed, pointing the other way.
+pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) -> bool {
+    let was_busy = { eng.lock().await.turn.busy };
     let (thread_id, session_id, texts, orphans) = stop_quiet(eng).await;
+    let had_open_rows = !texts.is_empty() || !orphans.is_empty();
+    let mut drained_queue = 0usize;
     if let Some(db) = app.try_state::<Db>() {
         persist_activity(&db, session_id, thread_id, "idle").await;
         finalize_orphan_tool_rows(app, &db, thread_id, orphans, "interrupted").await;
@@ -4506,7 +4525,7 @@ pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) {
             .await;
             emit_finalize(app, thread_id, id, "interrupted");
         }
-        mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
+        drained_queue = mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
     }
     let _ = app.emit(
         EVENT,
@@ -4518,6 +4537,7 @@ pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) {
             queue: Vec::new(),
         },
     );
+    was_busy || had_open_rows || drained_queue > 0
 }
 
 /// Explains the auto-recovery on the Needs-you feed (issue #93). Unlike the
@@ -5425,7 +5445,7 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
             .await;
             emit_finalize(app, thread_id, id, "interrupted");
         }
-        mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
+        let _ = mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
     }
     let _ = app.emit(
         EVENT,
@@ -6820,7 +6840,7 @@ fn spawn_reader(
                 },
             );
             drop(inner);
-            mark_queued_status(&app, &db, thread_id, session_id, queued_status).await;
+            let _ = mark_queued_status(&app, &db, thread_id, session_id, queued_status).await;
         }
     });
 }

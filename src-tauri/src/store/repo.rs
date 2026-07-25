@@ -5329,7 +5329,7 @@ mod tests {
     /// is not a harmless retry.
     #[tokio::test]
     async fn a_concurrent_commit_cannot_poison_the_switch_transaction() {
-        use sea_orm::{ConnectionTrait, TransactionTrait};
+        use sea_orm::TransactionTrait;
         let dir = tempfile::tempdir().expect("tempdir");
         let (a, b) = shared_file_db(dir.path()).await;
         let ws = create_workspace(&a, "ws").await.unwrap();
