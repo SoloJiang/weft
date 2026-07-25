@@ -37,7 +37,7 @@ pub struct SessionInfo {
     pub worktree: String,
     pub branch: String,
     pub tool: String,
-    /// Effective binary for terminal takeover (resume command): the per-session
+    /// Effective binary for the terminal resume command: the per-session
     /// pin / global alias, else the tool identity. Lets "Copy resume command"
     /// produce the actual CLI (e.g. `cc-claude`) for an aliased session.
     pub command: String,
@@ -394,7 +394,8 @@ pub async fn lead_ensure(
         .map_err(|e| e.to_string())
 }
 
-/// Stop the lead engine (terminal takeover: the session must have one writer).
+/// Stop the lead engine explicitly. Lifecycle control is separate from session
+/// navigation, so copying a resume command or opening Codex never reaches here.
 #[tauri::command]
 pub async fn lead_stop(app: AppHandle, thread_id: i32) -> Result<(), String> {
     if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
@@ -1064,8 +1065,8 @@ pub async fn auto_verify_check(
 // Every worker (claude/codex/opencode) runs on the engine: a weft-owned chat
 // timeline in the worker conversation surface, with per-tool wire dialects
 // (engine::per_turn).
-// Each session remains takeover-able in the user's own terminal via its
-// native id.
+// Native-session re-entry is non-destructive: Codex opens its app link; other
+// tools receive a terminal resume command for the native id.
 
 /// Spawn (or resume) a chat-mode worker for a (direction, repo) slot: worktree
 /// cwd, thread-bus MCP + ask bridge, the assembled brief as the first user

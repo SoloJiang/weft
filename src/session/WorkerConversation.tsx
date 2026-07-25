@@ -13,7 +13,7 @@ import { SessionInfoPanel } from "./SessionInfoPanel";
 import { Inspect } from "../components/Inspect";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { ALL_REWIND_MODES, RewindDialog, RewindPickerDialog } from "./RewindDialog";
-import { appLink, resumeCommand } from "../lib/resume";
+import { nativeSessionResumeTarget } from "../lib/resume";
 import { useImeComposition } from "../lib/useImeComposition";
 import {
   failChatHistoryLoad,
@@ -258,6 +258,31 @@ export function WorkerConversation() {
     void api.flagSessionSkillRefresh(sid).finally(() => markSkillsDirty());
   };
 
+  const sessionResumeAction = (() => {
+    if (!ref || !nativeId) return undefined;
+    const target = nativeSessionResumeTarget(ref.tool, ref.worktree, nativeId, ref.command);
+    switch (target.kind) {
+      case "open-codex":
+        return {
+          kind: "open-codex" as const,
+          onOpen: () => {
+            void api.openUrl(target.url).catch(() => {});
+          },
+        };
+      case "copy-terminal-command":
+        return {
+          kind: "copy-terminal-command" as const,
+          onCopy: async () => {
+            try {
+              await navigator.clipboard.writeText(target.command);
+              return true;
+            } catch {
+              return false;
+            }
+          },
+        };
+    }
+  })();
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
@@ -356,19 +381,7 @@ export function WorkerConversation() {
             onSend={(v, images, fs) => sendToWorker(directionId, repoId, v, images, fs)}
             onStop={() => sid != null && void api.chatInterrupt(sid)}
             onRewindPicker={canRewind ? () => setPickerOpen(true) : undefined}
-            onTakeOver={async () => {
-              if (!ref || !nativeId || sid == null) return false;
-              await api.chatStop(sid);
-              await navigator.clipboard.writeText(
-                resumeCommand(ref.tool, ref.worktree, nativeId, ref.command),
-              );
-              return true;
-            }}
-            onOpenApp={
-              ref && nativeId && appLink(ref.tool, nativeId)
-                ? () => void api.openUrl(appLink(ref.tool, nativeId)!)
-                : undefined
-            }
+            sessionResumeAction={sessionResumeAction}
           />
         </div>
       </section>

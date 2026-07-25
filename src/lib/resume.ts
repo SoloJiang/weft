@@ -1,6 +1,5 @@
-// Build the shell command to resume a session in the user's own terminal, and
-// the app deep link where one exists. weft drives native CLIs, so a session can
-// always be picked back up outside weft (architecture §5.6).
+// Build a non-destructive route back into a native session. Weft drives native
+// CLIs, but Codex has a session deep link while other tools resume in a terminal.
 
 function shq(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
@@ -36,4 +35,29 @@ export function resumeCommand(
 export function appLink(tool: string, nativeId: string): string | null {
   if (tool === "codex") return `codex://threads/${nativeId}`;
   return null;
+}
+
+/**
+ * The one safe, user-facing way to re-enter a native session.
+ *
+ * Codex opens its target thread through the app link. Every other coding agent
+ * gets its exact terminal resume command. Neither destination stops Weft's
+ * engine; lifecycle controls stay separate from session navigation.
+ */
+export type NativeSessionResumeTarget =
+  | { kind: "copy-terminal-command"; command: string }
+  | { kind: "open-codex"; url: string };
+
+export function nativeSessionResumeTarget(
+  tool: string,
+  cwd: string,
+  nativeId: string,
+  command?: string,
+): NativeSessionResumeTarget {
+  const url = appLink(tool, nativeId);
+  if (url) return { kind: "open-codex", url };
+  return {
+    kind: "copy-terminal-command",
+    command: resumeCommand(tool, cwd, nativeId, command),
+  };
 }

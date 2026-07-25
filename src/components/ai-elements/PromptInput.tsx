@@ -188,37 +188,6 @@ export function InputGroup({
   );
 }
 
-function InputGroupButton({
-  children,
-  onClick,
-  disabled,
-  title,
-  type = "button",
-}: {
-  readonly children: ReactNode;
-  readonly onClick?: () => void;
-  readonly disabled?: boolean;
-  readonly title?: string;
-  readonly type?: "button" | "submit";
-}) {
-  return (
-    <div className="flex items-end p-2">
-      <Button
-        type={type}
-        size="icon"
-        variant="primary"
-        disabled={disabled}
-        title={title}
-        aria-label={title}
-        onClick={onClick}
-        className="h-8 w-8"
-      >
-        {children}
-      </Button>
-    </div>
-  );
-}
-
 export function PromptInputButton({
   children,
   className,
@@ -295,31 +264,35 @@ export function PromptInputSubmit({
   disabled,
   loadingLabel,
   title,
+  className,
 }: {
   readonly children?: ReactNode;
   readonly canSubmit?: boolean;
   readonly disabled?: boolean;
   readonly loadingLabel: string;
   readonly title?: string;
+  readonly className?: string;
 }) {
   const ctx = usePromptInput();
   const hasText = ctx.value.trim().length > 0;
   const canSend = canSubmit ?? hasText;
   return (
-    <InputGroupButton
+    <Button
       type="submit"
+      size="icon"
+      variant="primary"
       disabled={ctx.disabled || disabled || !canSend}
       title={title}
+      aria-label={title}
+      className={cn("h-8 w-8", className)}
     >
       {ctx.isLoading ? <Spinner className="h-4 w-4" label={loadingLabel} /> : children}
-    </InputGroupButton>
+    </Button>
   );
 }
 
-/** The stop/interrupt button shown while a turn is streaming. Mirrors the submit
- *  button's footprint exactly (same `flex items-end p-2` wrapper + h-8 w-8 button)
- *  so toggling send ↔ stop never shifts the edge, and shows a FILLED square (the
- *  universal stop glyph) instead of a bare outline. Calm by default, danger on hover. */
+/** The stop/interrupt button mirrors submit's fixed circular footprint, so swapping
+ *  the two controls never moves the composer edge. */
 export function PromptInputStop({
   onClick,
   label,
@@ -328,21 +301,19 @@ export function PromptInputStop({
   readonly label: string;
 }) {
   return (
-    <div className="flex items-end p-2">
-      <Tooltip label={label} align="end">
-        <Button
-          type="button"
-          size="icon"
-          variant="default"
-          onClick={onClick}
-          title={label}
-          aria-label={label}
-          className="h-8 w-8 text-ink-muted hover:border-danger/50 hover:text-danger"
-        >
-          <span className="h-2.5 w-2.5 rounded-[2px] bg-current" aria-hidden />
-        </Button>
-      </Tooltip>
-    </div>
+    <Tooltip label={label} align="end">
+      <Button
+        type="button"
+        size="icon"
+        variant="primary"
+        onClick={onClick}
+        title={label}
+        aria-label={label}
+        className="h-8 w-8 rounded-full hover:bg-danger active:bg-danger"
+      >
+        <span className="h-2.5 w-2.5 rounded-[2px] bg-current" aria-hidden />
+      </Button>
+    </Tooltip>
   );
 }
 
