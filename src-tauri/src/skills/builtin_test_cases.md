@@ -7,7 +7,7 @@ description: Use when deriving or revising an issue's test cases (the <weft:test
 
 # Deriving an issue's test cases
 
-Flow: **draft outline → enrich from code → adversarial review → clarify with the human → finalize as `<weft:test_cases>`**. The sentinel is the document's only home — weft stores it, renders it as a mindmap, and lets the human edit it; never duplicate the tree in prose.
+Flow: **draft outline → enrich from code → adversarial review → clarify with the human → finalize as `<weft:test_cases>`**. The always-on lead prompt only holds the trigger and sentinel shell; this skill owns the workflow and quality bars. The sentinel is the document's only home — weft stores it, renders it as a mindmap, and lets the human edit it; never duplicate the tree in prose.
 
 ## Non-negotiables
 

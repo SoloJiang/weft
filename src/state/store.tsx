@@ -10,7 +10,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import { createDeltaCoalescer } from "./deltaCoalescer";
-import { applyLeadFinalize, mergeLeadSnapshot } from "./leadSnapshot";
+import { applyLeadConsumed, applyLeadFinalize, mergeLeadSnapshot } from "./leadSnapshot";
 import {
   beginChatHistoryLoad,
   failChatHistoryLoad,
@@ -145,6 +145,29 @@ function notifyProcessQuotaBlocked() {
   toast(i18n.t("processQuota.blockedToast"), "danger");
 }
 
+/** The raw rejection from a Tauri command: `Result<T, String>` commands reject
+ *  with the bare string; a handful of paths (network layer, JS runtime) reject
+ *  with a real `Error` instead — cover both, no nested ternary. */
+function rawErrorMessage(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  return "";
+}
+
+/** A send that never created a message row (queue-full race, worktree/session
+ *  mid-rewind, "turn ended while persisting", a missing agent binary before any
+ *  row lands, …) has no row to carry a delivery receipt — the composer
+ *  restoring the draft would otherwise be the ONLY visible effect, which reads
+ *  as a silent drop (issue #94). Surface the reason explicitly instead. */
+function notifySendFailed(error: unknown) {
+  const raw = rawErrorMessage(error);
+  const msg =
+    raw === "queue_full"
+      ? i18n.t("lead.queueFull")
+      : i18n.t("lead.sendFailedGeneric", { reason: raw || i18n.t("lead.sendFailedUnknown") });
+  toast(msg, "danger");
+}
+
 interface Store {
   workspaces: Workspace[];
   activeWorkspaceId: number | null;
@@ -252,11 +275,12 @@ interface Store {
    *  so the board can mark issues whose access was inherited and offer a revoke. */
   authGrants: GrantSnapshot;
   /** Revoke a standing grant. dir=null clears the whole issue's grants (one-click
-   *  "revoke all"); dir set clears one task; +summary drops a single always-rule. */
+   *  "revoke all"); dir set clears one task; +actionKey drops a single
+   *  always-rule (the canonical action identity, not the display summary). */
   revokeAuthGrant: (
     thread: number,
     dir: string | null,
-    summary: string | null,
+    actionKey: string | null,
   ) => Promise<void>;
   /** Lead-proposed write declarations awaiting human approve/deny. */
   writeTriggers: WriteTrigger[];
@@ -270,6 +294,12 @@ interface Store {
   refreshNeeds: () => Promise<void>;
   answerAsk: (item: NeedItem, text: string) => Promise<void>;
   goToAsk: (item: NeedItem) => Promise<void>;
+  /** Single-source jump for any worker reference carrying a bus-style
+   *  (thread, dir) pair — board cards, needs-you rows, anywhere a worker's
+   *  name is shown. `dir` is the direction id as a string (backend convention,
+   *  see WorkerConversation's dir-parsing note) or a non-numeric sentinel
+   *  ("lead") for a thread-level ask with no specific direction. */
+  goToDirectionRef: (thread: number, dir: string) => Promise<void>;
   answerPermission: (
     askId: number,
     answer: "allow" | "deny" | "always" | "full",
@@ -278,6 +308,13 @@ interface Store {
   /** The curator's repo map: profiles + dependency edges. */
   repoProfiles: RepoProfile[];
   repoEdges: RepoEdge[];
+  /** Whether an analysis pass (auto or forced) is currently queued or running for
+   *  the active workspace, straight from the backend's coalesced gate. Distinct
+   *  from `analyzing` (which also counts an unrelated curator-chat turn as busy):
+   *  this is precisely "a pass will reach an un-started repo soon" — the signal
+   *  repo cards use to render "queued" instead of "pending" (nothing scheduled,
+   *  needs a manual "Analyze deps" click). Refreshed alongside repoProfiles. */
+  repoAnalysisActive: boolean;
   /** Which workspace-home tab is active (Board · Repos). */
   homeTab: HomeTab;
   setHomeTab: (t: HomeTab) => void;
@@ -508,6 +545,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [showNeeds, setShowNeeds] = useState(false);
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
+  const [repoAnalysisActive, setRepoAnalysisActive] = useState(false);
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
@@ -1395,7 +1433,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (sessionId == null) return;
         await api.chatSend(sessionId, text, images, files);
       } catch (error) {
-        if (isProcessQuotaDegradedError(error)) notifyProcessQuotaBlocked();
+        if (isProcessQuotaDegradedError(error)) {
+          notifyProcessQuotaBlocked();
+        } else {
+          notifySendFailed(error);
+        }
         // ChatComposer restores the draft when the send promise rejects.
         throw error;
       }
@@ -1602,6 +1644,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               ? { ...x, content: p.content, status: p.status as LeadMessage["status"] }
               : x,
           ),
+        }));
+      } else if (p.type === "consumed") {
+        // Delivery receipt, third tier (issue #94): the agent produced its
+        // first activity for the turn this user row opened.
+        setLeadMessages((m) => ({
+          ...m,
+          [p.thread_id]: applyLeadConsumed(m[p.thread_id] ?? [], p.message_id, p.consumed_at),
         }));
       } else if (p.type === "activity") {
         const act = { name: p.name, summary: p.summary };
@@ -1830,7 +1879,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       try {
         await api.leadSend(threadId, text, currentLang(), images, files);
       } catch (error) {
-        if (isProcessQuotaDegradedError(error)) notifyProcessQuotaBlocked();
+        if (isProcessQuotaDegradedError(error)) {
+          notifyProcessQuotaBlocked();
+        } else {
+          notifySendFailed(error);
+        }
         // ChatComposer restores the draft when the send promise rejects.
         throw error;
       }
@@ -2012,6 +2065,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (ws == null) {
       setRepoProfiles([]);
       setRepoEdges([]);
+      setRepoAnalysisActive(false);
       return;
     }
     try {
@@ -2022,6 +2076,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (activeWorkspaceIdRef.current !== ws) return;
       setRepoProfiles(g.nodes);
       setRepoEdges(g.edges);
+      setRepoAnalysisActive(g.analysis_active);
     } catch (e) {
       /* workspace may be empty */
       console.error(e);
@@ -2426,11 +2481,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } catch (e) {
         /* already resolved/expired, or the durable write failed */
         console.error(e);
-        // Only Full persists (approach B: Always is in-memory only). Full still
-        // applies this session even if persisting it failed; surface that so a
-        // re-prompt after restart isn't a silent surprise. Always is never saved
-        // by design, so its re-prompt is expected — no "not saved" warning.
-        if (answer === "full") {
+        // Both Full and Always now create a durable standing grant (Always is
+        // keyed by the exact action_key, not the lossy display summary, so it's
+        // safe to persist too — issue #89). Either still applies this session
+        // even if persisting it failed; surface that so a re-prompt after
+        // restart isn't a silent surprise.
+        if (answer === "full" || answer === "always") {
           toast(i18n.t("grants.grantNotSaved"));
         }
       }
@@ -2439,7 +2495,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 
   const revokeAuthGrant = useCallback(
-    async (thread: number, dir: string | null, summary: string | null) => {
+    async (thread: number, dir: string | null, actionKey: string | null) => {
       // optimistic: drop the matching grants locally so the marker clears at once
       setAuthGrants((cur) => ({
         full: cur.full.filter(
@@ -2450,12 +2506,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             !(
               g.thread === thread &&
               (dir === null || g.dir === dir) &&
-              (summary === null || g.summary === summary)
+              (actionKey === null || g.action_key === actionKey)
             ),
         ),
       }));
       try {
-        await api.revokeAuthGrant(thread, dir, summary);
+        await api.revokeAuthGrant(thread, dir, actionKey);
       } catch (e) {
         console.error(e);
         // The backend rolls back a failed durable write, so the reconcile below
@@ -2474,21 +2530,34 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [],
   );
 
-  const goToAsk = useCallback(
-    async (item: NeedItem) => {
+  // Single entry for "jump to the worker this reference is about" — reused by
+  // every surface that shows a bus-delivered (thread, dir) pair (Needs-you
+  // rows today; board cards resolve via worktrees instead, see viewDirection).
+  // Prefers a live engine for that direction; falls back to the owning
+  // thread's lead chat when there is none (thread-level ask, or the direction
+  // never spawned a worker). `dir` non-numeric (e.g. the "lead" sentinel) just
+  // fails the live lookup and falls through to the thread — never throws.
+  const goToDirectionRef = useCallback(
+    async (thread: number, dir: string) => {
       setShowNeeds(false);
       setViewing(null);
-      const live = Object.values(sessions).find(
-        (s) => s.directionId === item.direction_id,
-      );
+      const directionId = Number(dir);
+      const live = Number.isFinite(directionId)
+        ? Object.values(sessions).find((s) => s.directionId === directionId)
+        : undefined;
       if (live) {
-        setActiveThreadId(item.thread_id);
+        setActiveThreadId(thread);
         openWorker(live.directionId, live.repoId);
         return;
       }
-      await selectThread(item.thread_id);
+      await selectThread(thread);
     },
     [sessions, selectThread, openWorker],
+  );
+
+  const goToAsk = useCallback(
+    (item: NeedItem) => goToDirectionRef(item.thread_id, String(item.direction_id)),
+    [goToDirectionRef],
   );
 
   useEffect(() => {
@@ -2662,9 +2731,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // forced pass (button) is in flight for the active workspace — the latter has no lead
   // turn, so it'd otherwise leave the Analyze control enabled mid-pass.
   const reanalyzing = activeWorkspaceId != null && reanalyzingWs.has(activeWorkspaceId);
+  // Also busy while the backend's coalesced gate reports a pass in flight for this
+  // workspace (`repoAnalysisActive`, refreshed alongside repoProfiles) — covers the
+  // auto pass spawned right after adding a repo, which has no lead turn AND isn't
+  // the direct button, so without this the toolbar sat idle while analysis was
+  // actually running in the background (the bug this state exists to fix).
   const analyzing =
     (curatorTid != null && isInFlight(leadTurn[curatorTid]?.state ?? "stopped")) ||
-    reanalyzing;
+    reanalyzing ||
+    repoAnalysisActive;
 
   const value: Store = {
     workspaces,
@@ -2739,9 +2814,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshNeeds,
     answerAsk,
     goToAsk,
+    goToDirectionRef,
     answerPermission,
     repoProfiles,
     repoEdges,
+    repoAnalysisActive,
     homeTab,
     setHomeTab,
     openSettings,
