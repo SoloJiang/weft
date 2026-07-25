@@ -458,11 +458,17 @@ async fn stalled_direction_ids(
 /// Reads only — the marker is written by the engine's recovery path. This file
 /// still persists nothing of its own (stall/redrive state stays in memory).
 ///
-/// Depends on TWO contracts on the writer's side. `recover_from_freeze` was
-/// the first writer to honour them; `lead_chat::commands::persist_switch` (the
-/// engine/model switch, issue #96/#98) is the second, and honours both by
-/// stamping first and aborting the switch outright if the stamp fails. Any
-/// third writer that clears a native id owes the same two:
+/// Depends on TWO contracts on the writer's side, and there are exactly two
+/// writers, each of which now encodes the dependency in a witness type rather
+/// than a comment (arrived at independently, in PR #144 and PR #140, after the
+/// comment version was missed twice):
+///   - the freeze auto-recovery — `engine::stamp_freeze_marker` →
+///     `FreezeMarkerStamped` → `engine::clear_native_context_after_freeze`;
+///   - the engine/model switch (issue #96/#98) —
+///     `lead_chat::commands::stamp_switch_marker` → `MarkerStamped` →
+///     `commands::persist_switch`, which additionally aborts the whole switch
+///     on a failed stamp, since a switch cannot fall back on "keep the old id".
+/// Any third writer that clears a native id owes the same two:
 ///
 /// 1. Write order — the marker is stamped before any write that exposes a
 ///    recoverable idle session. The session row and the marker are read in two

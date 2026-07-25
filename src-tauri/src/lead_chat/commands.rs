@@ -1659,6 +1659,16 @@ mod switch_gate {
     /// It also carries the `SwitchTarget` the stamp was made against, so the
     /// axis that was stamped and the axis that gets written are the same
     /// value by construction, not by two matching arguments.
+    ///
+    /// Sibling, not duplicate, of `engine::FreezeMarkerStamped` (PR #144),
+    /// which landed the same idea on the freeze-recovery axis while this was in
+    /// review. They stay separate on purpose: that one is a ZST guarding
+    /// `clear_native_context_after_freeze` in `engine`, this one carries a
+    /// payload and guards `persist_switch` here, and the two guard different
+    /// write sets with different failure policies (skip the clear vs. abort the
+    /// whole operation). Merging them would erase that distinction and buy
+    /// nothing. That both reviews independently reached for a witness is the
+    /// signal worth keeping: a comment was not enough, twice.
     pub(super) struct MarkerStamped(SwitchTarget);
 
     impl MarkerStamped {
@@ -2307,21 +2317,27 @@ mod live_slot_tests {
 ///     still resumable by `revive`'s own predicate; and a retry after an abort
 ///     completes rather than half-applying.
 ///
-/// The failure injection is a `BEFORE INSERT` trigger scoped to
-/// `kind = 'turn_freeze_recovered'`, so ONLY the grace-marker insert fails —
-/// deterministically, with a real DB error, no timing or locking dependency
-/// (same technique as `repo`'s `switch_worker_tool_txn` rollback test, which
-/// renames a table). Scoping it to the kind rather than the whole table keeps
-/// every other write in the sequence healthy, so the abort is genuinely
-/// attributable to the stamp. Verified non-vacuous by mutation: make
-/// `stamp_switch_marker` hand back a token even when the insert failed — #139's
-/// defect in this shape — and both failure tests go red.
+/// Failure injection is `repo::fail_write::while_failing`, the house seam
+/// (PR #144), armed on `"mark_turn_freeze_recovered"`. Its selectivity is what
+/// makes these attributable: ONLY that write fails while every neighbour in
+/// the sequence stays healthy, so an ungated implementation would genuinely
+/// succeed at persisting the tool and clearing the native id. It is
+/// task-scoped, so these run in parallel with the rest of the suite without a
+/// serializing lock, and `#[cfg(test)]`-stripped in production builds.
+///
+/// (An earlier revision of this PR used a `BEFORE INSERT` trigger scoped to
+/// `kind = 'turn_freeze_recovered'`, written before #144 landed. Same
+/// selectivity, but two techniques for one job is a divergence not worth
+/// keeping — and #144 instruments the exact write these tests need.)
+///
+/// Verified non-vacuous by mutation: make `stamp_switch_marker` hand back a
+/// token even when the insert failed — #139's defect in this shape — and both
+/// failure tests go red.
 #[cfg(test)]
 mod switch_gate_tests {
     use super::{persist_switch, stamp_switch_marker, SwitchTarget, SWITCH_MARKER_ERROR_CODE};
     use crate::lead_chat::revive::has_resumable_context;
     use crate::store::{repo, Db};
-    use sea_orm::ConnectionTrait;
 
     async fn mem() -> Db {
         Db::connect("sqlite::memory:").await.unwrap()
@@ -2348,27 +2364,9 @@ mod switch_gate_tests {
         (th.id, dir.id, sess.id)
     }
 
-    /// Make the grace-marker insert — and nothing else — fail with a genuine
-    /// DB error. `insert_lead_message` is a raw `INSERT … SELECT … WHERE
-    /// EXISTS`, so a row-level BEFORE INSERT trigger aborts the statement.
-    async fn block_marker_writes(db: &Db) {
-        db.0
-            .execute_unprepared(
-                "CREATE TRIGGER weft_test_block_freeze_marker \
-                 BEFORE INSERT ON lead_message FOR EACH ROW \
-                 WHEN NEW.kind = 'turn_freeze_recovered' \
-                 BEGIN SELECT RAISE(ABORT, 'injected: grace-marker insert failed'); END",
-            )
-            .await
-            .unwrap();
-    }
-
-    async fn unblock_marker_writes(db: &Db) {
-        db.0
-            .execute_unprepared("DROP TRIGGER weft_test_block_freeze_marker")
-            .await
-            .unwrap();
-    }
+    /// The one store write these tests fail, by the name #144 registered it
+    /// under at `repo::mark_turn_freeze_recovered`'s `fail_write!`.
+    const MARKER_WRITE: &str = "mark_turn_freeze_recovered";
 
     #[tokio::test]
     async fn lead_switch_stamps_the_marker_then_persists_and_clears() {
@@ -2443,16 +2441,18 @@ mod switch_gate_tests {
     async fn lead_switch_aborts_and_changes_nothing_when_the_marker_write_fails() {
         let db = mem().await;
         let (th, _dir, _sess) = fixture(&db).await;
-        block_marker_writes(&db).await;
 
-        let err = stamp_switch_marker(&db, SwitchTarget::Lead { thread_id: th }).await;
+        let err = repo::fail_write::while_failing(
+            MARKER_WRITE,
+            stamp_switch_marker(&db, SwitchTarget::Lead { thread_id: th }),
+        )
+        .await;
 
         assert_eq!(
             err.err().as_deref(),
             Some(SWITCH_MARKER_ERROR_CODE),
             "aborts with the stable code the UI translates, not a Rust-authored sentence"
         );
-        unblock_marker_writes(&db).await;
 
         let t = repo::get_thread(&db, th).await.unwrap().unwrap();
         assert_eq!(t.lead_tool, "claude", "tool/model persist must not have run");
@@ -2476,11 +2476,13 @@ mod switch_gate_tests {
     async fn worker_switch_aborts_and_changes_nothing_when_the_marker_write_fails() {
         let db = mem().await;
         let (th, dir, sess) = fixture(&db).await;
-        block_marker_writes(&db).await;
 
-        let err = stamp_switch_marker(
-            &db,
-            SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess },
+        let err = repo::fail_write::while_failing(
+            MARKER_WRITE,
+            stamp_switch_marker(
+                &db,
+                SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess },
+            ),
         )
         .await;
 
@@ -2489,7 +2491,6 @@ mod switch_gate_tests {
             Some(SWITCH_MARKER_ERROR_CODE),
             "aborts with the stable code the UI translates, not a Rust-authored sentence"
         );
-        unblock_marker_writes(&db).await;
 
         assert_eq!(
             repo::get_direction(&db, dir).await.unwrap().unwrap().tool,
@@ -2522,10 +2523,14 @@ mod switch_gate_tests {
         let db = mem().await;
         let (th, dir, sess) = fixture(&db).await;
         let target = SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess };
-        block_marker_writes(&db).await;
-        assert!(stamp_switch_marker(&db, target).await.is_err());
-        unblock_marker_writes(&db).await;
+        assert!(
+            repo::fail_write::while_failing(MARKER_WRITE, stamp_switch_marker(&db, target))
+                .await
+                .is_err()
+        );
 
+        // Outside the armed scope the same call is healthy again — the seam is
+        // task-scoped, which is exactly the shape a user's retry has.
         let stamped = stamp_switch_marker(&db, target).await.unwrap();
         persist_switch(&db, stamped, "codex", None).await.unwrap();
 
