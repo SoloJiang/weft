@@ -1693,6 +1693,13 @@ mod switch_gate {
             self.target
         }
 
+        /// The pending row the switch transaction promotes — see
+        /// `repo::promote_turn_freeze_marker`. Only [`super::persist_switch_writes`]
+        /// needs it; everything else goes through [`Self::retract`].
+        pub(super) fn marker_id(&self) -> i32 {
+            self.marker_id
+        }
+
         /// Undo this stamp — for the failure paths AFTER step 0, where the
         /// switch published a grace marker for a native-context reset that
         /// then never happened.
@@ -1745,7 +1752,7 @@ mod switch_gate {
     ) -> Result<MarkerStamped, String> {
         let thread_id = target.thread_id();
         let session_id = target.session_id();
-        match repo::mark_turn_freeze_recovered(db, thread_id, session_id).await {
+        match repo::mark_turn_freeze_pending(db, thread_id, session_id).await {
             Ok(marker_id) => Ok(MarkerStamped { target, marker_id }),
             Err(err) => {
                 eprintln!(
@@ -1758,37 +1765,9 @@ mod switch_gate {
         }
     }
 
-    /// Re-stamp the grace window once the switch has actually landed, so it is
-    /// measured from completion rather than from step 0 (review round 2).
-    ///
-    /// The step-0 stamp has to happen before `teardown_for_switch`, which can
-    /// take a long time — its `interrupt` is up to ~120s against a wedged
-    /// app-server, against a 300s default cooldown, and
-    /// `WEFT_STALL_REDRIVE_COOLDOWN_SECS` can be set lower still. Without this
-    /// the window is already partly (or entirely) spent when the new engine
-    /// comes up, and the very next sweep can re-drive the engine the window
-    /// exists to protect.
-    ///
-    /// A second row rather than an in-place update: `last_turn_freeze_recovery_secs`
-    /// takes the highest id, so the fresh row simply wins.
-    ///
-    /// Returns `Result` so the outcome is the CALLER's to decide and can be
-    /// asserted in a test, rather than being swallowed here (review round 3).
-    /// What the caller must not do with it is fail the command: by the time
-    /// this runs the switch has fully landed — new tool persisted, native id
-    /// cleared, new engine up — so reporting failure would be the dishonest
-    /// "said it failed, changed everything" outcome round 1 established as the
-    /// worst of the options, and there is nothing left to roll back to. The
-    /// honest degrade is to log and continue: the step-0 stamp still guards a
-    /// window, just a shorter one, which is exactly the behaviour that shipped
-    /// before this refresh existed.
-    pub(super) async fn refresh_switch_grace(db: &Db, target: SwitchTarget) -> anyhow::Result<()> {
-        repo::mark_turn_freeze_recovered(db, target.thread_id(), target.session_id()).await?;
-        Ok(())
-    }
 }
 
-use switch_gate::{refresh_switch_grace, stamp_switch_marker, MarkerStamped};
+use switch_gate::{stamp_switch_marker, MarkerStamped};
 
 /// The two durable writes an engine/model switch makes, openable only with a
 /// [`MarkerStamped`] — the GATE that `engine::recover_from_freeze` already
@@ -1898,15 +1877,24 @@ async fn persist_switch_writes(
 ) -> anyhow::Result<()> {
     match stamped.target() {
         SwitchTarget::Lead { thread_id } => {
-            repo::switch_lead_engine_txn(db, thread_id, tool, model).await.map(|_| ())
+            repo::switch_lead_engine_txn(db, thread_id, tool, model, stamped.marker_id())
+                .await
+                .map(|_| ())
         }
         SwitchTarget::Worker {
             direction_id,
             session_id,
             ..
-        } => repo::switch_worker_engine_txn(db, direction_id, session_id, tool, model)
-            .await
-            .map(|_| ()),
+        } => repo::switch_worker_engine_txn(
+            db,
+            direction_id,
+            session_id,
+            tool,
+            model,
+            stamped.marker_id(),
+        )
+        .await
+        .map(|_| ()),
     }
 }
 
@@ -2013,17 +2001,6 @@ pub async fn switch_lead_tool(
         eng.lock().await.pending_context_digest = Some(digest);
     }
 
-    // The switch landed: restart the grace window from NOW so the teardown's
-    // duration doesn't come out of it. Logged, never fatal — see
-    // `refresh_switch_grace` for why failing a completed switch here would be
-    // the dishonest option.
-    if let Err(err) = refresh_switch_grace(&db, target).await {
-        eprintln!(
-            "[weft] switch_lead_tool: could not restart the grace window for thread \
-             {thread_id} (the pre-teardown stamp still guards a shorter one): {err}"
-        );
-    }
-
     let outcome = SwitchOutcome {
         old_tool: before.lead_tool,
         new_tool: tool,
@@ -2121,13 +2098,6 @@ pub async fn switch_worker_tool(
         .map_err(|e| e.to_string())?;
     if !digest.is_empty() {
         eng.lock().await.pending_context_digest = Some(digest);
-    }
-
-    if let Err(err) = refresh_switch_grace(&db, target).await {
-        eprintln!(
-            "[weft] switch_worker_tool: could not restart the grace window for session \
-             {session_id} (the pre-teardown stamp still guards a shorter one): {err}"
-        );
     }
 
     let outcome = SwitchOutcome {
@@ -2499,7 +2469,7 @@ mod live_slot_tests {
 #[cfg(test)]
 mod switch_gate_tests {
     use super::{
-        persist_switch, refresh_switch_grace, stamp_switch_marker, SwitchTarget,
+        persist_switch, stamp_switch_marker, SwitchTarget,
         SWITCH_CLEANUP_ERROR_CODE, SWITCH_MARKER_ERROR_CODE,
     };
     use crate::lead_chat::revive::has_resumable_context;
@@ -2532,16 +2502,15 @@ mod switch_gate_tests {
 
     /// The one store write these tests fail, by the name #144 registered it
     /// under at `repo::mark_turn_freeze_recovered`'s `fail_write!`.
-    const MARKER_WRITE: &str = "mark_turn_freeze_recovered";
+    const MARKER_WRITE: &str = "mark_turn_freeze_pending";
 
-    /// Ids of every `turn_freeze_recovered` row on the thread, ascending — the
-    /// rows `last_turn_freeze_recovery_secs` picks its newest from.
+    /// Ids of every grace-marker row on the thread (either kind), ascending.
     async fn marker_ids(db: &Db, thread_id: i32) -> Vec<i32> {
         let mut ids: Vec<i32> = repo::list_lead_messages(db, thread_id)
             .await
             .unwrap_or_default()
             .into_iter()
-            .filter(|m| m.kind == "turn_freeze_recovered")
+            .filter(|m| m.kind.starts_with("turn_freeze_"))
             .map(|m| m.id)
             .collect();
         ids.sort_unstable();
@@ -2805,23 +2774,47 @@ mod switch_gate_tests {
         );
     }
 
-    /// Review round 3, finding 2 — a failed refresh is reported, not swallowed.
+    /// Review round 7 — a switch that dies between claiming the window and
+    /// committing must not look resumable afterwards.
     ///
-    /// The caller deliberately logs and continues rather than failing (by then
-    /// the switch has fully landed and there is nothing to roll back to), but
-    /// that is the CALLER's decision to make, which requires the helper to
-    /// actually return the failure. Asserting it here is what keeps the helper
-    /// from quietly going back to `-> ()`.
+    /// Simulates the crash directly: stamp, then never persist. The pending row
+    /// survives, exactly as it would across an app restart, and the assertion
+    /// is that `revive` still refuses this surface — it has no native id and
+    /// no COMMITTED marker, so nothing vouches for a reset that never
+    /// happened. What the pending row does still buy is the cooldown, which is
+    /// the only thing it was claimed for.
     #[tokio::test]
-    async fn a_failed_grace_refresh_is_reported_to_its_caller() {
+    async fn a_switch_that_dies_before_committing_never_looks_resumable() {
         let db = mem().await;
-        let (th, dir, sess) = fixture(&db).await;
-        let target = SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess };
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let th = repo::create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
 
-        let failed =
-            repo::fail_write::while_failing(MARKER_WRITE, refresh_switch_grace(&db, target)).await;
+        // No native id on purpose: the shape a rewound-to-empty surface has,
+        // where a stray marker is the whole difference between invisible and
+        // permanently re-drivable.
+        let _stamped = stamp_switch_marker(&db, SwitchTarget::Lead { thread_id: th.id })
+            .await
+            .unwrap();
+        // …and then nothing. No persist, no retract — the process is gone.
 
-        assert!(failed.is_err(), "a swallowed error would make the switch look fully guarded");
+        let recovered = repo::last_turn_freeze_recovery_secs(&db, th.id, None).await.unwrap();
+        assert_eq!(recovered, None, "a pending marker is not evidence of a reset");
+        assert!(
+            !has_resumable_context(
+                repo::lead_native_id(&db, th.id).await.unwrap().is_some(),
+                recovered
+            ),
+            "so the never-completed switch cannot make this surface re-drivable"
+        );
+        assert!(
+            repo::last_turn_freeze_guard_secs(&db, th.id, None)
+                .await
+                .unwrap()
+                .is_some(),
+            "it does still hold the cooldown, which is the one thing it was claimed for"
+        );
     }
 
     /// The codes are a cross-language contract with
@@ -2911,46 +2904,61 @@ mod switch_gate_tests {
             "rejects with the code the UI translates — the DB causes go to the log, not              into user-facing text (review round 5)"
         );
         assert!(
-            repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
+            repo::last_turn_freeze_guard_secs(&db, th, Some(sess))
                 .await
                 .unwrap()
                 .is_some(),
             "and the marker really is still there, which is what the message claims"
         );
+        // It is still only a PENDING one, so what it costs is one stale
+        // cooldown window — never resumability for a switch that never
+        // committed (review round 7).
+        assert_eq!(
+            repo::last_turn_freeze_recovery_secs(&db, th, Some(sess)).await.unwrap(),
+            None,
+            "a stray marker from an aborted switch must not read as evidence of a reset"
+        );
     }
 
-    /// Review round 2, finding 2 — the grace window is restarted once the
-    /// switch actually lands, so a slow `teardown_for_switch` (its interrupt
-    /// runs up to ~120s against a wedged app-server, versus a 300s default
-    /// cooldown that can be configured lower) doesn't come out of the window
-    /// the marker exists to provide.
+    /// The grace window runs from the COMMIT, not from step 0 — otherwise a
+    /// slow `teardown_for_switch` (its interrupt runs up to ~120s against a
+    /// wedged app-server, versus a 300s default cooldown that can be
+    /// configured lower) eats the window before the new engine is even up.
     ///
-    /// Asserted on row identity, not on a clock: `created_at` is whole seconds,
-    /// so two stamps in one test tick can share a timestamp. What must hold is
-    /// that the refresh writes a LATER row and that the reader — which takes
-    /// the highest id — resolves to it.
+    /// It is the promotion that restamps the clock, inside the switch's own
+    /// transaction, which is why there is no separate refresh step any more.
+    /// Asserted on the row's identity and kind rather than on a clock:
+    /// `created_at` is whole seconds, so a time comparison inside one test
+    /// tick would be flaky.
     #[tokio::test]
-    async fn a_completed_switch_restarts_the_grace_window() {
+    async fn committing_a_switch_promotes_the_pending_marker_in_place() {
         let db = mem().await;
         let (th, dir, sess) = fixture(&db).await;
         let target = SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess };
 
         let stamped = stamp_switch_marker(&db, target).await.unwrap();
-        let step0 = *marker_ids(&db, th).await.last().expect("step-0 stamp");
+        let pending = marker_ids(&db, th).await;
+        assert_eq!(pending.len(), 1, "step 0 claimed exactly one row");
+        assert_eq!(
+            repo::last_turn_freeze_recovery_secs(&db, th, Some(sess)).await.unwrap(),
+            None,
+            "which is not yet evidence of anything"
+        );
+
         persist_switch(&db, stamped, "codex", None).await.unwrap();
 
-        refresh_switch_grace(&db, target).await.unwrap();
-
-        let after = marker_ids(&db, th).await;
-        assert_eq!(after.len(), 2, "the refresh adds a row rather than editing one");
-        assert!(
-            *after.last().expect("refreshed stamp") > step0,
-            "and the reader's newest-wins pick is the post-switch one"
+        assert_eq!(
+            marker_ids(&db, th).await,
+            pending,
+            "promotion edits that row rather than adding a second — one switch, one marker"
         );
-        assert!(repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
+                .await
+                .unwrap()
+                .is_some(),
+            "and it now counts as evidence, in the same commit as the native-id clear"
+        );
     }
 
     /// A retry after an aborted switch must be a COMPLETE recovery, not a

@@ -516,9 +516,20 @@ async fn freeze_recovery_state(
     now: u64,
     grace_secs: u64,
 ) -> anyhow::Result<(Option<u64>, bool)> {
-    let last = repo::last_turn_freeze_recovery_secs(db, thread_id, session_id).await?;
+    // TWO reads, because the marker carries two separable facts and a
+    // switch-in-progress has only one of them (see `repo::MARKER_KIND_RECOVERED`):
+    //   - `recovered` is EVIDENCE the surface ran and had its native context
+    //     reset. Committed markers only — a pending one vouches for a switch
+    //     that may never have committed, and treating it as evidence is what
+    //     would let a crashed switch make an id-less surface look resumable
+    //     forever (adversarial re-review of PR #140, round 7).
+    //   - the cooldown counts EITHER kind: holding the sweep off is exactly
+    //     what a pending marker is claimed for, and it is claimed before the
+    //     teardown precisely so that window is covered.
+    let recovered = repo::last_turn_freeze_recovery_secs(db, thread_id, session_id).await?;
+    let guard = repo::last_turn_freeze_guard_secs(db, thread_id, session_id).await?;
     // Same shape as the redrive gate — including its backward-clock safety.
-    Ok((last, cooldown_elapsed(last, now, grace_secs)))
+    Ok((recovered, cooldown_elapsed(guard, now, grace_secs)))
 }
 
 /// Threads' in-progress directions whose latest worker session is `stopped` —
@@ -1557,6 +1568,59 @@ mod tests {
     /// not one worker. The review caught the original defect on the worker axis
     /// first and then again here, which is why `has_resumable_context` is one
     /// shared predicate; this pins the writer's half of that pairing on both
+    /// PR #140 round 7 — a switch that claimed the grace window and then died
+    /// before committing must NOT make its surface look resumable.
+    ///
+    /// Asserted through `collect_stalled_leads`, not through
+    /// `repo::last_turn_freeze_recovery_secs`: the switch-side test that reads
+    /// the repo directly passes even when this file stops distinguishing the
+    /// two marker kinds, which a mutation run demonstrated. The selection path
+    /// is the consumer that actually matters, so this is where the split has
+    /// to be pinned.
+    #[tokio::test]
+    async fn a_pending_switch_marker_never_makes_an_id_less_lead_resumable() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = stalled_direction(&db, th, repo_id, "working").await;
+        assert_eq!(collect_stalled(&db).await, vec![(th, vec![dir])], "precondition");
+
+        // The shape at risk: idle, no native id, nothing to resume. Excluded.
+        repo::set_lead_native_id_opt(&db, th, None).await.unwrap();
+        assert!(collect_stalled(&db).await.is_empty(), "precondition: nothing to resume");
+
+        // A switch claims the window and the process dies before committing.
+        let pending = repo::mark_turn_freeze_pending(&db, th, None).await.unwrap();
+        let claimed = repo::last_turn_freeze_guard_secs(&db, th, None)
+            .await
+            .unwrap()
+            .expect("pending marker recorded");
+
+        // Evaluated PAST the cooldown on purpose. Inside it the lead would be
+        // excluded anyway, and the assertion would prove nothing about the
+        // evidence rule — which is the half under test.
+        assert!(
+            collect_stalled_leads(&db, claimed + GRACE, GRACE).await.unwrap().is_empty(),
+            "a pending marker is a cooldown claim, not evidence the lead ever ran — it must \
+             not resurrect an id-less surface into the re-drive pool"
+        );
+
+        // Teeth: promote that very row — what a COMMITTED switch does — and the
+        // same surface becomes selectable, because now something really was
+        // reset. Without this the assertion above would also pass on a lead
+        // that is simply never selectable for unrelated reasons.
+        repo::promote_turn_freeze_marker(&db.0, pending).await.unwrap();
+        let promoted = repo::last_turn_freeze_recovery_secs(&db, th, None)
+            .await
+            .unwrap()
+            .expect("promoted marker recorded");
+        assert_eq!(
+            collect_stalled_leads(&db, promoted + GRACE, GRACE).await.unwrap(),
+            vec![(th, vec![dir])],
+            "a committed marker IS evidence, so the same surface is re-drivable again"
+        );
+    }
+
     /// axes too.
     #[tokio::test]
     async fn selects_stalled_lead_whose_freeze_marker_write_failed() {
