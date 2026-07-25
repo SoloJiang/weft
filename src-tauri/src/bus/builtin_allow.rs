@@ -61,13 +61,31 @@
 //! 2. `ask::classify_risk` independently rates the call `ReadOnly`, and
 //! 3. every path in its arguments is inside the session's own directories.
 //!
-//! Condition 2 deserves a note: `classify_risk` documents itself as a UX
-//! heuristic for card triage, NOT a security boundary. That stays true — it is
-//! used here only as a VETO (a non-`ReadOnly` verdict forces the card), never
-//! as a reason to allow. The gate is the allowlist; the heuristic only takes
-//! things off it. Its practical job is catching a credential-shaped file that
-//! lives INSIDE the working directory (a repo's own `.env`, `.npmrc`,
-//! `.git-credentials`), which containment alone would happily allow.
+//! # What each condition is actually worth
+//!
+//! Conditions 1 and 3 are the BOUNDARY. Both are structural: a closed set of
+//! names, and "does this resolve inside a directory weft itself created or the
+//! user registered". Neither depends on judging what a file contains.
+//!
+//! Condition 2 is BEST-EFFORT DEFENCE IN DEPTH, and this file is emphatic
+//! about that because review kept proving it. `classify_risk` documents itself
+//! as a UX heuristic for card triage, not a security boundary, and promoting a
+//! path-SPELLING judgment into a gate invites every trick that points a benign
+//! spelling at sensitive bytes. PR #146's review found four in a row: a
+//! `Grep` that never names what it reads, a symlink alias, a hard link, and a
+//! Windows separator that matched no marker. Each is fixed (see `contained`),
+//! and the honest conclusion is still that the NEXT one exists — the marker
+//! list was never exhaustive either (`~/.config/gh/hosts.yml` matches nothing
+//! in it).
+//!
+//! So: condition 2 is used ONLY as a veto — a non-`ReadOnly` verdict forces
+//! the card, never the reverse — and nothing here relies on it being complete.
+//! Its job is to stop the obvious foot-gun of auto-reading a repo's own `.env`
+//! or `.npmrc`, which containment alone would allow. What keeps the change
+//! safe when it fails is condition 3: whatever the veto misses is still, at
+//! worst, a file inside the session's own worktree or one of the workspace
+//! repos the user registered — the same material the engine's own default
+//! permission mode reads without prompting.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -236,13 +254,73 @@ fn contained(path: &str, roots: &[PathBuf]) -> bool {
     if !p.is_absolute() {
         return false;
     }
+    // BEFORE any filesystem call. `canonicalize` on a Windows UNC path
+    // (`\\host\share\x`) DIALS THE REMOTE SHARE, so deciding this after
+    // resolution would let a tool call weft is in the middle of GATING still
+    // perform agent-chosen network I/O from inside the hook — leaking Windows
+    // authentication to a host the agent picked, or hanging the whole ask on an
+    // unreachable one. Device/verbatim prefixes go the same way. A permission
+    // check must not become an outbound-request primitive. (Codex, PR #146.)
+    if has_non_disk_prefix(p) {
+        return false;
+    }
     let Ok(real) = std::fs::canonicalize(p) else {
         return false;
     };
     if !roots.iter().any(|r| real.starts_with(r)) {
         return false;
     }
+    if is_multi_linked(&real) {
+        return false;
+    }
     resolved_target_is_read_only(&real)
+}
+
+/// A path anchored at something other than a plain disk volume — a UNC share,
+/// a device path, a verbatim UNC. Inert on unix, where the parser never
+/// produces a `Prefix` component at all.
+fn has_non_disk_prefix(p: &Path) -> bool {
+    p.components().any(|c| match c {
+        std::path::Component::Prefix(pre) => !matches!(
+            pre.kind(),
+            std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+        ),
+        _ => false,
+    })
+}
+
+/// A regular file reachable under MORE THAN ONE name.
+///
+/// `canonicalize` resolves symlinks but not hard links — a hard link is not an
+/// alias for another name, it is an equally real name for the same inode. So
+/// `wt/config.txt` hard-linked to an outside `.env` canonicalizes to itself,
+/// sits genuinely inside the root, and shows the veto nothing but
+/// `config.txt`. Neither containment nor a spelling check can see through
+/// that; the only signal available at this layer is that the target has more
+/// than one name, so a multi-linked file goes to the human. (Codex, PR #146.)
+///
+/// Files only — a directory legitimately has several links (`.`, `..`).
+/// Metadata failure gates, like every other unknown here. Windows hard links
+/// are NOT detected: `std::os::windows::fs::MetadataExt::number_of_links` is
+/// unstable, so this is a documented gap on a platform weft does not yet test.
+///
+/// KNOWN over-ask: package managers that hard-link from a content store
+/// (pnpm's `node_modules`, in this very repo) produce multi-linked files, so
+/// reading one asks. Accepted — the failure direction is a click.
+fn is_multi_linked(resolved: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return match std::fs::metadata(resolved) {
+            Ok(m) => m.is_file() && m.nlink() > 1,
+            Err(_) => true,
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = resolved;
+        false
+    }
 }
 
 /// The credential veto, applied to a path AFTER symlink resolution.
@@ -252,10 +330,25 @@ fn contained(path: &str, roots: &[PathBuf]) -> bool {
 /// already established that the TOOL is a read-only builtin, so what is being
 /// asked here is only "is this destination credential-shaped", and a fixed
 /// read verb keeps the verdict a function of the path alone.
+///
+/// Separators are normalized to `/` first, because several `CRED_NET_MARKERS`
+/// spell a path fragment (`.kube/config`, `.docker/config.json`, `.gnupg/`)
+/// and a Windows path rendered with backslashes would match none of them —
+/// `C:\wt\.kube\config` read as `ReadOnly` at every layer. (Codex, PR #146.)
+/// Safe on unix even though a backslash is a legal filename character there:
+/// this string is used ONLY for marker matching, never for filesystem access,
+/// and since no marker contains a backslash the rewrite can only make MORE
+/// things match — it moves the verdict toward gating, never away.
+///
+/// The same normalization would fix `ask::classify_file`'s Windows verdict for
+/// the CARD LABEL too, which is where this defect also shows. Left alone
+/// deliberately: that is shared display code two other in-flight PRs are
+/// editing, and the gate here does not depend on it.
 fn resolved_target_is_read_only(resolved: &Path) -> bool {
+    let normalized = resolved.to_string_lossy().replace('\\', "/");
     crate::ask::classify_risk(crate::ask::RiskSignal::File {
         tool_name: "Read",
-        path: &resolved.to_string_lossy(),
+        path: &normalized,
     }) == crate::ask::RiskLevel::ReadOnly
 }
 
@@ -617,6 +710,107 @@ mod tests {
             ),
             "the veto must follow the symlink to what is actually opened"
         );
+    }
+
+    /// A HARD link inside the root, pointing at a credential file outside it.
+    ///
+    /// `canonicalize` resolves symlinks but not hard links — the alias is an
+    /// equally real name for the same inode, so it canonicalizes to ITSELF and
+    /// sits genuinely inside the root. Containment can't see it and the veto
+    /// sees only `config.txt`. Multiple names is the one signal left at this
+    /// layer. Codex caught it on PR #146.
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_credential_alias_is_refused() {
+        let base = TempTree::new("hardlink");
+        let root = base.0.join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        let secret = base.0.join("outside.env");
+        std::fs::write(&secret, b"TOKEN=1").unwrap();
+        let alias = root.join("config.txt");
+        // Same filesystem (same temp tree), so the link really is created.
+        std::fs::hard_link(&secret, &alias).unwrap();
+
+        // Premise: neither of the other two conditions objects. The alias
+        // canonicalizes to itself, INSIDE the root...
+        assert_eq!(
+            std::fs::canonicalize(&alias).unwrap(),
+            alias,
+            "premise: a hard link is not resolved away"
+        );
+        // ...and its name is innocuous.
+        assert_eq!(
+            crate::ask::classify_risk(crate::ask::RiskSignal::File {
+                tool_name: "Read",
+                path: &alias.to_string_lossy(),
+            }),
+            crate::ask::RiskLevel::ReadOnly,
+            "premise: the alias itself looks harmless"
+        );
+        assert!(
+            !paths_contained(
+                Some(&json!({ "file_path": alias.to_string_lossy() })),
+                &[root.clone()]
+            ),
+            "a multi-linked target must go to the human"
+        );
+
+        // Mirror: an ordinary single-linked file in the same root is fine, so
+        // the check can't be satisfied by refusing everything.
+        let plain = root.join("main.rs");
+        std::fs::write(&plain, b"x").unwrap();
+        assert!(paths_contained(
+            Some(&json!({ "file_path": plain.to_string_lossy() })),
+            &[root]
+        ));
+    }
+
+    /// The credential markers spell path fragments with `/`, so a
+    /// backslash-separated rendering matched none of them.
+    ///
+    /// Asserted through the normalization helper rather than a real Windows
+    /// path, so it runs on every platform: the point is that the string handed
+    /// to the classifier has `/` separators. Codex caught it on PR #146.
+    #[test]
+    fn backslash_separated_credential_paths_are_normalized() {
+        // Slash-spelled markers that a raw Windows rendering would miss.
+        for tail in [".kube\\config", ".docker\\config.json", ".gnupg\\key"] {
+            let win = PathBuf::from(format!("C:\\wt\\{tail}"));
+            assert!(
+                !resolved_target_is_read_only(&win),
+                "a backslash-spelled credential path must still trip the veto: {tail}"
+            );
+        }
+        // Mirror: an ordinary backslash-spelled path is still fine.
+        assert!(resolved_target_is_read_only(&PathBuf::from(
+            "C:\\wt\\src\\main.rs"
+        )));
+    }
+
+    /// A UNC / device path is refused BEFORE `canonicalize` is called on it, so
+    /// the permission hook never dials a host the agent chose. Asserted via the
+    /// prefix predicate, which is what runs ahead of the filesystem call.
+    #[test]
+    fn unc_and_device_paths_are_rejected_before_any_filesystem_call() {
+        for p in [
+            r"\\host\share\file",
+            r"\\?\UNC\host\share\file",
+            r"\\.\PhysicalDrive0",
+        ] {
+            let path = PathBuf::from(p);
+            #[cfg(windows)]
+            assert!(has_non_disk_prefix(&path), "{p} must be refused");
+            // On unix these are not absolute at all, so `contained` refuses
+            // them one step earlier — either way, no filesystem call.
+            #[cfg(not(windows))]
+            assert!(
+                has_non_disk_prefix(&path) || !path.is_absolute(),
+                "{p} must never reach canonicalize"
+            );
+        }
+        // An ordinary disk path is not caught by the prefix check.
+        assert!(!has_non_disk_prefix(&PathBuf::from(r"C:\wt\src\main.rs")));
+        assert!(!has_non_disk_prefix(&PathBuf::from("/wt/src/main.rs")));
     }
 
     #[test]
