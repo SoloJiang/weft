@@ -3,9 +3,12 @@ import { useTranslation } from "react-i18next";
 import {
   AppWindow,
   Boxes,
+  CircleAlert,
   CircleDashed,
+  Clock,
   GitBranch,
   Layers,
+  Loader2,
   Maximize2,
   Minus,
   Pencil,
@@ -40,15 +43,25 @@ const bandOf = (tier: string): Band =>
   (TIER_ORDER as readonly string[]).includes(tier) ? (tier as Band) : "other";
 
 // ─────────────────── repo analysis display status ───────────────────
-// All analysis runs through the workspace curator (仓库分析助手) now — the map is a
-// PROFILE surface, not a per-repo analysis lifecycle. A node is either classified
-// ("analyzed") or not yet ("pending", a passive "未分析" hint). No per-node
-// running/failed status or retry: progress and failures live in the curator chat.
+// A node's analysis lifecycle, single-sourced from the backend (issue #107): the
+// persisted `analysis_state` ("idle" | "running" | "failed") plus the workspace's
+// live coalesced-pass signal decide ONE discriminant per card, mapped exhaustively
+// below — never re-derived booleans per call site. "queued" vs "pending" is the
+// honest distinction the old always-"未分析" placeholder couldn't make: a pass is
+// actively working through the workspace and will reach this repo (queued) vs
+// nothing is scheduled and it needs a manual "Analyze deps" click (pending).
 
-type AnalysisView = "analyzed" | "pending";
+type AnalysisView = "analyzed" | "queued" | "running" | "failed" | "pending";
 
-function analysisView(p: RepoProfile): AnalysisView {
-  return p.analyzed ? "analyzed" : "pending";
+/** `workspaceQueued` is the active workspace's `repoAnalysisActive` (the backend
+ *  gate's live "a pass has outstanding work here" signal) — NOT per-repo, so every
+ *  not-yet-started card in the workspace reads "queued" together while a pass is
+ *  in flight, and falls back to "pending" together once it's done. */
+function analysisView(p: RepoProfile, workspaceQueued: boolean): AnalysisView {
+  if (p.analyzed) return "analyzed";
+  if (p.analysis_state === "running") return "running";
+  if (p.analysis_state === "failed") return "failed";
+  return workspaceQueued ? "queued" : "pending";
 }
 
 /** Status-driven border accent for a card. Selection/importance are separate
@@ -56,8 +69,44 @@ function analysisView(p: RepoProfile): AnalysisView {
  *  a new view forces a new entry — exhaustive by construction. */
 const CARD_STATUS_FRAME: Record<AnalysisView, string> = {
   pending: "border-dashed opacity-80",
+  queued: "border-dashed border-waiting/40",
+  running: "border-running/40",
+  failed: "border-danger/40",
   analyzed: "",
 };
+
+/** The non-"analyzed" states share a compact icon+label treatment (a card still
+ *  editable, just not yet profiled) — text key and color, keyed by discriminant. */
+const STATUS_TEXT_KEY: Record<Exclude<AnalysisView, "analyzed">, string> = {
+  pending: "repomap.notAnalyzed",
+  queued: "repomap.analysisQueued",
+  running: "repomap.analysisRunning",
+  failed: "repomap.analysisFailed",
+};
+
+const STATUS_TEXT_CLASS: Record<Exclude<AnalysisView, "analyzed">, string> = {
+  pending: "text-ink-faint",
+  queued: "text-waiting",
+  running: "text-running",
+  failed: "text-danger",
+};
+
+/** The leading glyph for a non-"analyzed" status. `null` for "pending" keeps the
+ *  original plain-text look for the common empty/no-op case. */
+function StatusGlyph({ view }: { view: Exclude<AnalysisView, "analyzed"> }) {
+  if (view === "running") return <Loader2 size={11} className="shrink-0 animate-spin" />;
+  if (view === "queued") return <Clock size={11} className="shrink-0" />;
+  if (view === "failed") return <CircleAlert size={11} className="shrink-0" />;
+  return null;
+}
+
+/** A known, stable error CODE (not the raw agent/transport diagnostic string) gets
+ *  a localized message; anything else is an inherently-English agent/CLI error and
+ *  is shown verbatim (it's diagnostic text, not meant for translation). */
+function analysisErrorText(t: (key: string) => string, error: string | null | undefined): string {
+  if (error === "checkout-missing") return t("repomap.analysisErrorCheckoutMissing");
+  return error ?? "";
+}
 
 /** Selection axis for a card border — orthogonal to analysis status. Importance is
  *  no longer accented: with dependency lines and the dependents badge gone, a lone
@@ -152,7 +201,17 @@ function nodeHeight(p: RepoProfile, mode: ViewMode): number {
  * the expanded view to break monorepos into their components. Drag to pan, scroll to zoom.
  */
 export function RepoGraph() {
-  const { repoProfiles, repoEdges, reanalyzeDeps, cancelReanalyze, analyzing, reanalyzing, selectedRepoId, openRepoDetail } = useStore();
+  const {
+    repoProfiles,
+    repoEdges,
+    repoAnalysisActive,
+    reanalyzeDeps,
+    cancelReanalyze,
+    analyzing,
+    reanalyzing,
+    selectedRepoId,
+    openRepoDetail,
+  } = useStore();
   const { t } = useTranslation();
   const [mode, setMode] = useState<ViewMode>("overview");
 
@@ -395,6 +454,7 @@ export function RepoGraph() {
                 pt={pt}
                 selected={selected}
                 onSelect={onSelect}
+                workspaceQueued={repoAnalysisActive}
               />
             );
           })}
@@ -482,12 +542,18 @@ function NodeStatusGlyph({
   return <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />;
 }
 
-/** A collapsed card's body: classified badges + summary, or a passive "未分析" hint
- *  for a not-yet-analyzed repo (analysis happens in the curator chat). */
+/** A collapsed card's body: classified badges + summary, or an honest status line
+ *  (queued / analyzing / failed / not analyzed) for a repo the agent hasn't
+ *  classified yet — see the `AnalysisView` map above. */
 function NodeStatusBody({ view, p }: { view: AnalysisView; p: RepoProfile }) {
   const { t } = useTranslation();
   if (view === "analyzed") return <NodeSummary profile={p} />;
-  return <span className="text-[11.5px] italic text-ink-faint">{t("repomap.notAnalyzed")}</span>;
+  return (
+    <span className={cn("flex items-center gap-1 text-[11.5px] italic", STATUS_TEXT_CLASS[view])}>
+      <StatusGlyph view={view} />
+      {t(STATUS_TEXT_KEY[view])}
+    </span>
+  );
 }
 
 function RepoNode({
@@ -495,14 +561,17 @@ function RepoNode({
   pt,
   selected,
   onSelect,
+  workspaceQueued,
 }: {
   profile: RepoProfile;
   pt: { x: number; y: number; w: number; h: number };
   selected: boolean;
   onSelect: () => void;
+  /** The active workspace's `repoAnalysisActive` — see `analysisView`. */
+  workspaceQueued: boolean;
 }) {
   const Icon = TIER_ICON[bandOf(p.tier)] ?? CircleDashed;
-  const view = analysisView(p);
+  const view = analysisView(p, workspaceQueued);
 
   return (
     <div
@@ -625,13 +694,54 @@ function ModeBtn({
   );
 }
 
-/** A passive "not analyzed yet" banner above the (still-editable) fields. Analysis
- *  runs through the curator chat now, so there's no per-repo run button here. */
-function PendingNotice() {
+/** A status banner above the (still-editable) fields for a repo the agent hasn't
+ *  classified yet: queued/running (a pass will reach or is analyzing it), pending
+ *  (nothing scheduled — the toolbar's "Analyze deps" queues one), or failed — with
+ *  the reason surfaced and a real retry action, not a silent perpetual spinner
+ *  (issue #107). Exhaustive over the non-"analyzed" states via the same
+ *  `AnalysisView` discriminant the card uses. */
+function AnalysisNotice({
+  view,
+  error,
+}: {
+  view: Exclude<AnalysisView, "analyzed">;
+  error?: string | null;
+}) {
   const { t } = useTranslation();
+  const { reanalyzeDeps, analyzing } = useStore();
+  if (view === "failed") {
+    return (
+      <div className="mb-4 rounded-[var(--radius-md)] border border-danger/30 bg-danger/5 px-3 py-2.5 text-[12px]">
+        <div className="flex items-center gap-1.5 font-medium text-danger">
+          <StatusGlyph view={view} />
+          {t("repomap.analysisFailed")}
+        </div>
+        {error && (
+          <p className="mt-1 break-words leading-relaxed text-ink-muted">
+            {analysisErrorText(t, error)}
+          </p>
+        )}
+        <Button
+          variant="ghost"
+          size="sm"
+          className="mt-2"
+          disabled={analyzing}
+          onClick={() => void reanalyzeDeps()}
+        >
+          {t("repomap.retryAnalysis")}
+        </Button>
+      </div>
+    );
+  }
   return (
-    <div className="mb-4 rounded-[var(--radius-md)] border border-dashed border-border bg-bg px-3 py-2 text-[12px] text-ink-faint">
-      {t("repomap.notAnalyzed")}
+    <div
+      className={cn(
+        "mb-4 flex items-center gap-1.5 rounded-[var(--radius-md)] border border-dashed border-border bg-bg px-3 py-2 text-[12px]",
+        STATUS_TEXT_CLASS[view],
+      )}
+    >
+      <StatusGlyph view={view} />
+      {t(STATUS_TEXT_KEY[view])}
     </div>
   );
 }
@@ -705,7 +815,7 @@ function AnalyzedProfileFields({
  *  button (the drawer owns close). */
 export function RepoDetailContent({ repoId }: { repoId: number | null }) {
   const { t } = useTranslation();
-  const { repoProfiles, repoEdges, deleteRepo, openRepoDetail } = useStore();
+  const { repoProfiles, repoEdges, repoAnalysisActive, deleteRepo, openRepoDetail } = useStore();
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const profile = repoId != null ? repoProfiles.find((p) => p.repo_id === repoId) : undefined;
@@ -720,16 +830,17 @@ export function RepoDetailContent({ repoId }: { repoId: number | null }) {
     .map((e) => ({ edge: e, repo: repoProfiles.find((p) => p.repo_id === e.from) }))
     .filter((x): x is { edge: RepoEdge; repo: RepoProfile } => !!x.repo);
   const Icon = TIER_ICON[bandOf(profile.tier)] ?? CircleDashed;
-  // Profile-only surface: classified repo shows its fields; an unanalyzed one shows
-  // a passive "未分析" hint above the (still-editable) fields. Analysis itself runs
-  // through the curator chat — no per-repo run/retry here.
+  // Profile-only surface: a classified repo shows its fields; an unanalyzed one
+  // shows an honest status banner (queued/running/failed/pending) above the
+  // (still-editable) fields — failed carries the reason + a retry action.
+  const view = analysisView(profile, repoAnalysisActive);
   const paneBody = (
     <AnalyzedProfileFields
       profile={profile}
       deps={deps}
       usedBy={usedBy}
       onSelect={openRepoDetail}
-      notice={profile.analyzed ? undefined : <PendingNotice />}
+      notice={view === "analyzed" ? undefined : <AnalysisNotice view={view} error={profile.analysis_error} />}
     />
   );
 

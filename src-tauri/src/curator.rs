@@ -53,6 +53,12 @@ pub struct ProfileView {
 pub struct Graph {
     pub nodes: Vec<ProfileView>,
     pub edges: Vec<Edge>,
+    /// Whether an analysis pass (auto or forced) is currently queued or running
+    /// for this workspace. Lets the UI render a not-yet-analyzed repo as "queued"
+    /// (a pass is working through the workspace and will reach it) instead of
+    /// indistinguishable from "pending" (nothing scheduled — needs a manual
+    /// "Analyze deps" click).
+    pub analysis_active: bool,
 }
 
 fn json_strs(v: &[String]) -> String {
@@ -298,7 +304,8 @@ pub async fn graph(db: &Db, workspace_id: i32) -> Result<Graph> {
         .flat_map(|(id, rels)| profile::agent_edges(*id, rels, &node_ids))
         .collect();
     maybe_schedule_backfill(db, workspace_id, &nodes);
-    Ok(Graph { nodes, edges })
+    let analysis_active = workspace_analysis_active(workspace_id);
+    Ok(Graph { nodes, edges, analysis_active })
 }
 
 /// Schedule the one-shot legacy backfill for an upgraded workspace whose rows
@@ -1453,12 +1460,26 @@ pub async fn unanalyzed_repo_names(db: &Db, workspace_id: i32) -> Vec<String> {
 /// Returns whether the pass was actually cancelled (mid-run, or while queued) — NOT
 /// merely whether the token was tripped, so a Stop that arrives after the pass already
 /// finished its relation write isn't reported as a cancelled (it completed).
+///
+/// Every FORCED entry point routes through here — the toolbar's "Analyze deps"
+/// button, a failed repo's Retry action, and the curator chat's reanalyze tool —
+/// so this marks the workspace active (`ActivePassGuard`) exactly like the auto
+/// path does: `Graph.analysis_active` promises "auto **or forced**", and a
+/// forced pass sequentially working through several never-analyzed repos must
+/// read as honestly "queued" for the ones it hasn't reached yet, the same as an
+/// auto pass would (see PR discussion on issue #107 — this half was originally
+/// missed).
 pub async fn reanalyze_workspace(
     db: &Db,
     workspace_id: i32,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> bool {
     let gate = pass_gate(workspace_id);
+    // Constructed BEFORE the cancellation-aware wait below, so it covers EVERY
+    // exit path via Drop — both early `return true` cancellations (queued, and
+    // just-before-starting) and the normal completion at the end — with no
+    // manual bookkeeping at each return site.
+    let _active = ActivePassGuard::new(gate.clone(), workspace_id);
     // Acquire the gate, but OBSERVE cancellation while waiting: when a background/add
     // pass already holds it, a Stop must return promptly instead of hanging until that
     // unrelated pass finishes. The cancel token is cooperative (no async wake), so poll
@@ -1532,6 +1553,21 @@ fn run_state_clear_all_for_test() {
 /// runners. Poison-tolerant (a panicking test must not wedge the rest).
 #[cfg(test)]
 fn test_run_state_guard() -> std::sync::MutexGuard<'static, ()> {
+    static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Serialize the tests that touch the process-global PASS-GATE registry
+/// (`pass_gate`, keyed by workspace_id) — a separate map from the run-state
+/// registry above, but with the exact same hazard: cargo runs tests in parallel,
+/// and every fresh in-memory test DB restarts workspace-id autoincrement at 1, so
+/// two unrelated tests can end up sharing the SAME `PassGate` (same lock + same
+/// `active` counter). A test that asserts an exact `workspace_analysis_active`
+/// value, or manually locks `gate.lock`, must take this guard first or an
+/// unrelated test's concurrent request corrupts its count / blocks on its hold.
+/// Poison-tolerant, same as `test_run_state_guard`.
+#[cfg(test)]
+fn test_pass_gate_guard() -> std::sync::MutexGuard<'static, ()> {
     static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
     L.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -2292,6 +2328,16 @@ struct PassGate {
     /// Sticky across the drain window: a forced (user-initiated) request anywhere
     /// while a pass is pending makes the next drained run force-retry failures.
     force: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Count of callers currently inside `analyze_workspace_coalesced` for this
+    /// workspace — queued behind the lock OR actively draining. >0 means "the
+    /// workspace has an analysis pass in flight", the signal the UI reads (via
+    /// `Graph::analysis_active`) to render an un-started repo as "queued" rather
+    /// than indistinguishable from "nothing scheduled, needs a manual click". A
+    /// counter (not a bool) is race-free under concurrent callers: every call does
+    /// exactly one increment on entry and one decrement on return, so it only
+    /// reaches zero once every outstanding caller — including ones merely waiting
+    /// for the lock — has actually returned.
+    active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn pass_gate(workspace_id: i32) -> PassGate {
@@ -2304,8 +2350,65 @@ fn pass_gate(workspace_id: i32) -> PassGate {
             lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             force: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
         .clone()
+}
+
+/// Whether an analysis pass (auto or forced) is currently queued or running for
+/// this workspace. Read by `graph()` so the UI can render an un-started repo
+/// honestly: "queued" (a pass is working through the workspace and will reach it)
+/// vs "pending" (nothing is scheduled — the user must click "Analyze deps").
+fn workspace_analysis_active(workspace_id: i32) -> bool {
+    pass_gate(workspace_id).active.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+/// RAII guard for `PassGate.active`: increments on construction, decrements on
+/// Drop. Shared by BOTH gate entry points — `analyze_workspace_coalesced` (the
+/// auto/background path) and `reanalyze_workspace` (the FORCED path: the
+/// toolbar's "Analyze deps" button, a failed repo's Retry action, and the
+/// curator chat's reanalyze tool all route through it) — so `analysis_active`
+/// stays honest for the "auto **or forced**" claim in its own doc comment: a
+/// forced pass working through several never-analyzed repos must ALSO read as
+/// "queued" for the ones it hasn't reached yet, not just the auto path.
+///
+/// Panic/early-return safety: the caller constructs this ONCE, up front, before
+/// any of its own early returns (a cancelled-while-queued check, etc.) — Drop
+/// runs on every exit, including an unwinding panic from deeper in the call
+/// chain (manifest/git parsing, proc_registry, …), so a bug there can strand the
+/// PASS at "failed" but can never leave this workspace's `active` counter stuck
+/// above zero (which would otherwise read as "queued" forever until restart,
+/// the one failure mode a plain fetch_add/fetch_sub pair can't rule out).
+struct ActivePassGuard {
+    gate: PassGate,
+    workspace_id: i32,
+}
+
+impl ActivePassGuard {
+    /// `gate` is the caller's already-looked-up `PassGate` for `workspace_id`
+    /// (a cheap Arc-clone) — takes it as a param rather than re-resolving via
+    /// `pass_gate` so construction can't itself contend the registry's outer
+    /// lock a second time.
+    fn new(gate: PassGate, workspace_id: i32) -> Self {
+        // Only the 0→1 edge emits — see `analyze_workspace_coalesced`'s call site
+        // for why (a batch of callers landing in quick succession would otherwise
+        // spam redundant refreshes).
+        if gate.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            emit_graph_updated(workspace_id);
+        }
+        Self { gate, workspace_id }
+    }
+}
+
+impl Drop for ActivePassGuard {
+    fn drop(&mut self) {
+        // Symmetric 1→0 edge: only the guard whose decrement drops the count to
+        // zero (no other caller still queued or draining) tells the UI the
+        // workspace has gone fully idle.
+        if self.gate.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            emit_graph_updated(self.workspace_id);
+        }
+    }
 }
 
 /// Test-only pass-gate observation for tests OUTSIDE this module (commands.rs):
@@ -2348,6 +2451,13 @@ pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32, force: bool
     if force {
         gate.force.store(true, Ordering::SeqCst);
     }
+    // Mark the workspace active for the whole time this caller is inside the gate
+    // — including time spent only waiting for the lock behind another pass.
+    // Declared BEFORE `_g` so it drops AFTER the lock releases (reverse
+    // declaration order), matching the prior explicit drop(_g)-then-decrement
+    // sequence — see `ActivePassGuard` for why this is a guard, not a manual
+    // fetch_add/fetch_sub pair.
+    let _active = ActivePassGuard::new(gate.clone(), workspace_id);
     let _g = gate.lock.lock().await;
     // Drain: run until no new request landed during the previous run. The holder
     // covers waiters' requests, so once it exits they acquire the lock, find
@@ -3927,6 +4037,7 @@ mod tests {
         // its relation pass can't run concurrently with another pass (and overwrite
         // newer output). Proof: while we hold the gate, the spawned resume is blocked
         // and its map-clear side effect can't happen; once released, it proceeds.
+        let _g = super::test_pass_gate_guard();
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws_resume_gate").await.unwrap();
         let r = repo::add_repo_ref(&db, ws.id, "solo", "/nonexistent/solo-resume", "main", "", true)
@@ -3957,6 +4068,252 @@ mod tests {
         assert!(
             repo::get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
             "after the gate is released, resume runs and clears the stale map"
+        );
+    }
+
+    // ── issue #107: honest "queued" status for a repo that hasn't started yet ──
+
+    /// A fabricated, never-recycled workspace id for pass-gate tests below — NOT a
+    /// real `create_workspace` row. `pass_gate`/`graph`/`analyze_workspace_coalesced`
+    /// don't require the workspace to exist (an empty repo list is a legitimate,
+    /// harmless case: `list_repos` is a plain filtered SELECT). A real id restarts
+    /// at 1 for every fresh in-memory test DB and collides with any OTHER test
+    /// touching the same shared, process-global gate map — including, we learned the
+    /// hard way, production code's best-effort fire-and-forget passes (e.g.
+    /// `register_repo`'s post-add spawn, exercised by commands.rs tests that call it
+    /// directly) which are never awaited and so can't be serialized against via
+    /// `test_pass_gate_guard` alone. Each test below gets its own offset so they
+    /// stay distinguishable in a debugger even though the guard already serializes
+    /// them against each other.
+    fn sentinel_ws_id(offset: i32) -> i32 {
+        2_000_000_000 + offset
+    }
+
+    #[tokio::test]
+    async fn analyze_workspace_coalesced_reports_active_while_queued_behind_another_pass() {
+        // The card's "queued" status (vs "pending" — nothing scheduled) reads
+        // `workspace_analysis_active`, which must be true for the WHOLE time a
+        // caller is inside `analyze_workspace_coalesced` — including merely
+        // waiting for the gate lock behind another pass, not just while its own
+        // `analyze_workspace` call runs. Proof: hold the gate manually (same
+        // technique as `resume_workspace_serializes_under_pass_gate` above), spawn
+        // a coalesced call, and confirm it reports active while blocked on the
+        // lock — before `analyze_workspace` has run even once — then confirm it
+        // drops back to idle once the call has actually returned.
+        let _g = super::test_pass_gate_guard();
+        let ws_id = sentinel_ws_id(1);
+        let db = mem().await;
+
+        let gate = super::pass_gate(ws_id);
+        let guard = gate.lock.lock().await;
+        assert!(!super::workspace_analysis_active(ws_id), "idle before any request");
+
+        let db2 = db.clone();
+        let handle = tokio::spawn(async move {
+            super::analyze_workspace_coalesced(&db2, ws_id, false).await;
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            super::workspace_analysis_active(ws_id),
+            "active while queued behind the held gate lock, before analyze_workspace ever runs"
+        );
+
+        drop(guard);
+        handle.await.unwrap();
+
+        assert!(
+            !super::workspace_analysis_active(ws_id),
+            "back to idle once the (only) caller has fully returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_workspace_coalesced_active_stays_true_until_every_caller_returns() {
+        // A batch add fires analyze_workspace_coalesced once per repo. `active` is a
+        // COUNTER (not a bool) precisely so it stays true until the LAST outstanding
+        // caller returns — a bool flipped false the moment the first caller's own
+        // drain saw no more work would flash sibling repos to "pending" for an
+        // instant even though a second caller is still genuinely queued right
+        // behind it (see the PassGate.active doc comment).
+        let _g = super::test_pass_gate_guard();
+        let ws_id = sentinel_ws_id(2);
+        let db = mem().await;
+
+        let gate = super::pass_gate(ws_id);
+        let guard = gate.lock.lock().await;
+
+        let db2 = db.clone();
+        let h1 = tokio::spawn(async move {
+            super::analyze_workspace_coalesced(&db2, ws_id, false).await;
+        });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let db3 = db.clone();
+        let h2 = tokio::spawn(async move {
+            super::analyze_workspace_coalesced(&db3, ws_id, false).await;
+        });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            super::workspace_analysis_active(ws_id),
+            "two callers queued behind the held gate lock, still active"
+        );
+
+        drop(guard);
+        h1.await.unwrap();
+        h2.await.unwrap();
+
+        assert!(
+            !super::workspace_analysis_active(ws_id),
+            "idle once BOTH callers have returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_reports_analysis_active_from_the_pass_gate() {
+        // `Graph::analysis_active` is the field the UI actually reads (via
+        // repo_graph) — this pins the wiring from the gate's live counter into the
+        // serialized DTO, on top of the two tests above that pin the counter's own
+        // increment/decrement semantics.
+        let _g = super::test_pass_gate_guard();
+        let ws_id = sentinel_ws_id(3);
+        let db = mem().await;
+
+        let g = super::graph(&db, ws_id).await.unwrap();
+        assert!(!g.analysis_active, "no pass in flight yet");
+
+        let gate = super::pass_gate(ws_id);
+        gate.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let g2 = super::graph(&db, ws_id).await.unwrap();
+        assert!(g2.analysis_active, "graph() surfaces an in-flight pass");
+        gate.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    // ── review follow-up: the FORCED half (reanalyze_workspace) must count too ──
+    // Every forced entry point — the toolbar's "Analyze deps" button, a failed
+    // repo's Retry action, and the curator chat's reanalyze tool — routes through
+    // `reanalyze_workspace`. `Graph.analysis_active`'s own doc comment promises
+    // "auto OR forced"; the tests above only proved the auto half
+    // (`analyze_workspace_coalesced`). These prove the forced half.
+
+    #[tokio::test]
+    async fn reanalyze_workspace_reports_active_while_queued_behind_another_pass() {
+        // Deterministic repro of the reported bug: a real forced pass (5
+        // never-analyzed repos, "Analyze deps" or a failed repo's Retry) works
+        // through the workspace sequentially — every repo except the one
+        // currently running must read "queued", not "pending". Before this fix
+        // `reanalyze_workspace` never touched `gate.active` at all, so that
+        // never happened. Proof mirrors the auto-path test above: hold the gate
+        // manually, spawn reanalyze_workspace, confirm active while it's queued
+        // behind the lock — before analyze_workspace has run even once — then
+        // confirm it drops back to idle once the call actually returns.
+        let _g = super::test_pass_gate_guard();
+        let ws_id = sentinel_ws_id(4);
+        let db = mem().await;
+
+        let gate = super::pass_gate(ws_id);
+        let guard = gate.lock.lock().await;
+        assert!(!super::workspace_analysis_active(ws_id), "idle before any request");
+
+        let db2 = db.clone();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel2 = cancel.clone();
+        let handle = tokio::spawn(async move { super::reanalyze_workspace(&db2, ws_id, &cancel2).await });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            super::workspace_analysis_active(ws_id),
+            "a forced pass queued behind the held gate lock reads as active, same as an auto pass"
+        );
+
+        drop(guard);
+        let cancelled = handle.await.unwrap();
+        assert!(!cancelled, "never cancelled — runs to completion (no repos, returns immediately)");
+
+        assert!(
+            !super::workspace_analysis_active(ws_id),
+            "back to idle once the forced pass has actually returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn reanalyze_workspace_active_clears_when_cancelled_while_queued() {
+        // The specific case a naive "fetch_add before the wait loop, fetch_sub
+        // after analyze_workspace returns" pair would get wrong:
+        // reanalyze_workspace can return EARLY (cancelled) from INSIDE the wait
+        // loop, before ever reaching the lock or analyze_workspace. The guard's
+        // Drop — not a decrement duplicated before each `return` — must still
+        // fire on that path. Proof: hold the gate so reanalyze_workspace can
+        // never acquire it, spawn it, confirm active while it polls for the
+        // lock, then trip its cancel token and confirm BOTH that it reports
+        // cancelled AND that active drops back to idle — while we are STILL
+        // holding the gate lock the whole time (proving the guard cleaned up
+        // independently of the lock, which this call never even got).
+        let _g = super::test_pass_gate_guard();
+        let ws_id = sentinel_ws_id(5);
+        let db = mem().await;
+
+        let gate = super::pass_gate(ws_id);
+        let guard = gate.lock.lock().await;
+
+        let db2 = db.clone();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel2 = cancel.clone();
+        let handle = tokio::spawn(async move { super::reanalyze_workspace(&db2, ws_id, &cancel2).await });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            super::workspace_analysis_active(ws_id),
+            "active while polling for the lock, before any cancellation"
+        );
+
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        let cancelled = handle.await.unwrap();
+        assert!(cancelled, "reported cancelled — it never got to run analyze_workspace");
+
+        assert!(
+            !super::workspace_analysis_active(ws_id),
+            "active must clear on the cancelled-while-queued early return, not just normal completion"
+        );
+
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn active_pass_guard_decrements_even_when_the_guarded_task_panics() {
+        // P2 hardening: nothing between ActivePassGuard::new and the end of its
+        // scope may leave `active` stuck above zero if a panic unwinds through
+        // it (e.g. a bug deep in analyze_workspace's call chain — manifest/git
+        // parsing, proc_registry, …) — that would strand the workspace reading
+        // "queued" forever, with no self-heal short of an app restart. Proof:
+        // spawn a task that constructs the guard and immediately panics; tokio
+        // catches the panic at the task boundary (a JoinError, not a test
+        // failure), but Drop still runs during the unwind INSIDE that task, so
+        // by the time we observe it here the counter is already back to zero.
+        let _g = super::test_pass_gate_guard();
+        let ws_id = sentinel_ws_id(6);
+        assert!(!super::workspace_analysis_active(ws_id), "idle before the panic");
+
+        let gate = super::pass_gate(ws_id);
+        let handle = tokio::spawn(async move {
+            let _active = super::ActivePassGuard::new(gate, ws_id);
+            panic!("simulated panic deep in analyze_workspace's call chain");
+        });
+        let result = handle.await;
+        assert!(result.is_err(), "the spawned task panicked, as intended");
+
+        assert!(
+            !super::workspace_analysis_active(ws_id),
+            "the guard's Drop ran during unwind — active must not be stuck"
         );
     }
 
