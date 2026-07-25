@@ -29,6 +29,25 @@ fn ensure_lead_cwd(thread_id: i32) -> anyhow::Result<std::path::PathBuf> {
     Ok(cwd)
 }
 
+/// Append a `--model <value>` override (issue #98) onto an engine's spawn args
+/// — the ONE place this flag gets built, called from all three `EngineInner`
+/// construction sites (`lead_engine`, `chat_open_worker_impl`, `worker_engine`)
+/// so the shape can't drift between them. claude and codex's per-turn argv
+/// builders both consume `extra_args` (`AgentAdapter::build_argv` / codex
+/// app-server's own spawn, see `codex_app_server::Client::connect_session`) and
+/// both accept a bare `--model <value>` flag, so no per-tool branching is
+/// needed here. opencode's argv builder never reads `extra_args` at all — this
+/// still pushes the flag (harmless, since nothing consumes it), and the
+/// frontend keeps that honest by disabling the model field for opencode
+/// (`session/engineSwitch.ts::modelSupported`) rather than silently no-op'ing
+/// a value the user typed. `None`/empty is a no-op (follow the CLI's default).
+fn push_model_arg(extra: &mut Vec<String>, model: Option<&str>) {
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        extra.push("--model".into());
+        extra.push(m.to_string());
+    }
+}
+
 /// What a (re)dispatched worker session looks like to the frontend.
 #[derive(serde::Serialize, Clone)]
 pub struct SessionInfo {
@@ -244,6 +263,7 @@ pub async fn lead_engine(
             crate::bus::inject::inject(&base, thread_id, crate::bus::LEAD, &t.lead_tool, &cwd).args,
         );
     }
+    push_model_arg(&mut extra, t.lead_model.as_deref());
     let system_prompt = if is_concierge {
         concierge_prompt(lang)
     } else if is_curator {
@@ -449,7 +469,79 @@ fn lead_alive(child_alive: bool, has_codex_client: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{lead_alive, lead_prompt, lead_prompt_for, lead_state_label, needs_list_repos_directives};
+    use super::{
+        lead_alive, lead_prompt, lead_prompt_for, lead_state_label, needs_list_repos_directives,
+        normalize_model, push_model_arg,
+    };
+
+    // issue #98 P0 (adversarial re-review of PR #139): the model override was
+    // persisted, surfaced in the UI, and confirmed via SwitchOutcome/the
+    // engine_switch marker — but `push_model_arg` was never actually CALLED
+    // from any of the three EngineInner construction sites, so `--model` never
+    // reached a spawn argv. These tests lock down the flag-building contract
+    // `lead_engine` / `chat_open_worker_impl` / `worker_engine` now all share
+    // (see the call sites: `push_model_arg(&mut extra, t.lead_model.as_deref())`
+    // etc.) — a full AppHandle-level test through those three functions isn't
+    // feasible without enabling tauri's `test` Cargo feature (not currently
+    // enabled, and not something to flip on speculatively for one test), so
+    // this is the closest unit-testable proof of the exact logic that broke.
+    #[test]
+    fn push_model_arg_appends_flag_and_value_in_order() {
+        let mut extra = vec!["--settings".to_string(), "/tmp/x.json".to_string()];
+        push_model_arg(&mut extra, Some("opus"));
+        assert_eq!(
+            extra,
+            vec!["--settings", "/tmp/x.json", "--model", "opus"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn push_model_arg_is_a_noop_for_none_or_empty() {
+        let mut extra = vec!["-c".to_string(), "k=v".to_string()];
+        let before = extra.clone();
+        push_model_arg(&mut extra, None);
+        assert_eq!(extra, before, "None must not append anything");
+        push_model_arg(&mut extra, Some(""));
+        assert_eq!(extra, before, "empty string must not append anything either");
+    }
+
+    #[test]
+    fn push_model_arg_starting_from_empty_extra_args() {
+        // The common case: a thread/session with no ask-hook/MCP injection args
+        // at all (can't happen in practice, but the function must not assume a
+        // non-empty starting vec).
+        let mut extra = vec![];
+        push_model_arg(&mut extra, Some("gpt-5.5-high"));
+        assert_eq!(extra, vec!["--model".to_string(), "gpt-5.5-high".to_string()]);
+    }
+
+    #[test]
+    fn normalize_model_trims_and_blanks_to_none() {
+        assert_eq!(normalize_model(None), None);
+        assert_eq!(normalize_model(Some("".into())), None);
+        assert_eq!(normalize_model(Some("   ".into())), None);
+        assert_eq!(normalize_model(Some("  opus  ".into())), Some("opus".to_string()));
+        assert_eq!(normalize_model(Some("gpt-5.5-high".into())), Some("gpt-5.5-high".to_string()));
+    }
+
+    /// End-to-end contract for a single switch: `normalize_model` (the switch
+    /// command's own input-sanitizing step) feeding directly into
+    /// `push_model_arg` (the engine-construction step) must round-trip a real
+    /// override into the exact argv pair a CLI expects, with no double-trim /
+    /// double-space / silent-drop surprises at the seam between the two.
+    #[test]
+    fn normalize_model_feeds_push_model_arg_correctly() {
+        let mut extra = vec![];
+        push_model_arg(&mut extra, normalize_model(Some("  opus  ".into())).as_deref());
+        assert_eq!(extra, vec!["--model".to_string(), "opus".to_string()]);
+
+        let mut extra2 = vec!["existing".to_string()];
+        push_model_arg(&mut extra2, normalize_model(Some("   ".into())).as_deref());
+        assert_eq!(extra2, vec!["existing".to_string()], "blank override clears to no-op");
+    }
 
     #[test]
     fn busy_turn_reports_busy_even_without_resident_child() {
@@ -1140,6 +1232,7 @@ pub(crate) async fn chat_open_worker_impl(
     }
     let mut extra = ask.args;
     extra.extend(inj.args);
+    push_model_arg(&mut extra, sess.model.as_deref());
 
     let state = app.state::<LeadChatState>();
     let key = sess.id as i64;
@@ -1268,6 +1361,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     }
     let mut extra = ask.args;
     extra.extend(inj.args);
+    push_model_arg(&mut extra, sess.model.as_deref());
     let mut inner = engine::EngineInner {
         thread_id: dir.thread_id,
         tool: sess.tool.clone(),
@@ -1511,11 +1605,14 @@ async fn insert_switch_marker(
 ///      `STATUS_STOPPED` (`engine::teardown_for_switch`), since this is a
 ///      replacement, not a stop the user needs to explicitly resume from.
 ///   3. persist the new tool/model (`repo::switch_thread_tool`, which also
-///      clears any stale command-alias pin) and clear the native session id
-///      (`engine::clear_native_id` — the SAME contract turn-freeze recovery
-///      and rewind already rely on: dogfooding pitfall #1, a stale native id
-///      handed to a different engine's `--resume`/`resume` fails fast with
-///      "No conversation found").
+///      clears any stale command-alias pin), re-stamp the freeze-recovery
+///      grace marker (`repo::mark_turn_freeze_recovered` — see its doc for
+///      why a switch reuses it: prevents `revive`'s stall sweep from
+///      auto-redriving this freshly-switched lead within the next tick), and
+///      clear the native session id (`engine::clear_native_id` — the SAME
+///      contract turn-freeze recovery and rewind already rely on: dogfooding
+///      pitfall #1, a stale native id handed to a different engine's
+///      `--resume`/`resume` fails fast with "No conversation found").
 ///   4. reconstruct the engine fresh via `lead_engine` — the exact construction
 ///      path a cold app boot uses (re-injects the ask-hook/MCP servers/
 ///      system-prompt for the NEW tool identity), never a hand-patched partial
@@ -1571,6 +1668,17 @@ pub async fn switch_lead_tool(
     repo::switch_thread_tool(&db, thread_id, &tool, model.as_deref())
         .await
         .map_err(|e| e.to_string())?;
+    // Re-stamp the freeze-recovery grace marker BEFORE clearing native id —
+    // same ordering discipline `recover_from_freeze` uses, and see
+    // `repo::mark_turn_freeze_recovered`'s doc for why a switch reuses it:
+    // without this, `revive`'s stall sweep could read a much-older, unrelated
+    // freeze-recovery marker as "resumable" once ITS OWN grace window had
+    // elapsed and auto-redrive this freshly-switched lead within one sweep
+    // tick. Best-effort (logged, not fatal) — the switch's own correctness
+    // does not depend on it.
+    if let Err(err) = repo::mark_turn_freeze_recovered(&db, thread_id, None).await {
+        eprintln!("[weft] switch_lead_tool: failed to stamp the freeze-recovery grace marker for thread {thread_id}: {err}");
+    }
     engine::clear_native_id(&db, None, thread_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -1597,12 +1705,17 @@ pub async fn switch_lead_tool(
 /// issue #96 layer 2 of 3 (independent of the thread's lead and of the global
 /// default; see `switch_lead_tool` / `set_default_tool`). Same six-step
 /// semantics as `switch_lead_tool`, with two worker-specific differences:
-///   - the durable write is `repo::switch_direction_tool` (NOT just
-///     `switch_session_tool`) — `chat_open_worker_impl`'s cold-recreate path
-///     (which fires the very next time this worker is opened, since the
-///     native id this switch just cleared makes that function's resume
-///     condition false) reads `direction.tool`, not `session.tool`; leaving
-///     the direction stale would silently revert the switch on next open.
+///   - the durable write is `repo::switch_worker_tool_txn` — ONE transaction
+///     covering BOTH `direction.tool` (the durable side: `chat_open_worker_impl`'s
+///     cold-recreate path, which fires the very next time this worker is
+///     opened since the native id this switch just cleared makes that
+///     function's resume condition false, reads `direction.tool` not
+///     `session.tool`) and `session.tool`/`session.model` (the live side
+///     `worker_engine`/every `chat_send` reads) — not two independent writes.
+///     A torn write between them would leave those two readers disagreeing
+///     about which tool this worker is actually running: the panel shows the
+///     new tool, the next message silently goes to the old one — #96's core
+///     confusion recurring in a harder-to-notice shape.
 ///   - the history digest is built from ONLY this session's own rows (a
 ///     worker's timeline is a sub-thread of the lead's, keyed by
 ///     `session_id`), not the whole thread's.
@@ -1641,12 +1754,14 @@ pub async fn switch_worker_tool(
         .collect();
     let digest = engine::build_switch_digest(&sess.tool, &tool, &own);
 
-    repo::switch_direction_tool(&db, sess.direction_id, &tool)
+    repo::switch_worker_tool_txn(&db, sess.direction_id, session_id, &tool, model.as_deref())
         .await
         .map_err(|e| e.to_string())?;
-    repo::switch_session_tool(&db, session_id, &tool, model.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
+    // See switch_lead_tool's identical call for why — same grace-window reuse,
+    // same best-effort posture, ordered before the native-id clear.
+    if let Err(err) = repo::mark_turn_freeze_recovered(&db, dir.thread_id, Some(session_id)).await {
+        eprintln!("[weft] switch_worker_tool: failed to stamp the freeze-recovery grace marker for session {session_id}: {err}");
+    }
     engine::clear_native_id(&db, Some(session_id), dir.thread_id)
         .await
         .map_err(|e| e.to_string())?;

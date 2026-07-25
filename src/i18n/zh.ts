@@ -392,7 +392,7 @@ export const zh = {
     switchModelHint: "以 --model 传给 CLI；留空则用它自己配置的默认模型。",
     switchModelUnsupported: "{{tool}} 暂不支持模型覆盖。",
     switchModelPlaceholder: "例如 opus、gpt-5.5-high…",
-    switchBody: "会清空这段对话的原生会话——新引擎从零开始，首条消息会附带一份历史摘要。",
+    switchBody: "会清空这段对话的原生会话——新引擎从零开始。为了不让 {{tool}} 从零认知起步，下一条消息会附带一份最近对话的摘要——也就是说，这段内容现在也会发给 {{tool}}，不再只有原来那个引擎能看到。",
     switchReloadBody: "会用全新原生会话重启这个引擎——用来让你刚改的 CLI 配置（比如它的默认模型）生效，或者救回一个卡住的引擎。",
     switchConfirm: "切换",
     switchReloadConfirm: "重新加载",

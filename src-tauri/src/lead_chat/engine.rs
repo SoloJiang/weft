@@ -1486,13 +1486,24 @@ pub struct EngineInner {
     pub native_id: Option<String>,
     /// A mechanical digest of the thread's history, staged by an engine/model
     /// switch (issue #96, pitfall 2: "new engine can't see thread history") to
-    /// ride the NEXT outgoing turn's dispatched text — consumed exactly once by
-    /// `send()`, then cleared. `None` in the common case (no switch pending).
-    /// Deliberately NOT persisted: an app restart between a switch and the next
-    /// send already lost nothing durable (the switch already cleared native_id
-    /// in the DB, so the fresh engine starts a brand-new native session either
-    /// way) — only this one best-effort context nudge would be skipped, not any
-    /// correctness guarantee.
+    /// ride the NEXT outgoing turn's dispatched text. `send()` PEEKS this (never
+    /// `.take()`s it) to build that turn's dispatched text, and clears it only
+    /// once delivery is confirmed (queued, written to a live stdin, or handed
+    /// to a spawn) — a transient failure on the first attempt after a switch
+    /// leaves it in place for the retry, rather than discarding it permanently
+    /// (adversarial re-review of PR #139, P1: an earlier version used `.take()`
+    /// up front, before any of `send()`'s many failure paths had run). `None`
+    /// in the common case (no switch pending). Deliberately NOT persisted to
+    /// the DB, and NEVER written into `lead_message.content` either (`send()`
+    /// builds the row's persisted `content`/`dispatched` fields from the
+    /// digest-free text FIRST, and only prepends this digest to the outbound
+    /// copy as the very last step) — an app restart between a switch and the
+    /// next send already lost nothing durable (the switch already cleared
+    /// native_id in the DB, so the fresh engine starts a brand-new native
+    /// session either way); only this one best-effort context nudge would be
+    /// skipped, not any correctness guarantee, and definitely not something
+    /// that should ever land at rest in the database (issue #96 pitfall 2's
+    /// digest can carry up to 12 prior turns of raw conversation text).
     pub pending_context_digest: Option<String>,
     pub slash_commands: Vec<super::proto::SlashCmd>,
     pub turn: TurnState,
@@ -2501,16 +2512,29 @@ pub async fn send(
     }
 
     // A switch (issue #96) may have staged a history digest for exactly this
-    // next turn — consumed once, here, so it rides the DISPATCHED text (agent-
-    // visible) without polluting `content` (the human-visible row built above
-    // from the raw `text`/`kind` a moment ago — the same asymmetry the
-    // "Attached files" appendix below already relies on). `.take()` under a
-    // fresh lock: cheap, and Phase 1 already dropped its lock before this point.
-    let digest = eng.lock().await.pending_context_digest.take();
-    let mut outbound = match digest {
-        Some(d) if !d.is_empty() => format!("{d}\n\n{text}"),
-        _ => text.to_string(),
-    };
+    // next turn — read here (NOT `.take()`n — see the clear at the bottom of
+    // this function) so it rides the DISPATCHED text (agent-visible) without
+    // polluting `content` (the human-visible row built above from the raw
+    // `text`/`kind` a moment ago — the same asymmetry the "Attached files"
+    // appendix below already relies on). PEEK, don't consume, under a fresh
+    // lock: cheap, and Phase 1 already dropped its lock before this point.
+    //
+    // Adversarial re-review of PR #139, P1: an EARLIER version of this code
+    // used `.take()` right here, before ANY of this function's many failure
+    // paths (reservation invalidated, write_user, queue-full, spawn_turn,
+    // spawn_codex_turn_or_exec, …) had a chance to run — so a transient
+    // failure on the FIRST send attempt after a switch permanently discarded
+    // the digest with no way to re-stage it short of switching again. Cloning
+    // here and clearing ONLY at the bottom — the single point every success
+    // path in this function converges on (verified: every OTHER exit between
+    // here and there is a `return Err(...)`) — means a failed attempt leaves
+    // the field untouched for the retry to pick up.
+    let digest = eng.lock().await.pending_context_digest.clone();
+    // Deliberately digest-FREE through the attachment appendices and the
+    // `dispatched` persistence below — the digest is prepended as the very
+    // last step, right before `Outgoing` is built, so it can never reach
+    // anything written to the DB (see that step for why).
+    let mut outbound = text.to_string();
     // Capture BEFORE images may be spilled to temp files below (per-turn dialects
     // clear out.images after spill; has_attachments must reflect the original inputs).
     let has_attachments = !files.is_empty() || !images.is_empty();
@@ -2543,7 +2567,14 @@ pub async fn send(
     // Persist the EXACT dispatched text for image-bearing per-turn rows: the
     // spill loop above omits a path when decode/write fails, and rewind's
     // native text match can't reconstruct that retroactively. (Text/files
-    // appendices are deterministic; only images need this.)
+    // appendices are deterministic; only images need this.) `outbound` here is
+    // STILL digest-free (see above) — adversarial re-review of PR #139, P1: an
+    // earlier version prepended the digest before this point, so a post-switch
+    // history digest (up to 12 prior turns, potentially containing paths,
+    // secrets pasted into chat, etc.) landed in `lead_message.content` here,
+    // directly contradicting `pending_context_digest`'s own "deliberately NOT
+    // persisted" doc. Only the human-typed `text` + attachment appendices are
+    // ever written to the row.
     if per_turn(&ctx.tool) && !image_uris.is_empty() {
         let with_dispatched = serde_json::json!({
             "text": text,
@@ -2552,6 +2583,11 @@ pub async fn send(
             "dispatched": &outbound,
         });
         let _ = repo::update_lead_message(db, row_id, &with_dispatched.to_string(), status).await;
+    }
+    // NOW prepend the digest (if any) — the very last transformation before the
+    // agent-bound `Outgoing`, strictly after every DB write above.
+    if let Some(d) = digest.as_deref().filter(|d| !d.is_empty()) {
+        outbound = format!("{d}\n\n{outbound}");
     }
     let out = Outgoing {
         text: outbound,
@@ -2753,6 +2789,20 @@ pub async fn send(
                 rollback_failed_visible_turn(app, db, eng, pturn, row_id, &content, status).await;
                 return Err(e);
             }
+        }
+    }
+    // The digest peeked above (if any) is now genuinely embedded in text that
+    // was written to a live stdin, handed to a queue, or handed to a spawn —
+    // this is the ONE point every success path converges on (every other exit
+    // between the peek and here is a `return Err(...)`), so it is safe to
+    // clear now. Only clear when it's still the SAME digest this send peeked
+    // (`Some(d) if cur.as_ref() == Some(d)`): a concurrent switch racing in
+    // between could have staged a NEW digest for a later turn, which belongs
+    // to that later turn, not this one.
+    if let Some(d) = &digest {
+        let mut inner = eng.lock().await;
+        if inner.pending_context_digest.as_ref() == Some(d) {
+            inner.pending_context_digest = None;
         }
     }
     Ok(())

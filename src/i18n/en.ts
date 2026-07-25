@@ -405,7 +405,7 @@ export const en = {
     switchModelUnsupported: "{{tool}} doesn't support a model override yet.",
     switchModelPlaceholder: "e.g. opus, gpt-5.5-high…",
     switchBody:
-      "Clears this conversation's native session — the new engine starts fresh, with a condensed summary of the history so far attached to your next message.",
+      "Clears this conversation's native session — the new engine starts fresh. Your next message carries a condensed summary of the recent conversation so {{tool}} isn't starting blind, which means that content is now also visible to {{tool}}, not just whichever engine ran it before.",
     switchReloadBody:
       "Restarts the engine with a fresh native session — use this to pick up a change you made to the CLI's own config (e.g. its default model), or to unstick one that's misbehaving.",
     switchConfirm: "Switch",

@@ -80,8 +80,11 @@ async fn two_directions_exchange_a_message() {
 /// The Ask Bridge's own response to that cancellation must be an EXPLICIT,
 /// well-formed deny — not the bare `{}` this endpoint used to return on
 /// timeout/cancel, which every weft-spawned engine (always headless) has no
-/// sane way to fall back from, and which opencode's hook plugin reads as an
-/// implicit ALLOW (only the literal string "deny" throws).
+/// sane way to fall back from, and which was confirmed fail-open for TWO of
+/// the three hook consumers (see `handle_ask`'s doc for the code-level
+/// citations): opencode's hook plugin reads it as an implicit ALLOW (only the
+/// literal string "deny" throws), and codex's global hook script exits 0 with
+/// no output, which Codex's own hook contract treats as success/continue.
 #[tokio::test]
 async fn ask_bridge_cancel_returns_explicit_deny() {
     let reg = BusRegistry::new();

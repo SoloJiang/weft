@@ -1159,21 +1159,49 @@ pub async fn rename_direction(db: &Db, direction_id: i32, name: &str) -> Result<
     Ok(a.update(&db.0).await?)
 }
 
-/// Persist a worker's engine identity switch onto the DURABLE side (issue
-/// #96/#98): `direction.tool` is the source `chat_open_worker_impl` reads
-/// whenever it (re)creates a session — e.g. the very next open after this
+/// Atomically switch BOTH halves of a worker's engine identity/model override
+/// (issue #96/#98) — `direction.tool` (the durable side `chat_open_worker_impl`
+/// reads whenever it (re)creates a session, e.g. the very next open after this
 /// switch cleared the session's native id, which flips that function's
-/// resume-vs-recreate branch to "recreate". Leaving `direction.tool` stale
-/// would silently revert the switch the next time the worker is opened.
-/// Pair with `switch_session_tool` for the live/session-scoped half.
-pub async fn switch_direction_tool(db: &Db, direction_id: i32, tool: &str) -> Result<direction::Model> {
-    let m = direction::Entity::find_by_id(direction_id)
-        .one(&db.0)
+/// resume-vs-recreate branch to "recreate") AND `session.tool`/`session.model`
+/// (the live side `worker_engine`/every `chat_send` reads). ONE transaction,
+/// not two independent `.update()` calls: a torn write — the direction commits
+/// but the session write fails, or vice versa — would leave the two readers
+/// disagreeing about which tool this worker is actually running, silently
+/// reintroducing #96's core confusion in a harder-to-notice shape (the panel
+/// shows the new tool; the next message goes to the old one). Also clears
+/// `session.command`: a per-tool alias pin from the OLD tool would otherwise
+/// try to spawn the NEW tool identity under the old alias binary. No-op for
+/// the session half if that row is gone (a session can be reclaimed between
+/// the caller's lookup and this write — moot, not a failure, same posture as
+/// the old `switch_session_tool`); the direction half is required (not found
+/// is a real error, same as before).
+pub async fn switch_worker_tool_txn(
+    db: &Db,
+    direction_id: i32,
+    session_id: i32,
+    tool: &str,
+    model: Option<&str>,
+) -> Result<direction::Model> {
+    use sea_orm::TransactionTrait;
+    let txn = db.0.begin().await?;
+    let d = direction::Entity::find_by_id(direction_id)
+        .one(&txn)
         .await?
         .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
-    let mut a: direction::ActiveModel = m.into();
-    a.tool = Set(tool.to_string());
-    Ok(a.update(&db.0).await?)
+    let mut da: direction::ActiveModel = d.into();
+    da.tool = Set(tool.to_string());
+    let updated = da.update(&txn).await?;
+
+    if let Some(s) = session::Entity::find_by_id(session_id).one(&txn).await? {
+        let mut sa: session::ActiveModel = s.into();
+        sa.tool = Set(tool.to_string());
+        sa.command = Set(None);
+        sa.model = Set(model.map(str::to_string));
+        sa.update(&txn).await?;
+    }
+    txn.commit().await?;
+    Ok(updated)
 }
 
 /// A direction's diff "vs target" config: `(stored, base_ref)` where `stored`
@@ -1652,30 +1680,6 @@ pub async fn create_session(
     Ok(inserted)
 }
 
-/// Persist a worker's engine identity switch onto the LIVE session row (issue
-/// #96/#98): `tool` + model override, and — like `switch_thread_tool` —
-/// clears `command` (a per-tool alias pin that would otherwise silently try
-/// to spawn the OLD tool's alias binary under the NEW tool identity). No-op
-/// (row gone) rather than an error: a session can be reclaimed between the
-/// caller's lookup and this write (e.g. a concurrent worktree delete), and a
-/// switch racing that is moot, not a failure. Pair with `switch_direction_tool`
-/// for the durable/direction-scoped half.
-pub async fn switch_session_tool(
-    db: &Db,
-    session_id: i32,
-    tool: &str,
-    model: Option<&str>,
-) -> Result<()> {
-    if let Some(s) = session::Entity::find_by_id(session_id).one(&db.0).await? {
-        let mut a: session::ActiveModel = s.into();
-        a.tool = Set(tool.to_string());
-        a.command = Set(None);
-        a.model = Set(model.map(str::to_string));
-        a.update(&db.0).await?;
-    }
-    Ok(())
-}
-
 pub async fn set_session_native_id(db: &Db, session_id: i32, native_id: &str) -> Result<()> {
     if let Some(s) = session::Entity::find_by_id(session_id).one(&db.0).await? {
         let mut a: session::ActiveModel = s.into();
@@ -1742,6 +1746,25 @@ pub async fn set_session_native_id_opt(
 /// "ran, and the recovery cleared its id" (`revive::has_resumable_context`).
 /// Clearing after a failed stamp would erase that evidence and strand the
 /// session permanently.
+///
+/// Reused (not just freeze recovery) by `lead_chat::commands::{switch_lead_tool,
+/// switch_worker_tool}` (issue #96/#98, adversarial re-review of PR #139, P2):
+/// a deliberate engine/model switch also clears the native id and lands the
+/// engine at idle, which is the EXACT shape `revive`'s stall sweep looks for —
+/// without this stamp, a thread/session that had EVER gone through a genuine
+/// freeze-recovery at any point in its (possibly much older) history would
+/// read `has_resumable_context() == true` from that stale marker alone once
+/// its OWN grace window had long since elapsed, letting the very next sweep
+/// tick (every 60s) auto-redrive the freshly-switched, not-yet-human-verified
+/// engine into a "resume stalled work" prompt — a false positive with no
+/// connection to the switch that just happened. Calling this on a switch too
+/// re-stamps the grace window with the CURRENT time, so `revive`'s existing
+/// (unmodified) cooldown check holds off exactly the way it already does
+/// after a real freeze recovery. The name stays freeze-scoped (renaming would
+/// touch `recover_from_freeze`'s established call site for no behavioral
+/// gain); read it as "the native context was deliberately reset and the next
+/// automated re-drive should back off for one grace window", of which a
+/// self-healed freeze is one cause and a human-initiated switch is another.
 pub async fn mark_turn_freeze_recovered(
     db: &Db,
     thread_id: i32,
@@ -4969,8 +4992,9 @@ mod tests {
             a.update(&db.0).await.unwrap();
         }
 
-        switch_direction_tool(&db, d.id, "opencode").await.unwrap();
-        switch_session_tool(&db, s.id, "opencode", Some("kimi-for-coding/k2p6")).await.unwrap();
+        switch_worker_tool_txn(&db, d.id, s.id, "opencode", Some("kimi-for-coding/k2p6"))
+            .await
+            .unwrap();
 
         let d2 = get_direction(&db, d.id).await.unwrap().unwrap();
         assert_eq!(d2.tool, "opencode", "direction.tool must follow the switch — chat_open_worker_impl's cold-recreate path reads it, not session.tool");
@@ -4982,9 +5006,60 @@ mod tests {
         // that is the caller's (lead_chat::commands) job, layered separately.
         assert_eq!(s2.native_session_id.as_deref(), Some("native-1"));
 
-        assert!(switch_direction_tool(&db, 9999, "codex").await.is_err());
-        // A missing session is tolerated (not an error) — see the function doc.
-        assert!(switch_session_tool(&db, 9999, "codex", None).await.is_ok());
+        assert!(switch_worker_tool_txn(&db, 9999, s.id, "codex", None).await.is_err());
+        // A missing session is tolerated (not an error) on the session half —
+        // see the function doc — as long as the direction is real.
+        assert!(switch_worker_tool_txn(&db, d.id, 9999, "codex", None).await.is_ok());
+    }
+
+    /// Adversarial re-review of PR #139, P1: the direction/session writes used
+    /// to be two independent `.update()` calls — a failure on the SECOND write
+    /// left the FIRST one committed, so `direction.tool` and `session.tool`
+    /// could disagree (exactly the "which engine is this worker really
+    /// talking to" confusion issue #96 exists to fix, recurring in a
+    /// harder-to-notice shape). Proves the fix is a REAL transaction, not just
+    /// a "no error happened" happy-path check: forces the session half to fail
+    /// with a genuine DB error (renaming the `session` table out from under a
+    /// live transaction — deterministic, no timing/locking dependency, unlike
+    /// a busy-snapshot race) while the direction half is perfectly healthy,
+    /// then asserts the direction was rolled back too.
+    #[tokio::test]
+    async fn switch_worker_tool_txn_rolls_back_direction_when_session_write_fails() {
+        use sea_orm::ConnectionTrait;
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        let d = create_direction(&db, t.id, "main", "claude", repo.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+        let s = create_session(&db, d.id, repo.id, "claude", "/tmp/cwd").await.unwrap();
+
+        // Make the session half of the transaction fail with a real DB error
+        // (not a simulated one) while leaving `direction` completely healthy.
+        db.0.execute_unprepared("ALTER TABLE session RENAME TO session_renamed_for_test")
+            .await
+            .unwrap();
+
+        let err = switch_worker_tool_txn(&db, d.id, s.id, "opencode", Some("gpt-5.5-high")).await;
+        assert!(err.is_err(), "the session-table write must fail (table renamed away)");
+
+        // Restore the table so the read-back below (and any other test using
+        // this connection) sees the schema it expects.
+        db.0.execute_unprepared("ALTER TABLE session_renamed_for_test RENAME TO session")
+            .await
+            .unwrap();
+
+        let d2 = get_direction(&db, d.id).await.unwrap().unwrap();
+        assert_eq!(
+            d2.tool, "claude",
+            "direction.tool must be ROLLED BACK, not left at the new value, when the session half fails"
+        );
+        let s2 = get_session(&db, s.id).await.unwrap().unwrap();
+        assert_eq!(s2.tool, "claude", "session.tool untouched — the write never committed");
+        assert_eq!(s2.model, None);
     }
 
     #[tokio::test]

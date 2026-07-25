@@ -122,7 +122,9 @@ export function EngineSwitchDialog({
           </Field>
 
           <p className="text-[12px] leading-relaxed text-ink-muted">
-            {t(isReload ? "session.switchReloadBody" : "session.switchBody")}
+            {t(isReload ? "session.switchReloadBody" : "session.switchBody", {
+              tool: toolFullName(tool),
+            })}
           </p>
           {err && <p className="text-[12px] text-danger">{err}</p>}
 
