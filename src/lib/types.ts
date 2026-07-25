@@ -750,6 +750,27 @@ export interface GrantSnapshot {
   always: AlwaysGrant[];
 }
 
+/** One session's "release all read-only" batch grant (issue #103). */
+export interface ReadOnlySessionGrant {
+  thread: number;
+  dir: string;
+}
+
+/** In-memory-only read-only auto-allow scopes (issue #103) — NEVER persisted
+ *  across a restart, unlike `GrantSnapshot`: a deliberately safer default for a
+ *  broader, often automatically-granted trust (see `ask.rs`'s
+ *  `Inner::read_only_session`/`read_only_issue` doc). `issue` = thread ids
+ *  whose WHOLE issue (every worker, including one spawned later) auto-allows a
+ *  `read_only`-tier ask — set when the human approves that issue's dispatch.
+ *  `session` = individual (thread, dir) sessions granted via the "release this
+ *  session's read-only" batch action. Either way, a `write` / `unknown` /
+ *  `network_or_credential` ask NEVER auto-allows through this — only
+ *  `read_only`. */
+export interface ReadOnlyGrants {
+  issue: number[];
+  session: ReadOnlySessionGrant[];
+}
+
 /** A lead-proposed write declaration awaiting human approve/deny (Needs you). */
 export interface WriteTrigger {
   thread_id: number;

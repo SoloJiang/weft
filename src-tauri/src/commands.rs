@@ -905,10 +905,43 @@ pub async fn set_proposal_direction_base(
     .map_err(e)
 }
 
+/// Confirm the stored proposal + propagate issue #103's read-only auto-allow
+/// to the whole issue. Extracted from the `#[tauri::command]` wrapper (mirrors
+/// `revoke_grant_durable`) so the propagation itself is directly testable
+/// without constructing a `tauri::State`.
+///
+/// Approving dispatch here IS the human's "I already trust this issue's
+/// worktree reads" decision (the issue's own motivating pain point — a worker
+/// started right after approval still asking `pwd`), so every dir under this
+/// thread — this call's new directions AND any spawned later (a re-dispatch, a
+/// subsequent write-trigger) — auto-allows a `RiskLevel::ReadOnly` ask from
+/// here on. Never widens beyond ReadOnly (see `AskRegistry::grant_read_only_issue`);
+/// in-memory only, so it does NOT survive a restart (contrast Full/Always) and
+/// is separately revocable (`revoke_read_only_grant`). Granted unconditionally
+/// on a successful confirm (including the idempotent re-dispatch retry path) —
+/// `HashSet::insert` is a no-op when already granted, so this is safe to call
+/// every time.
+async fn confirm_proposal_and_propagate_read_only(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+) -> anyhow::Result<Vec<i32>> {
+    let ids = crate::planner::confirm(db, thread_id).await?;
+    asks.grant_read_only_issue(thread_id);
+    Ok(ids)
+}
+
 /// Confirm the stored proposal: create its directions + materialize worktrees.
+/// See `confirm_proposal_and_propagate_read_only` for the read-only propagation.
 #[tauri::command]
-pub async fn confirm_proposal(db: State<'_, Db>, thread_id: i32) -> R<Vec<i32>> {
-    crate::planner::confirm(&db, thread_id).await.map_err(e)
+pub async fn confirm_proposal(
+    db: State<'_, Db>,
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+    thread_id: i32,
+) -> R<Vec<i32>> {
+    confirm_proposal_and_propagate_read_only(&db, &asks, thread_id)
+        .await
+        .map_err(e)
 }
 
 /// The brief a worker for this direction would be dispatched with (§4.10).
@@ -1561,16 +1594,40 @@ pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<Write
     Ok(out)
 }
 
+/// Approve a write declaration + propagate issue #103's read-only auto-allow to
+/// the whole issue. Extracted from the `#[tauri::command]` wrapper (mirrors
+/// `confirm_proposal_and_propagate_read_only`) so the propagation is directly
+/// testable without constructing a `tauri::State`.
+///
+/// Same trust decision as `confirm_proposal_and_propagate_read_only` (see its
+/// doc): approving ONE lane's dispatch outside the initial ScopeReview batch is
+/// still "the human approved this issue's dispatch to run", so it gets the
+/// identical grant. In-memory only, never widens beyond `RiskLevel::ReadOnly`,
+/// separately revocable (`revoke_read_only_grant`).
+async fn approve_write_trigger_and_propagate_read_only(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+    index: usize,
+    tool: &str,
+) -> anyhow::Result<i32> {
+    let id = crate::planner::approve_direction(db, thread_id, index, tool).await?;
+    asks.grant_read_only_issue(thread_id);
+    Ok(id)
+}
+
 /// Approve a write declaration: create its direction + materialize. Returns the
-/// new direction id so the caller can dispatch a worker.
+/// new direction id so the caller can dispatch a worker. See
+/// `approve_write_trigger_and_propagate_read_only` for the read-only propagation.
 #[tauri::command]
 pub async fn approve_write_trigger(
     db: State<'_, Db>,
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
     thread_id: i32,
     index: usize,
     tool: String,
 ) -> R<i32> {
-    crate::planner::approve_direction(&db, thread_id, index, &tool)
+    approve_write_trigger_and_propagate_read_only(&db, &asks, thread_id, index, &tool)
         .await
         .map_err(e)
 }
@@ -2131,6 +2188,58 @@ pub async fn revoke_auth_grant(
     action_key: Option<String>,
 ) -> R<()> {
     revoke_grant_durable(&asks, thread, dir.as_deref(), action_key.as_deref()).await
+}
+
+/// Current read-only auto-allow scopes (issue #103) — in-memory only, NEVER
+/// persisted (see `ask::Inner::read_only_session`'s doc), so this is a live
+/// snapshot, not something restored at boot. Backs the frontend's "read-only
+/// trusted" indicators (session + issue-wide) and their revoke entry points.
+#[tauri::command]
+pub fn read_only_grants(
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+) -> R<crate::ask::ReadOnlyGrants> {
+    Ok(asks.read_only_grants())
+}
+
+/// "Release all read-only for this session" (issue #103's core batch action):
+/// resolves every currently open `RiskLevel::ReadOnly` ask in (thread, dir) to
+/// Allow and installs a forward-looking session-scoped rule so a later
+/// ReadOnly ask in the same session doesn't re-prompt either. A Write/
+/// NetworkOrCredential/Unknown ask in this session is left untouched — still
+/// open, still needs a real human answer (`AskRegistry::grant_read_only_session`
+/// is the actual enforcement; this command is a thin wrapper). In-memory only,
+/// never persisted. Returns how many open asks were just resolved, so the
+/// frontend can toast "released N".
+#[tauri::command]
+pub fn release_session_read_only(
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+    thread: i32,
+    dir: String,
+) -> R<usize> {
+    Ok(asks.grant_read_only_session(thread, &dir))
+}
+
+/// Revoke a read-only auto-allow grant (issue #103), at the granularity the
+/// caller passes: `dir == None` revokes the WHOLE issue's propagation
+/// (`grant_read_only_issue`'s counterpart); `dir == Some` revokes just that one
+/// session's batch grant. In-memory only — there is no durable write to roll
+/// back here (contrast `revoke_auth_grant`'s acked flush for Full/Always), so
+/// this can't fail short of the ask registry itself being gone.
+#[tauri::command]
+pub fn revoke_read_only_grant(
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+    thread: i32,
+    dir: Option<String>,
+) -> R<()> {
+    match dir {
+        Some(dir) => {
+            asks.revoke_read_only_session(thread, &dir);
+        }
+        None => {
+            asks.revoke_read_only_issue(thread);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2874,9 +2983,9 @@ mod tests {
         cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
 
         // the deleted workspace's grant is gone; the other workspace's survives
-        assert!(asks.auto_decision(thread.id, "", "anything").is_none());
+        assert!(asks.auto_decision(thread.id, "", crate::ask::RiskLevel::Unknown, "anything").is_none());
         assert_eq!(
-            asks.auto_decision(keep_thread.id, "", "anything"),
+            asks.auto_decision(keep_thread.id, "", crate::ask::RiskLevel::Unknown, "anything"),
             Some(crate::ask::Decision::Allow)
         );
     }
@@ -2922,7 +3031,12 @@ mod tests {
         });
         // active before the delete
         assert_eq!(
-            asks.auto_decision(keep_thread.id, &routed.id.to_string(), "x"),
+            asks.auto_decision(
+                keep_thread.id,
+                &routed.id.to_string(),
+                crate::ask::RiskLevel::Unknown,
+                "x"
+            ),
             Some(crate::ask::Decision::Allow)
         );
 
@@ -2931,7 +3045,12 @@ mod tests {
         // deleting the workspace that owns the routed repo revokes the repo-routed
         // direction's grant (which lives in another workspace's thread).
         assert!(asks
-            .auto_decision(keep_thread.id, &routed.id.to_string(), "x")
+            .auto_decision(
+                keep_thread.id,
+                &routed.id.to_string(),
+                crate::ask::RiskLevel::Unknown,
+                "x"
+            )
             .is_none());
     }
 
@@ -3015,13 +3134,28 @@ mod tests {
 
         // BOUND (dir_a) and REPO-ROUTED (dir_routed) grants revoked; dir_b survives.
         assert!(asks
-            .auto_decision(thread.id, &dir_a.id.to_string(), "x")
+            .auto_decision(
+                thread.id,
+                &dir_a.id.to_string(),
+                crate::ask::RiskLevel::Unknown,
+                "x"
+            )
             .is_none());
         assert!(asks
-            .auto_decision(thread.id, &dir_routed.id.to_string(), "x")
+            .auto_decision(
+                thread.id,
+                &dir_routed.id.to_string(),
+                crate::ask::RiskLevel::Unknown,
+                "x"
+            )
             .is_none());
         assert_eq!(
-            asks.auto_decision(thread.id, &dir_b.id.to_string(), "x"),
+            asks.auto_decision(
+                thread.id,
+                &dir_b.id.to_string(),
+                crate::ask::RiskLevel::Unknown,
+                "x"
+            ),
             Some(crate::ask::Decision::Allow)
         );
         // their open asks are cancelled — a post-delete answer can't re-grant them.
@@ -3070,7 +3204,7 @@ mod tests {
         assert!(r.is_err(), "a failed durable write must surface as an error");
         // the revoked Full grant is restored (memory matches the unchanged store)...
         assert_eq!(
-            asks.auto_decision(7, "42", "x"),
+            asks.auto_decision(7, "42", crate::ask::RiskLevel::Unknown, "x"),
             Some(crate::ask::Decision::Allow),
             "the Full grant must be restored on a failed write"
         );
@@ -3087,7 +3221,7 @@ mod tests {
         );
         // ...and the unrelated grant is untouched (no blind whole-set re-seed).
         assert_eq!(
-            asks.auto_decision(8, "99", "x"),
+            asks.auto_decision(8, "99", crate::ask::RiskLevel::Unknown, "x"),
             Some(crate::ask::Decision::Allow)
         );
     }
@@ -3170,5 +3304,171 @@ mod tests {
             .any(|ask| ask.id == repo_scoped_id));
         assert_ne!(remove_id, keep_id);
         assert_ne!(repo_scoped_id, keep_id);
+    }
+
+    // ---- issue #103: read-only propagation wiring (the command-layer glue,
+    // not `AskRegistry::grant_read_only_issue`'s own boundary — that's covered
+    // exhaustively in ask.rs's unit tests) ---------------------------------
+
+    /// Confirming the proposal (the human's "approve dispatch") propagates a
+    /// read-only auto-allow to the WHOLE issue. Uses a REAL git repo because
+    /// `planner::confirm` materializes a worktree; holds `ENV_LOCK` because
+    /// `WEFT_HOME` is a process-global env var shared with `planner.rs`'s own
+    /// confirm/materialize tests running in this same binary.
+    #[tokio::test]
+    async fn confirm_proposal_propagates_read_only_to_the_whole_issue_but_never_write() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-readonly-propagate-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        init_main_repo(&root, "api");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            root.join("api").to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
+            .await
+            .unwrap();
+        let proposal = crate::planner::Proposal {
+            rationale: "r".into(),
+            directions: vec![crate::planner::ProposedDirection {
+                name: "A".into(),
+                repo: "api".into(),
+                reason: "r".into(),
+                mandate: "".into(),
+                base_branch: "".into(),
+                decision: "".into(),
+                direction_id: 0,
+            }],
+        };
+        crate::planner::save_proposal(&db, t.id, &proposal).await.unwrap();
+
+        let asks = crate::ask::AskRegistry::new();
+        let ids = confirm_proposal_and_propagate_read_only(&db, &asks, t.id)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1, "the single lane should materialize");
+        let dir = ids[0].to_string();
+
+        // the propagated grant covers a ReadOnly ask on the JUST-created direction...
+        assert_eq!(
+            asks.auto_decision(t.id, &dir, crate::ask::RiskLevel::ReadOnly, "ls"),
+            Some(crate::ask::Decision::Allow)
+        );
+        // ...AND a direction that didn't exist at confirm time — the whole point of
+        // ISSUE-wide (not just per-dir) propagation: a worker spawned later still
+        // inherits it (issue #103's motivating pain point).
+        assert_eq!(
+            asks.auto_decision(t.id, "999999", crate::ask::RiskLevel::ReadOnly, "pwd"),
+            Some(crate::ask::Decision::Allow)
+        );
+        // but a Write/Unknown ask on the SAME direction still must ask — the
+        // safety boundary this feature exists to respect (#139's review lesson:
+        // what the UI claims was authorized, the backend must actually enforce,
+        // proven with a real assertion, not just an absence of a wider grant).
+        assert!(asks
+            .auto_decision(t.id, &dir, crate::ask::RiskLevel::Write, "rm -rf x")
+            .is_none());
+        assert!(asks
+            .auto_decision(t.id, &dir, crate::ask::RiskLevel::Unknown, "mystery_tool")
+            .is_none());
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// Approving ONE write-trigger lane outside the initial ScopeReview batch
+    /// propagates the SAME issue-wide read-only grant — the identical trust
+    /// decision (see `approve_write_trigger_and_propagate_read_only`'s doc).
+    #[tokio::test]
+    async fn approve_write_trigger_propagates_read_only_to_the_whole_issue_but_never_write() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-readonly-propagate-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        init_main_repo(&root, "api");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            root.join("api").to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
+            .await
+            .unwrap();
+        let proposal = crate::planner::Proposal {
+            rationale: "r".into(),
+            directions: vec![crate::planner::ProposedDirection {
+                name: "B".into(),
+                repo: "api".into(),
+                reason: "r".into(),
+                mandate: "".into(),
+                base_branch: "".into(),
+                decision: "".into(),
+                direction_id: 0,
+            }],
+        };
+        crate::planner::save_proposal(&db, t.id, &proposal).await.unwrap();
+
+        let asks = crate::ask::AskRegistry::new();
+        let dir_id =
+            approve_write_trigger_and_propagate_read_only(&db, &asks, t.id, 0, "claude")
+                .await
+                .unwrap();
+        let dir = dir_id.to_string();
+
+        assert_eq!(
+            asks.auto_decision(t.id, &dir, crate::ask::RiskLevel::ReadOnly, "cat README.md"),
+            Some(crate::ask::Decision::Allow)
+        );
+        // issue-wide: covers a dir that didn't exist at approve time too.
+        assert_eq!(
+            asks.auto_decision(t.id, "999999", crate::ask::RiskLevel::ReadOnly, "pwd"),
+            Some(crate::ask::Decision::Allow)
+        );
+        assert!(asks
+            .auto_decision(t.id, &dir, crate::ask::RiskLevel::Write, "rm -rf x")
+            .is_none());
+        assert!(asks
+            .auto_decision(
+                t.id,
+                &dir,
+                crate::ask::RiskLevel::NetworkOrCredential,
+                "curl evil"
+            )
+            .is_none());
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
     }
 }
