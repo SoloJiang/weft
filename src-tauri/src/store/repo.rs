@@ -2282,24 +2282,47 @@ pub async fn complete_queued_by_id(
     Ok(Some(a.update(&db.0).await?))
 }
 
+/// Outcome of [`mark_message_consumed`] — the caller (the one-shot
+/// `note_turn_activity` gate, engine.rs) needs to tell "settled, never try
+/// again" apart from "not eligible YET, retry the next activity event": a
+/// still-`queued` row (queued deliveries flip to `status == "complete"` only
+/// AFTER the turn is already dispatched — see `mark_queued_delivered`'s
+/// callers) is exactly the transient case a real per-turn/app-server race can
+/// hit (PR #117 review, P2): the agent's first event can land before that
+/// flip, and treating it the same as "permanently ineligible" would burn the
+/// one-shot gate on a no-op and leave the receipt stuck at "delivered"
+/// forever even though the agent is actively working.
+pub enum ConsumeMark {
+    /// Freshly marked just now — carries the updated row.
+    Marked(lead_message::Model),
+    /// Already had `consumed_at` set (idempotent no-op) — a real terminal
+    /// state, never retry.
+    AlreadyConsumed,
+    /// Missing / wrong role / not yet `status == "complete"` — retry-worthy,
+    /// NOT a reason to permanently give up.
+    NotEligible,
+}
+
 /// Stamp the delivery receipt's third tier: the agent produced its first
 /// observed activity for the turn this "user" row opened (issue #94 — "已被
 /// agent 消费"). Idempotent and narrowly guarded so a stray/late caller can't
-/// misuse it as a general status-setter: no-ops (`Ok(None)`) unless the row is
-/// role `"user"`, already `status == "complete"` (delivered — a queued row
-/// hasn't reached the agent yet, so it cannot be "consumed"), and not already
+/// misuse it as a general status-setter: only marks a row that is role
+/// `"user"`, already `status == "complete"` (delivered — a queued row hasn't
+/// reached the agent yet, so it cannot be "consumed"), and not already
 /// marked. `consumed_at` is otherwise independent of `status`: it never
 /// overwrites it, so the existing queued/complete/error/interrupted lifecycle
-/// (and everything that reads it, e.g. rewind's anchor matching) is untouched.
-pub async fn mark_message_consumed(
-    db: &Db,
-    message_id: i32,
-) -> Result<Option<lead_message::Model>> {
+/// (and everything that reads it, e.g. rewind's anchor matching) is
+/// untouched — and the partial `Set` (see the stale-snapshot tests below)
+/// can't clobber a concurrent write to any OTHER column either.
+pub async fn mark_message_consumed(db: &Db, message_id: i32) -> Result<ConsumeMark> {
     let Some(m) = lead_message::Entity::find_by_id(message_id).one(&db.0).await? else {
-        return Ok(None);
+        return Ok(ConsumeMark::NotEligible);
     };
-    if m.role != "user" || m.status != "complete" || m.consumed_at.is_some() {
-        return Ok(None);
+    if m.consumed_at.is_some() {
+        return Ok(ConsumeMark::AlreadyConsumed);
+    }
+    if m.role != "user" || m.status != "complete" {
+        return Ok(ConsumeMark::NotEligible);
     }
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2307,7 +2330,7 @@ pub async fn mark_message_consumed(
         .unwrap_or_default();
     let mut a: lead_message::ActiveModel = m.into();
     a.consumed_at = Set(Some(millis));
-    Ok(Some(a.update(&db.0).await?))
+    Ok(ConsumeMark::Marked(a.update(&db.0).await?))
 }
 
 /// 删除一条消息行（仅用于取消未交付的 queued 行）。
@@ -4927,6 +4950,16 @@ mod tests {
         assert_eq!(still.status, "queued");
     }
 
+    /// Unwraps a `ConsumeMark::Marked`, panicking with the actual variant name
+    /// otherwise — keeps the "must have marked" assertions below readable.
+    fn expect_marked(outcome: ConsumeMark) -> lead_message::Model {
+        match outcome {
+            ConsumeMark::Marked(m) => m,
+            ConsumeMark::AlreadyConsumed => panic!("expected Marked, got AlreadyConsumed"),
+            ConsumeMark::NotEligible => panic!("expected Marked, got NotEligible"),
+        }
+    }
+
     /// A delivered ("complete") user row flips NULL -> Some(millis) exactly once.
     #[tokio::test]
     async fn mark_message_consumed_flips_null_to_some() {
@@ -4936,64 +4969,168 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(m.consumed_at, None, "fresh delivered row starts unconsumed");
-        let consumed = mark_message_consumed(&db, m.id).await.unwrap().unwrap();
+        let consumed = expect_marked(mark_message_consumed(&db, m.id).await.unwrap());
         assert_eq!(consumed.id, m.id);
         assert!(consumed.consumed_at.is_some(), "must stamp a millis timestamp");
         // status is untouched — consumed_at is an orthogonal signal.
         assert_eq!(consumed.status, "complete");
     }
 
-    /// A second mark is a no-op (Ok(None)): the DB timestamp never gets
-    /// overwritten by a later "first activity" observation racing in.
+    /// A second mark reports AlreadyConsumed (a real terminal state, the
+    /// caller must NOT retry it): the DB timestamp never gets overwritten by
+    /// a later "first activity" observation racing in.
     #[tokio::test]
-    async fn mark_message_consumed_idempotent_second_call_noops() {
+    async fn mark_message_consumed_idempotent_second_call_reports_already_consumed() {
         let db = mem().await;
         let t = live_thread(&db).await;
         let m = insert_lead_message(&db, t, None, 1, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        let first = mark_message_consumed(&db, m.id).await.unwrap().unwrap();
+        let first = expect_marked(mark_message_consumed(&db, m.id).await.unwrap());
         let second = mark_message_consumed(&db, m.id).await.unwrap();
-        assert!(second.is_none(), "an already-consumed row must not re-fire");
+        assert!(
+            matches!(second, ConsumeMark::AlreadyConsumed),
+            "an already-consumed row must report AlreadyConsumed, not re-fire or read as retry-worthy"
+        );
         let still = lead_message::Entity::find_by_id(m.id).one(&db.0).await.unwrap().unwrap();
         assert_eq!(still.consumed_at, first.consumed_at, "timestamp must not change");
     }
 
     /// A still-queued row hasn't reached the agent yet — it cannot be marked
     /// "consumed" ahead of "delivered" (queued -> complete -> consumed only).
+    /// Reports NotEligible (retry-worthy), not AlreadyConsumed: PR #117
+    /// review P2 — a queued delivery's row flips to "complete" only AFTER its
+    /// turn is already dispatched (`mark_queued_delivered`'s callers), so the
+    /// agent's first activity CAN legitimately race ahead of that flip, and
+    /// the caller (engine.rs's one-shot gate) must retry rather than give up.
     #[tokio::test]
-    async fn mark_message_consumed_ignores_queued_row() {
+    async fn mark_message_consumed_reports_not_eligible_for_a_queued_row() {
         let db = mem().await;
         let t = live_thread(&db).await;
         let m = insert_lead_message(&db, t, None, 1, "user", "text", "{}", "queued")
             .await
             .unwrap();
         let res = mark_message_consumed(&db, m.id).await.unwrap();
-        assert!(res.is_none(), "a queued row must not be markable as consumed");
+        assert!(
+            matches!(res, ConsumeMark::NotEligible),
+            "a queued row must be NotEligible (retry-worthy), not AlreadyConsumed"
+        );
         let still = lead_message::Entity::find_by_id(m.id).one(&db.0).await.unwrap().unwrap();
         assert_eq!(still.consumed_at, None);
+    }
+
+    /// The retry the above test motivates: once the SAME row transitions
+    /// queued -> complete (a real `complete_queued_by_id` delivery), it
+    /// becomes markable — proving NotEligible really is transient, not a
+    /// permanent rejection reachable only by construction.
+    #[tokio::test]
+    async fn mark_message_consumed_succeeds_after_a_queued_row_is_delivered() {
+        let db = mem().await;
+        let t = live_thread(&db).await;
+        let m = insert_lead_message(&db, t, None, 1, "user", "text", "{}", "queued")
+            .await
+            .unwrap();
+        assert!(matches!(
+            mark_message_consumed(&db, m.id).await.unwrap(),
+            ConsumeMark::NotEligible
+        ));
+        complete_queued_by_id(&db, m.id).await.unwrap();
+        let consumed = expect_marked(mark_message_consumed(&db, m.id).await.unwrap());
+        assert!(consumed.consumed_at.is_some());
     }
 
     /// Only the human's own row carries the receipt — an assistant/system row
     /// (even if somehow passed in) is never a valid target.
     #[tokio::test]
-    async fn mark_message_consumed_ignores_non_user_role() {
+    async fn mark_message_consumed_reports_not_eligible_for_non_user_role() {
         let db = mem().await;
         let t = live_thread(&db).await;
         let m = insert_lead_message(&db, t, None, 1, "assistant", "text", "{}", "complete")
             .await
             .unwrap();
         let res = mark_message_consumed(&db, m.id).await.unwrap();
-        assert!(res.is_none(), "a non-user row must not be markable as consumed");
+        assert!(
+            matches!(res, ConsumeMark::NotEligible),
+            "a non-user row must not be markable as consumed"
+        );
     }
 
     /// A missing row (e.g. deleted between the activity event and the mark)
-    /// fails soft — Ok(None), not an error the caller must handle specially.
+    /// fails soft — NotEligible, not an error the caller must handle specially.
     #[tokio::test]
-    async fn mark_message_consumed_missing_row_returns_none() {
+    async fn mark_message_consumed_reports_not_eligible_for_a_missing_row() {
         let db = mem().await;
         let res = mark_message_consumed(&db, 999_999).await.unwrap();
-        assert!(res.is_none());
+        assert!(matches!(res, ConsumeMark::NotEligible));
+    }
+
+    /// PR #117 review (P2, repo.rs:2310 x2): questioned whether
+    /// `mark_message_consumed`'s `let mut a: ActiveModel = m.into(); a.field
+    /// = Set(x); a.update()` idiom clobbers OTHER columns a concurrent write
+    /// landed on between this function's read and its update (e.g. the
+    /// rewind anchor / delivery seq, both written by separate code paths
+    /// while a "consumed" mark is in flight).
+    ///
+    /// It does not: SeaORM's `Model -> ActiveModel` conversion sets every
+    /// field to `ActiveValue::Unchanged`, and `.update()` only includes
+    /// explicitly-`Set` columns in the UPDATE's SET clause — `Unchanged`
+    /// columns are excluded, not re-written with the stale snapshot's value.
+    /// This proves it directly (write a concurrent value, then run a
+    /// stale-snapshot partial update touching an unrelated column, then
+    /// assert the concurrent value survived) rather than trusting the
+    /// pattern by inspection — and it covers the SAME idiom `complete_queued_by_id`
+    /// already relies on, not just this one call site.
+    #[tokio::test]
+    async fn stale_snapshot_partial_update_does_not_clobber_concurrent_columns() {
+        let db = mem().await;
+        let t = live_thread(&db).await;
+        let m = insert_lead_message(&db, t, None, 1, "user", "text", "{}", "complete")
+            .await
+            .unwrap();
+        // A "concurrent" write lands on a DIFFERENT column, after `m` above
+        // was read as a snapshot with native_anchor == None.
+        set_lead_message_anchor(&db, m.id, "concurrent-anchor").await.unwrap();
+
+        // The exact stale-snapshot-then-partial-Set-then-update idiom shared
+        // by mark_message_consumed / complete_queued_by_id, applied to `m`
+        // (captured BEFORE the concurrent write) touching an unrelated field.
+        let mut a: lead_message::ActiveModel = m.into();
+        a.status = Set("interrupted".to_string());
+        a.update(&db.0).await.unwrap();
+
+        let after = lead_message::Entity::find_by_id(1).one(&db.0).await.unwrap().unwrap();
+        assert_eq!(
+            after.native_anchor.as_deref(),
+            Some("concurrent-anchor"),
+            "a stale Model's Unchanged fields must not overwrite a concurrent \
+             write on the same row — only explicitly Set columns land in the UPDATE"
+        );
+    }
+
+    /// The same proof, specific to `mark_message_consumed`'s own two writable
+    /// paths a real race could hit: the rewind anchor (set on TurnEnd) and
+    /// the delivery seq (set when a queued row is dequeued) — both real
+    /// concurrent writers to a "user" row's OTHER columns while a "consumed"
+    /// mark is in flight for that same row.
+    #[tokio::test]
+    async fn mark_message_consumed_preserves_concurrently_written_anchor_and_seq() {
+        let db = mem().await;
+        let t = live_thread(&db).await;
+        let m = insert_lead_message(&db, t, None, 1, "user", "text", "{}", "complete")
+            .await
+            .unwrap();
+        set_lead_message_anchor(&db, m.id, "concurrent-anchor").await.unwrap();
+        let seq = assign_delivery_seq(&db, t, m.id).await.unwrap();
+
+        let consumed = expect_marked(mark_message_consumed(&db, m.id).await.unwrap());
+
+        assert_eq!(
+            consumed.native_anchor.as_deref(),
+            Some("concurrent-anchor"),
+            "must not clobber a concurrently-written rewind anchor"
+        );
+        assert_eq!(consumed.seq, Some(seq), "must not clobber a concurrently-assigned delivery seq");
+        assert!(consumed.consumed_at.is_some(), "the actual mark must still land");
     }
 
     /// M0030: analysis_state/error round-trip and upsert_repo_profile preserves them.

@@ -547,7 +547,17 @@ async fn mark_queued_status(
 /// idempotent UPDATE keyed by message id, so a dropped/delayed mark only
 /// delays the UI receipt — it can never block, retry into, or corrupt turn
 /// delivery (no OCC state is read or written here).
-fn note_turn_activity(app: &AppHandle, db: &Db, inner: &mut EngineInner) {
+///
+/// PR #117 review, P2: a QUEUED delivery's row only flips `status ==
+/// "complete"` AFTER its turn is already dispatched (`mark_queued_delivered`
+/// runs after `spawn_turn`/`client.start_turn` — see the flush sites), so the
+/// agent's first activity can race ahead of that flip and find the row
+/// `NotEligible`. Burning the one-shot gate on that transient outcome would
+/// strand the receipt at "delivered" forever even though the agent is
+/// actively working — so a `NotEligible` result re-arms the gate (only if
+/// this engine is still on the SAME turn/row) instead of accepting it as
+/// final.
+fn note_turn_activity(app: &AppHandle, db: &Db, eng: &EngineRef, inner: &mut EngineInner) {
     inner.clock.last_activity = std::time::Instant::now();
     if !inner.clock.mark_consumed_once() {
         return;
@@ -557,9 +567,10 @@ fn note_turn_activity(app: &AppHandle, db: &Db, inner: &mut EngineInner) {
     };
     let app = app.clone();
     let db = db.clone();
+    let eng = eng.clone();
     tauri::async_runtime::spawn(async move {
         match repo::mark_message_consumed(&db, message_id).await {
-            Ok(Some(m)) => {
+            Ok(repo::ConsumeMark::Marked(m)) => {
                 let _ = app.emit(
                     EVENT,
                     Push::Consumed {
@@ -569,7 +580,19 @@ fn note_turn_activity(app: &AppHandle, db: &Db, inner: &mut EngineInner) {
                     },
                 );
             }
-            Ok(None) => {}
+            Ok(repo::ConsumeMark::AlreadyConsumed) => {}
+            Ok(repo::ConsumeMark::NotEligible) => {
+                let mut i = eng.lock().await;
+                // Ownership-guarded like every other post-await re-lock in
+                // this file: only re-arm if turn_user_row still names THIS
+                // row. If it moved on (a stop/reset, or the turn already
+                // advanced), a stale retry permit would misattribute a LATER
+                // turn's activity — advance_dequeued_turn already retargeted
+                // the gate correctly for that turn, don't second-guess it.
+                if i.turn_user_row == Some(message_id) {
+                    i.clock.rearm_consumed_gate();
+                }
+            }
             Err(e) => eprintln!("[weft] mark_message_consumed failed: {e}"),
         }
     });
@@ -1348,6 +1371,14 @@ impl TurnClock {
             self.consumed_marked = true;
             true
         }
+    }
+    /// Un-burn the one-shot gate: the attempted mark turned out to be
+    /// `NotEligible` (transient — e.g. a queued row not yet flipped to
+    /// "complete"), not a settled outcome, so the NEXT activity event should
+    /// retry rather than silently giving up on this turn's receipt forever
+    /// (PR #117 review, P2).
+    fn rearm_consumed_gate(&mut self) {
+        self.consumed_marked = false;
     }
 }
 
@@ -2831,7 +2862,7 @@ async fn codex_consumer(
         match msg {
             ThreadMsg::Event(ChatEvent::TextDelta { text, item }) => {
                 let mut inner = eng.lock().await;
-                note_turn_activity(&app, &db, &mut inner);
+                note_turn_activity(&app, &db, &eng, &mut inner);
                 let thread_id = inner.thread_id;
                 let (sid, turn) = (inner.session_id, inner.turn_id);
                 // Ensure the target row exists: item-keyed rows in `open_texts`
@@ -2897,7 +2928,7 @@ async fn codex_consumer(
             }
             ThreadMsg::Event(ChatEvent::TextDone { item, text }) => {
                 let mut inner = eng.lock().await;
-                note_turn_activity(&app, &db, &mut inner);
+                note_turn_activity(&app, &db, &eng, &mut inner);
                 let streamed = item.as_ref().and_then(|k| inner.open_texts.remove(k));
                 match streamed {
                     // The item streamed: finalize its row, preferring the
@@ -2956,7 +2987,7 @@ async fn codex_consumer(
                 // unrelated stream's sentence into fragment bubbles. Serial
                 // ordering still holds: an item's completion precedes its tools.
                 let mut inner = eng.lock().await;
-                note_turn_activity(&app, &db, &mut inner);
+                note_turn_activity(&app, &db, &eng, &mut inner);
                 if !texts.is_empty() {
                     finalize_current_text(&app, &db, &mut inner, "complete").await;
                 }
@@ -3214,7 +3245,7 @@ async fn codex_consumer(
                 // outputDelta from a long-running command: no row change, just keep
                 // the turn alive so the idle watchdog doesn't reap it mid-output.
                 let mut inner = eng.lock().await;
-                note_turn_activity(&app, &db, &mut inner);
+                note_turn_activity(&app, &db, &eng, &mut inner);
             }
             ThreadMsg::Approval { id, method, params } => {
                 // An approval (command / file-change / permissions) — route to Weft's
@@ -3224,7 +3255,15 @@ async fn codex_consumer(
                 // asks never reach here — they're declined in the read_loop.
                 let is_perm = method.contains("permissions");
                 let (thread_id, dir) = {
-                    let i = eng.lock().await;
+                    let mut i = eng.lock().await;
+                    // An approval request IS the agent actively working on
+                    // this turn — it just needs a human before it can go
+                    // further. Without this, a turn whose FIRST event is an
+                    // approval (no preceding text/tool-call delta) would
+                    // leave the receipt stuck at "delivered" while the user
+                    // stares at a Needs-you card that proves otherwise (PR
+                    // #117 review, P2).
+                    note_turn_activity(&app, &db, &eng, &mut i);
                     (i.thread_id, i.ask_dir.clone())
                 };
                 // command/cwd may sit at the top level (commandExecution ask) or
@@ -4895,7 +4934,7 @@ fn spawn_reader(
             if inner.generation != generation {
                 return; // superseded by a respawn/stop
             }
-            note_turn_activity(&app, &db, &mut inner);
+            note_turn_activity(&app, &db, &eng, &mut inner);
             let thread_id = inner.thread_id;
             // Per-turn dialects carry the native session id on their events.
             if inner.native_id.is_none() {
