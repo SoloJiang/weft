@@ -7,6 +7,9 @@
 //! - `instance_process_count` / `instance_memory_bytes` / `by_owner`:Weft 自身
 //!   owned 进程子树的规模与构成(#91,`proc_registry` 的「UI 归因」只读函数)。
 //! - `active_sessions` / `max_sessions`:并发会话闸门的占用(#92)。
+//! - `engine_quota`:各引擎(claude/codex)账号侧额度感知(issue #97 的
+//!   `engine_quota` 全局 hub),同样是纯 GET——采样已经在 codex_app_server /
+//!   spawn_reader 侧的结构化信号消费里完成,本模块只读最新快照。
 //!
 //! 只读边界:本模块不 reap、不降级、不改任何安全网的写路径——纯粹的 GET。
 
@@ -31,6 +34,9 @@ pub struct ResourceDashboardSnapshot {
     pub active_sessions: u64,
     /// 并发会话闸门的槽位上限(`WEFT_MAX_ACTIVE_SESSIONS`,默认见 `session_gate`)。
     pub max_sessions: u64,
+    /// 各引擎(claude/codex)最近一次观测到的账号侧额度快照(issue #97)。本轮
+    /// 会话期间从未收到过信号的引擎不出现在列表里——不是「额度正常」的编造读数。
+    pub engine_quota: Vec<crate::engine_quota::QuotaSnapshot>,
 }
 
 #[tauri::command]
@@ -60,5 +66,6 @@ pub async fn resource_dashboard_snapshot(
         by_owner,
         active_sessions: active_sessions as u64,
         max_sessions: max_sessions as u64,
+        engine_quota: crate::engine_quota::all(),
     })
 }

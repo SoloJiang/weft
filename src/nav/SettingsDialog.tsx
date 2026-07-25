@@ -669,11 +669,21 @@ function AutomationSettings() {
   const [loopGuard, setLoopGuard] = useState(true);
   const [remoteStandby, setRemoteStandby] = useState(false);
   const [remoteStandbyLoaded, setRemoteStandbyLoaded] = useState(false);
+  // issue #97: auto fail-over to the fallback engine when the current one
+  // reports its usage limit exceeded. Own local+effect pair (mirrors
+  // remoteStandby just below) rather than the global store — this is a
+  // narrow, rarely-touched preference with no other consumer.
+  const [quotaFailover, setQuotaFailoverState] = useState(false);
+  const [quotaFailoverLoaded, setQuotaFailoverLoaded] = useState(false);
 
   useEffect(() => {
     void api.imGetSettings().then((s) => {
       setRemoteStandby(s.remote_standby);
       setRemoteStandbyLoaded(true);
+    });
+    void api.getQuotaFailoverEnabled().then((enabled) => {
+      setQuotaFailoverState(enabled);
+      setQuotaFailoverLoaded(true);
     });
   }, []);
 
@@ -684,6 +694,17 @@ function AutomationSettings() {
       await api.imSetRemoteStandby(on);
     } catch (err) {
       setRemoteStandby(prev);
+      throw err;
+    }
+  }
+
+  async function toggleQuotaFailover(on: boolean) {
+    const prev = quotaFailover;
+    setQuotaFailoverState(on);
+    try {
+      await api.setQuotaFailoverEnabled(on);
+    } catch (err) {
+      setQuotaFailoverState(prev);
       throw err;
     }
   }
@@ -706,6 +727,22 @@ function AutomationSettings() {
               on={remoteStandby}
               onChange={(v) => void toggleRemoteStandby(v)}
               label={t("settings.remoteStandby")}
+            />
+          ) : (
+            <div
+              aria-hidden
+              className="h-[22px] w-[38px] shrink-0 rounded-full bg-border-strong/40"
+            />
+          )}
+        </SettingRow>
+      </SettingsGroup>
+      <SettingsGroup title={t("settings.quotaFailoverGroup")}>
+        <SettingRow label={t("settings.quotaFailoverTitle")} hint={t("settings.quotaFailoverHint")}>
+          {quotaFailoverLoaded ? (
+            <Toggle
+              on={quotaFailover}
+              onChange={(v) => void toggleQuotaFailover(v)}
+              label={t("settings.quotaFailoverTitle")}
             />
           ) : (
             <div
