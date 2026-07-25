@@ -538,7 +538,8 @@ fn contains_marker(haystack_lower: &str, markers: &[&str]) -> bool {
 }
 
 /// Every JSON-object-KEY-shaped position in `haystack`: the text inside a
-/// quoted run (single OR double quotes, JSON backslash escapes respected)
+/// quoted run (single OR double quotes; JSON backslash escapes are NOT
+/// honored — see the body comment on why round-4 removed the escape skip)
 /// that is immediately followed — modulo whitespace — by a colon. Tolerating
 /// both quote styles and a space before the colon (`"network":`,
 /// `'network':`, `"network" :`) is round-3's finding: a single literal
@@ -640,16 +641,70 @@ const CRED_KEY_WORDS: &[&str] = &["token", "network"];
 /// however key-shaped its contents look. Recursion is bounded because
 /// `serde_json` enforces its own nesting limit while parsing, so a `Value`
 /// that exists at all is shallow enough to walk.
-fn json_value_has_cred_key(value: &serde_json::Value) -> bool {
+///
+/// `unwrap_encoded_json` permits ONE further layer of decoding: a string value
+/// that is itself an encoded JSON object/array is re-parsed and ITS keys
+/// walked. See `embedded_json_has_cred_key` for why, and for why exactly one.
+fn json_value_has_cred_key(value: &serde_json::Value, unwrap_encoded_json: bool) -> bool {
     match value {
-        serde_json::Value::Object(map) => map
+        serde_json::Value::Object(map) => map.iter().any(|(key, child)| {
+            has_word(&words(key), CRED_KEY_WORDS)
+                || json_value_has_cred_key(child, unwrap_encoded_json)
+        }),
+        serde_json::Value::Array(items) => items
             .iter()
-            .any(|(key, child)| {
-                has_word(&words(key), CRED_KEY_WORDS) || json_value_has_cred_key(child)
-            }),
-        serde_json::Value::Array(items) => items.iter().any(json_value_has_cred_key),
+            .any(|item| json_value_has_cred_key(item, unwrap_encoded_json)),
+        serde_json::Value::String(text) if unwrap_encoded_json => embedded_json_has_cred_key(text),
         _ => false,
     }
+}
+
+/// Whether a string value is worth handing back to the parser: it has to LOOK
+/// like a JSON object or array.
+///
+/// This is a COST guard, not a correctness one — prose, file paths, and code
+/// snippets (round-4's `const c = {'networkMode': true};`) do not open with a
+/// bracket, so the overwhelmingly common string value never reaches
+/// `serde_json` at all. Deleting this check would not change any verdict, since
+/// the parser rejects those same inputs on its own; it would only pay for the
+/// attempt.
+fn looks_like_encoded_json(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
+/// Whether `text` — a string VALUE out of the args blob — is itself an encoded
+/// JSON object/array carrying a credential-shaped KEY.
+///
+/// Post-#138 review: double encoding was the one realistic shape the
+/// key-position anchoring gave up on outright.
+/// `{"headers":"{\"apiToken\":\"sk-1\"}"}` classified as `Unknown` — the same
+/// tier as a call carrying no signal whatsoever — because `apiToken` is a key
+/// one layer down and tier 1 only ever saw the outer `headers`. That is the
+/// ORDINARY shape of an HTTP-proxy MCP tool (raw request headers or body
+/// forwarded as a string), which is precisely where a credential rides, and
+/// the pre-#138 whole-blob scan did catch it.
+///
+/// This does not walk back #138: a KEY is still the only thing that counts, in
+/// both layers, and that — not the pre-filter below — is what holds the line.
+/// What made the old blob scan cry wolf was matching VALUES and PATHS
+/// (`{"path":"src/token_bucket.rs"}`, a `content` value that merely mentions a
+/// network key); an encoded object's keys are keys, and a path or a code
+/// snippet is not a parseable JSON document in the first place.
+///
+/// EXACTLY ONE extra layer, hence the `false` passed down. Triple encoding
+/// stays undetected, and that is a deliberate, pinned boundary (see
+/// `double_encoded_json_credential_keys_are_found`) rather than an unbounded
+/// unwrap loop over server-controlled text. One layer also keeps the cost
+/// linear, which round-4's P1 makes non-negotiable on this path: each string
+/// is parsed at most once and never re-entered, and the strings are disjoint
+/// slices of the blob, so the total parse work stays O(blob).
+fn embedded_json_has_cred_key(text: &str) -> bool {
+    if !looks_like_encoded_json(text) {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(text)
+        .is_ok_and(|value| json_value_has_cred_key(&value, false))
 }
 
 /// Whether a credential/network-shaped KEY appears in this call, in two
@@ -660,7 +715,10 @@ fn json_value_has_cred_key(value: &serde_json::Value) -> bool {
 ///    keys. This is exact: a key is a key, a string value's contents are
 ///    never keys, escapes are the parser's problem, and it is linear.
 ///    Production traffic always lands here — `bus::server::summarize` builds
-///    `args_text` with `serde_json::to_string`.
+///    `args_text` with `serde_json::to_string`. One exception to "a string
+///    value's contents are never keys": a value that is itself an encoded
+///    JSON object gets one re-parse, because its keys ARE keys — see
+///    `embedded_json_has_cred_key`.
 /// 2. Otherwise fall back to the textual quote scan (`json_keys`), which
 ///    covers non-JSON haystacks (a shell command, a file path) and the
 ///    pseudo-JSON shapes round-3 found in hand-written payloads
@@ -684,7 +742,7 @@ fn json_value_has_cred_key(value: &serde_json::Value) -> bool {
 fn has_cred_key(text: &str, payload: Option<&str>) -> bool {
     let parsed = payload.and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok());
     if let Some(value) = parsed {
-        return json_value_has_cred_key(&value);
+        return json_value_has_cred_key(&value, true);
     }
     json_keys(text)
         .iter()
@@ -778,6 +836,14 @@ fn has_anchored_token(haystack_lower: &str) -> bool {
 /// `payload` is the raw argument blob on its own, when the caller has one, so
 /// the key check can parse it instead of guessing at its structure; callers
 /// without a structured payload pass `None`.
+///
+/// The two are NOT scanned uniformly, and the difference is `has_cred_key`'s:
+/// `contains_marker` and `has_anchored_token` see all of `text`, but the key
+/// check reads `payload` ALONE whenever that payload is real JSON (its tier
+/// 1) and only falls back to `text` otherwise. So a credential-shaped key can
+/// only ever be found in the args, never in the tool name — which costs
+/// nothing, since a tool name is a bare identifier with no key positions in
+/// it (no quotes, no colon) for either tier to find.
 ///
 /// Pass ORIGINAL-CASE text. The substring markers and the flag check are
 /// matched case-insensitively (lowercased right here, so no caller has to
@@ -2333,6 +2399,13 @@ mod tests {
         // content merely mentions a network key — the exact cried-wolf false
         // positive this change exists to remove. Parsing the payload settles
         // it structurally.
+        //
+        // Read the name as shorthand for what these cases are: PROSE and CODE
+        // in a value are never keys. There is one exception, added by the
+        // post-#138 review, and it does not weaken these: a value that is a
+        // whole encoded JSON DOCUMENT is re-parsed and its keys do count, since
+        // they are keys. See `double_encoded_json_credential_keys_are_found`.
+        // Nothing below is such a document — a code snippet does not parse.
         for args_text in [
             r#"{"path":"src/config.ts","content":"const c = {'networkMode': true};"}"#,
             r#"{"path":"src/a.ts","content":"const c = {\"accessToken\": x};"}"#,
@@ -2428,6 +2501,211 @@ mod tests {
                 elapsed < std::time::Duration::from_secs(5),
                 "{} byte payload took {elapsed:?} — scan is not linear",
                 payload.len()
+            );
+        }
+    }
+
+    #[test]
+    fn double_encoded_json_credential_keys_are_found() {
+        // Post-#138 review. Anchoring the check to KEY position closed the
+        // `token_bucket.rs` cried-wolf false positive, but it also made
+        // DOUBLE-ENCODED args invisible: an HTTP-proxy MCP tool forwards raw
+        // request headers/body as a STRING, and tier 1 only saw the outer
+        // `headers` key. `{"headers":"{\"apiToken\":\"sk-1\"}"}` came out
+        // `Unknown` — the same tier as a call with no signal at all — which is
+        // the shape a credential most plausibly arrives in.
+        for (tool_name, args_text) in [
+            // The review's verbatim reproduction.
+            ("call_api", r#"{"headers":"{\"apiToken\":\"sk-1\"}"}"#),
+            // The body half of the same shape, and a network key rather than a
+            // credential one.
+            ("call_api", r#"{"body":"{\"auth_token\":\"sk-1\"}"}"#),
+            ("call_api", r#"{"body":"{\"network\":true}"}"#),
+            // An encoded ARRAY is the same case; so is a key nested inside the
+            // encoded document rather than at its top level.
+            ("proxy", r#"{"payload":"[{\"accessToken\":\"sk-1\"}]"}"#),
+            ("proxy", r#"{"payload":"{\"a\":{\"apiToken\":\"sk-1\"}}"}"#),
+            // Leading whitespace before the bracket must not defeat the
+            // pre-filter — a proxied body is often pretty-printed.
+            ("call_api", r#"{"body":"  {\"apiToken\":\"sk-1\"}"}"#),
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Other { tool_name, args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} should be network/credential"
+            );
+        }
+
+        // Why fixing this is a COHERENCE win, not just a recall win: the
+        // escape-blind textual fallback (tier 2) already found the key here,
+        // because `apiToken\` reads as a quoted run followed by a colon. So
+        // the supposedly-exact tier 1 was strictly NARROWER than the tier it
+        // exists to improve on. Production always takes tier 1 (`summarize`
+        // stringifies with serde), so that inversion was the whole bug.
+        assert!(has_cred_key(r#"{"headers":"{\"apiToken\":\"sk-1\"}"}"#, None));
+
+        // KNOWN, ACCEPTED residual — pinned deliberately, exactly like
+        // `github_token_file=…` in `has_anchored_token`'s doc. The unwrap is
+        // ONE layer, so TRIPLE encoding is still invisible. An unbounded
+        // unwrap loop over server-controlled text is the thing not worth
+        // buying, and this tier is a glance-level hint, never the gate — the
+        // human still sees the full args via `DetailPreview` before allowing.
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: r#"{"a":"{\"b\":\"{\\\"apiToken\\\":\\\"sk-1\\\"}\"}"}"#
+            }),
+            RiskLevel::Unknown,
+            "triple encoding is the documented boundary; update the doc if this changes"
+        );
+    }
+
+    #[test]
+    fn encoded_json_unwrap_keeps_the_key_position_discipline() {
+        // The unwrap must not re-open any of the false positives #138 removed.
+        // What protects them is that BOTH layers still only ever match a KEY:
+        // a path is not a key, a prose mention is not a key, and neither a path
+        // nor a code snippet is a parseable JSON document to find keys in.
+        for (tool_name, args_text) in [
+            // Round-4's verbatim P2 case: file CONTENT that merely mentions a
+            // network key. Opens with `const`, so it is never re-parsed.
+            (
+                "write_file",
+                r#"{"path":"src/config.ts","content":"const c = {'networkMode': true};"}"#,
+            ),
+            // The motivating regression, untouched.
+            ("write_file", r#"{"path":"src/token_bucket.rs","content":"x"}"#),
+            // Writing a real JSON file: the embedded document IS parsed, and
+            // correctly finds nothing — benign keys stay benign.
+            (
+                "write_file",
+                r#"{"path":"tsconfig.json","content":"{\"compilerOptions\":{\"strict\":true}}"}"#,
+            ),
+            // An encoded document whose credential-shaped text sits in a VALUE
+            // is still not a key, one layer down just as at the top.
+            ("call_api", r#"{"body":"{\"comment\":\"rotate the api token\"}"}"#),
+            // Bracket-leading but NOT JSON: the parse fails and the value is
+            // simply text again, not a source of keys.
+            ("run_cmd", r#"{"cmd":"[not json] token: sk-1"}"#),
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Other { tool_name, args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} must not be flagged network/credential"
+            );
+        }
+        // The pre-filter decides no verdict on its own (see its doc — the
+        // parser rejects the same inputs anyway), so nothing above can fail if
+        // it regresses. Assert it directly, or it would be untested.
+        assert!(!looks_like_encoded_json("const c = {'networkMode': true};"));
+        assert!(!looks_like_encoded_json("src/token_bucket.rs"));
+        assert!(looks_like_encoded_json(r#"{"apiToken":"sk-1"}"#));
+        assert!(looks_like_encoded_json("  [1,2]"));
+    }
+
+    #[test]
+    fn encoded_json_unwrap_stays_linear() {
+        // Round-4 P1 made linearity non-negotiable on this path: a quadratic
+        // scan cost ~375ms on a 40 KB payload, on the permission-ask path. A
+        // second parse per string value is only safe because each string is
+        // parsed AT MOST once and never re-entered, and the strings are
+        // disjoint slices of the blob — so the total parse work stays O(blob).
+        //
+        // The LAST shape carries a credential key and expects the top tier, so
+        // this test also fails if the unwrap silently stops running at scale.
+        // The benign shapes cannot do that job — verified by mutation: with the
+        // unwrap disabled they still pass, since `assert_ne!` on a payload with
+        // no credential key holds either way. They guard the other direction,
+        // that a big blob does not become a false positive.
+        //
+        // Keys are DISTINCT (`k0`, `k1`, …) on purpose. `{"a":1,"a":1,…}` looks
+        // like a big document but collapses to a single entry once parsed —
+        // serde_json's `Map` de-duplicates — so it would exercise the parse
+        // while leaving the WALK O(1), quietly testing half of what it claims.
+        let pairs = (0..25_000)
+            .map(|i| format!(r#""k{i}":1"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        // One ~275 KB embedded document that parses and walks fully.
+        let valid_inner = format!("{{{pairs}}}");
+        // The same size, unterminated: serde_json parses the whole thing before
+        // failing at EOF, the worst case for the parse-then-discard branch.
+        let invalid_inner = format!("{{{pairs}");
+        // The same size again, with the credential key LAST so neither the
+        // parse nor `any()`'s short-circuit can skip the bulk of the work.
+        let cred_inner = format!(r#"{{{pairs},"apiToken":"sk-1"}}"#);
+        // ~20 000 SEPARATE string values, i.e. 20 000 distinct re-parses rather
+        // than one big one — the other way this could go super-linear.
+        let many = format!(
+            "[{}]",
+            std::iter::repeat(r#""{\"k\":1}""#)
+                .take(20_000)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let embed = |inner: &str| format!(r#"{{"body":"{}"}}"#, inner.replace('"', "\\\""));
+        for (payload, expected) in [
+            (embed(&valid_inner), RiskLevel::Unknown),
+            (embed(&invalid_inner), RiskLevel::Unknown),
+            (many, RiskLevel::Unknown),
+            (embed(&cred_inner), RiskLevel::NetworkOrCredential),
+        ] {
+            let started = std::time::Instant::now();
+            let risk = classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: &payload,
+            });
+            let elapsed = started.elapsed();
+            assert_eq!(risk, expected, "{} byte payload misclassified", payload.len());
+            // Same bound and rationale as `escaped_quote_payloads_stay_linear`:
+            // linear is milliseconds at this size, so 5s fails a regression
+            // without being sensitive to CI load.
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "{} byte payload took {elapsed:?} — the unwrap is not linear",
+                payload.len()
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_encoded_json_does_not_blow_the_stack() {
+        // Same argument as `deeply_nested_payloads_do_not_blow_the_stack`, now
+        // for the inner parse: `serde_json`'s own nesting limit bounds the walk
+        // of the RE-PARSED value too, and the one-layer rule means the two
+        // depths add rather than compound. Nothing here may crash; the shallow
+        // case must still find its key, and the over-limit cases simply fail to
+        // parse and yield no keys.
+        //
+        // Note the difference from that sibling: there, an over-limit payload
+        // fails the OUTER parse and degrades to the textual scan, which finds
+        // the key anyway — so every depth stays `NetworkOrCredential`. Here the
+        // outer `{"body": "…"}` is two levels deep and always parses, so tier 2
+        // never runs and an unparseable inner document simply yields nothing.
+        //
+        // The depths deliberately straddle serde_json's ~128 limit WIDE rather
+        // than sitting on it: asserting a flip at exactly 128 would make this
+        // test a tripwire for that library's internal constant, which is not
+        // what it is here to guard.
+        for (depth, expected) in [
+            (100usize, RiskLevel::NetworkOrCredential),
+            (1_000, RiskLevel::Unknown),
+            (20_000, RiskLevel::Unknown),
+        ] {
+            let inner = format!(
+                "{}{}{}",
+                r#"{"a":"#.repeat(depth),
+                r#"{"apiToken":"sk-1"}"#,
+                "}".repeat(depth)
+            );
+            let payload = format!(r#"{{"body":"{}"}}"#, inner.replace('"', "\\\""));
+            assert_eq!(
+                classify_risk(RiskSignal::Other {
+                    tool_name: "call_api",
+                    args_text: &payload
+                }),
+                expected,
+                "embedded depth {depth} misclassified"
             );
         }
     }
