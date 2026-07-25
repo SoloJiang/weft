@@ -136,6 +136,13 @@ async fn handle_ask(
     // human clicks (issue #96's 23-minute freeze). Closed allowlist, and every
     // condition below can only SUBTRACT approvals — see `bus::builtin_allow`
     // for why this lives here instead of in the hook's matcher.
+    //
+    // Distinct from issue #103's read-only grant below, and deliberately
+    // narrower: that one is a HUMAN's explicit "trust every read-only action in
+    // this session/issue" and then covers the whole `ReadOnly` tier (a `pwd`
+    // Bash, an MCP read). This is the zero-configuration default for a handful
+    // of named builtins, so it also demands containment — which is why it can
+    // apply without anyone having granted anything.
     match builtin_allow::safe_scope(tool, tool_name) {
         // Nothing to point anywhere: the name alone settles it, so this needs
         // neither the risk verdict nor the session's directories.
@@ -157,9 +164,11 @@ async fn handle_ask(
         None => {}
     }
 
-    // A standing rule (full access / always-allow) decides without surfacing.
-    // Matches on the canonical action_key, NOT the (possibly lossy) summary.
-    if asks.auto_decision(thread, &dir, &action_key) == Some(Decision::Allow) {
+    // A standing rule (full access / always-allow / issue #103's read-only
+    // batch-or-issue grant) decides without surfacing. Matches on the
+    // canonical action_key, NOT the (possibly lossy) summary; `risk` gates the
+    // read-only grants (never widens Full/Always, which ignore it entirely).
+    if asks.auto_decision(thread, &dir, risk, &action_key) == Some(Decision::Allow) {
         return hook_decision("allow", "Auto-approved by a weft rule");
     }
 

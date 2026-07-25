@@ -175,11 +175,11 @@ mod tests {
         let asks = AskRegistry::new();
         seed(&db, &asks).await;
         // Full is inherited...
-        assert_eq!(asks.auto_decision(1, "10", "anything"), Some(Decision::Allow));
+        assert_eq!(asks.auto_decision(1, "10", RiskLevel::Unknown, "anything"), Some(Decision::Allow));
         // ...and so is the precise Always grant — issue #89: it's safe to restore
         // because it's keyed by the exact action, not a lossy display summary.
         assert_eq!(
-            asks.auto_decision(2, "", "Run: npm test"),
+            asks.auto_decision(2, "", RiskLevel::Unknown, "Run: npm test"),
             Some(Decision::Allow)
         );
     }
@@ -221,7 +221,7 @@ mod tests {
         let revived = AskRegistry::new();
         seed(&db, &revived).await;
         assert_eq!(
-            revived.auto_decision(7, "42", "Run: anything-else"),
+            revived.auto_decision(7, "42", RiskLevel::Unknown, "Run: anything-else"),
             Some(Decision::Allow),
             "a persisted Full grant must not re-prompt after restart"
         );
@@ -253,13 +253,13 @@ mod tests {
         seed(&db, &revived).await;
         // the exact action_key is restored...
         assert_eq!(
-            revived.auto_decision(7, "42", "npm test\necho a"),
+            revived.auto_decision(7, "42", RiskLevel::Unknown, "npm test\necho a"),
             Some(Decision::Allow),
             "a persisted Always grant must survive restart when it's the exact action"
         );
         // ...but a different action sharing the old ask's display summary ("Run:
         // npm test") must still re-prompt — precision, not the label, persisted.
-        assert!(revived.auto_decision(7, "42", "npm test\nrm -rf /").is_none());
+        assert!(revived.auto_decision(7, "42", RiskLevel::Unknown, "npm test\nrm -rf /").is_none());
     }
 
     /// Acceptance #3: revoking a thread's grants (issue deletion) clears them from
@@ -280,7 +280,7 @@ mod tests {
         // restart after deletion: nothing seeded, so the id is un-granted again.
         let revived = AskRegistry::new();
         seed(&db, &revived).await;
-        assert!(revived.auto_decision(7, "42", "Run: x").is_none());
+        assert!(revived.auto_decision(7, "42", RiskLevel::Unknown, "Run: x").is_none());
     }
 
     #[tokio::test]
@@ -351,7 +351,7 @@ mod tests {
         let revived = AskRegistry::new();
         seed(&db, &revived).await;
         assert!(
-            revived.auto_decision(7, "42", "x").is_none(),
+            revived.auto_decision(7, "42", RiskLevel::Unknown, "x").is_none(),
             "a flushed revoke must survive a crash; the queued grant must NOT resurrect"
         );
     }

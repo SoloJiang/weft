@@ -1166,6 +1166,31 @@ impl GrantSnapshot {
     }
 }
 
+/// One session's read-only auto-allow scope, for the frontend's revoke UI
+/// (`ReadOnlyGrants::session`). Distinct from `FullGrant`/`AlwaysGrant`: this is
+/// a QUERY snapshot only — it is never written into `GrantSnapshot` or the
+/// store (see `Inner::read_only_session`'s doc for why a read-only grant is
+/// never persisted).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ReadOnlySessionGrant {
+    pub thread: i32,
+    pub dir: String,
+}
+
+/// Current in-memory read-only auto-allow scopes (issue #103), for the
+/// frontend to show "this session"/"this issue" as read-only-trusted and offer
+/// a one-click revoke — mirrors `GrantSnapshot`'s role for Full/Always, but
+/// this shape is NEVER itself persisted (see `Inner::read_only_session`'s doc).
+/// `issue` = thread ids with the whole-issue grant (set at dispatch-approval
+/// time, `AskRegistry::grant_read_only_issue`); `session` = individual
+/// (thread, dir) sessions granted via the "release this session's read-only"
+/// batch action (`AskRegistry::grant_read_only_session`).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Default)]
+pub struct ReadOnlyGrants {
+    pub issue: Vec<i32>,
+    pub session: Vec<ReadOnlySessionGrant>,
+}
+
 /// A persist request to the SINGLE ordered writer (the `auth_persist` consumer).
 /// `ack`, when present, is signalled with the store-write result once THIS message
 /// is written — so a grant-changing command can await durability and surface a
@@ -1204,6 +1229,35 @@ struct Inner {
     /// Dangerous mode: when on, EVERY ask from EVERY agent auto-allows (never
     /// surfaced). The global "skip all permission prompts" setting.
     dangerous: bool,
+    /// (thread, dir) sessions with a "release all read-only for this session"
+    /// batch grant (issue #103) — auto-allows any FUTURE ask this session gets
+    /// classified `RiskLevel::ReadOnly` (see `classify_risk` / `auto_decision`),
+    /// same tier as the backlog this grant sweeps at the moment it's set (see
+    /// `AskRegistry::grant_read_only_session`). In-memory ONLY: deliberately
+    /// NEVER mirrored to `persist` — see `read_only_issue`'s doc for why this
+    /// and its sibling field both skip persistence entirely.
+    read_only_session: HashSet<(i32, String)>,
+    /// Thread ids with an ISSUE-WIDE read-only auto-allow (issue #103's
+    /// dispatch-approval propagation — `AskRegistry::grant_read_only_issue`):
+    /// covers EVERY dir under the thread, present when granted OR spawned
+    /// later — a worker created after the grant still inherits it, which is
+    /// the whole point (no more "worker starts, asks `pwd`" after the human
+    /// already approved the issue's dispatch). Checked in `auto_decision`
+    /// alongside `read_only_session`; ONLY ever short-circuits a
+    /// `RiskLevel::ReadOnly` ask — a Write/NetworkOrCredential/Unknown ask
+    /// always still surfaces, no matter how broad this set gets.
+    ///
+    /// In-memory ONLY, deliberately NEVER persisted (contrast `full`/`always`,
+    /// #87/#89): `grant_snapshot`/`seed_grants` don't touch this field (or
+    /// `read_only_session`) at all, so a restart always starts every session
+    /// un-trusted again. This is the MORE conservative lifetime on purpose — a
+    /// read-only grant is broader than any single Always rule (it covers a
+    /// WHOLE risk class, on a WHOLE issue, including workers that don't exist
+    /// yet), and #87's own round-1 history is the reason: an unbounded standing
+    /// grant that outlives a restart is exactly the shape of thing that had to
+    /// be walked back before Full/Always earned persistence (and Always only
+    /// after #89 made it precise). This grant doesn't get that same trust.
+    read_only_issue: HashSet<i32>,
     /// IM 桥的通知器：装上后 Ask 开/答/撤事件外发；未装时零开销。
     notify: Option<tokio::sync::mpsc::UnboundedSender<AskEvent>>,
     /// transcript 结算痕迹消费者（与 IM 桥独立的第二订阅，始终在桌面端装上）。
@@ -1260,6 +1314,32 @@ impl Inner {
                 ack: None,
             });
         }
+    }
+
+    /// Resolve every ask in `hit` to Allow (持锁内调用). The caller has already
+    /// filtered `hit` to exactly the asks a read-only batch/issue grant covers
+    /// (`RiskLevel::ReadOnly` plus whatever scope predicate applies) — this is
+    /// just the shared wake-and-remove tail of
+    /// `AskRegistry::grant_read_only_session`/`grant_read_only_issue`, mirroring
+    /// `answer`'s own covered-asks sweep. Returns how many were resolved.
+    /// Deliberately does NOT call `emit_persist` — a read-only grant is never
+    /// persisted (see `read_only_session`'s doc on this struct).
+    fn resolve_read_only(&mut self, hit: Vec<Ask>) -> usize {
+        let ids: HashSet<u64> = hit.iter().map(|a| a.id).collect();
+        self.open.retain(|a| !ids.contains(&a.id));
+        for ask in &hit {
+            if let Some(tx) = self.waiters.remove(&ask.id) {
+                let _ = tx.send(Decision::Allow);
+            }
+        }
+        let n = hit.len();
+        for ask in hit {
+            self.emit(AskEvent::Resolved {
+                ask,
+                answer: Answer::Allow,
+            });
+        }
+        n
     }
 
     /// Remove the standing grants matching (thread, dir, action_key) and RETURN
@@ -1444,8 +1524,20 @@ impl AskRegistry {
     /// A standing rule's verdict for an incoming ask, checked BEFORE surfacing:
     /// full access or a matching always-allow → auto-allow (never shown). Matches
     /// on the canonical `action_key` (see `Ask::action_key`), NOT the lossy
-    /// display summary — issue #89.
-    pub fn auto_decision(&self, thread: i32, dir: &str, action_key: &str) -> Option<Decision> {
+    /// display summary — issue #89. `risk` is the SAME `classify_risk` tier the
+    /// ask itself carries (see `Ask::risk`) — it gates the read-only batch/issue
+    /// grants (issue #103): they auto-allow ONLY a `RiskLevel::ReadOnly` ask,
+    /// checked by value equality against what `classify_risk` already decided.
+    /// This function never re-derives or loosens that judgment; a Write/
+    /// NetworkOrCredential/Unknown ask falls through to `None` (surfaces)
+    /// exactly as it would if no read-only grant existed at all.
+    pub fn auto_decision(
+        &self,
+        thread: i32,
+        dir: &str,
+        risk: RiskLevel,
+        action_key: &str,
+    ) -> Option<Decision> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.dangerous {
             return Some(Decision::Allow);
@@ -1455,6 +1547,16 @@ impl AskRegistry {
             return Some(Decision::Allow);
         }
         if g.always.get(&k).is_some_and(|s| s.contains(action_key)) {
+            return Some(Decision::Allow);
+        }
+        // Read-only batch/issue grants (issue #103): a session granted "release
+        // all read-only" (`read_only_session`) or a whole issue granted at
+        // dispatch-approval time (`read_only_issue`) auto-allows a ReadOnly-tier
+        // ask — never anything else, by construction (the `risk ==` check gates
+        // the whole branch, not just a sub-case).
+        if risk == RiskLevel::ReadOnly
+            && (g.read_only_issue.contains(&thread) || g.read_only_session.contains(&k))
+        {
             return Some(Decision::Allow);
         }
         None
@@ -1630,6 +1732,102 @@ impl AskRegistry {
             .grant_snapshot()
     }
 
+    /// Batch-approve every ask (open right now, or arriving later this session)
+    /// classified `RiskLevel::ReadOnly` for one (thread, dir) session — issue
+    /// #103's "release all read-only for this session". In-memory only, NEVER
+    /// persisted (see `Inner::read_only_session`'s doc: unlike Full/Always, this
+    /// does not survive a restart). Immediately resolves every currently open
+    /// ReadOnly ask in this session to Allow — a Write/NetworkOrCredential/
+    /// Unknown ask in the SAME session is left untouched, still open, still
+    /// needs a real answer — and installs the forward-looking rule so a LATER
+    /// ReadOnly ask in this session doesn't re-prompt either. Returns how many
+    /// open asks were just resolved, so the caller can report "released N".
+    pub fn grant_read_only_session(&self, thread: i32, dir: &str) -> usize {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.read_only_session.insert((thread, dir.to_string()));
+        let hit: Vec<Ask> = g
+            .open
+            .iter()
+            .filter(|a| a.risk == RiskLevel::ReadOnly && a.thread == thread && a.dir == dir)
+            .cloned()
+            .collect();
+        g.resolve_read_only(hit)
+    }
+
+    /// Issue-wide counterpart of `grant_read_only_session` (issue #103's
+    /// dispatch-approval propagation): every dir under `thread` — present now,
+    /// or created later (a worker spawned after this call still inherits it) —
+    /// auto-allows a `RiskLevel::ReadOnly` ask. In-memory only, NEVER persisted
+    /// (see `Inner::read_only_issue`'s doc). Sweeps every currently open
+    /// ReadOnly ask across the WHOLE thread (any dir) to Allow; leaves every
+    /// Write/NetworkOrCredential/Unknown ask open. Returns how many were
+    /// resolved.
+    pub fn grant_read_only_issue(&self, thread: i32) -> usize {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.read_only_issue.insert(thread);
+        let hit: Vec<Ask> = g
+            .open
+            .iter()
+            .filter(|a| a.risk == RiskLevel::ReadOnly && a.thread == thread)
+            .cloned()
+            .collect();
+        g.resolve_read_only(hit)
+    }
+
+    /// Revoke one session's read-only batch grant (issue #103). Returns whether
+    /// it was actually set. Does NOT retroactively re-surface any ask this
+    /// grant already resolved to Allow — like revoking Full/Always, it only
+    /// stops covering FUTURE asks.
+    pub fn revoke_read_only_session(&self, thread: i32, dir: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read_only_session
+            .remove(&(thread, dir.to_string()))
+    }
+
+    /// Revoke a whole issue's read-only propagation (issue #103) — CASCADES to
+    /// every session-scoped grant under this thread too, not just the
+    /// issue-wide flag. Without this, a session separately granted via
+    /// `grant_read_only_session` (the per-ask "release this session's
+    /// read-only" action) would silently keep auto-allowing after the human
+    /// revoked the issue-wide grant from the board chip, even though its
+    /// revoke-dialog copy promises "every worker under this issue will stop
+    /// auto-allowing read-only requests" — and the chip itself, gated only on
+    /// the `issue` set (see `ReadOnlyTrustChip`), would have already
+    /// disappeared, handing the human a false "nothing is trusted anymore"
+    /// impression while a worker's session grant quietly lived on. Mirrors
+    /// `purge_thread`'s existing cascade (both sets cleared together there
+    /// too, for the same "issue revoke means the WHOLE issue" reasoning — see
+    /// its doc). Unconditional: always leaves `thread` with zero read-only
+    /// trust of any kind, regardless of what existed before, which is the
+    /// simplest correct reading of "revoke the whole issue's propagation".
+    /// Returns whether the issue-wide flag itself had been set.
+    pub fn revoke_read_only_issue(&self, thread: i32) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let had_issue = g.read_only_issue.remove(&thread);
+        g.read_only_session.retain(|(t, _)| *t != thread);
+        had_issue
+    }
+
+    /// Current read-only auto-allow scopes, for the frontend's "read-only
+    /// trusted" indicator + revoke (issue #103). See `ReadOnlyGrants`'s doc:
+    /// this is a QUERY snapshot only, never itself persisted.
+    pub fn read_only_grants(&self) -> ReadOnlyGrants {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        ReadOnlyGrants {
+            issue: g.read_only_issue.iter().copied().collect(),
+            session: g
+                .read_only_session
+                .iter()
+                .map(|(thread, dir)| ReadOnlySessionGrant {
+                    thread: *thread,
+                    dir: dir.clone(),
+                })
+                .collect(),
+        }
+    }
+
     /// Remove the standing grants matching (thread, dir, action_key), emit the
     /// reduced snapshot fire-and-forget, and RETURN exactly what was removed
     /// (both `full` and `always` — the removed-set, computed under one lock,
@@ -1711,6 +1909,15 @@ impl AskRegistry {
             self.cancel(id);
         }
         self.revoke_thread(thread);
+        // Read-only grants (issue #103) aren't in `GrantSnapshot`/`revoke_thread`
+        // at all (never persisted — see `Inner::read_only_session`'s doc), so
+        // they need their own cleanup here. Hygiene, not safety, like the rest
+        // of this function's doc: a stale thread id left in these sets is inert
+        // forever either way (AUTOINCREMENT never reuses it), but a long-running
+        // app session shouldn't accumulate dead entries.
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.read_only_issue.remove(&thread);
+        g.read_only_session.retain(|(t, _)| *t != thread);
     }
 
     /// Delete-time cleanup of ONE task's `(thread, dir)` footprint: cancel its open
@@ -1729,6 +1936,13 @@ impl AskRegistry {
             self.cancel(id);
         }
         self.revoke_grant(thread, dir, None);
+        // Same hygiene note as `purge_thread`: this session's read-only grant
+        // (issue #103) isn't covered by `revoke_grant` (never persisted).
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read_only_session
+            .remove(&(thread, dir.to_string()));
     }
 
     /// All Asks across threads (for the workspace-wide Needs-you surface).
@@ -3028,17 +3242,17 @@ mod tests {
             "Run: npm test",
         );
         // no rule yet
-        assert!(r.auto_decision(1, "10", "Run: npm test").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "Run: npm test").is_none());
         assert!(r.answer(id, Answer::Always));
         // same action in the same task now auto-allows
         assert_eq!(
-            r.auto_decision(1, "10", "Run: npm test"),
+            r.auto_decision(1, "10", RiskLevel::Unknown, "Run: npm test"),
             Some(Decision::Allow)
         );
         // a different action still asks
-        assert!(r.auto_decision(1, "10", "Run: rm -rf /").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "Run: rm -rf /").is_none());
         // another task is unaffected
-        assert!(r.auto_decision(2, "10", "Run: npm test").is_none());
+        assert!(r.auto_decision(2, "10", RiskLevel::Unknown, "Run: npm test").is_none());
     }
 
     /// Issue #89's core in-memory acceptance case: two asks share the SAME lossy
@@ -3069,11 +3283,11 @@ mod tests {
         assert!(r.answer(id_a, Answer::Always));
         // the exact action just granted auto-allows...
         assert_eq!(
-            r.auto_decision(1, "10", "npm test\necho safe"),
+            r.auto_decision(1, "10", RiskLevel::Unknown, "npm test\necho safe"),
             Some(Decision::Allow)
         );
         // ...but a different action that merely shares the display summary does not.
-        assert!(r.auto_decision(1, "10", "npm test\nrm -rf /").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "npm test\nrm -rf /").is_none());
         // B was NOT swept up by A's Always answer — it's still open, unresolved.
         assert_eq!(r.open().iter().map(|a| a.id).collect::<Vec<_>>(), vec![id_b]);
     }
@@ -3090,7 +3304,7 @@ mod tests {
         assert!(r.open().is_empty());
         // and any future ask auto-allows
         assert_eq!(
-            r.auto_decision(1, "10", "Run: anything"),
+            r.auto_decision(1, "10", RiskLevel::Unknown, "Run: anything"),
             Some(Decision::Allow)
         );
     }
@@ -3226,15 +3440,15 @@ mod tests {
             }],
         });
         // full → anything in (1,"10") auto-allows
-        assert_eq!(r.auto_decision(1, "10", "Run: anything"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "Run: anything"), Some(Decision::Allow));
         // always → only the exact action_key in (2,"20")
         assert_eq!(
-            r.auto_decision(2, "20", "Run: npm test"),
+            r.auto_decision(2, "20", RiskLevel::Unknown, "Run: npm test"),
             Some(Decision::Allow)
         );
-        assert!(r.auto_decision(2, "20", "Run: other").is_none());
+        assert!(r.auto_decision(2, "20", RiskLevel::Unknown, "Run: other").is_none());
         // an unrelated key is unaffected
-        assert!(r.auto_decision(3, "30", "x").is_none());
+        assert!(r.auto_decision(3, "30", RiskLevel::Unknown, "x").is_none());
     }
 
     #[test]
@@ -3276,7 +3490,7 @@ mod tests {
         assert!(r.answer(id, Answer::Always));
         // auto-allows this exact action in memory...
         assert_eq!(
-            r.auto_decision(1, "10", "npm test"),
+            r.auto_decision(1, "10", RiskLevel::Unknown, "npm test"),
             Some(Decision::Allow)
         );
         // ...and IS durably persisted — the send is synchronous inside answer(),
@@ -3376,9 +3590,9 @@ mod tests {
         r.set_persist_notifier(tx);
         r.revoke_thread(1);
         // thread 1 grants gone, thread 2 intact
-        assert!(r.auto_decision(1, "10", "anything").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "anything").is_none());
         assert_eq!(
-            r.auto_decision(2, "20", "anything"),
+            r.auto_decision(2, "20", RiskLevel::Unknown, "anything"),
             Some(Decision::Allow)
         );
         let snap = rx
@@ -3423,8 +3637,8 @@ mod tests {
         // and the round-tripped value seeds real behavior
         let r = AskRegistry::new();
         r.seed_grants(back);
-        assert_eq!(r.auto_decision(1, "10", "z"), Some(Decision::Allow));
-        assert_eq!(r.auto_decision(2, "", "Run: x"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "z"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(2, "", RiskLevel::Unknown, "Run: x"), Some(Decision::Allow));
     }
 
     #[test]
@@ -3466,8 +3680,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         r.set_persist_notifier(tx);
         r.revoke_grant(1, "10", None);
-        assert!(r.auto_decision(1, "10", "a").is_none());
-        assert!(r.auto_decision(1, "10", "anything").is_none()); // full gone too
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "a").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "anything").is_none()); // full gone too
         let snap = rx
             .try_recv()
             .expect("one-click revoke persists the cleared set")
@@ -3499,8 +3713,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         r.set_persist_notifier(tx);
         r.revoke_grant(1, "10", Some("a"));
-        assert!(r.auto_decision(1, "10", "a").is_none()); // dropped
-        assert_eq!(r.auto_decision(1, "10", "b"), Some(Decision::Allow)); // kept
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "a").is_none()); // dropped
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "b"), Some(Decision::Allow)); // kept
         let snap = rx
             .try_recv()
             .expect("a granular always-revoke must persist the reduced set")
@@ -3531,7 +3745,7 @@ mod tests {
         });
         r.revoke_grant(1, "10", Some("a"));
         // full access is a separate rule — dropping one always must not touch it
-        assert_eq!(r.auto_decision(1, "10", "anything"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "anything"), Some(Decision::Allow));
     }
 
     #[test]
@@ -3570,17 +3784,17 @@ mod tests {
         // dir=None → the whole issue (every dir under the thread) is cleared
         let r = seeded();
         r.revoke(1, None, None);
-        assert!(r.auto_decision(1, "10", "x").is_none());
-        assert!(r.auto_decision(1, "11", "b").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "x").is_none());
+        assert!(r.auto_decision(1, "11", RiskLevel::Unknown, "b").is_none());
         // dir=Some, action_key=None → only that one task; the sibling task survives
         let r = seeded();
         r.revoke(1, Some("10"), None);
-        assert!(r.auto_decision(1, "10", "x").is_none());
-        assert_eq!(r.auto_decision(1, "11", "b"), Some(Decision::Allow));
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "x").is_none());
+        assert_eq!(r.auto_decision(1, "11", RiskLevel::Unknown, "b"), Some(Decision::Allow));
         // dir=Some, action_key=Some → only that always-rule; full access stays
         let r = seeded();
         r.revoke(1, Some("10"), Some("a"));
-        assert_eq!(r.auto_decision(1, "10", "anything"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "anything"), Some(Decision::Allow));
     }
 
     #[test]
@@ -3592,7 +3806,7 @@ mod tests {
         // the ask is still open, so answering it Full is a SUCCESS (found + answered)
         // — the command must not report "expired" while the grant is being created.
         assert!(r.answer(id, Answer::Full));
-        assert_eq!(r.auto_decision(1, "10", "anything"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "anything"), Some(Decision::Allow));
         // a genuinely unknown / already-answered ask still returns false
         assert!(!r.answer(id, Answer::Full));
     }
@@ -3638,8 +3852,8 @@ mod tests {
             }]
         );
         // ...and it IS cleared from memory (auto_decision no longer allows it).
-        assert!(r.auto_decision(1, "10", "a").is_none());
-        assert_eq!(r.auto_decision(1, "11", "b"), Some(Decision::Allow));
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "a").is_none());
+        assert_eq!(r.auto_decision(1, "11", RiskLevel::Unknown, "b"), Some(Decision::Allow));
         // revoking nothing returns an empty set
         assert!(r.revoke(2, Some("99"), None).is_empty());
     }
@@ -3667,7 +3881,7 @@ mod tests {
                 dir: "10".into()
             }]
         );
-        assert!(r.auto_decision(1, "10", "x").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "x").is_none());
         assert!(
             rx.try_recv().is_err(),
             "revoke_no_emit must not emit a persist message"
@@ -3702,7 +3916,7 @@ mod tests {
         r.purge_thread(1);
 
         // thread 1's grant is revoked...
-        assert!(r.auto_decision(1, "10", "x").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "x").is_none());
         // ...and its open asks cancelled, while another thread's ask survives.
         let open: Vec<u64> = r.open().iter().map(|a| a.id).collect();
         assert_eq!(open, vec![keep]);
@@ -3747,10 +3961,339 @@ mod tests {
         r.purge_dir(1, "10");
 
         // (1,"10") grant + ask gone; the sibling dir (1,"11") is untouched.
-        assert!(r.auto_decision(1, "10", "x").is_none());
-        assert_eq!(r.auto_decision(1, "11", "x"), Some(Decision::Allow));
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "x").is_none());
+        assert_eq!(r.auto_decision(1, "11", RiskLevel::Unknown, "x"), Some(Decision::Allow));
         let open: Vec<u64> = r.open().iter().map(|a| a.id).collect();
         assert_eq!(open, vec![keep_id]);
         assert!(!open.contains(&drop_id));
+    }
+
+    // ---- issue #103: read-only batch/issue grants -----------------------------
+    //
+    // The safety boundary this whole feature exists to respect: ONLY
+    // RiskLevel::ReadOnly may ever auto-allow through either grant.
+    // Unknown is the classifier's honest "can't tell" fallback (never a stand-in
+    // for "probably safe" — see RiskLevel's own doc) and must NEVER be swept by
+    // this feature; Write/NetworkOrCredential obviously must not either. Every
+    // test below that grants read-only trust also asserts the OTHER tiers are
+    // still gated, not just that ReadOnly passes.
+
+    #[test]
+    fn read_only_session_grant_allows_read_only_but_gates_everything_else() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::ReadOnly, "pwd"),
+            Some(Decision::Allow)
+        );
+        // Write, NetworkOrCredential, and Unknown must ALL still surface —
+        // Unknown especially: it is the classifier's honest "can't tell"
+        // fallback, never a stand-in for "probably safe".
+        assert!(r.auto_decision(1, "10", RiskLevel::Write, "rm -rf x").is_none());
+        assert!(r
+            .auto_decision(1, "10", RiskLevel::NetworkOrCredential, "curl x")
+            .is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "mystery_tool").is_none());
+    }
+
+    #[test]
+    fn read_only_session_grant_does_not_leak_to_a_different_session() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        // a different dir under the SAME thread is unaffected...
+        assert!(r.auto_decision(1, "11", RiskLevel::ReadOnly, "pwd").is_none());
+        // ...and so is a different thread entirely.
+        assert!(r.auto_decision(2, "10", RiskLevel::ReadOnly, "pwd").is_none());
+    }
+
+    #[test]
+    fn read_only_issue_grant_allows_read_only_but_gates_everything_else() {
+        let r = AskRegistry::new();
+        r.grant_read_only_issue(1);
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::ReadOnly, "pwd"),
+            Some(Decision::Allow)
+        );
+        assert!(r.auto_decision(1, "10", RiskLevel::Write, "rm -rf x").is_none());
+        assert!(r
+            .auto_decision(1, "10", RiskLevel::NetworkOrCredential, "curl x")
+            .is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "mystery_tool").is_none());
+    }
+
+    /// The whole point of the ISSUE-wide grant vs. the session one: it covers a
+    /// dir that didn't exist yet at grant time — a worker spawned AFTER dispatch
+    /// was approved still inherits the trust (issue #103's motivating pain
+    /// point: "approve dispatch, worker starts, still asks `pwd`").
+    #[test]
+    fn read_only_issue_grant_covers_a_dir_created_after_the_grant() {
+        let r = AskRegistry::new();
+        r.grant_read_only_issue(1);
+        // "77" never existed when the grant was made — simulated by simply never
+        // having requested/seen it before this call.
+        assert_eq!(
+            r.auto_decision(1, "77", RiskLevel::ReadOnly, "ls"),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn read_only_issue_grant_does_not_leak_to_a_different_thread() {
+        let r = AskRegistry::new();
+        r.grant_read_only_issue(1);
+        assert!(r.auto_decision(2, "10", RiskLevel::ReadOnly, "pwd").is_none());
+    }
+
+    /// Session and issue grants are independent, non-substitutable scopes: one
+    /// being set doesn't imply the other.
+    #[test]
+    fn session_grant_alone_does_not_cover_a_sibling_dir_the_issue_grant_would() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        assert!(r.auto_decision(1, "11", RiskLevel::ReadOnly, "ls").is_none());
+    }
+
+    #[test]
+    fn grant_read_only_session_sweeps_open_read_only_backlog_but_leaves_others_open() {
+        let r = AskRegistry::new();
+        let (ro_id, mut ro_rx) =
+            r.request(1, "10", "codex", "ls", "ls", RiskLevel::ReadOnly, "ls");
+        let (write_id, _write_rx) = r.request(
+            1,
+            "10",
+            "codex",
+            "Run: rm -rf x",
+            "rm -rf x",
+            RiskLevel::Write,
+            "Run: rm -rf x",
+        );
+        let (unknown_id, _unknown_rx) = r.request(
+            1,
+            "10",
+            "codex",
+            "mystery_tool",
+            "{}",
+            RiskLevel::Unknown,
+            "mystery_tool",
+        );
+
+        let n = r.grant_read_only_session(1, "10");
+        assert_eq!(n, 1, "only the ReadOnly ask should be swept");
+
+        // the ReadOnly ask's waiter woke with Allow — the send is synchronous
+        // inside grant_read_only_session, so try_recv sees it immediately (same
+        // reasoning as the persist-notifier try_recv calls above).
+        assert_eq!(
+            ro_rx.try_recv().expect("read-only ask should resolve"),
+            Decision::Allow
+        );
+        // ...and it left the open list, while Write/Unknown are still sitting
+        // there waiting for a real human answer.
+        let open: std::collections::HashSet<u64> = r.open().iter().map(|a| a.id).collect();
+        assert!(!open.contains(&ro_id));
+        assert!(open.contains(&write_id));
+        assert!(open.contains(&unknown_id));
+    }
+
+    #[test]
+    fn grant_read_only_issue_sweeps_open_read_only_backlog_across_every_dir() {
+        let r = AskRegistry::new();
+        let (id_a, mut rx_a) = r.request(1, "10", "codex", "ls", "ls", RiskLevel::ReadOnly, "ls");
+        let (id_b, mut rx_b) =
+            r.request(1, "20", "codex", "cat x", "cat x", RiskLevel::ReadOnly, "cat x");
+        let (write_id, _w) = r.request(
+            1,
+            "10",
+            "codex",
+            "Run: rm -rf x",
+            "rm -rf x",
+            RiskLevel::Write,
+            "Run: rm -rf x",
+        );
+
+        let n = r.grant_read_only_issue(1);
+        assert_eq!(n, 2);
+        assert_eq!(rx_a.try_recv().expect("dir 10's ask should resolve"), Decision::Allow);
+        assert_eq!(rx_b.try_recv().expect("dir 20's ask should resolve"), Decision::Allow);
+
+        let open: std::collections::HashSet<u64> = r.open().iter().map(|a| a.id).collect();
+        assert!(!open.contains(&id_a) && !open.contains(&id_b));
+        assert!(open.contains(&write_id));
+    }
+
+    /// The events a read-only sweep emits must read as an ordinary Allow — an
+    /// IM-bridge/trail consumer watching `AskEvent::Resolved` can't tell (and
+    /// doesn't need to tell) a batch sweep from the human clicking Allow on that
+    /// one ask, mirroring how `set_dangerous`'s backlog release already works.
+    #[tokio::test]
+    async fn read_only_sweep_emits_resolved_with_answer_allow() {
+        let r = AskRegistry::new();
+        let (id, _rx) = r.request(1, "10", "codex", "ls", "ls", RiskLevel::ReadOnly, "ls");
+        let (tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        let snap: Vec<u64> = r.set_notifier(tx).iter().map(|a| a.id).collect();
+        assert_eq!(snap, vec![id]);
+        r.grant_read_only_session(1, "10");
+        match notify_rx.recv().await.unwrap() {
+            AskEvent::Resolved { ask, answer } => {
+                assert_eq!(ask.id, id);
+                assert_eq!(answer, Answer::Allow);
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revoke_read_only_session_stops_future_auto_allow() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        assert!(r.revoke_read_only_session(1, "10"));
+        assert!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls").is_none());
+        // revoking again (already gone) is a harmless false, not a panic.
+        assert!(!r.revoke_read_only_session(1, "10"));
+    }
+
+    #[test]
+    fn revoke_read_only_issue_stops_future_auto_allow() {
+        let r = AskRegistry::new();
+        r.grant_read_only_issue(1);
+        assert!(r.revoke_read_only_issue(1));
+        assert!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls").is_none());
+        assert!(!r.revoke_read_only_issue(1));
+    }
+
+    /// Regression for the exact bug an independent review caught: a session
+    /// separately granted (the per-ask "release this session's read-only"
+    /// action) must NOT survive a later issue-wide revoke — the board chip's
+    /// revoke dialog promises "every worker under this issue will stop", and
+    /// that promise must actually hold, not just for the issue-wide flag but
+    /// for any session grant coexisting under the same thread. Mutation
+    /// check: delete the `read_only_session.retain` line from
+    /// `revoke_read_only_issue` and this test goes red (the session grant
+    /// would still auto_decision Allow after the "revoke" call returns).
+    #[test]
+    fn revoke_read_only_issue_also_clears_a_coexisting_session_grant_on_the_same_thread() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        r.grant_read_only_issue(1);
+        assert!(r.revoke_read_only_issue(1));
+        // neither the issue-wide sweep NOR the earlier, separately-granted
+        // session grant may still auto-allow — the human's mental model on
+        // revoke is "this issue no longer auto-allows", full stop.
+        assert!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls").is_none());
+        assert_eq!(
+            r.read_only_grants(),
+            ReadOnlyGrants::default(),
+            "both the issue flag and the coexisting session grant must be gone"
+        );
+    }
+
+    /// A session grant on a DIFFERENT thread must be untouched by revoking
+    /// issue #1's propagation — the cascade is scoped to `thread`, not global.
+    #[test]
+    fn revoke_read_only_issue_does_not_touch_a_session_grant_on_another_thread() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(2, "20");
+        r.grant_read_only_issue(1);
+        r.revoke_read_only_issue(1);
+        assert_eq!(
+            r.auto_decision(2, "20", RiskLevel::ReadOnly, "ls"),
+            Some(Decision::Allow),
+            "thread 2's own session grant must survive revoking thread 1's issue grant"
+        );
+    }
+
+    /// Revoking a read-only grant is forward-only: it must not retroactively
+    /// re-surface an ask the grant already resolved to Allow while it was
+    /// active (mirrors how Full/Always revoke behaves — see `revoke`'s doc).
+    #[test]
+    fn revoking_read_only_grant_does_not_resurrect_an_already_swept_ask() {
+        let r = AskRegistry::new();
+        let (id, mut rx) = r.request(1, "10", "codex", "ls", "ls", RiskLevel::ReadOnly, "ls");
+        r.grant_read_only_session(1, "10");
+        assert_eq!(rx.try_recv().expect("ask should resolve"), Decision::Allow);
+        r.revoke_read_only_session(1, "10");
+        // the swept ask is gone for good, not somehow back in the open list.
+        assert!(!r.open().iter().any(|a| a.id == id));
+    }
+
+    /// Core invariant this feature must never violate (explicit regression
+    /// test, not just an absence of code touching GrantSnapshot): a read-only
+    /// grant — session OR issue — must be completely invisible to the
+    /// persistence layer. `grant_snapshot`/`seed_grants` are Full/Always' own
+    /// mechanism (#87/#89); read-only grants never go through them, so a
+    /// restart (seeding a FRESH registry from an OLD one's snapshot) always
+    /// starts every session un-trusted again.
+    #[test]
+    fn read_only_grants_never_appear_in_the_persisted_snapshot() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        r.grant_read_only_issue(2);
+        let snap = r.snapshot_grants();
+        assert!(snap.is_empty(), "read-only grants must never reach GrantSnapshot");
+
+        // Simulated restart: seed a fresh registry from the (empty) snapshot —
+        // the read-only trust does NOT come back.
+        let revived = AskRegistry::new();
+        revived.seed_grants(snap);
+        assert!(revived
+            .auto_decision(1, "10", RiskLevel::ReadOnly, "ls")
+            .is_none());
+        assert!(revived
+            .auto_decision(2, "20", RiskLevel::ReadOnly, "ls")
+            .is_none());
+    }
+
+    #[test]
+    fn read_only_grants_query_reflects_current_scopes() {
+        let r = AskRegistry::new();
+        assert_eq!(r.read_only_grants(), ReadOnlyGrants::default());
+        r.grant_read_only_session(1, "10");
+        r.grant_read_only_issue(2);
+        let snap = r.read_only_grants();
+        assert_eq!(snap.issue, vec![2]);
+        assert_eq!(
+            snap.session,
+            vec![ReadOnlySessionGrant {
+                thread: 1,
+                dir: "10".into(),
+            }]
+        );
+        r.revoke_read_only_session(1, "10");
+        r.revoke_read_only_issue(2);
+        assert_eq!(r.read_only_grants(), ReadOnlyGrants::default());
+    }
+
+    /// Full access and a read-only session/issue grant are independent
+    /// mechanisms — granting one must not be mistaken for (or leak into) the
+    /// other's coverage.
+    #[test]
+    fn read_only_session_grant_does_not_imply_full_access() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        // Full would cover a Write ask too; a read-only grant must not.
+        assert!(r.auto_decision(1, "10", RiskLevel::Write, "rm -rf x").is_none());
+    }
+
+    #[test]
+    fn purge_thread_clears_both_read_only_session_and_issue_grants() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        r.grant_read_only_issue(1);
+        r.purge_thread(1);
+        assert!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls").is_none());
+        assert_eq!(r.read_only_grants(), ReadOnlyGrants::default());
+    }
+
+    #[test]
+    fn purge_dir_clears_only_that_dirs_read_only_session_grant() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        r.grant_read_only_session(1, "11");
+        r.purge_dir(1, "10");
+        assert!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls").is_none());
+        assert_eq!(
+            r.auto_decision(1, "11", RiskLevel::ReadOnly, "ls"),
+            Some(Decision::Allow)
+        );
     }
 }

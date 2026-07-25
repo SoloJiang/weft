@@ -69,6 +69,14 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
           </span>
         </div>
       )}
+      {/* Issue #103: approving this ALSO propagates a read-only auto-allow to
+          the whole issue (approve_write_trigger → grant_read_only_issue),
+          same as confirming the ScopeReview proposal — reuse its exact
+          disclosure caption so both dispatch-approval entry points are
+          equally upfront about the consequence, not just the batch one. */}
+      <p className="px-3.5 pb-2 text-[11px] leading-snug text-ink-faint">
+        {t("scope.readOnlyPropagationNote")}
+      </p>
       <div className="flex flex-wrap items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">
         <Button
           variant="primary"
@@ -116,7 +124,7 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
 }
 
 export function PermissionRow({ ask }: { ask: PermissionAsk }) {
-  const { answerPermission, goToDirectionRef } = useStore();
+  const { answerPermission, releaseSessionReadOnly, goToDirectionRef } = useStore();
   const { t } = useTranslation();
   const context = [ask.thread_title, ask.dir_name].filter(Boolean).join(" · ");
   const contextLink = context ? (
@@ -136,6 +144,7 @@ export function PermissionRow({ ask }: { ask: PermissionAsk }) {
     <PermissionConfirmationCard
       ask={ask}
       onAnswer={(askId, answer) => void answerPermission(askId, answer)}
+      onReleaseSessionReadOnly={() => void releaseSessionReadOnly(ask.thread, ask.dir)}
       className="overflow-hidden rounded-[var(--radius-lg)] border-waiting/40 bg-waiting/10 px-3.5 pb-0 pt-3"
       actionsClassName="-mx-3.5 mt-1 self-stretch border-t border-border bg-bg/40 px-3.5 py-2.5"
       context={contextLink}

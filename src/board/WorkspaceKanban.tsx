@@ -7,6 +7,7 @@ import type { NeedItem, PermissionAsk, ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { CreateThreadDialog, CreateWorkspaceDialog } from "../nav/dialogs";
 import { InheritedAccessChip } from "../components/InheritedAccessChip";
+import { ReadOnlyTrustChip } from "../components/ReadOnlyTrustChip";
 import { inheritedAccessOf } from "../lib/grants";
 import { cn } from "../lib/cn";
 
@@ -174,7 +175,7 @@ function EmptyBoard() {
 }
 
 function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
-  const { sessions, needs, asks, checksByDirection, openNeeds, leadTurn, authGrants } =
+  const { sessions, needs, asks, checksByDirection, openNeeds, leadTurn, authGrants, readOnlyGrants } =
     useStore();
   const { t } = useTranslation();
   // Split the in-flight count so a stalled worker OR lead is visible on the card
@@ -189,6 +190,11 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
   // marker and its one-click revoke must cover both. The chip re-derives the
   // kind-accurate copy from this same helper.
   const inherited = inheritedAccessOf(authGrants, o.thread_id) !== null;
+  // Issue #103: dispatch approval propagated a read-only auto-allow to the
+  // whole issue. A SEPARATE, narrower grant from Full/Always above — in-memory
+  // only, never survives a restart, never covers Write/NetworkOrCredential/
+  // Unknown — so it gets its own marker rather than folding into `inherited`.
+  const readOnlyTrusted = readOnlyGrants.issue.includes(o.thread_id);
   const done = o.statuses.filter((s) => s === "done").length;
   const attention = threadAttentionCount(o, needs, asks);
   const failing = o.direction_ids.filter((id) =>
@@ -243,6 +249,7 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
           </span>
         )}
         {inherited && <InheritedAccessChip threadId={o.thread_id} />}
+        {readOnlyTrusted && <ReadOnlyTrustChip threadId={o.thread_id} />}
       </div>
 
       {(o.direction_ids.length > 0 || running > 0 || stalled > 0) && (
