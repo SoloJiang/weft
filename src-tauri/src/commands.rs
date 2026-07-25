@@ -1838,8 +1838,31 @@ pub async fn session_meta(
         }
         None => None,
     };
-    let snap =
+    let mut snap =
         crate::session_meta::gather(&dir.tool, &wt.path, native.as_deref(), &command).await;
+    // ACP workers: overlay live engine cache (MCP inject + reasoning/model).
+    if crate::lead_chat::engine::is_acp_tool(&dir.tool) {
+        if let Some(sid) = sid {
+            if let Some(states) = app.try_state::<crate::lead_chat::engine::LeadChatState>() {
+                if let Some(eng) = states.get(sid as i64) {
+                    let g = eng.lock().await;
+                    snap.mcp_servers = Some(g.last_mcp_servers.clone());
+                    if snap.model.is_none() {
+                        snap.model = g.last_model.clone();
+                    }
+                    if snap.reasoning_effort.is_none() {
+                        snap.reasoning_effort = g.last_reasoning.clone();
+                    }
+                    if snap.context_tokens.is_none() {
+                        snap.context_tokens = g.last_context_tokens;
+                    }
+                    if snap.window.is_none() {
+                        snap.window = g.last_window;
+                    }
+                }
+            }
+        }
+    }
     // Probe results feed the engine cache + persisted snapshot: codex/opencode
     // model/window/MCP only exist here, never in engine events.
     if let Some(sid) = sid {

@@ -1786,9 +1786,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
       try {
         const cmds = await api.discoverSlash(threadId, null);
-        if (cmds.length > 0) {
-          setLeadSlash((s) => ({ ...s, [threadId]: cmds }));
-        }
+        setLeadSlash((s) => ({ ...s, [threadId]: cmds }));
       } catch (e) {
         /* slash discovery is best-effort */
         console.error(e);
@@ -1850,7 +1848,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // the only source of context/model/MCP until the next turn.
       setLeadMeta((m) => ({
         ...m,
-        [threadId]: fillMetaHoles(m[threadId], metaFromSnapshot(st)),
+        [threadId]: fillMetaHoles(
+          m[threadId],
+          metaFromSnapshot({ ...st, mcp_known: true }),
+        ),
       }));
     } catch (e) {
       /* engine state is cosmetic at load time */
@@ -1870,7 +1871,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     void api
       .discoverSlash(null, sessionId)
       .then((cmds) => {
-        if (cmds.length > 0) setWorkerSlash((s) => ({ ...s, [sessionId]: cmds }));
+        setWorkerSlash((s) => ({ ...s, [sessionId]: cmds }));
       })
       .catch(() => {});
   }, []);

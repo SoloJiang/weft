@@ -2224,10 +2224,18 @@ pub async fn send(
         )
     };
     if skill_pending || cmd_now {
+        let tool_for_shutdown = eng.lock().await.tool.clone();
         let (tid, _sid, _texts, orphans, acp_asks) = stop_quiet(eng).await;
         if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
             for id in acp_asks {
                 asks.inner().cancel(id);
+            }
+        }
+        // Command/skill bounce: drop the pooled ACP child so the next
+        // client(program) respawns with the new effective binary.
+        if cmd_now {
+            if crate::acp::backend_for(&tool_for_shutdown).is_some() {
+                crate::acp::runtime::shutdown(&tool_for_shutdown).await;
             }
         }
         {
@@ -3240,6 +3248,18 @@ async fn acp_emit_turn_end(
                     pending_usage = outcome.usage.clone();
                     pending_error = outcome.is_error;
                     pending_cancel = outcome.cancelled || eng.lock().await.interrupting;
+                    // Drain consumer before finalizing this queued turn (same as
+                    // first-prompt path via acp_drain_then_end).
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    if client
+                        .send_session_event(
+                            &sid,
+                            crate::acp::runtime::SessionEvent::DrainBarrier(tx),
+                        )
+                        .await
+                    {
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+                    }
                 }
                 Err(err) => {
                     eprintln!("[weft][acp] flush prompt failed: {err}");
@@ -3390,6 +3410,21 @@ async fn acp_consumer(
             } => {
                 // Drop late events after stop/unsubscribe/teardown.
             }
+            SessionEvent::ToolProgress { summary } => {
+                let mut inner = eng.lock().await;
+                note_turn_activity(&app, &db, &eng, &mut inner);
+                let (thread_id, session_id) = (inner.thread_id, inner.session_id);
+                drop(inner);
+                let _ = app.emit(
+                    EVENT,
+                    Push::Activity {
+                        thread_id,
+                        session_id,
+                        name: "tool".into(),
+                        summary,
+                    },
+                );
+            }
             SessionEvent::Thought { text } => {
                 {
                     let mut inner = eng.lock().await;
@@ -3511,12 +3546,40 @@ async fn acp_consumer(
             SessionEvent::Chat(ChatEvent::Commands { commands }) => {
                 let mut inner = eng.lock().await;
                 // Empty is authoritative (session cleared its slash palette).
-                inner.slash_commands = commands;
+                inner.slash_commands = commands.clone();
+                let (thread_id, session_id) = (inner.thread_id, inner.session_id);
+                let _ = app.emit(
+                    EVENT,
+                    Push::Init {
+                        thread_id,
+                        session_id,
+                        native_id: inner.native_id.clone().unwrap_or_default(),
+                        slash_commands: commands,
+                        mcp_servers: inner.last_mcp_servers.clone(),
+                        tools: inner.last_tools.clone(),
+                        model: inner.last_model.clone(),
+                        window: inner.last_window,
+                    },
+                );
             }
             SessionEvent::Commands(commands) => {
                 let mut inner = eng.lock().await;
                 // Empty is authoritative (session cleared its slash palette).
-                inner.slash_commands = commands;
+                inner.slash_commands = commands.clone();
+                let (thread_id, session_id) = (inner.thread_id, inner.session_id);
+                let _ = app.emit(
+                    EVENT,
+                    Push::Init {
+                        thread_id,
+                        session_id,
+                        native_id: inner.native_id.clone().unwrap_or_default(),
+                        slash_commands: commands,
+                        mcp_servers: inner.last_mcp_servers.clone(),
+                        tools: inner.last_tools.clone(),
+                        model: inner.last_model.clone(),
+                        window: inner.last_window,
+                    },
+                );
             }
             SessionEvent::Usage {
                 context_tokens,

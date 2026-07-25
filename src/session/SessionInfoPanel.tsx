@@ -61,7 +61,7 @@ export function SessionInfoPanel({
   // - codex/claude: workspace-enabled ∪ engine-discovered (name-deduped)
   // - omp/opencode: workspace-enabled only — engine "discovery" is either
   //   absent (opencode) or just a cwd re-scan of Weft-materialized builtins (omp)
-  const mergeEngineSkills = tool !== "omp" && tool !== "opencode";
+  const mergeEngineSkills = tool !== "opencode";
   const unifiedSkills = useMemo(() => {
     const byName = new Map<string, { name: string; description?: string }>();
     for (const s of skills) {

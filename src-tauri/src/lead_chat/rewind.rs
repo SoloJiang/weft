@@ -532,10 +532,17 @@ fn omp_user_body_matches(body: &str, want_norm: &str, is_first_user: bool) -> bo
     if !is_first_user {
         return false;
     }
-    match body.split_once("\n\n") {
-        Some((prefix, rest)) if !prefix.is_empty() => normalize_ws(rest) == want_norm,
-        _ => false,
+    // System prepend may contain multiple blank-line paragraphs. Accept when
+    // the normalized body ends with the user text and contains the separator,
+    // with a non-empty prefix (anything before the final user segment).
+    if !body.contains("\n\n") {
+        return false;
     }
+    // Strip trailing user segment: find last \n\n and compare rest.
+    if let Some((prefix, rest)) = body.rsplit_once("\n\n") {
+        return !prefix.is_empty() && normalize_ws(rest) == want_norm;
+    }
+    false
 }
 
 /// Cut-before rewind for omp ACP sessions.
@@ -1239,6 +1246,14 @@ mod tests {
     }
 
     #[test]
+    fn omp_multi_paragraph_system_prepend_matches() {
+        let want = normalize_ws("run tests");
+        let body = "You are the lead.\n\nOperate with judgment.\n\nThird para.\n\nrun tests";
+        assert!(omp_user_body_matches(body, &want, true));
+        assert!(!omp_user_body_matches(body, &want, false));
+    }
+
+    #[test]
     fn omp_user_body_matches_system_prepend_only_on_first() {
         let want = normalize_ws("run tests");
         // First user: system prepend OK
@@ -1315,5 +1330,18 @@ mod tests {
                 .unwrap_or(false);
             assert!(!ok, "symlink bucket must be rejected");
         }
+    }
+
+    #[test]
+    fn walkdir_jsonl_respects_max_hits_cap() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path();
+        // Create more matching files than MAX_HITS (32).
+        for i in 0..80 {
+            std::fs::write(root.join(format!("sess-cap-{i}.jsonl")), b"{}\n").unwrap();
+        }
+        let hits = walkdir_jsonl(root, "sess-cap").expect("walk");
+        assert!(hits.len() <= 32, "capped at MAX_HITS, got {}", hits.len());
+        assert!(!hits.is_empty());
     }
 }

@@ -54,10 +54,8 @@ export function metaFromInit(
   },
 ): SessionMeta {
   const grouped = groupMcpTools(p.mcp_servers, p.tools);
-  // Model OR a non-empty MCP list makes this init authoritative for servers.
-  // ACP open often has MCP before/without a model field — must not keep the
-  // empty "pending" placeholder in that case.
-  const authoritative = p.model != null || grouped.length > 0;
+  // MCP authority only from MCP payload (raw servers present).
+  const authoritative = p.mcp_servers.length > 0;
   const keepPrevServers = !authoritative && grouped.length === 0;
   return {
     contextTokens: prev?.contextTokens,
@@ -122,20 +120,18 @@ export function metaFromSnapshot(snap: {
   model: string | null;
   mcp_servers: { name: string; status: string }[];
   tools: string[];
+  mcp_known?: boolean;
 }): SessionMeta {
   const mcpServers = groupMcpTools(snap.mcp_servers, snap.tools);
-  // Engine cache is authoritative even when every server is Weft-internal
-  // (filtered out) — the panel must show "none" not perpetual "pending".
-  const hasEngineSignal =
-    snap.model != null ||
-    snap.mcp_servers.length > 0 ||
-    snap.context_tokens != null;
+  // Authority only from MCP reading (mcp_known or non-empty raw list).
+  const mcpAuthoritative =
+    snap.mcp_known === true || snap.mcp_servers.length > 0 ? true : undefined;
   return {
     contextTokens: snap.context_tokens ?? undefined,
     window: snap.window ?? undefined,
     model: snap.model ?? undefined,
     mcpServers,
-    mcpAuthoritative: hasEngineSignal ? true : undefined,
+    mcpAuthoritative,
   };
 }
 

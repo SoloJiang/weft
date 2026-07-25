@@ -23,6 +23,10 @@ pub enum UpdateOut {
     Thought {
         text: String,
     },
+    /// Non-terminal tool progress — keep the watchdog fed.
+    ToolProgress {
+        summary: String,
+    },
     Ignore,
 }
 
@@ -135,9 +139,15 @@ fn tool_name_from_raw(raw: Option<&Value>, kind: &str) -> String {
 
 fn tool_call_update(update: &Value) -> UpdateOut {
     let status = update.get("status").and_then(|s| s.as_str()).unwrap_or("");
-    // Only terminal states become ToolResults; in_progress is Ignore (start row exists).
+    // Only terminal states become ToolResults; in_progress keeps the turn alive.
     if status != "completed" && status != "failed" {
-        return UpdateOut::Ignore;
+        let title = update
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("tool");
+        return UpdateOut::ToolProgress {
+            summary: title.to_string(),
+        };
     }
     let id = update
         .get("toolCallId")
@@ -358,7 +368,7 @@ mod tests {
             "toolCallId": "call-1",
             "status": "in_progress"
         });
-        assert!(matches!(update_to_out(&inflight), UpdateOut::Ignore));
+        assert!(matches!(update_to_out(&inflight), UpdateOut::ToolProgress { .. }));
     }
 
     #[test]

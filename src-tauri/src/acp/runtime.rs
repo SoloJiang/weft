@@ -41,6 +41,9 @@ pub enum SessionEvent {
     Thought {
         text: String,
     },
+    ToolProgress {
+        summary: String,
+    },
     /// Prompt-task → consumer ordering: consumer replies when this is dequeued.
     DrainBarrier(tokio::sync::oneshot::Sender<()>),
     /// Permission needed — engine/runtime resolves via Ask and replies on the wire.
@@ -96,9 +99,9 @@ struct Inner {
     /// Sessions currently between session/new|resume and subscribe — only these
     /// may buffer pre-subscribe updates. Explicit unsubscribe drops the key.
     opening_sessions: std::collections::HashSet<String>,
-    /// True while a session/new|resume|load request is in flight — buffer any
-    /// session/update even before we know the sessionId.
-    expecting_session: bool,
+    /// In-flight session/new|resume|load count — buffer updates while > 0.
+    /// Counter (not bool) so concurrent opens don't clear early.
+    expecting_session: u32,
     /// Generation of this child connection; read_loop only clears inner when
     /// its generation still owns the slot (writer-fail reconnect race).
     connection_gen: u64,
@@ -136,6 +139,11 @@ fn config_option_current(result: &Value, id: &str) -> Option<String> {
 pub struct ClientHandle {
     backend_id: &'static str,
     inner: Arc<Mutex<Option<Inner>>>,
+    /// Effective program last successfully connected; used to detect pin changes.
+    program: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Held during spawn+initialize so concurrent ensure_connected waiters
+    /// don't race a half-ready child.
+    connect_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct Pool {
@@ -179,6 +187,8 @@ pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHan
     let handle = ClientHandle {
         backend_id: id,
         inner: Arc::new(Mutex::new(None)),
+        program: Arc::new(tokio::sync::Mutex::new(None)),
+        connect_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     handle.ensure_connected(backend, program).await?;
     POOL.clients.lock().await.insert(id, handle.clone());
@@ -215,10 +225,21 @@ impl ClientHandle {
         backend: Arc<dyn AcpBackend>,
         program: &str,
     ) -> anyhow::Result<()> {
+        // Serialize reconnect/init so a second waiter can't send session/*
+        // before initialize finishes.
+        let _guard = self.connect_lock.lock().await;
         if self.inner.lock().await.is_some() {
-            return Ok(());
+            // Already live. If program pin changed, tear down and respawn.
+            let prev = self.program.lock().await.clone();
+            if prev.as_deref() == Some(program) {
+                return Ok(());
+            }
+            // Different program: full recycle under the same connect_lock.
+            self.shutdown_and_reap().await;
         }
-        self.spawn(backend, program).await
+        self.spawn(backend, program).await?;
+        *self.program.lock().await = Some(program.to_string());
+        Ok(())
     }
 
     async fn spawn(&self, backend: Arc<dyn AcpBackend>, program: &str) -> anyhow::Result<()> {
@@ -279,7 +300,7 @@ impl ClientHandle {
             permission_gen: 0,
             pending_updates: std::collections::HashMap::new(),
             opening_sessions: std::collections::HashSet::new(),
-            expecting_session: false,
+            expecting_session: 0,
             connection_gen,
             _child: child,
             _reg: reg,
@@ -386,13 +407,14 @@ impl ClientHandle {
             },
             UpdateOut::Meta { model, thinking } => SessionEvent::Meta { model, thinking },
             UpdateOut::Thought { text } => SessionEvent::Thought { text },
+            UpdateOut::ToolProgress { summary } => SessionEvent::ToolProgress { summary },
             UpdateOut::Ignore => return,
         };
         if let Some(inner) = self.inner.lock().await.as_mut() {
             if let Some(route) = inner.sessions.get(sid) {
                 let _ = route.events.send(ev);
             } else if !sid.is_empty()
-                && (inner.opening_sessions.contains(sid) || inner.expecting_session)
+                && (inner.opening_sessions.contains(sid) || inner.expecting_session > 0)
             {
                 // Buffer while open→subscribe is in flight OR a session/* RPC is
                 // outstanding (updates can race ahead of mark_opening). After
@@ -702,7 +724,11 @@ impl ClientHandle {
 
     async fn set_expecting_session(&self, on: bool) {
         if let Some(inner) = self.inner.lock().await.as_mut() {
-            inner.expecting_session = on;
+            if on {
+                inner.expecting_session = inner.expecting_session.saturating_add(1);
+            } else {
+                inner.expecting_session = inner.expecting_session.saturating_sub(1);
+            }
         }
     }
 
