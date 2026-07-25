@@ -4695,7 +4695,9 @@ pub(super) async fn stamp_freeze_marker(
 ) -> Option<FreezeMarkerStamped> {
     let db = db?;
     match repo::mark_turn_freeze_recovered(db, thread_id, session_id).await {
-        Ok(()) => Some(FreezeMarkerStamped(())),
+        // The row id is the switch path's business (it may need to undo its own
+        // stamp); freeze recovery never retracts one, so it drops it here.
+        Ok(_) => Some(FreezeMarkerStamped(())),
         Err(err) => {
             eprintln!(
                 "[weft] turn-freeze recovery: failed to stamp coordination marker for thread {thread_id}: {err}"

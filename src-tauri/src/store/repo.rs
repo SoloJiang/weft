@@ -658,6 +658,10 @@ pub async fn switch_thread_tool(
     tool: &str,
     model: Option<&str>,
 ) -> Result<thread::Model> {
+    // Seam point: `commands::switch_lead_tool` must RETRACT its grace marker
+    // when this write fails, and that path has no other way to be reached from
+    // a test. See `fail_write`'s doc for the boundary.
+    fail_write!("switch_thread_tool");
     let m = thread::Entity::find_by_id(thread_id)
         .one(&db.0)
         .await?
@@ -1852,12 +1856,12 @@ pub async fn mark_turn_freeze_recovered(
     db: &Db,
     thread_id: i32,
     session_id: Option<i32>,
-) -> Result<()> {
+) -> Result<i32> {
     // Seam point: the failure this write's CALLERS must degrade correctly for
     // (`engine::stamp_freeze_marker` → the gated native-id clear) has no other
     // way to be reached from a test. See `fail_write`'s doc for the boundary.
     fail_write!("mark_turn_freeze_recovered");
-    insert_lead_message(
+    let row = insert_lead_message(
         db,
         thread_id,
         session_id,
@@ -1868,6 +1872,28 @@ pub async fn mark_turn_freeze_recovered(
         "complete",
     )
     .await?;
+    Ok(row.id)
+}
+
+/// Undo one [`mark_turn_freeze_recovered`] stamp, by the id it returned.
+///
+/// Only the engine/model switch needs this, and only on its own failure path:
+/// it stamps BEFORE tearing anything down (so an abort is honestly a no-op),
+/// which means a switch that then fails has published a marker for a reset
+/// that never happened. Leaving it is not merely a wasted grace window —
+/// [`crate::lead_chat::revive::has_resumable_context`] reads a marker as
+/// "this surface ran and had its native context deliberately cleared", so on a
+/// surface with NO native id (one rewound to before its first message, say)
+/// the stray marker would make it re-drivable forever.
+///
+/// Deletes BY ID, never "the newest marker for this (thread, session)": a real
+/// freeze recovery could have stamped its own row in between, and that one is
+/// load-bearing. A missing row is not an error — the switch's cleanup must not
+/// fail louder than the failure it is cleaning up after.
+pub async fn delete_turn_freeze_marker(db: &Db, marker_id: i32) -> Result<()> {
+    lead_message::Entity::delete_by_id(marker_id)
+        .exec(&db.0)
+        .await?;
     Ok(())
 }
 
