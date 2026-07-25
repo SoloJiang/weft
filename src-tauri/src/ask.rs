@@ -217,14 +217,20 @@ const CRED_NET_MARKERS: &[&str] = &[
     // product (`src/network/mod.rs`, `tokenizer.py` both matched before this
     // fix), so a raw substring check produced frequent false positives on
     // the MOST severe tier, eroding trust in the badge exactly the way
-    // under-classifying would. `_token`/`token=` keep a punctuation-anchored
-    // signal for shell-variable/assignment shapes (`$GITHUB_TOKEN`,
-    // `AUTH_TOKEN`, `token=xyz`) without matching a bare path segment or
-    // module/file name. The literal `"network":`/`"token":` JSON-key forms
-    // that used to live here were superseded by `has_json_key` (round-3
-    // review: those two literals missed single-quoted pseudo-JSON and a
-    // space before the colon — see `matches_cred_net`).
-    "_token",
+    // under-classifying would. `token=` keeps a punctuation-anchored signal
+    // for the assignment shape (`token=xyz`, `AUTH_TOKEN=xyz`) without
+    // matching a bare path segment or module/file name. The literal
+    // `"network":`/`"token":` JSON-key forms that used to live here were
+    // superseded by the credential-key check (round-3 review: those two literals
+    // missed single-quoted pseudo-JSON and a space before the colon — see
+    // `matches_cred_net`).
+    //
+    // The other two "token" shapes are NOT plain substring entries: `_token`
+    // (shell variable / credential file) and `--token` (CLI option) both need
+    // a boundary check to avoid matching the middle of a longer name, so they
+    // live in `has_anchored_token`. `_token` was a bare entry here until
+    // round-4 — see that function for why every `*_token*.rs` source file a
+    // coding agent edits was reading as the most severe tier.
     "token=",
 ];
 
@@ -288,11 +294,23 @@ const READ_ONLY_COMMAND_WORDS: &[&str] = &[
 /// listed (`is_universally_safe_flag`).
 ///
 /// KNOWN, ACCEPTED precision loss: a short flag with a DIRECTLY-ATTACHED
-/// value (`-M50%`, `-n5`, no space) unbundles character-by-character and
-/// will usually fail the whitelist even though the space-separated form
-/// (`-M 50%`, `-n 5`) passes — this only ever pushes a legitimate invocation
-/// toward `Write`, never the other way, so it's accepted rather than adding
-/// per-flag arity metadata for marginal precision.
+/// value (`-M50%`, no space) unbundles character-by-character, so each
+/// character of the VALUE has to clear the whitelist on its own — `-m50%`
+/// yields `-m`/`-5`/`-0`/`-%`, and the unrecognized `-%` drops `git diff
+/// -M50%` to `Write` even though the space-separated `-M 50%` passes. This
+/// only ever pushes a legitimate invocation toward `Write`, never the other
+/// way, so it's accepted rather than adding per-flag arity metadata for
+/// marginal precision.
+///
+/// Round-4 review: this paragraph used to claim an attached value "will
+/// usually fail", citing `-n5` alongside `-M50%`. That was wrong about
+/// `-n5`, and the distinction is worth stating precisely because it decides
+/// whether a very common invocation reads as `ReadOnly` or `Write`: a purely
+/// NUMERIC attached value passes, because every digit fragment it unbundles
+/// into (`-5`) is count-shaped and therefore accepted for any command by
+/// `is_universally_safe_flag`. `head -n5` unbundles to `-n` (on `head`'s
+/// whitelist) + `-5` (universally safe) and classifies `ReadOnly`, exactly
+/// like `head -n 5` — see `attached_numeric_short_flag_value_still_passes`.
 ///
 /// `find` is NOT here: its flags (`-delete`, `-exec`, `-name`, …) are
 /// multi-letter SINGLE-dash tokens that do NOT POSIX-bundle the way these
@@ -319,6 +337,17 @@ const READ_ONLY_COMMAND_WORDS: &[&str] = &[
 /// below happens to have no UNSAFE lowercase counterpart to an intended
 /// uppercase-safe flag, so this is a precision tradeoff, not a safety one —
 /// but it's worth remembering before adding a new entry.
+///
+/// The flip side, and the reason this is called out twice: some entries here
+/// exist ONLY as the lowercased form of a flag that is uppercase-only in the
+/// real command, so they look like typos or dead weight when read against
+/// `--help`. `grep`'s `-g` is one — there is no lowercase `grep -g`, but
+/// `grep -G` (`--basic-regexp`, present in both GNU and BSD grep) arrives
+/// here lowercased, and deleting the entry would demote a perfectly
+/// read-only `grep -G 'pat' file` to `Write`. Round-4 review flagged it as a
+/// dead entry on exactly that reading; `grep_basic_regexp_flag_is_read_only`
+/// now pins the behavior so the next reader gets an answer from the test
+/// suite instead of a plausible-looking cleanup.
 const FLAG_POLICIES: &[(&str, &[&str])] = &[
     (
         "ls",
@@ -508,37 +537,257 @@ fn contains_marker(haystack_lower: &str, markers: &[&str]) -> bool {
     markers.iter().any(|m| haystack_lower.contains(m))
 }
 
-/// Whether `haystack` (lowercased) contains a JSON-object-KEY-shaped mention
-/// of `key` — tolerant of single OR double quotes and optional whitespace
-/// before the colon (`"network":`, `'network':`, `"network" :`). Round-3
-/// review: a single literal substring (`"network":`, no space, double-quote
-/// only) missed single-quoted pseudo-JSON and a space before the colon —
-/// both were found in real MCP-args-shaped text. Still anchored to "this
-/// looks like a JSON key" (quote…quote…colon), NOT a bare word, so unlike
-/// word-boundary matching it does NOT match a file path segment (a path
-/// never contains a quote character) — safe to use in `classify_file` too.
-fn has_json_key(haystack: &str, key: &str) -> bool {
-    for quote in ['"', '\''] {
-        let quoted = format!("{quote}{key}{quote}");
-        if let Some(pos) = haystack.find(&quoted) {
-            let after = &haystack[pos + quoted.len()..];
-            if after.trim_start().starts_with(':') {
-                return true;
+/// Every JSON-object-KEY-shaped position in `haystack`: the text inside a
+/// quoted run (single OR double quotes, JSON backslash escapes respected)
+/// that is immediately followed — modulo whitespace — by a colon. Tolerating
+/// both quote styles and a space before the colon (`"network":`,
+/// `'network':`, `"network" :`) is round-3's finding: a single literal
+/// substring missed all three variations, which real MCP-args-shaped text
+/// does use.
+///
+/// The KEY position is the whole point. A value is not a key, and — because
+/// a key must sit between two quotes — a bare file path can never be one (a
+/// path contains no quote characters), which is what makes this safe to run
+/// over `classify_file`/`classify_command` haystacks too.
+///
+/// Scanning ALL positions rather than only the first occurrence also fixes a
+/// latent round-3 bug: the previous `haystack.find`-based check stopped at
+/// the first quoted `"token"` it saw, so a benign VALUE mention earlier in
+/// the blob (`{"a": "token", "token": "sk-…"}`) made it miss the real key
+/// that followed.
+fn json_keys(haystack: &str) -> Vec<&str> {
+    let bytes = haystack.as_bytes();
+    let mut keys = Vec::new();
+    // A quote character with no further occurrence can never close a run;
+    // remembering that (instead of rescanning the tail for every later quote
+    // of the same kind) keeps this linear on quote-heavy text.
+    let mut unclosable = [false; 2];
+    let mut i = 0;
+    while i < bytes.len() {
+        let kind = match bytes[i] {
+            b'"' => 0,
+            b'\'' => 1,
+            _ => {
+                i += 1;
+                continue;
             }
+        };
+        if unclosable[kind] {
+            i += 1;
+            continue;
         }
+        let quote = bytes[i];
+        let start = i + 1;
+        let mut j = start;
+        let mut closing = None;
+        while j < bytes.len() {
+            // Backslash escapes are deliberately NOT honored here. This scan
+            // is the FALLBACK for text that is not valid JSON, where `\` has
+            // no agreed meaning — and skipping `\"` pairs was what made the
+            // scan quadratic (round-4 review, P1): a skip jumps OVER later
+            // quote bytes, so the per-quote scans stop telescoping and each
+            // escaped quote gets re-scanned to the end of its string. Real
+            // JSON never reaches here (see `has_cred_key`), so nothing is
+            // lost by treating every quote byte as an ordinary delimiter.
+            if bytes[j] == quote {
+                closing = Some(j);
+                break;
+            }
+            j += 1;
+        }
+        // An unterminated quote is ordinary text (an apostrophe in prose),
+        // not the start of a run — skip past it and keep looking rather than
+        // abandoning the rest of the blob.
+        let Some(end) = closing else {
+            unclosable[kind] = true;
+            i += 1;
+            continue;
+        };
+        // `start`/`end` both sit adjacent to an ASCII quote byte, so these
+        // slices are always on char boundaries.
+        if haystack[end + 1..].trim_start().starts_with(':') {
+            keys.push(&haystack[start..end]);
+            // A confirmed key means these two quotes really were a matched
+            // pair, so it's safe to skip past the whole run.
+            i = end + 1;
+            continue;
+        }
+        // NOT a key — which also means this pairing may have been spurious,
+        // so back off ONE character rather than consuming the run. Round-4
+        // review: in `it's here: {'network': true}` the apostrophe in "it's"
+        // pairs with the OPENING quote of `'network'`; jumping past that run
+        // swallowed the real key's opening quote and the credential-shaped
+        // key was never found (a recall regression against the round-3
+        // exact-key search this replaced). Backing off re-examines the quote
+        // at `end` as a potential opener, which is what finds it. With the
+        // escape skip gone (above), each scan now stops at the IMMEDIATELY
+        // next same-kind quote, so the per-quote scans telescope and the
+        // whole walk is linear in the haystack length.
+        i += 1;
     }
-    false
+    keys
+}
+
+/// Words that make a JSON key credential/network-shaped. Matched with the
+/// SAME camelCase-aware tokenizer used for verb-matching (`words`), so
+/// `accessToken`/`apiToken`/`auth_token`/`GITHUB_TOKEN` all reduce to an
+/// exact "token" word — while `tokens`/`maxTokens` (an LLM budget parameter,
+/// plural) do not.
+const CRED_KEY_WORDS: &[&str] = &["token", "network"];
+
+/// Whether any OBJECT KEY anywhere in `value` is credential/network-shaped.
+/// Recurses into nested objects and arrays; a string VALUE is never a key,
+/// however key-shaped its contents look. Recursion is bounded because
+/// `serde_json` enforces its own nesting limit while parsing, so a `Value`
+/// that exists at all is shallow enough to walk.
+fn json_value_has_cred_key(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(key, child)| {
+                has_word(&words(key), CRED_KEY_WORDS) || json_value_has_cred_key(child)
+            }),
+        serde_json::Value::Array(items) => items.iter().any(json_value_has_cred_key),
+        _ => false,
+    }
+}
+
+/// Whether a credential/network-shaped KEY appears in this call, in two
+/// tiers of decreasing confidence.
+///
+/// 1. If the caller hands over a `payload` (only `classify_other` has one —
+///    an MCP call's raw args) and it parses as real JSON, walk the PARSED
+///    keys. This is exact: a key is a key, a string value's contents are
+///    never keys, escapes are the parser's problem, and it is linear.
+///    Production traffic always lands here — `bus::server::summarize` builds
+///    `args_text` with `serde_json::to_string`.
+/// 2. Otherwise fall back to the textual quote scan (`json_keys`), which
+///    covers non-JSON haystacks (a shell command, a file path) and the
+///    pseudo-JSON shapes round-3 found in hand-written payloads
+///    (single-quoted keys, a space before the colon).
+///
+/// Round-4 review, P2: tier 1 exists because the textual scan cannot tell a
+/// key from key-shaped text sitting inside a value, and said yes to
+/// `{"path":"src/config.ts","content":"const c = {'networkMode': true};"}` —
+/// an ordinary file write whose CONTENT merely mentions a network key. That
+/// is precisely the cried-wolf false positive this whole change removes, so
+/// a scanner that can be fooled by file content is not good enough where a
+/// real parser is available. The scan stays only for the inputs a parser
+/// cannot accept.
+///
+/// Takes ORIGINAL-CASE text. `words` is what makes `accessToken` split into
+/// ["access", "token"], and it can only see that boundary while the capital
+/// `T` is still there — a pre-lowercased `accesstoken` tokenizes to one
+/// opaque word and matches nothing. (`words` lowercases its own output, so
+/// the comparison against `CRED_KEY_WORDS` is still case-insensitive, and
+/// separator-delimited shapes like `GITHUB_TOKEN` work either way.)
+fn has_cred_key(text: &str, payload: Option<&str>) -> bool {
+    let parsed = payload.and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok());
+    if let Some(value) = parsed {
+        return json_value_has_cred_key(&value);
+    }
+    json_keys(text)
+        .iter()
+        .any(|key| has_word(&words(key), CRED_KEY_WORDS))
+}
+
+/// Whether `haystack_lower` passes a token as a COMPLETE `--token` long
+/// option (`--token sk-1`, `--token=sk-1`, `["--token", "sk-1"]`), as
+/// opposed to merely starting one.
+///
+/// This is the one credential shape with no JSON key to anchor on, so
+/// `classify_other`'s narrowing needs it — but it cannot be a plain
+/// `CRED_NET_MARKERS` substring. Round-4 review caught that a raw `--token`
+/// entry also fires on `--tokens 500` and `--tokenizer bpe`, ordinary
+/// LLM/NLP options, which both re-creates the exact false positive this
+/// whole change removes AND contradicts `CRED_KEY_WORDS`' deliberate refusal
+/// of plural `tokens`/`maxTokens`. An alphanumeric, `-`, or `_` directly
+/// after `--token` means a DIFFERENT option (`--token-file` is its own flag,
+/// not this one); anything else — whitespace, `=`, a quote, `,`, `]`, or end
+/// of input — is an argument boundary.
+///
+/// Deliberately double-dashed: a single-dash `-token` would match the tail
+/// of an ordinary kebab-case source path (`src/auth/refresh-token.rs`),
+/// while a path segment never carries a `--` prefix.
+/// Characters that continue an identifier, a filename, or a CLI option, and
+/// therefore are NOT a boundary. `.` is in here specifically because it is
+/// what separates a source file from a credential: `generate_token.py` and
+/// `oauth_token_store.rs` are code, `auth_token` and `$GITHUB_TOKEN` are not.
+fn is_identifier_continuation(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+}
+
+/// The punctuation-anchored "token" shapes, with whether each must also START
+/// a token to count.
+///
+/// `--token` MUST (`true`): without a leading boundary, `feature--token` — a
+/// branch name whose tail merely reads as the flag — matches.
+///
+/// `_token` must NOT (`false`): it is a SUFFIX by construction. The whole
+/// point is to match the tail of `$GITHUB_TOKEN` / `auth_token`, where the
+/// character before the underscore is an ordinary identifier character.
+const ANCHORED_TOKEN_MARKERS: &[(&str, bool)] = &[("--token", true), ("_token", false)];
+/// Whether `haystack_lower` contains one of `ANCHORED_TOKEN_MARKERS` as a
+/// COMPLETE token rather than as a fragment of a longer one.
+///
+/// Both entries need a TRAILING boundary, and for the same reason: without
+/// one, the marker matches the middle of a longer name. `--tokens 500` and
+/// `--tokenizer bpe` are ordinary LLM/NLP options, not credentials — and
+/// `generate_token.py`, `oauth_token_store.rs`, `refresh_token_test.go` are
+/// ordinary SOURCE FILES, which a coding agent edits constantly. Flagging
+/// those as the most severe tier is the same cried-wolf harm this whole
+/// change removes, so `_token` gets the same boundary discipline `--token`
+/// got rather than staying a bare substring.
+///
+/// What survives, because none of these continue the identifier: `$GITHUB_TOKEN`
+/// and `cat ~/.config/auth_token` (end of input), `AUTH_TOKEN=x` (`=`),
+/// `{"auth_token": "x"}` (a quote), `x-auth_token: abc` (`:`).
+///
+/// KNOWN, ACCEPTED cost: a credential name that keeps going loses the marker
+/// — `GITHUB_TOKEN_FILE=/run/secrets/x`, `auth_token.json`. Those name a
+/// PATH to a secret rather than the secret itself, which is the credential-
+/// path markers' job (`.env`, `.netrc`, …), and this direction only ever
+/// costs an over-flag, never a missed one, for the ordinary-source-file case
+/// that made the marker misfire far more often than it fired.
+fn has_anchored_token(haystack_lower: &str) -> bool {
+    ANCHORED_TOKEN_MARKERS.iter().any(|(marker, needs_leading)| {
+        haystack_lower.match_indices(marker).any(|(pos, m)| {
+            let opens = !needs_leading
+                || !haystack_lower[..pos]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_identifier_continuation);
+            let ends = !haystack_lower[pos + m.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_identifier_continuation);
+            opens && ends
+        })
+    })
 }
 
 /// The single check every `classify_*` function uses for "does this text
-/// show network access or a credential": the flat substring list PLUS the
-/// quote/spacing-tolerant JSON-key check for "network"/"token" (round-3
-/// review — see `has_json_key`). One function so command/file/other never
-/// drift apart on which of the two checks they remember to run.
-fn matches_cred_net(haystack_lower: &str) -> bool {
-    contains_marker(haystack_lower, CRED_NET_MARKERS)
-        || has_json_key(haystack_lower, "network")
-        || has_json_key(haystack_lower, "token")
+/// show network access or a credential": the flat substring list, the
+/// boundary-checked anchored `token` shapes (`has_anchored_token`), and
+/// the credential-key check
+/// (round-3/round-4 — see `has_cred_key`). One function so command/file/other
+/// never drift apart on which of the three checks they remember to run.
+///
+/// `text` is everything worth scanning — for `classify_other` that is the
+/// tool name AND its args, since a secret or URL can show up in either.
+/// `payload` is the raw argument blob on its own, when the caller has one, so
+/// the key check can parse it instead of guessing at its structure; callers
+/// without a structured payload pass `None`.
+///
+/// Pass ORIGINAL-CASE text. The substring markers and the flag check are
+/// matched case-insensitively (lowercased right here, so no caller has to
+/// remember), but the key check needs the original camelCase — see
+/// `has_cred_key`.
+fn matches_cred_net(text: &str, payload: Option<&str>) -> bool {
+    let lower = text.to_ascii_lowercase();
+    contains_marker(&lower, CRED_NET_MARKERS)
+        || has_anchored_token(&lower)
+        || has_cred_key(text, payload)
 }
 
 /// True when `trimmed` (already lowercased) starts with `word` as a whole
@@ -721,10 +970,12 @@ fn is_read_only_command(lower: &str) -> bool {
 /// of mutation, so an unrecognized (or compound, or flagged-destructive)
 /// command is never waved through as read-only.
 fn classify_command(cmd: &str) -> RiskLevel {
-    let lower = cmd.to_ascii_lowercase();
-    if matches_cred_net(&lower) {
+    // Original case — `matches_cred_net` lowercases for its own substring
+    // markers, and its key check needs the camelCase boundaries intact.
+    if matches_cred_net(cmd, None) {
         return RiskLevel::NetworkOrCredential;
     }
+    let lower = cmd.to_ascii_lowercase();
     if is_read_only_command(&lower) {
         return RiskLevel::ReadOnly;
     }
@@ -737,12 +988,10 @@ fn classify_command(cmd: &str) -> RiskLevel {
 /// unrecognized tool name touching a file doesn't default to a guess either
 /// way.
 fn classify_file(tool_name: &str, path: &str) -> RiskLevel {
-    let haystack = format!(
-        "{} {}",
-        tool_name.to_ascii_lowercase(),
-        path.to_ascii_lowercase()
-    );
-    if matches_cred_net(&haystack) {
+    // Original case — `matches_cred_net` lowercases for its substring markers
+    // itself, and its key check needs the camelCase boundaries intact.
+    let haystack = format!("{tool_name} {path}");
+    if matches_cred_net(&haystack, None) {
         return RiskLevel::NetworkOrCredential;
     }
     let w = words(tool_name);
@@ -758,11 +1007,34 @@ fn classify_file(tool_name: &str, path: &str) -> RiskLevel {
 /// Any other tool call's tier (MCP tools, `WebFetch`/`WebSearch`/`TodoWrite`,
 /// a Codex permission-scope escalation, …): a couple of high-confidence
 /// exact-name overrides, then credential/network markers scanned across BOTH
-/// the tool name and its args (a secret/URL can show up in either — see
-/// `matches_cred_net`), then a camelCase/compound "token" key (round-3
-/// review — see below), then a write verb in EITHER the tool name OR the
-/// args (round-2 review, issue #101 P0-b — see below), then the tool name's
-/// own read-only verb, else `Unknown`.
+/// the tool name and its args (a secret/URL can show up in either — including
+/// a camelCase/compound credential KEY like `accessToken`; see
+/// `matches_cred_net`), then a write verb in EITHER the tool name OR the args
+/// (round-2 review, issue #101 P0-b — see below), then the tool name's own
+/// read-only verb, else `Unknown`.
+///
+/// Round-4 review: the credential check here used to ALSO tokenize the entire
+/// stringified args blob and fire on an exact "token" word anywhere in it,
+/// key or value. Round-3 justified that as bounded ("args_text is never a
+/// bare file path the way `tokenizer.py` is") — but that only held for the
+/// two argument names `bus::server::summarize` routes AWAY from here
+/// (`file_path`/`filePath`); every other file-touching MCP tool lands in this
+/// function with its path sitting in the blob. The widely-used
+/// `@modelcontextprotocol/server-filesystem` names its argument `path`, so
+/// `{"path":"src/token_bucket.rs"}` — an utterly ordinary source-file write —
+/// came out `NetworkOrCredential`, the top tier. That is the SAME "cried
+/// wolf" harm round-2 removed bare "network"/"token" from `CRED_NET_MARKERS`
+/// to fix (see that list's comment), re-entering through a different door,
+/// and it works directly against issue #101's goal of a badge that tells you
+/// at a glance which cards deserve a closer look.
+///
+/// So the check now lives in `matches_cred_net`, anchored to JSON KEY
+/// position (`has_cred_key`) — where a credential parameter actually
+/// appears, and where a path never can. KNOWN, ACCEPTED recall loss: a
+/// secret quoted only in a VALUE with no credential-shaped key and no
+/// punctuation anchor (`{"comment":"rotate the api token"}`) no longer
+/// reaches the top tier. That is a glance-level hint, not the gate — the
+/// human still sees the full args via `DetailPreview` before allowing.
 fn classify_other(tool_name: &str, args_text: &str) -> RiskLevel {
     // High-confidence overrides for common built-ins that would otherwise be
     // UNDER-classified by the generic scan below: both tokenize to a word
@@ -772,29 +1044,12 @@ fn classify_other(tool_name: &str, args_text: &str) -> RiskLevel {
     if tool_name.eq_ignore_ascii_case("WebFetch") || tool_name.eq_ignore_ascii_case("WebSearch") {
         return RiskLevel::NetworkOrCredential;
     }
-    let haystack = format!(
-        "{} {}",
-        tool_name.to_ascii_lowercase(),
-        args_text.to_ascii_lowercase()
-    );
-    if matches_cred_net(&haystack) {
+    // Original case — see `classify_file` / `matches_cred_net`.
+    let haystack = format!("{tool_name} {args_text}");
+    if matches_cred_net(&haystack, Some(args_text)) {
         return RiskLevel::NetworkOrCredential;
     }
     let args_words = words(args_text);
-    // Round-3 review: `matches_cred_net`'s literal anchors (`_token`,
-    // `token=`, the `has_json_key` check) never match a camelCase/compound
-    // key like `accessToken`/`apiToken` — no underscore, no adjacent
-    // quote+colon around the LITERAL word "token" (the key IS "accessToken",
-    // not "token"). The SAME camelCase-aware tokenizer already used for
-    // verb-matching below splits "accessToken" into ["access","token"], so
-    // an EXACT "token" word catches it. Scoped to `classify_other` only
-    // (never `classify_file`/`classify_command`): args_text is never a bare
-    // file path the way `tokenizer.py` is, so this can't reintroduce the
-    // round-2 P2 false positive — a path segment "tokenizer" tokenizes to
-    // ["tokenizer"], which is NOT the exact word "token".
-    if has_word(&args_words, &["token"]) {
-        return RiskLevel::NetworkOrCredential;
-    }
     let name_words = words(tool_name);
     // `tool_name` is a deliberate, structured identifier; `args_text` is
     // arbitrary content the MCP SERVER controls — issue #101's own
@@ -2230,7 +2485,7 @@ mod tests {
 
     #[test]
     fn other_single_quoted_and_spaced_json_keys_are_credential_shaped() {
-        // `has_json_key` tolerates single quotes and whitespace before the
+        // `json_keys` tolerates single quotes and whitespace before the
         // colon — variations a hand-written or non-standard-JSON MCP payload
         // might use.
         for args_text in [r#"{'network': true}"#, r#"{"network" : true}"#] {
@@ -2244,30 +2499,418 @@ mod tests {
 
     #[test]
     fn other_json_key_check_requires_a_colon_not_just_a_quoted_word() {
-        // `has_json_key` specifically requires the quoted word to be
+        // The fallback scan specifically requires the quoted word to be
         // followed by a colon (a KEY position) — a quoted VALUE that merely
         // contains the word must not match it, else it would just be a
         // differently-shaped substring check with extra steps.
-        assert!(!has_json_key(r#"{"description": "a network issue"}"#, "network"));
-        assert!(has_json_key(r#"{"network": true}"#, "network"));
+        assert!(!has_cred_key(r#"{"description": "a network issue"}"#, None));
+        assert!(has_cred_key(r#"{"network": true}"#, None));
     }
 
     #[test]
-    fn other_bare_token_word_anywhere_in_args_is_upgrade_only_over_caution() {
-        // Unlike `has_json_key` (key-position only), the camelCase-aware
-        // word-boundary check for "token" (see `classify_other`) does NOT
-        // distinguish a key from a value — "token" appearing ANYWHERE in
-        // args_text is treated as a signal. This is a DELIBERATE, documented
-        // over-caution tradeoff (consistent with WRITE_TOOL_WORDS's own
-        // args_text scan, which has the same key/value-agnostic shape): a
-        // benign mention ("please rotate the token") costs an occasional
-        // over-flagged card, never a missed dangerous one.
+    fn json_keys_scans_every_position_not_just_the_first() {
+        // The round-3 `haystack.find`-based check stopped at the FIRST
+        // quoted occurrence: a benign value mention earlier in the blob hid
+        // the real credential key that came after it.
+        let args = r#"{"a": "token", "apiToken": "sk-1"}"#;
+        assert_eq!(json_keys(args), vec!["a", "apiToken"]);
+        assert!(has_cred_key(args, None));
+    }
+
+    #[test]
+    fn json_keys_survives_an_unterminated_quote() {
+        // An apostrophe in prose is not the start of a quoted run. Bailing
+        // out at the first unclosable quote would blind the scan to every
+        // key after it.
+        assert!(has_cred_key(r#"{"msg": "don't", "accessToken": "sk-1"}"#, None));
+        assert!(has_cred_key(r#"it's here: {"network": true}"#, None));
+    }
+
+    #[test]
+    fn value_contents_are_never_treated_as_keys() {
+        // Round-4 review P2: the textual scan cannot tell a key from
+        // key-shaped text inside a VALUE, and said yes to a file write whose
+        // content merely mentions a network key — the exact cried-wolf false
+        // positive this change exists to remove. Parsing the payload settles
+        // it structurally.
+        for args_text in [
+            r#"{"path":"src/config.ts","content":"const c = {'networkMode': true};"}"#,
+            r#"{"path":"src/a.ts","content":"const c = {\"accessToken\": x};"}"#,
+            r##"{"path":"src/a.py","content":"# see 'token': the auth doc"}"##,
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Other { tool_name: "write_file", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} must not be flagged network/credential"
+            );
+        }
+        // A real key at the SAME nesting depth as those values still fires.
         assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "write_file",
+                args_text: r#"{"path":"src/a.ts","accessToken":"sk-1"}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+    }
+
+    #[test]
+    fn parsed_payload_finds_keys_at_any_depth() {
+        // The parsed walk must recurse through objects AND arrays, not just
+        // look at the top level.
+        for args_text in [
+            r#"{"env":{"GITHUB_TOKEN":"sk-1"}}"#,
+            r#"{"steps":[{"with":{"apiToken":"sk-1"}}]}"#,
+            r#"[{"accessToken":"sk-1"}]"#,
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} should be network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_payloads_do_not_blow_the_stack() {
+        // `json_value_has_cred_key` recurses, and `args_text` is
+        // server-controlled. What keeps that safe is that `serde_json`
+        // enforces its own nesting limit while PARSING, so a `Value` that
+        // exists at all is shallow enough to walk — and anything deeper
+        // simply fails to parse and degrades to the (iterative) textual scan
+        // rather than reaching the recursion. Measured here: nesting parses
+        // up to ~126 and is rejected beyond, with no depth crashing.
+        for depth in [100usize, 128, 5_000, 100_000] {
+            let payload = format!(
+                "{}{}{}",
+                r#"{"a":"#.repeat(depth),
+                r#"{"apiToken":"sk-1"}"#,
+                "}".repeat(depth)
+            );
+            assert_eq!(
+                classify_risk(RiskSignal::Other {
+                    tool_name: "get_status",
+                    args_text: &payload
+                }),
+                RiskLevel::NetworkOrCredential,
+                "depth {depth} lost the key"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_quote_payloads_stay_linear() {
+        // Round-4 review P1: skipping `\"` pairs made the scan jump OVER
+        // later quote bytes, so the per-quote scans stopped telescoping and
+        // every escaped quote was re-scanned to the end of its string. A
+        // 40 KB payload took ~375ms in one call, on the permission-ask path.
+        // BOTH paths need covering. A valid-JSON payload goes to the parser;
+        // an invalid one (single-quoted key here) falls back to the textual
+        // scan, which is where the escape skip lived — a valid-JSON case
+        // alone would never execute that code and could not catch its
+        // return.
+        let escaped = r#"\""#.repeat(100_000);
+        for payload in [
+            format!(r#"{{"content":"{escaped}"}}"#),
+            format!(r#"{{'content':"{escaped}"}}"#),
+        ] {
+            let started = std::time::Instant::now();
+            let risk = classify_risk(RiskSignal::Other {
+                tool_name: "write_file",
+                args_text: &payload,
+            });
+            let elapsed = started.elapsed();
+            assert_ne!(risk, RiskLevel::NetworkOrCredential);
+            // Linear is milliseconds here; the quadratic version needed
+            // minutes at this size. A 5s bound fails the bug without being
+            // sensitive to CI load.
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "{} byte payload took {elapsed:?} — scan is not linear",
+                payload.len()
+            );
+        }
+    }
+
+    #[test]
+    fn json_keys_finds_a_single_quoted_key_after_a_contraction() {
+        // Round-4 review: the apostrophe in "it's" pairs with the OPENING
+        // quote of `'network'`. Consuming that mispairing as a finished run
+        // swallowed the real key's opening quote and lost the key entirely —
+        // a recall regression against the round-3 exact-key search, and one
+        // the SAME-quote-kind case above (`it's` + a DOUBLE-quoted key) could
+        // not catch. Backing off one character on a non-key run finds it.
+        assert_eq!(json_keys(r#"it's here: {'network': true}"#), vec!["network"]);
+        assert!(has_cred_key(r#"it's here: {'network': true}"#, None));
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "get_status",
+                args_text: r#"it's here: {'network': true}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+        // The well-formed cases must not regress from the same change.
+        assert_eq!(
+            json_keys(r#"{"a": "token", "apiToken": "sk-1"}"#),
+            vec!["a", "apiToken"]
+        );
+    }
+
+    #[test]
+    fn token_flag_needs_an_argument_boundary() {
+        // Round-4 review: as a raw substring marker, `--token` also fired on
+        // `--tokens`/`--tokenizer` — ordinary LLM/NLP options — recreating
+        // the very false positive this change removes and contradicting
+        // CRED_KEY_WORDS' deliberate refusal of plural `tokens`/`maxTokens`.
+        for args_text in [
+            r#"{"args":["--tokens","500"]}"#,
+            r#"{"cmd":"llm --tokenizer bpe"}"#,
+            r#"{"args":["--token-file","/tmp/t"]}"#,
+            r#"{"args":["--token_file","/tmp/t"]}"#,
+            // A complete flag is bounded on BOTH sides, by the SAME
+            // continuation set — these are branch names whose tail happens
+            // to read as the flag.
+            r#"{"cmd":"git checkout feature--token"}"#,
+            r#"{"cmd":"git checkout feature_--token"}"#,
+            r#"{"cmd":"git checkout feature---token"}"#,
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} must not be flagged network/credential"
+            );
+        }
+        assert_ne!(
+            classify_risk(RiskSignal::Command("python train.py --tokens 500")),
+            RiskLevel::NetworkOrCredential
+        );
+        // Every real argument boundary still counts.
+        for args_text in [
+            r#"{"args":["--token","sk-1"]}"#,
+            r#"{"cmd":"deploy --token=sk-1"}"#,
+            r#"{"cmd":"deploy --token sk-1"}"#,
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} should be network/credential"
+            );
+        }
+        assert!(has_anchored_token("deploy --token"));
+    }
+
+    #[test]
+    fn cred_json_key_needs_the_original_case_to_see_camelcase() {
+        // `words` splits on the capital T; pre-lowercasing the haystack (as
+        // every `classify_*` used to do before handing it over) collapses
+        // "accessToken" into one opaque word and the key check goes blind.
+        // This is the seam that makes `matches_cred_net` own the lowercasing.
+        assert!(has_cred_key(r#"{"accessToken": "sk-1"}"#, None));
+        assert!(!has_cred_key(
+            &r#"{"accessToken": "sk-1"}"#.to_ascii_lowercase(),
+            None
+        ));
+        // Separator-delimited shapes survive lowercasing either way.
+        assert!(has_cred_key(r#"{"GITHUB_TOKEN": "sk-1"}"#, None));
+        assert!(has_cred_key(r#"{"auth_token": "sk-1"}"#, None));
+    }
+
+    // ---- round-4 independent review (issue #101, follow-up to PR #134): the
+    // camelCase "token" word check scanned the WHOLE stringified args blob,
+    // not just key positions, so any MCP tool naming its path argument
+    // anything other than `file_path`/`filePath` (e.g.
+    // `@modelcontextprotocol/server-filesystem`, which uses `path`) flagged
+    // ordinary source-file writes as the MOST severe tier. ----
+
+    #[test]
+    fn other_ordinary_source_paths_with_a_token_segment_are_not_credentials() {
+        // The exact reproduction from the review, plus the sibling path
+        // shapes a coding agent hits every day. All are plain file writes.
+        for args_text in [
+            r#"{"path":"src/token_bucket.rs","content":"pub struct Bucket;"}"#,
+            r#"{"path":"src/token.rs","content":"x"}"#,
+            r#"{"path":"src/auth/token_refresh.rs","content":"x"}"#,
+            r#"{"path":"src/auth/refresh-token.rs","content":"x"}"#,
+            r#"{"uri":"file:///repo/src/nlp/tokenizer.py"}"#,
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Other { tool_name: "write_file", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} must not be flagged network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn other_credential_shaped_keys_still_reach_the_top_tier() {
+        // The narrowing must not cost recall on the shapes a credential
+        // actually takes: camelCase keys, snake_case keys, screaming-snake
+        // env keys, a nested key, and a `--token` CLI flag inside an args
+        // array (the one shape with no key to anchor on — kept alive by the
+        // `--token` marker in CRED_NET_MARKERS).
+        for args_text in [
+            r#"{"accessToken": "sk-1"}"#,
+            r#"{"apiToken": "sk-1"}"#,
+            r#"{"auth_token": "sk-1"}"#,
+            r#"{"env": {"GITHUB_TOKEN": "sk-1"}}"#,
+            r#"{"networkMode": "host"}"#,
+            r#"{"command": "deploy", "args": ["--token", "sk-1"]}"#,
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} should be network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn other_token_in_a_value_no_longer_upgrades_but_write_verbs_still_do() {
+        // Round-3 deliberately fired on "token" anywhere in the blob, key or
+        // value, and pinned `{"comment": "rotate the api token soon"}` as an
+        // accepted over-flag. Round-4 reverses THAT specific call — a value
+        // mention is now a glance-level miss, not a red badge — because the
+        // same blob-wide scan was what turned every token-named source path
+        // red. This is the deliberate recall trade recorded in
+        // `classify_other`'s doc comment.
+        assert_ne!(
             classify_risk(RiskSignal::Other {
                 tool_name: "get_status",
                 args_text: r#"{"comment": "rotate the api token soon"}"#
             }),
             RiskLevel::NetworkOrCredential
+        );
+        // The UPGRADE-ONLY architecture is untouched: args are still scanned
+        // for write verbs, and a reassuring tool name still cannot pull a
+        // destructive args payload back down (issue #101 P0-b).
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "get_status",
+                args_text: r#"{"path":"src/token_bucket.rs","op":"delete_all"}"#
+            }),
+            RiskLevel::Write
+        );
+    }
+
+    #[test]
+    fn snake_case_token_source_files_are_not_credentials() {
+        // The `_token` marker was a bare substring until round-4, so every
+        // ordinary snake_case source file with a token segment read as the
+        // MOST severe tier — and unlike the args-blob scan this fires through
+        // `classify_file` too, so a plain `Read` of one was red as well.
+        // Same cried-wolf harm, a third door into it.
+        let paths = [
+            "src/generate_token.py",
+            "src/oauth_token_store.rs",
+            "src/auth/refresh_token_test.go",
+        ];
+        for path in paths {
+            assert_ne!(
+                classify_risk(RiskSignal::File { tool_name: "Read", path }),
+                RiskLevel::NetworkOrCredential,
+                "Read {path:?} must not be flagged network/credential"
+            );
+            assert_ne!(
+                classify_risk(RiskSignal::File { tool_name: "Write", path }),
+                RiskLevel::NetworkOrCredential,
+                "Write {path:?} must not be flagged network/credential"
+            );
+            let args_text = format!(r#"{{"path":"{path}","content":"x"}}"#);
+            assert_ne!(
+                classify_risk(RiskSignal::Other {
+                    tool_name: "write_file",
+                    args_text: &args_text
+                }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} must not be flagged network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn token_suffix_still_fires_at_a_real_boundary() {
+        // The narrowing must not cost the shapes `_token` exists for. Asserted
+        // on the predicate itself, because at the `classify_risk` level most
+        // of these ALSO trip a marker of their own (`curl `, `token=`) and
+        // would pass even with `_token` deleted outright — a test that cannot
+        // fail is not a guard.
+        for text in [
+            "echo $github_token",            // shell variable, end of input
+            "cat ~/.config/auth_token",      // credential file, no extension
+            "export auth_token=abc",         // assignment
+            r#"{"auth_token": "sk-1"}"#,     // json key, quote
+            r#"curl -h "x-auth_token: abc""#, // header, colon
+            "run --token sk-1",              // the sibling anchored shape
+        ] {
+            assert!(has_anchored_token(text), "{text:?} lost its anchor");
+        }
+        for text in [
+            "src/generate_token.py",
+            "src/oauth_token_store.rs",
+            "src/auth/refresh_token_test.go",
+            "github_token_file=/run/secrets/x", // accepted cost, see the fn doc
+        ] {
+            assert!(!has_anchored_token(text), "{text:?} should not anchor");
+        }
+        // End to end on the two commands that DO isolate `_token` — `echo`
+        // and `cat` are read-only-shaped, so nothing else can be lifting them.
+        for cmd in ["echo $GITHUB_TOKEN", "cat ~/.config/auth_token"] {
+            assert_eq!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::NetworkOrCredential,
+                "{cmd:?} should be network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn file_paths_with_a_token_segment_are_not_credentials() {
+        // `classify_file` never had the blob scan, but it shares
+        // `matches_cred_net` — pin that the shared path stays clean too.
+        for path in [
+            "src/token_bucket.rs",
+            "src/token.rs",
+            "src/auth/refresh-token.rs",
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::File { tool_name: "Write", path }),
+                RiskLevel::NetworkOrCredential,
+                "{path:?} must not be flagged network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn attached_numeric_short_flag_value_still_passes() {
+        // Round-4 review of FLAG_POLICIES' doc comment: it claimed an
+        // attached short-flag value "will usually fail the whitelist" and
+        // cited `-n5`. Wrong for the numeric case — `-n5` unbundles to `-n`
+        // (on head's whitelist) + `-5` (count-shaped, universally safe).
+        for cmd in ["head -n5 file.txt", "head -n 5 file.txt", "tail -n20 log"] {
+            assert_eq!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::ReadOnly,
+                "{cmd:?} should be read-only"
+            );
+        }
+        // The non-numeric attached value the paragraph is actually about:
+        // `-M50%` unbundles to `-m`/`-5`/`-0`/`-%`, and `-%` is unrecognized.
+        assert_eq!(
+            classify_risk(RiskSignal::Command("git diff -M50%")),
+            RiskLevel::Write
+        );
+    }
+
+    #[test]
+    fn grep_basic_regexp_flag_is_read_only() {
+        // Round-4 review read grep's `-g` entry as dead (no lowercase `-g`
+        // exists in GNU or BSD grep — true). It is the LOWERCASED form of
+        // `-G`/`--basic-regexp`, which both greps do have: `classify_command`
+        // lowercases before `flags_in_token` runs. Deleting the entry would
+        // demote this read-only invocation to `Write`.
+        assert_eq!(
+            classify_risk(RiskSignal::Command("grep -G 'a.c' file.txt")),
+            RiskLevel::ReadOnly
         );
     }
 
@@ -2476,6 +3119,77 @@ mod tests {
             let risk = classify_risk(RiskSignal::Command(cmd));
             println!("  {cmd:?} -> {risk:?} (expected: ReadOnly)");
             assert_eq!(risk, RiskLevel::ReadOnly, "{cmd:?} should still be read-only");
+        }
+
+        println!("\n--- transcript complete: every example above matches its post-fix expectation ---\n");
+    }
+
+    /// Round-4 independent review transcript (issue #101, fast-follow to PR
+    /// #134): round-3 closed a recall gap on camelCase credential KEYS by
+    /// tokenizing the ENTIRE stringified args blob and firing on an exact
+    /// "token" word anywhere in it. Its own justification — "args_text is
+    /// never a bare file path" — held only for the two argument names
+    /// `bus::server::summarize` routes away from `classify_other`
+    /// (`file_path`/`filePath`). Every other file-touching MCP tool lands
+    /// here WITH its path in the blob, so this re-opened round-2's P2
+    /// cried-wolf false positive through a different door. Run with `cargo
+    /// test --lib ask::tests::round_4_review_examples_transcript --
+    /// --nocapture` to see the transcript.
+    #[test]
+    fn round_4_review_examples_transcript() {
+        println!("\n--- issue #101 round-4 review: before/after transcript ---");
+
+        println!("\n[P2] ordinary source paths in non-`file_path` MCP args (must NOT be NetworkOrCredential):");
+        for (tool_name, args_text) in [
+            // The review's verbatim reproduction. `server-filesystem` names
+            // this argument `path`, so it never reaches `classify_file`.
+            ("write_file", r#"{"path":"src/token_bucket.rs","content":"..."}"#),
+            ("write_file", r#"{"path":"src/token.rs","content":"x"}"#),
+            ("write_file", r#"{"path":"src/auth/token_refresh.rs","content":"x"}"#),
+            ("edit_file", r#"{"path":"src/auth/refresh-token.rs","content":"x"}"#),
+            // This one fired through the SEPARATE round-2 `_token` substring
+            // marker rather than the args-blob scan, so it survived the first
+            // pass of this fix and needed the marker's own boundary check —
+            // see `has_anchored_token`.
+            ("write_file", r#"{"path":"src/generate_token.py","content":"x"}"#),
+        ] {
+            let risk = classify_risk(RiskSignal::Other { tool_name, args_text });
+            println!("  {tool_name:?} args={args_text:?} -> {risk:?} (pre-fix: NetworkOrCredential)");
+            assert_ne!(
+                risk,
+                RiskLevel::NetworkOrCredential,
+                "{tool_name:?}/{args_text:?} still a false positive"
+            );
+        }
+
+        println!("\n[recall] real credential shapes must STILL be NetworkOrCredential (no overcorrection):");
+        for (tool_name, args_text) in [
+            ("get_status", r#"{"accessToken": "sk-1"}"#),
+            ("get_status", r#"{"apiToken": "sk-1"}"#),
+            ("get_status", r#"{"auth_token": "sk-1"}"#),
+            ("get_status", r#"{"env": {"GITHUB_TOKEN": "sk-1"}}"#),
+            ("run_cmd", r#"{"args": ["--token", "sk-1"]}"#),
+        ] {
+            let risk = classify_risk(RiskSignal::Other { tool_name, args_text });
+            println!("  {tool_name:?} args={args_text:?} -> {risk:?} (expected: NetworkOrCredential)");
+            assert_eq!(
+                risk,
+                RiskLevel::NetworkOrCredential,
+                "{tool_name:?}/{args_text:?} lost to the narrowing"
+            );
+        }
+
+        println!("\n[P3] FLAG_POLICIES doc corrections (behavior pinned, docs were wrong/misread):");
+        for (cmd, expected) in [
+            // Doc claimed an attached short-flag value "will usually fail";
+            // a NUMERIC one passes via `is_universally_safe_flag`.
+            ("head -n5 file.txt", RiskLevel::ReadOnly),
+            // grep's `-g` entry was read as dead; it is the lowercased `-G`.
+            ("grep -G 'a.c' file.txt", RiskLevel::ReadOnly),
+        ] {
+            let risk = classify_risk(RiskSignal::Command(cmd));
+            println!("  {cmd:?} -> {risk:?} (expected: {expected:?})");
+            assert_eq!(risk, expected, "{cmd:?} misclassified");
         }
 
         println!("\n--- transcript complete: every example above matches its post-fix expectation ---\n");
