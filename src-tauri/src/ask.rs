@@ -657,12 +657,6 @@ const CRED_KEY_WORDS: &[&str] = &["token", "network"];
 /// a false top-tier badge is the trust erosion #138 existed to stop.
 const TRANSPORT_KEY_WORDS: &[&str] = &["header", "headers", "body", "payload"];
 
-/// Whether any OBJECT KEY anywhere in `value` is credential/network-shaped.
-/// Recurses into nested objects and arrays; a string VALUE is never a key,
-/// however key-shaped its contents look. Recursion is bounded because
-/// `serde_json` enforces its own nesting limit while parsing, so a `Value`
-/// that exists at all is shallow enough to walk.
-///
 /// How the key walk should treat a string VALUE it reaches. ONE discriminated
 /// state rather than a pair of booleans, because the three cases are genuinely
 /// distinct and `Exhausted` must not be re-derivable from the other two: a
@@ -671,9 +665,10 @@ const TRANSPORT_KEY_WORDS: &[&str] = &["header", "headers", "body", "payload"];
 /// all (`{"body":"{\"body\":\"{\\\"apiToken\\\"…\"}"}`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EncodedJson {
-    /// Not inside a transport envelope — a string is just a string.
+    /// Not an envelope slot — a string here is just a string.
     Opaque,
-    /// Inside one: a string that is an encoded JSON document gets ONE re-parse.
+    /// THIS slot is a transport envelope: a string that is an encoded JSON
+    /// document gets ONE re-parse.
     Decodable,
     /// Already inside a re-parsed document — no further decoding, ever.
     Exhausted,
@@ -686,10 +681,21 @@ enum EncodedJson {
 /// that exists at all is shallow enough to walk.
 ///
 /// `encoded` carries the string-value policy down the walk. It starts `Opaque`
-/// at the args root and becomes `Decodable` when the walk descends through a
-/// `TRANSPORT_KEY_WORDS` key — so the same encoded document is inspected under
+/// at the args root and becomes `Decodable` for the DIRECT value of a
+/// `TRANSPORT_KEY_WORDS` key — so the same encoded document is decoded under
 /// `body` and ignored under `content`. It never climbs back out of `Exhausted`.
 /// See `embedded_json_has_cred_key` for why, and for why exactly one layer.
+///
+/// `Decodable` propagates through ARRAYS but NOT through nested objects, and
+/// round-5 review's second P2 is why. Carrying it to every descendant re-opened
+/// the false positive one level in: `{"body":{"content":"{\"apiToken\":\"x\"}"}}`
+/// decoded a `content` field just because an ancestor was named `body`, which
+/// contradicts this change's own rule. The line that holds: an ENVELOPE is a
+/// string (or a list of them) sitting in the slot. Once the walk is inside an
+/// OBJECT, that payload was already serialized structurally and its keys are
+/// being read normally anyway — so a string deeper in is domain data of that
+/// object, whatever it is named. Each key still gets its own transport test on
+/// the way down, so a nested `{"request":{"body":"…"}}` is still decoded.
 fn json_value_has_cred_key(value: &serde_json::Value, encoded: EncodedJson) -> bool {
     match value {
         serde_json::Value::Object(map) => map.iter().any(|(key, child)| {
@@ -699,11 +705,8 @@ fn json_value_has_cred_key(value: &serde_json::Value, encoded: EncodedJson) -> b
             }
             let child_encoded = match encoded {
                 EncodedJson::Exhausted => EncodedJson::Exhausted,
-                EncodedJson::Decodable => EncodedJson::Decodable,
-                EncodedJson::Opaque if has_word(&key_words, TRANSPORT_KEY_WORDS) => {
-                    EncodedJson::Decodable
-                }
-                EncodedJson::Opaque => EncodedJson::Opaque,
+                _ if has_word(&key_words, TRANSPORT_KEY_WORDS) => EncodedJson::Decodable,
+                _ => EncodedJson::Opaque,
             };
             json_value_has_cred_key(child, child_encoded)
         }),
@@ -2722,17 +2725,37 @@ mod tests {
                 "{plain:?} is not a transport envelope and must not be unwrapped"
             );
         }
-        // The envelope flag propagates DOWN, so an encoded document nested
-        // inside a transport field's own structure is still reached.
+        // `Decodable` reaches an ARRAY of envelopes — a list of encoded
+        // documents in the slot is still the slot.
         assert_eq!(
             classify_risk(RiskSignal::Other {
                 tool_name: "call_api",
-                args_text: r#"{"body":{"raw":["{\"apiToken\":\"sk-1\"}"]}}"#
+                args_text: r#"{"payload":["{\"apiToken\":\"sk-1\"}"]}"#
             }),
             RiskLevel::NetworkOrCredential
         );
-        // And it does not leak UPWARD: a sibling of a transport field is not
-        // itself inside one.
+        // A transport key nested under a NEUTRAL one is still tested on its own,
+        // so the scoping is about the slot, not about depth.
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: r#"{"request":{"body":"{\"apiToken\":\"sk-1\"}"}}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+        // But it does NOT flow through a nested OBJECT — round-5 review's second
+        // P2, verbatim. Once inside an object the payload was already serialized
+        // structurally and its keys are read normally, so a string deeper in is
+        // that object's domain data; decoding it because an ANCESTOR was named
+        // `body` is the same false positive one level in.
+        assert_ne!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: r#"{"body":{"content":"{\"apiToken\":\"fixture\"}"}}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+        // Nor does it leak sideways: a sibling of a transport field is not one.
         assert_ne!(
             classify_risk(RiskSignal::Other {
                 tool_name: "call_api",
@@ -2750,12 +2773,13 @@ mod tests {
         // parsed AT MOST once and never re-entered, and the strings are
         // disjoint slices of the blob — so the total parse work stays O(blob).
         //
-        // The LAST shape carries a credential key and expects the top tier, so
-        // this test also fails if the unwrap silently stops running at scale.
-        // The benign shapes cannot do that job — verified by mutation: with the
-        // unwrap disabled they still pass, since `assert_ne!` on a payload with
-        // no credential key holds either way. They guard the other direction,
-        // that a big blob does not become a false positive.
+        // Every shape is PAIRED: a benign twin expecting `Unknown` and a twin
+        // with a credential key placed LAST expecting the top tier. The benign
+        // half alone cannot detect a decoder that silently stopped running —
+        // verified by mutation, it passes with decoding disabled, since
+        // `Unknown` on a payload with no credential key holds either way. So the
+        // benign half guards "a big blob does not become a false positive" and
+        // the credential half guards "this workload is actually still measured".
         //
         // Keys are DISTINCT (`k0`, `k1`, …) on purpose. `{"a":1,"a":1,…}` looks
         // like a big document but collapses to a single entry once parsed —
@@ -2775,19 +2799,32 @@ mod tests {
         let cred_inner = format!(r#"{{{pairs},"apiToken":"sk-1"}}"#);
         // ~20 000 SEPARATE string values, i.e. 20 000 distinct re-parses rather
         // than one big one — the other way this could go super-linear.
-        let many = format!(
-            "[{}]",
-            std::iter::repeat(r#""{\"k\":1}""#)
-                .take(20_000)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        //
+        // Under `body`, not at the root, and round-5 review's first P2 is why: a
+        // ROOT array is walked as `Opaque`, so after transport scoping none of
+        // these strings reached the parser and this shape silently stopped
+        // measuring the workload its own comment describes. `Decodable`
+        // propagates through arrays, so one transport key at the top puts every
+        // element on the decoding path.
+        let elements = std::iter::repeat(r#""{\"k\":1}""#)
+            .take(20_000)
+            .collect::<Vec<_>>()
+            .join(",");
+        let many = format!(r#"{{"body":[{elements}]}}"#);
+        // The same 20 000 with a credential key in the LAST element. Without
+        // this, moving the array off the decoding path would go UNDETECTED all
+        // over again — the benign shape is fast and `Unknown` whether or not a
+        // single string is ever decoded, which is exactly how the root-array
+        // version passed while measuring nothing. This one fails if the
+        // elements stop being reached, and still has to scan all of them.
+        let many_cred = format!(r#"{{"body":[{elements},"{{\"apiToken\":\"sk-1\"}}"]}}"#);
         let embed = |inner: &str| format!(r#"{{"body":"{}"}}"#, inner.replace('"', "\\\""));
         for (payload, expected) in [
             (embed(&valid_inner), RiskLevel::Unknown),
             (embed(&invalid_inner), RiskLevel::Unknown),
             (many, RiskLevel::Unknown),
             (embed(&cred_inner), RiskLevel::NetworkOrCredential),
+            (many_cred, RiskLevel::NetworkOrCredential),
         ] {
             let started = std::time::Instant::now();
             let risk = classify_risk(RiskSignal::Other {
