@@ -235,9 +235,19 @@ pub fn is_elicitation_request(method: &str) -> bool {
 /// commandExecution/fileChange/mcpToolCall …) become a running tool row on
 /// `item/started` and its result on `item/completed`; agent text streams via
 /// deltas; `thread/tokenUsage/updated` carries the current-context usage.
+///
+/// Every notification's `threadId` (issue #99) is read here and carried RAW into
+/// `ChatEvent::agent_thread` — the conversation/agent that produced this event,
+/// main narration and every collab sub-agent's own activity alike (app-server
+/// forwards a spawned sub-agent's events over this SAME connection, per-thread
+/// listener, tagged with ITS OWN thread id — see `read_loop`'s demux). This
+/// function does NOT know which thread is "ours": the engine (`codex_consumer`,
+/// which alone holds the session's own thread id) compares it and normalizes to
+/// "mainline" (None) vs "a specific sub-agent" (Some) before a row is ever built.
 pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> {
     use crate::lead_chat::proto::ChatEvent;
     let item = &params["item"];
+    let thread = params["threadId"].as_str().map(String::from);
     match method {
         "item/agentMessage/delta" => {
             params["delta"]
@@ -249,14 +259,17 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
                     // sub-agents + the main narration) each get their own row
                     // instead of char-interleaving into one shared bubble.
                     item: params["itemId"].as_str().map(String::from),
+                    agent_thread: thread,
                 })
         }
         "item/started" => match item["type"].as_str() {
             // Transient error items (e.g. codex's own reconnect banners) go to
-            // the anonymous slot — never merged into an agentMessage row.
+            // the anonymous slot — never merged into an agentMessage row, and
+            // never attributed to a sub-agent branch either.
             Some("error") => Some(ChatEvent::TextDelta {
                 text: crate::lead_chat::proto::error_text_from_item(item),
                 item: None,
+                agent_thread: None,
             }),
             // The tool-call item types (verified against the 0.139.0 ThreadItem
             // union): exec/edit/MCP plus subagent (collabAgentToolCall) and custom
@@ -269,6 +282,7 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
                 texts: vec![],
                 tools: vec![appserver_tool_call(item)],
                 uuid: None,
+                agent_thread: thread,
             }),
             _ => None,
         },
@@ -288,6 +302,7 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
             Some("agentMessage") => Some(ChatEvent::TextDone {
                 item: item["id"].as_str().map(String::from),
                 text: item["text"].as_str().map(String::from),
+                agent_thread: thread,
             }),
             // userMessage / reasoning carry no display payload; an error item's
             // text was already surfaced by its item/started.
@@ -299,6 +314,7 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
                     ChatEvent::TextDone {
                         item: item["id"].as_str().map(String::from),
                         text: Some(text),
+                        agent_thread: thread,
                     }
                 })
             }
@@ -313,7 +329,11 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
                     .or_else(|| params["error"].as_str())
                     .unwrap_or("Codex reported an error."),
             );
-            (!text.is_empty()).then(|| ChatEvent::TextDelta { text, item: None })
+            (!text.is_empty()).then(|| ChatEvent::TextDelta {
+                text,
+                item: None,
+                agent_thread: None,
+            })
         }
         "thread/tokenUsage/updated" => {
             let tu = &params["tokenUsage"];
@@ -354,15 +374,39 @@ fn appserver_tool_call(item: &Value) -> crate::lead_chat::proto::ToolCall {
         summary: appserver_tool_summary(item),
         output: None,
         is_error: false,
+        collab_threads: appserver_collab_threads(item),
     }
 }
 
+/// A `collabAgentToolCall` item's known sub-agent thread ids (issue #99):
+/// `receiverThreadIds` — "the newly spawned agent" for a spawn call, or the
+/// existing target agent for a send/wait call. Empty for a spawn's own
+/// `item/started` (the child doesn't exist yet) and for every non-collab item —
+/// `receiverThreadIds` simply isn't present on those, so the field reads empty
+/// rather than erroring. The frontend uses whichever row FIRST reveals a given
+/// thread id as that sub-agent's branch anchor (`src/session/collabBranches.ts`).
+fn appserver_collab_threads(item: &Value) -> Vec<String> {
+    item["receiverThreadIds"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
 /// Result of an app-server `item.completed` tool item, keyed by item id.
+///
+/// issue #99, timing note: a `spawnAgent` collab call's `receiverThreadIds` is
+/// EMPTY on its `item/started` (the child thread doesn't exist yet) and only
+/// becomes known on THIS event, `item/completed` — captured here via
+/// `appserver_collab_threads` for exactly that reason. A `sendInput`/`wait`
+/// call already knows its target at `item/started` (captured by
+/// `appserver_tool_call` instead), so this is a re-affirmation for those, not
+/// their only source.
 fn appserver_tool_result(item: &Value) -> crate::lead_chat::proto::ToolResultItem {
     crate::lead_chat::proto::ToolResultItem {
         id: item["id"].as_str().unwrap_or_default().to_string(),
         output: appserver_tool_output(item),
         is_error: appserver_tool_is_error(item),
+        collab_threads: appserver_collab_threads(item),
     }
 }
 
@@ -759,6 +803,11 @@ impl Client {
                                         crate::lead_chat::proto::ChatEvent::TextDelta {
                                             text,
                                             item: None,
+                                            // A sub-agent's OWN turn can fail too — tag
+                                            // it like any other event on this thread
+                                            // (issue #99) so the error lands in its
+                                            // branch, not as spurious mainline text.
+                                            agent_thread: tid.clone(),
                                         },
                                     ),
                                 )
@@ -1158,11 +1207,14 @@ mod tests {
             "item/agentMessage/delta",
             &json!({"threadId":"t","turnId":"u","itemId":"i","delta":"He"}),
         ) {
-            Some(ChatEvent::TextDelta { text, item }) => {
+            Some(ChatEvent::TextDelta { text, item, agent_thread }) => {
                 assert_eq!(text, "He");
                 // Deltas carry their item id: parallel streams (collab sub-agents)
                 // key their own rows instead of interleaving into one bubble.
                 assert_eq!(item.as_deref(), Some("i"));
+                // The envelope's threadId (issue #99) rides along RAW — the engine,
+                // not this mapper, decides mainline vs a sub-agent branch.
+                assert_eq!(agent_thread.as_deref(), Some("t"));
             }
             e => panic!("{e:?}"),
         }
@@ -1237,11 +1289,14 @@ mod tests {
             "item/started",
             &json!({"item":{"id":"i","type":"error","message":"unknown slash command"}}),
         ) {
-            Some(ChatEvent::TextDelta { text, item }) => {
+            Some(ChatEvent::TextDelta { text, item, agent_thread }) => {
                 assert_eq!(text, "unknown slash command");
                 // Error items go to the anonymous slot — never merged into an
-                // agentMessage row (codex's own reconnect banners arrive here).
+                // agentMessage row (codex's own reconnect banners arrive here) —
+                // and never attributed to a sub-agent branch either, even though
+                // this notification carries no threadId to attribute anyway.
                 assert_eq!(item, None);
+                assert_eq!(agent_thread, None);
             }
             e => panic!("{e:?}"),
         }
@@ -1290,9 +1345,11 @@ mod tests {
             "item/completed",
             &json!({"item":{"id":"i","type":"agentMessage","text":"done"}}),
         ) {
-            Some(ChatEvent::TextDone { item, text }) => {
+            Some(ChatEvent::TextDone { item, text, agent_thread }) => {
                 assert_eq!(item.as_deref(), Some("i"));
                 assert_eq!(text.as_deref(), Some("done"));
+                // No threadId on this notification → mainline.
+                assert_eq!(agent_thread, None);
             }
             e => panic!("{e:?}"),
         }
@@ -1316,12 +1373,43 @@ mod tests {
         };
         for (item, s) in [("a", "我先只读梳理"), ("b", "我会并行追踪"), ("a", " Cargo 结构")] {
             match d(item, s) {
-                Some(ChatEvent::TextDelta { text, item: got }) => {
+                Some(ChatEvent::TextDelta { text, item: got, agent_thread }) => {
                     assert_eq!(text, s);
                     assert_eq!(got.as_deref(), Some(item));
+                    // Same threadId ("t") on every delta here — a REAL parallel
+                    // pair (main narration vs a collab sub-agent) would differ,
+                    // which `collab_thread_delta_gets_its_own_agent_thread` below
+                    // covers explicitly.
+                    assert_eq!(agent_thread.as_deref(), Some("t"));
                 }
                 e => panic!("{e:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn collab_thread_delta_gets_its_own_agent_thread() {
+        // The falsifying case from PR #132's review: main narration and a collab
+        // sub-agent's own text differ ONLY by threadId, never by item id shape —
+        // agent_thread (not arrival order) is what the engine keys grouping on.
+        let main = notification_to_event(
+            "item/agentMessage/delta",
+            &json!({"threadId":"lead-1","turnId":"u","itemId":"m","delta":"main"}),
+        );
+        let sub = notification_to_event(
+            "item/agentMessage/delta",
+            &json!({"threadId":"sub-1","turnId":"u","itemId":"s","delta":"sub"}),
+        );
+        match (main, sub) {
+            (
+                Some(ChatEvent::TextDelta { agent_thread: a, .. }),
+                Some(ChatEvent::TextDelta { agent_thread: b, .. }),
+            ) => {
+                assert_eq!(a.as_deref(), Some("lead-1"));
+                assert_eq!(b.as_deref(), Some("sub-1"));
+                assert_ne!(a, b);
+            }
+            e => panic!("{e:?}"),
         }
     }
 
@@ -1363,9 +1451,10 @@ mod tests {
             "item/completed",
             &json!({"item":{"id":"p","type":"plan","text":"1. x","status":"completed"}}),
         ) {
-            Some(ChatEvent::TextDone { item, text }) => {
+            Some(ChatEvent::TextDone { item, text, agent_thread }) => {
                 assert_eq!(item.as_deref(), Some("p"));
                 assert_eq!(text.as_deref(), Some("1. x"));
+                assert_eq!(agent_thread, None);
             }
             e => panic!("{e:?}"),
         }
@@ -1382,13 +1471,15 @@ mod tests {
         // A turn-level failure (auth / usage-limit / context-window) arrives as a
         // bare `error` notification — surface it so the turn doesn't end blank.
         match notification_to_event("error", &json!({"message":"usage limit reached"})) {
-            Some(ChatEvent::TextDelta { text, item: None }) => {
+            Some(ChatEvent::TextDelta { text, item: None, agent_thread: None }) => {
                 assert_eq!(text, "usage limit reached")
             }
             e => panic!("{e:?}"),
         }
         match notification_to_event("error", &json!({"error":{"message":"nested"}})) {
-            Some(ChatEvent::TextDelta { text, item: None }) => assert_eq!(text, "nested"),
+            Some(ChatEvent::TextDelta { text, item: None, agent_thread: None }) => {
+                assert_eq!(text, "nested")
+            }
             e => panic!("{e:?}"),
         }
         // An empty error message yields nothing (turn/completed still flags error).
@@ -1438,6 +1529,75 @@ mod tests {
             &json!({"item":{"id":"c","type":"reasoning","status":"inProgress"}}),
         )
         .is_none());
+    }
+
+    #[test]
+    fn collab_tool_call_carries_receiver_thread_ids() {
+        // issue #99: `receiverThreadIds` is the minimal backend signal the
+        // frontend groups on — verified against the real `CollabAgentToolCall`
+        // ThreadItem shape (codex-rs app-server-protocol/src/protocol/v2/item.rs).
+        // A spawn's item/started has no receiver yet (the child doesn't exist).
+        match notification_to_event(
+            "item/started",
+            &json!({"item":{
+                "id":"call_1","type":"collabAgentToolCall","tool":"spawnAgent",
+                "status":"inProgress","senderThreadId":"lead-1","receiverThreadIds":[],
+                "agentsStates":{},
+            }}),
+        ) {
+            Some(ChatEvent::Assistant { tools, .. }) => {
+                assert_eq!(tools[0].name, "collabAgentToolCall");
+                assert_eq!(tools[0].collab_threads, Vec::<String>::new());
+            }
+            e => panic!("{e:?}"),
+        }
+        // The spawn's item/completed reveals the newly spawned agent's thread
+        // id — THIS is the only place a spawn call's collab_threads is ever
+        // non-empty (its item/started, above, had none): ToolResults, unlike
+        // Assistant, must carry it too, or the frontend could never anchor
+        // that thread's branch for the by-far most common collab pattern
+        // (spawn once, then `wait`). engine.rs's `merge_tool_results` merges
+        // this into the row alongside output/is_error (mutates the ORIGINAL
+        // Assistant-inserted content in place, never rebuilds it).
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{
+                "id":"call_1","type":"collabAgentToolCall","tool":"spawnAgent",
+                "status":"completed","senderThreadId":"lead-1",
+                "receiverThreadIds":["sub-1"],"agentsStates":{},
+            }}),
+        ) {
+            Some(ChatEvent::ToolResults { items }) => {
+                assert_eq!(items[0].collab_threads, vec!["sub-1"]);
+            }
+            e => panic!("{e:?}"),
+        }
+        // A send/wait call already knows its target — receiverThreadIds populated
+        // immediately at item/started, unlike spawn.
+        match notification_to_event(
+            "item/started",
+            &json!({"item":{
+                "id":"call_2","type":"collabAgentToolCall","tool":"wait",
+                "status":"inProgress","senderThreadId":"lead-1",
+                "receiverThreadIds":["sub-1","sub-2"],"agentsStates":{},
+            }}),
+        ) {
+            Some(ChatEvent::Assistant { tools, .. }) => {
+                assert_eq!(tools[0].collab_threads, vec!["sub-1", "sub-2"]);
+            }
+            e => panic!("{e:?}"),
+        }
+        // A non-collab tool never carries collab_threads even if the field name
+        // were somehow present — only collabAgentToolCall's shape has it.
+        match notification_to_event(
+            "item/started",
+            &json!({"item":{"id":"c","type":"commandExecution","command":"echo hi"}}),
+        ) {
+            Some(ChatEvent::Assistant { tools, .. }) => {
+                assert!(tools[0].collab_threads.is_empty());
+            }
+            e => panic!("{e:?}"),
+        }
     }
 
     #[test]

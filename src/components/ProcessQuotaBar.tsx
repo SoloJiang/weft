@@ -81,7 +81,7 @@ export function ProcessQuotaBar({ inSettings = false }: { inSettings?: boolean }
             {!inSettings && (
               <button
                 type="button"
-                onClick={openSettings}
+                onClick={() => openSettings("resources")}
                 className="shrink-0 rounded-[var(--radius-sm)] px-2 py-0.5 font-medium text-ink transition-colors hover:bg-bg/60"
               >
                 {t("processQuota.openDetails")}

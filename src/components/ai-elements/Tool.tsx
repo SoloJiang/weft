@@ -1,4 +1,4 @@
-import { useState, type ComponentType } from "react";
+import { useState, type ComponentType, type ReactNode } from "react";
 import { ChevronRight, type LucideProps } from "lucide-react";
 import { cn } from "../../lib/cn";
 import { FilePathRef } from "../FilePathRef";
@@ -23,6 +23,7 @@ export function Tool({
   outputLabel,
   showMoreLabel,
   showLessLabel,
+  children,
 }: {
   readonly icon: ToolIcon;
   readonly label: string;
@@ -39,9 +40,18 @@ export function Tool({
   readonly outputLabel: string;
   readonly showMoreLabel: (hiddenLineCount: number) => string;
   readonly showLessLabel: string;
+  /** Extra detail shown alongside input/output once expanded — a sub-agent
+   *  branch's own nested transcript (weft issue #99). Folds into the SAME
+   *  expand/collapse toggle as input/output rather than a second one. The
+   *  caller is responsible for keeping this bounded (see `CollabBranchRow` in
+   *  ChatTimeline.tsx, which wraps it exactly like `ToolBlock` below bounds
+   *  input/output: `max-h-80 overflow-auto`) — a long sub-agent transcript
+   *  must scroll inside its own box, not grow the page (review [P2]). */
+  readonly children?: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
-  const hasDetail = (input && input.length > 0) || (output && output.length > 0);
+  const hasDetail =
+    (input && input.length > 0) || (output && output.length > 0) || children != null;
   const hasInteractiveTarget = Boolean(targetToken);
   const disabled = !hasDetail;
 
@@ -110,6 +120,7 @@ export function Tool({
               showLessLabel={showLessLabel}
             />
           )}
+          {children}
         </div>
       )}
     </div>

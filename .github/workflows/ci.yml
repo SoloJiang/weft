@@ -45,6 +45,12 @@ jobs:
       - name: Type-check and build frontend
         run: pnpm build
 
+      # The frontend unit tests (tests/frontend/*.test.ts) existed for a long
+      # time without a gate, so a regression they cover could land green. Run
+      # them here — node's own runner, no extra dependency.
+      - name: Frontend unit tests
+        run: pnpm test
+
   rust-test:
     strategy:
       fail-fast: false

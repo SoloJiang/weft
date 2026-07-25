@@ -24,6 +24,7 @@ import type {
   RepoGraph,
   RepoRef,
   ResolvedProposal,
+  ResourceDashboardSnapshot,
   RewindMode,
   RewindOutcome,
   SessionInfo,
@@ -307,6 +308,11 @@ export const api = {
   setGuardrails: (idleSecs: number, wallSecs: number) =>
     invoke<void>("set_guardrails", { idleSecs, wallSecs }),
   processQuotaStatus: () => invoke<ProcessQuotaStatus>("process_quota_status"),
+  // Local-runtime resource dashboard (issue #112): read-only aggregate of
+  // process_quota / proc_registry / session_gate. Polled while the Settings →
+  // Resources page is open; no new sampling happens on the backend for this.
+  resourceDashboardSnapshot: () =>
+    invoke<ResourceDashboardSnapshot>("resource_dashboard_snapshot"),
   // Effective config (skills + rules) for a repo, tagged by layer + override.
   effectiveConfig: (repoPath: string, wsId?: number) =>
     invoke<ConfigItem[]>("effective_config", { repoPath, wsId }),

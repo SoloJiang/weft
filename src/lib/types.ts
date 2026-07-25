@@ -21,6 +21,28 @@ export interface ProcessQuotaStatus {
   transitionSeq: number;
 }
 
+/** One owner category's directly-managed child-process count (`proc_registry`'s
+ *  `OwnerKind`, e.g. "session" | "lead_thread" | "curator" | ...). Only non-zero
+ *  categories are included; `kind` is the Rust enum's snake_case tag as-is. */
+export interface ResourceOwnerCount {
+  kind: string;
+  count: number;
+}
+
+/** Read-only local-runtime dashboard snapshot (issue #112). Combines the three
+ *  process-tree safety-net axes — no sampling happens here, this only aggregates
+ *  what `process_quota` / `proc_registry` / `session_gate` already track. */
+export interface ResourceDashboardSnapshot {
+  quota: ProcessQuotaStatus;
+  instanceProcessCount: number;
+  /** Owned-subtree RSS total, bytes. `null` on a platform without the sampler
+   *  (non-macOS/Linux) — render as "unavailable", never as 0. */
+  instanceMemoryBytes: number | null;
+  byOwner: ResourceOwnerCount[];
+  activeSessions: number;
+  maxSessions: number;
+}
+
 export interface Workspace {
   id: number;
   name: string;
@@ -633,6 +655,15 @@ export interface ThreadOverview {
   write_repos: { id: number; name: string }[];
 }
 
+/** A permission ask's danger tier for one-glance triage in an authorization
+ * storm (issue #101). Computed ONCE, server-side, by `classify_risk`
+ * (`src-tauri/src/ask.rs`) — the single place this judgment is made; the
+ * frontend only maps this value to a color/label (`RISK_STYLE` in
+ * `ConfirmationCard.tsx`), it never re-derives the verdict. `unknown` is the
+ * HONEST fallback when the classifier can't tell — never a stand-in for
+ * "probably safe". */
+export type RiskLevel = "read_only" | "write" | "network_or_credential" | "unknown";
+
 /** A tool's permission request, blocked on the human (the Ask Bridge §4.3). */
 export interface PermissionAsk {
   id: number;
@@ -641,6 +672,8 @@ export interface PermissionAsk {
   tool: string;
   summary: string;
   detail: string;
+  /** see `RiskLevel` — issue #101. */
+  risk: RiskLevel;
   ts: number;
   /** owning thread title + asking task name, for context on the card. */
   thread_title: string;
