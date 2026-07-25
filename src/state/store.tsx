@@ -39,6 +39,7 @@ import type {
   ProcessQuotaStatus,
   Proposal,
   QueuedItem,
+  ReadOnlyGrants,
   RepoChecks,
   RepoEdge,
   RepoProfile,
@@ -304,6 +305,19 @@ interface Store {
     dir: string | null,
     actionKey: string | null,
   ) => Promise<void>;
+  /** Read-only auto-allow scopes (issue #103) — in-memory only, NEVER persisted
+   *  across a restart (contrast `authGrants`): the session-scoped "release all
+   *  read-only" batch grants and the issue-wide dispatch-approval propagation. */
+  readOnlyGrants: ReadOnlyGrants;
+  /** "Release all read-only for this session" (issue #103's core batch
+   *  action): resolves the open ReadOnly-tier backlog in (thread, dir) to
+   *  Allow and trusts the rest of the session going forward. A Write/
+   *  NetworkOrCredential/Unknown ask in the same session is untouched. */
+  releaseSessionReadOnly: (thread: number, dir: string) => Promise<void>;
+  /** Revoke a read-only grant. dir=null revokes the whole issue's propagation
+   *  (set at dispatch-approval time); dir set revokes just that one session's
+   *  batch grant. */
+  revokeReadOnlyGrant: (thread: number, dir: string | null) => Promise<void>;
   /** Lead-proposed write declarations awaiting human approve/deny. */
   writeTriggers: WriteTrigger[];
   approveWriteTrigger: (item: WriteTrigger, tool?: string) => Promise<void>;
@@ -570,6 +584,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [authGrants, setAuthGrants] = useState<GrantSnapshot>({
     full: [],
     always: [],
+  });
+  const [readOnlyGrants, setReadOnlyGrants] = useState<ReadOnlyGrants>({
+    issue: [],
+    session: [],
   });
   const [writeTriggers, setWriteTriggers] = useState<WriteTrigger[]>([]);
   const [needsByWorkspace, setNeedsByWorkspace] = useState<Record<number, number>>({});
@@ -2127,6 +2145,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       console.error(e);
     }
+    // Read-only auto-allow scopes (issue #103) — in-memory only, so this poll
+    // (plus the explicit refreshes after confirmProposal/approveWriteTrigger/
+    // releaseSessionReadOnly/revokeReadOnlyGrant below) is the only way the
+    // frontend's copy stays honest; the backend's own gate never depends on it.
+    try {
+      setReadOnlyGrants(await api.readOnlyGrants());
+    } catch (e) {
+      console.error(e);
+    }
     if (activeWorkspaceId == null) {
       setNeeds([]);
       setWriteTriggers([]);
@@ -2392,6 +2419,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setProposal(null);
     setReviewingProposal(false);
     await loadThreadChildren(activeThreadId);
+    // Approving dispatch just propagated issue #103's read-only auto-allow to
+    // the whole issue backend-side (confirm_proposal); refresh so the "read-only
+    // trusted" indicator appears without waiting for the next poll. Best-effort
+    // — the backend's own gate never depends on this frontend copy being fresh.
+    try {
+      setReadOnlyGrants(await api.readOnlyGrants());
+    } catch (e) {
+      console.error(e);
+    }
     // Automation-first: dispatch every new task's worker immediately.
     for (const id of ids) void dispatchDirection(id);
   }, [activeThreadId, loadThreadChildren, dispatchDirection, refreshProposal]);
@@ -2623,6 +2659,48 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     },
     [],
   );
+
+  // "Release all read-only for this session" (issue #103's core batch action).
+  // Optimistic: drop this session's open read_only asks locally (mirrors
+  // answerPermission), then reconcile with backend truth — the SAME pattern as
+  // revokeAuthGrant above, because the backend, not this optimistic guess, is
+  // the actual gate: a Write/NetworkOrCredential/Unknown ask in this session is
+  // never touched here or there.
+  const releaseSessionReadOnly = useCallback(async (thread: number, dir: string) => {
+    setAsks((cur) => cur.filter((a) => !(a.thread === thread && a.dir === dir && a.risk === "read_only")));
+    try {
+      const n = await api.releaseSessionReadOnly(thread, dir);
+      if (n > 0) toast(i18n.t("grants.readOnlyReleased", { count: n }));
+    } catch (e) {
+      console.error(e);
+    }
+    try {
+      setReadOnlyGrants(await api.readOnlyGrants());
+      setAsks(await api.pendingAsks());
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
+
+  const revokeReadOnlyGrant = useCallback(async (thread: number, dir: string | null) => {
+    // optimistic: drop the matching scope locally so the indicator clears at once
+    setReadOnlyGrants((cur) => ({
+      issue: dir === null ? cur.issue.filter((t) => t !== thread) : cur.issue,
+      session: cur.session.filter((g) => !(g.thread === thread && (dir === null || g.dir === dir))),
+    }));
+    try {
+      await api.revokeReadOnlyGrant(thread, dir);
+    } catch (e) {
+      console.error(e);
+    }
+    // reconcile with backend truth (in-memory only, but still: a concurrent
+    // grant/revoke from another view must win over this optimistic guess)
+    try {
+      setReadOnlyGrants(await api.readOnlyGrants());
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
 
   // Single entry for "jump to the worker this reference is about" — reused by
   // every surface that shows a bus-delivered (thread, dir) pair (Needs-you
@@ -2901,6 +2979,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     asks,
     authGrants,
     revokeAuthGrant,
+    readOnlyGrants,
+    releaseSessionReadOnly,
+    revokeReadOnlyGrant,
     writeTriggers,
     approveWriteTrigger,
     denyWriteTrigger,
