@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { LeadMessage } from "../../src/lib/types.ts";
-import { applyLeadFinalize, mergeLeadSnapshot } from "../../src/state/leadSnapshot.ts";
+import { applyLeadFinalize, mergeLeadSnapshot, withText } from "../../src/state/leadSnapshot.ts";
 
 function row(
   id: number,
@@ -109,4 +109,32 @@ test("non-text content falls back to the snapshot row", () => {
   const localTool = { ...row(3, "", "streaming", "tool"), content: '{"name":"grep"}' };
   const snapTool = { ...row(3, "", "streaming", "tool"), content: '{"name":"grep","out":"x"}' };
   assert.equal(mergeLeadSnapshot([localTool], [snapTool])[0], snapTool);
+});
+
+// ---- withText (issue #99: content rewrites must preserve agentThread) ----
+//
+// The backend stamps a sub-agent's origin into a text row's content ONCE, at
+// creation (engine.rs's text_row_content), and re-embeds it into every LATER
+// rewrite it makes itself. Every LIVE content rewrite the FRONTEND makes to
+// the same row — a coalesced delta, this finalize — must do the same or the
+// tag silently vanishes from the live view on the very next rewrite while a
+// cold reload (which re-fetches the row verbatim) still shows it: exactly the
+// live/cold disagreement this feature's design rules out.
+
+test("withText preserves an existing agentThread while replacing the text", () => {
+  const existing = JSON.stringify({ text: "old", agentThread: "sub-1" });
+  const next = withText(existing, "new");
+  assert.deepEqual(JSON.parse(next), { text: "new", agentThread: "sub-1" });
+});
+
+test("withText on a bare/fresh row still just sets text", () => {
+  assert.deepEqual(JSON.parse(withText("", "hi")), { text: "hi" });
+  assert.deepEqual(JSON.parse(withText("not json", "hi")), { text: "hi" });
+});
+
+test("applyLeadFinalize's content override preserves agentThread (not just status)", () => {
+  const branched = row(1, "old", "streaming");
+  branched.content = JSON.stringify({ text: "old", agentThread: "sub-1" });
+  const finalized = applyLeadFinalize([branched], 1, "complete", "cleaned");
+  assert.deepEqual(JSON.parse(finalized[0].content), { text: "cleaned", agentThread: "sub-1" });
 });

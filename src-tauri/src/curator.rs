@@ -2547,8 +2547,17 @@ mod tests {
     fn turn_collector_decides_outcome_and_streams() {
         use crate::lead_chat::proto::ChatEvent;
         let te = |is_error| ChatEvent::TurnEnd { is_error, context_tokens: None };
-        let delta = |s: &str| ChatEvent::TextDelta { text: s.to_string(), item: None };
-        let asst = |s: &str| ChatEvent::Assistant { texts: vec![s.to_string()], tools: vec![], uuid: None };
+        let delta = |s: &str| ChatEvent::TextDelta {
+            text: s.to_string(),
+            item: None,
+            agent_thread: None,
+        };
+        let asst = |s: &str| ChatEvent::Assistant {
+            texts: vec![s.to_string()],
+            tools: vec![],
+            uuid: None,
+            agent_thread: None,
+        };
         let mut noop = |_: super::AnalysisEvent| {};
 
         // Clean app-server turn: deltas then a non-error TurnEnd → Ok with the text.

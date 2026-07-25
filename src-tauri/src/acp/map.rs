@@ -62,6 +62,7 @@ fn text_delta(update: &Value) -> UpdateOut {
     UpdateOut::Chat(ChatEvent::TextDelta {
         text: text.to_string(),
         item: None,
+        agent_thread: None,
     })
 }
 
@@ -116,8 +117,10 @@ fn tool_call_start(update: &Value) -> UpdateOut {
             summary,
             output: None,
             is_error: false,
+            collab_threads: Vec::new(),
         }],
         uuid: None,
+        agent_thread: None,
     })
 }
 
@@ -164,6 +167,7 @@ fn tool_call_update(update: &Value) -> UpdateOut {
             id,
             output,
             is_error,
+            collab_threads: Vec::new(),
         }],
     })
 }
@@ -305,7 +309,7 @@ mod tests {
             "content": { "type": "text", "text": "pong" }
         });
         match update_to_out(&u) {
-            UpdateOut::Chat(ChatEvent::TextDelta { text, item: None }) => {
+            UpdateOut::Chat(ChatEvent::TextDelta { text, item: None, .. }) => {
                 assert_eq!(text, "pong");
             }
             o => panic!("{o:?}"),

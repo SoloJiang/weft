@@ -11,6 +11,7 @@ import {
   Radio,
   Search,
   SquareTerminal,
+  Users,
   Wrench,
 } from "lucide-react";
 import { isPathLike } from "../lib/filePathParsing.ts";
@@ -21,7 +22,7 @@ const MANIFEST_FILE_TARGET_RE =
   /(?:^|[\s"'`])((?:~[\\/]|(?:[A-Za-z]:[\\/])?)[^\s"'`,;!?，。；！？、]*(?:Dockerfile|Makefile|\.gitignore|\.env(?:\.[\w.-]+)?))(?:$|[\s"'`),.;:!?，。；！？、])/;
 const PATH_SEP_TARGET_RE =
   /(?:^|[\s"'`])((?:~[\\/]|(?:[A-Za-z]:[\\/])?)[^\s"'`,;!?，。；！？、]+[\\/][^\s"'`,;!?，。；！？、]+)(?:$|[\s"'`),.;:!?，。；！？、])/;
-type ToolKind = "command" | "edit" | "search" | "read" | "sync" | "todo" | "thinking" | "generic";
+type ToolKind = "command" | "edit" | "search" | "read" | "sync" | "todo" | "thinking" | "collab" | "generic";
 
 /** Map a (cleaned) tool name to a glyph so the pills are scannable. */
 export function toolIcon(name: string): ComponentType<LucideProps> {
@@ -33,6 +34,7 @@ export function toolIcon(name: string): ComponentType<LucideProps> {
     sync: Radio,
     todo: ListTodo,
     thinking: Brain,
+    collab: Users,
     generic: Wrench,
   };
   return icons[toolKind(name)];
@@ -55,6 +57,7 @@ export function toolLabelKey(name: string) {
     sync: "session.toolSyncing",
     todo: "session.toolOrganizing",
     thinking: "session.toolThinking",
+    collab: "session.toolDelegating",
     generic: "session.toolCalling",
   };
   return labels[toolKind(name)];
@@ -71,6 +74,7 @@ export function toolDoneLabelKey(name: string) {
     sync: "session.toolSynced",
     todo: "session.toolOrganized",
     thinking: "session.toolThought",
+    collab: "session.toolDelegated",
     generic: "session.toolCalled",
   };
   return labels[toolKind(name)];
@@ -199,5 +203,6 @@ function toolKind(name: string): ToolKind {
     return "sync";
   }
   if (has("todo")) return "todo";
+  if (has("collab")) return "collab";
   return "generic";
 }

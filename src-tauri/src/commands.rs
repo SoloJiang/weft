@@ -1653,6 +1653,15 @@ pub fn set_keep_awake(power: tauri::State<'_, crate::power::PowerGuard>, on: boo
     Ok(())
 }
 
+/// Production default for the runaway-guard idle-kill cap: 30 min (1800s).
+/// Named (not an inline literal) so `lead_chat::engine`'s turn-freeze
+/// auto-recovery threshold — a DIFFERENT, faster-firing mechanism (issue #93)
+/// that must always fire well before this cap does, or it's silently
+/// shadowed/made dead code by this one — can cross-module sentinel-test
+/// against it (see `lead_chat::engine`'s
+/// `turn_freeze_threshold_stays_under_idle_watchdog_default` test). §7 跑飞护栏.
+pub(crate) const IDLE_WATCHDOG_DEFAULT_SECS: u64 = 1800;
+
 /// Runaway-guardrail caps (§7 跑飞护栏), enforced per busy turn by the chat
 /// engine's watchdog (lead_chat::engine::spawn_watchdog). Configurable at
 /// runtime from Settings; seeded from the WEFT_* env defaults so an env
@@ -1665,8 +1674,8 @@ impl Default for GuardrailState {
     fn default() -> Self {
         Self {
             inner: std::sync::Mutex::new((
-                env_secs("WEFT_IDLE_WATCHDOG_SECS", 1800), // 30 min
-                env_secs("WEFT_WALL_CAP_SECS", 7200),      // 2 h
+                env_secs("WEFT_IDLE_WATCHDOG_SECS", IDLE_WATCHDOG_DEFAULT_SECS),
+                env_secs("WEFT_WALL_CAP_SECS", 7200), // 2 h
             )),
         }
     }
@@ -2792,17 +2801,34 @@ mod tests {
         .unwrap();
         let asks = crate::ask::AskRegistry::new();
         let (remove_id, remove_rx) =
-            asks.request(thread.id, "", "claude", "Run: rm", "rm -rf tmp", "rm -rf tmp");
+            asks.request(
+                thread.id,
+                "",
+                "claude",
+                "Run: rm",
+                "rm -rf tmp",
+                crate::ask::RiskLevel::Unknown,
+                "rm -rf tmp",
+            );
         let (repo_scoped_id, repo_scoped_rx) = asks.request(
             keep_thread.id,
             &keep_direction.id.to_string(),
             "claude",
             "Run: clean",
             "rm -rf tmp",
+            crate::ask::RiskLevel::Unknown,
             "rm -rf tmp",
         );
         let (keep_id, _keep_rx) =
-            asks.request(keep_thread.id, "20", "claude", "Run: test", "pnpm test", "pnpm test");
+            asks.request(
+                keep_thread.id,
+                "20",
+                "claude",
+                "Run: test",
+                "pnpm test",
+                crate::ask::RiskLevel::Unknown,
+                "pnpm test",
+            );
 
         cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
 
@@ -2960,9 +2986,25 @@ mod tests {
         });
         // open asks for the two directions the repo delete removes
         let (ask_a, _r1) =
-            asks.request(thread.id, &dir_a.id.to_string(), "codex", "Run: x", "x", "x");
+            asks.request(
+                thread.id,
+                &dir_a.id.to_string(),
+                "codex",
+                "Run: x",
+                "x",
+                crate::ask::RiskLevel::Unknown,
+                "x",
+            );
         let (ask_routed, _r2) =
-            asks.request(thread.id, &dir_routed.id.to_string(), "codex", "Run: y", "y", "y");
+            asks.request(
+                thread.id,
+                &dir_routed.id.to_string(),
+                "codex",
+                "Run: y",
+                "y",
+                crate::ask::RiskLevel::Unknown,
+                "y",
+            );
 
         purge_repo_ask_footprint(&db, &asks, repo_a.id)
             .await

@@ -746,6 +746,11 @@ fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
                 if SKIP_DIR_NAMES.iter().any(|s| name.eq_ignore_ascii_case(s)) {
                     continue;
                 }
+                // Cap enqueues, not only visits — a wide fan-out can otherwise
+                // grow `stack` without bound before dirs_visited hits MAX_DIRS.
+                if dirs_visited + stack.len() >= MAX_DIRS {
+                    continue;
+                }
                 stack.push((p, depth + 1));
             } else {
                 files_scanned += 1;
@@ -1344,4 +1349,26 @@ mod tests {
         assert!(hits.len() <= 32, "capped at MAX_HITS, got {}", hits.len());
         assert!(!hits.is_empty());
     }
+
+    #[test]
+    fn walkdir_jsonl_caps_wide_directory_fanout() {
+        use std::fs;
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path();
+        // One level with many child dirs (few files) — must not grow stack unbounded.
+        for i in 0..2_000 {
+            let d = root.join(format!("d{i}"));
+            fs::create_dir(&d).expect("mkdir");
+            // one non-matching file per dir so we exercise file branch too
+            fs::write(d.join("x.txt"), b"x").expect("file");
+        }
+        // A single hit buried late should still be findable within caps, but
+        // the walk must terminate quickly and never enqueue > MAX_DIRS pending.
+        fs::write(root.join("sess-wide.jsonl"), b"{}\n").expect("hit");
+        let hits = walkdir_jsonl(root, "sess-wide").expect("walk");
+        // Cap may stop before discovering the hit if fan-out exhausts MAX_DIRS;
+        // the invariant under test is termination + no panic/OOM, and hits ≤ MAX_HITS.
+        assert!(hits.len() <= 32, "hits capped");
+    }
+
 }

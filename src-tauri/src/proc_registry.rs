@@ -35,6 +35,7 @@
 //! 逼近 ulimit 时连 `ps`/`kill` 都要 fork 会失败,故枚举与杀进程一律走 syscall
 //! (`libc::killpg`、Linux `/proc`、macOS `proc_pidinfo`),绝不 shell 外化。
 
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -58,40 +59,75 @@ pub fn instance_id() -> &'static str {
     ID.get_or_init(|| std::process::id().to_string()).as_str()
 }
 
-/// 逻辑属主 = 谁要的这个子进程,便于按属主整树收尸。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OwnerKind {
-    /// 全局(app-scoped)codex app-server。
-    GlobalAppServer,
-    /// 某个 worker 会话。
-    Session,
-    /// 某个 lead thread 会话。
-    LeadThread,
-    /// 仓库图谱扫描(每仓库/关系一发,短命)。
-    Curator,
-    /// opencode server。
-    Opencode,
-    /// rewind 预览静态服务。
-    Preview,
-    /// 探测(版本/能力,短命)。
-    Probe,
-    /// 其它 / 测试。
-    Other,
+/// Defines [`OwnerKind`] and every method whose correctness depends on
+/// covering all variants, from ONE list of `variant => "label"` lines — so a
+/// variant cannot be *defined* without also being *wired into* [`OwnerKind::all`].
+///
+/// This replaces the previous `next()`-linked-list approach after round-2
+/// review found it didn't actually deliver that guarantee: `next()`'s
+/// exhaustive `match` only forces every variant to have *some* arm, never
+/// that the arm's value keeps it reachable from `all()`'s traversal. A new
+/// variant given an arm like `NewKind => None` satisfies the compiler,
+/// compiles clean, and leaves the old hard-coded-8-item regression test
+/// green — while `all()` / `instance_owner_counts` / the dashboard's
+/// "process tree" breakdown silently drop the new variant. That's the exact
+/// "array literal missing an item" failure round-1 set out to close, just
+/// one indirection removed. (This also corrects an overclaim in that
+/// revision's comments and commit message, which read the exhaustive
+/// `match` as forcing the variant to be "wired into the traversal chain" —
+/// it only forces *an* arm to exist, never that the arm is correct or
+/// reachable. "Compiles" was never the same guarantee as "wired in".)
+///
+/// Generating `all()` as a plain `vec![...]` straight from this list — not a
+/// `while let` walk over a hand-linked chain — also closes the round-2
+/// finding that an accidentally-cyclic chain would hang `all()` forever:
+/// there is no traversal left to loop, so there is nothing to protect with
+/// an iteration cap. `all()` backs the resource dashboard's 3s poll, so a
+/// silent hang here would have been a real incident, not a red test.
+macro_rules! owner_kinds {
+    ($($(#[$doc:meta])* $variant:ident => $label:literal),+ $(,)?) => {
+        /// 逻辑属主 = 谁要的这个子进程,便于按属主整树收尸。
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum OwnerKind {
+            $($(#[$doc])* $variant,)+
+        }
+
+        impl OwnerKind {
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(OwnerKind::$variant => $label,)+
+                }
+            }
+
+            /// 全部变体,声明顺序,供 [`instance_owner_counts`] 遍历。直接由
+            /// `owner_kinds!` 宏调用(见下方)的 token 列表展开成 `vec![...]`——不是
+            /// 遍历一条手工维护的链,也不是另一份手写数组字面量。一个变体能不能被
+            /// 定义出来,和它会不会出现在这里是**同一件事**(同一次宏展开):不存在
+            /// 「变体已定义、但没接进遍历」的中间状态,也没有链式结构可供死循环。
+            fn all() -> Vec<OwnerKind> {
+                vec![$(OwnerKind::$variant,)+]
+            }
+        }
+    };
 }
 
-impl OwnerKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            OwnerKind::GlobalAppServer => "global_app_server",
-            OwnerKind::Session => "session",
-            OwnerKind::LeadThread => "lead_thread",
-            OwnerKind::Curator => "curator",
-            OwnerKind::Opencode => "opencode",
-            OwnerKind::Preview => "preview",
-            OwnerKind::Probe => "probe",
-            OwnerKind::Other => "other",
-        }
-    }
+owner_kinds! {
+    /// 全局(app-scoped)codex app-server。
+    GlobalAppServer => "global_app_server",
+    /// 某个 worker 会话。
+    Session => "session",
+    /// 某个 lead thread 会话。
+    LeadThread => "lead_thread",
+    /// 仓库图谱扫描(每仓库/关系一发,短命)。
+    Curator => "curator",
+    /// opencode server。
+    Opencode => "opencode",
+    /// rewind 预览静态服务。
+    Preview => "preview",
+    /// 探测(版本/能力,短命)。
+    Probe => "probe",
+    /// 其它 / 测试。
+    Other => "other",
 }
 
 /// 一个受管子进程的属主标识 `{kind, id}`。`id` 通常是 session/thread id;无自然 id 的
@@ -439,6 +475,102 @@ pub fn instance_group_ids() -> Vec<i32> {
     groups.into_iter().collect()
 }
 
+// ── UI 归因(issue #112 资源仪表盘,只读)──────────────────────────────────────
+//
+// 下面几个函数只**读**既有登记表 / `instance_pids()`,不改动上面的口径、reap 或
+// admission 逻辑;供只读资源面板展示「进程树从哪儿来」与「大概占多少内存」。
+
+/// 一个 owner 分类的直接子进程计数,供仪表盘的「进程树」展示。数的是**登记表里
+/// 的直接子进程**(session/lead_thread/curator/... 各开了几个受管进程),不含它们
+/// 的后代——后代总量由 [`count_instance_processes`] 单独给出,两者在 UI 上并列
+/// 展示(「共 N 个进程,来自 M 个会话 + ...」),不是同一层级、不重复计数。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerCount {
+    pub kind: &'static str,
+    pub count: u64,
+}
+
+/// 按 owner kind 分组统计登记表(见 [`OwnerCount`])。只保留非零分类,顺序固定为
+/// [`OwnerKind::all`] 的声明顺序(不是 hash 顺序,也不是手写数组),让前端每次渲染
+/// 的分类顺序不跳动,且新增 `OwnerKind` 变体时不会静默漏出这份分组。
+pub fn instance_owner_counts() -> Vec<OwnerCount> {
+    let regs = registered();
+    OwnerKind::all()
+        .into_iter()
+        .filter_map(|kind| {
+            let count = regs.iter().filter(|r| r.owner.kind == kind).count() as u64;
+            (count > 0).then_some(OwnerCount { kind: kind.as_str(), count })
+        })
+        .collect()
+}
+
+/// 本实例 owned 子树(见 [`instance_pids`])**加上 Weft 自身**的常驻内存(RSS)合计,
+/// 单位字节。逐 pid 走 fork-free 的平台 syscall(macOS `proc_pidinfo` / Linux
+/// `/proc/<pid>/status`),单个 pid 读失败(已退出等)按 0 计入合计,不让整体求和因
+/// 单点失败而报废——与 `count_instance_processes` 同样的「尽力而为」哲学。`None` 仅
+/// 在平台没有 fork-free 枚举时出现(与 [`instance_pids`] 同一条件);真实测得「当前
+/// 0 个 owned 子进程」时是 `Some(自身 RSS)`,不是 `None` 也不是 `Some(0)`——调用方
+/// 不应把三者混为一谈。
+///
+/// 故意**不**把 `std::process::id()` 塞进 [`instance_pids`] 本身:那份列表还喂给
+/// [`instance_group_ids`] 的 T2 崩溃兜底(下次启动按 pgid `kill_group`),把 Weft 自己
+/// 的 pid/pgid 混进去是危险的口径污染;这里只在内存求和这一步单独加一项自身读数,
+/// [`instance_pids`] 与 [`count_instance_processes`] 的既有口径(仅后代闭包)不变。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn instance_memory_bytes() -> Option<u64> {
+    let subtree: u64 = instance_pids().iter().filter_map(|&pid| proc_resident_bytes(pid)).sum();
+    let own = proc_resident_bytes(std::process::id() as i32).unwrap_or(0);
+    Some(subtree + own)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn instance_memory_bytes() -> Option<u64> {
+    None
+}
+
+/// [`count_instance_processes`] + [`instance_memory_bytes`], from a **single**
+/// [`instance_pids`] scan. Callers that want both numbers together (the resource
+/// dashboard's poll tick is the first — and, per `instance_pids`'s own doc, exactly
+/// the "every-second polling" case it warned would need this) would otherwise call
+/// the two functions above back-to-back, each independently paying for
+/// `instance_pids`'s full O(存活进程数 × 祖先深度) scan — doubling the per-tick
+/// syscall volume for numbers that are supposed to describe the same instant. This
+/// walks the pid list once and derives both from that one snapshot, which also
+/// removes the TOCTOU gap between them (they're now guaranteed to be the same pid
+/// set, not two scans microseconds apart).
+///
+/// `count_instance_processes` and `instance_memory_bytes` are left exactly as they
+/// are for any caller that only needs one of the two numbers — this is an additional
+/// combined path, not a replacement.
+#[derive(Clone, Copy, Debug)]
+pub struct InstanceUsage {
+    /// Same value [`count_instance_processes`] would return.
+    pub process_count: usize,
+    /// Same value [`instance_memory_bytes`] would return.
+    pub memory_bytes: Option<u64>,
+}
+
+pub fn instance_usage() -> InstanceUsage {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let pids = instance_pids();
+        // process_count stays the subtree-only count ([`count_instance_processes`]'s
+        // existing contract, and what `instance_group_ids`'s T2 crash-fallback pgid
+        // sweep implicitly relies on `instance_pids` never including Weft's own pid).
+        // memory_bytes additionally folds in Weft's own RSS — see
+        // [`instance_memory_bytes`]'s doc for why that addition is memory-only.
+        let subtree: u64 = pids.iter().filter_map(|&pid| proc_resident_bytes(pid)).sum();
+        let own = proc_resident_bytes(std::process::id() as i32).unwrap_or(0);
+        InstanceUsage { process_count: pids.len(), memory_bytes: Some(subtree + own) }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        // Mirrors count_instance_processes' non-macOS/Linux fallback branch.
+        InstanceUsage { process_count: registered().len(), memory_bytes: None }
+    }
+}
+
 // ── 平台相关:进程枚举(fork-free)────────────────────────────────────────────
 
 /// `(ppid, pgid)`。macOS 走 `proc_pidinfo`,Linux 读 `/proc/<pid>/stat`,均 fork-free、
@@ -467,25 +599,61 @@ fn proc_ppid_pgid(pid: i32) -> Option<(i32, i32)> {
     }
 }
 
+/// This pid's resident memory (RSS), in bytes. `None` if the pid vanished
+/// mid-read or the syscall failed; callers sum via `filter_map` so one bad pid
+/// (already exited) doesn't zero out the whole tree's total — mirrors
+/// `proc_ppid_pgid`'s same "success iff kernel filled the full struct" check.
+#[cfg(target_os = "macos")]
+fn proc_resident_bytes(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let sz = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: 传入本地栈上 proc_taskinfo 及其正确 size;成功时内核填满 sz 字节
+    // (与上面 proc_ppid_pgid 的 PROC_PIDTBSDINFO 调用同一套路)。
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            sz,
+        )
+    };
+    if n == sz {
+        Some(info.pti_resident_size)
+    } else {
+        None
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn all_pids() -> Vec<i32> {
-    // SAFETY: 先以 NULL 探需要的字节数,再按容量取全量;返回值为写入字节数。
+    // SAFETY: 先以 NULL 探当前 pid 个数,再按容量取全量;buffersize 实参是字节数,
+    // 但**返回值是 pid 个数,不是字节数**——`proc_listallpids` 包装了底层按字节计的
+    // `proc_listpids`,内部已经 `/ sizeof(int)` 过一次才返回(Apple 开源 Libc
+    // libsyscall/wrappers/libproc/libproc.c:`numpids = proc_listpids(...); return
+    // numpids / sizeof(int);`,probe 调用与实取调用同一套逻辑)。之前这里又拿返回值
+    // 除了一次 `size_of::<i32>()`,相当于把一个已经是「个数」的值当「字节数」二次
+    // 折半再折半——四条里丢三条,新起的高 pid agent 尤其容易被截掉;这里改成直接把
+    // 返回值当 pid 个数用,只在 SIZE 实参上保留字节单位。
     unsafe {
-        let need_bytes = libc::proc_listallpids(std::ptr::null_mut(), 0);
-        if need_bytes <= 0 {
+        let need = libc::proc_listallpids(std::ptr::null_mut(), 0);
+        if need <= 0 {
             return Vec::new();
         }
-        // proc_listallpids 返回「字节数」;pid 为 i32。宽松扩容防两次调用间进程增长。
-        let cap = (need_bytes as usize) / std::mem::size_of::<i32>() + 1024;
+        // 宽松扩容防两次调用间进程增长。
+        let cap = (need as usize) + 1024;
         let mut buf = vec![0i32; cap];
-        let got_bytes = libc::proc_listallpids(
+        let got = libc::proc_listallpids(
             buf.as_mut_ptr() as *mut libc::c_void,
             (cap * std::mem::size_of::<i32>()) as libc::c_int,
         );
-        if got_bytes <= 0 {
+        if got <= 0 {
             return Vec::new();
         }
-        let count = ((got_bytes as usize) / std::mem::size_of::<i32>()).min(cap);
+        let count = (got as usize).min(cap);
         buf.truncate(count);
         buf.retain(|&p| p > 0);
         buf
@@ -512,6 +680,30 @@ fn parse_stat_ppid_pgid(s: &str) -> Option<(i32, i32)> {
     let ppid = it.next()?.parse::<i32>().ok()?;
     let pgrp = it.next()?.parse::<i32>().ok()?;
     Some((ppid, pgrp))
+}
+
+/// This pid's resident memory (RSS), in bytes, read from `/proc/<pid>/status`.
+/// `None` if the pid vanished mid-read or the file is malformed.
+#[cfg(target_os = "linux")]
+fn proc_resident_bytes(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let s = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    parse_vmrss_kb(&s).map(|kb| kb.saturating_mul(1024))
+}
+
+/// Parse the `VmRSS:  1234 kB` line out of `/proc/<pid>/status` content.
+/// Extracted as a pure function (mirrors `parse_stat_ppid_pgid` above) so it's
+/// unit-testable without a real `/proc`, and compiles on non-Linux hosts too.
+#[cfg(any(target_os = "linux", test))]
+fn parse_vmrss_kb(s: &str) -> Option<u64> {
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest.trim().split_whitespace().next()?.parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -741,6 +933,37 @@ mod tests {
         reap(&mut child, &reg).await;
     }
 
+    /// Regression guard for the `proc_listallpids` return-value bug (Codex review,
+    /// PR #131): the wrapper's return is a **pid count**, not a byte count — dividing
+    /// it by `size_of::<i32>()` again (as the old code did) kept only ~1/4 of the true
+    /// pid list. The test process's own pid is trivially alive for the entire
+    /// duration of this call, so a correct full-table scan must always find it;
+    /// under the old bug it would be silently dropped whenever it fell outside
+    /// whatever quarter of the kernel's fill order survived the bogus truncation.
+    #[test]
+    fn all_pids_includes_the_test_process_itself() {
+        let me = std::process::id() as i32;
+        let pids = all_pids();
+        assert!(
+            pids.contains(&me),
+            "a correct full-table scan must include the caller's own live pid; got {} pids, self ({me}) missing",
+            pids.len()
+        );
+    }
+
+    /// Regression guard (Codex review, PR #131): the memory total must include
+    /// Weft's OWN resident memory, not only its owned subtree's — the subtree can
+    /// genuinely be empty (no agent running right now), and reporting 0 B in that
+    /// case contradicted the dashboard's "this app plus every agent it spawned"
+    /// copy. Doesn't need `test_guard`: it only asserts a floor from Weft's own
+    /// always-positive RSS, which the unconditional own-pid addend guarantees
+    /// regardless of what other tests concurrently register.
+    #[test]
+    fn instance_memory_bytes_includes_self_even_with_empty_subtree() {
+        let bytes = instance_memory_bytes().expect("macos/linux always sample RSS");
+        assert!(bytes > 0, "must include Weft's own resident memory even with no owned subtree");
+    }
+
     /// 最安全关键的守卫:`kill_group` **绝不**给进程组 0(调用者自己的组)、1(init)或
     /// Weft 本进程所在的组发信号。放一个「与 Weft 同组」的哨兵(不 configure→继承测试进程
     /// 的组),对这三个禁忌目标各发一次,哨兵必须存活。若守卫失效,这条会连测试进程一起
@@ -808,5 +1031,113 @@ mod tests {
             "dropping the registration deregisters even without reap"
         );
         let _ = child.kill().await; // 无 reap 发生,直接杀掉哨兵子进程收尾
+    }
+
+    /// `/proc/<pid>/status` 的 `VmRSS:` 行解析:纯字符串、不依赖 /proc,可在 macOS
+    /// 上也跑(与 `parse_stat_handles_comm_with_parens_and_spaces` 同一惯例)。
+    #[test]
+    fn parse_vmrss_kb_reads_the_vmrss_line() {
+        let status = "Name:\tsh\nVmPeak:\t   10240 kB\nVmRSS:\t    2048 kB\nVmHWM:\t   3072 kB\n";
+        assert_eq!(parse_vmrss_kb(status), Some(2048));
+        // 缺 VmRSS 行 → None(不 panic)。
+        assert_eq!(parse_vmrss_kb("Name:\tsh\nVmPeak:\t 10240 kB\n"), None);
+        // 畸形数值 → None。
+        assert_eq!(parse_vmrss_kb("VmRSS:\tnot-a-number kB\n"), None);
+    }
+
+    /// 回归哨兵(记录性,非穷尽性来源):`OwnerKind::all()` 必须覆盖全部变体、无重复、
+    /// 顺序即声明顺序。自改用 `owner_kinds!` 宏后,「变体存在」与「出现在 `all()`
+    /// 里」已经是同一次宏展开的同一件事,穷尽性由宏结构本身担保(见宏定义处文档),
+    /// 不再靠这条测试撑住。这条测试现在防的是另一件事:有人重排/增删
+    /// `owner_kinds!` 调用里的行时,没意识到顺序变化会影响
+    /// `instance_owner_counts` 对前端的顺序承诺(分类顺序不跳动)——用一份显式的
+    /// 期望列表把当前顺序钉住,变动时逼着改动的人在这里也确认一遍。
+    #[test]
+    fn owner_kind_all_covers_every_variant_in_declaration_order() {
+        assert_eq!(
+            OwnerKind::all(),
+            vec![
+                OwnerKind::GlobalAppServer,
+                OwnerKind::Session,
+                OwnerKind::LeadThread,
+                OwnerKind::Curator,
+                OwnerKind::Opencode,
+                OwnerKind::Preview,
+                OwnerKind::Probe,
+                OwnerKind::Other,
+            ]
+        );
+    }
+
+    /// 仪表盘的内存读数必须反映真实 owned 子树:起一个子进程后,合计 RSS 应 > 0。
+    #[tokio::test]
+    async fn instance_memory_bytes_reflects_owned_subtree() {
+        let _g = test_guard();
+        let mut cmd = null_cmd("sh");
+        cmd.arg("-c").arg("sleep 30");
+        let cfg = configure(&mut cmd, Owner::other("test-mem"));
+        let mut child = cmd.spawn().expect("spawn");
+        let reg = cfg.register(&child);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let bytes = instance_memory_bytes().expect("macOS/Linux always yield Some");
+        assert!(bytes > 0, "owned subtree should report nonzero RSS, got {bytes}");
+        reap(&mut child, &reg).await;
+    }
+
+    /// `instance_usage` 是单扫描版的 `count_instance_processes` + `instance_memory_bytes`
+    /// 组合——两条读数必须与分别调用两个独立函数完全一致,否则「只扫一次」的优化就
+    /// 悄悄改了语义。
+    #[tokio::test]
+    async fn instance_usage_matches_the_two_separate_functions_it_replaces() {
+        let _g = test_guard();
+        let mut cmd = null_cmd("sh");
+        cmd.arg("-c").arg("sleep 30");
+        let cfg = configure(&mut cmd, Owner::other("test-usage"));
+        let mut child = cmd.spawn().expect("spawn");
+        let reg = cfg.register(&child);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let usage = instance_usage();
+        assert_eq!(
+            usage.process_count,
+            count_instance_processes(),
+            "instance_usage's count must match count_instance_processes"
+        );
+        assert!(usage.memory_bytes.unwrap_or(0) > 0, "owned subtree should report nonzero RSS");
+        // 两条读数本就来自 instance_pids() 的分别两次调用,进程数在几百毫秒内几乎
+        // 不会变化,故允许极小误差而非要求逐字节相等。
+        let separate = instance_memory_bytes().expect("macOS/Linux always yield Some");
+        let combined = usage.memory_bytes.expect("macOS/Linux always yield Some");
+        let diff = separate.abs_diff(combined);
+        assert!(
+            diff <= separate / 10 + 1024,
+            "combined-scan RSS ({combined}) should closely match the separate call ({separate})"
+        );
+
+        reap(&mut child, &reg).await;
+    }
+
+    /// `instance_owner_counts` 分组必须按登记的 owner kind 统计,且过滤掉计数为零
+    /// 的分类(前端渲染只关心「实际存在」的分类)。
+    #[tokio::test]
+    async fn owner_counts_group_by_kind_and_skip_zero() {
+        let _g = test_guard();
+        let mut cmd = null_cmd("sh");
+        cmd.arg("-c").arg("sleep 30");
+        let cfg = configure(&mut cmd, Owner::session("s1"));
+        let mut child = cmd.spawn().expect("spawn");
+        let reg = cfg.register(&child);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let counts = instance_owner_counts();
+        assert!(
+            counts.iter().any(|c| c.kind == "session" && c.count >= 1),
+            "the registered session-owned child must show up under the session kind"
+        );
+        assert!(
+            counts.iter().all(|c| c.count > 0),
+            "zero-count owner kinds must not appear in the breakdown"
+        );
+        reap(&mut child, &reg).await;
     }
 }

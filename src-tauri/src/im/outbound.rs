@@ -217,6 +217,7 @@ mod tests {
             tool: "claude".into(),
             summary: "Run: npm test".into(),
             detail: "npm test".into(),
+            risk: crate::ask::RiskLevel::Unknown,
             ts: 0,
             thread_title: "登录超时修复".into(),
             dir_name: "backend".into(),
