@@ -1786,14 +1786,28 @@ impl AskRegistry {
             .remove(&(thread, dir.to_string()))
     }
 
-    /// Revoke a whole issue's read-only propagation (issue #103). Returns
-    /// whether it was actually set.
+    /// Revoke a whole issue's read-only propagation (issue #103) — CASCADES to
+    /// every session-scoped grant under this thread too, not just the
+    /// issue-wide flag. Without this, a session separately granted via
+    /// `grant_read_only_session` (the per-ask "release this session's
+    /// read-only" action) would silently keep auto-allowing after the human
+    /// revoked the issue-wide grant from the board chip, even though its
+    /// revoke-dialog copy promises "every worker under this issue will stop
+    /// auto-allowing read-only requests" — and the chip itself, gated only on
+    /// the `issue` set (see `ReadOnlyTrustChip`), would have already
+    /// disappeared, handing the human a false "nothing is trusted anymore"
+    /// impression while a worker's session grant quietly lived on. Mirrors
+    /// `purge_thread`'s existing cascade (both sets cleared together there
+    /// too, for the same "issue revoke means the WHOLE issue" reasoning — see
+    /// its doc). Unconditional: always leaves `thread` with zero read-only
+    /// trust of any kind, regardless of what existed before, which is the
+    /// simplest correct reading of "revoke the whole issue's propagation".
+    /// Returns whether the issue-wide flag itself had been set.
     pub fn revoke_read_only_issue(&self, thread: i32) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .read_only_issue
-            .remove(&thread)
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let had_issue = g.read_only_issue.remove(&thread);
+        g.read_only_session.retain(|(t, _)| *t != thread);
+        had_issue
     }
 
     /// Current read-only auto-allow scopes, for the frontend's "read-only
@@ -4145,6 +4159,47 @@ mod tests {
         assert!(r.revoke_read_only_issue(1));
         assert!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls").is_none());
         assert!(!r.revoke_read_only_issue(1));
+    }
+
+    /// Regression for the exact bug an independent review caught: a session
+    /// separately granted (the per-ask "release this session's read-only"
+    /// action) must NOT survive a later issue-wide revoke — the board chip's
+    /// revoke dialog promises "every worker under this issue will stop", and
+    /// that promise must actually hold, not just for the issue-wide flag but
+    /// for any session grant coexisting under the same thread. Mutation
+    /// check: delete the `read_only_session.retain` line from
+    /// `revoke_read_only_issue` and this test goes red (the session grant
+    /// would still auto_decision Allow after the "revoke" call returns).
+    #[test]
+    fn revoke_read_only_issue_also_clears_a_coexisting_session_grant_on_the_same_thread() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        r.grant_read_only_issue(1);
+        assert!(r.revoke_read_only_issue(1));
+        // neither the issue-wide sweep NOR the earlier, separately-granted
+        // session grant may still auto-allow — the human's mental model on
+        // revoke is "this issue no longer auto-allows", full stop.
+        assert!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls").is_none());
+        assert_eq!(
+            r.read_only_grants(),
+            ReadOnlyGrants::default(),
+            "both the issue flag and the coexisting session grant must be gone"
+        );
+    }
+
+    /// A session grant on a DIFFERENT thread must be untouched by revoking
+    /// issue #1's propagation — the cascade is scoped to `thread`, not global.
+    #[test]
+    fn revoke_read_only_issue_does_not_touch_a_session_grant_on_another_thread() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(2, "20");
+        r.grant_read_only_issue(1);
+        r.revoke_read_only_issue(1);
+        assert_eq!(
+            r.auto_decision(2, "20", RiskLevel::ReadOnly, "ls"),
+            Some(Decision::Allow),
+            "thread 2's own session grant must survive revoking thread 1's issue grant"
+        );
     }
 
     /// Revoking a read-only grant is forward-only: it must not retroactively

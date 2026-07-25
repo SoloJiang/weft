@@ -69,6 +69,14 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
           </span>
         </div>
       )}
+      {/* Issue #103: approving this ALSO propagates a read-only auto-allow to
+          the whole issue (approve_write_trigger → grant_read_only_issue),
+          same as confirming the ScopeReview proposal — reuse its exact
+          disclosure caption so both dispatch-approval entry points are
+          equally upfront about the consequence, not just the batch one. */}
+      <p className="px-3.5 pb-2 text-[11px] leading-snug text-ink-faint">
+        {t("scope.readOnlyPropagationNote")}
+      </p>
       <div className="flex flex-wrap items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">
         <Button
           variant="primary"
