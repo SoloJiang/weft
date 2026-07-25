@@ -129,7 +129,7 @@ async fn answer_perm_route_resolves_the_blocked_ask() {
         BusRegistry::new(),
         FakeChannel::default(),
     );
-    let (id, rx) = asks.request(1, "10", "claude", "Run: npm test", "npm test");
+    let (id, rx) = asks.request(1, "10", "claude", "Run: npm test", "npm test", "npm test");
     let r = Route::AnswerPerm {
         ask_id: id,
         answer: Answer::Allow,
