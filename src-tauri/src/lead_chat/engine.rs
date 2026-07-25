@@ -3254,7 +3254,7 @@ fn codex_approval_fields(
             .or_else(|| net["url"].as_str())
             .or_else(|| net["domain"].as_str())
             .unwrap_or("network");
-        let action_key = format!("Network:{host}");
+        let action_key = crate::ask::action_key(&["Network", host]);
         return (
             "Network",
             format!("network access: {host}"),
@@ -3267,8 +3267,13 @@ fn codex_approval_fields(
         let first = full.lines().next().unwrap_or("").to_string();
         // action_key = the full, untruncated command — a later line or arg
         // change is a different action even if the first line (and thus
-        // `summary`) matches.
-        let action_key = format!("Bash:{full}");
+        // `summary`) matches. Routed through the SAME collision-resistant
+        // encoding as bus::server::summarize (crate::ask::action_key) — a bare
+        // `format!("Bash:{full}")` join is a fixed-literal-prefixed string, so
+        // it's safe here in isolation, but using one canonical helper for every
+        // engine's action_key removes any need to re-litigate that argument
+        // per call site (see #89's round-2 finding on the claude/opencode side).
+        let action_key = crate::ask::action_key(&["Bash", &full]);
         return ("Bash", format!("Run: {first}"), full.clone(), action_key);
     }
     if has_changes {
@@ -3277,7 +3282,7 @@ fn codex_approval_fields(
         // summary caps at "first 3 + N" must still disambiguate from a
         // DIFFERENT >3-path edit sharing that same capped label.
         let (summary, full_paths) = codex_change_approval_summary(params);
-        let action_key = format!("Edit:{full_paths}");
+        let action_key = crate::ask::action_key(&["Edit", &full_paths]);
         return ("Edit", summary, full_paths, action_key);
     }
     // A permission escalation — key it by the REQUESTED scope, else an Always
@@ -3291,7 +3296,7 @@ fn codex_approval_fields(
         .map(|v| v.to_string())
         .unwrap_or_else(|| "(unspecified)".to_string());
     let scope_label: String = scope_json.chars().take(120).collect();
-    let action_key = format!("Permission:{scope_json}");
+    let action_key = crate::ask::action_key(&["Permission", &scope_json]);
     (
         "Permission",
         format!("permission: {scope_label}"),
@@ -6045,7 +6050,7 @@ mod tests {
         );
         assert_eq!(tool, "Network");
         assert_eq!(summary, "network access: example.com");
-        assert_eq!(key, "Network:example.com");
+        assert_eq!(key, crate::ask::action_key(&["Network", "example.com"]));
 
         // Edit: action_key carries the FULL path list even beyond the 3-path cap.
         let (tool, summary, _detail, key) = codex_approval_fields(
@@ -6065,7 +6070,23 @@ mod tests {
         );
         assert_eq!(tool, "Permission");
         assert!(summary.len() < detail.len());
-        assert_eq!(key, format!("Permission:{detail}"));
+        assert_eq!(key, crate::ask::action_key(&["Permission", &detail]));
+    }
+
+    /// Same collision class as `bus::server`'s round-2 finding, mirrored on the
+    /// codex side for defense in depth: the fixed literal kind tags ("Bash",
+    /// "Edit", ...) already make a bare `format!` join safe here in isolation
+    /// (no two kinds share a prefix), but routing through the shared
+    /// `crate::ask::action_key` helper — rather than re-deriving that argument —
+    /// is what actually GUARANTEES it, and keeps both engines' action_keys
+    /// built by the same one canonical, provably-injective encoding.
+    #[test]
+    fn codex_approval_fields_action_key_uses_the_shared_collision_resistant_encoding() {
+        let (_, _, _, bash_key) = codex_approval_fields(
+            "codex/commandExecution",
+            &serde_json::json!({"command": "echo hi"}),
+        );
+        assert_eq!(bash_key, crate::ask::action_key(&["Bash", "echo hi"]));
     }
 
     #[test]

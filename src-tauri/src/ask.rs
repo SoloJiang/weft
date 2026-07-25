@@ -75,6 +75,30 @@ impl Answer {
     }
 }
 
+/// Canonical, collision-resistant encoding for an `action_key`: JSON-array-
+/// encodes the ordered parts so two DIFFERENT part-tuples can never collide
+/// into the same key, regardless of what characters any part contains
+/// (colons, quotes, newlines — JSON's own string escaping keeps every part
+/// unambiguous, and the array structure keeps positions unambiguous, so a
+/// `["cmd", tool_name, content]` triple can never equal a `["file", tool_name,
+/// content]` triple even when `tool_name`/`content` coincide).
+///
+/// A bare `format!("{a}:{b}")` join is NOT collision-resistant: it has two
+/// independent failure modes — (1) if the SAME tool_name can appear on more
+/// than one ask-creation branch (e.g. a `command`-shaped input and a
+/// `file_path`-shaped input from the same MCP tool name), omitting a
+/// branch/kind tag lets the two branches' `"{tool_name}:{content}"` strings
+/// collide whenever `content` happens to match; (2) even within one branch, if
+/// `tool_name` itself can contain the separator character, `"{a}:{b}"` is not
+/// injective (`tool_name="A:B", content="C"` and `tool_name="A",
+/// content="B:C"` both join to `"A:B:C"`). Every engine's ask-creation path
+/// MUST build its `action_key` through this helper — see issue #89's
+/// round-2 finding (an over-broad-match bug of the exact shape this issue
+/// exists to eliminate, reintroduced by a naive join).
+pub fn action_key(parts: &[&str]) -> String {
+    serde_json::to_string(parts).unwrap_or_default()
+}
+
 /// A pending permission request, awaiting the human's decision.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Ask {
@@ -118,6 +142,17 @@ pub struct FullGrant {
 /// auto-allows. Precise by construction, so persisting it is safe (issue #89):
 /// a restored grant re-applies to the SAME action only, never a different one
 /// that merely shared the old grant's display summary.
+///
+/// KNOWN FOLLOW-UP (not fixed here — see PR #119's review): `action_key` has no
+/// `#[serde(default)]`. `GrantSnapshot` is stored as ONE JSON blob (see
+/// `auth_persist::load_snapshot`), so a future field rename here (the same
+/// change this PR just made, `summary` → `action_key`) would make an
+/// old-shaped `AlwaysGrant` entry fail to deserialize, which fails the WHOLE
+/// `Vec<AlwaysGrant>`, which fails the WHOLE `GrantSnapshot` — silently
+/// dropping `full` too (via `load_snapshot`'s corrupt-value fallback), not
+/// just the malformed `always` entries. This PR's rename itself is safe (no
+/// real on-disk `Always` data existed to break — PR #87 always stripped it at
+/// boot), but the underlying fragility persists for the NEXT rename.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AlwaysGrant {
     pub thread: i32,
@@ -717,6 +752,33 @@ mod tests {
         for a in [Answer::Allow, Answer::Deny, Answer::Always, Answer::Full] {
             assert_eq!(Answer::parse(a.as_str()), Some(a));
         }
+    }
+
+    // ---- action_key encoding (round-2 finding: a naive `"{a}:{b}"` join is NOT
+    // collision-resistant) ------------------------------------------------------
+
+    #[test]
+    fn action_key_distinguishes_branches_sharing_a_tool_name_and_content() {
+        // The exact collision a bare `format!("{tool_name}:{content}")` join
+        // would produce: same tool_name, same content, different branch/kind.
+        let cmd_branch = action_key(&["cmd", "X", "foo"]);
+        let file_branch = action_key(&["file", "X", "foo"]);
+        assert_ne!(cmd_branch, file_branch);
+    }
+
+    #[test]
+    fn action_key_is_injective_even_when_a_part_contains_the_naive_separator() {
+        // A naive "{a}:{b}" join is NOT injective when a part itself contains
+        // ':' — tool_name="A:B", content="C" and tool_name="A", content="B:C"
+        // both join to "A:B:C". The JSON-array encoding must NOT collide here.
+        let a = action_key(&["cmd", "A:B", "C"]);
+        let b = action_key(&["cmd", "A", "B:C"]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn action_key_is_stable_and_deterministic_for_the_same_parts() {
+        assert_eq!(action_key(&["cmd", "X", "foo"]), action_key(&["cmd", "X", "foo"]));
     }
 
     #[tokio::test]

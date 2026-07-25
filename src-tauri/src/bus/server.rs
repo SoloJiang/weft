@@ -267,6 +267,16 @@ fn hook_decision(decision: &str, reason: &str) -> Response {
 /// IM plain-text card); `action_key` is the EXACT action identity used ONLY for
 /// Always-grant matching (`auto_decision`), never shown to the human — a later
 /// ask sharing `summary` but not `action_key` must NOT auto-allow (issue #89).
+///
+/// Each branch tags its `action_key` with a fixed literal kind ("cmd" / "file" /
+/// "mcp") via `crate::ask::action_key`, THEN folds in `tool_name` and the exact
+/// content — never a bare `format!("{tool_name}:{content}")` join. Without the
+/// kind tag, the SAME `tool_name` used across two different input shapes (e.g. a
+/// tool that sometimes sends `{"command": "X"}` and other times `{"file_path":
+/// "X"}`) would collide into the identical joined string whenever the content
+/// matched, letting an Always for one silently cover the other (see #89's
+/// round-2 finding — a fresh instance of the exact over-broad-match bug this
+/// issue exists to eliminate).
 fn summarize(tool_name: &str, input: Option<&Value>) -> (String, String, String) {
     let s = |k: &str| {
         input
@@ -279,14 +289,14 @@ fn summarize(tool_name: &str, input: Option<&Value>) -> (String, String, String)
         // action_key = the full, untruncated command — a later line differing
         // (e.g. a multi-line command sharing only its first line) is a DIFFERENT
         // action even though `summary` collides.
-        let action_key = format!("{tool_name}:{cmd}");
+        let action_key = crate::ask::action_key(&["cmd", tool_name, &cmd]);
         return (format!("Run: {first}"), cmd, action_key);
     }
     if let Some(f) = s("file_path").or_else(|| s("filePath")) {
         // action_key folds in the tool name too: `Read` and `Write` on the same
         // path are different actions, even though both already show the full
         // (untruncated) path in `summary` today.
-        let action_key = format!("{tool_name}:{f}");
+        let action_key = crate::ask::action_key(&["file", tool_name, &f]);
         return (format!("{tool_name} {f}"), f.clone(), action_key);
     }
     let detail = input.map(|v| v.to_string()).unwrap_or_default();
@@ -294,7 +304,7 @@ fn summarize(tool_name: &str, input: Option<&Value>) -> (String, String, String)
     // display — e.g. "WebFetch"), but `action_key` folds in the full args so two
     // calls to the same tool with different args are different actions (issue
     // #89's MCP tool-name-fallback case).
-    let action_key = format!("{tool_name}:{detail}");
+    let action_key = crate::ask::action_key(&["mcp", tool_name, &detail]);
     (tool_name.to_string(), detail, action_key)
 }
 
@@ -1061,6 +1071,24 @@ mod tests {
         let (_s_read, _d_read, key_read) = summarize("Read", Some(&input));
         let (_s_write, _d_write, key_write) = summarize("Write", Some(&input));
         assert_ne!(key_read, key_write);
+    }
+
+    /// Round-2 finding: a naive `format!("{tool_name}:{content}")` join lets an
+    /// ask from the `command` branch collide with an ask from the `file_path`
+    /// branch when they share the SAME tool_name and the SAME content string —
+    /// e.g. one MCP tool that sends `{"command": "X"}` on one call and
+    /// `{"file_path": "X"}` on another. Without a branch/kind tag, both would
+    /// produce the identical `action_key`, so an Always on one silently covers
+    /// the other even though running a command and touching a file are
+    /// different actions. Each branch must be distinguishable regardless of
+    /// tool_name/content coincidence.
+    #[test]
+    fn summarize_cross_branch_same_tool_and_content_does_not_collide() {
+        let cmd_input = json!({"command": "X"});
+        let file_input = json!({"file_path": "X"});
+        let (_sc, _dc, cmd_key) = summarize("SameTool", Some(&cmd_input));
+        let (_sf, _df, file_key) = summarize("SameTool", Some(&file_input));
+        assert_ne!(cmd_key, file_key);
     }
 
     #[test]

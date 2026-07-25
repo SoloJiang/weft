@@ -2979,17 +2979,36 @@ mod tests {
                     dir: "99".into(),
                 },
             ],
-            always: vec![],
+            // Always is durable now (issue #89) — the rollback must restore it
+            // too, not just Full. `removed.always` is no longer unconditionally
+            // empty (see ask::tests::revoke_returns_exactly_what_it_removed), so
+            // a task-level revoke's rollback must cover both.
+            always: vec![crate::ask::AlwaysGrant {
+                thread: 7,
+                dir: "42".into(),
+                action_key: "npm test".into(),
+            }],
         });
 
         let r = revoke_grant_durable(&asks, 7, Some("42"), None).await;
 
         assert!(r.is_err(), "a failed durable write must surface as an error");
-        // the revoked grant is restored (memory matches the unchanged store)...
+        // the revoked Full grant is restored (memory matches the unchanged store)...
         assert_eq!(
             asks.auto_decision(7, "42", "x"),
             Some(crate::ask::Decision::Allow),
-            "the grant must be restored on a failed write"
+            "the Full grant must be restored on a failed write"
+        );
+        // ...and so is the revoked Always rule specifically (not just masked by
+        // the restored Full grant above — check it directly via the snapshot).
+        assert_eq!(
+            asks.snapshot_grants().always,
+            vec![crate::ask::AlwaysGrant {
+                thread: 7,
+                dir: "42".into(),
+                action_key: "npm test".into(),
+            }],
+            "the Always grant must be restored on a failed write, not just Full"
         );
         // ...and the unrelated grant is untouched (no blind whole-set re-seed).
         assert_eq!(
