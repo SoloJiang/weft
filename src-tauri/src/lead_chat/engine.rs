@@ -4290,31 +4290,31 @@ async fn take_frozen_turn(eng: &EngineRef, turn_id: i32) -> FreezeClaim {
 ///      [`reset_frozen_appserver_turn`] — finalizing whatever the frozen
 ///      turn left open (current/streaming rows, tool calls, queued
 ///      follow-ups) as `interrupted` below. A `Stale` claim means the turn
-///      already resolved itself during the wait: steps 3-6 below must NOT
+///      already resolved itself during the wait: steps 3-5 below must NOT
 ///      run — see [`FreezeClaim`].
-///   3. Stamp a `turn_freeze_recovered` marker (`repo::mark_turn_freeze_recovered`)
-///      — an invisible timeline row recording that this recovery happened,
-///      and the issue #116 (idle re-drive) coordination point: its
-///      `created_at` lets #116 tell "just came back from a freeze
-///      auto-recovery" apart from an ordinary clean turn-end, so
-///      `revive::freeze_grace_elapsed` can withhold this lead/worker from
-///      re-dispatch for a grace window instead of racing this self-heal.
-///      Runs FIRST of the DB writes on purpose — before step 4's drain
-///      persists `idle` — so no sweep can observe a recoverable idle session
-///      that has no marker yet; see the inline comment at the call for the
-///      full race. That protection deliberately does NOT ride on step 5: the
-///      cleared native id happens to exclude the session from #116's
-///      selection too, but only as a side effect of an unrelated predicate
-///      (the accidental, fragile protection review round 4 flagged — see the
-///      history note on `repo::mark_turn_freeze_recovered`). This marker is
-///      what carries the rule now.
+///   3. Both DB writes that hide this session from issue #116's idle re-drive,
+///      together and BEFORE step 4 persists `idle`:
+///      a. Stamp a `turn_freeze_recovered` marker
+///         (`repo::mark_turn_freeze_recovered`) — an invisible timeline row
+///         recording that this recovery happened, and #116's coordination
+///         point: its `created_at` lets `revive::freeze_grace_elapsed` tell
+///         "just came back from a freeze auto-recovery" apart from an ordinary
+///         clean turn-end, and withhold this lead/worker from re-dispatch for
+///         a grace window instead of racing this self-heal.
+///      b. Clear the native session id, so the NEXT send opens a brand-new
+///         native session instead of resuming one whose transport may still be
+///         wedged (mirrors the "no native id ⇒ fresh session next send"
+///         contract `rewind` already ships).
+///      The rule is carried by (a); (b) also happens to exclude the session
+///      from #116's selection, but only as a side effect of an unrelated
+///      predicate — the accidental, fragile protection review round 4 flagged
+///      (see the history note on `repo::mark_turn_freeze_recovered`). They are
+///      paired here so one failed write degrades to the other guard instead of
+///      to none; see the inline comment at the call for the race and for why
+///      aborting on a failed write would be worse.
 ///   4. App-server dialect only: shut the taken connection down and finalize
 ///      whatever the frozen turn left open, persisting the session `idle`.
-///   5. Clear the native session id, so the NEXT send opens a brand-new native
-///      session instead of resuming one whose transport may still be wedged
-///      (mirrors the "no native id ⇒ fresh session next send" contract
-///      `rewind` already ships).
-///   6. Post a Needs-you notice — this is a self-heal, but the user should
+///   5. Post a Needs-you notice — this is a self-heal, but the user should
 ///      still know their native context was reset.
 /// Returns false when the turn already ended in the gap (nothing to do) —
 /// including whenever [`take_frozen_turn`] reports [`FreezeClaim::Stale`].
@@ -4350,19 +4350,32 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
         FreezeClaim::Stale => return false,
         FreezeClaim::Owned(taken) => taken,
     };
-    // Publish the coordination marker BEFORE anything below exposes a
-    // recoverable idle state — position is load-bearing, not stylistic.
-    // `persist_activity(.., "idle")` in the drain block writes session status
-    // = idle while `native_session_id` is still set (it is cleared ~70 lines
-    // and many awaits later), which is EXACTLY the shape
-    // `revive::stalled_direction_ids` selects. With the marker written last,
-    // a stall sweep interleaving there reads an idle+native session and no
-    // marker yet, and enqueues the immediate re-drive the grace window exists
-    // to prevent. Marker-first makes the window unobservable: every state a
-    // sweep can see with the recovery in flight is already covered by
-    // `revive::freeze_grace_elapsed`.
+    // BOTH writes that make this session invisible to `revive`'s stall sweep
+    // land HERE, before anything below exposes a recoverable idle state.
+    // Position is load-bearing, not stylistic: `persist_activity(.., "idle")`
+    // in the drain block writes session status = idle, and an idle session
+    // that still has a `native_session_id` and no grace marker is EXACTLY the
+    // shape `revive::stalled_direction_ids` selects — so with either write
+    // trailing it, a sweep interleaving there enqueues the immediate re-drive
+    // this whole mechanism exists to prevent.
     //
-    // Still AFTER `take_frozen_turn`, deliberately: a `Stale` claim stamps
+    // They are deliberately redundant, because each can fail on its own and
+    // `revive` excludes the session if EITHER landed: the marker via
+    // `freeze_grace_elapsed`, the cleared id via the `native_session_id
+    // .is_some()` predicate. One transient DB error therefore degrades to the
+    // other guard rather than to no guard. Only a double failure re-opens the
+    // window, and that is logged, not silent.
+    //
+    // Why not fail closed by aborting on a failed marker write: by this point
+    // `take_frozen_turn` has ALREADY taken the app-server client and reset the
+    // turn in memory. Returning early here would leak that connection
+    // un-shut-down, leave the drained rows dangling as `streaming` forever,
+    // and leave the DB claiming `running` for a turn that is over — strictly
+    // worse than a missing marker, and it would break the honest-status
+    // invariant. Skipping only the `idle` persist has the same last problem.
+    // Redundancy is the affordable fail-safe here; aborting is not.
+    //
+    // Still AFTER `take_frozen_turn`, deliberately: a `Stale` claim writes
     // nothing (review round 4), so a declined recovery can't suppress a
     // legitimate re-drive for a whole window.
     //
@@ -4378,6 +4391,15 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
         if let Err(err) = repo::mark_turn_freeze_recovered(&db, thread_id, session_id).await {
             eprintln!(
                 "[weft] turn-freeze recovery: failed to stamp coordination marker for thread {thread_id}: {err}"
+            );
+        }
+        // Safe to clear this early: nothing between here and the old call site
+        // writes `native_session_id` back. `persist_activity` only touches
+        // `status`, and `set_lead_status`'s meta upsert preserves the other
+        // fields — so a cleared id stays cleared.
+        if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
+            eprintln!(
+                "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
             );
         }
     }
@@ -4455,13 +4477,9 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
         // did. Here, we are that "whatever".
         emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
     }
-    if let Some(db) = app.try_state::<Db>() {
-        if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
-            eprintln!(
-                "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
-            );
-        }
-    }
+    // The DB half of this ran above, alongside the marker — see there for why
+    // both guards must precede the drain block's `idle` persist. Only the
+    // in-memory mirror is left here.
     eng.lock().await.native_id = None;
     if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
         bus.ask_human(thread_id, &dir, &freeze_recovery_text(freeze_secs));
