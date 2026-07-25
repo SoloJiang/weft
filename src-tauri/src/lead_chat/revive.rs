@@ -342,20 +342,31 @@ async fn collect_stalled_leads(
     let mut stalled = Vec::new();
     for ws in repo::list_workspaces(db).await? {
         for th in repo::list_threads(db, ws.id).await? {
-            // The lead must have orchestration context to resume from (a native
-            // id) and be legitimately idle — NOT "running" (an interrupted turn,
-            // already handled by collect_targets) and NOT "stopped" (taken over
-            // in the user's terminal).
-            if repo::lead_native_id(db, th.id).await?.is_none() {
-                continue;
-            }
+            // The lead must be legitimately idle — NOT "running" (an interrupted
+            // turn, already handled by collect_targets) and NOT "stopped" (taken
+            // over in the user's terminal).
             if repo::lead_status(db, th.id).await?.as_deref() != Some("idle") {
                 continue;
             }
             // `None` session = the lead's own marker (repo::mark_turn_freeze_recovered).
-            let (_, grace_elapsed) =
+            let (recovered, grace_elapsed) =
                 freeze_recovery_state(db, th.id, None, now, grace_secs).await?;
             if !grace_elapsed {
+                continue;
+            }
+            // Same two-opposite-meanings rule [`stalled_direction_ids`] applies to
+            // worker sessions, on the lead axis: no native id means either "never
+            // orchestrated anything" (nothing to resume — excluded) or "had
+            // context and the freeze recovery cleared it" (the recovery working as
+            // designed). Excluding the latter stranded MORE than one task: a
+            // freeze-recovered lead could never be auto-redriven, so every
+            // in-progress task on that issue stayed stalled until a human stepped
+            // in. Past the window it is re-driven like any other stall; the resume
+            // prompt is already written for a lead that must re-derive state
+            // ("check each one's current state and latest output") and it carries
+            // the stalled worker ids explicitly, so a fresh native session can
+            // orient itself through tools rather than from memory.
+            if recovered.is_none() && repo::lead_native_id(db, th.id).await?.is_none() {
                 continue;
             }
             let dirs = stalled_direction_ids(db, th.id, now, grace_secs).await?;
@@ -1279,6 +1290,17 @@ mod tests {
     /// tests that mean "just recovered" must use this one, or they assert a
     /// shape production never produces (review finding on the first revision of
     /// these tests).
+    /// The lead-axis twin of [`recovered_worker`]: marker stamped AND the lead's
+    /// native id cleared, exactly what `recover_from_freeze` leaves behind for a
+    /// lead (`clear_native_id` → `set_lead_native_id_opt(.., None)`).
+    async fn recovered_lead(db: &Db, thread_id: i32) -> u64 {
+        let stamped = mark_recovered(db, thread_id, None).await;
+        repo::set_lead_native_id_opt(db, thread_id, None)
+            .await
+            .unwrap();
+        stamped
+    }
+
     async fn recovered_worker(db: &Db, thread_id: i32, direction_id: i32) -> u64 {
         let sess = session_of(db, direction_id).await;
         let stamped = mark_recovered(db, thread_id, Some(sess)).await;
@@ -1392,20 +1414,31 @@ mod tests {
         idle_lead(&db, th).await;
         stalled_direction(&db, th, repo_id, "working").await;
 
-        let stamped = mark_recovered(&db, th, None).await;
+        // The REAL post-recovery lead state: marker stamped AND native id cleared.
+        let stamped = recovered_lead(&db, th).await;
 
         let stalled = collect_stalled_leads(&db, stamped, GRACE).await.unwrap();
         assert!(stalled.is_empty());
     }
 
-    /// …and likewise recovers normal selection after the window.
+    /// …and likewise recovers normal selection after the window — with the
+    /// lead's native id CLEARED, as `recover_from_freeze` leaves it. Same defect
+    /// the worker path had, one level up and strictly worse: the old
+    /// `lead_native_id.is_none()` check ran before the marker was ever consulted,
+    /// so a freeze-recovered lead could never be auto-redriven and EVERY
+    /// in-progress task on that issue stayed stalled until a human stepped in.
     #[tokio::test]
-    async fn selects_stalled_lead_once_its_freeze_grace_window_elapses() {
+    async fn selects_freeze_recovered_lead_with_cleared_native_id_after_the_window() {
         let db = mem().await;
         let (th, repo_id) = fixture(&db).await;
         idle_lead(&db, th).await;
         let dir = stalled_direction(&db, th, repo_id, "working").await;
-        let stamped = mark_recovered(&db, th, None).await;
+        let stamped = recovered_lead(&db, th).await;
+        assert_eq!(
+            repo::lead_native_id(&db, th).await.unwrap(),
+            None,
+            "precondition: the recovery cleared the lead's native id"
+        );
 
         let stalled = collect_stalled_leads(&db, stamped + GRACE, GRACE)
             .await
