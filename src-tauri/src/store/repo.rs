@@ -1641,12 +1641,14 @@ pub async fn set_session_native_id_opt(
 /// auto-recovery (issue #93 review round 1 ↔ issue #116 coordination): an
 /// invisible timeline marker row (`kind` excluded from the frontend's
 /// text/tool timeline allowlist, same as `"meta"`) whose `created_at` is the
-/// coordination point #116's idle re-drive consults via
-/// [`last_turn_freeze_recovery_secs`] to hold off re-dispatching into the same
-/// wedge for a grace window, instead of racing this self-heal. `session_id =
-/// None` for the lead. Uses the SAME deletion-fenced insert as the rest of the
-/// timeline (`insert_lead_message`), so a thread deleted mid-recovery can't
-/// leave an orphaned row.
+/// coordination point #116's idle re-drive reads back through
+/// [`last_turn_freeze_recovery_secs`]. Its one consumer is
+/// `lead_chat::revive::freeze_grace_elapsed`, which withholds a
+/// just-self-healed lead/worker from re-dispatch for one grace window rather
+/// than racing this recovery back into the same wedge. `session_id = None` for
+/// the lead. Uses the SAME deletion-fenced insert as the rest of the timeline
+/// (`insert_lead_message`), so a thread deleted mid-recovery can't leave an
+/// orphaned row.
 pub async fn mark_turn_freeze_recovered(
     db: &Db,
     thread_id: i32,

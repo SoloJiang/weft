@@ -4216,8 +4216,12 @@ fn reset_frozen_appserver_turn(inner: &mut EngineInner, turn_id: i32) -> Option<
 ///   4. Stamp a `turn_freeze_recovered` marker (`repo::mark_turn_freeze_recovered`)
 ///      — the issue #116 (idle re-drive) coordination point: its `created_at`
 ///      lets #116 tell "just came back from a freeze auto-recovery" apart from
-///      an ordinary clean turn-end, so it can hold off re-dispatching into the
-///      same wedge for a grace window instead of racing this self-heal.
+///      an ordinary clean turn-end. `revive::freeze_grace_elapsed` reads it and
+///      withholds this lead/worker from re-dispatch for one grace window
+///      instead of racing this self-heal back into the same wedge. Note this
+///      does NOT ride on step 3: the cleared native id happens to exclude the
+///      session from #116's selection too, but that is a side effect of an
+///      unrelated predicate, so the marker is what actually carries the rule.
 ///   5. Post a Needs-you notice — this is a self-heal, but the user should
 ///      still know their native context was reset.
 /// Returns false when the turn already ended in the gap (nothing to do).
