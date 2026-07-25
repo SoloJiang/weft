@@ -354,19 +354,16 @@ async fn collect_stalled_leads(
             if !grace_elapsed {
                 continue;
             }
-            // Same two-opposite-meanings rule [`stalled_direction_ids`] applies to
-            // worker sessions, on the lead axis: no native id means either "never
-            // orchestrated anything" (nothing to resume — excluded) or "had
-            // context and the freeze recovery cleared it" (the recovery working as
-            // designed). Excluding the latter stranded MORE than one task: a
-            // freeze-recovered lead could never be auto-redriven, so every
-            // in-progress task on that issue stayed stalled until a human stepped
-            // in. Past the window it is re-driven like any other stall; the resume
-            // prompt is already written for a lead that must re-derive state
-            // ("check each one's current state and latest output") and it carries
-            // the stalled worker ids explicitly, so a fresh native session can
+            // Shared rule — see `has_resumable_context`. Excluding a recovered
+            // lead stranded MORE than the worker case does: every in-progress
+            // task on the issue stayed stalled until a human stepped in. Past
+            // the window it is re-driven like any other stall; the resume prompt
+            // is already written for a lead that must re-derive state ("check
+            // each one's current state and latest output") and carries the
+            // stalled worker ids explicitly, so a fresh native session can
             // orient itself through tools rather than from memory.
-            if recovered.is_none() && repo::lead_native_id(db, th.id).await?.is_none() {
+            let native = repo::lead_native_id(db, th.id).await?;
+            if !has_resumable_context(native.is_some(), recovered) {
                 continue;
             }
             let dirs = stalled_direction_ids(db, th.id, now, grace_secs).await?;
@@ -414,20 +411,11 @@ async fn stalled_direction_ids(
         if !grace_elapsed {
             continue;
         }
-        // A missing native id means one of two OPPOSITE things, and the marker
-        // is the only thing that tells them apart:
-        //   - never captured one ⇒ this worker never ran a turn; there is no
-        //     stall to resume, so it stays excluded (the original rule).
-        //   - captured one, then had it deliberately cleared by the freeze
-        //     auto-recovery ⇒ it DID run, and losing its native context is the
-        //     recovery working as designed ("no native id ⇒ fresh session next
-        //     send"). Excluding it here is what made a freeze-recovered worker
-        //     invisible FOREVER rather than for one grace window: nothing
-        //     automated can recreate the id while it is excluded, so the
-        //     re-drive could never come back for it. Past the window it is an
-        //     ordinary stall again, and the re-dispatch opens the fresh native
-        //     session the recovery intended.
-        if sess.native_session_id.is_none() && recovered.is_none() {
+        // Shared rule — see `has_resumable_context`. Excluding a recovered
+        // worker here is what made it invisible FOREVER rather than for one
+        // grace window: nothing automated can recreate the id while it is
+        // excluded, so the re-drive could never come back for it.
+        if !has_resumable_context(sess.native_session_id.is_some(), recovered) {
             continue;
         }
         ids.push(dir.id);
@@ -481,6 +469,26 @@ async fn stalled_direction_ids(
 /// [`stalled_direction_ids`]'s `native_session_id` check hides it when the
 /// clear landed. That pairing is deliberate and documented at the write site;
 /// don't reorder or separate them.
+/// Does this surface (lead or worker session) have orchestration context a
+/// re-drive can resume from? `native_id_present` is the stored id; `recovered`
+/// is its last turn-freeze recovery, if any.
+///
+/// ONE rule, deliberately shared by both axes. A missing native id means two
+/// OPPOSITE things and only the marker separates them: never captured one (the
+/// surface never ran — nothing to resume) versus captured one and had it
+/// deliberately cleared by the freeze auto-recovery (it DID run; losing native
+/// context is the recovery working as designed, and the next dispatch opens the
+/// fresh session it intended).
+///
+/// It lives here as a shared predicate because the review caught the SAME defect
+/// twice — first on worker sessions, then, after that was fixed, on the lead
+/// axis, which had been patched separately and kept the old rule. Two call sites
+/// encoding the same rule independently is how the second one got missed; a
+/// third axis should reuse this rather than re-derive it.
+fn has_resumable_context(native_id_present: bool, recovered: Option<u64>) -> bool {
+    native_id_present || recovered.is_some()
+}
+
 async fn freeze_recovery_state(
     db: &Db,
     thread_id: i32,
@@ -899,6 +907,23 @@ mod tests {
 
     fn empty() -> HashSet<i64> {
         HashSet::new()
+    }
+
+    /// The shared rule, exhaustively: all four combinations of "has a native
+    /// id" × "has a freeze marker". The two middle rows are the whole point —
+    /// a missing id means opposite things depending on the marker, and getting
+    /// that wrong on ONE axis is the defect this predicate was extracted to
+    /// stop happening a third time.
+    #[test]
+    fn resumable_context_rule_is_exhaustive() {
+        // Ordinary live surface: id present, never froze.
+        assert!(has_resumable_context(true, None));
+        // Froze, then started a fresh session that captured a new id.
+        assert!(has_resumable_context(true, Some(1)));
+        // Froze and the recovery cleared the id — it DID run; resumable.
+        assert!(has_resumable_context(false, Some(1)));
+        // Never captured an id and never froze — never ran; nothing to resume.
+        assert!(!has_resumable_context(false, None));
     }
 
     /// The default-configuration selection: real "now", the shipped grace
