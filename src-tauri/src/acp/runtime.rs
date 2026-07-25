@@ -736,10 +736,53 @@ impl ClientHandle {
     }
 
     pub async fn unsubscribe(&self, session_id: &str) {
-        if let Some(inner) = self.inner.lock().await.as_mut() {
-            inner.sessions.remove(session_id);
-            inner.opening_sessions.remove(session_id);
-            inner.pending_updates.remove(session_id);
+        let empty = {
+            if let Some(inner) = self.inner.lock().await.as_mut() {
+                inner.sessions.remove(session_id);
+                inner.opening_sessions.remove(session_id);
+                inner.pending_updates.remove(session_id);
+                inner.sessions.is_empty()
+                    && inner.opening_sessions.is_empty()
+                    && inner.expecting_session == 0
+            } else {
+                false
+            }
+        };
+        if empty {
+            self.maybe_reap_if_idle().await;
+        }
+    }
+
+    /// Drop this program-keyed pool entry when no routes remain so command-pin
+    /// changes do not accumulate orphan ACP children for the app lifetime.
+    async fn maybe_reap_if_idle(&self) {
+        let prog = self.program.lock().await.clone();
+        let Some(program) = prog else {
+            return;
+        };
+        let key = pool_key(self.backend_id, &program);
+        let empty = {
+            if let Some(inner) = self.inner.lock().await.as_ref() {
+                inner.sessions.is_empty()
+                    && inner.opening_sessions.is_empty()
+                    && inner.expecting_session == 0
+                    && inner.pending.is_empty()
+            } else {
+                true
+            }
+        };
+        if !empty {
+            return;
+        }
+        let removed = {
+            let mut g = POOL.clients.lock().await;
+            match g.get(&key) {
+                Some(c) if std::sync::Arc::ptr_eq(&c.inner, &self.inner) => g.remove(&key),
+                _ => None,
+            }
+        };
+        if let Some(c) = removed {
+            c.shutdown_and_reap().await;
         }
     }
 

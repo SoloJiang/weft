@@ -3100,9 +3100,10 @@ async fn spawn_acp_turn(
                 Err(resume_err) => match client.load_session(&id, &cwd, mcp.clone()).await {
                     Ok(sid) => (sid, None, None),
                     Err(load_err) => {
-                        return Err(anyhow::anyhow!(
-                            "ACP resume failed ({resume_err}); load also failed ({load_err})"
-                        ));
+                        eprintln!(
+                            "[weft][acp] resume failed ({resume_err}); load also failed ({load_err})"
+                        );
+                        return Err(anyhow::anyhow!("acp_session_open_failed"));
                     }
                 },
             }
@@ -3150,6 +3151,15 @@ async fn spawn_acp_turn(
         );
     }
 
+    // If resume/load minted a replacement id, drop the prior route so late
+    // notifications cannot mutate this engine under the old sessionId.
+    if let Some(prev) = prior_native.as_deref() {
+        if prev != session_id.as_str() {
+            let _ = client.cancel(prev).await;
+            client.unsubscribe(prev).await;
+        }
+    }
+
     // Always resubscribe when the runtime lost the route (child restart /
     // shutdown clears sessions) even if the engine still holds acp_client.
     let need_sub = !client.is_subscribed(&session_id).await;
@@ -3168,7 +3178,11 @@ async fn spawn_acp_turn(
 
     let stop_won = {
         let mut g = eng.lock().await;
-        let won = g.stopped || expected_epoch.is_some_and(|e| e != g.reset_epoch);
+        // Ordinary composer Stop sets `interrupting` without bumping epoch until
+        // the delayed force reset — must not publish acp_client or arm prompt.
+        let won = g.stopped
+            || g.interrupting
+            || expected_epoch.is_some_and(|e| e != g.reset_epoch);
         if !won {
             g.acp_client = Some(client.clone());
             if g.native_id.as_deref() != Some(session_id.as_str()) {
@@ -3208,7 +3222,10 @@ async fn spawn_acp_turn(
     // between stop_won and here must not start session/prompt after cancel.
     let prompt_epoch = {
         let g = eng.lock().await;
-        if g.stopped || expected_epoch.is_some_and(|e| e != g.reset_epoch) {
+        if g.stopped
+            || g.interrupting
+            || expected_epoch.is_some_and(|e| e != g.reset_epoch)
+        {
             let _ = client.cancel(&session_id).await;
             return Err(anyhow::anyhow!("engine stopped before ACP prompt"));
         }
@@ -3228,7 +3245,7 @@ async fn spawn_acp_turn(
         // have landed while this task was scheduled.
         {
             let g = e.lock().await;
-            if g.stopped || g.reset_epoch != prompt_epoch {
+            if g.stopped || g.interrupting || g.reset_epoch != prompt_epoch {
                 return;
             }
         }
@@ -3817,8 +3834,10 @@ async fn acp_consumer(
                                 let mut g = eng.lock().await;
                                 g.acp_pending_asks.retain(|x| *x != id);
                             }
-                            // If stop landed while we waited, reject regardless of answer.
-                            if eng.lock().await.stopped {
+                            // If stop/interrupt landed while we waited, reject
+                            // regardless of the human's answer.
+                            let g = eng.lock().await;
+                            if g.stopped || g.interrupting {
                                 crate::acp::Want::RejectOnce
                             } else {
                                 decided

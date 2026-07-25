@@ -580,16 +580,22 @@ pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> 
         if role != "user" {
             continue;
         }
-        let body = v
-            .pointer("/message/content")
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
+        let content = v.pointer("/message/content").and_then(|c| c.as_array());
+        // Tool-result rows are also role=user but have no direct text block.
+        // Attachment-only prompts DO have a text block (text may be empty).
+        let Some(arr) = content else { continue };
+        let has_text_block = arr.iter().any(|b| {
+            b.get("type").and_then(|t| t.as_str()) == Some("text")
+                || b.get("text").and_then(|t| t.as_str()).is_some()
+        });
+        if !has_text_block {
+            continue;
+        }
+        let body = arr
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
         let is_first_user = seen_users == 0;
         seen_users += 1;
         if !omp_user_body_matches(&body, &want, is_first_user) {
@@ -664,16 +670,29 @@ fn find_omp_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>
         .map(|m| m.is_dir() && !m.file_type().is_symlink())
         .unwrap_or(false);
     if preferred_ok {
+        const MAX_PREFERRED_SCAN: usize = 4_096;
+        const MAX_PREFERRED_HITS: usize = 32;
+        let mut scanned = 0usize;
         for e in std::fs::read_dir(&preferred)? {
+            if scanned >= MAX_PREFERRED_SCAN {
+                break;
+            }
             let e = e?;
+            scanned += 1;
             let p = e.path();
             let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
             if meta.file_type().is_symlink() {
                 continue;
             }
+            if !meta.is_file() {
+                continue;
+            }
             let name = e.file_name().to_string_lossy().into_owned();
             if name.contains(session_id) && name.ends_with(".jsonl") {
                 candidates.push(p);
+                if candidates.len() >= MAX_PREFERRED_HITS {
+                    break;
+                }
             }
         }
     }
@@ -1368,5 +1387,60 @@ mod tests {
         // the invariant under test is termination + no panic/OOM, and hits ≤ MAX_HITS.
         assert!(hits.len() <= 32, "hits capped");
     }
+
+    #[test]
+    fn preferred_bucket_caps_large_dir() {
+        use std::fs;
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path();
+        let sessions = home.join(".omp/agent/sessions");
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let encoded = omp_encode_cwd(&cwd);
+        let bucket = sessions.join(&encoded);
+        fs::create_dir_all(&bucket).unwrap();
+        for i in 0..5_000 {
+            fs::write(bucket.join(format!("noise-{i}.txt")), b"x").unwrap();
+        }
+        fs::write(bucket.join("zzz_sess-cap-me.jsonl"), b"{}\n").unwrap();
+        let old = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let found = find_omp_session_file(&cwd, "sess-cap-me");
+        match old {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        assert!(found.is_ok());
+    }
+
+    #[test]
+    fn omp_user_text_block_required_not_tool_result() {
+        let tool = serde_json::json!({
+            "type":"message",
+            "message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"ok"}
+            ]}
+        });
+        let arr = tool.pointer("/message/content").and_then(|c| c.as_array()).unwrap();
+        let has = arr.iter().any(|b| {
+            b.get("type").and_then(|t| t.as_str()) == Some("text")
+                || b.get("text").and_then(|t| t.as_str()).is_some()
+        });
+        assert!(!has);
+        let img = serde_json::json!({
+            "type":"message",
+            "message":{"role":"user","content":[
+                {"type":"text","text":""},
+                {"type":"image"}
+            ]}
+        });
+        let arr = img.pointer("/message/content").and_then(|c| c.as_array()).unwrap();
+        let has = arr.iter().any(|b| {
+            b.get("type").and_then(|t| t.as_str()) == Some("text")
+                || b.get("text").and_then(|t| t.as_str()).is_some()
+        });
+        assert!(has);
+    }
+
 
 }

@@ -172,10 +172,16 @@ function rawErrorMessage(error: unknown): string {
  *  as a silent drop (issue #94). Surface the reason explicitly instead. */
 function notifySendFailed(error: unknown) {
   const raw = rawErrorMessage(error);
-  const msg =
-    raw === "queue_full"
-      ? i18n.t("lead.queueFull")
-      : i18n.t("lead.sendFailedGeneric", { reason: raw || i18n.t("lead.sendFailedUnknown") });
+  let msg: string;
+  if (raw === "queue_full") {
+    msg = i18n.t("lead.queueFull");
+  } else if (raw.includes("acp_session_open_failed")) {
+    msg = i18n.t("session.acpSessionOpenFailed");
+  } else {
+    msg = i18n.t("lead.sendFailedGeneric", {
+      reason: raw || i18n.t("lead.sendFailedUnknown"),
+    });
+  }
   toast(msg, "danger");
 }
 
