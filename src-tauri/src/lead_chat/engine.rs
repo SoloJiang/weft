@@ -4109,6 +4109,76 @@ fn freeze_recovery_text(freeze_secs: u64) -> String {
     )
 }
 
+/// Drained turn artifacts from [`reset_frozen_appserver_turn`], handed back to
+/// the caller to finalize OUTSIDE the lock — same captured-exactly-these-ids
+/// discipline `cleanup_disconnected_turn` / `stop_quiet` use, so a session-wide
+/// sweep after the lock drops can never catch a concurrent send's freshly
+/// inserted row and fail a message that is about to be delivered.
+struct FrozenTurnDrain {
+    current: Option<(i32, String)>,
+    orphan_texts: Vec<(i32, String)>,
+    orphan_tools: Vec<(i32, serde_json::Value)>,
+    drained_queue: Vec<i32>,
+    turn_saw_text: bool,
+}
+
+/// Pure state reset for `recover_from_freeze`'s app-server path (review round
+/// 2, P1): `codex_client.take()+shutdown()` just severed the connection
+/// `codex_consumer` was reading, which makes ITS OWN tail-of-loop disconnect
+/// check (`still_active`, gated on `codex_client` still pointing at the SAME
+/// client) read false — so `cleanup_disconnected_turn` never runs, and no
+/// clean `TurnEnd` is ever coming either (the whole point of this feature is
+/// that the transport is wedged). Nothing else will reset this turn's
+/// `busy`/`tool_rows`/`current` — this is that reset, done by hand.
+///
+/// Mirrors `cleanup_disconnected_turn`'s field resets but deliberately lands
+/// at IDLE, not its `stopped=true` STATUS_STOPPED hard state:
+/// `recover_from_freeze` must land in the same honest, resumable idle state a
+/// normal interrupt does (see its doc comment). For the same reason
+/// `reset_epoch` is NOT bumped here (unlike `stop_quiet`/
+/// `cleanup_disconnected_turn`'s STOP semantics) — an in-flight send whose
+/// Phase 1 reserved against the busy turn just before this fires still
+/// promotes cleanly onto the fresh idle engine at Phase 3
+/// (`send_reservation_valid`'s "continuity reset" case) instead of being
+/// invalidated the way a hard stop/cleanup would invalidate it.
+///
+/// `turn_id` is the turn this recovery targets, captured before the
+/// (possibly ~120s) `interrupt()` RPC wait. Guarded exactly like
+/// `reset_failed_hidden_turn`: a mismatch — or the turn having already gone
+/// idle on its own, e.g. a very-delayed clean `TurnEnd` that slipped in
+/// during that wait — means a NEWER turn may already be live on this engine;
+/// leave it untouched and return `None` rather than destroying state that has
+/// nothing to do with the frozen turn.
+fn reset_frozen_appserver_turn(inner: &mut EngineInner, turn_id: i32) -> Option<FrozenTurnDrain> {
+    if inner.turn_id != turn_id || !inner.turn.busy {
+        return None;
+    }
+    let current = inner.current.take().map(|(id, text, _)| (id, text));
+    let orphan_texts: Vec<(i32, String)> = inner
+        .open_texts
+        .drain()
+        .map(|(_, (id, text, _))| (id, text))
+        .collect();
+    let orphan_tools: Vec<(i32, serde_json::Value)> =
+        inner.tool_rows.drain().map(|(_, v)| v).collect();
+    let drained_queue: Vec<i32> = inner.turn.queue.iter().filter_map(|o| o.queue_id).collect();
+    let turn_saw_text = inner.turn_saw_text;
+    inner.turn = TurnState::default();
+    inner.clock = TurnClock::default();
+    inner.turn_saw_text = false;
+    inner.interrupting = false;
+    inner.current_origin_tag = None;
+    inner.child = None;
+    inner.stdin = None;
+    Some(FrozenTurnDrain {
+        current,
+        orphan_texts,
+        orphan_tools,
+        drained_queue,
+        turn_saw_text,
+    })
+}
+
 /// Re-confirm and execute the turn-freeze auto-recovery (issue #93). The
 /// sweep's verdict was computed under a lock already dropped, so this re-runs
 /// the FULL check (busy + silent past `freeze_secs` + not legitimately blocked
@@ -4132,7 +4202,13 @@ fn freeze_recovery_text(freeze_secs: u64) -> String {
 ///      (`codex_client.take()` + `shutdown()`) so the next send reconnects
 ///      fresh instead of reusing a connection `is_alive()` would wrongly
 ///      trust. No-op for every non-app-server dialect (client is already
-///      `None`).
+///      `None`). Severing the connection here also makes `codex_consumer`'s
+///      OWN disconnect cleanup skip itself (review round 2, P1 — its
+///      `still_active` check reads false once `codex_client` is gone), so
+///      right after the drop this step resets the turn by hand under a fresh
+///      lock — see [`reset_frozen_appserver_turn`] — and finalizes whatever
+///      the frozen turn left open (current/streaming rows, tool calls, queued
+///      follow-ups) as `interrupted`.
 ///   3. Clear the native session id, so the NEXT send opens a brand-new native
 ///      session instead of resuming one whose transport may still be wedged
 ///      (mirrors the "no native id ⇒ fresh session next send" contract
@@ -4146,7 +4222,7 @@ fn freeze_recovery_text(freeze_secs: u64) -> String {
 ///      still know their native context was reset.
 /// Returns false when the turn already ended in the gap (nothing to do).
 async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64) -> bool {
-    let (thread_id, session_id, dir, act) = {
+    let (thread_id, session_id, dir, act, turn_id) = {
         let inner = eng.lock().await;
         let quiet = inner.clock.last_activity.elapsed().as_secs();
         let has_open_ask = has_blocking_perm_ask(app, &inner.ask_dir, inner.thread_id);
@@ -4157,14 +4233,104 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
             has_open_ask,
             !inner.tool_rows.is_empty(),
         );
-        (inner.thread_id, inner.session_id, inner.ask_dir.clone(), act)
+        (
+            inner.thread_id,
+            inner.session_id,
+            inner.ask_dir.clone(),
+            act,
+            inner.turn_id,
+        )
     };
     if !act {
         return false;
     }
     let _ = interrupt(app, eng).await;
-    if let Some(c) = eng.lock().await.codex_client.take() {
+    // Bind the taken client to a local BEFORE branching on it: `if let Some(c)
+    // = eng.lock().await.codex_client.take() { .. }` would extend the
+    // temporary `MutexGuard`'s scope over the whole if-let body (Rust's
+    // temporary-lifetime-extension for an `if let` scrutinee), and the fresh
+    // `eng.lock().await` the reset below needs would then self-deadlock
+    // against that still-held guard.
+    let taken_client = { eng.lock().await.codex_client.take() };
+    if let Some(c) = taken_client {
         c.shutdown().await;
+        // Round-2 P1: this shutdown makes codex_consumer's own disconnect
+        // cleanup skip itself — see `reset_frozen_appserver_turn`'s doc for
+        // why, and why the reset below (not `cleanup_disconnected_turn`) is
+        // the correct replacement.
+        let drain = {
+            let mut inner = eng.lock().await;
+            reset_frozen_appserver_turn(&mut inner, turn_id)
+        };
+        if let Some(drain) = drain {
+            if let Some(db) = app.try_state::<Db>() {
+                persist_activity(&db, session_id, thread_id, "idle").await;
+                // Mirrors `cleanup_disconnected_turn`'s own use of this helper:
+                // finalize whichever open row already exists (`current`), or —
+                // if the turn produced no visible output at all before it
+                // froze — insert a placeholder terminal row so the timeline
+                // doesn't just dangle with no reply and no error marker.
+                // `had_busy_turn` is unconditionally true here — this whole
+                // branch only runs when `reset_frozen_appserver_turn` matched
+                // a genuinely busy turn — so only `had_orphan_texts` gates it.
+                let had_orphan_texts = !drain.orphan_texts.is_empty() || drain.turn_saw_text;
+                if let Ok(Some(row)) = persist_disconnected_turn_row(
+                    &db,
+                    thread_id,
+                    session_id,
+                    turn_id,
+                    "interrupted",
+                    !had_orphan_texts,
+                    drain.current,
+                )
+                .await
+                {
+                    match row {
+                        DisconnectedTurnRow::Finalized { message_id } => {
+                            emit_finalize(app, thread_id, message_id, "interrupted");
+                        }
+                        DisconnectedTurnRow::Inserted(message) => {
+                            let _ = app.emit(EVENT, Push::Message { thread_id, message });
+                        }
+                    }
+                }
+                // Item-keyed open rows freeze like `current`: raw text + terminal
+                // status (mirrors cleanup_disconnected_turn's disconnect handling).
+                for (id, text) in drain.orphan_texts {
+                    let _ = repo::update_lead_message(
+                        &db,
+                        id,
+                        &serde_json::json!({ "text": text }).to_string(),
+                        "interrupted",
+                    )
+                    .await;
+                    emit_finalize(app, thread_id, id, "interrupted");
+                }
+                finalize_orphan_tool_rows(app, &db, thread_id, drain.orphan_tools, "interrupted")
+                    .await;
+                if !drain.drained_queue.is_empty() {
+                    match repo::set_queued_status_by_ids(&db, &drain.drained_queue, "interrupted")
+                        .await
+                    {
+                        Ok(rows) => {
+                            for m in rows {
+                                emit_finalize(app, thread_id, m.id, "interrupted");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[weft] turn-freeze recovery: queue finalize failed: {e}");
+                        }
+                    }
+                }
+            }
+            // Tell the frontend the turn is over — nothing else will: the
+            // watchdog sweep's own idle transition (which observes `busy` on
+            // its NEXT tick) only reconciles watchdog-owned bookkeeping
+            // (stall notice / freeze_handled), it never pushes a Turn event
+            // itself, on the assumption that whatever ended the turn already
+            // did. Here, we are that "whatever".
+            emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
+        }
     }
     if let Some(db) = app.try_state::<Db>() {
         if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
@@ -6722,6 +6888,99 @@ mod tests {
 
         assert!(reset_failed_hidden_turn(&mut inner, old_turn).is_none());
         assert!(inner.turn.busy);
+    }
+
+    /// Round-2 P1 regression (PR #118): `recover_from_freeze`'s app-server
+    /// reset must actually clear `busy`/`tool_rows`/`current`/`open_texts`/
+    /// `interrupting` — the exact fields `codex_consumer`'s (deliberately
+    /// skipped, see `still_active`) disconnect cleanup would have cleared —
+    /// so a subsequent send is NOT silently queued forever behind a turn
+    /// that will never end. `try_begin_send` is the actual decision point
+    /// `send()` uses to choose "write now" vs "enqueue"; asserting it
+    /// returns true here is the literal ask from review round 2.
+    #[test]
+    fn reset_frozen_appserver_turn_clears_state_and_unblocks_next_send() {
+        let mut inner = test_inner("codex");
+        inner.turn.busy = true;
+        inner.turn_id = 5;
+        inner.interrupting = true; // set by `interrupt()` just before this fires
+        inner.current_origin_tag = Some("im-reply-target".into());
+        inner.current = Some((10, "partial reply".into(), std::time::Instant::now()));
+        inner.open_texts.insert(
+            "item-1".into(),
+            (11, "parallel stream".into(), std::time::Instant::now()),
+        );
+        inner
+            .tool_rows
+            .insert("call-1".into(), (12, serde_json::json!({"tool": "bash"})));
+        inner.turn.queue.push_back(Outgoing {
+            text: "follow-up sent during the freeze".into(),
+            images: vec![],
+            tracked: true,
+            origin_tag: None,
+            queue_id: Some(99),
+            has_attachments: false,
+        });
+
+        let drain = reset_frozen_appserver_turn(&mut inner, 5).expect("same turn, still busy");
+
+        // Idle and resumable, NOT stop_quiet's harder `stopped=true` state.
+        assert!(!inner.turn.busy);
+        assert!(!inner.stopped);
+        assert!(!inner.interrupting);
+        assert!(inner.tool_rows.is_empty());
+        assert!(inner.open_texts.is_empty());
+        assert!(inner.current.is_none());
+        assert!(inner.turn.queue.is_empty());
+        assert!(inner.current_origin_tag.is_none());
+        // "Continuity reset", not a STOP: reset_epoch stays put so an
+        // in-flight Phase 1 -> Phase 3 send still promotes cleanly onto this
+        // fresh idle engine instead of being invalidated (see the doc
+        // comment on `reset_frozen_appserver_turn`).
+        assert_eq!(inner.reset_epoch, 0);
+        // The literal ask from review round 2: a subsequent send must NOT be
+        // silently queued behind the (now-abandoned) frozen turn.
+        assert!(inner.turn.try_begin_send());
+
+        assert_eq!(drain.current, Some((10, "partial reply".into())));
+        assert_eq!(drain.orphan_texts, vec![(11, "parallel stream".into())]);
+        assert_eq!(
+            drain.orphan_tools,
+            vec![(12, serde_json::json!({"tool": "bash"}))]
+        );
+        assert_eq!(drain.drained_queue, vec![99]);
+    }
+
+    /// A very-delayed clean TurnEnd (or a promoted queued send) can advance
+    /// `turn_id` while `interrupt()`'s RPC is still in flight — its ~120s
+    /// worst case is the whole reason this recovery path exists. The reset
+    /// must not destroy a newer, unrelated turn's state.
+    #[test]
+    fn reset_frozen_appserver_turn_ignores_a_newer_turn() {
+        let mut inner = test_inner("codex");
+        inner.turn.busy = true;
+        inner.turn_id = 6;
+        inner
+            .tool_rows
+            .insert("call-1".into(), (1, serde_json::json!({"tool": "bash"})));
+
+        assert!(reset_frozen_appserver_turn(&mut inner, 5).is_none());
+
+        assert!(inner.turn.busy);
+        assert!(!inner.tool_rows.is_empty());
+    }
+
+    /// The frozen turn may have ended cleanly on its own (a delayed TurnEnd
+    /// landing between the freeze verdict and this reset running) — the
+    /// normal TurnEnd handler already reset everything correctly in that
+    /// case, so this must be a no-op rather than a redundant/conflicting one.
+    #[test]
+    fn reset_frozen_appserver_turn_ignores_an_already_idle_turn() {
+        let mut inner = test_inner("codex");
+        inner.turn_id = 5;
+        inner.turn.busy = false;
+
+        assert!(reset_frozen_appserver_turn(&mut inner, 5).is_none());
     }
 
     #[tokio::test]
