@@ -632,6 +632,15 @@ export interface ThreadOverview {
   write_repos: { id: number; name: string }[];
 }
 
+/** A permission ask's danger tier for one-glance triage in an authorization
+ * storm (issue #101). Computed ONCE, server-side, by `classify_risk`
+ * (`src-tauri/src/ask.rs`) — the single place this judgment is made; the
+ * frontend only maps this value to a color/label (`RISK_STYLE` in
+ * `ConfirmationCard.tsx`), it never re-derives the verdict. `unknown` is the
+ * HONEST fallback when the classifier can't tell — never a stand-in for
+ * "probably safe". */
+export type RiskLevel = "read_only" | "write" | "network_or_credential" | "unknown";
+
 /** A tool's permission request, blocked on the human (the Ask Bridge §4.3). */
 export interface PermissionAsk {
   id: number;
@@ -640,6 +649,8 @@ export interface PermissionAsk {
   tool: string;
   summary: string;
   detail: string;
+  /** see `RiskLevel` — issue #101. */
+  risk: RiskLevel;
   ts: number;
   /** owning thread title + asking task name, for context on the card. */
   thread_title: string;

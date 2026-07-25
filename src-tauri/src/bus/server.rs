@@ -104,7 +104,7 @@ async fn handle_ask(
         }
     }
 
-    let (summary, detail, action_key) = summarize(tool_name, req.get("tool_input"));
+    let (summary, detail, risk, action_key) = summarize(tool_name, req.get("tool_input"));
 
     // A standing rule (full access / always-allow) decides without surfacing.
     // Matches on the canonical action_key, NOT the (possibly lossy) summary.
@@ -112,7 +112,7 @@ async fn handle_ask(
         return hook_decision("allow", "Auto-approved by a weft rule");
     }
 
-    let (id, rx) = asks.request(thread, &dir, tool, &summary, &detail, &action_key);
+    let (id, rx) = asks.request(thread, &dir, tool, &summary, &detail, risk, &action_key);
 
     match tokio::time::timeout(ASK_WAIT, rx).await {
         Ok(Ok(decision)) => {
@@ -257,16 +257,20 @@ fn hook_decision(decision: &str, reason: &str) -> Response {
     .into_response()
 }
 
-/// A short human label + raw detail + canonical action key for a tool action.
-/// Tool-agnostic across claude (Bash / file_path) and opencode (bash / filePath,
-/// lowercase names): a command reads as "Run: …", a file op as "<tool> <file>".
+/// A short human label + raw detail + danger tier + canonical action key for a
+/// tool action. Tool-agnostic across claude (Bash / file_path) and opencode
+/// (bash / filePath, lowercase names): a command reads as "Run: …", a file op
+/// as "<tool> <file>".
 ///
-/// Returns `(summary, detail, action_key)`: `summary` is a compact DISPLAY label
-/// that MAY truncate (a multi-line command's first line, a bare MCP tool name);
-/// `detail` is the FULL raw content (untruncated — shown in the detail tooltip /
-/// IM plain-text card); `action_key` is the EXACT action identity used ONLY for
-/// Always-grant matching (`auto_decision`), never shown to the human — a later
-/// ask sharing `summary` but not `action_key` must NOT auto-allow (issue #89).
+/// Returns `(summary, detail, risk, action_key)`: `summary` is a compact
+/// DISPLAY label that MAY truncate (a multi-line command's first line, a bare
+/// MCP tool name); `detail` is the FULL raw content (untruncated — shown in
+/// the detail tooltip / IM plain-text card); `risk` is the danger tier for
+/// the human's one-glance triage, computed by the single shared
+/// `crate::ask::classify_risk` (issue #101); `action_key` is the EXACT action
+/// identity used ONLY for Always-grant matching (`auto_decision`), never
+/// shown to the human — a later ask sharing `summary` but not `action_key`
+/// must NOT auto-allow (issue #89).
 ///
 /// Each branch tags its `action_key` with a fixed literal kind ("cmd" / "file" /
 /// "mcp") via `crate::ask::action_key`, THEN folds in `tool_name` and the exact
@@ -277,7 +281,10 @@ fn hook_decision(decision: &str, reason: &str) -> Response {
 /// matched, letting an Always for one silently cover the other (see #89's
 /// round-2 finding — a fresh instance of the exact over-broad-match bug this
 /// issue exists to eliminate).
-fn summarize(tool_name: &str, input: Option<&Value>) -> (String, String, String) {
+fn summarize(
+    tool_name: &str,
+    input: Option<&Value>,
+) -> (String, String, crate::ask::RiskLevel, String) {
     let s = |k: &str| {
         input
             .and_then(|v| v.get(k))
@@ -288,24 +295,34 @@ fn summarize(tool_name: &str, input: Option<&Value>) -> (String, String, String)
         let first = cmd.lines().next().unwrap_or("").to_string();
         // action_key = the full, untruncated command — a later line differing
         // (e.g. a multi-line command sharing only its first line) is a DIFFERENT
-        // action even though `summary` collides.
+        // action even though `summary` collides. `risk` scans that SAME full
+        // text, so a dangerous second line still raises the tier.
         let action_key = crate::ask::action_key(&["cmd", tool_name, &cmd]);
-        return (format!("Run: {first}"), cmd, action_key);
+        let risk = crate::ask::classify_risk(crate::ask::RiskSignal::Command(&cmd));
+        return (format!("Run: {first}"), cmd, risk, action_key);
     }
     if let Some(f) = s("file_path").or_else(|| s("filePath")) {
         // action_key folds in the tool name too: `Read` and `Write` on the same
         // path are different actions, even though both already show the full
         // (untruncated) path in `summary` today.
         let action_key = crate::ask::action_key(&["file", tool_name, &f]);
-        return (format!("{tool_name} {f}"), f.clone(), action_key);
+        let risk = crate::ask::classify_risk(crate::ask::RiskSignal::File {
+            tool_name,
+            path: &f,
+        });
+        return (format!("{tool_name} {f}"), f.clone(), risk, action_key);
     }
     let detail = input.map(|v| v.to_string()).unwrap_or_default();
     // MCP/fallback ask: `summary` is just the bare tool name (lossy for
     // display — e.g. "WebFetch"), but `action_key` folds in the full args so two
     // calls to the same tool with different args are different actions (issue
-    // #89's MCP tool-name-fallback case).
+    // #89's MCP tool-name-fallback case). `risk` scans the same full args text.
     let action_key = crate::ask::action_key(&["mcp", tool_name, &detail]);
-    (tool_name.to_string(), detail, action_key)
+    let risk = crate::ask::classify_risk(crate::ask::RiskSignal::Other {
+        tool_name,
+        args_text: &detail,
+    });
+    (tool_name.to_string(), detail, risk, action_key)
 }
 
 async fn get_not_allowed() -> StatusCode {
@@ -1028,6 +1045,7 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::{is_weft_internal_tool, session_servers_for_kind, summarize};
+    use crate::ask::RiskLevel;
     use serde_json::json;
 
     /// Issue #89: a Claude/opencode multi-line command truncates `summary` to
@@ -1036,15 +1054,18 @@ mod tests {
     #[test]
     fn summarize_command_action_key_is_full_command_not_first_line() {
         let input = json!({"command": "npm test\nrm -rf /"});
-        let (summary, detail, action_key) = summarize("Bash", Some(&input));
+        let (summary, detail, risk, action_key) = summarize("Bash", Some(&input));
         assert_eq!(summary, "Run: npm test"); // display: first line only
         assert_eq!(detail, "npm test\nrm -rf /"); // full command, untruncated
         assert!(action_key.contains("rm -rf /")); // match key carries the WHOLE command
+        // issue #101: an unrecognized shell command is never waved through as
+        // read-only.
+        assert_eq!(risk, RiskLevel::Write);
 
         // A different multi-line command sharing the same first line must yield a
         // DIFFERENT action_key even though `summary` collides.
         let other = json!({"command": "npm test\necho safe"});
-        let (summary2, _detail2, action_key2) = summarize("Bash", Some(&other));
+        let (summary2, _detail2, _risk2, action_key2) = summarize("Bash", Some(&other));
         assert_eq!(summary2, summary, "both display as \"Run: npm test\"");
         assert_ne!(action_key2, action_key);
     }
@@ -1056,21 +1077,26 @@ mod tests {
     fn summarize_mcp_fallback_action_key_includes_full_args() {
         let a = json!({"url": "https://safe.example"});
         let b = json!({"url": "https://evil.example"});
-        let (summary_a, _da, key_a) = summarize("WebFetch", Some(&a));
-        let (summary_b, _db, key_b) = summarize("WebFetch", Some(&b));
+        let (summary_a, _da, risk_a, key_a) = summarize("WebFetch", Some(&a));
+        let (summary_b, _db, _risk_b, key_b) = summarize("WebFetch", Some(&b));
         assert_eq!(summary_a, "WebFetch"); // lossy tool-name-only display
         assert_eq!(summary_a, summary_b, "both display as just the tool name");
         assert_ne!(key_a, key_b, "different args must yield different action keys");
+        // issue #101: WebFetch is network access regardless of the URL's args.
+        assert_eq!(risk_a, RiskLevel::NetworkOrCredential);
     }
 
     /// A file-op action_key folds in the tool name: reading and writing the same
-    /// path are different actions.
+    /// path are different actions. issue #101: risk also follows the tool name
+    /// (Read is read-only, Write is a write) for the SAME path.
     #[test]
     fn summarize_file_op_action_key_distinguishes_tool() {
         let input = json!({"file_path": "/tmp/x"});
-        let (_s_read, _d_read, key_read) = summarize("Read", Some(&input));
-        let (_s_write, _d_write, key_write) = summarize("Write", Some(&input));
+        let (_s_read, _d_read, risk_read, key_read) = summarize("Read", Some(&input));
+        let (_s_write, _d_write, risk_write, key_write) = summarize("Write", Some(&input));
         assert_ne!(key_read, key_write);
+        assert_eq!(risk_read, RiskLevel::ReadOnly);
+        assert_eq!(risk_write, RiskLevel::Write);
     }
 
     /// Round-2 finding: a naive `format!("{tool_name}:{content}")` join lets an
@@ -1086,8 +1112,8 @@ mod tests {
     fn summarize_cross_branch_same_tool_and_content_does_not_collide() {
         let cmd_input = json!({"command": "X"});
         let file_input = json!({"file_path": "X"});
-        let (_sc, _dc, cmd_key) = summarize("SameTool", Some(&cmd_input));
-        let (_sf, _df, file_key) = summarize("SameTool", Some(&file_input));
+        let (_sc, _dc, _rc, cmd_key) = summarize("SameTool", Some(&cmd_input));
+        let (_sf, _df, _rf, file_key) = summarize("SameTool", Some(&file_input));
         assert_ne!(cmd_key, file_key);
     }
 

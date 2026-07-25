@@ -609,6 +609,7 @@ pub fn global_specs() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ask::RiskLevel;
     use crate::store::Db;
 
     async fn mem_db() -> Db {
@@ -670,7 +671,15 @@ mod tests {
         let t = repo::create_thread(&db, w.id, "登录修复", "bugfix", "claude")
             .await
             .unwrap();
-        let (id, _rx) = asks.request(t.id, "10", "claude", "Run: npm test", "npm test", "npm test");
+        let (id, _rx) = asks.request(
+            t.id,
+            "10",
+            "claude",
+            "Run: npm test",
+            "npm test",
+            RiskLevel::Unknown,
+            "npm test",
+        );
         let v = call_global(&db, &asks, &bus, "pending_needs_you", &json!({})).await;
         let parsed: Value =
             serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -685,7 +694,15 @@ mod tests {
         let db = mem_db().await;
         let asks = AskRegistry::new();
         let bus = BusRegistry::new();
-        let (id, rx) = asks.request(1, "10", "claude", "Run: npm test", "npm test", "npm test");
+        let (id, rx) = asks.request(
+            1,
+            "10",
+            "claude",
+            "Run: npm test",
+            "npm test",
+            RiskLevel::Unknown,
+            "npm test",
+        );
         let v = call_global(
             &db,
             &asks,
@@ -706,7 +723,7 @@ mod tests {
         let db = mem_db().await;
         let asks = AskRegistry::new();
         let bus = BusRegistry::new();
-        let (id, _rx) = asks.request(1, "10", "claude", "x", "x", "x");
+        let (id, _rx) = asks.request(1, "10", "claude", "x", "x", RiskLevel::Unknown, "x");
         let v = call_global(
             &db,
             &asks,
@@ -728,8 +745,8 @@ mod tests {
         let t = repo::create_thread(&db, w.id, "issue", "feature", "claude")
             .await
             .unwrap();
-        let _ = asks.request(t.id, "10", "claude", "a", "a", "a");
-        let _ = asks.request(t.id, "10", "claude", "b", "b", "b");
+        let _ = asks.request(t.id, "10", "claude", "a", "a", RiskLevel::Unknown, "a");
+        let _ = asks.request(t.id, "10", "claude", "b", "b", RiskLevel::Unknown, "b");
         let v = call_global(
             &db,
             &asks,
