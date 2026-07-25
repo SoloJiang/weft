@@ -157,11 +157,12 @@ pub enum RiskSignal<'a> {
 }
 
 /// Substrings that mark network access or a credential, checked case-
-/// insensitively and (deliberately) anywhere in the text — these are already
+/// insensitively anywhere in the text. Most entries here are already
 /// distinctive enough as raw substrings (a URL scheme, a dotfile name, a
-/// full word like "password") that word-boundary matching would only add
-/// complexity, not precision. This is a UX heuristic for a quick glance, NOT
-/// a security boundary — the human's Allow/Deny (with the full args visible
+/// multi-word phrase) that word-boundary matching would only add complexity,
+/// not precision — but see the trailing block for two that are NOT (round-2
+/// review, issue #101). This is a UX heuristic for a quick glance, NOT a
+/// security boundary — the human's Allow/Deny (with the full args visible
 /// via `DetailPreview`) remains the real gate.
 const CRED_NET_MARKERS: &[&str] = &[
     "http://",
@@ -199,18 +200,42 @@ const CRED_NET_MARKERS: &[&str] = &[
     "password",
     "passwd",
     "secret",
-    "token",
     "credential",
-    // Not a URL/credential itself, but the clearest single word a permission-
-    // scope escalation (Codex's `{"network": ...}` shape) uses to say so —
-    // see `codex_approval_fields`'s final (Permission) branch.
-    "network",
+    // Round-2 review: additional credential-file/path markers the first
+    // pass missed — `/etc/shadow` (password hashes; `/etc/passwd` was
+    // already caught via the "passwd" substring above, but shadow was not),
+    // macOS Keychain, GnuPG, Docker's own credential store, shell history
+    // (often holds a pasted token), and Azure's CLI credential cache.
+    "/etc/shadow",
+    ".keychain-db",
+    ".gnupg/",
+    ".docker/config.json",
+    ".bash_history",
+    ".azure/",
+    // Round-2 review: bare "network"/"token" were REMOVED here — both are
+    // common, INNOCENT substrings of ordinary code paths in a coding-agent
+    // product (`src/network/mod.rs`, `tokenizer.py` both matched before this
+    // fix), so a raw substring check produced frequent false positives on
+    // the MOST severe tier, eroding trust in the badge exactly the way
+    // under-classifying would. These punctuation-anchored forms keep the
+    // signal — a JSON `"network":` key (Codex's own permission-scope shape,
+    // see `codex_approval_fields`'s final Permission branch); a
+    // `_token`-suffixed identifier (`$GITHUB_TOKEN`, `AUTH_TOKEN`); a
+    // `token=` shell assignment; a `"token":` JSON key — without matching a
+    // bare path segment or module/file name.
+    "\"network\":",
+    "_token",
+    "token=",
+    "\"token\":",
 ];
 
 /// Leading commands treated as read-only when they open a shell command that
-/// didn't already match `CRED_NET_MARKERS` — matched against the START of the
-/// (trimmed) command text so e.g. `"lsof"` doesn't false-match the `"ls"`
-/// entry (see `starts_with_command`).
+/// didn't already match `CRED_NET_MARKERS`, has NO shell control construct
+/// anywhere (see `has_shell_control`), and — for `find`/`git branch`, whose
+/// OWN flags decide destructiveness — isn't flagged destructive (see
+/// `find_is_destructive`/`git_branch_is_destructive`). Matched against the
+/// START of the (trimmed) command text so e.g. `"lsof"` doesn't false-match
+/// the `"ls"` entry (see `starts_with_command`).
 const READ_ONLY_COMMAND_WORDS: &[&str] = &[
     "ls",
     "cat",
@@ -237,7 +262,8 @@ const READ_ONLY_COMMAND_WORDS: &[&str] = &[
 
 /// Whole-word verbs (matched via `words`, NOT raw substring — so "runbook"
 /// doesn't false-match "run" and "dataset" doesn't false-match "set") that
-/// mark a tool name as mutating.
+/// mark a tool name — or, for `classify_other`, an MCP call's args (round-2
+/// review, issue #101 P0-b) — as mutating/destructive.
 const WRITE_TOOL_WORDS: &[&str] = &[
     "write",
     "edit",
@@ -274,6 +300,9 @@ const WRITE_TOOL_WORDS: &[&str] = &[
     "post",
     "put",
     "set",
+    // Round-2 review: a disk/database/index "format" op is destructive and
+    // wasn't covered by any existing verb (`format_disk`, `format_volume`).
+    "format",
 ];
 
 /// Whole-word verbs/nouns (matched via `words`) that mark a tool name as
@@ -348,20 +377,81 @@ fn has_word(words: &[String], list: &[&str]) -> bool {
     words.iter().any(|w| list.iter().any(|k| k == w))
 }
 
+/// Whether `text` (already lowercased) contains a shell control construct —
+/// a pipe, a `;`/`&`-separated sequence, backtick or `$(` command
+/// substitution, a `>`/`<` redirect, or more than one line. Round-2 review
+/// (issue #101 P0-a): the leading-word read-only allowlist below must NOT
+/// fire when ANY of these are present, even if the text starts with a safe
+/// word — `ls | rm -rf /tmp` still starts with "ls", but the pipe hands its
+/// output to `rm`; `ls\nrm -rf /` starts with "ls" too, but a second line
+/// can do anything (the SAME class of gap `action_key`/`risk` already treat
+/// a multi-line command's full text as one unit for elsewhere).
+fn has_shell_control(text: &str) -> bool {
+    let has_control_char = text
+        .chars()
+        .any(|c| matches!(c, '|' | ';' | '&' | '`' | '>' | '<' | '\n'));
+    has_control_char || text.contains("$(")
+}
+
+/// `find`'s OWN flags — not shell metacharacters — decide whether it's
+/// destructive: `-delete` removes every match outright, and
+/// `-exec`/`-execdir`/`-ok`/`-okdir` run an arbitrary command per match.
+/// `find . -exec rm -rf {} \;` also trips `has_shell_control` via its `;`,
+/// but `find . -name '*.tmp' -delete` has NO shell metacharacters at all —
+/// this flag check is the only signal that catches that form.
+fn find_is_destructive(trimmed: &str) -> bool {
+    const DESTRUCTIVE_FIND_FLAGS: &[&str] = &["-delete", "-exec", "-execdir", "-ok", "-okdir"];
+    DESTRUCTIVE_FIND_FLAGS.iter().any(|f| trimmed.contains(f))
+}
+
+/// `git branch`'s delete flags are what make it destructive — `git branch
+/// -a` (list) and `git branch feature-x` (create) are read-adjacent/low-
+/// risk, but `git branch -D important-work` force-removes one, with no
+/// shell metacharacter in sight. Matched as a whole whitespace-separated
+/// token (already lowercased upstream, so `-D` arrives as `-d`) so a branch
+/// NAME that happens to contain "delete" doesn't spuriously match.
+fn git_branch_is_destructive(trimmed: &str) -> bool {
+    trimmed
+        .split_whitespace()
+        .any(|tok| matches!(tok, "-d" | "--delete"))
+}
+
+/// Whether the (already lowercased) command text is safely read-only: no
+/// shell control construct anywhere, AND its leading word is a recognized
+/// read-only command, AND — for `find`/`git branch`, whose own flags decide
+/// destructiveness — it isn't flagged destructive.
+fn is_read_only_command(lower: &str) -> bool {
+    if has_shell_control(lower) {
+        return false;
+    }
+    let trimmed = lower.trim_start();
+    let Some(word) = READ_ONLY_COMMAND_WORDS
+        .iter()
+        .find(|w| starts_with_command(trimmed, w))
+    else {
+        return false;
+    };
+    if *word == "find" {
+        return !find_is_destructive(trimmed);
+    }
+    if *word == "git branch" {
+        return !git_branch_is_destructive(trimmed);
+    }
+    true
+}
+
 /// A shell command's tier: credential/network markers beat everything, a
-/// recognized read-only leading command is `ReadOnly`, and anything else
-/// defaults to `Write` — arbitrary shell is presumed capable of mutation, so
-/// an unrecognized command is never waved through as read-only.
+/// recognized read-only leading command (with no shell control construct and
+/// no destructive flag — see `is_read_only_command`) is `ReadOnly`, and
+/// anything else defaults to `Write` — arbitrary shell is presumed capable
+/// of mutation, so an unrecognized (or compound, or flagged-destructive)
+/// command is never waved through as read-only.
 fn classify_command(cmd: &str) -> RiskLevel {
     let lower = cmd.to_ascii_lowercase();
     if contains_marker(&lower, CRED_NET_MARKERS) {
         return RiskLevel::NetworkOrCredential;
     }
-    let trimmed = lower.trim_start();
-    if READ_ONLY_COMMAND_WORDS
-        .iter()
-        .any(|w| starts_with_command(trimmed, w))
-    {
+    if is_read_only_command(&lower) {
         return RiskLevel::ReadOnly;
     }
     RiskLevel::Write
@@ -394,8 +484,10 @@ fn classify_file(tool_name: &str, path: &str) -> RiskLevel {
 /// Any other tool call's tier (MCP tools, `WebFetch`/`WebSearch`/`TodoWrite`,
 /// a Codex permission-scope escalation, …): a couple of high-confidence
 /// exact-name overrides, then credential/network markers scanned across BOTH
-/// the tool name and its args (a secret/URL can show up in either), then the
-/// tool name's own read/write verb, else `Unknown`.
+/// the tool name and its args (a secret/URL can show up in either), then a
+/// write verb in EITHER the tool name OR the args (round-2 review, issue
+/// #101 P0-b — see below), then the tool name's own read-only verb, else
+/// `Unknown`.
 fn classify_other(tool_name: &str, args_text: &str) -> RiskLevel {
     // High-confidence overrides for common built-ins that would otherwise be
     // UNDER-classified by the generic scan below: both tokenize to a word
@@ -413,11 +505,22 @@ fn classify_other(tool_name: &str, args_text: &str) -> RiskLevel {
     if contains_marker(&haystack, CRED_NET_MARKERS) {
         return RiskLevel::NetworkOrCredential;
     }
-    let w = words(tool_name);
-    if has_word(&w, WRITE_TOOL_WORDS) {
+    let name_words = words(tool_name);
+    // `tool_name` is a deliberate, structured identifier; `args_text` is
+    // arbitrary content the MCP SERVER controls — issue #101's own
+    // motivating scenario is a bare tool name (`get_status`) that reveals
+    // nothing while its args say `{"action":"format_disk"}`. A write verb
+    // ANYWHERE in the args must be able to UPGRADE the verdict: the tool
+    // name is fully attacker/server-controlled and must never silently
+    // override a destructive signal sitting right there in the args. This is
+    // upgrade-only — args are scanned against WRITE_TOOL_WORDS only, never
+    // against READ_ONLY_TOOL_WORDS, so they can push the tier UP toward
+    // Write but never pull it down toward ReadOnly.
+    let args_words = words(args_text);
+    if has_word(&name_words, WRITE_TOOL_WORDS) || has_word(&args_words, WRITE_TOOL_WORDS) {
         return RiskLevel::Write;
     }
-    if has_word(&w, READ_ONLY_TOOL_WORDS) {
+    if has_word(&name_words, READ_ONLY_TOOL_WORDS) {
         return RiskLevel::ReadOnly;
     }
     RiskLevel::Unknown
@@ -1217,6 +1320,83 @@ mod tests {
         }
     }
 
+    // ---- round-2 adversarial review (issue #101 P0-a): a leading-word
+    // allowlist alone ignores shell metacharacters and destructive flags —
+    // every example below was independently compiled and run against the
+    // PRE-fix code, confirmed ReadOnly, before this fix landed. ----------
+
+    #[test]
+    fn command_shell_control_constructs_disqualify_the_read_only_allowlist() {
+        // Each of these starts with (or contains) a safe leading word, but a
+        // pipe/chain/redirect/substitution hands control to something else.
+        for cmd in [
+            "ls | rm -rf /tmp/x",
+            "ls ; rm -rf ~",
+            "ls && rm -rf /",
+            "echo evil > ~/.bashrc",
+            "echo hi $(rm -rf ~)",
+            "grep -l TODO -r . | xargs rm",
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::ReadOnly,
+                "{cmd:?} must not be read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn command_find_delete_and_exec_are_not_read_only() {
+        // No shell metacharacters in the `-delete` form — only `find`'s OWN
+        // flag says this is destructive.
+        for cmd in [
+            "find . -name '*.tmp' -delete",
+            r"find . -exec rm -rf {} \;",
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::ReadOnly,
+                "{cmd:?} must not be read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn command_git_branch_delete_is_not_read_only_but_list_still_is() {
+        assert_ne!(
+            classify_risk(RiskSignal::Command("git branch -D important-work")),
+            RiskLevel::ReadOnly
+        );
+        // The flag-aware check must not overcorrect into flagging EVERY
+        // `git branch` invocation — listing/creating are genuinely low-risk,
+        // and this codebase's own `git_branch_is_destructive` must leave
+        // them alone (P2's "more precise, not just stricter" concern).
+        assert_eq!(
+            classify_risk(RiskSignal::Command("git branch -a")),
+            RiskLevel::ReadOnly
+        );
+    }
+
+    #[test]
+    fn cred_net_markers_cover_shadow_keychain_gnupg_docker_history_azure() {
+        // issue #101 round-2 P1: these credential-shaped paths were gaps in
+        // the first pass.
+        for cmd in [
+            "cat /etc/shadow",
+            "cat ~/Library/Keychains/login.keychain-db",
+            "tar -czf backup.tar.gz ~/.gnupg/",
+            "cat ~/.docker/config.json",
+            "cat ~/.bash_history",
+            "ls ~/.azure/",
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::NetworkOrCredential,
+                "{cmd:?} should be network/credential"
+            );
+        }
+    }
+
     #[test]
     fn file_credential_shaped_path_wins_regardless_of_tool_name() {
         // Even a plain Read is sensitive when the path IS the secret.
@@ -1260,6 +1440,30 @@ mod tests {
             }),
             RiskLevel::Unknown
         );
+    }
+
+    // ---- round-2 adversarial review (issue #101 P2): a raw substring check
+    // on "network"/"token" flagged ordinary code paths as the MOST severe
+    // tier — independently compiled and run against the PRE-fix code,
+    // confirmed NetworkOrCredential, before this fix landed. A coding agent
+    // reads paths like these constantly; over-flagging erodes trust in the
+    // badge exactly like under-flagging would. ---------------------------
+
+    #[test]
+    fn file_read_on_network_or_tokenizer_paths_is_not_a_false_positive() {
+        for path in ["src/network/mod.rs", "src/nlp/tokenizer.py"] {
+            assert_ne!(
+                classify_risk(RiskSignal::File { tool_name: "Read", path }),
+                RiskLevel::NetworkOrCredential,
+                "{path:?} must not be flagged network/credential"
+            );
+            // These are plain source files with no write/read verb in their
+            // own name-shape — Read on them is exactly ReadOnly.
+            assert_eq!(
+                classify_risk(RiskSignal::File { tool_name: "Read", path }),
+                RiskLevel::ReadOnly
+            );
+        }
     }
 
     #[test]
@@ -1334,6 +1538,54 @@ mod tests {
         );
     }
 
+    // ---- round-2 adversarial review (issue #101 P0-b): `args_text` was
+    // never scanned for a write verb — an MCP tool NAME is fully
+    // attacker/server-controlled (this is issue #101's OWN motivating
+    // scenario: a bare tool name reveals nothing), so a reassuring name like
+    // "get_status" must not silently override a destructive verb sitting
+    // right there in the args. Every example below was independently
+    // compiled and run against the PRE-fix code, confirmed ReadOnly, before
+    // this fix landed. --------------------------------------------------
+
+    #[test]
+    fn other_args_write_verb_upgrades_a_reassuring_tool_name() {
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "get_status",
+                args_text: r#"{"action":"format_disk","target":"/dev/sda"}"#
+            }),
+            RiskLevel::Write
+        );
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "read_config",
+                args_text: r#"{"op":"delete_all_data"}"#
+            }),
+            RiskLevel::Write
+        );
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "list_items",
+                args_text: r#"{"sql":"DROP TABLE users;"}"#
+            }),
+            RiskLevel::Write
+        );
+    }
+
+    #[test]
+    fn other_args_write_verb_is_upgrade_only_never_a_downgrade() {
+        // A tool name that's ALREADY the most severe tier (credential/
+        // network) must not be pulled down by args that merely lack an
+        // explicit write verb.
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "WebFetch",
+                args_text: r#"{"url":"https://example.com"}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+    }
+
     #[test]
     fn other_unrecognized_tool_and_args_is_honestly_unknown() {
         // The issue's own motivating example: an MCP tool whose name and args
@@ -1356,6 +1608,71 @@ mod tests {
         assert_eq!(serde_json::to_string(&RiskLevel::ReadOnly).unwrap(), "\"read_only\"");
         assert_eq!(serde_json::to_string(&RiskLevel::Write).unwrap(), "\"write\"");
         assert_eq!(serde_json::to_string(&RiskLevel::Unknown).unwrap(), "\"unknown\"");
+    }
+
+    /// Round-2 adversarial review transcript (issue #101): every example the
+    /// review's own compiled-and-run counterexample script found broken,
+    /// re-run here with the fix in place and printed for the record. Run
+    /// with `cargo test --lib ask::tests::round_2_review_examples_transcript
+    /// -- --nocapture` to see the transcript; the `assert_ne!`/`assert_eq!`
+    /// calls are what actually GUARD each example (this is not just a
+    /// printout).
+    #[test]
+    fn round_2_review_examples_transcript() {
+        println!("\n--- issue #101 round-2 review: before/after transcript ---");
+
+        println!("\n[P0-a] shell metacharacters / destructive flags (must NOT be ReadOnly):");
+        for cmd in [
+            "ls | rm -rf /tmp/x",
+            "ls ; rm -rf ~",
+            "ls && rm -rf /",
+            "echo evil > ~/.bashrc",
+            "echo hi $(rm -rf ~)",
+            "find . -name '*.tmp' -delete",
+            r"find . -exec rm -rf {} \;",
+            "git branch -D important-work",
+            "grep -l TODO -r . | xargs rm",
+        ] {
+            let risk = classify_risk(RiskSignal::Command(cmd));
+            println!("  {cmd:?} -> {risk:?} (pre-fix: ReadOnly)");
+            assert_ne!(risk, RiskLevel::ReadOnly, "{cmd:?} regressed to ReadOnly");
+        }
+        // "cat /etc/shadow" needed a P1 marker, not just a P0-a fix — listed
+        // again below alongside its P1 siblings.
+
+        println!("\n[P0-b] args-only destructive signal (must be Write):");
+        for (tool_name, args_text) in [
+            ("get_status", r#"{"action":"format_disk","target":"/dev/sda"}"#),
+            ("read_config", r#"{"op":"delete_all_data"}"#),
+            ("list_items", r#"{"sql":"DROP TABLE users;"}"#),
+        ] {
+            let risk = classify_risk(RiskSignal::Other { tool_name, args_text });
+            println!("  {tool_name:?} args={args_text:?} -> {risk:?} (pre-fix: ReadOnly)");
+            assert_eq!(risk, RiskLevel::Write, "{tool_name:?}/{args_text:?} did not upgrade");
+        }
+
+        println!("\n[P1] missing credential-path markers (must be NetworkOrCredential):");
+        for cmd in [
+            "cat /etc/shadow",
+            "cat ~/Library/Keychains/login.keychain-db",
+            "tar -czf backup.tar.gz ~/.gnupg/",
+            "cat ~/.docker/config.json",
+            "cat ~/.bash_history",
+            "ls ~/.azure/",
+        ] {
+            let risk = classify_risk(RiskSignal::Command(cmd));
+            println!("  {cmd:?} -> {risk:?} (pre-fix: ReadOnly)");
+            assert_eq!(risk, RiskLevel::NetworkOrCredential, "{cmd:?} still not caught");
+        }
+
+        println!("\n[P2] over-broad substring false positives (must NOT be NetworkOrCredential):");
+        for path in ["src/network/mod.rs", "src/nlp/tokenizer.py"] {
+            let risk = classify_risk(RiskSignal::File { tool_name: "Read", path });
+            println!("  Read {path:?} -> {risk:?} (pre-fix: NetworkOrCredential)");
+            assert_ne!(risk, RiskLevel::NetworkOrCredential, "{path:?} still a false positive");
+        }
+
+        println!("\n--- transcript complete: every example above matches its post-fix expectation ---\n");
     }
 
     #[tokio::test]

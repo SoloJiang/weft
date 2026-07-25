@@ -281,7 +281,11 @@ fn hook_decision(decision: &str, reason: &str) -> Response {
 /// matched, letting an Always for one silently cover the other (see #89's
 /// round-2 finding — a fresh instance of the exact over-broad-match bug this
 /// issue exists to eliminate).
-fn summarize(
+// `pub(crate)` (not `pub`) — crate-internal only, but visible to
+// `lead_chat::engine`'s test module for the cross-engine consistency
+// regression test (issue #101 round-2 P3): the SAME command text must yield
+// the SAME `RiskLevel` from both `summarize` and `codex_approval_fields`.
+pub(crate) fn summarize(
     tool_name: &str,
     input: Option<&Value>,
 ) -> (String, String, crate::ask::RiskLevel, String) {

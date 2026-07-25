@@ -331,6 +331,7 @@ export const en = {
     riskNetworkOrCredentialTitle: "Leaves this machine or touches a credential — review closely",
     riskUnknown: "Unknown risk",
     riskUnknownTitle: "Couldn't classify this call — review the arguments before approving",
+    detailTruncated: "… {{n}} more characters truncated",
   },
   tool: {
     input: "Input",

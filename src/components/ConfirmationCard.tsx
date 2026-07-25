@@ -115,27 +115,61 @@ export function ConfirmationAction(props: ComponentProps<typeof Button>) {
 
 /** A visible (never hover-only) preview of an ask's full raw detail — see
  *  `hasHiddenDetail` below for why this must not be opt-in. Bounded height with
- *  its own scroll so a very long command/path list can't blow out the card. */
+ *  its own scroll so a very long command/path list can't blow out the card.
+ *  `formatDetail` is memoized on `detail` (round-2 review, issue #101
+ *  P2-optional): a JSON parse+stringify on every render is wasted work once
+ *  the ask stops changing — most re-renders here are from unrelated store
+ *  updates (timestamp ticking, sibling asks), not a new `detail`. The
+ *  truncation note is rendered here (not inside `formatDetail`, which is a
+ *  plain function with no i18n access) so it goes through `t()` like every
+ *  other user-facing string in this file. */
 function DetailPreview({ detail }: { readonly detail: string }) {
+  const { t } = useTranslation();
+  const { text, omittedChars } = useMemo(() => formatDetail(detail), [detail]);
   return (
     <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-[var(--radius-md)] border border-border/60 bg-bg px-2 py-1.5 font-mono text-[11px] leading-relaxed text-ink-muted">
-      {formatDetail(detail)}
+      {text}
+      {omittedChars > 0 && (
+        <span className="mt-1 block text-ink-faint">
+          {t("needs.detailTruncated", { n: omittedChars })}
+        </span>
+      )}
     </pre>
   );
 }
+
+/** Hard cap on rendered detail length (round-2 review, issue #101
+ *  P2-optional). `DetailPreview`'s `max-h-28 overflow-auto` already crops
+ *  the VISIBLE height, but that's CSS, not content — the underlying string
+ *  was otherwise unbounded, so a pathologically large args blob (a giant
+ *  pasted file, a huge code arg) still cost a full parse+stringify and put
+ *  the whole thing in the DOM. This bounds both; the truncation note (see
+ *  `DetailPreview`) makes clear there's more than what's shown. */
+const MAX_DETAIL_CHARS = 20_000;
 
 /** `detail` is the raw arg payload (issue #101: for an MCP ask this is the
  *  FULL args JSON, compact/single-line — see `hasHiddenDetail`). When it
  *  parses as JSON, pretty-print it so nested args read as an indented tree
  *  instead of one long wrapped line; anything else (a command, a path) is
  *  shown verbatim. Purely a rendering transform of the SAME `detail` string
- *  already carried end-to-end since #119 — no new data, no new channel. */
-function formatDetail(detail: string): string {
+ *  already carried end-to-end since #119 — no new data, no new channel.
+ *  Returns the (possibly truncated) text plus how many characters were cut,
+ *  so the caller can render a translated truncation note — this function
+ *  itself returns no user-facing string. */
+function formatDetail(detail: string): { text: string; omittedChars: number } {
+  let formatted: string;
   try {
-    return JSON.stringify(JSON.parse(detail), null, 2);
+    formatted = JSON.stringify(JSON.parse(detail), null, 2);
   } catch {
-    return detail;
+    formatted = detail;
   }
+  if (formatted.length <= MAX_DETAIL_CHARS) {
+    return { text: formatted, omittedChars: 0 };
+  }
+  return {
+    text: formatted.slice(0, MAX_DETAIL_CHARS),
+    omittedChars: formatted.length - MAX_DETAIL_CHARS,
+  };
 }
 
 /** issue #101: a permission ask's danger tier, mapped to the project's
