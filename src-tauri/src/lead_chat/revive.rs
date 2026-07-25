@@ -458,17 +458,21 @@ async fn stalled_direction_ids(
 /// Reads only — the marker is written by the engine's recovery path. This file
 /// still persists nothing of its own (stall/redrive state stays in memory).
 ///
-/// Depends on a WRITE-ORDER contract on that side: `recover_from_freeze` stamps
-/// the marker — and clears the native id beside it — before any of its writes
-/// expose a recoverable idle session. The session row and the marker are read
-/// in two separate awaits here, so were the stamp to move after the `idle`
-/// persist, a sweep interleaving between them would see an idle+native session
-/// with no marker and re-drive anyway — the exact case this window prevents.
-/// The paired clear is the fallback for a transient failure of either write:
-/// this predicate hides the session when the marker landed,
-/// [`stalled_direction_ids`]'s `native_session_id` check hides it when the
-/// clear landed. That pairing is deliberate and documented at the write site;
-/// don't reorder or separate them.
+/// Depends on TWO contracts on the writer's side, both in `recover_from_freeze`:
+///
+/// 1. Write order — the marker is stamped before any write that exposes a
+///    recoverable idle session. The session row and the marker are read in two
+///    separate awaits here, so were the stamp to move after the `idle` persist,
+///    a sweep interleaving between them would see an idle session with no
+///    marker and re-drive anyway, which is the exact case this window prevents.
+/// 2. The native-id clear is GATED on the stamp having succeeded. The marker is
+///    the sole evidence that distinguishes "never ran" from "ran, and the
+///    recovery cleared its id" ([`has_resumable_context`]), so clearing after a
+///    failed stamp would erase that evidence and strand the session for good.
+///
+/// The clear is NOT a second guard — an earlier revision of this PR paired them
+/// as mutual backups and that is reverted; `revive` no longer treats a missing
+/// native id as "not selectable" at all.
 /// Does this surface (lead or worker session) have orchestration context a
 /// re-drive can resume from? `native_id_present` is the stored id; `recovered`
 /// is its last turn-freeze recovery, if any.

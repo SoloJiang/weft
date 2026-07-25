@@ -1664,13 +1664,15 @@ pub async fn set_session_native_id_opt(
 /// no longer RIDES on that: it reads this marker directly, and has tests that
 /// go red if the read is removed.
 ///
-/// The native-id clear is still there, though — promoted from accident to
-/// deliberate backup. `recover_from_freeze` now issues both writes together,
-/// before it persists the session `idle`, so a transient failure of either one
-/// degrades to the other guard instead of to none (see the comment at that
-/// call site). The difference from before is that the marker is what CARRIES
-/// the rule and is tested as such; the clear is the fallback, not the
-/// mechanism.
+/// The native-id clear is still there, but it is NOT a second guard — `revive`
+/// deliberately stopped treating a missing native id as "not selectable",
+/// because that is what made a freeze-recovered session invisible to the
+/// re-drive forever instead of for one window. The dependency now runs the
+/// other way: `recover_from_freeze` clears the id ONLY if this row was
+/// stamped, since this row is the sole evidence separating "never ran" from
+/// "ran, and the recovery cleared its id" (`revive::has_resumable_context`).
+/// Clearing after a failed stamp would erase that evidence and strand the
+/// session permanently.
 pub async fn mark_turn_freeze_recovered(
     db: &Db,
     thread_id: i32,
