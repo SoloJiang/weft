@@ -119,7 +119,7 @@ pub fn spawn(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ask::{AlwaysGrant, Decision, FullGrant};
+    use crate::ask::{AlwaysGrant, Decision, FullGrant, RiskLevel};
 
     async fn mem() -> Db {
         Db::connect("sqlite::memory:").await.unwrap()
@@ -211,6 +211,7 @@ mod tests {
             "codex",
             "Run: cargo build",
             "cargo build",
+            RiskLevel::Unknown,
             "Run: cargo build",
         );
         assert!(asks.answer(id, crate::ask::Answer::Full));
@@ -242,6 +243,7 @@ mod tests {
             "codex",
             "Run: npm test",
             "npm test\necho a",
+            RiskLevel::Unknown,
             "npm test\necho a",
         );
         assert!(asks.answer(id, crate::ask::Answer::Always));
@@ -268,7 +270,7 @@ mod tests {
         let asks = AskRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         asks.set_persist_notifier(tx);
-        let (id, _rx) = asks.request(7, "42", "codex", "Run: x", "x", "Run: x");
+        let (id, _rx) = asks.request(7, "42", "codex", "Run: x", "x", RiskLevel::Unknown, "Run: x");
         assert!(asks.answer(id, crate::ask::Answer::Full));
         drain_once(&mut rx, &db).await;
 
@@ -336,7 +338,7 @@ mod tests {
 
         // grant then revoke BEFORE the writer starts — a stale {full} snapshot is now
         // queued ahead of the {} revoke, exactly the round-1 race window.
-        let (id, _rx) = asks.request(7, "42", "codex", "Run: x", "x", "Run: x");
+        let (id, _rx) = asks.request(7, "42", "codex", "Run: x", "x", RiskLevel::Unknown, "Run: x");
         assert!(asks.answer(id, crate::ask::Answer::Full)); // queues {full}
         asks.revoke_grant(7, "42", None); // queues {}
 
