@@ -226,17 +226,10 @@ const CRED_NET_MARKERS: &[&str] = &[
     // missed single-quoted pseudo-JSON and a space before the colon — see
     // `matches_cred_net`).
     //
-    // Round-4 review: `--token` is new here, and is deliberately DOUBLE-dashed.
-    // A single-dash `-token` would match the tail of an ordinary kebab-case
-    // source path (`src/auth/refresh-token.rs`) — precisely the false-positive
-    // class this list already refuses for bare "token" — whereas a path
-    // segment never carries a `--` prefix. It preserves the one credential
-    // shape round-4's narrowing of the args scan (see `classify_other`) would
-    // otherwise have dropped: a token passed as a POSITIONAL flag inside an
-    // args array, where there is no JSON key to anchor on.
+    // The `--token` CLI-flag shape is NOT a plain substring entry here — it
+    // needs an argument boundary after it, so it lives in `has_token_flag`.
     "_token",
     "token=",
-    "--token",
 ];
 
 /// Leading commands treated as read-only when they open a shell command that
@@ -608,8 +601,22 @@ fn json_keys(haystack: &str) -> Vec<&str> {
         // slices are always on char boundaries.
         if haystack[end + 1..].trim_start().starts_with(':') {
             keys.push(&haystack[start..end]);
+            // A confirmed key means these two quotes really were a matched
+            // pair, so it's safe to skip past the whole run.
+            i = end + 1;
+            continue;
         }
-        i = end + 1;
+        // NOT a key — which also means this pairing may have been spurious,
+        // so back off ONE character rather than consuming the run. Round-4
+        // review: in `it's here: {'network': true}` the apostrophe in "it's"
+        // pairs with the OPENING quote of `'network'`; jumping past that run
+        // swallowed the real key's opening quote and the credential-shaped
+        // key was never found (a recall regression against the round-3
+        // exact-key search this replaced). Backing off re-examines the quote
+        // at `end` as a potential opener, which is what finds it. This stays
+        // linear: each scan runs to the NEXT same-kind quote, so the total
+        // work telescopes to the length of the haystack.
+        i += 1;
     }
     keys
 }
@@ -636,17 +643,48 @@ fn has_cred_json_key(haystack: &str) -> bool {
         .any(|key| has_word(&words(key), CRED_KEY_WORDS))
 }
 
-/// The single check every `classify_*` function uses for "does this text
-/// show network access or a credential": the flat substring list PLUS the
-/// key-position check for credential-shaped JSON keys (round-3/round-4 —
-/// see `has_cred_json_key`). One function so command/file/other never drift
-/// apart on which of the two checks they remember to run.
+/// Whether `haystack_lower` passes a token as a COMPLETE `--token` long
+/// option (`--token sk-1`, `--token=sk-1`, `["--token", "sk-1"]`), as
+/// opposed to merely starting one.
 ///
-/// Pass the ORIGINAL-CASE text. The substring markers are matched case-
-/// insensitively (lowercased right here, so no caller has to remember), but
-/// the key check needs the original camelCase — see `has_cred_json_key`.
+/// This is the one credential shape with no JSON key to anchor on, so
+/// `classify_other`'s narrowing needs it — but it cannot be a plain
+/// `CRED_NET_MARKERS` substring. Round-4 review caught that a raw `--token`
+/// entry also fires on `--tokens 500` and `--tokenizer bpe`, ordinary
+/// LLM/NLP options, which both re-creates the exact false positive this
+/// whole change removes AND contradicts `CRED_KEY_WORDS`' deliberate refusal
+/// of plural `tokens`/`maxTokens`. An alphanumeric, `-`, or `_` directly
+/// after `--token` means a DIFFERENT option (`--token-file` is its own flag,
+/// not this one); anything else — whitespace, `=`, a quote, `,`, `]`, or end
+/// of input — is an argument boundary.
+///
+/// Deliberately double-dashed: a single-dash `-token` would match the tail
+/// of an ordinary kebab-case source path (`src/auth/refresh-token.rs`),
+/// while a path segment never carries a `--` prefix.
+fn has_token_flag(haystack_lower: &str) -> bool {
+    haystack_lower
+        .match_indices("--token")
+        .any(|(pos, m)| match haystack_lower[pos + m.len()..].chars().next() {
+            None => true,
+            Some(c) => !c.is_ascii_alphanumeric() && c != '-' && c != '_',
+        })
+}
+
+/// The single check every `classify_*` function uses for "does this text
+/// show network access or a credential": the flat substring list, the
+/// boundary-checked `--token` flag shape, and the key-position check for
+/// credential-shaped JSON keys (round-3/round-4 — see `has_cred_json_key`).
+/// One function so command/file/other never drift apart on which of the
+/// three checks they remember to run.
+///
+/// Pass the ORIGINAL-CASE text. The substring markers and the flag check are
+/// matched case-insensitively (lowercased right here, so no caller has to
+/// remember), but the key check needs the original camelCase — see
+/// `has_cred_json_key`.
 fn matches_cred_net(haystack: &str) -> bool {
-    contains_marker(&haystack.to_ascii_lowercase(), CRED_NET_MARKERS)
+    let lower = haystack.to_ascii_lowercase();
+    contains_marker(&lower, CRED_NET_MARKERS)
+        || has_token_flag(&lower)
         || has_cred_json_key(haystack)
 }
 
@@ -2163,6 +2201,66 @@ mod tests {
         // key after it.
         assert!(has_cred_json_key(r#"{"msg": "don't", "accessToken": "sk-1"}"#));
         assert!(has_cred_json_key(r#"it's here: {"network": true}"#));
+    }
+
+    #[test]
+    fn json_keys_finds_a_single_quoted_key_after_a_contraction() {
+        // Round-4 review: the apostrophe in "it's" pairs with the OPENING
+        // quote of `'network'`. Consuming that mispairing as a finished run
+        // swallowed the real key's opening quote and lost the key entirely —
+        // a recall regression against the round-3 exact-key search, and one
+        // the SAME-quote-kind case above (`it's` + a DOUBLE-quoted key) could
+        // not catch. Backing off one character on a non-key run finds it.
+        assert_eq!(json_keys(r#"it's here: {'network': true}"#), vec!["network"]);
+        assert!(has_cred_json_key(r#"it's here: {'network': true}"#));
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "get_status",
+                args_text: r#"it's here: {'network': true}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+        // The well-formed cases must not regress from the same change.
+        assert_eq!(
+            json_keys(r#"{"a": "token", "apiToken": "sk-1"}"#),
+            vec!["a", "apiToken"]
+        );
+    }
+
+    #[test]
+    fn token_flag_needs_an_argument_boundary() {
+        // Round-4 review: as a raw substring marker, `--token` also fired on
+        // `--tokens`/`--tokenizer` — ordinary LLM/NLP options — recreating
+        // the very false positive this change removes and contradicting
+        // CRED_KEY_WORDS' deliberate refusal of plural `tokens`/`maxTokens`.
+        for args_text in [
+            r#"{"args":["--tokens","500"]}"#,
+            r#"{"cmd":"llm --tokenizer bpe"}"#,
+            r#"{"args":["--token-file","/tmp/t"]}"#,
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} must not be flagged network/credential"
+            );
+        }
+        assert_ne!(
+            classify_risk(RiskSignal::Command("python train.py --tokens 500")),
+            RiskLevel::NetworkOrCredential
+        );
+        // Every real argument boundary still counts.
+        for args_text in [
+            r#"{"args":["--token","sk-1"]}"#,
+            r#"{"cmd":"deploy --token=sk-1"}"#,
+            r#"{"cmd":"deploy --token sk-1"}"#,
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} should be network/credential"
+            );
+        }
+        assert!(has_token_flag("deploy --token"));
     }
 
     #[test]
