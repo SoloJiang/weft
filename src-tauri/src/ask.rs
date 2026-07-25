@@ -662,12 +662,22 @@ fn has_cred_json_key(haystack: &str) -> bool {
 /// of an ordinary kebab-case source path (`src/auth/refresh-token.rs`),
 /// while a path segment never carries a `--` prefix.
 fn has_token_flag(haystack_lower: &str) -> bool {
-    haystack_lower
-        .match_indices("--token")
-        .any(|(pos, m)| match haystack_lower[pos + m.len()..].chars().next() {
+    haystack_lower.match_indices("--token").any(|(pos, m)| {
+        // A COMPLETE flag is bounded on BOTH sides. Leading side: an
+        // alphanumeric directly before the dashes means `--token` is the tail
+        // of something longer (`feature--token` is a branch name, not a flag).
+        let opens_a_flag = match haystack_lower[..pos].chars().next_back() {
+            None => true,
+            Some(c) => !c.is_ascii_alphanumeric(),
+        };
+        // Trailing side: an alphanumeric, `-`, or `_` means a DIFFERENT
+        // option (`--tokens`, `--tokenizer`, `--token-file`).
+        let ends_the_flag = match haystack_lower[pos + m.len()..].chars().next() {
             None => true,
             Some(c) => !c.is_ascii_alphanumeric() && c != '-' && c != '_',
-        })
+        };
+        opens_a_flag && ends_the_flag
+    })
 }
 
 /// The single check every `classify_*` function uses for "does this text
@@ -2237,6 +2247,10 @@ mod tests {
             r#"{"args":["--tokens","500"]}"#,
             r#"{"cmd":"llm --tokenizer bpe"}"#,
             r#"{"args":["--token-file","/tmp/t"]}"#,
+            r#"{"args":["--token_file","/tmp/t"]}"#,
+            // A complete flag is bounded on BOTH sides — this is a branch
+            // name whose tail happens to read as the flag.
+            r#"{"cmd":"git checkout feature--token"}"#,
         ] {
             assert_ne!(
                 classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
