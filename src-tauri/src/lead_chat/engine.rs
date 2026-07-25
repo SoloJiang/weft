@@ -3106,6 +3106,24 @@ async fn spawn_acp_turn(
                 return;
             }
         }
+        // Soft thinking chip for the pre-token gap. Many models (incl. current
+        // omp/grok) do not stream agent_thought_chunk; without this the UI only
+        // shows a generic "working" pulse until the first answer token.
+        {
+            let (thread_id, session_id) = {
+                let g = e.lock().await;
+                (g.thread_id, g.session_id)
+            };
+            let _ = a.emit(
+                EVENT,
+                Push::Activity {
+                    thread_id,
+                    session_id,
+                    name: "thinking".into(),
+                    summary: String::new(),
+                },
+            );
+        }
         match c.prompt(&s, &txt).await {
             Ok(outcome) => {
                 let (cancelled, stopped) = {
