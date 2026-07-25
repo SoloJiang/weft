@@ -182,7 +182,6 @@ export function LeadTab({
     // ref clicked during the fetch window would resolve against the old lead
     // workspace. Undefined cwd fails safe (relative paths report not-found).
     setLeadCwd(undefined);
-    setLeadResumeTarget(null);
     if (tid == null) return;
     let alive = true;
     void api
@@ -190,6 +189,23 @@ export function LeadTab({
       .then((st) => {
         if (!alive) return;
         setLeadCwd(st.cwd);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [tid]);
+
+  useEffect(() => {
+    if (tid == null) {
+      setLeadResumeTarget(null);
+      return;
+    }
+    let alive = true;
+    void api
+      .leadState(tid)
+      .then((st) => {
+        if (!alive) return;
         if (!st.native_id) {
           setLeadResumeTarget(null);
           return;
