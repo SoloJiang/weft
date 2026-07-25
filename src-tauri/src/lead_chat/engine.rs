@@ -421,6 +421,9 @@ fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> Option<Vec
     inner.clock.started = None;
     inner.current_origin_tag = None;
     inner.child = None;
+    // Dropping `child` kills it (kill_on_drop), so its session_gate slot must go
+    // with it — see `child_permit`'s doc for the leak this closes.
+    inner.child_permit = None;
     inner.stdin = None;
     inner.current = None;
     inner.interrupting = false;
@@ -1246,6 +1249,10 @@ async fn cleanup_disconnected_turn(
     let drained: Vec<i32> = inner.turn.queue.iter().filter_map(|o| o.queue_id).collect();
     inner.interrupting = false;
     inner.child = None;
+    // This reset carries STOP semantics (`stopped = true` below), so nothing
+    // will respawn a child until the human sends again — quite possibly never.
+    // The slot goes back with the process it belonged to.
+    inner.child_permit = None;
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
@@ -1498,10 +1505,23 @@ pub struct EngineInner {
     /// only deregisters (never reclaims).
     pub child_reg: Option<crate::proc_registry::Registration>,
     /// Active-session slot permit for `child` (paired with `child_reg`). Set at
-    /// every spawn right after registration; dropped exactly when `child` is
-    /// cleared (respawn overwrite / invalidate_resident / stop_quiet), which
-    /// releases the slot so a queued session can proceed. `None` = ungated
-    /// (session_gate degraded / no permit was available). See [`crate::session_gate`].
+    /// every spawn right after registration; dropped at EVERY site that clears
+    /// or replaces `child`, which releases the slot so a queued session can
+    /// proceed. Those sites, exhaustively: the respawn overwrite
+    /// (`ensure_running_locked` / `spawn_turn`), `invalidate_resident`,
+    /// `stop_quiet`, `cleanup_disconnected_turn`, `reset_failed_hidden_turn`,
+    /// `reset_frozen_appserver_turn`, and BOTH of `spawn_reader`'s EOF branches
+    /// (per-turn exit and resident death). Miss one and the slot leaks for the
+    /// rest of the process: the gate is a `OnceLock` singleton, so a session
+    /// that was stopped hours ago keeps counting against the ceiling until the
+    /// app restarts — see `stop_quiet_releases_the_session_gate_slot`.
+    ///
+    /// The pairing is directional both ways: a respawn must also release the
+    /// DEAD child's permit *before* queuing for a new one, or a saturated gate
+    /// leaves the session waiting on a slot it is itself still holding.
+    ///
+    /// `None` = ungated (session_gate degraded / no permit was available).
+    /// See [`crate::session_gate`].
     pub child_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     pub stdin: Option<ChildStdin>,
     /// Streaming assistant row being built: (row id, accumulated text, last DB flush).
@@ -1950,6 +1970,10 @@ async fn ensure_running_locked(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    // 先还旧槽,再排队要新的。走到这里 `child` 要么是 None、要么已被上面的
+    // try_wait 判定为死进程,它的 permit 是陈的;若留着不放就去 await 新槽,gate
+    // 打满时这个会话会卡在等一个它自己占着的槽上(自锁),得等别的会话结束才解开。
+    inner.child_permit = None;
     // 活跃会话软上限:拿一个会话槽,已满则在此排队等某个在跑的会话结束(与上面
     // admit_new_work 的总进程数硬闸互补——那个拒绝、这个排队,不丢会话)。
     let session_permit = crate::session_gate::acquire_session_slot().await;
@@ -2024,6 +2048,10 @@ pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
     if let Some(mut child) = inner.child.take() {
         let _ = child.start_kill();
     }
+    // The killed child's session_gate slot goes with it. Unconditional (not
+    // folded into the `if let`): a permit with no child left to represent is
+    // exactly the leak, whichever way `child` came to be None.
+    inner.child_permit = None;
 }
 
 /// Undo the turn reservation made by `send` Phase 1 when later persistence
@@ -4335,6 +4363,11 @@ fn reset_frozen_appserver_turn(inner: &mut EngineInner, turn_id: i32) -> Option<
     inner.interrupting = false;
     inner.current_origin_tag = None;
     inner.child = None;
+    // Inside the turn_id+busy guard on purpose: only the caller that OWNS this
+    // frozen turn may hand its slot back. Releasing outside the guard would drop
+    // a NEWER turn's permit while its child is still running (issue #118's whole
+    // point is that this path can fire late), under-counting the live gate.
+    inner.child_permit = None;
     inner.stdin = None;
     Some(FrozenTurnDrain {
         current,
@@ -4889,6 +4922,13 @@ pub async fn stop_quiet(
         c.shutdown().await;
     }
     inner.child = None;
+    // Hand the session_gate slot back on the explicit stop, not on the next
+    // spawn. "Stop" is a high-frequency button and a stopped session may never
+    // send again — holding its slot until a respawn that never comes is a leak
+    // for the life of the process (the gate is a `OnceLock` singleton), and it
+    // is exactly what the resource dashboard (issue #112) surfaces as an
+    // active-session count that never falls back to zero.
+    inner.child_permit = None;
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
@@ -6279,6 +6319,12 @@ fn spawn_reader(
                 );
             }
             inner.child = None;
+            // Sibling of the per-turn EOF release above: the resident claude
+            // process just died (crash, or the kill an `interrupt()` issued) and
+            // nothing respawns it until the next send — which may never come. Its
+            // slot has to go back now, or a session the user interrupted and then
+            // left alone counts as active forever.
+            inner.child_permit = None;
             inner.stdin = None;
             inner.turn = TurnState::default();
             inner.clock = TurnClock::default();
@@ -7508,6 +7554,125 @@ mod tests {
         // Still busy — this function never resets state when there's no
         // client to take; that stays the reader task's job for this dialect.
         assert!(eng.lock().await.turn.busy);
+    }
+
+    // ---- session_gate: a cleared `child` must hand its slot back ----
+    //
+    // `session_gate`'s own tests only cover the semaphore primitives; nothing
+    // asserted that the ENGINE actually releases what it acquires. That gap is
+    // what let `stop_quiet` / `invalidate_resident` / the resident-death and
+    // disconnect resets each keep a slot on a process they had just killed —
+    // permanently, since `gate()` is a process-wide `OnceLock` singleton.
+    // These tests measure the only thing a leak changes: whether the count
+    // comes back. They serialize on `gate_test_lock` because that shared static
+    // makes an exact before/after delta meaningless otherwise.
+
+    fn slots_used() -> usize {
+        crate::session_gate::active_session_slots().0
+    }
+
+    /// Take a real slot off the process-wide gate and park it exactly where a
+    /// spawn parks it, asserting the gate registered it — so a test that later
+    /// sees `baseline` is seeing a release, not a slot that was never taken.
+    async fn park_a_real_slot(inner: &mut EngineInner, baseline: usize) {
+        inner.child_permit = crate::session_gate::acquire_session_slot().await;
+        assert!(
+            inner.child_permit.is_some(),
+            "the gate must hand out a slot to test with"
+        );
+        assert_eq!(slots_used(), baseline + 1, "a live session holds a slot");
+    }
+
+    /// End-to-end, through the real `stop_quiet` that every explicit Stop
+    /// funnels into: after the stop, the gate is back where it started.
+    ///
+    /// The user-visible bug this pins: Stop is a high-frequency button, and a
+    /// stopped session may never send again. Holding its slot until a respawn
+    /// that never comes means the default ceiling of 8 erodes one ghost at a
+    /// time, and new sessions eventually queue behind sessions that ended
+    /// hours ago — with the resource dashboard (issue #112) reporting an
+    /// active-session count that never falls back.
+    #[tokio::test]
+    async fn stop_quiet_releases_the_session_gate_slot() {
+        let _serialized = crate::session_gate::gate_test_lock().lock().await;
+        let baseline = slots_used();
+        let mut inner = test_inner("claude");
+        park_a_real_slot(&mut inner, baseline).await;
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+
+        let _ = stop_quiet(&eng).await;
+
+        assert_eq!(
+            slots_used(),
+            baseline,
+            "an explicit stop must hand the slot back to the gate"
+        );
+        assert!(eng.lock().await.child_permit.is_none());
+    }
+
+    /// `invalidate_resident` kills a wedged resident so the next send respawns
+    /// clean. A resident whose stdin keeps timing out gets invalidated over and
+    /// over — one leaked slot per invalidation would exhaust the gate fastest
+    /// of all the leak sites.
+    #[tokio::test]
+    async fn invalidate_resident_releases_the_session_gate_slot() {
+        let _serialized = crate::session_gate::gate_test_lock().lock().await;
+        let baseline = slots_used();
+        let mut inner = test_inner("claude");
+        park_a_real_slot(&mut inner, baseline).await;
+
+        invalidate_resident(&mut inner);
+
+        assert_eq!(slots_used(), baseline, "the killed resident's slot comes back");
+        assert!(inner.child_permit.is_none());
+    }
+
+    /// A failed hidden turn drops `child` — which kills it, `kill_on_drop` —
+    /// so the slot goes too.
+    #[tokio::test]
+    async fn reset_failed_hidden_turn_releases_the_session_gate_slot() {
+        let _serialized = crate::session_gate::gate_test_lock().lock().await;
+        let baseline = slots_used();
+        let mut inner = test_inner("claude");
+        park_a_real_slot(&mut inner, baseline).await;
+        let turn_id = mark_hidden_turn_started(&mut inner);
+
+        assert!(reset_failed_hidden_turn(&mut inner, turn_id).is_some());
+
+        assert_eq!(slots_used(), baseline);
+        assert!(inner.child_permit.is_none());
+    }
+
+    /// The freeze recovery (#118) releases the slot INSIDE its turn_id+busy
+    /// guard. Both halves matter: the owned turn hands its slot back, and a
+    /// turn that advanced while the up-to-~120s `interrupt()` RPC was in flight
+    /// keeps its own — releasing outside the guard would free a slot whose
+    /// child is still running, under-counting the live gate instead of
+    /// over-counting it.
+    #[tokio::test]
+    async fn reset_frozen_appserver_turn_releases_the_slot_only_for_the_turn_it_owns() {
+        let _serialized = crate::session_gate::gate_test_lock().lock().await;
+        let baseline = slots_used();
+
+        let mut owned = test_inner("codex");
+        owned.turn.busy = true;
+        owned.turn_id = 5;
+        park_a_real_slot(&mut owned, baseline).await;
+        assert!(reset_frozen_appserver_turn(&mut owned, 5).is_some());
+        assert_eq!(slots_used(), baseline, "the frozen turn's slot comes back");
+        assert!(owned.child_permit.is_none());
+
+        let mut newer = test_inner("codex");
+        newer.turn.busy = true;
+        newer.turn_id = 6; // advanced past the turn_id=5 being recovered
+        park_a_real_slot(&mut newer, baseline).await;
+        assert!(reset_frozen_appserver_turn(&mut newer, 5).is_none());
+        assert_eq!(
+            slots_used(),
+            baseline + 1,
+            "a newer turn keeps the slot its child is still using"
+        );
+        assert!(newer.child_permit.is_some());
     }
 
     #[tokio::test]
