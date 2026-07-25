@@ -108,8 +108,9 @@ pub fn summary_from_params(params: &Value) -> (String, String) {
         .get("rawInput")
         .map(|r| r.to_string())
         .unwrap_or_default();
+    // Stable machine token — frontend i18n maps `acp.permission_required`.
     let summary = if title.is_empty() {
-        "Permission required".into()
+        "acp.permission_required".into()
     } else {
         title.to_string()
     };

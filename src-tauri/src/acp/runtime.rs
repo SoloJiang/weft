@@ -41,6 +41,8 @@ pub enum SessionEvent {
     Thought {
         text: String,
     },
+    /// Prompt-task → consumer ordering: consumer replies when this is dequeued.
+    DrainBarrier(tokio::sync::oneshot::Sender<()>),
     /// Permission needed — engine/runtime resolves via Ask and replies on the wire.
     /// Carries enough for the default handler; custom handlers may be installed later.
     Permission {
@@ -94,6 +96,9 @@ struct Inner {
     /// Sessions currently between session/new|resume and subscribe — only these
     /// may buffer pre-subscribe updates. Explicit unsubscribe drops the key.
     opening_sessions: std::collections::HashSet<String>,
+    /// True while a session/new|resume|load request is in flight — buffer any
+    /// session/update even before we know the sessionId.
+    expecting_session: bool,
     /// Generation of this child connection; read_loop only clears inner when
     /// its generation still owns the slot (writer-fail reconnect race).
     connection_gen: u64,
@@ -274,6 +279,7 @@ impl ClientHandle {
             permission_gen: 0,
             pending_updates: std::collections::HashMap::new(),
             opening_sessions: std::collections::HashSet::new(),
+            expecting_session: false,
             connection_gen,
             _child: child,
             _reg: reg,
@@ -342,11 +348,14 @@ impl ClientHandle {
                 Incoming::Skip => {}
             }
         }
-        // Only clear if we still own the slot — writer-fail may have taken
-        // inner and a reconnect spawned a newer generation on this handle.
+        // Stdout closed: tree-reap if we still own the slot. A writer-fail may
+        // have already taken inner and spawned a newer generation.
         let mut g = self.inner.lock().await;
         if g.as_ref().is_some_and(|i| i.connection_gen == connection_gen) {
-            *g = None;
+            if let Some(mut inner) = g.take() {
+                drop(g);
+                crate::proc_registry::reap(&mut inner._child, &inner._reg).await;
+            }
         }
     }
 
@@ -382,10 +391,13 @@ impl ClientHandle {
         if let Some(inner) = self.inner.lock().await.as_mut() {
             if let Some(route) = inner.sessions.get(sid) {
                 let _ = route.events.send(ev);
-            } else if !sid.is_empty() && inner.opening_sessions.contains(sid) {
-                // Buffer ONLY while open→subscribe is in flight. After explicit
-                // unsubscribe the session is not opening — drop late updates so
-                // a cancelled prompt cannot replay into the next turn.
+            } else if !sid.is_empty()
+                && (inner.opening_sessions.contains(sid) || inner.expecting_session)
+            {
+                // Buffer while open→subscribe is in flight OR a session/* RPC is
+                // outstanding (updates can race ahead of mark_opening). After
+                // explicit unsubscribe, expecting_session is false and the sid
+                // is not in opening_sessions — drop late updates.
                 const MAX_BUFFERED: usize = 64;
                 let buf = inner.pending_updates.entry(sid.to_string()).or_default();
                 if buf.len() < MAX_BUFFERED {
@@ -688,12 +700,29 @@ impl ClientHandle {
         }
     }
 
+    async fn set_expecting_session(&self, on: bool) {
+        if let Some(inner) = self.inner.lock().await.as_mut() {
+            inner.expecting_session = on;
+        }
+    }
+
+    /// Enqueue a session-scoped event (used for DrainBarrier). Returns false if
+    /// the route is gone.
+    pub async fn send_session_event(&self, session_id: &str, ev: SessionEvent) -> bool {
+        let g = self.inner.lock().await;
+        g.as_ref()
+            .and_then(|inner| inner.sessions.get(session_id))
+            .map(|route| route.events.send(ev).is_ok())
+            .unwrap_or(false)
+    }
+
     pub async fn new_session(
         &self,
         cwd: &Path,
         mcp: Vec<McpServerSpec>,
     ) -> anyhow::Result<SessionOpen> {
         let mcp_v = Self::paint_mcp(self.backend_id, mcp);
+        self.set_expecting_session(true).await;
         let result = self
             .request(
                 "session/new",
@@ -702,13 +731,27 @@ impl ClientHandle {
                     "mcpServers": mcp_v,
                 }),
             )
-            .await?;
-        let session_id = result
+            .await;
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_expecting_session(false).await;
+                return Err(e);
+            }
+        };
+        let session_id = match result
             .get("sessionId")
             .and_then(|s| s.as_str())
             .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("session/new missing sessionId"))?;
+        {
+            Some(id) => id,
+            None => {
+                self.set_expecting_session(false).await;
+                return Err(anyhow::anyhow!("session/new missing sessionId"));
+            }
+        };
         self.mark_opening(&session_id).await;
+        self.set_expecting_session(false).await;
         Ok(SessionOpen {
             session_id,
             model: config_option_current(&result, "model"),
@@ -724,6 +767,9 @@ impl ClientHandle {
         mcp: Vec<McpServerSpec>,
     ) -> anyhow::Result<SessionOpen> {
         let mcp_v = Self::paint_mcp(self.backend_id, mcp);
+        self.set_expecting_session(true).await;
+        // Pre-mark the known id so updates for this sid buffer immediately.
+        self.mark_opening(session_id).await;
         let result = self
             .request(
                 "session/resume",
@@ -733,13 +779,23 @@ impl ClientHandle {
                     "mcpServers": mcp_v,
                 }),
             )
-            .await?;
+            .await;
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_expecting_session(false).await;
+                return Err(e);
+            }
+        };
         let sid = result
             .get("sessionId")
             .and_then(|s| s.as_str())
             .unwrap_or(session_id)
             .to_string();
-        self.mark_opening(&sid).await;
+        if sid != session_id {
+            self.mark_opening(&sid).await;
+        }
+        self.set_expecting_session(false).await;
         Ok(SessionOpen {
             session_id: sid,
             model: config_option_current(&result, "model"),

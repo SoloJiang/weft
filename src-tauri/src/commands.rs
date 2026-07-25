@@ -1491,7 +1491,11 @@ pub async fn set_tool_command(
             "opencode" => crate::opencode::shutdown().await,
             "codex" => crate::codex_app_server::shutdown_global().await,
             t if crate::acp::backend_for(t).is_some() => {
-                crate::acp::runtime::shutdown(t).await;
+                // Shared ACP child serves all sessions for this backend. Command
+                // changes already set pending_command_refresh on engines so the
+                // bounce happens on the next idle send — never reap here or an
+                // in-flight prompt dies mid-turn.
+                let _ = t;
             }
             _ => {}
         }

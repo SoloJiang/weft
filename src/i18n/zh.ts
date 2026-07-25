@@ -291,6 +291,7 @@ export const zh = {
     blockedToast: "进程额度仍处于降级状态。消息已保留，请在恢复后重试。",
   },
   needs: {
+    acpPermissionRequired: "需要授权",
     title: "待你处理",
     subtitle: "只有你能回答的审批与提问",
     wantsPermission: "请求权限",

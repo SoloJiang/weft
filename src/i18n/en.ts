@@ -300,6 +300,7 @@ export const en = {
     blockedToast: "Process capacity is still constrained. Your message was kept; try again after recovery.",
   },
   needs: {
+    acpPermissionRequired: "Permission required",
     title: "Needs you",
     subtitle: "approvals and questions only you can answer",
     wantsPermission: "wants permission",

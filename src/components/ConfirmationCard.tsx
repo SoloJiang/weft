@@ -231,7 +231,9 @@ export function PermissionConfirmationCard({
                 className="ml-1.5 font-mono text-[11.5px] text-ink"
                 title={detailTitle}
               >
-                {ask.summary}
+                {ask.summary === "acp.permission_required"
+                  ? t("needs.acpPermissionRequired")
+                  : ask.summary}
               </span>
             )}
           </ConfirmationTitle>
@@ -247,7 +249,9 @@ export function PermissionConfirmationCard({
           className="truncate font-mono text-[13px] text-ink"
           title={detailTitle}
         >
-          {ask.summary}
+          {ask.summary === "acp.permission_required"
+            ? t("needs.acpPermissionRequired")
+            : ask.summary}
         </p>
       )}
       {isBlockSummary && hasHiddenDetail && <DetailPreview detail={ask.detail} />}

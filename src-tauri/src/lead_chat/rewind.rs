@@ -653,12 +653,22 @@ fn find_omp_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>
     let encoded = omp_encode_cwd(cwd);
     let mut candidates = Vec::new();
     let preferred = root.join(&encoded);
-    if preferred.is_dir() {
+    // Do not follow a symlink bucket (or entries): rewind must stay under
+    // ~/.omp/agent/sessions.
+    let preferred_ok = std::fs::symlink_metadata(&preferred)
+        .map(|m| m.is_dir() && !m.file_type().is_symlink())
+        .unwrap_or(false);
+    if preferred_ok {
         for e in std::fs::read_dir(&preferred)? {
             let e = e?;
+            let p = e.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             let name = e.file_name().to_string_lossy().into_owned();
             if name.contains(session_id) && name.ends_with(".jsonl") {
-                candidates.push(e.path());
+                candidates.push(p);
             }
         }
     }
@@ -1253,5 +1263,57 @@ mod tests {
         // paragraph: only allowed on the first user turn.
         assert!(omp_user_body_matches("sys\n\nrun tests", &want, true));
         assert!(!omp_user_body_matches("sys\n\nrun tests", &want, false));
+    }
+
+    #[test]
+    fn walkdir_jsonl_skips_symlinks_and_caps() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        // real hit
+        std::fs::write(root.join("sess-abc.jsonl"), "{}\n").unwrap();
+        // symlink file must be skipped
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(root.join("sess-abc.jsonl"), root.join("link-sess-abc.jsonl"));
+            // outside is a SIBLING of root, not a child — only reachable via symlink
+            let outside = dir.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("sess-abc-out.jsonl"), "{}\n").unwrap();
+            let _ = std::os::unix::fs::symlink(&outside, root.join("symdir"));
+        }
+        // artifact dir skipped
+        let nm = root.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(nm.join("sess-abc-nm.jsonl"), "{}\n").unwrap();
+        let hits = walkdir_jsonl(&root, "sess-abc").expect("walk");
+        let names: Vec<_> = hits.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
+        assert!(names.iter().any(|n| n == "sess-abc.jsonl"), "real hit: {names:?}");
+        assert!(names.iter().all(|n| n != "link-sess-abc.jsonl"), "symlink file skipped: {names:?}");
+        assert!(names.iter().all(|n| !n.contains("out")), "symlink dir not followed: {names:?}");
+        assert!(names.iter().all(|n| n != "sess-abc-nm.jsonl"), "node_modules skipped: {names:?}");
+    }
+
+    #[test]
+    fn preferred_omp_bucket_rejects_symlink_dir() {
+        let dir = tempfile::tempdir().expect("tmp");
+        // Build a fake home-relative structure is hard; unit-test the metadata gate.
+        let bucket = dir.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("x-sid.jsonl"), "a\n").unwrap();
+        let meta = std::fs::symlink_metadata(&bucket).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("linkbucket");
+            let _ = std::os::unix::fs::symlink(&bucket, &link);
+            let lm = std::fs::symlink_metadata(&link).unwrap();
+            assert!(lm.file_type().is_symlink());
+            // Gate used by find_omp_session_file:
+            let ok = std::fs::symlink_metadata(&link)
+                .map(|m| m.is_dir() && !m.file_type().is_symlink())
+                .unwrap_or(false);
+            assert!(!ok, "symlink bucket must be rejected");
+        }
     }
 }

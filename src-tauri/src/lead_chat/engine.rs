@@ -3137,10 +3137,12 @@ async fn spawn_acp_turn(
                     // Hard stop already owns terminal state — do not emit idle.
                     return;
                 }
-                acp_emit_turn_end(
+                acp_drain_then_end(
                     a.clone(),
                     d.clone(),
                     e.clone(),
+                    c.clone(),
+                    s.clone(),
                     outcome.is_error,
                     cancelled,
                     outcome.usage.clone(),
@@ -3160,10 +3162,12 @@ async fn spawn_acp_turn(
                 if stopped {
                     return;
                 }
-                acp_emit_turn_end(
+                acp_drain_then_end(
                     a.clone(),
                     d.clone(),
                     e.clone(),
+                    c.clone(),
+                    s.clone(),
                     true,
                     interrupting,
                     None,
@@ -3178,6 +3182,31 @@ async fn spawn_acp_turn(
         let _ = client.cancel(&session_id).await;
     }
     Ok(())
+}
+
+/// Wait until the session consumer has drained events enqueued before the
+/// prompt result, then finalize. Prevents turn-end from racing late text/tool
+/// rows still in the mpsc buffer.
+async fn acp_drain_then_end(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    client: crate::acp::runtime::ClientHandle,
+    session_id: String,
+    is_error: bool,
+    cancelled: bool,
+    usage: Option<crate::acp::runtime::UsageBits>,
+    prompt_epoch: u64,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let sent = client
+        .send_session_event(&session_id, crate::acp::runtime::SessionEvent::DrainBarrier(tx))
+        .await;
+    if sent {
+        // Bounded wait: if the consumer is gone, don't hang finalize forever.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+    }
+    acp_emit_turn_end(app, db, eng, is_error, cancelled, usage, prompt_epoch).await;
 }
 
 async fn acp_emit_turn_end(
@@ -3347,9 +3376,25 @@ async fn acp_consumer(
     use super::proto::ChatEvent;
     // Accumulated thought text for the busy-line chip (cleared on answer tokens).
     let mut thought_buf = String::new();
+    // Drop late events after stop/unsubscribe/teardown (reset_epoch advances).
+    let start_epoch = eng.lock().await.reset_epoch;
     while let Some(msg) = rx.recv().await {
         match msg {
+            // Barrier: prompt-task waits until prior events are drained.
+            SessionEvent::DrainBarrier(tx) => {
+                let _ = tx.send(());
+            }
+            _ if {
+                let g = eng.lock().await;
+                g.stopped || g.reset_epoch != start_epoch
+            } => {
+                // Drop late events after stop/unsubscribe/teardown.
+            }
             SessionEvent::Thought { text } => {
+                {
+                    let mut inner = eng.lock().await;
+                    note_turn_activity(&app, &db, &eng, &mut inner);
+                }
                 thought_buf.push_str(&text);
                 // Live reasoning on the busy line so the turn doesn't look stuck
                 // before the first answer token. Show a tail window of the buffer.
@@ -3375,9 +3420,9 @@ async fn acp_consumer(
             }
 
             SessionEvent::Chat(ChatEvent::TextDelta { text, item: _ }) => {
-                // Answer tokens started — drop the thinking activity chip.
-                if !thought_buf.is_empty() {
-                    thought_buf.clear();
+                // Answer tokens started — drop soft/real thinking chip always.
+                thought_buf.clear();
+                {
                     let (thread_id, session_id) = {
                         let i = eng.lock().await;
                         (i.thread_id, i.session_id)
@@ -3393,7 +3438,7 @@ async fn acp_consumer(
                     );
                 }
                 let mut inner = eng.lock().await;
-                inner.clock.last_activity = std::time::Instant::now();
+                note_turn_activity(&app, &db, &eng, &mut inner);
                 let thread_id = inner.thread_id;
                 let (sid, turn) = (inner.session_id, inner.turn_id);
                 if inner.current.is_none() {
@@ -3434,9 +3479,9 @@ async fn acp_consumer(
                 );
             }
             SessionEvent::Chat(ChatEvent::Assistant { tools, .. }) => {
-                // Tool calls also end the thinking phase (no TextDelta first).
-                if !thought_buf.is_empty() {
-                    thought_buf.clear();
+                // Tool calls end thinking (including soft pre-token chip).
+                thought_buf.clear();
+                {
                     let (thread_id, session_id) = {
                         let i = eng.lock().await;
                         (i.thread_id, i.session_id)
@@ -3452,7 +3497,11 @@ async fn acp_consumer(
                     );
                 }
                 let mut inner = eng.lock().await;
-                inner.clock.last_activity = std::time::Instant::now();
+                note_turn_activity(&app, &db, &eng, &mut inner);
+                // Close the open text row so post-tool text starts a new bubble.
+                if inner.current.is_some() {
+                    finalize_current_text(&app, &db, &mut inner, "complete").await;
+                }
                 persist_tool_calls(&app, &db, &mut inner, tools).await;
             }
             SessionEvent::Chat(ChatEvent::ToolResults { items }) => {
@@ -3461,15 +3510,13 @@ async fn acp_consumer(
             }
             SessionEvent::Chat(ChatEvent::Commands { commands }) => {
                 let mut inner = eng.lock().await;
-                if !commands.is_empty() {
-                    inner.slash_commands = commands;
-                }
+                // Empty is authoritative (session cleared its slash palette).
+                inner.slash_commands = commands;
             }
             SessionEvent::Commands(commands) => {
                 let mut inner = eng.lock().await;
-                if !commands.is_empty() {
-                    inner.slash_commands = commands;
-                }
+                // Empty is authoritative (session cleared its slash palette).
+                inner.slash_commands = commands;
             }
             SessionEvent::Usage {
                 context_tokens,
@@ -4388,7 +4435,14 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
     if is_acp_tool(&inner.tool) {
         let sid = inner.native_id.clone();
         let client = inner.acp_client.clone();
+        // Drop open Needs-you cards so Always/Full cannot land after Stop.
+        let asks = std::mem::take(&mut inner.acp_pending_asks);
         drop(inner);
+        if let Some(reg) = app.try_state::<crate::ask::AskRegistry>() {
+            for id in asks {
+                reg.inner().cancel(id);
+            }
+        }
         if let (Some(sid), Some(client)) = (sid, client) {
             let _ = client.cancel(&sid).await;
         }

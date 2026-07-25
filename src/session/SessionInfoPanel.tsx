@@ -16,7 +16,7 @@ import { ToolIcon, toolFullName } from "../components/ToolIcon";
 export function SessionInfoPanel({
   meta,
   skills,
-  tool,
+  tool: _tool,
   subtasks,
   onOpenSubtask,
   onClose,
@@ -25,9 +25,7 @@ export function SessionInfoPanel({
 }: {
   meta: SessionMeta | undefined;
   skills: EnabledSkill[];
-  /** lead_tool / ObserveRef.tool — gates the "Discovered" Skills group to
-   *  engines that can actually report it (see {@link skillDiscoverySupported}).
-   *  Omitted/undefined (tool identity not resolved yet) still renders. */
+  /** lead_tool / ObserveRef.tool — optional session tool identity. */
   tool?: string;
   /** 该 thread 已创建的子任务(lead 专用;worker 不传 → 不渲染该段)。 */
   subtasks?: Direction[];
@@ -59,27 +57,15 @@ export function SessionInfoPanel({
 
   const servers = meta?.mcpServers ?? [];
 
-  // Flat skill list: workspace-enabled ∪ engine-discovered, name-deduped.
-  // Engine list may be undefined until the first probe — don't treat that as
-  // "zero skills" when the workspace list is also still loading empty.
-  const unifiedSkills = useMemo(() => {
-    const byName = new Map<string, { name: string; description?: string }>();
-    for (const s of skills) {
-      byName.set(s.name, { name: s.name, description: s.description });
-    }
-    for (const s of meta?.engineSkills ?? []) {
-      if (!byName.has(s.name)) {
-        byName.set(s.name, { name: s.name, description: s.description });
-      }
-    }
-    return [...byName.values()];
-  }, [skills, meta?.engineSkills]);
-  // Pending only when we expect a discovery probe and it hasn't landed yet AND
-  // workspace list is empty (otherwise workspace chips already answer the question).
-  const skillsPending =
-    skills.length === 0 &&
-    skillDiscoverySupported(tool) &&
-    meta?.engineSkills == null;
+  // Flat list of workspace-enabled skills only. Engine "discovered" scans for
+  // omp just re-read Weft-materialized builtins (not real engine discovery) and
+  // must not surface here. Codex/claude still expose engineSkills via other UI
+  // if needed later — this panel stays one simple list.
+  const unifiedSkills = useMemo(
+    () => skills.map((s) => ({ name: s.name, description: s.description })),
+    [skills],
+  );
+  const skillsPending = false;
 
   return (
     <aside className="flex h-full w-[270px] shrink-0 flex-col overflow-hidden border-l border-border bg-bg">
@@ -264,23 +250,6 @@ function OverflowList<T>({
   );
 }
 
-/** Whether this session's engine has ANY mechanism to report which skills it
- *  actually loaded — mirrors `session_meta::gather`'s dispatch in
- *  `src-tauri/src/session_meta.rs`: claude scans the session cwd's
- *  `.claude/skills`, codex has its own skill discovery; opencode has no
- *  equivalent probe, so `gather_opencode` never sets `skills` and
- *  `meta.engineSkills` would stay `undefined` for the life of the session —
- *  not "pending", just permanently unavailable. `tool` unresolved
- *  (`undefined`, e.g. the worker surface before its session lookup lands)
- *  still counts as supported: the session_meta effects that would populate
- *  `engineSkills` already gate on the tool being known first (see
- *  LeadTab/WorkerConversation), so there's no real window where this default
- *  would show a reading that never arrives. */
-function skillDiscoverySupported(tool: string | undefined): boolean {
-  // OpenCode has no engine-skills probe. OMP scans the session cwd after Weft
-  // materializes skills (gather_omp → Some(list), empty = authoritative zero).
-  return tool !== "opencode";
-}
 
 
 /** created_at → epoch for ordering. Store writes Unix seconds as a string;
