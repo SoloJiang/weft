@@ -93,6 +93,34 @@ impl OwnerKind {
             OwnerKind::Other => "other",
         }
     }
+
+    /// 声明顺序中排在 `self` 后一个的变体;最后一个(`Other`)之后是 `None`。穷尽
+    /// `match`——和 [`Self::as_str`] 同款写法:新增第 9 个变体若不给它接一条臂,这里
+    /// 编译不过,逼着改动的人在加变体的同一时刻把它接进遍历链,而不是留一个只有
+    /// 运行期才会被发现(或永远不会被发现)的空洞。
+    fn next(self) -> Option<OwnerKind> {
+        match self {
+            OwnerKind::GlobalAppServer => Some(OwnerKind::Session),
+            OwnerKind::Session => Some(OwnerKind::LeadThread),
+            OwnerKind::LeadThread => Some(OwnerKind::Curator),
+            OwnerKind::Curator => Some(OwnerKind::Opencode),
+            OwnerKind::Opencode => Some(OwnerKind::Preview),
+            OwnerKind::Preview => Some(OwnerKind::Probe),
+            OwnerKind::Probe => Some(OwnerKind::Other),
+            OwnerKind::Other => None,
+        }
+    }
+
+    /// 全部变体,声明顺序,供 [`instance_owner_counts`] 遍历。沿 [`Self::next`] 从第
+    /// 一个变体走到链尾——单一来源:能出现在这里的变体必然先在 `next` 的穷尽 `match`
+    /// 里露过面,不像手写字面量数组那样可以悄悄漏掉一个新变体而不报错。
+    fn all() -> Vec<OwnerKind> {
+        let mut out = vec![OwnerKind::GlobalAppServer];
+        while let Some(next) = out.last().copied().and_then(OwnerKind::next) {
+            out.push(next);
+        }
+        out
+    }
 }
 
 /// 一个受管子进程的属主标识 `{kind, id}`。`id` 通常是 session/thread id;无自然 id 的
@@ -442,7 +470,7 @@ pub fn instance_group_ids() -> Vec<i32> {
 
 // ── UI 归因(issue #112 资源仪表盘,只读)──────────────────────────────────────
 //
-// 下面两个函数只**读**既有登记表 / `instance_pids()`,不改动上面的口径、reap 或
+// 下面几个函数只**读**既有登记表 / `instance_pids()`,不改动上面的口径、reap 或
 // admission 逻辑;供只读资源面板展示「进程树从哪儿来」与「大概占多少内存」。
 
 /// 一个 owner 分类的直接子进程计数,供仪表盘的「进程树」展示。数的是**登记表里
@@ -457,20 +485,11 @@ pub struct OwnerCount {
 }
 
 /// 按 owner kind 分组统计登记表(见 [`OwnerCount`])。只保留非零分类,顺序固定为
-/// [`OwnerKind`] 的声明顺序(不是 hash 顺序),让前端每次渲染的分类顺序不跳动。
+/// [`OwnerKind::all`] 的声明顺序(不是 hash 顺序,也不是手写数组),让前端每次渲染
+/// 的分类顺序不跳动,且新增 `OwnerKind` 变体时不会静默漏出这份分组。
 pub fn instance_owner_counts() -> Vec<OwnerCount> {
     let regs = registered();
-    let kinds = [
-        OwnerKind::GlobalAppServer,
-        OwnerKind::Session,
-        OwnerKind::LeadThread,
-        OwnerKind::Curator,
-        OwnerKind::Opencode,
-        OwnerKind::Preview,
-        OwnerKind::Probe,
-        OwnerKind::Other,
-    ];
-    kinds
+    OwnerKind::all()
         .into_iter()
         .filter_map(|kind| {
             let count = regs.iter().filter(|r| r.owner.kind == kind).count() as u64;
@@ -493,6 +512,42 @@ pub fn instance_memory_bytes() -> Option<u64> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn instance_memory_bytes() -> Option<u64> {
     None
+}
+
+/// [`count_instance_processes`] + [`instance_memory_bytes`], from a **single**
+/// [`instance_pids`] scan. Callers that want both numbers together (the resource
+/// dashboard's poll tick is the first — and, per `instance_pids`'s own doc, exactly
+/// the "every-second polling" case it warned would need this) would otherwise call
+/// the two functions above back-to-back, each independently paying for
+/// `instance_pids`'s full O(存活进程数 × 祖先深度) scan — doubling the per-tick
+/// syscall volume for numbers that are supposed to describe the same instant. This
+/// walks the pid list once and derives both from that one snapshot, which also
+/// removes the TOCTOU gap between them (they're now guaranteed to be the same pid
+/// set, not two scans microseconds apart).
+///
+/// `count_instance_processes` and `instance_memory_bytes` are left exactly as they
+/// are for any caller that only needs one of the two numbers — this is an additional
+/// combined path, not a replacement.
+#[derive(Clone, Copy, Debug)]
+pub struct InstanceUsage {
+    /// Same value [`count_instance_processes`] would return.
+    pub process_count: usize,
+    /// Same value [`instance_memory_bytes`] would return.
+    pub memory_bytes: Option<u64>,
+}
+
+pub fn instance_usage() -> InstanceUsage {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let pids = instance_pids();
+        let memory_bytes = pids.iter().filter_map(|&pid| proc_resident_bytes(pid)).sum();
+        InstanceUsage { process_count: pids.len(), memory_bytes: Some(memory_bytes) }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        // Mirrors count_instance_processes' non-macOS/Linux fallback branch.
+        InstanceUsage { process_count: registered().len(), memory_bytes: None }
+    }
 }
 
 // ── 平台相关:进程枚举(fork-free)────────────────────────────────────────────
@@ -931,6 +986,26 @@ mod tests {
         assert_eq!(parse_vmrss_kb("VmRSS:\tnot-a-number kB\n"), None);
     }
 
+    /// 回归守卫:`OwnerKind::all()` 必须覆盖全部变体、无重复、顺序即声明顺序。这条
+    /// 本身不是穷尽性保证的来源(那是 `next()` 的穷尽 `match` 在编译期给的)——它防的
+    /// 是另一种漂移:有人往 `next()` 接新变体时把链接错,导致 `all()` 漏掉或重复。
+    #[test]
+    fn owner_kind_all_covers_every_variant_in_declaration_order() {
+        assert_eq!(
+            OwnerKind::all(),
+            vec![
+                OwnerKind::GlobalAppServer,
+                OwnerKind::Session,
+                OwnerKind::LeadThread,
+                OwnerKind::Curator,
+                OwnerKind::Opencode,
+                OwnerKind::Preview,
+                OwnerKind::Probe,
+                OwnerKind::Other,
+            ]
+        );
+    }
+
     /// 仪表盘的内存读数必须反映真实 owned 子树:起一个子进程后,合计 RSS 应 > 0。
     #[tokio::test]
     async fn instance_memory_bytes_reflects_owned_subtree() {
@@ -943,6 +1018,39 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let bytes = instance_memory_bytes().expect("macOS/Linux always yield Some");
         assert!(bytes > 0, "owned subtree should report nonzero RSS, got {bytes}");
+        reap(&mut child, &reg).await;
+    }
+
+    /// `instance_usage` 是单扫描版的 `count_instance_processes` + `instance_memory_bytes`
+    /// 组合——两条读数必须与分别调用两个独立函数完全一致,否则「只扫一次」的优化就
+    /// 悄悄改了语义。
+    #[tokio::test]
+    async fn instance_usage_matches_the_two_separate_functions_it_replaces() {
+        let _g = test_guard();
+        let mut cmd = null_cmd("sh");
+        cmd.arg("-c").arg("sleep 30");
+        let cfg = configure(&mut cmd, Owner::other("test-usage"));
+        let mut child = cmd.spawn().expect("spawn");
+        let reg = cfg.register(&child);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let usage = instance_usage();
+        assert_eq!(
+            usage.process_count,
+            count_instance_processes(),
+            "instance_usage's count must match count_instance_processes"
+        );
+        assert!(usage.memory_bytes.unwrap_or(0) > 0, "owned subtree should report nonzero RSS");
+        // 两条读数本就来自 instance_pids() 的分别两次调用,进程数在几百毫秒内几乎
+        // 不会变化,故允许极小误差而非要求逐字节相等。
+        let separate = instance_memory_bytes().expect("macOS/Linux always yield Some");
+        let combined = usage.memory_bytes.expect("macOS/Linux always yield Some");
+        let diff = separate.abs_diff(combined);
+        assert!(
+            diff <= separate / 10 + 1024,
+            "combined-scan RSS ({combined}) should closely match the separate call ({separate})"
+        );
+
         reap(&mut child, &reg).await;
     }
 

@@ -17,8 +17,9 @@ use serde::Serialize;
 pub struct ResourceDashboardSnapshot {
     /// 系统级进程配额状态(与 `process_quota_status` 命令同源,状态口径完全一致)。
     pub quota: crate::process_quota::ProcessQuotaSnapshot,
-    /// Weft 本实例 owned 进程子树的存活进程总数(含后代,见
-    /// `proc_registry::count_instance_processes`)。
+    /// Weft 本实例 owned 进程子树的存活进程总数(含后代,语义同
+    /// `proc_registry::count_instance_processes`;实际由 `proc_registry::instance_usage`
+    /// 单次扫描给出,与 `instance_memory_bytes` 共享同一份 pid 快照)。
     pub instance_process_count: u64,
     /// 该子树的常驻内存(RSS)合计,字节。`None` = 当前平台没有 fork-free 内存采样
     /// (非 macOS/Linux);前端应展示「不可用」而非当作 0。
@@ -37,10 +38,15 @@ pub fn resource_dashboard_snapshot(
     governor: tauri::State<'_, crate::process_quota::ProcessQuotaGovernor>,
 ) -> ResourceDashboardSnapshot {
     let (active_sessions, max_sessions) = crate::session_gate::active_session_slots();
+    // Single-scan: count + memory both derive from one `instance_pids()` snapshot
+    // instead of each independently re-walking the full process table (see
+    // `proc_registry::instance_usage`'s doc — this poll tick is exactly the
+    // per-second-polling case `instance_pids` warned would need it).
+    let usage = crate::proc_registry::instance_usage();
     ResourceDashboardSnapshot {
         quota: governor.snapshot(),
-        instance_process_count: crate::proc_registry::count_instance_processes() as u64,
-        instance_memory_bytes: crate::proc_registry::instance_memory_bytes(),
+        instance_process_count: usage.process_count as u64,
+        instance_memory_bytes: usage.memory_bytes,
         by_owner: crate::proc_registry::instance_owner_counts(),
         active_sessions: active_sessions as u64,
         max_sessions: max_sessions as u64,

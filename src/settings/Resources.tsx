@@ -16,6 +16,12 @@ import type {
 // cadence) — polling faster would just re-read the same value.
 const POLL_MS = 3000;
 
+// One missed tick is normal IPC noise and stays silent (see the `.catch` below).
+// Past this many *consecutive* misses (~9s at POLL_MS=3000) the snapshot is old
+// enough that staying silent would be dishonest for a panel whose whole point is
+// "right now" — surface a restrained staleness hint instead.
+const STALE_AFTER_CONSECUTIVE_FAILURES = 3;
+
 /** Settings → Resources: read-only local-runtime dashboard (issue #112). Polls
  *  the combined snapshot while mounted and layers the existing
  *  `process-quota://changed` push event on top so a warn/degrade transition
@@ -26,10 +32,12 @@ const POLL_MS = 3000;
 export function ResourcesSettings() {
   const { t } = useTranslation();
   const [snapshot, setSnapshot] = useState<ResourceDashboardSnapshot | null>(null);
+  const [stale, setStale] = useState(false);
 
   useEffect(() => {
     let alive = true;
     let seq = 0;
+    let consecutiveFailures = 0;
     const poll = () => {
       const mySeq = ++seq;
       void api
@@ -38,11 +46,21 @@ export function ResourcesSettings() {
           // A newer poll (or the unmount cleanup) may have already landed;
           // never let a slow, out-of-order response regress the display.
           if (!alive || mySeq !== seq) return;
+          consecutiveFailures = 0;
           setSnapshot(next);
+          setStale(false);
         })
         .catch(() => {
           // Transient IPC hiccup: keep showing the last good snapshot rather
-          // than flashing an error state for one missed tick.
+          // than flashing an error state for one missed tick. Only past
+          // STALE_AFTER_CONSECUTIVE_FAILURES misses in a row does the panel
+          // admit the data might be old — self-clears the instant a poll
+          // succeeds again, so it never lingers past the problem.
+          if (!alive || mySeq !== seq) return;
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= STALE_AFTER_CONSECUTIVE_FAILURES) {
+            setStale(true);
+          }
         });
     };
     poll();
@@ -60,7 +78,14 @@ export function ResourcesSettings() {
 
   return (
     <div className="flex flex-col gap-10">
-      <p className="text-[12px] leading-relaxed text-ink-faint">{t("settings.resourcesHint")}</p>
+      <div className="flex flex-col gap-1">
+        <p className="text-[12px] leading-relaxed text-ink-faint">{t("settings.resourcesHint")}</p>
+        {stale && (
+          <p className="text-[11.5px] leading-relaxed text-ink-faint">
+            {t("settings.resourcesStale")}
+          </p>
+        )}
+      </div>
 
       <SettingsGroup title={t("settings.resourcesQuotaGroup")}>
         <div className="px-3 py-3.5">
