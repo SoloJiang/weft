@@ -1661,9 +1661,16 @@ pub async fn set_session_native_id_opt(
 /// accidental — it depended entirely on THAT field staying cleared at THAT
 /// moment, and would have vanished silently under a refactor that stopped
 /// clearing it, or a re-drive path that stopped gating on it. The grace window
-/// no longer rides on that: it reads this marker directly, and has tests that
+/// no longer RIDES on that: it reads this marker directly, and has tests that
 /// go red if the read is removed.
-
+///
+/// The native-id clear is still there, though — promoted from accident to
+/// deliberate backup. `recover_from_freeze` now issues both writes together,
+/// before it persists the session `idle`, so a transient failure of either one
+/// degrades to the other guard instead of to none (see the comment at that
+/// call site). The difference from before is that the marker is what CARRIES
+/// the rule and is tested as such; the clear is the fallback, not the
+/// mechanism.
 pub async fn mark_turn_freeze_recovered(
     db: &Db,
     thread_id: i32,

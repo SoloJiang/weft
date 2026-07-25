@@ -4379,28 +4379,62 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
     // nothing (review round 4), so a declined recovery can't suppress a
     // legitimate re-drive for a whole window.
     //
-    // Residual, and why it is acceptable: for non-app-server dialects the
-    // `interrupt()` above kills the child, and THEIR OWN reader task persists
-    // idle on EOF — that can land in the small gap before this line. It is
-    // also the case where the grace window has least to protect: there is no
-    // surviving shared transport to be re-driven back into (the process is
-    // gone; the next send spawns a fresh CLI). The app-server dialect — the
-    // wedged-connection case this whole feature targets — is fully closed,
-    // because its only idle exposure is the `persist_activity` below.
+    // Residual — an ORDERING one, separate from the write-failure case above:
+    // for non-app-server dialects the `interrupt()` above kills the child, and
+    // THEIR OWN reader task persists idle on EOF, which can land in the small
+    // gap before these two writes. That is also the case where the grace
+    // window has least to protect: there is no surviving shared transport to
+    // be re-driven back into (the process is gone; the next send spawns a
+    // fresh CLI). For the app-server dialect — the wedged-connection case this
+    // whole feature targets — no ordering window is left at all, since its
+    // only idle exposure is the `persist_activity` below. "No ordering window"
+    // is not "no window": a double write failure still re-opens it, as above.
     if let Some(db) = app.try_state::<Db>() {
         if let Err(err) = repo::mark_turn_freeze_recovered(&db, thread_id, session_id).await {
             eprintln!(
                 "[weft] turn-freeze recovery: failed to stamp coordination marker for thread {thread_id}: {err}"
             );
         }
-        // Safe to clear this early: nothing between here and the old call site
-        // writes `native_session_id` back. `persist_activity` only touches
-        // `status`, and `set_lead_status`'s meta upsert preserves the other
-        // fields — so a cleared id stays cleared.
-        if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
-            eprintln!(
-                "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
-            );
+    }
+    // Clear BOTH mirrors of the native id — DB and in-memory — under ONE lock
+    // hold and ONE ownership re-check. Three things make that necessary rather
+    // than tidy:
+    //
+    // - Split mirrors desynchronize. `take_frozen_turn` already reset `busy`,
+    //   so a send can be accepted while this recovery is still awaiting
+    //   `shutdown()` and row finalization. That newer turn captures and
+    //   persists its OWN native id. With the DB clear here and the memory
+    //   clear at the end of the function (many awaits later), the newer id
+    //   could be persisted in between: the DB would hold it while the engine
+    //   held none, and the next send would start a THIRD session, silently
+    //   losing continuity with the turn that just started.
+    // - The ownership check is round 4's own principle, applied consistently:
+    //   `FreezeClaim::Stale` exists so this function never touches state
+    //   belonging to a newer turn, yet the trailing `native_id = None` used to
+    //   run unconditionally after all those awaits. `turn_id` is bumped by
+    //   every turn start, so a mismatch means "not ours" — leave both mirrors
+    //   to the turn that owns them.
+    // - Holding the guard across the DB write is what makes the pair atomic
+    //   against a turn start, which is the whole point: a send cannot begin a
+    //   turn without this same lock, so it either happens entirely before this
+    //   block (and the check sees the newer turn_id and skips) or entirely
+    //   after (and finds both mirrors already cleared). Safe: `clear_native_id`
+    //   touches only the store, never re-enters the engine, so there is no
+    //   deadlock — unlike the `if let Some(c) = eng.lock().await…take()` shape
+    //   `take_frozen_turn`'s doc warns about, this is an explicit scope. Worst
+    //   case it blocks this engine's sends for one small UPDATE (bounded by
+    //   SQLite's busy timeout) on a turn that was just frozen for minutes.
+    {
+        let mut inner = eng.lock().await;
+        if inner.turn_id == turn_id {
+            inner.native_id = None;
+            if let Some(db) = app.try_state::<Db>() {
+                if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
+                    eprintln!(
+                        "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
+                    );
+                }
+            }
         }
     }
     if let Some((c, drain)) = taken {
@@ -4477,10 +4511,10 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
         // did. Here, we are that "whatever".
         emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
     }
-    // The DB half of this ran above, alongside the marker — see there for why
-    // both guards must precede the drain block's `idle` persist. Only the
-    // in-memory mirror is left here.
-    eng.lock().await.native_id = None;
+    // Both native-id mirrors were cleared together above, alongside the marker
+    // and under a newer-turn ownership check — see there. Nothing to do here:
+    // an unconditional clear at this point would be exactly the unguarded
+    // late write that could wipe a newer turn's id.
     if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
         bus.ask_human(thread_id, &dir, &freeze_recovery_text(freeze_secs));
     }
