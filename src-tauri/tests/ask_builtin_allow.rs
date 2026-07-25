@@ -187,10 +187,11 @@ async fn read_inside_the_worktree_is_auto_approved() {
         out.contains("\"permissionDecision\":\"allow\""),
         "a read inside the worktree must not cost a human click, got {out}"
     );
-    // Grep/Glob too — including the no-`path` form that defaults to the
-    // session's own cwd.
+    // Glob too — including the no-`path` form that defaults to the session's
+    // own cwd. (`Grep` is deliberately NOT here; see
+    // `content_search_still_surfaces_the_card`.)
     for (tool, input) in [
-        ("Grep", serde_json::json!({ "pattern": "TODO" })),
+        ("Glob", serde_json::json!({ "pattern": "**/*.rs" })),
         (
             "Glob",
             serde_json::json!({ "pattern": "**/*.rs", "path": wt.to_string_lossy() }),
@@ -202,6 +203,43 @@ async fn read_inside_the_worktree_is_auto_approved() {
             "{tool} inside the worktree must be auto-approved, got {out}"
         );
     }
+}
+
+/// A CONTENT search stays gated even entirely inside the worktree — the third
+/// P1 Codex found on PR #146.
+///
+/// `Grep` was originally allowlisted next to `Read` as "same exposure, same
+/// scoping". It isn't: the request never names the files it reads, so the
+/// credential veto has nothing to inspect. This exact call — pattern `.+`
+/// rooted at the worktree — is rated `ReadOnly`, passes containment, and would
+/// have returned the contents of the `credentials.json` sitting right there,
+/// while `Read` of that same file surfaces a card
+/// (`credential_file_inside_the_worktree_still_surfaces_the_card`).
+#[tokio::test]
+async fn content_search_still_surfaces_the_card() {
+    let tree = TempTree::new("contentsearch");
+    let wt = tree.dir("wt");
+    file_in(&wt, "credentials.json");
+    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+
+    let base2 = base.clone();
+    let dir_s = dir.to_string();
+    let wt_s = wt.to_string_lossy().to_string();
+    let call = tokio::spawn(async move {
+        ask(
+            &base2,
+            thread,
+            &dir_s,
+            "claude",
+            "Grep",
+            serde_json::json!({ "pattern": ".+", "path": wt_s }),
+        )
+        .await
+    });
+
+    let id = wait_for_card(&asks, "a content search over the worktree").await;
+    assert!(asks.answer(id, Answer::Deny));
+    assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
 }
 
 /// Containment is the load-bearing half: the SAME tool pointed outside the
@@ -463,11 +501,14 @@ async fn glob_pattern_climbing_out_of_the_worktree_surfaces_the_card() {
 /// `direction_from_another_thread_fails_closed` only ever sent a `Read` with an
 /// explicit `file_path`, so it was caught by the absolute-path rule and never
 /// proved anything about the identity check itself. A cwd-defaulting
-/// `Grep {"pattern": …}` has nothing for that rule to reject, so a stale or
-/// cross-thread route could read from an unverified cwd with no human in the
-/// loop. Same wrong-thread route, targetless call: must still surface the card.
+/// `Glob {"pattern": "**/*.rs"}` has nothing for that rule to reject, so a stale or
+/// cross-thread route could list an unverified cwd with no human in the loop.
+/// Same wrong-thread route, targetless call: must still surface the card.
+///
+/// Uses `Glob`, not `Grep` — `Grep` came off the allowlist entirely, so it
+/// would now pass this test for a reason that has nothing to do with identity.
 #[tokio::test]
-async fn targetless_grep_on_a_foreign_route_fails_closed() {
+async fn targetless_glob_on_a_foreign_route_fails_closed() {
     let tree = TempTree::new("targetless");
     let wt = tree.dir("wt");
     file_in(&wt, "src/main.rs");
@@ -481,13 +522,13 @@ async fn targetless_grep_on_a_foreign_route_fails_closed() {
         thread,
         &dir.to_string(),
         "claude",
-        "Grep",
-        serde_json::json!({ "pattern": "TODO" }),
+        "Glob",
+        serde_json::json!({ "pattern": "**/*.rs" }),
     )
     .await;
     assert!(
         ok.contains("\"permissionDecision\":\"allow\""),
-        "a targetless Grep on its own session must stay auto-approved, got {ok}"
+        "a targetless Glob on its own session must stay auto-approved, got {ok}"
     );
 
     let base2 = base.clone();
@@ -499,13 +540,13 @@ async fn targetless_grep_on_a_foreign_route_fails_closed() {
             other_thread,
             &dir_s,
             "claude",
-            "Grep",
-            serde_json::json!({ "pattern": "TODO" }),
+            "Glob",
+            serde_json::json!({ "pattern": "**/*.rs" }),
         )
         .await
     });
 
-    let id = wait_for_card(&asks, "a targetless Grep on a foreign route").await;
+    let id = wait_for_card(&asks, "a targetless Glob on a foreign route").await;
     assert!(asks.answer(id, Answer::Deny));
     assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
 }

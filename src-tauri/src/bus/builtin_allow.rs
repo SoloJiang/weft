@@ -40,6 +40,8 @@
 //! its additional directories, and DO prompt outside them. `ReadOnlyPath`
 //! adopts that same rule — read-only tools, scoped to the session's own
 //! directories — with weft's DB supplying the directory set (`session_roots`).
+//! Parity is a CEILING, not a target: `Grep` is on claude's don't-prompt list
+//! and is deliberately NOT on this one (see the omissions on `SAFE_BUILTINS`).
 //!
 //! That set is NOT always identical to the engine's own cwd, and the difference
 //! is deliberate: a lead's cwd is an almost-empty scratch dir
@@ -108,6 +110,19 @@ pub enum SafeScope {
 ///   read-only-command classifier (`ask::READ_ONLY_COMMAND_WORDS`) but it is a
 ///   display heuristic, and promoting it into a gate that skips the human is a
 ///   separate, deliberate product decision — not something to slip in here.
+/// - `Grep` — REMOVED after review (Codex, PR #146). It was listed alongside
+///   `Read` as "same exposure, same scoping", and that was wrong in a way that
+///   breaks condition 2: a content search never names the files it reads, so
+///   `classify_risk` has nothing to inspect. `Grep {"pattern": ".+", "path":
+///   "/worktree"}` is rated `ReadOnly`, passes containment, and returns lines
+///   out of a tracked `credentials.json` — a file that `Read` could not have
+///   touched without surfacing a card. Restricting it to the name-only
+///   `output_mode`s doesn't save it either: repeated `pattern` probes
+///   (`SECRET_KEY=a`, `SECRET_KEY=b`, …) turn match/no-match into a
+///   content ORACLE, one auto-approved bit at a time. `Glob` has no such
+///   problem — it matches on names and cannot test contents. An entry whose
+///   safety argument needs this many caveats does not belong on a conservative
+///   allowlist.
 /// - `Skill` — claude's own tools reference marks it permission-REQUIRED.
 /// - `Agent` / `Task` — spawns a subagent. Its children each hit this bridge on
 ///   their own, but weft's session accounting doesn't model subagents, so the
@@ -133,8 +148,7 @@ const SAFE_BUILTINS: &[(&str, &str, SafeScope)] = &[
     // Lists paths matching a glob. Returns names, not contents — still
     // path-scoped, since a listing outside the working dir is a leak too.
     ("claude", "Glob", SafeScope::ReadOnlyPath),
-    // Searches file CONTENTS; same exposure as Read, same scoping.
-    ("claude", "Grep", SafeScope::ReadOnlyPath),
+    // `Grep` is NOT here — see the omissions above for why it was removed.
     // Legacy notebook reader (superseded by `Read` in claude 2.x, still present
     // in older CLIs weft may be pointed at). Read-only by construction.
     ("claude", "NotebookRead", SafeScope::ReadOnlyPath),
@@ -151,7 +165,7 @@ const SAFE_BUILTINS: &[(&str, &str, SafeScope)] = &[
 
 /// Argument keys that NAME A TARGET for the path-scoped builtins, across the
 /// engines' spelling conventions (claude `file_path`, opencode `filePath`,
-/// `path` for Glob/Grep roots, `notebook_path` for the legacy notebook
+/// `path` for the `Glob` root, `notebook_path` for the legacy notebook
 /// reader). When one of these is present it MUST be a string, absolute, and
 /// contained — a relative or `~`-prefixed value is refused rather than guessed
 /// at, because resolving it would mean trusting a base directory the agent
@@ -210,7 +224,7 @@ fn contained(path: &str, roots: &[PathBuf]) -> bool {
 ///    contained. This is what refuses `{"file_path": 42}` and
 ///    `{"file_path": "~/.ssh/id_rsa"}` — values rule 2 would skip because
 ///    neither is an absolute path string. A target key that is ABSENT is fine:
-///    `Grep`/`Glob` then default to the engine's own cwd, which weft set to a
+///    `Glob` then defaults to the engine's own cwd, which weft set to a
 ///    root when it spawned the session — a fact that only holds once the
 ///    session RESOLVED, hence the empty-`roots` refusal below.
 /// 2. Recursively, EVERY string value must stay inside the roots — absolute
@@ -252,7 +266,7 @@ pub fn paths_contained(input: Option<&Value>, roots: &[PathBuf]) -> bool {
         return false;
     }
     let Some(v) = input else {
-        // No arguments at all: nothing points anywhere. `Read`/`Grep` without
+        // No arguments at all: nothing points anywhere. A `Read`/`Glob` without
         // arguments is malformed and the engine will reject it on its own.
         return true;
     };
@@ -288,9 +302,18 @@ fn every_string_stays_in_root(v: &Value, roots: &[PathBuf]) -> bool {
 ///   collapses any `..` along the way, so `/wt/src/../lib.rs` is correctly
 ///   judged by where it actually lands, not by how it's spelled.
 /// - RELATIVE: safe only because it resolves under the ENGINE'S CWD, which weft
-///   set to a root. A `..` component breaks exactly that premise — it climbs
-///   above the directory the value is relative TO, whatever that is, so no
-///   amount of checking the rest of the string helps. Refused outright.
+///   set to a root. Any component that escapes that anchoring is refused
+///   outright, since no amount of checking the rest of the string helps once
+///   the value no longer resolves under the cwd:
+///   - `ParentDir` (`..`) climbs above whatever the value is relative TO.
+///   - `RootDir` / `Prefix` are the WINDOWS forms of the same escape.
+///     `\Users\outside\*` has a root component but is NOT `is_absolute()`
+///     there (Windows wants a drive prefix too), so it would otherwise slip
+///     through this branch and search from the current drive's root;
+///     `C:foo` is drive-relative and just as unanchored. Both are inert on
+///     unix — a unix relative path can produce neither component — so this
+///     costs nothing on the platforms weft tests today and closes the hole on
+///     the one it doesn't. Caught in review by Codex on PR #146.
 ///
 /// The relative half is what catches `Glob {"pattern": "../outside/*"}`: the
 /// pattern isn't absolute, so the containment check never looked at it, yet
@@ -306,8 +329,14 @@ fn string_stays_in_root(s: &str, roots: &[PathBuf]) -> bool {
     if p.is_absolute() {
         return contained(s, roots);
     }
-    !p.components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
+    !p.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -376,6 +405,9 @@ mod tests {
         // the machine. If any of these ever answers Some(..), the bridge has
         // stopped gating the thing it exists to gate.
         for name in [
+            // Removed from the allowlist after review: a content search never
+            // names the files it reads, so the credential veto can't see them.
+            "Grep",
             "Bash",
             "BashOutput",
             "KillShell",
@@ -535,7 +567,7 @@ mod tests {
     #[test]
     fn missing_target_key_is_fine_but_stray_absolute_paths_are_not() {
         let t = TempTree::new("missing");
-        // Grep/Glob without `path` search the session's own cwd — a root.
+        // Glob without `path` searches the session's own cwd — a root.
         assert!(paths_contained(
             Some(&json!({ "pattern": "TODO", "output_mode": "content" })),
             &t.roots()
@@ -629,6 +661,39 @@ mod tests {
                 !paths_contained(Some(&escaping), &roots),
                 "a parent-traversing relative arg must not be auto-approved: {escaping}"
             );
+        }
+    }
+
+    /// A relative value can also escape via the WINDOWS root forms, which
+    /// `is_absolute()` rejects there: `\Users\outside\*` has a `RootDir` but no
+    /// drive prefix, and `C:foo` has a prefix but no root. Both would search
+    /// from somewhere other than the cwd. Codex caught it on PR #146.
+    ///
+    /// Asserted on every platform: on unix these strings simply can't be
+    /// produced by a real relative path, so the check is inert there — but the
+    /// assertion still pins the INTENT, and the code is compiled for Windows.
+    /// `\Users\outside\*` is one opaque component on unix and so passes; the
+    /// forward-slash spelling is what unix actually parses as a root.
+    #[test]
+    fn windows_root_relative_args_are_refused() {
+        let t = TempTree::new("winroot");
+        // Parsed as RootDir on unix; on Windows this is the drive-relative
+        // form `is_absolute()` says false to. Refused on both.
+        assert!(!paths_contained(
+            Some(&json!({ "pattern": "/Users/outside/*" })),
+            &t.roots()
+        ));
+        #[cfg(windows)]
+        {
+            for escaping in [
+                json!({ "pattern": "\\Users\\outside\\*" }),
+                json!({ "pattern": "C:foo\\*" }),
+            ] {
+                assert!(
+                    !paths_contained(Some(&escaping), &t.roots()),
+                    "a Windows root-relative arg must not be auto-approved: {escaping}"
+                );
+            }
         }
     }
 
