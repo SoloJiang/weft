@@ -444,6 +444,7 @@ export const zh = {
     copyCommand: "复制恢复命令",
     copied: "已复制到剪贴板",
     openInCodex: "在 Codex 中打开",
+    stopEngine: "停止 Weft 引擎",
   },
   repomap: {
     subtitle: "每个仓库是什么，以及它们如何相互依赖",

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Check,
+  CircleStop,
   ExternalLink,
   Paperclip,
   Send,
@@ -78,6 +79,7 @@ export function ChatComposer({
   queued,
   onSend,
   onStop,
+  onStopEngine,
   sessionResumeAction,
   extraActions,
   placeholder,
@@ -102,6 +104,8 @@ export function ChatComposer({
     files: string[],
   ) => void | Promise<unknown>;
   onStop: () => void;
+  /** Explicit lifecycle control for a terminal handoff; never runs on copy. */
+  onStopEngine?: () => void;
   /** Copy a terminal command or open Codex, never both or an implicit stop. */
   sessionResumeAction?: SessionResumeAction;
   /** Host-injected action icons (diff, inspect …) for the toolbar row. */
@@ -132,6 +136,7 @@ export function ChatComposer({
         queued={queued}
         onSend={onSend}
         onStop={onStop}
+        onStopEngine={onStopEngine}
         sessionResumeAction={sessionResumeAction}
         extraActions={extraActions}
         placeholder={placeholder}
@@ -156,6 +161,7 @@ interface ChatComposerBodyProps {
     files: string[],
   ) => void | Promise<unknown>;
   onStop: () => void;
+  onStopEngine?: () => void;
   sessionResumeAction?: SessionResumeAction;
   extraActions?: React.ReactNode;
   placeholder?: string;
@@ -173,6 +179,7 @@ function ChatComposerBody({
   queued,
   onSend,
   onStop,
+  onStopEngine,
   sessionResumeAction,
   extraActions,
   placeholder,
@@ -592,7 +599,9 @@ function ChatComposerBody({
             >
               <Paperclip size={13} />
             </PromptInputButton>
-            {sessionResumeAction && <ComposerSessionResumeAction action={sessionResumeAction} />}
+            {sessionResumeAction && (
+              <ComposerSessionResumeAction action={sessionResumeAction} onStopEngine={onStopEngine} />
+            )}
             {renderSubmitButton()}
           </div>
         </PromptInputActions>
@@ -601,7 +610,13 @@ function ChatComposerBody({
   );
 }
 
-function ComposerSessionResumeAction({ action }: { readonly action: SessionResumeAction }) {
+function ComposerSessionResumeAction({
+  action,
+  onStopEngine,
+}: {
+  readonly action: SessionResumeAction;
+  readonly onStopEngine?: () => void;
+}) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
 
@@ -616,13 +631,24 @@ function ComposerSessionResumeAction({ action }: { readonly action: SessionResum
   switch (action.kind) {
     case "copy-terminal-command":
       return (
-        <PromptInputButton
-          onClick={() => void copyCommand()}
-          tooltip={copied ? t("resume.copied") : t("resume.copyCommand")}
-          tooltipAlign="end"
-        >
-          {copied ? <Check size={13} className="text-running" /> : <SquareTerminal size={13} />}
-        </PromptInputButton>
+        <>
+          {onStopEngine && (
+            <PromptInputButton
+              onClick={onStopEngine}
+              tooltip={t("resume.stopEngine")}
+              tooltipAlign="end"
+            >
+              <CircleStop size={13} />
+            </PromptInputButton>
+          )}
+          <PromptInputButton
+            onClick={() => void copyCommand()}
+            tooltip={copied ? t("resume.copied") : t("resume.copyCommand")}
+            tooltipAlign="end"
+          >
+            {copied ? <Check size={13} className="text-running" /> : <SquareTerminal size={13} />}
+          </PromptInputButton>
+        </>
       );
     case "open-codex":
       return (

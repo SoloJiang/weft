@@ -293,6 +293,12 @@ export function LeadTab({
         };
     }
   })();
+  let onStopEngine: (() => void) | undefined;
+  if (sessionResumeAction?.kind === "copy-terminal-command") {
+    onStopEngine = () => {
+      void api.leadStop(tid);
+    };
+  }
   // Rewind is scoped to claude/codex/opencode leads — the tools with native
   // fork support (same gate as the worker); the lead rewinds conversation-only.
   const canRewind = leadTool === "claude" || leadTool === "codex" || leadTool === "opencode";
@@ -385,6 +391,7 @@ export function LeadTab({
             sendLeadChat(tid, text, images, files)
           }
           onStop={() => void interruptLead(tid)}
+          onStopEngine={onStopEngine}
           onNeedSlashCommands={() => discoverLeadSlash(tid)}
           onRewindPicker={canRewind ? () => setPickerOpen(true) : undefined}
           sessionResumeAction={sessionResumeAction}

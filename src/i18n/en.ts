@@ -457,6 +457,7 @@ export const en = {
     copyCommand: "Copy resume command",
     copied: "Copied to clipboard",
     openInCodex: "Open in Codex",
+    stopEngine: "Stop Weft engine",
   },
   repomap: {
     subtitle: "what each repo is, and how they depend on each other",
