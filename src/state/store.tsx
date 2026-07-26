@@ -179,6 +179,15 @@ function notifySendFailed(error: unknown) {
   toast(msg, "danger");
 }
 
+/** Background worker starts have no composer to restore a draft or report a
+ * rejected promise. Process-quota pauses already have a persistent UI state;
+ * every other failure must become visible instead of being dropped by a `void`
+ * dispatch/revive caller. */
+function notifyBackgroundWorkerDispatchFailed(error: unknown) {
+  if (isProcessQuotaDegradedError(error)) return;
+  notifySendFailed(error);
+}
+
 interface Store {
   workspaces: Workspace[];
   activeWorkspaceId: number | null;
@@ -1517,10 +1526,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         try {
           await spawnWorker(directionId, w.repo_id, false);
         } catch (error) {
-          // The persistent quota bar already explains the pause. Background
-          // auto-dispatch must not leak a rejected promise while degraded.
-          if (isProcessQuotaDegradedError(error)) continue;
-          throw error;
+          notifyBackgroundWorkerDispatchFailed(error);
+          return;
         }
       }
     },
@@ -1541,7 +1548,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // Skip reclaimed worktrees (exists=false): a resume would drive a worker
       // into a missing cwd.
       for (const w of wts.filter((w) => w.exists)) {
-        await driveDirection(directionId, w.repo_id, false);
+        try {
+          await driveDirection(directionId, w.repo_id, false);
+        } catch (error) {
+          notifyBackgroundWorkerDispatchFailed(error);
+          return;
+        }
       }
     },
     [driveDirection],
