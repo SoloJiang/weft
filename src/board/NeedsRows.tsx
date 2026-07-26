@@ -17,6 +17,7 @@ import { Input } from "../components/ui/Input";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { PermissionConfirmationCard } from "../components/ConfirmationCard";
 import { routeLabelKey, routeReasonKey, routeToolName } from "../lib/engineRoutingDisplay";
+import { needsRoutingControlOf } from "./needsRoutingControl";
 
 export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
   const { approveWriteTrigger, denyWriteTrigger, selectThread, defaultTool, installedTools } =
@@ -24,14 +25,12 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
   const [picked, setPicked] = useState<string | null>(null);
-  const route = item.route;
-  const blocked = route?.blocked === true;
-  const tool = picked ?? route?.tool ?? defaultTool;
-  const installed = installedTools.filter((tl) => tl.installed);
-  const manualTool = picked ?? undefined;
-  const approvalBlocked = blocked && picked === null;
-  const pickerVisible = installed.length > 1 || blocked;
-  const pickerTool = blocked ? picked : tool;
+  const routingControl = needsRoutingControlOf({
+    route: item.route,
+    picked,
+    installedTools,
+    defaultTool,
+  });
   const context = [item.thread_title, item.name].filter(Boolean).join(" · ");
 
   async function act(fn: () => Promise<void>) {
@@ -65,14 +64,23 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
       <p className="px-3.5 pb-1 pt-1.5 text-[14px] leading-relaxed text-ink">
         {item.reason}
       </p>
-      {route && (
+      {routingControl.route && (
         <div className="flex flex-col gap-0.5 px-3.5 pb-2 text-[11px] text-ink-faint">
-          <span className={cn("inline-flex items-center gap-1", route.blocked && "text-danger")}>
-            {route.tool && <ToolIcon tool={route.tool} size={12} />}
-            {t(routeLabelKey(route), { tool: toolFullName(routeToolName(route)) })}
+          <span
+            className={cn(
+              "inline-flex items-center gap-1",
+              routingControl.showBlockedStatus && "text-danger",
+            )}
+          >
+            {routingControl.route.tool && (
+              <ToolIcon tool={routingControl.route.tool} size={12} />
+            )}
+            {t(routeLabelKey(routingControl.route), {
+              tool: toolFullName(routeToolName(routingControl.route)),
+            })}
           </span>
-          <span>{t(routeReasonKey(route.reason))}</span>
-          {route.blocked && <span>{t("scope.engineRouteBlockedHint")}</span>}
+          <span>{t(routeReasonKey(routingControl.route.reason))}</span>
+          {routingControl.showBlockedStatus && <span>{t("scope.engineRouteBlockedHint")}</span>}
         </div>
       )}
       {item.base_branch && (
@@ -97,29 +105,35 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
       <div className="flex flex-wrap items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">
         <Button
           variant="primary"
-          disabled={busy || approvalBlocked}
-          title={approvalBlocked ? t("scope.engineRouteBlockedHint") : t("needs.approveRunTitle")}
-          onClick={() => void act(() => approveWriteTrigger(item, manualTool))}
+          disabled={busy || routingControl.approvalDisabled}
+          title={
+            routingControl.approvalDisabled
+              ? t("scope.engineRouteBlockedHint")
+              : t("needs.approveRunTitle")
+          }
+          onClick={() => void act(() => approveWriteTrigger(item, routingControl.manualTool))}
         >
           <Check size={13} />
           {t("needs.approveRun")}
         </Button>
-        {pickerVisible && (
+        {routingControl.pickerVisible && (
           <div
             title={t("needs.runWith")}
             className="inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-bg p-0.5"
           >
-            {installed.map((tl) => (
+            {routingControl.pickerOptions.map((tl) => (
               <button
                 key={tl.tool}
                 type="button"
                 title={toolFullName(tl.tool)}
                 aria-label={toolFullName(tl.tool)}
-                aria-pressed={pickerTool === tl.tool}
+                aria-pressed={routingControl.pickerTool === tl.tool}
                 onClick={() => setPicked(tl.tool)}
                 className={cn(
                   "grid h-6 w-7 place-items-center rounded-[var(--radius-sm)] transition-opacity duration-150",
-                  pickerTool === tl.tool ? "bg-raised" : "opacity-40 hover:opacity-80",
+                  routingControl.pickerTool === tl.tool
+                    ? "bg-raised"
+                    : "opacity-40 hover:opacity-80",
                 )}
               >
                 <ToolIcon tool={tl.tool} size={13} />

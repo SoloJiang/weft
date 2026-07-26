@@ -1185,6 +1185,119 @@ pub async fn chat_open_worker(
     .map_err(|e| e.to_string())
 }
 
+/// Persist the automatic decision made when a sessionless worker first opens.
+/// The audit marker is required even when the current tool already matches the
+/// stored direction: an earlier planner marker can describe a stale route.
+async fn reconcile_initial_worker_route(
+    db: &Db,
+    direction: &mut crate::store::entities::direction::Model,
+    prior_session_id: Option<i32>,
+    route: &crate::engine_routing::RouteDecision,
+) -> anyhow::Result<()> {
+    let selected = route
+        .selected()
+        .ok_or_else(|| anyhow::anyhow!("unblocked worker route had no selected engine"))?;
+    if selected.as_str() != direction.tool.as_str() {
+        repo::refresh_unpinned_direction_route(
+            db,
+            direction.id,
+            prior_session_id,
+            selected.as_str(),
+        )
+        .await?;
+        direction.tool = selected.as_str().to_string();
+    }
+    crate::engine_routing::record_decision(
+        db,
+        direction.thread_id,
+        None,
+        Some(direction.id),
+        "worker_start",
+        route,
+    )
+    .await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod initial_worker_route_tests {
+    use super::reconcile_initial_worker_route;
+    use crate::engine_quota::QuotaStatus;
+    use crate::engine_routing::{EngineId, RouteDecision, RouteReason, RoutingHint, RoutingSource};
+    use crate::store::{repo, Db};
+
+    async fn mem() -> Db {
+        Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn initial_worker_route_records_the_selected_tool_when_it_is_unchanged() {
+        let db = mem().await;
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, workspace.id, "repo", "/tmp/repo", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let mut direction = repo::create_direction(
+            &db,
+            thread.id,
+            "alpha",
+            "codex",
+            repo_ref.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let stale = serde_json::json!({
+            "tool": "claude",
+            "source": "automatic",
+            "operation": "planner_confirm",
+            "direction_id": direction.id,
+        })
+        .to_string();
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "system",
+            "engine_route",
+            &stale,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let route = RouteDecision {
+            tool: Some(EngineId::Codex),
+            source: RoutingSource::Automatic,
+            reason: RouteReason::NormalPreference,
+            hint: RoutingHint::Normal,
+            quota: Some(QuotaStatus::Ok),
+            blocked: false,
+        };
+
+        reconcile_initial_worker_route(&db, &mut direction, None, &route)
+            .await
+            .unwrap();
+
+        let marker = repo::list_lead_messages(&db, thread.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.kind == "engine_route" && message.session_id.is_none())
+            .last()
+            .unwrap();
+        let content: serde_json::Value = serde_json::from_str(&marker.content).unwrap();
+        assert_eq!(content["operation"], "worker_start");
+        assert_eq!(content["tool"], "codex");
+        assert_eq!(content["direction_id"], direction.id);
+    }
+}
+
 pub(crate) async fn chat_open_worker_impl(
     app: &AppHandle,
     db: &Db,
@@ -1242,28 +1355,13 @@ pub(crate) async fn chat_open_worker_impl(
         anyhow::bail!("engine_route_blocked:{}", route.reason_code());
     }
     if can_refresh_initial_route {
-        let selected = route
-            .selected()
-            .ok_or_else(|| anyhow::anyhow!("unblocked worker route had no selected engine"))?;
-        if selected.as_str() != dir.tool.as_str() {
-            repo::refresh_unpinned_direction_route(
-                db,
-                direction_id,
-                prior.as_ref().map(|session| session.id),
-                selected.as_str(),
-            )
-            .await?;
-            crate::engine_routing::record_decision(
-                db,
-                dir.thread_id,
-                None,
-                Some(direction_id),
-                "worker_start",
-                &route,
-            )
-            .await;
-            dir.tool = selected.as_str().to_string();
-        }
+        reconcile_initial_worker_route(
+            db,
+            &mut dir,
+            prior.as_ref().map(|session| session.id),
+            &route,
+        )
+        .await?;
     }
 
     // Resume an earlier conversation when this slot already captured one.

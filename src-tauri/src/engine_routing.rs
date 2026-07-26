@@ -769,10 +769,11 @@ fn is_later_lead_route_or_switch(message: &crate::store::entities::lead_message:
     )
 }
 
-/// Reconcile the initial route of an unstarted, unpinned lead. A blocked marker
-/// carries its original hint; if that best-effort marker was never written, the
-/// durable unpinned/unstarted thread state is enough to force a fresh decision
-/// instead of launching the fallback tool that automatic policy rejected.
+/// Reconcile the initial route of an unstarted, unpinned lead. Initial markers
+/// carry their original hints but never freeze an automatic decision before the
+/// first real start. If an audit marker was never written, the durable
+/// unpinned/unstarted thread state is enough to force a fresh decision instead
+/// of launching the fallback tool that automatic policy rejected.
 /// Existing healthy/running leads and migrated legacy/manual threads never move.
 pub async fn prepare_initial_lead(
     db: &Db,
@@ -790,16 +791,17 @@ pub async fn prepare_initial_lead(
     if repo::lead_status(db, thread.id).await?.is_some() {
         return Ok(thread.clone());
     }
-    let messages = repo::list_lead_messages(db, thread.id)
-        .await
-        .unwrap_or_default();
+    let messages = repo::list_lead_messages(db, thread.id).await?;
     let initial = messages
         .iter()
         .enumerate()
         .rev()
         .find_map(|(index, message)| initial_lead_route_marker(message).map(|route| (index, route)));
     let hint = match initial {
-        Some((_index, (false, _))) => return Ok(thread.clone()),
+        // A successful creation-time decision is only a hint. Until a lead has
+        // a status row it has not actually started, so its automatic route must
+        // be rechecked against the current commands and quota snapshot.
+        Some((_index, (false, hint))) => hint,
         Some((blocked_index, (true, hint))) => {
             // Once a blocked initial route has been resolved, a later LEAD
             // route/switch marker is the durable witness that this participant
@@ -1074,6 +1076,79 @@ mod tests {
             !err.to_string().is_empty(),
             "a lead-status read failure must abort recovery instead of rerouting a started lead"
         );
+    }
+
+    #[tokio::test]
+    async fn initial_lead_routing_propagates_a_route_history_read_failure() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        db.0
+            .execute_unprepared("DROP TABLE lead_message")
+            .await
+            .unwrap();
+
+        let err = prepare_initial_lead(&db, &thread).await.unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "a route-history read failure must abort recovery instead of discarding its hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_lead_rechecks_a_successful_marker_before_first_start() {
+        let _quota_hub_lock = crate::engine_quota::hub_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::engine_quota::clear_for_test();
+
+        let ready_command = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::tool_command::set_overrides(std::collections::HashMap::from([
+            ("codex".to_string(), "/definitely/missing-codex".to_string()),
+            ("claude".to_string(), ready_command),
+        ]));
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::set_setting(&db, K_AUTOMATIC_ROUTING_ENABLED, "true")
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let marker = serde_json::json!({
+            "tool": "codex",
+            "source": "automatic",
+            "operation": "new_issue",
+            "hint": "normal",
+        })
+        .to_string();
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "system",
+            "engine_route",
+            &marker,
+            "complete",
+        )
+        .await
+        .unwrap();
+
+        let recovered = prepare_initial_lead(&db, &thread).await.unwrap();
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+        crate::engine_quota::clear_for_test();
+
+        assert_eq!(recovered.lead_tool, "claude");
     }
 
     #[tokio::test]
