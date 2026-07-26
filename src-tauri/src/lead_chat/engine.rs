@@ -2021,7 +2021,7 @@ fn merge_init_slash_commands(
 async fn ensure_running_locked(
     app: &AppHandle,
     inner: &mut EngineInner,
-) -> anyhow::Result<Option<(tokio::process::ChildStdout, u64)>> {
+) -> anyhow::Result<Option<(tokio::process::ChildStdout, u64, String)>> {
     if inner.stopped {
         return Ok(None);
     }
@@ -2090,7 +2090,7 @@ async fn ensure_running_locked(
     inner.clock = TurnClock::default();
     inner.current = None;
     inner.interrupting = false;
-    Ok(Some((stdout, inner.generation)))
+    Ok(Some((stdout, inner.generation, program)))
 }
 
 /// Spawn the process if it isn't alive (fresh or `--resume`), wiring the reader.
@@ -2099,8 +2099,8 @@ pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow
     let mut inner = eng.lock().await;
     let reader = ensure_running_locked(app, &mut inner).await?;
     drop(inner);
-    if let Some((stdout, generation)) = reader {
-        spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
+    if let Some((stdout, generation, quota_command)) = reader {
+        spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation, quota_command);
     }
     Ok(())
 }
@@ -2980,14 +2980,21 @@ async fn spawn_codex_turn(
             let _ = client.resume_thread(&thread).await;
         }
         let rx = client.subscribe(&thread).await;
-        let (a, d, e, c, th) = (
+        let quota_command = match client.spawned_command().await {
+            Some(command) => command,
+            None => program.clone(),
+        };
+        let (a, d, e, c, th, quota_command) = (
             app.clone(),
             db.clone(),
             eng.clone(),
             client.clone(),
             thread.clone(),
+            quota_command,
         );
-        tauri::async_runtime::spawn(async move { codex_consumer(a, d, e, c, th, rx).await });
+        tauri::async_runtime::spawn(async move {
+            codex_consumer(a, d, e, c, th, quota_command, rx).await;
+        });
     }
     // stop_quiet may have run during the connect / start_thread / subscribe awaits
     // above, when there was no `codex_client` for it to shut down. If the stop won
@@ -3117,6 +3124,7 @@ async fn codex_consumer(
     eng: EngineRef,
     client: crate::codex_app_server::Client,
     thread: String,
+    quota_command: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::codex_app_server::ThreadMsg>,
 ) {
     use super::proto::ChatEvent;
@@ -3129,21 +3137,19 @@ async fn codex_consumer(
     while let Some(msg) = rx.recv().await {
         match msg {
             ThreadMsg::QuotaExceeded => {
-                let source = {
+                let tool = {
                     let mut inner = eng.lock().await;
                     if inner.turn.busy {
                         inner.turn.quota_exceeded = true;
-                        let tool = inner.tool.clone();
-                        let command = crate::tool_command::effective(inner.command.as_deref(), &tool);
-                        Some((tool, command))
+                        Some(inner.tool.clone())
                     } else {
                         None
                     }
                 };
-                if let Some((tool, command)) = source {
+                if let Some(tool) = tool {
                     let previous = crate::engine_quota::current(&tool);
                     if let Some(snapshot) = structured_codex_exhaustion_snapshot(&tool, previous.as_ref()) {
-                        crate::engine_quota::report_for_command(snapshot, &command);
+                        crate::engine_quota::report_for_command(snapshot, &quota_command);
                     }
                 }
             }
@@ -3938,7 +3944,7 @@ async fn spawn_turn(
     inner.current = None;
     let generation = inner.generation;
     drop(inner);
-    spawn_reader(app, db, eng, stdout, generation);
+    spawn_reader(app, db, eng, stdout, generation, program);
     Ok(())
 }
 
@@ -4153,8 +4159,15 @@ async fn send_hidden_inner(
         // Spawn the resident process under THIS lock, never releasing it before
         // the slot is reserved below. The reader task blocks on this lock and
         // proceeds once we drop it on return.
-        if let Some((stdout, generation)) = ensure_running_locked(app, &mut inner).await? {
-            spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
+        if let Some((stdout, generation, quota_command)) = ensure_running_locked(app, &mut inner).await? {
+            spawn_reader(
+                app.clone(),
+                db.clone(),
+                eng.clone(),
+                stdout,
+                generation,
+                quota_command,
+            );
         }
     }
     let out = Outgoing {
@@ -6263,6 +6276,7 @@ fn spawn_reader(
     eng: EngineRef,
     stdout: tokio::process::ChildStdout,
     generation: u64,
+    quota_command: String,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -6312,8 +6326,7 @@ fn spawn_reader(
                 {
                     inner.turn.quota_exceeded = true;
                 }
-                let command = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
-                crate::engine_quota::report_for_command(snapshot, &command);
+                crate::engine_quota::report_for_command(snapshot, &quota_command);
             }
             let event = crate::adapters::adapter_for(&inner.tool)
                 .map(|a| a.parse_line(&line))

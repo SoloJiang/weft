@@ -608,6 +608,9 @@ pub enum ThreadMsg {
 }
 
 struct Inner {
+    /// Exact binary that spawned this app-server process. It stays immutable for
+    /// the connection's lifetime even if the global command override changes.
+    command: String,
     /// Channel to the dedicated stdin writer task. Holds no `ChildStdin` directly,
     /// so async writes never need the state lock.
     // Each entry is (bytes, optional flush-ack): the writer task acks AFTER
@@ -679,6 +682,11 @@ impl Client {
     /// Whether the connection is still alive (read_loop clears the inner on EOF).
     pub async fn is_alive(&self) -> bool {
         self.0.lock().await.is_some()
+    }
+
+    /// The immutable binary that owns this connection's account/quota events.
+    pub async fn spawned_command(&self) -> Option<String> {
+        self.0.lock().await.as_ref().map(|inner| inner.command.clone())
     }
 
     /// Same underlying connection? Lets a consumer tell a genuine disconnect (still
@@ -819,6 +827,7 @@ impl Client {
         });
 
         *g = Some(Inner {
+            command: program.to_string(),
             write_tx,
             next_id: 1,
             pending: HashMap::new(),
@@ -1206,6 +1215,7 @@ impl Client {
         let reg = configured.register(&child);
         let (write_tx, _write_rx) = mpsc::unbounded_channel();
         Client(Arc::new(Mutex::new(Some(Inner {
+            command: "codex".to_string(),
             write_tx,
             next_id: 1,
             pending: HashMap::new(),

@@ -787,12 +787,7 @@ pub async fn prepare_initial_lead(
     // A status row means this participant has already been started at least
     // once. Initial routing is not a license to rebalance it on a later
     // resume, even if the quota/installation snapshot has changed.
-    if repo::lead_status(db, thread.id)
-        .await
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    if repo::lead_status(db, thread.id).await?.is_some() {
         return Ok(thread.clone());
     }
     let messages = repo::list_lead_messages(db, thread.id)
@@ -1062,6 +1057,22 @@ mod tests {
         assert_eq!(
             quota_failover_for_db(&db, "codex", false, true, true).await,
             FailoverDecision::Skip(FailoverSkipReason::PolicyUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_lead_routing_propagates_a_lead_status_read_failure() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        db.0.close_by_ref().await.unwrap();
+
+        let err = prepare_initial_lead(&db, &thread).await.unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "a lead-status read failure must abort recovery instead of rerouting a started lead"
         );
     }
 

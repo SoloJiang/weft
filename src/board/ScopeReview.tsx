@@ -10,6 +10,7 @@ import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { routeReasonKey } from "../lib/engineRoutingDisplay";
 import { PlanSummary } from "../session/blocks/PlanSummary";
 import { latestPlanCard, type ParsedPlanCard } from "../session/planCard";
+import { SCOPE_CONFIRM_DISABLED, scopeConfirmStateOf } from "./scopeConfirmState";
 
 // One sub-task lane: exactly one write repo per direction (scope rework). The
 // old read/write/none taxonomy is gone from this gate — every lane here is a
@@ -111,6 +112,12 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
     [leadMessages, activeThreadId],
   );
   const confirmMode = confirmModeOf(planCard);
+  const confirmState = scopeConfirmStateOf({
+    dirCount: dirs.length,
+    confirming,
+    routeBlocked: blockedRoute !== null,
+    manualTool,
+  });
 
   if (!proposal) return null;
 
@@ -271,7 +278,7 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
               className="ml-auto shrink-0"
               variant="primary"
               onClick={() => void confirm()}
-              disabled={confirming || dirs.length === 0}
+              disabled={SCOPE_CONFIRM_DISABLED[confirmState]}
             >
               <GitBranch size={14} />
               {confirming ? t("scope.confirming") : t(CONFIRM_LABEL_KEY[confirmMode], { count: dirs.length })}
