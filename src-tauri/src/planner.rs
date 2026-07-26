@@ -386,6 +386,65 @@ fn proposal_json_with_hints(proposal: &Proposal, baseline: &str) -> Result<Strin
     Ok(serde_json::to_string(&value)?)
 }
 
+/// Find the same reusable direction that confirmation would claim for a lane.
+///
+/// Preview must not match a terminal lane's direction again: confirmation reserves those
+/// directions before it handles pending siblings. `consumed` mirrors that reservation so a
+/// duplicate name/repo proposal does not preview the wrong engine for one of its lanes.
+fn reusable_direction_for_preview<'a>(
+    existing_dirs: &'a [crate::store::entities::direction::Model],
+    direction: &ResolvedDirection,
+    repo_ref: Option<&crate::store::entities::repo_ref::Model>,
+    consumed: &std::collections::HashSet<i32>,
+) -> Option<&'a crate::store::entities::direction::Model> {
+    existing_dirs.iter().find(|existing| {
+        existing.name == direction.name
+            && existing.repo_id == direction.repo.repo_id
+            && existing.status != "done"
+            && !consumed.contains(&existing.id)
+            && repo_ref.is_none_or(|repo| {
+                base_compatible(
+                    &existing.base_branch,
+                    &direction.base_branch,
+                    std::path::Path::new(&repo.local_git_path),
+                    &repo.base_ref,
+                    repo.base_ref_is_default,
+                )
+            })
+    })
+}
+
+/// Build the route preview for a pending lane without changing confirmation semantics.
+///
+/// A pinned direction or a direction with an existing session is already a participant, so its
+/// persisted/session tool is authoritative even when the current automatic candidates are
+/// blocked. The explicit-tool resolver is used only to express that retained identity and to
+/// surface an unavailable command; it does not select a new engine. Sessionless, unpinned
+/// directions continue through the current automatic resolver and therefore remain blocked when
+/// no eligible candidate exists.
+async fn preview_route_for_direction(
+    db: &Db,
+    direction: &ResolvedDirection,
+    existing: Option<&crate::store::entities::direction::Model>,
+    repo_id: i32,
+    legacy_tool: &str,
+) -> Result<Option<crate::engine_routing::RouteDecision>> {
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let session = repo::latest_session_for(db, existing.id, repo_id).await?;
+    if !existing.engine_pinned && session.is_none() {
+        return Ok(None);
+    }
+    let tool = session
+        .as_ref()
+        .map(|session| session.tool.as_str())
+        .unwrap_or(existing.tool.as_str());
+    Ok(Some(
+        crate::engine_routing::resolve_for_db(db, Some(tool), legacy_tool, direction.hint).await,
+    ))
+}
+
 /// Withdraw a thread's pending proposal (the lead's first-class "cancel/retract").
 /// ALL-OR-NOTHING on a still-pending proposal: clears the directions and flips status to
 /// "withdrawn" ONLY when the plan is "proposed" AND no lane has been approved/materialized.
@@ -475,17 +534,71 @@ pub async fn get_resolved(db: &Db, thread_id: i32) -> Result<Option<ResolvedProp
     };
     let mut resolved = resolved_from_plan(db, thread_id, &p).await?;
     let legacy = crate::tools::default_tool(db).await;
+    let existing_dirs = repo::list_directions(db, thread_id).await?;
+    let mut consumed = std::collections::HashSet::new();
+
+    // Match confirmation's terminal pre-claim so a pending duplicate lane does not preview the
+    // route of an already-approved/denied sibling. Recorded ids are authoritative; older plans
+    // fall back to the same base-aware lookup used by the confirmation path.
+    for direction in &resolved.directions {
+        if !direction.repo.known
+            || !(direction.decision == "approved" || direction.decision == "denied")
+        {
+            continue;
+        }
+        if direction.direction_id != 0 {
+            let owns = existing_dirs
+                .iter()
+                .any(|existing| existing.id == direction.direction_id && existing.status != "done");
+            if owns {
+                consumed.insert(direction.direction_id);
+                continue;
+            }
+        }
+        // The confirmation path treats this terminal pre-claim as best effort:
+        // a transient repo read must not stop a pending sibling from reaching
+        // its own later, authoritative repository validation.
+        let repo_ref = repo::get_repo(db, direction.repo.repo_id).await.ok().flatten();
+        if let Some(existing) = reusable_direction_for_preview(
+            &existing_dirs,
+            direction,
+            repo_ref.as_ref(),
+            &consumed,
+        ) {
+            consumed.insert(existing.id);
+        }
+    }
+
     for direction in &mut resolved.directions {
         if direction.decision.is_empty() {
-            direction.route = Some(
-                crate::engine_routing::resolve_for_db(
-                    db,
-                    None,
-                    &legacy,
-                    direction.hint,
-                )
-                .await,
+            let repo_ref = if direction.repo.known {
+                repo::get_repo(db, direction.repo.repo_id).await?
+            } else {
+                None
+            };
+            let existing = reusable_direction_for_preview(
+                &existing_dirs,
+                direction,
+                repo_ref.as_ref(),
+                &consumed,
             );
+            if let Some(existing) = existing {
+                consumed.insert(existing.id);
+            }
+            let retained_route = preview_route_for_direction(
+                db,
+                direction,
+                existing,
+                direction.repo.repo_id,
+                &legacy,
+            )
+            .await?;
+            direction.route = Some(match retained_route {
+                Some(route) => route,
+                None => {
+                    crate::engine_routing::resolve_for_db(db, None, &legacy, direction.hint).await
+                }
+            });
         }
     }
     Ok(Some(resolved))
@@ -3083,6 +3196,223 @@ mod tests {
         assert_eq!(plan.status, "proposed", "the failed confirmation must remain retryable");
 
         let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn reused_route_preview_and_confirm_keep_existing_engine_when_automatic_blocked() {
+        let _quota_hub_lock = crate::engine_quota::hub_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::engine_quota::clear_for_test();
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-reused-route-preview-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            root.join("api").to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        repo::set_setting(&db, crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED, "true")
+            .await
+            .unwrap();
+
+        let pinned_thread = repo::create_thread(&db, ws.id, "pinned", "feature", "codex")
+            .await
+            .unwrap();
+        let pinned = repo::create_direction_with_engine_pin(
+            &db,
+            pinned_thread.id,
+            "pinned lane",
+            "opencode",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        materialize::materialize_direction(&db, pinned.id)
+            .await
+            .unwrap();
+        save_proposal(
+            &db,
+            pinned_thread.id,
+            &Proposal {
+                rationale: "r".into(),
+                directions: vec![ProposedDirection {
+                    name: "pinned lane".into(),
+                    repo: "api".into(),
+                    reason: "r".into(),
+                    mandate: "plan+impl".into(),
+                    base_branch: "".into(),
+                    decision: "".into(),
+                    direction_id: 0,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let session_thread = repo::create_thread(&db, ws.id, "session", "feature", "codex")
+            .await
+            .unwrap();
+        let session_direction = repo::create_direction_with_engine_pin(
+            &db,
+            session_thread.id,
+            "session lane",
+            "opencode",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+            false,
+        )
+        .await
+        .unwrap();
+        materialize::materialize_direction(&db, session_direction.id)
+            .await
+            .unwrap();
+        let session = repo::create_session(
+            &db,
+            session_direction.id,
+            repo_ref.id,
+            "opencode",
+            "/tmp/session-lane",
+        )
+        .await
+        .unwrap();
+        repo::set_session_native_id(&db, session.id, "native-session")
+            .await
+            .unwrap();
+        save_proposal(
+            &db,
+            session_thread.id,
+            &Proposal {
+                rationale: "r".into(),
+                directions: vec![ProposedDirection {
+                    name: "session lane".into(),
+                    repo: "api".into(),
+                    reason: "r".into(),
+                    mandate: "plan+impl".into(),
+                    base_branch: "".into(),
+                    decision: "".into(),
+                    direction_id: 0,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let fresh_thread = repo::create_thread(&db, ws.id, "fresh", "feature", "codex")
+            .await
+            .unwrap();
+        let fresh = repo::create_direction_with_engine_pin(
+            &db,
+            fresh_thread.id,
+            "fresh lane",
+            "codex",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+            false,
+        )
+        .await
+        .unwrap();
+        materialize::materialize_direction(&db, fresh.id).await.unwrap();
+        save_proposal(
+            &db,
+            fresh_thread.id,
+            &Proposal {
+                rationale: "r".into(),
+                directions: vec![ProposedDirection {
+                    name: "fresh lane".into(),
+                    repo: "api".into(),
+                    reason: "r".into(),
+                    mandate: "plan+impl".into(),
+                    base_branch: "".into(),
+                    decision: "".into(),
+                    direction_id: 0,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let current_exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::tool_command::set_overrides(std::collections::HashMap::from([
+            (
+                "codex".to_string(),
+                root.join("missing-codex").to_string_lossy().into_owned(),
+            ),
+            (
+                "claude".to_string(),
+                root.join("missing-claude").to_string_lossy().into_owned(),
+            ),
+            ("opencode".to_string(), current_exe),
+        ]));
+
+        let pinned_preview = get_resolved(&db, pinned_thread.id).await.unwrap().unwrap();
+        assert_eq!(pinned_preview.directions[0].route.as_ref().unwrap().tool.as_ref().map(|t| t.as_str()), Some("opencode"));
+        assert!(!pinned_preview.directions[0].route.as_ref().unwrap().blocked);
+        let session_preview = get_resolved(&db, session_thread.id).await.unwrap().unwrap();
+        assert_eq!(session_preview.directions[0].route.as_ref().unwrap().tool.as_ref().map(|t| t.as_str()), Some("opencode"));
+        assert!(!session_preview.directions[0].route.as_ref().unwrap().blocked);
+        let fresh_preview = get_resolved(&db, fresh_thread.id).await.unwrap().unwrap();
+        assert!(fresh_preview.directions[0].route.as_ref().unwrap().blocked);
+
+        let pinned_ids = confirm_with_manual_tool(&db, pinned_thread.id, None)
+            .await
+            .unwrap();
+        assert_eq!(pinned_ids, vec![pinned.id]);
+        assert_eq!(repo::get_direction(&db, pinned.id).await.unwrap().unwrap().tool, "opencode");
+
+        let session_ids = confirm_with_manual_tool(&db, session_thread.id, None)
+            .await
+            .unwrap();
+        assert_eq!(session_ids, vec![session_direction.id]);
+        assert_eq!(repo::get_direction(&db, session_direction.id).await.unwrap().unwrap().tool, "opencode");
+        assert!(repo::get_session(&db, session.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .native_session_id
+            .is_some());
+
+        let blocked = confirm_with_manual_tool(&db, fresh_thread.id, None).await;
+        assert!(blocked.is_err(), "a sessionless unpinned lane must still reject a blocked route");
+
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+        crate::engine_quota::clear_for_test();
+        let removed = repo::delete_thread_cascade(&db, pinned_thread.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        let removed = repo::delete_thread_cascade(&db, session_thread.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        let removed = repo::delete_thread_cascade(&db, fresh_thread.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
