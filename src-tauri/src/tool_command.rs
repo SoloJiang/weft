@@ -42,10 +42,28 @@ pub fn set_overrides(map: HashMap<String, String>) {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    *g = map
+    let next: HashMap<String, String> = map
         .into_iter()
         .filter(|(_tool, cmd)| validate_override(cmd).is_ok())
         .collect();
+    let changed_tools: Vec<String> = ["codex", "claude", "opencode"]
+        .into_iter()
+        .filter(|tool| {
+            g.get(*tool).map(String::as_str).unwrap_or(*tool)
+                != next.get(*tool).map(String::as_str).unwrap_or(*tool)
+        })
+        .map(str::to_string)
+        .collect();
+    *g = next;
+    drop(g);
+
+    // Quota snapshots are keyed by stable tool identity so the routing UI can
+    // aggregate them across sessions. A command override changes the effective
+    // account/binary behind that identity, so stale exhaustion must not survive
+    // the configuration change.
+    for tool in changed_tools {
+        crate::engine_quota::clear(&tool);
+    }
 }
 
 /// Tests in multiple modules temporarily replace this process-global map. Keep
@@ -232,6 +250,22 @@ mod tests {
         )]));
         assert_eq!(command_for("claude"), "/opt/homebrew/bin/claude");
         assert_eq!(effective(None, "claude"), "/opt/homebrew/bin/claude");
+
+        // A command change invalidates quota state captured for the old
+        // account/binary instead of carrying its exhaustion into the new one.
+        crate::engine_quota::clear_for_test();
+        set_overrides(HashMap::from([("claude".to_string(), "old-claude".to_string())]));
+        crate::engine_quota::report(crate::engine_quota::QuotaSnapshot {
+            tool: "claude".into(),
+            status: crate::engine_quota::QuotaStatus::Exceeded,
+            used_percent: Some(100),
+            resets_at: Some(crate::engine_quota::now_unix() + 3_600),
+            window_label: Some("five_hour".into()),
+            observed_at: crate::engine_quota::now_unix(),
+        });
+        set_overrides(HashMap::from([("claude".to_string(), "new-claude".to_string())]));
+        assert!(crate::engine_quota::current("claude").is_none());
+        crate::engine_quota::clear_for_test();
 
         set_overrides(HashMap::new()); // leave the global map clean
     }

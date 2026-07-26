@@ -145,6 +145,18 @@ pub fn report(snapshot: QuotaSnapshot) {
         .insert(snapshot.tool.clone(), snapshot);
 }
 
+/// Drop the account snapshot for one tool after its effective command changes.
+/// A quota reading is account/command scoped in practice, while the in-memory
+/// hub is intentionally keyed by the stable tool identity for normal routing.
+/// Clearing only the affected identity prevents an old command's exhaustion
+/// state from blocking the newly configured command.
+pub fn clear(tool: &str) {
+    hub()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(tool);
+}
+
 /// The current snapshot for one tool, if any has been observed this run.
 pub fn current(tool: &str) -> Option<QuotaSnapshot> {
     let mut snapshots = hub().lock().unwrap_or_else(|e| e.into_inner());
@@ -282,6 +294,38 @@ mod tests {
             observed_at: now - UNKNOWN_RESET_SNAPSHOT_TTL_SECS - 1,
         });
         assert!(all().is_empty());
+    }
+
+    #[test]
+    fn clear_invalidates_only_the_changed_tool_snapshot() {
+        let _test_hub_lock = hub_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_for_test();
+        let now = now_unix();
+        report(QuotaSnapshot {
+            tool: "claude".into(),
+            status: QuotaStatus::Exceeded,
+            used_percent: Some(100),
+            resets_at: Some(now + 3_600),
+            window_label: Some("five_hour".into()),
+            observed_at: now,
+        });
+        report(QuotaSnapshot {
+            tool: "codex".into(),
+            status: QuotaStatus::Warning,
+            used_percent: Some(85),
+            resets_at: Some(now + 3_600),
+            window_label: Some("primary".into()),
+            observed_at: now,
+        });
+
+        clear("claude");
+
+        assert!(current("claude").is_none());
+        assert_eq!(
+            current("codex").map(|snapshot| snapshot.status),
+            Some(QuotaStatus::Warning)
+        );
+        clear_for_test();
     }
 
     #[test]

@@ -10,6 +10,8 @@ use crate::engine_quota::{QuotaSnapshot, QuotaStatus};
 use crate::store::{repo, Db};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(unix)]
+use std::path::Path;
 
 pub const K_AUTOMATIC_ROUTING_ENABLED: &str = "automatic_engine_routing";
 pub const K_QUOTA_FAILOVER_ENABLED: &str = "quota_failover_on_exceeded";
@@ -338,6 +340,7 @@ pub enum FailoverSkipReason {
     NotStructuredExceeded,
     NoFallback,
     CooldownActive,
+    PolicyUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -410,12 +413,52 @@ fn snapshots_by_tool() -> Vec<QuotaSnapshot> {
     crate::engine_quota::all()
 }
 
+#[cfg(unix)]
+fn is_executable_regular_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn command_is_ready_on_path(command: &str, search_path: &str) -> bool {
+    let path = Path::new(command);
+    if path.is_absolute() {
+        return is_executable_regular_file(path);
+    }
+    std::env::split_paths(search_path)
+        .map(|directory| directory.join(command))
+        .any(|path| is_executable_regular_file(&path))
+}
+
+/// Match the eventual bare `Command::new(command)` spawn closely enough for
+/// automatic routing. Windows keeps the existing PATHEXT-aware detector; Unix
+/// additionally rejects regular files that the process cannot execute.
+fn command_is_ready(command: &str) -> bool {
+    if !crate::detect::resolves_on_path(command) {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        true
+    }
+
+    #[cfg(unix)]
+    {
+        command_is_ready_on_path(command, &crate::detect::tool_path())
+    }
+}
+
 fn candidate_for(tool: EngineId, snapshots: &[QuotaSnapshot]) -> RouteCandidate {
     let command = crate::tool_command::command_for(tool.as_str());
     // A route must only select a command that the eventual bare
     // `Command::new(command)` spawn can reach. This excludes the Codex app
-    // bundle fallback on Unix and uses PATHEXT-aware lookup for Windows shims.
-    let installed = crate::detect::resolves_on_path(&command);
+    // bundle fallback on Unix, rejects non-executable files, and uses
+    // PATHEXT-aware lookup for Windows shims.
+    let installed = command_is_ready(&command);
     let quota = snapshots
         .iter()
         .find(|snapshot| snapshot.tool == tool.as_str())
@@ -438,57 +481,73 @@ fn candidate_list() -> Vec<RouteCandidate> {
 /// Read the one global setting and resolve a request against the live local
 /// installation/quota state. Invalid manual identities are blocked rather than
 /// silently transformed into a different engine.
+pub async fn try_resolve_for_db(
+    db: &Db,
+    manual_tool: Option<&str>,
+    legacy_tool: &str,
+    hint: RoutingHint,
+) -> anyhow::Result<RouteDecision> {
+    let legacy = EngineId::parse(legacy_tool).unwrap_or(EngineId::Codex);
+    if let Some(manual_tool) = manual_tool {
+        let Some(manual) = EngineId::parse(manual_tool) else {
+            return Ok(blocked(RouteReason::InvalidManualTool, hint));
+        };
+        return Ok(resolve(&RouteRequest {
+            automatic_enabled: false,
+            manual_tool: Some(manual),
+            legacy_tool: legacy,
+            hint,
+            candidates: candidate_list(),
+        }));
+    }
+
+    let automatic_enabled = is_enabled(
+        repo::get_setting(db, K_AUTOMATIC_ROUTING_ENABLED)
+            .await?
+            .as_deref(),
+    );
+    Ok(resolve(&RouteRequest {
+        automatic_enabled,
+        manual_tool: None,
+        legacy_tool: legacy,
+        hint,
+        candidates: candidate_list(),
+    }))
+}
+
+/// Compatibility boundary for existing callers that consume a decision
+/// directly. Policy read failures become an explicit blocked route, never a
+/// false/disabled policy that can launch the persisted legacy tool. Callers
+/// that need the underlying database error should use [`try_resolve_for_db`].
 pub async fn resolve_for_db(
     db: &Db,
     manual_tool: Option<&str>,
     legacy_tool: &str,
     hint: RoutingHint,
 ) -> RouteDecision {
-    let automatic_enabled = is_enabled(
-        repo::get_setting(db, K_AUTOMATIC_ROUTING_ENABLED)
-            .await
-            .ok()
-            .flatten()
-            .as_deref(),
-    );
-    let legacy = EngineId::parse(legacy_tool).unwrap_or(EngineId::Codex);
-    let Some(manual_tool) = manual_tool else {
-        return resolve(&RouteRequest {
-            automatic_enabled,
-            manual_tool: None,
-            legacy_tool: legacy,
-            hint,
-            candidates: candidate_list(),
-        });
-    };
-    let Some(manual) = EngineId::parse(manual_tool) else {
-        return blocked(RouteReason::InvalidManualTool, hint);
-    };
-    resolve(&RouteRequest {
-        automatic_enabled,
-        manual_tool: Some(manual),
-        legacy_tool: legacy,
-        hint,
-        candidates: candidate_list(),
-    })
+    match try_resolve_for_db(db, manual_tool, legacy_tool, hint).await {
+        Ok(decision) => decision,
+        Err(err) => {
+            eprintln!("[weft][routing] policy read failed; route blocked: {err}");
+            blocked(RouteReason::AutomaticCandidateUnavailable, hint)
+        }
+    }
 }
 
-pub async fn quota_failover_for_db(
+pub async fn try_quota_failover_for_db(
     db: &Db,
     current: &str,
     manual_pin: bool,
     structured_exceeded: bool,
     cooldown_ok: bool,
-) -> FailoverDecision {
+) -> anyhow::Result<FailoverDecision> {
     let enabled = is_enabled(
         repo::get_setting(db, K_QUOTA_FAILOVER_ENABLED)
-            .await
-            .ok()
-            .flatten()
+            .await?
             .as_deref(),
     );
     let Some(current) = EngineId::parse(current) else {
-        return FailoverDecision::Skip(FailoverSkipReason::NoFallback);
+        return Ok(FailoverDecision::Skip(FailoverSkipReason::NoFallback));
     };
     let candidates = candidate_list();
     let fallback_tool = match current {
@@ -497,14 +556,41 @@ pub async fn quota_failover_for_db(
         EngineId::Opencode => None,
     };
     let fallback = fallback_tool.and_then(|tool| candidate(&candidates, tool));
-    resolve_failover(
+    Ok(resolve_failover(
         current,
         enabled,
         manual_pin,
         structured_exceeded,
         fallback,
         cooldown_ok,
+    ))
+}
+
+/// Compatibility boundary for the quota callback. An unreadable opt-in
+/// setting safely skips handoff and leaves a distinct reason for callers to
+/// log/audit; it never treats the policy as disabled and proceeds implicitly.
+pub async fn quota_failover_for_db(
+    db: &Db,
+    current: &str,
+    manual_pin: bool,
+    structured_exceeded: bool,
+    cooldown_ok: bool,
+) -> FailoverDecision {
+    match try_quota_failover_for_db(
+        db,
+        current,
+        manual_pin,
+        structured_exceeded,
+        cooldown_ok,
     )
+    .await
+    {
+        Ok(decision) => decision,
+        Err(err) => {
+            eprintln!("[weft][quota] policy read failed; failover skipped: {err}");
+            FailoverDecision::Skip(FailoverSkipReason::PolicyUnavailable)
+        }
+    }
 }
 
 fn quota_code(quota: Option<QuotaStatus>) -> Option<&'static str> {
@@ -738,7 +824,7 @@ pub async fn prepare_initial_lead(
         // into permission to run its persisted fallback tool.
         None => default_initial_hint(thread),
     };
-    let decision = resolve_for_db(db, None, &thread.lead_tool, hint).await;
+    let decision = try_resolve_for_db(db, None, &thread.lead_tool, hint).await?;
     let Some(tool) = decision.selected() else {
         record_decision(db, thread.id, None, None, "lead_start", &decision).await;
         anyhow::bail!("engine_route_blocked:{}", decision.reason_code());
@@ -761,13 +847,7 @@ pub async fn mirror_direction_route(db: &Db, thread_id: i32, direction_id: i32, 
     let messages = repo::list_lead_messages(db, thread_id)
         .await
         .unwrap_or_default();
-    if messages
-        .iter()
-        .any(|message| message.session_id == Some(session_id) && message.kind == "engine_route")
-    {
-        return;
-    }
-    let Some(source) = messages.into_iter().rev().find(|message| {
+    let Some(source) = messages.iter().rev().find(|message| {
         if message.kind != "engine_route" || message.session_id.is_some() {
             return false;
         }
@@ -778,6 +858,18 @@ pub async fn mirror_direction_route(db: &Db, thread_id: i32, direction_id: i32, 
     }) else {
         return;
     };
+    // A session can be created before native startup, then be reopened after
+    // its unpinned direction is re-resolved. Reuse the old mirror only when it
+    // is byte-for-byte the current authoritative direction marker; otherwise
+    // append the newer marker so the timeline retains both route decisions.
+    if messages.iter().rev().any(|message| {
+        message.session_id == Some(session_id)
+            && message.kind == "engine_route"
+            && message.content == source.content
+    }) {
+        return;
+    }
+    let source_content = source.content.clone();
     let turn_id = match repo::next_turn_id(db, thread_id).await {
         Ok(turn) => turn,
         Err(_) => return,
@@ -789,7 +881,7 @@ pub async fn mirror_direction_route(db: &Db, thread_id: i32, direction_id: i32, 
         turn_id,
         "system",
         "engine_route",
-        &source.content,
+        &source_content,
         "complete",
     )
     .await;
@@ -827,6 +919,7 @@ pub async fn has_manual_pin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::ConnectionTrait;
 
     fn candidate(tool: EngineId, installed: bool, quota: Option<QuotaStatus>) -> RouteCandidate {
         RouteCandidate {
@@ -913,6 +1006,64 @@ mod tests {
         ));
         assert_eq!(out.selected(), Some(EngineId::Claude));
         assert_eq!(out.source, RoutingSource::Manual);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_candidates_require_executable_regular_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("agent");
+        std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let search_path = dir.path().to_string_lossy().into_owned();
+        assert!(!command_is_ready_on_path(
+            executable.to_str().unwrap(),
+            &search_path
+        ));
+        assert!(!command_is_ready_on_path("agent", &search_path));
+
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        assert!(command_is_ready_on_path(
+            executable.to_str().unwrap(),
+            &search_path
+        ));
+        assert!(command_is_ready_on_path("agent", &search_path));
+    }
+
+    #[tokio::test]
+    async fn routing_policy_read_errors_fail_closed() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        db.0
+            .execute_unprepared("DROP TABLE app_setting")
+            .await
+            .unwrap();
+
+        let checked = try_resolve_for_db(&db, None, "codex", RoutingHint::Normal).await;
+        assert!(checked.is_err());
+
+        let manual = try_resolve_for_db(&db, Some("opencode"), "codex", RoutingHint::Normal)
+            .await
+            .unwrap();
+        assert_eq!(manual.selected(), Some(EngineId::Opencode));
+
+        let blocked = resolve_for_db(&db, None, "codex", RoutingHint::Normal).await;
+        assert!(blocked.blocked);
+        assert_eq!(blocked.reason, RouteReason::AutomaticCandidateUnavailable);
+
+        let checked_failover =
+            try_quota_failover_for_db(&db, "codex", false, true, true).await;
+        assert!(checked_failover.is_err());
+        assert_eq!(
+            quota_failover_for_db(&db, "codex", false, true, true).await,
+            FailoverDecision::Skip(FailoverSkipReason::PolicyUnavailable)
+        );
     }
 
     #[tokio::test]
@@ -1086,6 +1237,71 @@ mod tests {
             Ok(resolved) => assert_ne!(resolved.lead_tool, "not-a-tool"),
             Err(err) => assert!(err.to_string().starts_with("engine_route_blocked:")),
         }
+    }
+
+    #[tokio::test]
+    async fn mirror_direction_route_appends_a_newer_authoritative_marker() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let old_route = serde_json::json!({
+            "tool": "codex",
+            "source": "automatic",
+            "operation": "planner_confirm",
+            "direction_id": 7,
+        })
+        .to_string();
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "system",
+            "engine_route",
+            &old_route,
+            "complete",
+        )
+        .await
+        .unwrap();
+
+        mirror_direction_route(&db, thread.id, 7, 19).await;
+
+        let new_route = serde_json::json!({
+            "tool": "claude",
+            "source": "automatic",
+            "operation": "planner_confirm",
+            "direction_id": 7,
+        })
+        .to_string();
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            2,
+            "system",
+            "engine_route",
+            &new_route,
+            "complete",
+        )
+        .await
+        .unwrap();
+
+        mirror_direction_route(&db, thread.id, 7, 19).await;
+        mirror_direction_route(&db, thread.id, 7, 19).await;
+
+        let mirrors: Vec<_> = repo::list_lead_messages(&db, thread.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|message| {
+                message.session_id == Some(19) && message.kind == "engine_route"
+            })
+            .collect();
+        assert_eq!(mirrors.len(), 2);
+        assert_eq!(mirrors[0].content, old_route);
+        assert_eq!(mirrors[1].content, new_route);
     }
 
     #[test]
