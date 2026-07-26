@@ -901,10 +901,13 @@ pub async fn list_directions(
 /// workspace repos (ARCHITECTURE §4.10, §5.1). None if nothing proposed yet.
 #[tauri::command]
 pub async fn get_proposal(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     thread_id: i32,
 ) -> R<Option<crate::planner::ResolvedProposal>> {
-    crate::planner::get_resolved(&db, thread_id)
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.get(session_id as i64).is_some();
+    crate::planner::get_resolved_with_live_sessions(&db, thread_id, &is_session_live)
         .await
         .map_err(e)
 }
@@ -989,20 +992,42 @@ async fn confirm_proposal_and_propagate_read_only_with_manual_tool(
     Ok(ids)
 }
 
+async fn confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sessions(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+    manual_tool: Option<&str>,
+    is_session_live: &(dyn Fn(i32) -> bool + Send + Sync),
+) -> anyhow::Result<Vec<i32>> {
+    let ids = crate::planner::confirm_with_manual_tool_and_live_sessions(
+        db,
+        thread_id,
+        manual_tool,
+        is_session_live,
+    )
+    .await?;
+    asks.grant_read_only_issue(thread_id);
+    Ok(ids)
+}
+
 /// Confirm the stored proposal: create its directions + materialize worktrees.
 /// See `confirm_proposal_and_propagate_read_only` for the read-only propagation.
 #[tauri::command]
 pub async fn confirm_proposal(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     asks: tauri::State<'_, crate::ask::AskRegistry>,
     thread_id: i32,
     manual_tool: Option<String>,
 ) -> R<Vec<i32>> {
-    confirm_proposal_and_propagate_read_only_with_manual_tool(
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.get(session_id as i64).is_some();
+    confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sessions(
         &db,
         &asks,
         thread_id,
         manual_tool.as_deref(),
+        &is_session_live,
     )
         .await
         .map_err(e)
@@ -1689,7 +1714,13 @@ pub struct WriteTrigger {
 /// Every pending write declaration across the workspace's threads — the
 /// data behind the Needs-you "approve a write" cards.
 #[tauri::command]
-pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<WriteTrigger>> {
+pub async fn write_triggers(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    workspace_id: i32,
+) -> R<Vec<WriteTrigger>> {
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.get(session_id as i64).is_some();
     let threads: Vec<_> = repo::list_threads(&db, workspace_id)
         .await
         .map_err(e)?
@@ -1698,7 +1729,13 @@ pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<Write
         .collect();
     let mut out = Vec::new();
     for t in threads {
-        for p in crate::planner::pending_writes(&db, t.id).await.map_err(e)? {
+        for p in crate::planner::pending_writes_with_live_sessions(
+            &db,
+            t.id,
+            &is_session_live,
+        )
+        .await
+        .map_err(e)? {
             out.push(WriteTrigger {
                 thread_id: t.id,
                 thread_title: t.title.clone(),
@@ -1742,17 +1779,21 @@ async fn approve_write_trigger_and_propagate_read_only(
 /// `approve_write_trigger_and_propagate_read_only` for the read-only propagation.
 #[tauri::command]
 pub async fn approve_write_trigger(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     asks: tauri::State<'_, crate::ask::AskRegistry>,
     thread_id: i32,
     index: usize,
     tool: Option<String>,
 ) -> R<i32> {
-    let id = crate::planner::approve_direction_with_pin(
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.get(session_id as i64).is_some();
+    let id = crate::planner::approve_direction_with_pin_and_live_sessions(
         &db,
         thread_id,
         index,
         tool.as_deref(),
+        &is_session_live,
     )
     .await
     .map_err(e)?;

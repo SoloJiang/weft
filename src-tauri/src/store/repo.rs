@@ -13,6 +13,17 @@ use sea_orm::{
 };
 use std::collections::HashMap;
 
+/// A manual route selected for a reused direction before its first native
+/// conversation. `session_id` is present only when an interrupted initial
+/// open left a session row behind; that row must move with the direction so a
+/// later cold open cannot recover the stale tool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitialDirectionRoutePin {
+    pub direction_id: i32,
+    pub session_id: Option<i32>,
+    pub tool: String,
+}
+
 /// Test-only DB-write failure injection.
 ///
 /// Why it exists: several already-shipped degradation paths differ from their
@@ -919,6 +930,89 @@ pub async fn update_plan_proposal_cas(
     Ok(res.rows_affected > 0)
 }
 
+/// Persist one selected route under a transaction that has already claimed the
+/// SQLite writer lock with its plan update.
+///
+/// A sessionless route must remain sessionless. A `session_id` identifies the
+/// latest interrupted initial session: it may be updated only while it has not
+/// captured a native conversation or become independently pinned. The planner
+/// checks the in-memory live-engine registry before choosing that shape; this
+/// store boundary keeps the durable native-session race fail-closed.
+async fn pin_initial_direction_route(
+    txn: &sea_orm::DatabaseTransaction,
+    thread_id: i32,
+    pin: &InitialDirectionRoutePin,
+    operation: &str,
+) -> Result<()> {
+    let direction_write = direction::Entity::update_many()
+        .col_expr(direction::Column::Tool, Expr::value(pin.tool.clone()))
+        .col_expr(direction::Column::EnginePinned, Expr::value(true))
+        .filter(direction::Column::Id.eq(pin.direction_id))
+        .filter(direction::Column::ThreadId.eq(thread_id))
+        .filter(direction::Column::EnginePinned.eq(false))
+        .exec(txn)
+        .await?;
+    if direction_write.rows_affected == 0 {
+        anyhow::bail!(
+            "direction {} became manually pinned while {operation} its route",
+            pin.direction_id
+        );
+    }
+
+    let Some(session_id) = pin.session_id else {
+        let opened_session = session::Entity::find()
+            .filter(session::Column::DirectionId.eq(pin.direction_id))
+            .one(txn)
+            .await?;
+        if opened_session.is_some() {
+            anyhow::bail!(
+                "direction {} opened while {operation} its manual route",
+                pin.direction_id
+            );
+        }
+        return Ok(());
+    };
+
+    let latest_session = session::Entity::find()
+        .filter(session::Column::DirectionId.eq(pin.direction_id))
+        .order_by_desc(session::Column::Id)
+        .one(txn)
+        .await?;
+    let can_refresh_session = latest_session.is_some_and(|session| {
+        session.id == session_id
+            && session.native_session_id.is_none()
+            && !session.engine_pinned
+    });
+    if !can_refresh_session {
+        anyhow::bail!(
+            "direction {} opened while {operation} its manual route",
+            pin.direction_id
+        );
+    }
+
+    let session_write = session::Entity::update_many()
+        .col_expr(session::Column::Tool, Expr::value(pin.tool.clone()))
+        .col_expr(session::Column::EnginePinned, Expr::value(true))
+        .col_expr(session::Column::Command, Expr::value(Option::<String>::None))
+        .col_expr(session::Column::Model, Expr::value(Option::<String>::None))
+        .col_expr(
+            session::Column::NativeSessionId,
+            Expr::value(Option::<String>::None),
+        )
+        .filter(session::Column::Id.eq(session_id))
+        .filter(session::Column::DirectionId.eq(pin.direction_id))
+        .filter(session::Column::EnginePinned.eq(false))
+        .filter(session::Column::NativeSessionId.is_null())
+        .exec(txn)
+        .await?;
+    if session_write.rows_affected == 0 {
+        anyhow::bail!(
+            "session {session_id} became established while {operation} its manual route"
+        );
+    }
+    Ok(())
+}
+
 /// Atomically record a reused lane's approval and its explicit manual route.
 /// The worktree has already materialized before this is called, but the plan
 /// must never become approved without the manual pin that justified dispatch.
@@ -931,8 +1025,7 @@ pub async fn commit_reused_approval_with_direction_pin_cas(
     new_proposal: &str,
     expected_proposal: &str,
     expected_status: &str,
-    direction_id: i32,
-    tool: &str,
+    manual_pin: &InitialDirectionRoutePin,
 ) -> Result<bool> {
     use sea_orm::TransactionTrait;
 
@@ -951,25 +1044,9 @@ pub async fn commit_reused_approval_with_direction_pin_cas(
         return Ok(false);
     }
 
-    let opened_session = session::Entity::find()
-        .filter(session::Column::DirectionId.eq(direction_id))
-        .one(&txn)
-        .await?;
-    if opened_session.is_some() {
-        txn.rollback().await?;
-        anyhow::bail!("direction {direction_id} opened while approving its manual route");
-    }
-    let direction_write = direction::Entity::update_many()
-        .col_expr(direction::Column::Tool, Expr::value(tool))
-        .col_expr(direction::Column::EnginePinned, Expr::value(true))
-        .filter(direction::Column::Id.eq(direction_id))
-        .filter(direction::Column::ThreadId.eq(thread_id))
-        .filter(direction::Column::EnginePinned.eq(false))
-        .exec(&txn)
-        .await?;
-    if direction_write.rows_affected == 0 {
-        txn.rollback().await?;
-        anyhow::bail!("direction {direction_id} became manually pinned while approving its route");
+    if let Err(err) = pin_initial_direction_route(&txn, thread_id, manual_pin, "approving").await {
+        let _ = txn.rollback().await;
+        return Err(err);
     }
 
     txn.commit().await?;
@@ -1041,15 +1118,16 @@ pub async fn commit_confirmed_plan_cas(
 }
 
 /// Commit a confirmed plan and the manual route pins selected for reused,
-/// never-started directions in one transaction. A failed confirmation must not
-/// leave an existing direction pinned to a route the plan never consumed.
+/// not-yet-established directions in one transaction. A failed confirmation
+/// must not leave a direction or an interrupted initial session pinned to a
+/// route the plan never consumed.
 pub async fn commit_confirmed_plan_with_direction_pins_cas(
     db: &Db,
     thread_id: i32,
     new_proposal: &str,
     expected_proposal: &str,
     expected_status: &str,
-    manual_pins: &[(i32, String)],
+    manual_pins: &[InitialDirectionRoutePin],
 ) -> Result<bool> {
     use sea_orm::TransactionTrait;
 
@@ -1068,34 +1146,14 @@ pub async fn commit_confirmed_plan_with_direction_pins_cas(
         return Ok(false);
     }
 
-    for (direction_id, tool) in manual_pins {
+    for manual_pin in manual_pins {
         // The plan write above is the transaction's first statement, so it
         // holds SQLite's writer lock before this read. A worker session that
         // committed first is visible here; one that starts later must wait for
         // this pin and then re-read the current direction route before insert.
-        let opened_session = session::Entity::find()
-            .filter(session::Column::DirectionId.eq(*direction_id))
-            .one(&txn)
-            .await?;
-        if opened_session.is_some() {
-            txn.rollback().await?;
-            anyhow::bail!(
-                "direction {direction_id} opened while confirming its manual route"
-            );
-        }
-        let direction_write = direction::Entity::update_many()
-            .col_expr(direction::Column::Tool, Expr::value(tool.clone()))
-            .col_expr(direction::Column::EnginePinned, Expr::value(true))
-            .filter(direction::Column::Id.eq(*direction_id))
-            .filter(direction::Column::ThreadId.eq(thread_id))
-            .filter(direction::Column::EnginePinned.eq(false))
-            .exec(&txn)
-            .await?;
-        if direction_write.rows_affected == 0 {
-            txn.rollback().await?;
-            anyhow::bail!(
-                "direction {direction_id} became manually pinned while confirming its route"
-            );
+        if let Err(err) = pin_initial_direction_route(&txn, thread_id, manual_pin, "confirming").await {
+            let _ = txn.rollback().await;
+            return Err(err);
         }
     }
 
@@ -5859,7 +5917,11 @@ mod tests {
             "after",
             "before",
             "proposed",
-            &[(direction.id, "opencode".to_string())],
+            &[InitialDirectionRoutePin {
+                direction_id: direction.id,
+                session_id: None,
+                tool: "opencode".to_string(),
+            }],
         )
         .await
         .unwrap_err();
@@ -5870,6 +5932,45 @@ mod tests {
         let after = get_direction(&db, direction.id).await.unwrap().unwrap();
         assert_eq!(after.tool, "codex");
         assert!(!after.engine_pinned);
+    }
+
+    #[tokio::test]
+    async fn confirmed_plan_pin_updates_an_unestablished_session_atomically() {
+        let db = mem().await;
+        let (_, repo, thread, direction) = worker_fixture(&db).await;
+        upsert_plan(&db, thread.id, "before", "proposed", "1")
+            .await
+            .unwrap();
+        let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
+            .await
+            .unwrap();
+
+        let applied = commit_confirmed_plan_with_direction_pins_cas(
+            &db,
+            thread.id,
+            "after",
+            "before",
+            "proposed",
+            &[InitialDirectionRoutePin {
+                direction_id: direction.id,
+                session_id: Some(session.id),
+                tool: "opencode".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert!(applied);
+        let plan = get_plan(&db, thread.id).await.unwrap().unwrap();
+        assert_eq!(plan.proposal, "after");
+        assert_eq!(plan.status, "confirmed");
+        let direction = get_direction(&db, direction.id).await.unwrap().unwrap();
+        assert_eq!(direction.tool, "opencode");
+        assert!(direction.engine_pinned);
+        let session = get_session(&db, session.id).await.unwrap().unwrap();
+        assert_eq!(session.tool, "opencode");
+        assert!(session.engine_pinned);
+        assert!(session.native_session_id.is_none());
     }
 
     #[tokio::test]
@@ -5886,8 +5987,11 @@ mod tests {
             "after",
             "before",
             "proposed",
-            direction.id,
-            "opencode",
+            &InitialDirectionRoutePin {
+                direction_id: direction.id,
+                session_id: None,
+                tool: "opencode".to_string(),
+            },
         )
         .await
         .unwrap();
@@ -5898,6 +6002,43 @@ mod tests {
         let after = get_direction(&db, direction.id).await.unwrap().unwrap();
         assert_eq!(after.tool, "opencode");
         assert!(after.engine_pinned);
+    }
+
+    #[tokio::test]
+    async fn reused_approval_updates_an_unestablished_session_atomically() {
+        let db = mem().await;
+        let (_, repo, thread, direction) = worker_fixture(&db).await;
+        upsert_plan(&db, thread.id, "before", "proposed", "1")
+            .await
+            .unwrap();
+        let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
+            .await
+            .unwrap();
+
+        let applied = commit_reused_approval_with_direction_pin_cas(
+            &db,
+            thread.id,
+            "after",
+            "before",
+            "proposed",
+            &InitialDirectionRoutePin {
+                direction_id: direction.id,
+                session_id: Some(session.id),
+                tool: "opencode".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(applied);
+        assert_eq!(get_plan(&db, thread.id).await.unwrap().unwrap().proposal, "after");
+        let direction = get_direction(&db, direction.id).await.unwrap().unwrap();
+        assert_eq!(direction.tool, "opencode");
+        assert!(direction.engine_pinned);
+        let session = get_session(&db, session.id).await.unwrap().unwrap();
+        assert_eq!(session.tool, "opencode");
+        assert!(session.engine_pinned);
+        assert!(session.native_session_id.is_none());
     }
 
     #[tokio::test]
@@ -5917,8 +6058,11 @@ mod tests {
             "after",
             "before",
             "proposed",
-            direction.id,
-            "opencode",
+            &InitialDirectionRoutePin {
+                direction_id: direction.id,
+                session_id: None,
+                tool: "opencode".to_string(),
+            },
         )
         .await
         .unwrap_err();

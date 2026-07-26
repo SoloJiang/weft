@@ -14,6 +14,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Optional view of the runtime worker registry. Planner operations normally
+/// run against durable state alone, but command callers supply this check so a
+/// session that is still alive in memory cannot be treated as an abandoned
+/// initial route merely because it has not captured its native id yet.
+type LiveSessionCheck<'a> = Option<&'a (dyn Fn(i32) -> bool + Send + Sync)>;
+
 /// Deserialize a JSON string OR null into a String (null/absent → ""). The lead
 /// tool may emit `base_branch: null` for "use the repo default"; without this,
 /// serde rejects the whole Proposal and `call_planner` drops every direction.
@@ -414,26 +420,41 @@ fn reusable_direction_for_preview<'a>(
     })
 }
 
+/// A persisted session becomes an established participant only after it has
+/// captured its native conversation or has a live engine in this process.
+/// No-native rows without a runtime engine are interrupted initial opens and
+/// must continue through the current route resolver.
+fn session_is_established(
+    session: Option<&crate::store::entities::session::Model>,
+    is_session_live: LiveSessionCheck<'_>,
+) -> bool {
+    session.is_some_and(|session| {
+        session.native_session_id.is_some()
+            || is_session_live.is_some_and(|is_live| is_live(session.id))
+    })
+}
+
 /// Build the route preview for a pending lane without changing confirmation semantics.
 ///
-/// A pinned direction or a direction with an existing session is already a participant, so its
+/// A pinned direction or a direction with an established session is already a participant, so its
 /// persisted/session tool is authoritative even when the current automatic candidates are
 /// blocked. The explicit-tool resolver is used only to express that retained identity and to
-/// surface an unavailable command; it does not select a new engine. Sessionless, unpinned
-/// directions continue through the current automatic resolver and therefore remain blocked when
-/// no eligible candidate exists.
+/// surface an unavailable command; it does not select a new engine. Unpinned directions without
+/// an established session continue through the current automatic resolver and therefore remain
+/// blocked when no eligible candidate exists.
 async fn preview_route_for_direction(
     db: &Db,
     direction: &ResolvedDirection,
     existing: Option<&crate::store::entities::direction::Model>,
     repo_id: i32,
     legacy_tool: &str,
+    is_session_live: LiveSessionCheck<'_>,
 ) -> Result<Option<crate::engine_routing::RouteDecision>> {
     let Some(existing) = existing else {
         return Ok(None);
     };
     let session = repo::latest_session_for(db, existing.id, repo_id).await?;
-    if !existing.engine_pinned && session.is_none() {
+    if !existing.engine_pinned && !session_is_established(session.as_ref(), is_session_live) {
         return Ok(None);
     }
     let tool = session
@@ -528,7 +549,27 @@ async fn resolved_from_plan(
 }
 
 /// The stored proposal for a thread, resolved against its workspace repos.
+/// Durable callers without a runtime registry treat no-native session rows as
+/// interrupted initial opens.
 pub async fn get_resolved(db: &Db, thread_id: i32) -> Result<Option<ResolvedProposal>> {
+    get_resolved_with_session_liveness(db, thread_id, None).await
+}
+
+/// Runtime-aware variant of [`get_resolved`]. Tauri command callers provide
+/// the worker registry so a presently live engine retains its existing route.
+pub async fn get_resolved_with_live_sessions(
+    db: &Db,
+    thread_id: i32,
+    is_session_live: &(dyn Fn(i32) -> bool + Send + Sync),
+) -> Result<Option<ResolvedProposal>> {
+    get_resolved_with_session_liveness(db, thread_id, Some(is_session_live)).await
+}
+
+async fn get_resolved_with_session_liveness(
+    db: &Db,
+    thread_id: i32,
+    is_session_live: LiveSessionCheck<'_>,
+) -> Result<Option<ResolvedProposal>> {
     let Some(p) = repo::get_plan(db, thread_id).await? else {
         return Ok(None);
     };
@@ -591,6 +632,7 @@ pub async fn get_resolved(db: &Db, thread_id: i32) -> Result<Option<ResolvedProp
                 existing,
                 direction.repo.repo_id,
                 &legacy,
+                is_session_live,
             )
             .await?;
             direction.route = Some(match retained_route {
@@ -670,6 +712,33 @@ pub async fn confirm_with_manual_tool(
     db: &Db,
     thread_id: i32,
     manual_tool: Option<&str>,
+) -> Result<Vec<i32>> {
+    confirm_with_manual_tool_with_session_liveness(db, thread_id, manual_tool, None).await
+}
+
+/// Runtime-aware counterpart of [`confirm_with_manual_tool`]. This preserves a
+/// live no-native worker while allowing an interrupted initial session to be
+/// re-routed with the rest of the pending proposal.
+pub async fn confirm_with_manual_tool_and_live_sessions(
+    db: &Db,
+    thread_id: i32,
+    manual_tool: Option<&str>,
+    is_session_live: &(dyn Fn(i32) -> bool + Send + Sync),
+) -> Result<Vec<i32>> {
+    confirm_with_manual_tool_with_session_liveness(
+        db,
+        thread_id,
+        manual_tool,
+        Some(is_session_live),
+    )
+    .await
+}
+
+async fn confirm_with_manual_tool_with_session_liveness(
+    db: &Db,
+    thread_id: i32,
+    manual_tool: Option<&str>,
+    is_session_live: LiveSessionCheck<'_>,
 ) -> Result<Vec<i32>> {
     // Serialize all plan mutations for this thread: held across the whole confirm (read → reuse/
     // create → materialize → CAS commit) so no concurrent confirm/approve/deny/save_proposal can
@@ -930,7 +999,7 @@ pub async fn confirm_with_manual_tool(
     // A reused lane can receive a manual batch selection. Defer its durable
     // pin until the final plan CAS so a later materialize failure leaves the
     // pre-existing direction exactly as it was.
-    let mut pending_reused_manual_pins: Vec<(i32, String)> = Vec::new();
+    let mut pending_reused_manual_pins: Vec<repo::InitialDirectionRoutePin> = Vec::new();
     // Reused lanes whose RECLAIMED worktree dir this attempt RECREATED. On any later failure they
     // must be re-reclaimed (not torn down — the direction pre-existed), so the user's disk-reclaim
     // isn't undone by a confirm that never committed. Tracked separately from created_now because
@@ -1059,8 +1128,9 @@ pub async fn confirm_with_manual_tool(
             // worker. Re-check its current eligible route before consuming the
             // proposal; otherwise confirmation can succeed only for the later
             // worker open to reject the stale provider.
+            let latest_session = repo::latest_session_for(db, ex_id, repo_ref.id).await?;
             let unstarted = !ex.engine_pinned
-                && repo::latest_session_for(db, ex_id, repo_ref.id).await?.is_none();
+                && !session_is_established(latest_session.as_ref(), is_session_live);
             if unstarted {
                 let route = crate::engine_routing::resolve_for_db(
                     db,
@@ -1083,7 +1153,11 @@ pub async fn confirm_with_manual_tool(
                     anyhow::bail!("engine_route_blocked:{}", route.reason_code());
                 };
                 if matches!(route.source, crate::engine_routing::RoutingSource::Manual) {
-                    pending_reused_manual_pins.push((ex_id, selected_tool.as_str().to_string()));
+                    pending_reused_manual_pins.push(repo::InitialDirectionRoutePin {
+                        direction_id: ex_id,
+                        session_id: latest_session.as_ref().map(|session| session.id),
+                        tool: selected_tool.as_str().to_string(),
+                    });
                 }
                 committed_route_markers.push((ex_id, route));
             }
@@ -1343,6 +1417,37 @@ pub async fn approve_direction_with_pin(
     index: usize,
     manual_tool: Option<&str>,
 ) -> Result<i32> {
+    approve_direction_with_pin_with_session_liveness(db, thread_id, index, manual_tool, None)
+        .await
+}
+
+/// Runtime-aware counterpart of [`approve_direction_with_pin`]. A live worker
+/// remains on its established route; an interrupted no-native session is still
+/// eligible for the user-selected route.
+pub async fn approve_direction_with_pin_and_live_sessions(
+    db: &Db,
+    thread_id: i32,
+    index: usize,
+    manual_tool: Option<&str>,
+    is_session_live: &(dyn Fn(i32) -> bool + Send + Sync),
+) -> Result<i32> {
+    approve_direction_with_pin_with_session_liveness(
+        db,
+        thread_id,
+        index,
+        manual_tool,
+        Some(is_session_live),
+    )
+    .await
+}
+
+async fn approve_direction_with_pin_with_session_liveness(
+    db: &Db,
+    thread_id: i32,
+    index: usize,
+    manual_tool: Option<&str>,
+    is_session_live: LiveSessionCheck<'_>,
+) -> Result<i32> {
     // Serialize all plan mutations for this thread (see `thread_gate`): a concurrent
     // approve/confirm/save_proposal for the same thread can no longer interleave with this read →
     // CAS → materialize, so the existing CAS-then-materialize-then-revert ordering is race-free.
@@ -1488,12 +1593,13 @@ pub async fn approve_direction_with_pin(
         // in case the worktree dir was reclaimed (exists=false) — so the lane has a
         // live worktree to dispatch. Mirror what the normal (non-reuse) path does below.
         let id = existing.id;
-        // An interrupted pre-dispatch direction has no session and no manual
-        // provenance. Re-resolve its current eligibility before approving it;
+        // A direction without an established worker has no durable route
+        // provenance. Re-resolve current eligibility before approving it;
         // otherwise this card can claim success only for worker open to reject
         // the stale provider later.
+        let latest_session = repo::latest_session_for(db, id, repo_ref.id).await?;
         let reuse_route = if !existing.engine_pinned
-            && repo::latest_session_for(db, id, repo_ref.id).await?.is_none()
+            && !session_is_established(latest_session.as_ref(), is_session_live)
         {
             let route = crate::engine_routing::resolve_for_db(
                 db,
@@ -1556,14 +1662,18 @@ pub async fn approve_direction_with_pin(
                     return Err(err);
                 }
             };
+            let manual_pin = repo::InitialDirectionRoutePin {
+                direction_id: id,
+                session_id: latest_session.as_ref().map(|session| session.id),
+                tool: selected_tool.to_string(),
+            };
             let applied = match repo::commit_reused_approval_with_direction_pin_cas(
                 db,
                 thread_id,
                 &new_json,
                 &plan.proposal,
                 &plan.status,
-                id,
-                selected_tool,
+                &manual_pin,
             )
             .await
             {
@@ -1812,7 +1922,25 @@ pub struct PendingWrite {
 
 /// The pending write declarations for a thread (known repo + undecided).
 pub async fn pending_writes(db: &Db, thread_id: i32) -> Result<Vec<PendingWrite>> {
-    let Some(p) = get_resolved(db, thread_id).await? else {
+    pending_writes_with_session_liveness(db, thread_id, None).await
+}
+
+/// Runtime-aware counterpart of [`pending_writes`], used by the board command
+/// so a currently live worker does not advertise an automatic replacement.
+pub async fn pending_writes_with_live_sessions(
+    db: &Db,
+    thread_id: i32,
+    is_session_live: &(dyn Fn(i32) -> bool + Send + Sync),
+) -> Result<Vec<PendingWrite>> {
+    pending_writes_with_session_liveness(db, thread_id, Some(is_session_live)).await
+}
+
+async fn pending_writes_with_session_liveness(
+    db: &Db,
+    thread_id: i32,
+    is_session_live: LiveSessionCheck<'_>,
+) -> Result<Vec<PendingWrite>> {
+    let Some(p) = get_resolved_with_session_liveness(db, thread_id, is_session_live).await? else {
         return Ok(Vec::new());
     };
     // A confirmed plan has no pending writes: confirm() created every still-
@@ -2167,6 +2295,53 @@ mod tests {
         sh(&p, &["git", "add", "-A"]);
         sh(&p, &["git", "commit", "-q", "-m", "init"]);
         p
+    }
+
+    async fn create_unestablished_reused_lane(
+        db: &Db,
+        workspace_id: i32,
+        repo_id: i32,
+        title: &str,
+        lane: &str,
+    ) -> (i32, i32, i32) {
+        let thread = repo::create_thread(db, workspace_id, title, "feature", "codex")
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            db,
+            thread.id,
+            lane,
+            "opencode",
+            repo_id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        materialize::materialize_direction(db, direction.id).await.unwrap();
+        let session = repo::create_session(db, direction.id, repo_id, "opencode", "/tmp/lane")
+            .await
+            .unwrap();
+        save_proposal(
+            db,
+            thread.id,
+            &Proposal {
+                rationale: "r".into(),
+                directions: vec![ProposedDirection {
+                    name: lane.into(),
+                    repo: "api".into(),
+                    reason: "r".into(),
+                    mandate: "plan+impl".into(),
+                    base_branch: "".into(),
+                    decision: "".into(),
+                    direction_id: 0,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        (thread.id, direction.id, session.id)
     }
 
     #[tokio::test]
@@ -3410,6 +3585,143 @@ mod tests {
         let removed = repo::delete_thread_cascade(&db, session_thread.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         let removed = repo::delete_thread_cascade(&db, fresh_thread.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn no_native_reused_sessions_refresh_only_without_a_live_engine() {
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-no-native-reuse-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "api",
+            repo_path.to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        repo::set_setting(&db, crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED, "true")
+            .await
+            .unwrap();
+        let (confirm_thread, confirm_direction, confirm_session) =
+            create_unestablished_reused_lane(
+                &db,
+                workspace.id,
+                repo_ref.id,
+                "confirm",
+                "confirm lane",
+            )
+            .await;
+        let (approve_thread, approve_direction, approve_session) =
+            create_unestablished_reused_lane(
+                &db,
+                workspace.id,
+                repo_ref.id,
+                "approve",
+                "approve lane",
+            )
+            .await;
+
+        let current_exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::tool_command::set_overrides(std::collections::HashMap::from([
+            ("codex".to_string(), current_exe),
+            (
+                "claude".to_string(),
+                root.join("missing-claude").to_string_lossy().into_owned(),
+            ),
+            (
+                "opencode".to_string(),
+                root.join("missing-opencode").to_string_lossy().into_owned(),
+            ),
+        ]));
+
+        let preview = get_resolved(&db, confirm_thread).await.unwrap().unwrap();
+        assert_eq!(
+            preview.directions[0]
+                .route
+                .as_ref()
+                .unwrap()
+                .tool
+                .as_ref()
+                .map(|tool| tool.as_str()),
+            Some("codex"),
+            "an interrupted no-native session must use the current automatic route"
+        );
+        let live_check = |session_id| session_id == confirm_session;
+        let live_preview = get_resolved_with_live_sessions(&db, confirm_thread, &live_check)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live_preview.directions[0]
+                .route
+                .as_ref()
+                .unwrap()
+                .tool
+                .as_ref()
+                .map(|tool| tool.as_str()),
+            Some("opencode"),
+            "a live no-native engine must retain its existing route"
+        );
+
+        let confirmed = confirm_with_manual_tool(&db, confirm_thread, Some("codex"))
+            .await
+            .unwrap();
+        assert_eq!(confirmed, vec![confirm_direction]);
+        let confirmed_direction = repo::get_direction(&db, confirm_direction)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(confirmed_direction.tool, "codex");
+        assert!(confirmed_direction.engine_pinned);
+        let confirmed_session = repo::get_session(&db, confirm_session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(confirmed_session.tool, "codex");
+        assert!(confirmed_session.engine_pinned);
+
+        let approved = approve_direction_with_pin(&db, approve_thread, 0, Some("codex"))
+            .await
+            .unwrap();
+        assert_eq!(approved, approve_direction);
+        let approved_direction = repo::get_direction(&db, approve_direction)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approved_direction.tool, "codex");
+        assert!(approved_direction.engine_pinned);
+        let approved_session = repo::get_session(&db, approve_session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approved_session.tool, "codex");
+        assert!(approved_session.engine_pinned);
+
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+        let removed = repo::delete_thread_cascade(&db, confirm_thread).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        let removed = repo::delete_thread_cascade(&db, approve_thread).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
