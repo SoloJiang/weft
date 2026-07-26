@@ -87,13 +87,9 @@ fn write_builtin(cwd: &Path, name: &str, content: &str) {
 
 fn has_repo_owned_builtin(cwd: &Path, name: &str) -> bool {
     TARGET_DIRS.iter().any(|d| {
-        let dir = cwd.join(d).join(name);
-        if !dir.exists() {
-            return false;
-        }
-        match std::fs::read_to_string(dir.join("SKILL.md")) {
+        match std::fs::read_to_string(cwd.join(d).join(name).join("SKILL.md")) {
             Ok(existing) => !existing.contains(BUILTIN_MARKER),
-            Err(_) => true,
+            Err(_) => false,
         }
     })
 }
@@ -103,12 +99,14 @@ fn has_repo_owned_builtin(cwd: &Path, name: &str) -> bool {
 /// repository-owned file and its directory intact.
 fn remove_managed_builtin_counterparts(cwd: &Path, name: &str) {
     for d in TARGET_DIRS {
-        let file = cwd.join(d).join(name).join("SKILL.md");
+        let dir = cwd.join(d).join(name);
+        let file = dir.join("SKILL.md");
         let Ok(existing) = std::fs::read_to_string(&file) else {
             continue;
         };
         if existing.contains(BUILTIN_MARKER) {
             let _ = std::fs::remove_file(file);
+            let _ = std::fs::remove_dir(dir);
         }
     }
 }
@@ -206,6 +204,17 @@ mod tests {
                         .join("weft-preflight-merge/SKILL.md")
                         .exists(),
                     "builtin must not materialize in {target} when {owner_target} owns the name"
+                );
+            }
+
+            std::fs::remove_file(&owned).unwrap();
+            materialize_builtins(cwd);
+            for target in TARGET_DIRS {
+                let restored = cwd.join(target).join("weft-preflight-merge/SKILL.md");
+                assert_eq!(
+                    std::fs::read_to_string(restored).unwrap(),
+                    BUILTIN_MERGE_PREFLIGHT,
+                    "builtin must return after the override is removed from {owner_target}"
                 );
             }
         }
