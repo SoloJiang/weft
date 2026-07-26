@@ -233,7 +233,7 @@ pub async fn lead_engine(
     if let Some(e) = state.get(lead_key(thread_id)) {
         return Ok(e);
     }
-    let t = crate::engine_routing::prepare_blocked_lead(db, &t).await?;
+    let t = crate::engine_routing::prepare_initial_lead(db, &t).await?;
     let cwd = ensure_lead_cwd(thread_id)?;
     let base = app.state::<crate::BusBase>().0.clone();
     let is_concierge = t.kind == "concierge";

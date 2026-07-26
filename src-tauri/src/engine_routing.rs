@@ -414,7 +414,16 @@ fn snapshots_by_tool() -> Vec<QuotaSnapshot> {
 
 fn candidate_for(tool: EngineId, snapshots: &[QuotaSnapshot]) -> RouteCandidate {
     let command = crate::tool_command::command_for(tool.as_str());
-    let installed = crate::detect::resolve_tool_path(&command).is_some();
+    // A route must only select a command that the eventual bare
+    // `Command::new(command)` spawn can reach. On Unix, the app-bundle fallback
+    // in `resolve_tool_path` is intentionally excluded because it is not added
+    // to that spawn's PATH. Windows keeps the existing resolver until its
+    // PATHEXT-aware equivalent is available.
+    let installed = if cfg!(windows) {
+        crate::detect::resolve_tool_path(&command).is_some()
+    } else {
+        crate::detect::resolves_on_path(&command)
+    };
     let quota = snapshots
         .iter()
         .find(|snapshot| snapshot.tool == tool.as_str())
@@ -621,10 +630,69 @@ pub async fn record_failover_blocked(
     }
 }
 
-/// Re-check only a lead that was previously blocked before it has ever started.
-/// Existing healthy/running leads never enter this path, and an old thread with
-/// no route marker is deliberately left on its persisted legacy tool.
-pub async fn prepare_blocked_lead(
+fn default_initial_hint(thread: &crate::store::entities::thread::Model) -> RoutingHint {
+    if thread.kind == "curator" {
+        return RoutingHint::Deep;
+    }
+    RoutingHint::Normal
+}
+
+/// `(was_blocked, hint)` for an initial lead decision marker. Direction-scoped
+/// planner markers are deliberately excluded: they describe workers, not the
+/// issue lead that this recovery path starts.
+fn initial_lead_route_marker(
+    message: &crate::store::entities::lead_message::Model,
+) -> Option<(bool, RoutingHint)> {
+    if message.session_id.is_some()
+        || !matches!(message.kind.as_str(), "engine_route" | "engine_route_blocked")
+    {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(&message.content).ok()?;
+    let source = value.get("source").and_then(|source| source.as_str());
+    let operation = value
+        .get("operation")
+        .and_then(|operation| operation.as_str());
+    let direction_id = value.get("direction_id");
+    if source == Some("quota_failover")
+        || matches!(direction_id, Some(direction_id) if !direction_id.is_null())
+        || !matches!(
+            operation,
+            Some("new_thread") | Some("new_issue") | Some("curator_start") | Some("concierge_start")
+        )
+    {
+        return None;
+    }
+    let hint = value
+        .get("hint")
+        .and_then(|hint| hint.as_str())
+        .map(|hint| RoutingHint::parse(Some(hint)))
+        .unwrap_or_default();
+    Some((message.kind == "engine_route_blocked", hint))
+}
+
+fn is_later_lead_route_or_switch(message: &crate::store::entities::lead_message::Model) -> bool {
+    if message.session_id.is_some() {
+        return false;
+    }
+    if message.kind == "engine_switch" {
+        return true;
+    }
+    if message.kind != "engine_route" {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
+        return false;
+    };
+    !matches!(value.get("direction_id"), Some(direction_id) if !direction_id.is_null())
+}
+
+/// Reconcile the initial route of an unstarted, unpinned lead. A blocked marker
+/// carries its original hint; if that best-effort marker was never written, the
+/// durable unpinned/unstarted thread state is enough to force a fresh decision
+/// instead of launching the fallback tool that automatic policy rejected.
+/// Existing healthy/running leads and migrated legacy/manual threads never move.
+pub async fn prepare_initial_lead(
     db: &Db,
     thread: &crate::store::entities::thread::Model,
 ) -> anyhow::Result<crate::store::entities::thread::Model> {
@@ -648,52 +716,35 @@ pub async fn prepare_blocked_lead(
     let messages = repo::list_lead_messages(db, thread.id)
         .await
         .unwrap_or_default();
-    let Some((blocked_index, blocked_marker)) =
-        messages.iter().enumerate().rev().find(|(_, message)| {
-            let message = *message;
-            if message.session_id.is_some() || message.kind != "engine_route_blocked" {
-                return false;
+    let initial = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| initial_lead_route_marker(message).map(|route| (index, route)));
+    let hint = match initial {
+        Some((_index, (false, _))) => return Ok(thread.clone()),
+        Some((blocked_index, (true, hint))) => {
+            // Once a blocked initial route has been resolved, a later LEAD
+            // route/switch marker is the durable witness that this participant
+            // made its one pre-start choice. Worker route markers must not
+            // suppress a separately blocked lead recovery.
+            if messages
+                .iter()
+                .skip(blocked_index + 1)
+                .any(is_later_lead_route_or_switch)
+            {
+                return Ok(thread.clone());
             }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
-                return false;
-            };
-            let source = value.get("source").and_then(|source| source.as_str());
-            let operation = value
-                .get("operation")
-                .and_then(|operation| operation.as_str());
-            source != Some("quota_failover")
-                && matches!(
-                    operation,
-                    Some("new_thread")
-                        | Some("new_issue")
-                        | Some("curator_start")
-                        | Some("concierge_start")
-                )
-        })
-    else {
-        return Ok(thread.clone());
+            hint
+        }
+        // `record_decision` is intentionally best-effort audit output. A crash
+        // or write failure after thread creation must not turn a blocked route
+        // into permission to run its persisted fallback tool.
+        None => default_initial_hint(thread),
     };
-    // Once the blocked initial route has been resolved, a later route/switch
-    // marker is the durable witness that this participant has already made its
-    // one pre-start choice. Do not reinterpret it on a later resume or move a
-    // healthy task because the availability snapshot changed.
-    if messages.iter().skip(blocked_index + 1).any(|message| {
-        message.session_id.is_none()
-            && (message.kind == "engine_route" || message.kind == "engine_switch")
-    }) {
-        return Ok(thread.clone());
-    }
-    let hint = serde_json::from_str::<serde_json::Value>(&blocked_marker.content)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("hint")
-                .and_then(|hint| hint.as_str())
-                .map(|hint| RoutingHint::parse(Some(hint)))
-        })
-        .unwrap_or_default();
     let decision = resolve_for_db(db, None, &thread.lead_tool, hint).await;
     let Some(tool) = decision.selected() else {
+        record_decision(db, thread.id, None, None, "lead_start", &decision).await;
         anyhow::bail!("engine_route_blocked:{}", decision.reason_code());
     };
     if tool.as_str() != thread.lead_tool {
@@ -903,8 +954,82 @@ mod tests {
         .unwrap();
 
         let pinned = repo::get_thread(&db, thread.id).await.unwrap().unwrap();
-        let recovered = prepare_blocked_lead(&db, &pinned).await.unwrap();
+        let recovered = prepare_initial_lead(&db, &pinned).await.unwrap();
         assert_eq!(recovered.lead_tool, "not-a-tool");
+    }
+
+    #[tokio::test]
+    async fn missing_initial_marker_rechecks_an_unpinned_unstarted_lead() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::set_setting(&db, K_AUTOMATIC_ROUTING_ENABLED, "true")
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "not-a-tool")
+            .await
+            .unwrap();
+
+        let outcome = prepare_initial_lead(&db, &thread).await;
+        match outcome {
+            Ok(resolved) => assert_ne!(resolved.lead_tool, "not-a-tool"),
+            Err(err) => assert!(err.to_string().starts_with("engine_route_blocked:")),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_route_marker_does_not_suppress_blocked_lead_recovery() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::set_setting(&db, K_AUTOMATIC_ROUTING_ENABLED, "true")
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "not-a-tool")
+            .await
+            .unwrap();
+        let blocked = serde_json::json!({
+            "source": "blocked",
+            "operation": "new_issue",
+            "hint": "normal",
+            "direction_id": null,
+        })
+        .to_string();
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "system",
+            "engine_route_blocked",
+            &blocked,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let worker_route = serde_json::json!({
+            "source": "manual",
+            "operation": "planner_confirm",
+            "hint": "normal",
+            "direction_id": 42,
+        })
+        .to_string();
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            2,
+            "system",
+            "engine_route",
+            &worker_route,
+            "complete",
+        )
+        .await
+        .unwrap();
+
+        let outcome = prepare_initial_lead(&db, &thread).await;
+        match outcome {
+            Ok(resolved) => assert_ne!(resolved.lead_tool, "not-a-tool"),
+            Err(err) => assert!(err.to_string().starts_with("engine_route_blocked:")),
+        }
     }
 
     #[test]
