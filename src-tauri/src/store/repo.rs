@@ -982,6 +982,56 @@ pub async fn commit_confirmed_plan_cas(
     Ok(res.rows_affected > 0)
 }
 
+/// Commit a confirmed plan and the manual route pins selected for reused,
+/// never-started directions in one transaction. A failed confirmation must not
+/// leave an existing direction pinned to a route the plan never consumed.
+pub async fn commit_confirmed_plan_with_direction_pins_cas(
+    db: &Db,
+    thread_id: i32,
+    new_proposal: &str,
+    expected_proposal: &str,
+    expected_status: &str,
+    manual_pins: &[(i32, String)],
+) -> Result<bool> {
+    use sea_orm::TransactionTrait;
+
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let txn = db.0.begin().await?;
+    let plan_write = plan::Entity::update_many()
+        .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
+        .col_expr(plan::Column::Status, Expr::value("confirmed"))
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .filter(plan::Column::Proposal.eq(expected_proposal))
+        .filter(plan::Column::Status.eq(expected_status))
+        .exec(&txn)
+        .await?;
+    if plan_write.rows_affected == 0 {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+
+    for (direction_id, tool) in manual_pins {
+        let direction_write = direction::Entity::update_many()
+            .col_expr(direction::Column::Tool, Expr::value(tool.clone()))
+            .col_expr(direction::Column::EnginePinned, Expr::value(true))
+            .filter(direction::Column::Id.eq(*direction_id))
+            .filter(direction::Column::ThreadId.eq(thread_id))
+            .filter(direction::Column::EnginePinned.eq(false))
+            .exec(&txn)
+            .await?;
+        if direction_write.rows_affected == 0 {
+            txn.rollback().await?;
+            anyhow::bail!(
+                "direction {direction_id} became manually pinned while confirming its route"
+            );
+        }
+    }
+
+    txn.commit().await?;
+    ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    Ok(true)
+}
+
 pub async fn get_repo_profile(db: &Db, repo_id: i32) -> Result<Option<repo_profile::Model>> {
     Ok(repo_profile::Entity::find()
         .filter(repo_profile::Column::RepoId.eq(repo_id))

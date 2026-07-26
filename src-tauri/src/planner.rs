@@ -814,6 +814,10 @@ pub async fn confirm_with_manual_tool(
     // fails, rollback removes the direction/worktree and no audit row claims a
     // route that never became dispatchable.
     let mut committed_route_markers: Vec<(i32, crate::engine_routing::RouteDecision)> = Vec::new();
+    // A reused lane can receive a manual batch selection. Defer its durable
+    // pin until the final plan CAS so a later materialize failure leaves the
+    // pre-existing direction exactly as it was.
+    let mut pending_reused_manual_pins: Vec<(i32, String)> = Vec::new();
     // Reused lanes whose RECLAIMED worktree dir this attempt RECREATED. On any later failure they
     // must be re-reclaimed (not torn down — the direction pre-existed), so the user's disk-reclaim
     // isn't undone by a confirm that never committed. Tracked separately from created_now because
@@ -966,14 +970,7 @@ pub async fn confirm_with_manual_tool(
                     anyhow::bail!("engine_route_blocked:{}", route.reason_code());
                 };
                 if matches!(route.source, crate::engine_routing::RoutingSource::Manual) {
-                    repo::refresh_unpinned_direction_route_with_pin(
-                        db,
-                        ex_id,
-                        None,
-                        selected_tool.as_str(),
-                        true,
-                    )
-                    .await?;
+                    pending_reused_manual_pins.push((ex_id, selected_tool.as_str().to_string()));
                 }
                 committed_route_markers.push((ex_id, route));
             }
@@ -1079,12 +1076,13 @@ pub async fn confirm_with_manual_tool(
     // ever fire, roll back the lanes created in this attempt and bail so the plan is NOT left
     // "confirmed" with stale lanes.
     let new_json = proposal_json_with_hints(&proposal, &start_plan.proposal)?;
-    if !repo::commit_confirmed_plan_cas(
+    if !repo::commit_confirmed_plan_with_direction_pins_cas(
         db,
         thread_id,
         &new_json,
         &start_plan.proposal,
         &start_plan.status,
+        &pending_reused_manual_pins,
     )
     .await?
     {
@@ -1158,6 +1156,40 @@ async fn auto_settle_if_fully_decided(
     }
     if let Ok(json) = proposal_json_with_hints(proposal, baseline) {
         let _ = repo::mark_plan_confirmed_cas(db, thread_id, &json, "proposed").await;
+    }
+}
+
+/// Undo a reuse approval after a post-CAS step fails. The direction existed
+/// before this approval, so only the proposal decision and a just-recreated
+/// worktree are reversible here.
+async fn revert_reused_approval(
+    db: &Db,
+    thread_id: i32,
+    index: usize,
+    direction_id: i32,
+    proposal: &Proposal,
+    plan: &crate::store::entities::plan::Model,
+    was_reclaimed: bool,
+) {
+    let mut reverted = proposal.clone();
+    if let Some(direction) = reverted.directions.get_mut(index) {
+        direction.decision = String::new();
+    }
+    if let (Ok(approved_json), Ok(reverted_json)) = (
+        proposal_json_with_hints(proposal, &plan.proposal),
+        proposal_json_with_hints(&reverted, &plan.proposal),
+    ) {
+        let _ = repo::update_plan_proposal_cas(
+            db,
+            thread_id,
+            &reverted_json,
+            &approved_json,
+            &plan.status,
+        )
+        .await;
+    }
+    if was_reclaimed {
+        let _ = materialize::reclaim_recreated_worktree(db, direction_id).await;
     }
 }
 
@@ -1287,6 +1319,7 @@ pub async fn approve_direction_with_pin(
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo {} not found", resolved.repo.repo_id))?;
     let repo_path = std::path::Path::new(&repo_ref.local_git_path);
+    let legacy_tool = crate::tools::default_tool(db).await;
     if let Some(existing) = dirs
         .iter()
         // Exclude terminal (done) directions from reuse: a completed lane is history,
@@ -1325,6 +1358,36 @@ pub async fn approve_direction_with_pin(
         // in case the worktree dir was reclaimed (exists=false) — so the lane has a
         // live worktree to dispatch. Mirror what the normal (non-reuse) path does below.
         let id = existing.id;
+        // An interrupted pre-dispatch direction has no session and no manual
+        // provenance. Re-resolve its current eligibility before approving it;
+        // otherwise this card can claim success only for worker open to reject
+        // the stale provider later.
+        let reuse_route = if !existing.engine_pinned
+            && repo::latest_session_for(db, id, repo_ref.id).await?.is_none()
+        {
+            let route = crate::engine_routing::resolve_for_db(
+                db,
+                manual_tool,
+                &legacy_tool,
+                hint,
+            )
+            .await;
+            if route.selected().is_none() {
+                crate::engine_routing::record_decision(
+                    db,
+                    thread_id,
+                    None,
+                    Some(id),
+                    "planner_approve",
+                    &route,
+                )
+                .await;
+                anyhow::bail!("engine_route_blocked:{}", route.reason_code());
+            }
+            Some(route)
+        } else {
+            None
+        };
         // Test-only seam: let a test land a re-propose in the window between our read and the CAS.
         #[cfg(test)]
         tests::approve_persist_gate(db, thread_id).await;
@@ -1353,35 +1416,48 @@ pub async fn approve_direction_with_pin(
             // Needs card stays retryable (else refreshNeeds drops it with no worker dispatched).
             // Best-effort CAS against the approved proposal we just wrote; if a re-propose has
             // since landed the CAS no-ops (the card is superseded anyway).
-            let mut reverted = proposal.clone();
-            if let Some(d) = reverted.directions.get_mut(index) {
-                d.decision = String::new();
-            }
-            if let (Ok(approved_json), Ok(reverted_json)) = (
-                proposal_json_with_hints(&proposal, &plan.proposal),
-                proposal_json_with_hints(&reverted, &plan.proposal),
-            ) {
-                let _ = repo::update_plan_proposal_cas(
-                    db,
-                    thread_id,
-                    &reverted_json,
-                    &approved_json,
-                    &plan.status,
-                )
-                .await;
-            }
-            // R54-4: if the dir was reclaimed before this call, materialize may have RECREATED it
-            // on disk before failing — re-reclaim so the user's disk-reclaim isn't undone by an
-            // approval that didn't apply. No-op when nothing was recreated (dir still absent).
-            if was_reclaimed {
-                let _ = materialize::reclaim_recreated_worktree(db, id).await;
-            }
+            revert_reused_approval(db, thread_id, index, id, &proposal, &plan, was_reclaimed).await;
             return Err(err);
+        }
+        if let Some(route) = reuse_route.as_ref() {
+            if matches!(route.source, crate::engine_routing::RoutingSource::Manual) {
+                if let Some(selected_tool) = route.selected() {
+                    if let Err(err) = repo::refresh_unpinned_direction_route_with_pin(
+                        db,
+                        id,
+                        None,
+                        selected_tool.as_str(),
+                        true,
+                    )
+                    .await
+                    {
+                        revert_reused_approval(
+                            db,
+                            thread_id,
+                            index,
+                            id,
+                            &proposal,
+                            &plan,
+                            was_reclaimed,
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                }
+            }
+            crate::engine_routing::record_decision(
+                db,
+                thread_id,
+                None,
+                Some(id),
+                "planner_approve",
+                route,
+            )
+            .await;
         }
         auto_settle_if_fully_decided(db, thread_id, &proposal, &plan.proposal).await;
         return Ok(id);
     }
-    let legacy_tool = crate::tools::default_tool(db).await;
     let route = crate::engine_routing::resolve_for_db(
         db,
         manual_tool,
@@ -2731,6 +2807,304 @@ mod tests {
         let route: Value = serde_json::from_str(&marker.content).unwrap();
         assert_eq!(route["tool"], "claude");
         assert_eq!(route["hint"], "deep");
+
+        let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn confirm_failure_does_not_pin_reused_manual_direction() {
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-manual-pin-rollback-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            root.join("api").to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let reused = repo::create_direction(
+            &db,
+            thread.id,
+            "A",
+            "codex",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        materialize::materialize_direction(&db, reused.id).await.unwrap();
+        let proposal = Proposal {
+            rationale: "r".into(),
+            directions: vec![
+                ProposedDirection {
+                    name: "A".into(),
+                    repo: "api".into(),
+                    reason: "r".into(),
+                    mandate: "plan+impl".into(),
+                    base_branch: "".into(),
+                    decision: "".into(),
+                    direction_id: 0,
+                },
+                ProposedDirection {
+                    name: "B".into(),
+                    repo: "api".into(),
+                    reason: "r".into(),
+                    mandate: "plan+impl".into(),
+                    base_branch: "no-such-xyz".into(),
+                    decision: "".into(),
+                    direction_id: 0,
+                },
+            ],
+        };
+        save_proposal(&db, thread.id, &proposal).await.unwrap();
+
+        let current_exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::tool_command::set_overrides(std::collections::HashMap::from([(
+            "opencode".to_string(),
+            current_exe,
+        )]));
+        let result = confirm_with_manual_tool(&db, thread.id, Some("opencode")).await;
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+
+        assert!(result.is_err(), "the bad later lane must abort the batch");
+        let after = repo::get_direction(&db, reused.id).await.unwrap().unwrap();
+        assert_eq!(after.tool, "codex", "failed confirmation must not retarget reuse");
+        assert!(!after.engine_pinned, "failed confirmation must not leave a manual pin");
+        let plan = repo::get_plan(&db, thread.id).await.unwrap().unwrap();
+        assert_eq!(plan.status, "proposed", "failed confirmation must stay retryable");
+
+        let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn approve_reuse_blocks_when_current_automatic_route_is_unavailable() {
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-reuse-route-blocked-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            root.join("api").to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED, "true")
+            .await
+            .unwrap();
+        let reused = repo::create_direction(
+            &db,
+            thread.id,
+            "A",
+            "codex",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        materialize::materialize_direction(&db, reused.id).await.unwrap();
+        let proposal = Proposal {
+            rationale: "r".into(),
+            directions: vec![ProposedDirection {
+                name: "A".into(),
+                repo: "api".into(),
+                reason: "r".into(),
+                mandate: "plan+impl".into(),
+                base_branch: "".into(),
+                decision: "".into(),
+                direction_id: 0,
+            }],
+        };
+        save_proposal(&db, thread.id, &proposal).await.unwrap();
+
+        crate::tool_command::set_overrides(std::collections::HashMap::from([
+            (
+                "codex".to_string(),
+                root.join("missing-codex").to_string_lossy().into_owned(),
+            ),
+            (
+                "claude".to_string(),
+                root.join("missing-claude").to_string_lossy().into_owned(),
+            ),
+            (
+                "opencode".to_string(),
+                root.join("missing-opencode").to_string_lossy().into_owned(),
+            ),
+        ]));
+        let result = approve_direction_with_pin(&db, thread.id, 0, None).await;
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+
+        assert!(result.is_err(), "blocked automatic reuse must reject approval");
+        let plan = repo::get_plan(&db, thread.id).await.unwrap().unwrap();
+        let parsed: Proposal = serde_json::from_str(&plan.proposal).unwrap();
+        assert_eq!(parsed.directions[0].decision, "", "blocked reuse stays pending");
+        let after = repo::get_direction(&db, reused.id).await.unwrap().unwrap();
+        assert_eq!(after.tool, "codex");
+        assert!(!after.engine_pinned);
+        let marker = repo::list_lead_messages(&db, thread.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.kind == "engine_route_blocked")
+            .unwrap();
+        let route: Value = serde_json::from_str(&marker.content).unwrap();
+        assert_eq!(route["operation"], "planner_approve");
+        assert_eq!(route["direction_id"], reused.id);
+
+        let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn approve_reuse_pins_manual_route_only_after_materialize_succeeds() {
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-reuse-manual-pin-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            repo_path.to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let reused = repo::create_direction(
+            &db,
+            thread.id,
+            "A",
+            "codex",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        materialize::materialize_direction(&db, reused.id).await.unwrap();
+        let worktree = repo::list_worktrees(&db, Some(reused.id)).await.unwrap().remove(0);
+        let worktree_path = std::path::PathBuf::from(&worktree.path);
+        let _ = crate::git::remove_worktree(&repo_path, &worktree_path);
+        let _ = std::fs::remove_dir_all(&worktree_path);
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        std::fs::write(worktree_path.join("stray.txt"), b"not a worktree").unwrap();
+        let proposal = Proposal {
+            rationale: "r".into(),
+            directions: vec![ProposedDirection {
+                name: "A".into(),
+                repo: "api".into(),
+                reason: "r".into(),
+                mandate: "plan+impl".into(),
+                base_branch: "".into(),
+                decision: "".into(),
+                direction_id: 0,
+            }],
+        };
+        save_proposal(&db, thread.id, &proposal).await.unwrap();
+
+        let current_exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::tool_command::set_overrides(std::collections::HashMap::from([(
+            "opencode".to_string(),
+            current_exe,
+        )]));
+        let failed = approve_direction_with_pin(&db, thread.id, 0, Some("opencode")).await;
+        assert!(failed.is_err(), "plain worktree directory must make materialize fail");
+        let after_failure = repo::get_direction(&db, reused.id).await.unwrap().unwrap();
+        assert_eq!(after_failure.tool, "codex");
+        assert!(!after_failure.engine_pinned, "failed materialize must not persist the manual pin");
+        let pending = repo::get_plan(&db, thread.id).await.unwrap().unwrap();
+        let pending: Proposal = serde_json::from_str(&pending.proposal).unwrap();
+        assert_eq!(pending.directions[0].decision, "", "failed approval stays retryable");
+
+        let _ = std::fs::remove_dir_all(&worktree_path);
+        let approved = approve_direction_with_pin(&db, thread.id, 0, Some("opencode"))
+            .await
+            .unwrap();
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+
+        assert_eq!(approved, reused.id);
+        let after_success = repo::get_direction(&db, reused.id).await.unwrap().unwrap();
+        assert_eq!(after_success.tool, "opencode");
+        assert!(after_success.engine_pinned, "successful manual reuse must persist its pin");
+        let marker = repo::list_lead_messages(&db, thread.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.kind == "engine_route")
+            .unwrap();
+        let route: Value = serde_json::from_str(&marker.content).unwrap();
+        assert_eq!(route["operation"], "planner_approve");
+        assert_eq!(route["tool"], "opencode");
 
         let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;

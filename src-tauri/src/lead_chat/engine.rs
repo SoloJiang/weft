@@ -383,16 +383,21 @@ fn should_attempt_quota_failover(
     status == "error" && structured_exceeded && !still_busy
 }
 
-fn structured_codex_exhaustion_snapshot(tool: &str) -> Option<crate::engine_quota::QuotaSnapshot> {
+fn structured_codex_exhaustion_snapshot(
+    tool: &str,
+    previous: Option<&crate::engine_quota::QuotaSnapshot>,
+) -> Option<crate::engine_quota::QuotaSnapshot> {
     if tool != "codex" {
         return None;
     }
     Some(crate::engine_quota::QuotaSnapshot {
         tool: "codex".to_string(),
         status: crate::engine_quota::QuotaStatus::Exceeded,
-        used_percent: None,
-        resets_at: None,
-        window_label: None,
+        // The structured exhaustion event says only that the limit was hit.
+        // Keep the richer account snapshot's reset/window metadata visible.
+        used_percent: previous.and_then(|snapshot| snapshot.used_percent),
+        resets_at: previous.and_then(|snapshot| snapshot.resets_at),
+        window_label: previous.and_then(|snapshot| snapshot.window_label.clone()),
         observed_at: crate::engine_quota::now_unix(),
     })
 }
@@ -3113,15 +3118,19 @@ async fn codex_consumer(
     while let Some(msg) = rx.recv().await {
         match msg {
             ThreadMsg::QuotaExceeded => {
-                let snapshot = {
+                let tool = {
                     let mut inner = eng.lock().await;
                     if inner.turn.busy {
                         inner.turn.quota_exceeded = true;
-                        structured_codex_exhaustion_snapshot(&inner.tool)
+                        Some(inner.tool.clone())
                     } else {
                         None
                     }
                 };
+                let snapshot = tool.as_deref().and_then(|tool| {
+                    let previous = crate::engine_quota::current(tool);
+                    structured_codex_exhaustion_snapshot(tool, previous.as_ref())
+                });
                 if let Some(snapshot) = snapshot {
                     crate::engine_quota::report(snapshot);
                 }
@@ -7264,14 +7273,26 @@ mod tests {
 
     #[test]
     fn structured_codex_exhaustion_snapshot_is_global_but_codex_only() {
-        let snapshot = structured_codex_exhaustion_snapshot("codex").unwrap();
+        let previous = crate::engine_quota::QuotaSnapshot {
+            tool: "codex".to_string(),
+            status: crate::engine_quota::QuotaStatus::Warning,
+            used_percent: Some(93),
+            resets_at: Some(crate::engine_quota::now_unix() + 3600),
+            window_label: Some("primary".to_string()),
+            observed_at: crate::engine_quota::now_unix(),
+        };
+        let snapshot = structured_codex_exhaustion_snapshot("codex", Some(&previous)).unwrap();
         assert_eq!(snapshot.tool, "codex");
         assert_eq!(snapshot.status, crate::engine_quota::QuotaStatus::Exceeded);
-        assert_eq!(snapshot.used_percent, None);
-        assert_eq!(snapshot.resets_at, None);
-        assert_eq!(snapshot.window_label, None);
-        assert!(structured_codex_exhaustion_snapshot("claude").is_none());
-        assert!(structured_codex_exhaustion_snapshot("opencode").is_none());
+        assert_eq!(snapshot.used_percent, Some(93));
+        assert_eq!(snapshot.resets_at, previous.resets_at);
+        assert_eq!(snapshot.window_label.as_deref(), Some("primary"));
+        let empty = structured_codex_exhaustion_snapshot("codex", None).unwrap();
+        assert_eq!(empty.used_percent, None);
+        assert_eq!(empty.resets_at, None);
+        assert_eq!(empty.window_label, None);
+        assert!(structured_codex_exhaustion_snapshot("claude", None).is_none());
+        assert!(structured_codex_exhaustion_snapshot("opencode", None).is_none());
     }
 
     #[test]
