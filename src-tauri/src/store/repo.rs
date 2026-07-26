@@ -1362,6 +1362,53 @@ pub async fn set_direction_engine_pinned(
     Ok(())
 }
 
+/// Refresh the initial automatic route of a direction that has never been
+/// manually pinned. When a session row already exists but has no native
+/// conversation, both persistent identities move together so the next open
+/// cannot recreate the stale engine selected at plan-confirm time.
+pub async fn refresh_unpinned_direction_route(
+    db: &Db,
+    direction_id: i32,
+    session_id: Option<i32>,
+    tool: &str,
+) -> Result<()> {
+    use sea_orm::TransactionTrait;
+
+    let txn = db.0.begin().await?;
+    let direction_write = direction::Entity::update_many()
+        .col_expr(direction::Column::Tool, Expr::value(tool))
+        .col_expr(direction::Column::EnginePinned, Expr::value(false))
+        .filter(direction::Column::Id.eq(direction_id))
+        .filter(direction::Column::EnginePinned.eq(false))
+        .exec(&txn)
+        .await?;
+    if direction_write.rows_affected == 0 {
+        anyhow::bail!("direction {direction_id} became manually pinned while refreshing its route");
+    }
+
+    if let Some(session_id) = session_id {
+        let session_write = session::Entity::update_many()
+            .col_expr(session::Column::Tool, Expr::value(tool))
+            .col_expr(session::Column::EnginePinned, Expr::value(false))
+            .col_expr(session::Column::Command, Expr::value(Option::<String>::None))
+            .col_expr(session::Column::Model, Expr::value(Option::<String>::None))
+            .col_expr(
+                session::Column::NativeSessionId,
+                Expr::value(Option::<String>::None),
+            )
+            .filter(session::Column::Id.eq(session_id))
+            .filter(session::Column::EnginePinned.eq(false))
+            .exec(&txn)
+            .await?;
+        if session_write.rows_affected == 0 {
+            anyhow::bail!("session {session_id} became manually pinned while refreshing its route");
+        }
+    }
+
+    txn.commit().await?;
+    Ok(())
+}
+
 /// Set a direction's lifecycle status (agent- or human-driven). No-op if gone.
 pub async fn set_direction_status(db: &Db, direction_id: i32, status: &str) -> Result<()> {
     if let Some(d) = direction::Entity::find_by_id(direction_id)
@@ -5424,6 +5471,58 @@ mod tests {
         // A missing session is tolerated (not an error) on the session half —
         // see the function doc — as long as the direction is real.
         assert!(switch_worker_engine_txn(&db, d.id, 9999, "codex", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn refresh_unpinned_direction_route_updates_the_initial_session_too() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "Issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "main",
+            "codex",
+            repo.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
+            .await
+            .unwrap();
+        set_session_native_id(&db, session.id, "native-1").await.unwrap();
+        {
+            let mut active: session::ActiveModel = get_session(&db, session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+            active.command = Set(Some("cc-codex".to_string()));
+            active.model = Set(Some("gpt-5.5-high".to_string()));
+            active.update(&db.0).await.unwrap();
+        }
+
+        refresh_unpinned_direction_route(&db, direction.id, Some(session.id), "claude")
+            .await
+            .unwrap();
+
+        let refreshed_direction = get_direction(&db, direction.id).await.unwrap().unwrap();
+        let refreshed_session = get_session(&db, session.id).await.unwrap().unwrap();
+        assert_eq!(refreshed_direction.tool, "claude");
+        assert!(!refreshed_direction.engine_pinned);
+        assert_eq!(refreshed_session.tool, "claude");
+        assert!(!refreshed_session.engine_pinned);
+        assert_eq!(refreshed_session.command, None);
+        assert_eq!(refreshed_session.model, None);
+        assert_eq!(refreshed_session.native_session_id, None);
     }
 
     #[tokio::test]

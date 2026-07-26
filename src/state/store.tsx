@@ -166,6 +166,8 @@ function notifySendFailed(error: unknown) {
   let msg: string;
   if (raw === "queue_full") {
     msg = i18n.t("lead.queueFull");
+  } else if (raw.includes("engine_switch_in_progress")) {
+    msg = i18n.t("session.switchInProgress");
   } else {
     const routeBlocked = routeBlockedErrorMessage(raw);
     if (routeBlocked) {

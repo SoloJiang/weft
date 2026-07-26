@@ -424,6 +424,7 @@ export const zh = {
     switchReloadConfirm: "重新加载",
     switchedToast: "已切换：{{from}} → {{to}}",
     switchReloadedToast: "{{tool}} 已重新加载",
+    switchInProgress: "引擎正在因额度达限切换，请稍后重试。",
     switchFailed: "这次切换没成功——会话还在原来的引擎上，也没有影响到它手头的任何事。请重试。",
     switchFailedInterrupted: "这次切换没成功——会话还在原来的引擎上，但正在进行的那轮已经被中断。请重试。",
     engineSwitchedMarker: "引擎已切换：{{from}} → {{to}}",

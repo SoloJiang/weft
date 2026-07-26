@@ -43,6 +43,7 @@ export function switchKindOf(oldTool: string, newTool: string): SwitchKind {
  *  Longest match wins, since `switch_failed` is a prefix of
  *  `switch_failed_interrupted` and these are matched by substring. */
 export const SWITCH_ERROR_I18N: Record<string, string> = {
+  engine_switch_in_progress: "session.switchInProgress",
   switch_failed_interrupted: "session.switchFailedInterrupted",
   switch_failed: "session.switchFailed",
 };

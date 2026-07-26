@@ -440,6 +440,7 @@ export const en = {
     switchReloadConfirm: "Reload",
     switchedToast: "Switched {{from}} → {{to}}",
     switchReloadedToast: "{{tool}} reloaded",
+    switchInProgress: "The engine is switching after a quota limit was reached. Try again in a moment.",
     switchFailed:
       "The switch didn't go through — this session is still on its current engine, and nothing it was doing was affected. Try again.",
     switchFailedInterrupted:

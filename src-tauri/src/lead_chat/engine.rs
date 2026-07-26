@@ -1647,6 +1647,11 @@ pub struct EngineInner {
     /// window where a concurrent send's turn would be silently interrupted
     /// and its rows deleted by the rewind's stop/truncate steps.
     pub rewinding: bool,
+    /// Set only for the tiny final handoff of an opt-in quota fail-over. A
+    /// send that wins before this flag is set keeps the existing engine; once
+    /// set, new sends fail visibly rather than starting a healthy turn that
+    /// the imminent switch would interrupt.
+    pub quota_failover_committing: bool,
     /// The worktree this worker runs in (None for the lead console): lets
     /// send's admission honor a worktree-level restore reservation without a
     /// DB lookup. Sibling sessions of one worktree share the same id.
@@ -2341,8 +2346,14 @@ pub async fn send(
     // A rewind holds its reservation from the busy check to the final
     // truncate; sends error out for that window rather than racing the
     // rewind's stop/truncate steps.
-    if eng.lock().await.rewinding {
-        return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+    {
+        let inner = eng.lock().await;
+        if inner.rewinding {
+            return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+        }
+        if inner.quota_failover_committing {
+            return Err(anyhow::anyhow!("engine_switch_in_progress"));
+        }
     }
     // Skill-refresh: a flag set on idle means newly-injected skills are waiting.
     // Silently bounce the resident process so the relaunch (resume) reads them.
@@ -2442,6 +2453,9 @@ pub async fn send(
         // rows deleted by the rewind's stop/truncate steps.
         if inner.rewinding {
             return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+        }
+        if inner.quota_failover_committing {
+            return Err(anyhow::anyhow!("engine_switch_in_progress"));
         }
         // A code restore holds a reservation on the whole WORKTREE: sibling
         // sessions of the same worktree must not start editing it mid-restore.
@@ -4901,6 +4915,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         turn_user_row: None,
         last_assistant_uuid: None,
         rewinding: false,
+        quota_failover_committing: false,
         worktree_id: None,
     }
 }
@@ -8729,6 +8744,7 @@ mod tests {
             turn_user_row: None,
             last_assistant_uuid: None,
             rewinding: false,
+            quota_failover_committing: false,
             worktree_id: None,
         };
         let fresh = build_args(&inner);

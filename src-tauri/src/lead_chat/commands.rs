@@ -333,6 +333,7 @@ pub async fn lead_engine(
         turn_user_row: None,
         last_assistant_uuid: None,
         rewinding: false,
+        quota_failover_committing: false,
         worktree_id: None,
     };
     // Restore the last persisted meta snapshot so the Session panel is populated
@@ -1194,7 +1195,7 @@ pub(crate) async fn chat_open_worker_impl(
     let wt = repo::worktree_for(db, direction_id, repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no materialized worktree for that direction+repo"))?;
-    let dir = repo::ensure_direction_workspace_accepts_writes(db, direction_id).await?;
+    let mut dir = repo::ensure_direction_workspace_accepts_writes(db, direction_id).await?;
     repo::ensure_repo_workspace_accepts_writes(db, repo_id).await?;
     let cwd = std::path::PathBuf::from(&wt.path);
     // A worktree row can outlive its directory (reclaimed via the Done-card
@@ -1205,19 +1206,59 @@ pub(crate) async fn chat_open_worker_impl(
         anyhow::bail!("worktree directory no longer exists for that direction+repo");
     }
 
-    // The persisted direction tool is the task's manual/previous route pin.
-    // Run it through the shared resolver for validation and mirror any
-    // automatic planner decision into this worker's own durable timeline.
+    // An unpinned direction that has not yet established a native conversation
+    // is still an initial route, not a running participant. Re-resolve it so a
+    // delayed open cannot launch an engine that the current automatic policy
+    // excludes. Once a worker has a native conversation or a live engine, keep
+    // its selected identity: automatic routing is not a license to migrate an
+    // existing session on open.
+    let prior = repo::latest_session_for(db, direction_id, repo_id).await?;
+    let has_live_prior = prior
+        .as_ref()
+        .is_some_and(|session| app.state::<LeadChatState>().get(session.id as i64).is_some());
+    let can_refresh_initial_route = !dir.engine_pinned
+        && !has_live_prior
+        && prior
+            .as_ref()
+            .map_or(true, |session| session.native_session_id.is_none());
     let legacy_tool = crate::tools::default_tool(db).await;
     let route = crate::engine_routing::resolve_for_db(
         db,
-        Some(&dir.tool),
+        if can_refresh_initial_route {
+            None
+        } else {
+            Some(&dir.tool)
+        },
         &legacy_tool,
         crate::engine_routing::RoutingHint::Normal,
     )
     .await;
     if route.blocked {
         anyhow::bail!("engine_route_blocked:{}", route.reason_code());
+    }
+    if can_refresh_initial_route {
+        let selected = route
+            .selected()
+            .ok_or_else(|| anyhow::anyhow!("unblocked worker route had no selected engine"))?;
+        if selected.as_str() != dir.tool.as_str() {
+            repo::refresh_unpinned_direction_route(
+                db,
+                direction_id,
+                prior.as_ref().map(|session| session.id),
+                selected.as_str(),
+            )
+            .await?;
+            crate::engine_routing::record_decision(
+                db,
+                dir.thread_id,
+                None,
+                Some(direction_id),
+                "worker_start",
+                &route,
+            )
+            .await;
+            dir.tool = selected.as_str().to_string();
+        }
     }
 
     // Resume an earlier conversation when this slot already captured one.
@@ -1299,6 +1340,7 @@ pub(crate) async fn chat_open_worker_impl(
                 turn_user_row: None,
                 last_assistant_uuid: None,
                 rewinding: false,
+                quota_failover_committing: false,
                 worktree_id: Some(wt.id),
             };
             // Restore the last persisted meta snapshot so the Session panel is
@@ -1421,6 +1463,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         turn_user_row: None,
         last_assistant_uuid: None,
         rewinding: false,
+        quota_failover_committing: false,
         // One cheap lookup at engine build so send's admission can honor a
         // worktree-level restore reservation without a per-send DB query.
         worktree_id: repo::worktree_for(db, sess.direction_id, sess.repo_id)
@@ -1732,23 +1775,18 @@ async fn switch_lead_tool_inner(
         return Err(format!("unknown tool {tool:?}"));
     }
     let model = normalize_model(model);
+    let automatic_failover = reason.as_deref() == Some(QUOTA_FAILOVER_REASON);
+    if !automatic_failover {
+        if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
+            if eng.lock().await.quota_failover_committing {
+                return Err("engine_switch_in_progress".to_string());
+            }
+        }
+    }
     let before = repo::get_thread(db, thread_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("thread {thread_id} not found"))?;
-
-    if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
-        asks.cancel_for(thread_id, "lead");
-    }
-    // Whether real work was interrupted decides which failure the user is
-    // shown if the write below does not commit — see `switch_failure`. The
-    // answer comes from the teardown itself, NOT from whether an engine was
-    // cached: a resident-but-idle engine is torn down with nothing to cut
-    // short (review round 13).
-    let mut interrupted = false;
-    if let Some(eng) = app.state::<LeadChatState>().remove(lead_key(thread_id)) {
-        interrupted = engine::teardown_for_switch(app, &eng).await;
-    }
 
     // The lead's OWN timeline only — `list_lead_messages` returns every row for
     // the thread, including every worker's chat (session_id = Some(_)); the
@@ -1763,15 +1801,44 @@ async fn switch_lead_tool_inner(
         .collect();
     let digest = engine::build_switch_digest(&before.lead_tool, &tool, &messages);
 
+    if automatic_failover
+        && !quota_failover_commit_is_valid(app, thread_id, None, &before.lead_tool).await
+    {
+        return Err(QUOTA_FAILOVER_CANCELED.to_string());
+    }
+    if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
+        asks.cancel_for(thread_id, "lead");
+    }
+
     // ONE transaction: the new tool/model, the native-id clear (issue #96
     // pitfall 1) and the grace marker that vouches for it. The marker and the
     // clear are the two halves of `revive::has_resumable_context`, and
     // committing them together is what makes the defect this PR fixes
     // structurally impossible rather than merely guarded.
     let pinned = reason.is_none();
-    repo::switch_lead_engine_txn_with_pin(db, thread_id, &tool, model.as_deref(), pinned)
-        .await
-        .map_err(|e| switch_failure(&format!("thread {thread_id}"), interrupted, e))?;
+    // A fail-over keeps its committing flag in the old engine until the durable
+    // route is updated. That prevents a concurrent open from constructing an
+    // old-tool engine in the remove-to-write window below.
+    if automatic_failover {
+        repo::switch_lead_engine_txn_with_pin(db, thread_id, &tool, model.as_deref(), pinned)
+            .await
+            .map_err(|e| switch_failure(&format!("thread {thread_id}"), false, e))?;
+    }
+
+    // Whether real work was interrupted decides which failure the user is
+    // shown if the write below does not commit — see `switch_failure`. The
+    // answer comes from the teardown itself, NOT from whether an engine was
+    // cached: a resident-but-idle engine is torn down with nothing to cut
+    // short (review round 13).
+    let mut interrupted = false;
+    if let Some(eng) = app.state::<LeadChatState>().remove(lead_key(thread_id)) {
+        interrupted = engine::teardown_for_switch(app, &eng).await;
+    }
+    if !automatic_failover {
+        repo::switch_lead_engine_txn_with_pin(db, thread_id, &tool, model.as_deref(), pinned)
+            .await
+            .map_err(|e| switch_failure(&format!("thread {thread_id}"), interrupted, e))?;
+    }
 
     let lang = lang.unwrap_or_else(|| "en".to_string());
     let eng = lead_engine(app, db, thread_id, &lang)
@@ -1840,6 +1907,14 @@ async fn switch_worker_tool_inner(
         return Err(format!("unknown tool {tool:?}"));
     }
     let model = normalize_model(model);
+    let automatic_failover = reason.as_deref() == Some(QUOTA_FAILOVER_REASON);
+    if !automatic_failover {
+        if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
+            if eng.lock().await.quota_failover_committing {
+                return Err("engine_switch_in_progress".to_string());
+            }
+        }
+    }
     let sess = repo::get_session(db, session_id)
         .await
         .map_err(|e| e.to_string())?
@@ -1849,15 +1924,6 @@ async fn switch_worker_tool_inner(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("direction {} not found", sess.direction_id))?;
 
-    if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
-        asks.cancel_for(dir.thread_id, &sess.direction_id.to_string());
-    }
-    // Same as switch_lead_tool: the teardown reports, cache presence does not.
-    let mut interrupted = false;
-    if let Some(eng) = app.state::<LeadChatState>().remove(session_id as i64) {
-        interrupted = engine::teardown_for_switch(app, &eng).await;
-    }
-
     let messages = repo::list_lead_messages(db, dir.thread_id).await.unwrap_or_default();
     let own: Vec<_> = messages
         .into_iter()
@@ -1865,21 +1931,50 @@ async fn switch_worker_tool_inner(
         .collect();
     let digest = engine::build_switch_digest(&sess.tool, &tool, &own);
 
+    if automatic_failover
+        && !quota_failover_commit_is_valid(app, dir.thread_id, Some(session_id), &sess.tool).await
+    {
+        return Err(QUOTA_FAILOVER_CANCELED.to_string());
+    }
+    if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
+        asks.cancel_for(dir.thread_id, &sess.direction_id.to_string());
+    }
+
     // ONE transaction, worker axis — see switch_lead_tool. It already covered
     // both halves of the tool write itself (`direction.tool` for the
     // cold-recreate path, `session.tool`/`model` for the live one), which is
     // why the marker and the native-id clear simply joined it.
     let pinned = reason.is_none();
-    repo::switch_worker_engine_txn_with_pin(
-        db,
-        sess.direction_id,
-        session_id,
-        &tool,
-        model.as_deref(),
-        pinned,
-    )
+    if automatic_failover {
+        repo::switch_worker_engine_txn_with_pin(
+            db,
+            sess.direction_id,
+            session_id,
+            &tool,
+            model.as_deref(),
+            pinned,
+        )
+        .await
+        .map_err(|e| switch_failure(&format!("session {session_id}"), false, e))?;
+    }
+
+    // Same as switch_lead_tool: the teardown reports, cache presence does not.
+    let mut interrupted = false;
+    if let Some(eng) = app.state::<LeadChatState>().remove(session_id as i64) {
+        interrupted = engine::teardown_for_switch(app, &eng).await;
+    }
+    if !automatic_failover {
+        repo::switch_worker_engine_txn_with_pin(
+            db,
+            sess.direction_id,
+            session_id,
+            &tool,
+            model.as_deref(),
+            pinned,
+        )
         .await
         .map_err(|e| switch_failure(&format!("session {session_id}"), interrupted, e))?;
+    }
 
     let eng = worker_engine(app, db, session_id)
         .await
@@ -1914,6 +2009,12 @@ pub const K_QUOTA_FAILOVER_ENABLED: &str = crate::engine_routing::K_QUOTA_FAILOV
 /// `engine_switch` rows) can tell an auto fail-over apart from a switch the
 /// user clicked.
 pub const QUOTA_FAILOVER_REASON: &str = "quota_exceeded";
+
+/// Internal cancellation sentinel: a user started a new turn, stopped the
+/// engine, or changed its identity before the background fail-over reached its
+/// final safe handoff. This is not a failed switch and must not create a
+/// misleading failure marker.
+const QUOTA_FAILOVER_CANCELED: &str = "quota_failover_canceled";
 
 /// Minimum gap between two auto fail-overs of the SAME (thread, session) —
 /// the storm-breaker alongside the "fallback isn't ALSO exceeded" check in
@@ -1962,6 +2063,73 @@ fn claim_quota_failover_slot(key: QuotaFailoverKey) -> bool {
     true
 }
 
+fn release_quota_failover_slot(key: QuotaFailoverKey) {
+    let mut cooldowns = quota_failover_cooldowns()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cooldowns.remove(&key);
+}
+
+fn quota_failover_engine_key(thread_id: i32, session_id: Option<i32>) -> i64 {
+    session_id.map(i64::from).unwrap_or_else(|| lead_key(thread_id))
+}
+
+fn can_commit_quota_failover(inner: &engine::EngineInner, expected_tool: &str) -> bool {
+    !inner.quota_failover_committing
+        && !inner.turn.busy
+        && !inner.interrupting
+        && !inner.stopped
+        && inner.tool == expected_tool
+}
+
+async fn claim_quota_failover_commit(
+    app: &AppHandle,
+    thread_id: i32,
+    session_id: Option<i32>,
+    expected_tool: &str,
+) -> bool {
+    let state = app.state::<LeadChatState>();
+    let Some(eng) = state.get(quota_failover_engine_key(thread_id, session_id)) else {
+        return false;
+    };
+    let mut inner = eng.lock().await;
+    if !can_commit_quota_failover(&inner, expected_tool) {
+        return false;
+    }
+    inner.quota_failover_committing = true;
+    true
+}
+
+async fn quota_failover_commit_is_valid(
+    app: &AppHandle,
+    thread_id: i32,
+    session_id: Option<i32>,
+    expected_tool: &str,
+) -> bool {
+    let state = app.state::<LeadChatState>();
+    let Some(eng) = state.get(quota_failover_engine_key(thread_id, session_id)) else {
+        return false;
+    };
+    let inner = eng.lock().await;
+    inner.quota_failover_committing
+        && !inner.turn.busy
+        && !inner.interrupting
+        && !inner.stopped
+        && inner.tool == expected_tool
+}
+
+async fn release_quota_failover_commit(
+    app: &AppHandle,
+    thread_id: i32,
+    session_id: Option<i32>,
+) {
+    let state = app.state::<LeadChatState>();
+    let Some(eng) = state.get(quota_failover_engine_key(thread_id, session_id)) else {
+        return;
+    };
+    eng.lock().await.quota_failover_committing = false;
+}
+
 /// Fire-and-forget entry point: engine.rs's two TurnEnd sites (codex_consumer,
 /// spawn_reader) call this right after a turn ends in error (issue #97).
 /// Spawns its OWN task so it can safely re-lock the engine —
@@ -2005,22 +2173,13 @@ async fn maybe_failover_on_quota(
 ) {
     let key: QuotaFailoverKey = (thread_id, session_id);
     let cooldown_ok = !quota_failover_cooldown_active(key);
-    let direction_id = if let Some(session_id) = session_id {
-        repo::get_session(db, session_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|session| session.direction_id)
-    } else {
-        None
+    let manual_pin = match crate::engine_routing::has_manual_pin(db, thread_id, session_id).await {
+        Ok(manual_pin) => manual_pin,
+        Err(err) => {
+            eprintln!("[weft][quota] skipped fail-over because pin lookup failed: {err}");
+            return;
+        }
     };
-    let manual_pin = crate::engine_routing::has_manual_pin(
-        db,
-        thread_id,
-        session_id,
-        direction_id,
-    )
-    .await;
     let decision = crate::engine_routing::quota_failover_for_db(
         db,
         tool,
@@ -2058,10 +2217,13 @@ async fn maybe_failover_on_quota(
         }
         crate::engine_routing::FailoverDecision::SwitchTo { tool, .. } => tool.as_str(),
     };
-    // Re-check-and-claim for real right before dispatching: closes the tiny
-    // race between the peek above and here (two concurrent calls for the
-    // same key), at the cost of a redundant read in the common case.
+    // Claim the cooldown slot before the short final engine handoff. A second
+    // turn-end callback then cannot race this one into a duplicate switch.
     if !claim_quota_failover_slot(key) {
+        return;
+    }
+    if !claim_quota_failover_commit(app, thread_id, session_id, tool).await {
+        release_quota_failover_slot(key);
         return;
     }
     eprintln!(
@@ -2098,6 +2260,11 @@ async fn maybe_failover_on_quota(
         }
     };
     if let Err(err) = result {
+        release_quota_failover_commit(app, thread_id, session_id).await;
+        if err == QUOTA_FAILOVER_CANCELED {
+            release_quota_failover_slot(key);
+            return;
+        }
         eprintln!("[weft][quota] auto fail-over {tool} -> {fallback} failed: {err}");
         insert_quota_failover_failed_marker(app, db, thread_id, session_id, tool, fallback, &err)
             .await;
@@ -2169,6 +2336,28 @@ mod quota_failover_tests {
         let other: QuotaFailoverKey = (900_001, Some(1));
         assert!(!quota_failover_cooldown_active(other));
         assert!(claim_quota_failover_slot(other));
+    }
+
+    #[test]
+    fn quota_failover_commit_requires_the_same_idle_engine() {
+        let mut inner = engine::test_inner("codex");
+        assert!(can_commit_quota_failover(&inner, "codex"));
+
+        inner.turn.busy = true;
+        assert!(!can_commit_quota_failover(&inner, "codex"));
+        inner.turn.busy = false;
+
+        inner.interrupting = true;
+        assert!(!can_commit_quota_failover(&inner, "codex"));
+        inner.interrupting = false;
+
+        inner.stopped = true;
+        assert!(!can_commit_quota_failover(&inner, "codex"));
+        inner.stopped = false;
+
+        assert!(!can_commit_quota_failover(&inner, "claude"));
+        inner.quota_failover_committing = true;
+        assert!(!can_commit_quota_failover(&inner, "codex"));
     }
 
 }

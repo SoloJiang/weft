@@ -336,7 +336,6 @@ pub enum FailoverSkipReason {
     Disabled,
     ManualPin,
     NotStructuredExceeded,
-    NotExceeded,
     NoFallback,
     CooldownActive,
 }
@@ -365,7 +364,6 @@ pub fn resolve_failover(
     enabled: bool,
     manual_pin: bool,
     structured_exceeded: bool,
-    current_quota: Option<QuotaStatus>,
     fallback: Option<&RouteCandidate>,
     cooldown_ok: bool,
 ) -> FailoverDecision {
@@ -378,9 +376,9 @@ pub fn resolve_failover(
     if !structured_exceeded {
         return FailoverDecision::Skip(FailoverSkipReason::NotStructuredExceeded);
     }
-    if current_quota != Some(QuotaStatus::Exceeded) {
-        return FailoverDecision::Skip(FailoverSkipReason::NotExceeded);
-    }
+    // A structured turn-end quota code is authoritative for THIS failed turn.
+    // Account/rate-limit snapshots can arrive later (or never), so requiring a
+    // current hub reading here would suppress the only supported L3 handoff.
     let expected = match current {
         EngineId::Claude => EngineId::Codex,
         EngineId::Codex => EngineId::Claude,
@@ -499,7 +497,6 @@ pub async fn quota_failover_for_db(
         return FailoverDecision::Skip(FailoverSkipReason::NoFallback);
     };
     let candidates = candidate_list();
-    let current_quota = candidate(&candidates, current).and_then(|candidate| candidate.quota);
     let fallback_tool = match current {
         EngineId::Claude => Some(EngineId::Codex),
         EngineId::Codex => Some(EngineId::Claude),
@@ -511,7 +508,6 @@ pub async fn quota_failover_for_db(
         enabled,
         manual_pin,
         structured_exceeded,
-        current_quota,
         fallback,
         cooldown_ok,
     )
@@ -799,35 +795,30 @@ pub async fn mirror_direction_route(db: &Db, thread_id: i32, direction_id: i32, 
 
 /// Manual pin detection is persisted alongside the engine identity. Timeline
 /// rows are an audit trail, not a source of truth: history can be pruned and a
-/// legacy row has no marker from which to infer whether a human chose it.
+/// legacy row has no marker from which to infer whether a human chose it. A
+/// lookup failure propagates so the fail-over caller can fail closed rather
+/// than treating an unreadable pin as permission to switch.
 pub async fn has_manual_pin(
     db: &Db,
     thread_id: i32,
     session_id: Option<i32>,
-    direction_id: Option<i32>,
-) -> bool {
+) -> anyhow::Result<bool> {
     match session_id {
         Some(session_id) => {
-            let session_pinned = repo::get_session(db, session_id)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|session| session.engine_pinned);
-            let direction_pinned = match direction_id {
-                Some(direction_id) => repo::get_direction(db, direction_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|direction| direction.engine_pinned),
-                None => false,
-            };
-            session_pinned || direction_pinned
+            let session = repo::get_session(db, session_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+            let direction = repo::get_direction(db, session.direction_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("direction {} not found", session.direction_id))?;
+            Ok(session.engine_pinned || direction.engine_pinned)
         }
-        None => repo::get_thread(db, thread_id)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|thread| thread.engine_pinned),
+        None => {
+            let thread = repo::get_thread(db, thread_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
+            Ok(thread.engine_pinned)
+        }
     }
 }
 
@@ -956,6 +947,13 @@ mod tests {
         let pinned = repo::get_thread(&db, thread.id).await.unwrap().unwrap();
         let recovered = prepare_initial_lead(&db, &pinned).await.unwrap();
         assert_eq!(recovered.lead_tool, "not-a-tool");
+    }
+
+    #[tokio::test]
+    async fn manual_pin_lookup_errors_for_a_missing_participant() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        assert!(has_manual_pin(&db, 999, None).await.is_err());
+        assert!(has_manual_pin(&db, 1, Some(999)).await.is_err());
     }
 
     #[tokio::test]
@@ -1126,7 +1124,6 @@ mod tests {
                 false,
                 false,
                 true,
-                Some(QuotaStatus::Exceeded),
                 Some(&fallback),
                 true,
             ),
@@ -1138,7 +1135,6 @@ mod tests {
                 true,
                 true,
                 true,
-                Some(QuotaStatus::Exceeded),
                 Some(&fallback),
                 true,
             ),
@@ -1155,7 +1151,6 @@ mod tests {
                 true,
                 false,
                 true,
-                Some(QuotaStatus::Exceeded),
                 Some(&fallback),
                 true,
             ),
@@ -1172,11 +1167,29 @@ mod tests {
                 true,
                 false,
                 false,
-                Some(QuotaStatus::Exceeded),
                 Some(&fallback),
                 true,
             ),
             FailoverDecision::Skip(FailoverSkipReason::NotStructuredExceeded)
+        );
+    }
+
+    #[test]
+    fn quota_failover_accepts_a_structured_turn_code_without_a_snapshot() {
+        let fallback = candidate(EngineId::Claude, true, None);
+        assert_eq!(
+            resolve_failover(
+                EngineId::Codex,
+                true,
+                false,
+                true,
+                Some(&fallback),
+                true,
+            ),
+            FailoverDecision::SwitchTo {
+                tool: EngineId::Claude,
+                quota: None,
+            }
         );
     }
 }
