@@ -255,6 +255,7 @@ export const en = {
     receiptConsumed: "Agent started",
     sendFailedGeneric: "Send failed: {{reason}}",
     sendFailedUnknown: "unknown error",
+    engineRouteBlocked: "Engine routing is blocked: {{reason}}",
   },
   scope: {
     addReposFirst: "Add repos to this workspace first.",

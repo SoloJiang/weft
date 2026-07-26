@@ -306,11 +306,8 @@ pub async fn save_proposal_value(db: &Db, thread_id: i32, input: &Value) -> Resu
         // sets it only via confirm/approve. Reset to 0 (unset) before storing.
         d.direction_id = 0;
     }
-    let prior = repo::get_plan(db, thread_id)
-        .await?
-        .and_then(|plan| serde_json::from_str::<Value>(&plan.proposal).ok());
     let mut value = serde_json::to_value(&p)?;
-    normalize_hints(&mut value, input, prior.as_ref());
+    normalize_input_hints(&mut value, input);
     let json = serde_json::to_string(&value)?;
     // Bump the proposal VERSION on EVERY re-propose (R50-2). `upsert_plan` uses `version` as the
     // INSERT created_at but PRESERVES created_at on UPDATE; for a re-propose (existing row) the
@@ -337,22 +334,13 @@ fn hint_from_value(value: &Value, index: usize) -> crate::engine_routing::Routin
         .unwrap_or_default()
 }
 
-fn hint_for_direction(value: &Value, name: &str, repo_name: &str) -> Option<String> {
-    value
-        .get("directions")
-        .and_then(Value::as_array)
-        .and_then(|directions| {
-            directions.iter().find(|direction| {
-                direction.get("name").and_then(Value::as_str) == Some(name)
-                    && direction.get("repo").and_then(Value::as_str) == Some(repo_name)
-            })
-        })
-        .and_then(|direction| direction.get("hint"))
-        .and_then(Value::as_str)
-        .map(|hint| crate::engine_routing::RoutingHint::parse(Some(hint)).as_str().to_string())
+fn normalized_hint(raw: Option<&str>) -> Value {
+    Value::String(crate::engine_routing::RoutingHint::parse(raw).as_str().to_string())
 }
 
-fn normalize_hints(value: &mut Value, input: &Value, prior: Option<&Value>) {
+/// A fresh lead proposal owns its hint values. Omitting one deliberately means
+/// the documented `normal` default; do not inherit a prior lane by name/repo.
+fn normalize_input_hints(value: &mut Value, input: &Value) {
     let Some(directions) = value.get_mut("directions").and_then(Value::as_array_mut) else {
         return;
     };
@@ -365,23 +353,35 @@ fn normalize_hints(value: &mut Value, input: &Value, prior: Option<&Value>) {
             .and_then(|items| items.get(index))
             .and_then(|item| item.get("hint"))
             .and_then(Value::as_str);
-        let prior_hint = if input_hint.is_none() {
-            let name = object.get("name").and_then(Value::as_str).unwrap_or_default();
-            let repo_name = object.get("repo").and_then(Value::as_str).unwrap_or_default();
-            prior.and_then(|old| hint_for_direction(old, name, repo_name))
-        } else {
-            None
+        object.insert("hint".to_string(), normalized_hint(input_hint));
+    }
+}
+
+/// Server-side approve/confirm updates deserialize the long-standing Proposal
+/// type, which intentionally does not carry `hint`. Preserve the stored hint by
+/// index for those updates only; a fresh lead proposal goes through
+/// `normalize_input_hints` instead.
+fn preserve_hints_from_baseline(value: &mut Value, baseline: Option<&Value>) {
+    let Some(directions) = value.get_mut("directions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let baseline_directions = baseline.and_then(|value| value.get("directions")).and_then(Value::as_array);
+    for (index, direction) in directions.iter_mut().enumerate() {
+        let Some(object) = direction.as_object_mut() else {
+            continue;
         };
-        let hint = crate::engine_routing::RoutingHint::parse(input_hint.or(prior_hint.as_deref()));
-        object.insert("hint".to_string(), Value::String(hint.as_str().to_string()));
+        let hint = baseline_directions
+            .and_then(|items| items.get(index))
+            .and_then(|item| item.get("hint"))
+            .and_then(Value::as_str);
+        object.insert("hint".to_string(), normalized_hint(hint));
     }
 }
 
 fn proposal_json_with_hints(proposal: &Proposal, baseline: &str) -> Result<String> {
     let mut value = serde_json::to_value(proposal)?;
-    let prior = serde_json::from_str::<Value>(baseline).ok();
-    let input = value.clone();
-    normalize_hints(&mut value, &input, prior.as_ref());
+    let baseline = serde_json::from_str::<Value>(baseline).ok();
+    preserve_hints_from_baseline(&mut value, baseline.as_ref());
     Ok(serde_json::to_string(&value)?)
 }
 
@@ -767,6 +767,10 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     // failure because they existed (and may be running) before this confirm call.
     let mut dispatch_ids: Vec<i32> = Vec::new();
     let mut created_now: Vec<i32> = Vec::new();
+    // Markers are committed only after the plan CAS succeeds. If a later lane
+    // fails, rollback removes the direction/worktree and no audit row claims a
+    // route that never became dispatchable.
+    let mut committed_route_markers: Vec<(i32, crate::engine_routing::RouteDecision)> = Vec::new();
     // Reused lanes whose RECLAIMED worktree dir this attempt RECREATED. On any later failure they
     // must be re-reclaimed (not torn down — the direction pre-existed), so the user's disk-reclaim
     // isn't undone by a confirm that never committed. Tracked separately from created_now because
@@ -979,15 +983,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             return Err(err);
         }
         created_now.push(dir.id);
-        crate::engine_routing::record_decision(
-            db,
-            thread_id,
-            None,
-            Some(dir.id),
-            "planner_confirm",
-            &route,
-        )
-        .await;
+        committed_route_markers.push((dir.id, route));
         // RECORD the freshly-created direction's id on this lane so the confirmed fast-path
         // re-dispatches it directly (no re-matching). Persisted by the final commit_confirmed_plan_cas.
         if let Some(pd) = proposal.directions.get_mut(idx) {
@@ -1022,6 +1018,17 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     {
         rollback_attempt(db, &created_now, &recreated_reused).await;
         anyhow::bail!("plan changed during confirm (re-proposed); please retry");
+    }
+    for (direction_id, route) in committed_route_markers {
+        crate::engine_routing::record_decision(
+            db,
+            thread_id,
+            None,
+            Some(direction_id),
+            "planner_confirm",
+            &route,
+        )
+        .await;
     }
     Ok(dispatch_ids)
 }
@@ -1654,6 +1661,36 @@ mod tests {
                 known: true
             }
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_reproposal_omitting_hints_defaults_each_lane_to_normal() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = repo::create_thread(&db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let initial = serde_json::json!({
+            "directions": [
+                {"name": "same", "repo": "api", "reason": "first", "hint": "deep"},
+                {"name": "same", "repo": "api", "reason": "second", "hint": "normal"}
+            ]
+        });
+        save_proposal_value(&db, thread.id, &initial).await.unwrap();
+
+        let fresh = serde_json::json!({
+            "directions": [
+                {"name": "same", "repo": "api", "reason": "fresh first"},
+                {"name": "same", "repo": "api", "reason": "fresh second"}
+            ]
+        });
+        save_proposal_value(&db, thread.id, &fresh).await.unwrap();
+
+        let plan = repo::get_plan(&db, thread.id).await.unwrap().unwrap();
+        let stored: Value = serde_json::from_str(&plan.proposal).unwrap();
+        let directions = stored["directions"].as_array().unwrap();
+        assert_eq!(directions[0]["hint"], "normal");
+        assert_eq!(directions[1]["hint"], "normal");
     }
 
     #[test]

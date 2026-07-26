@@ -27,6 +27,8 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
   const route = item.route;
   const tool = picked ?? route?.tool ?? defaultTool;
   const installed = installedTools.filter((tl) => tl.installed);
+  const soleBlockedManualTool = route?.blocked && installed.length === 1 ? installed[0]?.tool : undefined;
+  const manualTool = picked ?? soleBlockedManualTool;
   const context = [item.thread_title, item.name].filter(Boolean).join(" · ");
 
   async function act(fn: () => Promise<void>) {
@@ -94,7 +96,7 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
           variant="primary"
           disabled={busy}
           title={t("needs.approveRunTitle")}
-          onClick={() => void act(() => approveWriteTrigger(item, picked ? tool : undefined))}
+          onClick={() => void act(() => approveWriteTrigger(item, manualTool))}
         >
           <Check size={13} />
           {t("needs.approveRun")}

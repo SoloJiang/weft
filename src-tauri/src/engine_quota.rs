@@ -117,6 +117,25 @@ fn hub() -> &'static Mutex<HashMap<String, QuotaSnapshot>> {
     HUB.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// A provider can omit a reset time on a sparse rate-limit event. That signal is
+/// still useful briefly, but must not keep new work blocked forever when no
+/// later account update arrives.
+const UNKNOWN_RESET_SNAPSHOT_TTL_SECS: i64 = 15 * 60;
+
+fn snapshot_is_expired(snapshot: &QuotaSnapshot, now: i64) -> bool {
+    if snapshot.resets_at.is_some_and(|resets_at| resets_at <= now) {
+        return true;
+    }
+    if snapshot.resets_at.is_some() {
+        return false;
+    }
+    now.saturating_sub(snapshot.observed_at) > UNKNOWN_RESET_SNAPSHOT_TTL_SECS
+}
+
+fn prune_expired_snapshots(snapshots: &mut HashMap<String, QuotaSnapshot>, now: i64) {
+    snapshots.retain(|_, snapshot| !snapshot_is_expired(snapshot, now));
+}
+
 /// Record (replace) the latest snapshot for `snapshot.tool`. Called from the
 /// codex app-server transport and from claude's per-line quota-signal check —
 /// never from a hot chat-render path, so a plain std Mutex is fine.
@@ -129,14 +148,17 @@ pub fn report(snapshot: QuotaSnapshot) {
 
 /// The current snapshot for one tool, if any has been observed this run.
 pub fn current(tool: &str) -> Option<QuotaSnapshot> {
-    hub().lock().unwrap_or_else(|e| e.into_inner()).get(tool).cloned()
+    let mut snapshots = hub().lock().unwrap_or_else(|e| e.into_inner());
+    prune_expired_snapshots(&mut snapshots, now_unix());
+    snapshots.get(tool).cloned()
 }
 
 /// Every observed snapshot, sorted by tool name — the Resources dashboard's
 /// read side.
 pub fn all() -> Vec<QuotaSnapshot> {
-    let g = hub().lock().unwrap_or_else(|e| e.into_inner());
-    let mut v: Vec<QuotaSnapshot> = g.values().cloned().collect();
+    let mut snapshots = hub().lock().unwrap_or_else(|e| e.into_inner());
+    prune_expired_snapshots(&mut snapshots, now_unix());
+    let mut v: Vec<QuotaSnapshot> = snapshots.values().cloned().collect();
     v.sort_by(|a, b| a.tool.cmp(&b.tool));
     v
 }
@@ -162,6 +184,11 @@ pub fn clear_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hub_test_lock() -> &'static Mutex<()> {
+        static TEST_HUB_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_HUB_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn status_for_thresholds() {
@@ -191,15 +218,17 @@ mod tests {
 
     #[test]
     fn hub_report_current_all_round_trip() {
+        let _test_hub_lock = hub_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         clear_for_test();
+        let now = now_unix();
         assert!(current("claude").is_none());
         report(QuotaSnapshot {
             tool: "claude".into(),
             status: QuotaStatus::Warning,
             used_percent: Some(85),
-            resets_at: Some(1_700_000_000),
+            resets_at: Some(now + 3_600),
             window_label: Some("five_hour".into()),
-            observed_at: 1_699_999_000,
+            observed_at: now,
         });
         report(QuotaSnapshot {
             tool: "codex".into(),
@@ -207,7 +236,7 @@ mod tests {
             used_percent: Some(100),
             resets_at: None,
             window_label: Some("primary".into()),
-            observed_at: 1_699_999_500,
+            observed_at: now,
         });
         assert_eq!(current("claude").unwrap().status, QuotaStatus::Warning);
         assert_eq!(current("codex").unwrap().status, QuotaStatus::Exceeded);
@@ -224,10 +253,36 @@ mod tests {
             used_percent: Some(5),
             resets_at: None,
             window_label: None,
-            observed_at: 1_700_000_100,
+            observed_at: now,
         });
         assert_eq!(current("claude").unwrap().status, QuotaStatus::Ok);
         assert_eq!(all().len(), 2);
+    }
+
+    #[test]
+    fn expired_or_stale_snapshots_stop_affecting_routing() {
+        let _test_hub_lock = hub_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_for_test();
+        let now = now_unix();
+        report(QuotaSnapshot {
+            tool: "claude".into(),
+            status: QuotaStatus::Exceeded,
+            used_percent: Some(100),
+            resets_at: Some(now - 1),
+            window_label: Some("five_hour".into()),
+            observed_at: now - 60,
+        });
+        assert!(current("claude").is_none());
+
+        report(QuotaSnapshot {
+            tool: "codex".into(),
+            status: QuotaStatus::Exceeded,
+            used_percent: Some(100),
+            resets_at: None,
+            window_label: None,
+            observed_at: now - UNKNOWN_RESET_SNAPSHOT_TTL_SECS - 1,
+        });
+        assert!(all().is_empty());
     }
 
     #[test]

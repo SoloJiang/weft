@@ -24,6 +24,7 @@ import {
   shouldApplyProcessQuotaStatus,
   type ProcessQuotaNotice,
 } from "../lib/processQuota";
+import { routeReasonKey } from "../lib/engineRoutingDisplay";
 import { STORAGE_KEYS } from "../lib/storageKeys";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
@@ -146,6 +147,15 @@ function rawErrorMessage(error: unknown): string {
   return "";
 }
 
+function routeBlockedErrorMessage(raw: string): string | null {
+  const prefix = "engine_route_blocked:";
+  if (!raw.startsWith(prefix)) return null;
+  const reason = raw.slice(prefix.length);
+  return i18n.t("lead.engineRouteBlocked", {
+    reason: i18n.t(routeReasonKey(reason)),
+  });
+}
+
 /** A send that never created a message row (queue-full race, worktree/session
  *  mid-rewind, "turn ended while persisting", a missing agent binary before any
  *  row lands, …) has no row to carry a delivery receipt — the composer
@@ -153,10 +163,17 @@ function rawErrorMessage(error: unknown): string {
  *  as a silent drop (issue #94). Surface the reason explicitly instead. */
 function notifySendFailed(error: unknown) {
   const raw = rawErrorMessage(error);
-  const msg =
-    raw === "queue_full"
-      ? i18n.t("lead.queueFull")
-      : i18n.t("lead.sendFailedGeneric", { reason: raw || i18n.t("lead.sendFailedUnknown") });
+  let msg: string;
+  if (raw === "queue_full") {
+    msg = i18n.t("lead.queueFull");
+  } else {
+    const routeBlocked = routeBlockedErrorMessage(raw);
+    if (routeBlocked) {
+      msg = routeBlocked;
+    } else {
+      msg = i18n.t("lead.sendFailedGeneric", { reason: raw || i18n.t("lead.sendFailedUnknown") });
+    }
+  }
   toast(msg, "danger");
 }
 

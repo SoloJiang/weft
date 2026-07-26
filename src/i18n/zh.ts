@@ -250,6 +250,7 @@ export const zh = {
     receiptConsumed: "Agent 已开始处理",
     sendFailedGeneric: "发送失败：{{reason}}",
     sendFailedUnknown: "未知错误",
+    engineRouteBlocked: "引擎路由已阻断：{{reason}}",
   },
   scope: {
     addReposFirst: "请先往这个工作区添加仓库。",

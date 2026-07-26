@@ -1807,7 +1807,12 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
             )
             .await;
         }
-        return Err(anyhow::anyhow!("engine-routing-blocked:{}", route.reason_code()));
+        let message = format!("engine-routing-blocked:{}", route.reason_code());
+        run_finish_err(rid, message.clone());
+        let _ = repo::set_analysis_state(db, rid, "failed", Some(&message)).await;
+        emit_repo_analysis(ws, rid, "failed", None, Some(&message));
+        emit_graph_updated(ws);
+        return Err(anyhow::anyhow!(message));
     }
     let tool = route
         .selected()

@@ -628,6 +628,12 @@ pub async fn prepare_blocked_lead(
     db: &Db,
     thread: &crate::store::entities::thread::Model,
 ) -> anyhow::Result<crate::store::entities::thread::Model> {
+    // A manual switch persists its pin before lead_engine re-enters this path.
+    // Never reinterpret an older blocked automatic marker as permission to
+    // overwrite that explicit recovery choice.
+    if thread.engine_pinned {
+        return Ok(thread.clone());
+    }
     // A status row means this participant has already been started at least
     // once. Initial routing is not a license to rebalance it on a later
     // resume, even if the quota/installation snapshot has changed.
@@ -863,6 +869,42 @@ mod tests {
         ));
         assert_eq!(out.selected(), Some(EngineId::Claude));
         assert_eq!(out.source, RoutingSource::Manual);
+    }
+
+    #[tokio::test]
+    async fn manual_pin_bypasses_blocked_initial_route_recovery() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        // An invalid legacy identity makes a missing manual-pin guard observable:
+        // recovery would normalize it to Codex even with automatic routing off.
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "not-a-tool")
+            .await
+            .unwrap();
+        repo::set_thread_engine_pinned(&db, thread.id, true)
+            .await
+            .unwrap();
+        let content = serde_json::json!({
+            "source": "blocked",
+            "operation": "new_issue",
+            "hint": "normal"
+        })
+        .to_string();
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "system",
+            "engine_route_blocked",
+            &content,
+            "complete",
+        )
+        .await
+        .unwrap();
+
+        let pinned = repo::get_thread(&db, thread.id).await.unwrap().unwrap();
+        let recovered = prepare_blocked_lead(&db, &pinned).await.unwrap();
+        assert_eq!(recovered.lead_tool, "not-a-tool");
     }
 
     #[test]
