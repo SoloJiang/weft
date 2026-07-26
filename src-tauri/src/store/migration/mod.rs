@@ -1937,7 +1937,9 @@ impl MigrationTrait for M0043SessionModel {
 
 /// Records whether a tool identity came from a user choice rather than the
 /// global/default routing policy. Existing rows intentionally migrate as
-/// pinned: an upgrade must never redirect a currently known task.
+/// pinned: an upgrade must never redirect a currently known task. Legacy
+/// curator rows remain pinned as well because older versions did not persist
+/// enough provenance to distinguish a default from an explicit engine choice.
 pub struct M0044EngineRoutingPin;
 impl MigrationName for M0044EngineRoutingPin {
     fn name(&self) -> &str {
@@ -1972,15 +1974,6 @@ impl MigrationTrait for M0044EngineRoutingPin {
             }
         }
 
-        // The curator is a Weft-owned repository assistant, not a historical
-        // user choice. Keep it on the shared global policy after upgrading.
-        use sea_orm::{ConnectionTrait, Statement};
-        let db = manager.get_connection();
-        db.execute(Statement::from_string(
-            db.get_database_backend(),
-            "UPDATE thread SET engine_pinned = 0 WHERE kind = 'curator'".to_string(),
-        ))
-        .await?;
         Ok(())
     }
 
@@ -2005,7 +1998,7 @@ impl MigrationTrait for M0044EngineRoutingPin {
 
 #[cfg(test)]
 mod tests {
-    use super::gateway_components_to_backend;
+    use super::{gateway_components_to_backend, M0044EngineRoutingPin};
 
     #[test]
     fn gateway_tier_rewritten_to_backend() {
@@ -2229,6 +2222,90 @@ mod tests {
             meta.contains("idx_lead_message_thread_kind_session"),
             "meta lookup must use the composite index prefix, got: {meta}"
         );
+    }
+
+    /// M0044: legacy curator rows stay conservatively pinned. The old schema
+    /// has no provenance to distinguish a default engine from a manual pick,
+    /// so migration must not opt any existing row into automatic fail-over.
+    #[tokio::test]
+    async fn m0044_legacy_curator_is_pinned_and_existing_values_survive_rerun() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        for sql in [
+            "CREATE TABLE thread (id INTEGER PRIMARY KEY, kind TEXT NOT NULL)",
+            "CREATE TABLE direction (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE session (id INTEGER PRIMARY KEY)",
+            "INSERT INTO thread (id, kind) VALUES (1, 'curator'), (2, 'feature')",
+            "INSERT INTO direction (id) VALUES (1)",
+            "INSERT INTO session (id) VALUES (1)",
+        ] {
+            db.execute(Statement::from_string(backend, sql.to_owned()))
+                .await
+                .unwrap();
+        }
+
+        M0044EngineRoutingPin
+            .up(&SchemaManager::new(&db))
+            .await
+            .unwrap();
+
+        for sql in [
+            "SELECT engine_pinned FROM thread WHERE id = 1",
+            "SELECT engine_pinned FROM thread WHERE id = 2",
+            "SELECT engine_pinned FROM direction WHERE id = 1",
+            "SELECT engine_pinned FROM session WHERE id = 1",
+        ] {
+            let row = db
+                .query_one(Statement::from_string(backend, sql.to_owned()))
+                .await
+                .unwrap()
+                .unwrap();
+            let pinned: bool = row.try_get("", "engine_pinned").unwrap();
+            assert!(pinned, "legacy rows must migrate as pinned: {sql}");
+        }
+
+        db.execute(Statement::from_string(
+            backend,
+            "UPDATE thread SET engine_pinned = 0 WHERE id = 1".to_owned(),
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_string(
+            backend,
+            "UPDATE direction SET engine_pinned = 0 WHERE id = 1".to_owned(),
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_string(
+            backend,
+            "UPDATE session SET engine_pinned = 0 WHERE id = 1".to_owned(),
+        ))
+        .await
+        .unwrap();
+
+        // A retry against an already-upgraded database must leave explicit
+        // values untouched, including the curator row.
+        M0044EngineRoutingPin
+            .up(&SchemaManager::new(&db))
+            .await
+            .unwrap();
+
+        for sql in [
+            "SELECT engine_pinned FROM thread WHERE id = 1",
+            "SELECT engine_pinned FROM direction WHERE id = 1",
+            "SELECT engine_pinned FROM session WHERE id = 1",
+        ] {
+            let row = db
+                .query_one(Statement::from_string(backend, sql.to_owned()))
+                .await
+                .unwrap()
+                .unwrap();
+            let pinned: bool = row.try_get("", "engine_pinned").unwrap();
+            assert!(!pinned, "an existing engine_pinned value must survive: {sql}");
+        }
     }
 
     /// M0037: code_checkpoint exists after migration and round-trips a row.
