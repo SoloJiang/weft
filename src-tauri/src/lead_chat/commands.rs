@@ -1308,7 +1308,6 @@ pub(crate) async fn chat_open_worker_impl(
     let wt = repo::worktree_for(db, direction_id, repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no materialized worktree for that direction+repo"))?;
-    let mut dir = repo::ensure_direction_workspace_accepts_writes(db, direction_id).await?;
     repo::ensure_repo_workspace_accepts_writes(db, repo_id).await?;
     let cwd = std::path::PathBuf::from(&wt.path);
     // A worktree row can outlive its directory (reclaimed via the Done-card
@@ -1319,16 +1318,36 @@ pub(crate) async fn chat_open_worker_impl(
         anyhow::bail!("worktree directory no longer exists for that direction+repo");
     }
 
+    // A planner's final manual pin and a worker's first engine registration
+    // own the same initial route. Hold this through the first start/send so a
+    // stale no-native engine cannot appear between the planner's liveness check
+    // and its durable route transaction.
+    let _initial_route_guard = engine::initial_worker_route_gate(direction_id)
+        .lock_owned()
+        .await;
+    let mut dir = repo::ensure_direction_workspace_accepts_writes(db, direction_id).await?;
+
     // An unpinned direction that has not yet established a native conversation
     // is still an initial route, not a running participant. Re-resolve it so a
     // delayed open cannot launch an engine that the current automatic policy
     // excludes. Once a worker has a native conversation or a live engine, keep
     // its selected identity: automatic routing is not a license to migrate an
     // existing session on open.
+    let state = app.state::<LeadChatState>();
     let prior = repo::latest_session_for(db, direction_id, repo_id).await?;
     let has_live_prior = prior
         .as_ref()
-        .is_some_and(|session| app.state::<LeadChatState>().get(session.id as i64).is_some());
+        .is_some_and(|session| state.worker_is_running(session.id));
+    if let Some(session) = prior
+        .as_ref()
+        .filter(|session| session.native_session_id.is_none() && !has_live_prior)
+    {
+        if let Some(stale) = state.get(session.id as i64) {
+            if let Some(stale) = state.remove_if_same(session.id as i64, &stale) {
+                let _ = engine::teardown_for_switch(app, &stale).await;
+            }
+        }
+    }
     let can_refresh_initial_route = !dir.engine_pinned
         && !has_live_prior
         && prior
@@ -1398,7 +1417,6 @@ pub(crate) async fn chat_open_worker_impl(
     extra.extend(inj.args);
     push_model_arg(&mut extra, sess.model.as_deref());
 
-    let state = app.state::<LeadChatState>();
     let key = sess.id as i64;
     repo::ensure_thread_workspace_accepts_writes(db, dir.thread_id).await?;
     let eng = match state.get(key) {
@@ -1455,7 +1473,12 @@ pub(crate) async fn chat_open_worker_impl(
             state.get_or_insert(key, e)
         }
     };
-    engine::ensure_running(app, db, &eng).await?;
+    if let Err(err) = engine::ensure_running(app, db, &eng).await {
+        if let Some(stale) = state.remove_if_same(key, &eng) {
+            let _ = engine::teardown_for_switch(app, &stale).await;
+        }
+        return Err(err);
+    }
 
     // A fresh conversation starts with a user-shaped task request, followed by
     // the structured Weft brief as context.
@@ -1465,7 +1488,12 @@ pub(crate) async fn chat_open_worker_impl(
             .unwrap_or_default();
         if !brief.trim().is_empty() {
             brief.push_str(lang_directive(lang));
-            engine::send(app, db, &eng, &brief, vec![], vec![], None).await?;
+            if let Err(err) = engine::send(app, db, &eng, &brief, vec![], vec![], None).await {
+                if let Some(stale) = state.remove_if_same(key, &eng) {
+                    let _ = engine::teardown_for_switch(app, &stale).await;
+                }
+                return Err(err);
+            }
         }
     }
     // Dispatch enters the mandate's first phase: plan+impl workers start by

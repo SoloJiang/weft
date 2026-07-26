@@ -1955,6 +1955,46 @@ impl LeadChatState {
     pub fn get_or_insert(&self, key: i64, eng: EngineRef) -> EngineRef {
         self.0.entry(key).or_insert(eng).value().clone()
     }
+
+    /// A cached worker is live only while it owns an active turn. An idle
+    /// resident process or a failed initial open carries no conversation and
+    /// may still follow the current initial-route policy.
+    pub fn worker_is_running(&self, session_id: i32) -> bool {
+        let Some(engine) = self.get(session_id as i64) else {
+            return false;
+        };
+        let Ok(inner) = engine.try_lock() else {
+            // A worker whose state is being changed is conservatively live: a
+            // route update must never race an in-flight turn transition.
+            return true;
+        };
+        !inner.stopped && inner.turn.busy
+    }
+
+    /// Remove an engine only when the caller still owns the exact cached Arc.
+    /// An initial-open failure must not tear down a newer engine that won a
+    /// concurrent reconstruction race.
+    pub fn remove_if_same(&self, key: i64, expected: &EngineRef) -> Option<EngineRef> {
+        self.0
+            .remove_if(&key, |_, current| Arc::ptr_eq(current, expected))
+            .map(|(_, engine)| engine)
+    }
+}
+
+/// Serialize a worker's first-route ownership across planner pinning and engine
+/// registration. A direction owns one worktree route, so `direction_id` is the
+/// right key even before a session row has been created.
+pub(crate) fn initial_worker_route_gate(
+    direction_id: i32,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static GATES: std::sync::OnceLock<
+        DashMap<i32, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    > = std::sync::OnceLock::new();
+    let gates = GATES.get_or_init(DashMap::new);
+    gates
+        .entry(direction_id)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 fn build_args(inner: &EngineInner) -> Vec<String> {
@@ -7009,6 +7049,19 @@ fn emit_lead_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worker_liveness_requires_an_active_turn() {
+        let state = LeadChatState::default();
+        let engine: EngineRef = Arc::new(tokio::sync::Mutex::new(test_inner("claude")));
+        state.get_or_insert(42, engine.clone());
+
+        assert!(!state.worker_is_running(42));
+        engine.lock().await.turn.busy = true;
+        assert!(state.worker_is_running(42));
+        engine.lock().await.turn.busy = false;
+        assert!(!state.worker_is_running(42));
+    }
 
     // ---- issue #99: sub-agent branch attribution (branch_of / text_row_content) ----
 

@@ -434,6 +434,38 @@ fn session_is_established(
     })
 }
 
+/// Lock every reused direction that is about to receive a manual initial-route
+/// pin. `chat_open_worker_impl` takes the same per-direction gate from its
+/// route snapshot through first engine registration, so the durable pin cannot
+/// race a no-native engine into existence.
+async fn lock_initial_worker_routes(
+    pins: &[repo::InitialDirectionRoutePin],
+) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+    let direction_ids: std::collections::BTreeSet<i32> =
+        pins.iter().map(|pin| pin.direction_id).collect();
+    let mut guards = Vec::with_capacity(direction_ids.len());
+    for direction_id in direction_ids {
+        guards.push(
+            crate::lead_chat::engine::initial_worker_route_gate(direction_id)
+                .lock_owned()
+                .await,
+        );
+    }
+    guards
+}
+
+fn live_initial_session_pin(
+    pins: &[repo::InitialDirectionRoutePin],
+    is_session_live: LiveSessionCheck<'_>,
+) -> Option<i32> {
+    let is_live = is_session_live?;
+    pins.iter().find_map(|pin| {
+        pin.session_id
+            .filter(|session_id| is_live(*session_id))
+            .map(|_| pin.direction_id)
+    })
+}
+
 /// Build the route preview for a pending lane without changing confirmation semantics.
 ///
 /// A pinned direction or a direction with an established session is already a participant, so its
@@ -1132,11 +1164,12 @@ async fn confirm_with_manual_tool_with_session_liveness(
             let unstarted = !ex.engine_pinned
                 && !session_is_established(latest_session.as_ref(), is_session_live);
             if unstarted {
-                let route = crate::engine_routing::resolve_for_db(
+                let route = crate::engine_routing::resolve_for_db_with_manual_intent(
                     db,
                     manual_tool,
                     &legacy_tool,
                     d.hint,
+                    crate::engine_routing::ManualRouteIntent::Fresh,
                 )
                 .await;
                 let Some(selected_tool) = route.selected() else {
@@ -1191,11 +1224,12 @@ async fn confirm_with_manual_tool_with_session_liveness(
             dispatch_ids.push(ex_id);
             continue;
         }
-        let route = crate::engine_routing::resolve_for_db(
+        let route = crate::engine_routing::resolve_for_db_with_manual_intent(
             db,
             manual_tool,
             &legacy_tool,
             d.hint,
+            crate::engine_routing::ManualRouteIntent::Fresh,
         )
         .await;
         let Some(selected_tool) = route.selected() else {
@@ -1246,6 +1280,15 @@ async fn confirm_with_manual_tool_with_session_liveness(
             pd.direction_id = dir.id;
         }
         dispatch_ids.push(dir.id);
+    }
+    let _initial_route_guards = lock_initial_worker_routes(&pending_reused_manual_pins).await;
+    if let Some(direction_id) =
+        live_initial_session_pin(&pending_reused_manual_pins, is_session_live)
+    {
+        rollback_attempt(db, &created_now, &recreated_reused).await;
+        anyhow::bail!(
+            "direction {direction_id} opened while confirming its manual route"
+        );
     }
     // Test-only seam: let a test land a re-propose in the window before the CAS to exercise the
     // defensive rollback below (mirrors approve_persist_gate). In production the per-thread gate
@@ -1601,11 +1644,12 @@ async fn approve_direction_with_pin_with_session_liveness(
         let reuse_route = if !existing.engine_pinned
             && !session_is_established(latest_session.as_ref(), is_session_live)
         {
-            let route = crate::engine_routing::resolve_for_db(
+            let route = crate::engine_routing::resolve_for_db_with_manual_intent(
                 db,
                 manual_tool,
                 &legacy_tool,
                 hint,
+                crate::engine_routing::ManualRouteIntent::Fresh,
             )
             .await;
             if route.selected().is_none() {
@@ -1643,6 +1687,20 @@ async fn approve_direction_with_pin_with_session_liveness(
             .and_then(|route| route.selected())
             .map(|tool| tool.as_str().to_string());
         if let Some(selected_tool) = manual_reuse_tool.as_deref() {
+            // Claim the same direction gate a first worker open uses before
+            // materializing and pinning this reused route. A worker that won
+            // just before this lock is visible through the refreshed session
+            // below; a worker that starts later waits until this atomic pin has
+            // committed and then observes the selected tool.
+            let _initial_route_guard = crate::lead_chat::engine::initial_worker_route_gate(id)
+                .lock_owned()
+                .await;
+            let pin_session = repo::latest_session_for(db, id, repo_ref.id).await?;
+            if session_is_established(pin_session.as_ref(), is_session_live) {
+                anyhow::bail!(
+                    "direction {id} opened while approving its manual route"
+                );
+            }
             // Materialization is safe before the durable approval under the
             // per-thread gate. The approval and the pin then commit together,
             // so an exit cannot leave an approved lane without its explicit
@@ -1664,7 +1722,7 @@ async fn approve_direction_with_pin_with_session_liveness(
             };
             let manual_pin = repo::InitialDirectionRoutePin {
                 direction_id: id,
-                session_id: latest_session.as_ref().map(|session| session.id),
+                session_id: pin_session.as_ref().map(|session| session.id),
                 tool: selected_tool.to_string(),
             };
             let applied = match repo::commit_reused_approval_with_direction_pin_cas(
@@ -1725,11 +1783,12 @@ async fn approve_direction_with_pin_with_session_liveness(
         auto_settle_if_fully_decided(db, thread_id, &proposal, &plan.proposal).await;
         return Ok(id);
     }
-    let route = crate::engine_routing::resolve_for_db(
+    let route = crate::engine_routing::resolve_for_db_with_manual_intent(
         db,
         manual_tool,
         &legacy_tool,
         hint,
+        crate::engine_routing::ManualRouteIntent::Fresh,
     )
     .await;
     let Some(selected_tool) = route.selected() else {
@@ -2989,6 +3048,22 @@ mod tests {
             .into_owned();
         crate::tool_command::set_overrides(std::collections::HashMap::from([(
             "opencode".to_string(),
+            root.join("missing-opencode").to_string_lossy().into_owned(),
+        )]));
+        let unavailable = confirm_with_manual_tool(&db, thread.id, Some("opencode"))
+            .await
+            .unwrap_err();
+        assert!(
+            unavailable
+                .to_string()
+                .contains("engine_route_blocked:manual_tool_unavailable")
+        );
+        assert!(
+            repo::list_directions(&db, thread.id).await.unwrap().is_empty(),
+            "a stale manual selection must not create a direction"
+        );
+        crate::tool_command::set_overrides(std::collections::HashMap::from([(
+            "opencode".to_string(),
             current_exe,
         )]));
         let ids_result = confirm_with_manual_tool(&db, thread.id, Some("opencode")).await;
@@ -3717,6 +3792,143 @@ mod tests {
             .unwrap();
         assert_eq!(approved_session.tool, "codex");
         assert!(approved_session.engine_pinned);
+
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+        let removed = repo::delete_thread_cascade(&db, confirm_thread).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        let removed = repo::delete_thread_cascade(&db, approve_thread).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn manual_route_pin_rechecks_liveness_after_its_initial_snapshot() {
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-manual-pin-live-race-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "api",
+            repo_path.to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let (confirm_thread, confirm_direction, confirm_session) =
+            create_unestablished_reused_lane(
+                &db,
+                workspace.id,
+                repo_ref.id,
+                "confirm",
+                "confirm lane",
+            )
+            .await;
+        let (approve_thread, approve_direction, approve_session) =
+            create_unestablished_reused_lane(
+                &db,
+                workspace.id,
+                repo_ref.id,
+                "approve",
+                "approve lane",
+            )
+            .await;
+        let current_exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::tool_command::set_overrides(std::collections::HashMap::from([
+            ("codex".to_string(), current_exe),
+            (
+                "claude".to_string(),
+                root.join("missing-claude").to_string_lossy().into_owned(),
+            ),
+            (
+                "opencode".to_string(),
+                root.join("missing-opencode").to_string_lossy().into_owned(),
+            ),
+        ]));
+
+        let confirm_checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let confirm_live = {
+            let confirm_checks = confirm_checks.clone();
+            move |session_id| {
+                session_id == confirm_session
+                    && confirm_checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+            }
+        };
+        let confirm_err = confirm_with_manual_tool_and_live_sessions(
+            &db,
+            confirm_thread,
+            Some("codex"),
+            &confirm_live,
+        )
+        .await
+        .unwrap_err();
+        assert!(confirm_err.to_string().contains("opened while confirming"));
+        assert!(confirm_checks.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        let confirm_plan = repo::get_plan(&db, confirm_thread).await.unwrap().unwrap();
+        assert_eq!(confirm_plan.status, "proposed");
+        let confirm_direction = repo::get_direction(&db, confirm_direction)
+            .await
+            .unwrap()
+            .unwrap();
+        let confirm_session = repo::get_session(&db, confirm_session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(confirm_direction.tool, "opencode");
+        assert!(!confirm_direction.engine_pinned);
+        assert_eq!(confirm_session.tool, "opencode");
+        assert!(!confirm_session.engine_pinned);
+
+        let approve_checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let approve_live = {
+            let approve_checks = approve_checks.clone();
+            move |session_id| {
+                session_id == approve_session
+                    && approve_checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+            }
+        };
+        let approve_err = approve_direction_with_pin_and_live_sessions(
+            &db,
+            approve_thread,
+            0,
+            Some("codex"),
+            &approve_live,
+        )
+        .await
+        .unwrap_err();
+        assert!(approve_err.to_string().contains("opened while approving"));
+        assert!(approve_checks.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        let approve_plan = repo::get_plan(&db, approve_thread).await.unwrap().unwrap();
+        assert_eq!(approve_plan.status, "proposed");
+        let approve_direction = repo::get_direction(&db, approve_direction)
+            .await
+            .unwrap()
+            .unwrap();
+        let approve_session = repo::get_session(&db, approve_session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approve_direction.tool, "opencode");
+        assert!(!approve_direction.engine_pinned);
+        assert_eq!(approve_session.tool, "opencode");
+        assert!(!approve_session.engine_pinned);
 
         crate::tool_command::set_overrides(std::collections::HashMap::new());
         let removed = repo::delete_thread_cascade(&db, confirm_thread).await.unwrap();

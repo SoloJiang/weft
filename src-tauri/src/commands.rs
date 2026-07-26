@@ -906,7 +906,7 @@ pub async fn get_proposal(
     thread_id: i32,
 ) -> R<Option<crate::planner::ResolvedProposal>> {
     let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
-    let is_session_live = |session_id| live_sessions.get(session_id as i64).is_some();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
     crate::planner::get_resolved_with_live_sessions(&db, thread_id, &is_session_live)
         .await
         .map_err(e)
@@ -1021,7 +1021,7 @@ pub async fn confirm_proposal(
     manual_tool: Option<String>,
 ) -> R<Vec<i32>> {
     let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
-    let is_session_live = |session_id| live_sessions.get(session_id as i64).is_some();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
     confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sessions(
         &db,
         &asks,
@@ -1720,7 +1720,7 @@ pub async fn write_triggers(
     workspace_id: i32,
 ) -> R<Vec<WriteTrigger>> {
     let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
-    let is_session_live = |session_id| live_sessions.get(session_id as i64).is_some();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
     let threads: Vec<_> = repo::list_threads(&db, workspace_id)
         .await
         .map_err(e)?
@@ -1787,7 +1787,7 @@ pub async fn approve_write_trigger(
     tool: Option<String>,
 ) -> R<i32> {
     let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
-    let is_session_live = |session_id| live_sessions.get(session_id as i64).is_some();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
     let id = crate::planner::approve_direction_with_pin_and_live_sessions(
         &db,
         thread_id,

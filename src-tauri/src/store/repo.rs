@@ -1623,11 +1623,25 @@ pub async fn refresh_unpinned_direction_route_with_pin(
                 Expr::value(Option::<String>::None),
             )
             .filter(session::Column::Id.eq(session_id))
+            .filter(session::Column::DirectionId.eq(direction_id))
             .filter(session::Column::EnginePinned.eq(false))
+            // A freshly captured native id establishes a real conversation.
+            // Do not clear it under a stale automatic-route snapshot.
+            .filter(session::Column::NativeSessionId.is_null())
             .exec(&txn)
-            .await?;
+            .await;
+        let session_write = match session_write {
+            Ok(session_write) => session_write,
+            Err(err) => {
+                let _ = txn.rollback().await;
+                return Err(err.into());
+            }
+        };
         if session_write.rows_affected == 0 {
-            anyhow::bail!("session {session_id} became manually pinned while refreshing its route");
+            let _ = txn.rollback().await;
+            anyhow::bail!(
+                "session {session_id} became established or pinned while refreshing its route"
+            );
         }
     }
 
@@ -5795,7 +5809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_unpinned_direction_route_updates_the_initial_session_too() {
+    async fn refresh_unpinned_direction_route_updates_a_no_native_initial_session_too() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
         let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
@@ -5819,7 +5833,6 @@ mod tests {
         let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
             .await
             .unwrap();
-        set_session_native_id(&db, session.id, "native-1").await.unwrap();
         {
             let mut active: session::ActiveModel = get_session(&db, session.id)
                 .await
@@ -5844,6 +5857,49 @@ mod tests {
         assert_eq!(refreshed_session.command, None);
         assert_eq!(refreshed_session.model, None);
         assert_eq!(refreshed_session.native_session_id, None);
+    }
+
+    #[tokio::test]
+    async fn refresh_unpinned_direction_route_preserves_a_newly_established_session() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "Issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "main",
+            "codex",
+            repo.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
+            .await
+            .unwrap();
+        set_session_native_id(&db, session.id, "native-1")
+            .await
+            .unwrap();
+
+        let err = refresh_unpinned_direction_route(&db, direction.id, Some(session.id), "claude")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("became established"));
+
+        let unchanged_direction = get_direction(&db, direction.id).await.unwrap().unwrap();
+        let unchanged_session = get_session(&db, session.id).await.unwrap().unwrap();
+        assert_eq!(unchanged_direction.tool, "codex");
+        assert!(!unchanged_direction.engine_pinned);
+        assert_eq!(unchanged_session.tool, "codex");
+        assert!(!unchanged_session.engine_pinned);
+        assert_eq!(unchanged_session.native_session_id.as_deref(), Some("native-1"));
     }
 
     #[tokio::test]
