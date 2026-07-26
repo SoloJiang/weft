@@ -17,10 +17,12 @@ import {
   SquarePen,
   Trash2,
 } from "lucide-react";
-import { isPendingNeed, pendingNeedsCount, threadLiveCounts, useStore } from "../state/store";
+import { isPendingNeed, pendingNeedsCount, useStore } from "../state/store";
+import { selectThreadActivity } from "../state/threadActivity";
 import type { Thread } from "../lib/types";
 import { cn } from "../lib/cn";
 import { openCommandPalette } from "../components/CommandPalette";
+import { ThreadActivity } from "../components/ui/ThreadActivity";
 import {
   AddRepoDialog,
   CreateThreadDialog,
@@ -349,14 +351,11 @@ function ThreadRow({ thread, onRename }: { thread: Thread; onRename: (id: number
   const { t } = useTranslation();
   const isActive = activeThreadId === thread.id;
   const dirCount = directionsByThread[thread.id]?.length;
-  // Split running vs stalled so an all-stalled thread doesn't advertise a healthy
-  // green pulse. Shared derivation with the workspace card: worker sessions + the
-  // thread lead (which has no session row) → running vs stalled.
-  const { running, stalled } = threadLiveCounts(
-    sessions,
-    (directionsByThread[thread.id] ?? []).map((d) => d.id),
-    leadTurn[thread.id]?.state,
-  );
+  const activity = selectThreadActivity({
+    workerSessions: Object.values(sessions),
+    directionIds: (directionsByThread[thread.id] ?? []).map((d) => d.id),
+    leadState: leadTurn[thread.id]?.state,
+  });
   const needsYou =
     needs.some((n) => n.thread_id === thread.id && isPendingNeed(n)) ||
     asks.some((a) => a.thread === thread.id);
@@ -383,18 +382,7 @@ function ThreadRow({ thread, onRename }: { thread: Thread; onRename: (id: number
           #{thread.id}
         </span>
         <span className="truncate text-[13px]">{thread.title}</span>
-        {running > 0 && (
-          <span className="flex items-center gap-1 text-[10px] text-running">
-            <span className="weft-pulse h-1.5 w-1.5 rounded-full bg-running" />
-            {running}
-          </span>
-        )}
-        {stalled > 0 && (
-          <span className="flex items-center gap-1 text-[10px] text-waiting">
-            <span className="h-1.5 w-1.5 rounded-full bg-waiting" />
-            {stalled}
-          </span>
-        )}
+        <ThreadActivity activity={activity} className="shrink-0 text-[10px]" />
         <span className="ml-auto flex items-center gap-1.5 transition-opacity group-hover:opacity-0">
           {needsYou && (
             <span
