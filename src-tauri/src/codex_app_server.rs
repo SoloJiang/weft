@@ -830,7 +830,10 @@ impl Client {
         drop(g);
 
         let me = self.clone();
-        tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
+        let read_quota_command = program.to_string();
+        tauri::async_runtime::spawn(async move {
+            me.read_loop(stdout, read_quota_command).await;
+        });
 
         // Handshake: initialize (await), then the `initialized` notification. If it
         // wedges/errors (auth/network/version), tear the half-open client down so a
@@ -857,7 +860,12 @@ impl Client {
         // AFTER a turn already ran on this connection — decoupled task so a
         // slow/unsupported endpoint can never delay the connection itself.
         let quota_probe = self.clone();
-        tauri::async_runtime::spawn(async move { quota_probe.refresh_quota_snapshot().await });
+        let probe_quota_command = program.to_string();
+        tauri::async_runtime::spawn(async move {
+            quota_probe
+                .refresh_quota_snapshot(&probe_quota_command)
+                .await;
+        });
         Ok(())
     }
 
@@ -867,17 +875,17 @@ impl Client {
     /// connection or a turn — the notification path (`read_loop`'s
     /// `account/rateLimits/updated` branch) still populates the hub reactively
     /// either way.
-    async fn refresh_quota_snapshot(&self) {
+    async fn refresh_quota_snapshot(&self, command: &str) {
         if let Ok(result) = self.request("account/rateLimits/read", Value::Null).await {
             if let Some(snapshot) = codex_quota_snapshot(&result["rateLimits"]) {
-                crate::engine_quota::report(snapshot);
+                crate::engine_quota::report_for_command(snapshot, command);
             }
         }
     }
 
     /// Demux the server's stdout for the connection's lifetime: correlate replies
     /// by id, route notifications + approval requests to the owning thread.
-    async fn read_loop(&self, stdout: tokio::process::ChildStdout) {
+    async fn read_loop(&self, stdout: tokio::process::ChildStdout, quota_command: String) {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             match classify(&line) {
@@ -932,7 +940,7 @@ impl Client {
                         // no chat row to render) — land straight in the quota hub
                         // instead of going through ChatEvent/route_resolved.
                         if let Some(snapshot) = codex_quota_snapshot(&params["rateLimits"]) {
-                            crate::engine_quota::report(snapshot);
+                            crate::engine_quota::report_for_command(snapshot, &quota_command);
                         }
                     }
                 }

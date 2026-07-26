@@ -145,6 +145,17 @@ pub fn report(snapshot: QuotaSnapshot) {
         .insert(snapshot.tool.clone(), snapshot);
 }
 
+/// Record a quota snapshot only when its reporting process is the command that
+/// new automatic routes would launch for this tool. Existing sessions can stay
+/// pinned to an older command after an alias change; their account state must
+/// not repopulate the global routing snapshot for the newly configured binary.
+pub fn report_for_command(snapshot: QuotaSnapshot, command: &str) {
+    if crate::tool_command::command_for(&snapshot.tool) != command {
+        return;
+    }
+    report(snapshot);
+}
+
 /// Drop the account snapshot for one tool after its effective command changes.
 /// A quota reading is account/command scoped in practice, while the in-memory
 /// hub is intentionally keyed by the stable tool identity for normal routing.
@@ -328,6 +339,46 @@ mod tests {
             current("codex").map(|snapshot| snapshot.status),
             Some(QuotaStatus::Warning)
         );
+        clear_for_test();
+    }
+
+    #[test]
+    fn pinned_old_command_cannot_repopulate_the_current_routing_snapshot() {
+        let _test_hub_lock = hub_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_for_test();
+        crate::tool_command::set_overrides(std::collections::HashMap::from([(
+            "claude".to_string(),
+            "old-claude".to_string(),
+        )]));
+        let snapshot = QuotaSnapshot {
+            tool: "claude".into(),
+            status: QuotaStatus::Exceeded,
+            used_percent: Some(100),
+            resets_at: Some(now_unix() + 3_600),
+            window_label: Some("five_hour".into()),
+            observed_at: now_unix(),
+        };
+        report_for_command(snapshot.clone(), "old-claude");
+        assert_eq!(current("claude").map(|reading| reading.status), Some(QuotaStatus::Exceeded));
+
+        crate::tool_command::set_overrides(std::collections::HashMap::from([(
+            "claude".to_string(),
+            "new-claude".to_string(),
+        )]));
+        assert!(current("claude").is_none(), "the override change clears the old account state");
+
+        // A legacy session pinned to old-claude can keep reporting, but its
+        // exhausted account must not block new work routed to new-claude.
+        report_for_command(snapshot.clone(), "old-claude");
+        assert!(current("claude").is_none());
+
+        report_for_command(snapshot, "new-claude");
+        assert_eq!(current("claude").map(|reading| reading.status), Some(QuotaStatus::Exceeded));
+
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
         clear_for_test();
     }
 

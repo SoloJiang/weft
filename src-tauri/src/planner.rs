@@ -1076,7 +1076,9 @@ pub async fn confirm_with_manual_tool(
     // ever fire, roll back the lanes created in this attempt and bail so the plan is NOT left
     // "confirmed" with stale lanes.
     let new_json = proposal_json_with_hints(&proposal, &start_plan.proposal)?;
-    if !repo::commit_confirmed_plan_with_direction_pins_cas(
+    #[cfg(test)]
+    tests::confirm_pin_race_gate(db, thread_id).await;
+    let applied = match repo::commit_confirmed_plan_with_direction_pins_cas(
         db,
         thread_id,
         &new_json,
@@ -1084,8 +1086,15 @@ pub async fn confirm_with_manual_tool(
         &start_plan.status,
         &pending_reused_manual_pins,
     )
-    .await?
+    .await
     {
+        Ok(applied) => applied,
+        Err(err) => {
+            rollback_attempt(db, &created_now, &recreated_reused).await;
+            return Err(err.into());
+        }
+    };
+    if !applied {
         rollback_attempt(db, &created_now, &recreated_reused).await;
         anyhow::bail!("plan changed during confirm (re-proposed); please retry");
     }
@@ -1801,6 +1810,32 @@ mod tests {
                 .map(|p| p.created_at)
                 .unwrap_or_else(now);
             let _ = repo::upsert_plan(db, thread_id, &json, &status, &created).await;
+        }
+    }
+
+    /// A test-only concurrent manual pin landed after every lane was
+    /// materialized but before the final transaction. It makes the transaction
+    /// reject so the test can assert that confirm rolls all side effects back.
+    fn confirm_pin_race_map() -> &'static std::sync::Mutex<std::collections::HashMap<i32, (i32, String)>> {
+        static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, (i32, String)>>> =
+            std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn arm_confirm_pin_race(thread_id: i32, direction_id: i32, tool: &str) {
+        confirm_pin_race_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(thread_id, (direction_id, tool.to_string()));
+    }
+
+    pub(super) async fn confirm_pin_race_gate(db: &Db, thread_id: i32) {
+        let armed = confirm_pin_race_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&thread_id);
+        if let Some((direction_id, tool)) = armed {
+            let _ = repo::pin_unstarted_unpinned_direction_route(db, direction_id, &tool).await;
         }
     }
 
@@ -2934,6 +2969,118 @@ mod tests {
         assert!(!after.engine_pinned, "failed confirmation must not leave a manual pin");
         let plan = repo::get_plan(&db, thread.id).await.unwrap().unwrap();
         assert_eq!(plan.status, "proposed", "failed confirmation must stay retryable");
+
+        let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn confirm_rolls_back_materialization_when_reused_pin_transaction_errors() {
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-pin-txn-rollback-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "api",
+            repo_path.to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let reused = repo::create_direction(
+            &db,
+            thread.id,
+            "B",
+            "codex",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        materialize::materialize_direction(&db, reused.id).await.unwrap();
+        let reused_worktree = repo::worktree_for(&db, reused.id, repo_ref.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let reused_worktree_path = std::path::PathBuf::from(&reused_worktree.path);
+        let _ = crate::git::remove_worktree(&repo_path, &reused_worktree_path);
+        let _ = std::fs::remove_dir_all(&reused_worktree_path);
+        assert!(
+            !reused_worktree_path.exists(),
+            "precondition: the reused lane starts reclaimed so confirm recreates it"
+        );
+
+        let proposal = Proposal {
+            rationale: "r".into(),
+            directions: vec![
+                ProposedDirection {
+                    name: "A".into(),
+                    repo: "api".into(),
+                    reason: "r".into(),
+                    mandate: "plan+impl".into(),
+                    base_branch: "".into(),
+                    decision: "".into(),
+                    direction_id: 0,
+                },
+                ProposedDirection {
+                    name: "B".into(),
+                    repo: "api".into(),
+                    reason: "r".into(),
+                    mandate: "plan+impl".into(),
+                    base_branch: "".into(),
+                    decision: "".into(),
+                    direction_id: 0,
+                },
+            ],
+        };
+        save_proposal(&db, thread.id, &proposal).await.unwrap();
+
+        let current_exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::tool_command::set_overrides(std::collections::HashMap::from([(
+            "opencode".to_string(),
+            current_exe,
+        )]));
+        arm_confirm_pin_race(thread.id, reused.id, "opencode");
+        let result = confirm_with_manual_tool(&db, thread.id, Some("opencode")).await;
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+
+        assert!(result.is_err(), "the concurrent manual pin must reject the final transaction");
+        let directions = repo::list_directions(&db, thread.id).await.unwrap();
+        assert!(
+            !directions.iter().any(|direction| direction.name == "A"),
+            "a newly materialized lane must be removed when the transaction errors"
+        );
+        assert!(directions.iter().any(|direction| direction.id == reused.id));
+        assert!(
+            !reused_worktree_path.exists(),
+            "the reused lane's recreation must be re-reclaimed when the transaction errors"
+        );
+        let plan = repo::get_plan(&db, thread.id).await.unwrap().unwrap();
+        assert_eq!(plan.status, "proposed", "the failed confirmation must remain retryable");
 
         let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;

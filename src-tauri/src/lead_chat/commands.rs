@@ -2227,6 +2227,20 @@ async fn release_quota_failover_commit(
     eng.lock().await.quota_failover_committing = false;
 }
 
+/// The policy decision is made before waiting on the per-engine switch gate.
+/// A human can complete a same-tool manual switch in that interval, so re-read
+/// the durable pin once the gate is ours. A read failure remains fail-closed.
+async fn quota_failover_still_unpinned(db: &Db, thread_id: i32, session_id: Option<i32>) -> bool {
+    match crate::engine_routing::has_manual_pin(db, thread_id, session_id).await {
+        Ok(false) => true,
+        Ok(true) => false,
+        Err(err) => {
+            eprintln!("[weft][quota] skipped fail-over because post-gate pin lookup failed: {err}");
+            false
+        }
+    }
+}
+
 /// Fire-and-forget entry point: engine.rs's two TurnEnd sites (codex_consumer,
 /// spawn_reader) call this right after a turn ends in error (issue #97).
 /// Spawns its OWN task so it can safely re-lock the engine —
@@ -2320,6 +2334,9 @@ async fn maybe_failover_on_quota(
     let _switch_gate = engine_switch_gate(quota_failover_engine_key(thread_id, session_id))
         .lock_owned()
         .await;
+    if !quota_failover_still_unpinned(db, thread_id, session_id).await {
+        return;
+    }
     // Claim the cooldown slot before the short final engine handoff. A second
     // turn-end callback then cannot race this one into a duplicate switch.
     if !claim_quota_failover_slot(key) {
@@ -2418,6 +2435,7 @@ async fn insert_quota_failover_failed_marker(
 #[cfg(test)]
 mod quota_failover_tests {
     use super::*;
+    use crate::store::{repo, Db};
 
     #[test]
     fn quota_failover_cooldown_blocks_immediate_repeat_then_releases() {
@@ -2476,6 +2494,24 @@ mod quota_failover_tests {
         assert!(
             second.try_lock().is_ok(),
             "the next switch may claim the gate after the first completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_failover_recheck_refuses_a_manual_pin_added_while_waiting() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+
+        assert!(quota_failover_still_unpinned(&db, thread.id, None).await);
+        repo::switch_lead_engine_txn_with_pin(&db, thread.id, "codex", None, true)
+            .await
+            .unwrap();
+        assert!(
+            !quota_failover_still_unpinned(&db, thread.id, None).await,
+            "the post-gate recheck must stop the automatic handoff after a same-tool manual switch"
         );
     }
 

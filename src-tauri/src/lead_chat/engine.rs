@@ -3129,21 +3129,22 @@ async fn codex_consumer(
     while let Some(msg) = rx.recv().await {
         match msg {
             ThreadMsg::QuotaExceeded => {
-                let tool = {
+                let source = {
                     let mut inner = eng.lock().await;
                     if inner.turn.busy {
                         inner.turn.quota_exceeded = true;
-                        Some(inner.tool.clone())
+                        let tool = inner.tool.clone();
+                        let command = crate::tool_command::effective(inner.command.as_deref(), &tool);
+                        Some((tool, command))
                     } else {
                         None
                     }
                 };
-                let snapshot = tool.as_deref().and_then(|tool| {
-                    let previous = crate::engine_quota::current(tool);
-                    structured_codex_exhaustion_snapshot(tool, previous.as_ref())
-                });
-                if let Some(snapshot) = snapshot {
-                    crate::engine_quota::report(snapshot);
+                if let Some((tool, command)) = source {
+                    let previous = crate::engine_quota::current(&tool);
+                    if let Some(snapshot) = structured_codex_exhaustion_snapshot(&tool, previous.as_ref()) {
+                        crate::engine_quota::report_for_command(snapshot, &command);
+                    }
                 }
             }
             ThreadMsg::Event(ChatEvent::TextDelta { text, item, agent_thread }) => {
@@ -6311,7 +6312,8 @@ fn spawn_reader(
                 {
                     inner.turn.quota_exceeded = true;
                 }
-                crate::engine_quota::report(snapshot);
+                let command = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
+                crate::engine_quota::report_for_command(snapshot, &command);
             }
             let event = crate::adapters::adapter_for(&inner.tool)
                 .map(|a| a.parse_line(&line))
