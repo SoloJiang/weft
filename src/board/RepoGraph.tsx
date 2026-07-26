@@ -25,6 +25,7 @@ import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Button } from "../components/ui/Button";
 import { Select } from "../components/ui/Select";
 import { cn } from "../lib/cn";
+import { routeReasonKey } from "../lib/engineRoutingDisplay";
 
 /** The two architectural tiers laid out left→right, plus the catch-all "other"
  *  band that holds unclassified / still-analyzing repos. */
@@ -103,8 +104,16 @@ function StatusGlyph({ view }: { view: Exclude<AnalysisView, "analyzed"> }) {
 /** A known, stable error CODE (not the raw agent/transport diagnostic string) gets
  *  a localized message; anything else is an inherently-English agent/CLI error and
  *  is shown verbatim (it's diagnostic text, not meant for translation). */
-function analysisErrorText(t: (key: string) => string, error: string | null | undefined): string {
+function analysisErrorText(
+  t: (key: string, options?: Record<string, string>) => string,
+  error: string | null | undefined,
+): string {
   if (error === "checkout-missing") return t("repomap.analysisErrorCheckoutMissing");
+  const routeBlockedPrefix = "engine-routing-blocked:";
+  if (error?.startsWith(routeBlockedPrefix)) {
+    const reason = error.slice(routeBlockedPrefix.length);
+    return t("lead.engineRouteBlocked", { reason: t(routeReasonKey(reason)) });
+  }
   return error ?? "";
 }
 
