@@ -1804,6 +1804,15 @@ async fn switch_lead_tool_inner(
     }
     let model = normalize_model(model);
     let automatic_failover = reason.as_deref() == Some(QUOTA_FAILOVER_REASON);
+    // Serialize a human-requested switch with the final quota-failover
+    // handoff. The gate covers the initial DB snapshot as well as teardown, so
+    // an automatic switch cannot commit from an older route after a human has
+    // started choosing a new one.
+    let _switch_gate = if automatic_failover {
+        None
+    } else {
+        Some(engine_switch_gate(lead_key(thread_id)).lock_owned().await)
+    };
     if !automatic_failover {
         if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
             if eng.lock().await.quota_failover_committing {
@@ -1868,14 +1877,6 @@ async fn switch_lead_tool_inner(
             .map_err(|e| switch_failure(&format!("thread {thread_id}"), interrupted, e))?;
     }
 
-    let lang = lang.unwrap_or_else(|| "en".to_string());
-    let eng = lead_engine(app, db, thread_id, &lang)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !digest.is_empty() {
-        eng.lock().await.pending_context_digest = Some(digest);
-    }
-
     let outcome = SwitchOutcome {
         old_tool: before.lead_tool,
         new_tool: tool,
@@ -1884,6 +1885,27 @@ async fn switch_lead_tool_inner(
         reason,
         quota_basis,
     };
+    let lang = lang.unwrap_or_else(|| "en".to_string());
+    let eng = match lead_engine(app, db, thread_id, &lang).await {
+        Ok(eng) => eng,
+        Err(err) if automatic_failover => {
+            // The durable transaction already committed. Treat a failed eager
+            // reconstruction as a committed failover (a later open can retry
+            // construction) rather than writing a false failure marker and
+            // leaving the frontend on the exhausted provider.
+            eprintln!(
+                "[weft][quota] committed lead fail-over for thread {thread_id}, but eager engine reconstruction failed: {err}"
+            );
+            insert_switch_marker(app, db, thread_id, None, &outcome).await;
+            emit_engine_switched(app, thread_id, None, None, &outcome, None);
+            return Ok(outcome);
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    if !digest.is_empty() {
+        eng.lock().await.pending_context_digest = Some(digest);
+    }
+
     insert_switch_marker(app, db, thread_id, None, &outcome).await;
     emit_engine_switched(app, thread_id, None, None, &outcome, None);
     Ok(outcome)
@@ -1937,6 +1959,13 @@ async fn switch_worker_tool_inner(
     }
     let model = normalize_model(model);
     let automatic_failover = reason.as_deref() == Some(QUOTA_FAILOVER_REASON);
+    // See the lead equivalent: manual changes and automatic quota handoffs
+    // share one per-engine gate from their first snapshot through replacement.
+    let _switch_gate = if automatic_failover {
+        None
+    } else {
+        Some(engine_switch_gate(session_id as i64).lock_owned().await)
+    };
     if !automatic_failover {
         if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
             if eng.lock().await.quota_failover_committing {
@@ -2005,13 +2034,6 @@ async fn switch_worker_tool_inner(
         .map_err(|e| switch_failure(&format!("session {session_id}"), interrupted, e))?;
     }
 
-    let eng = worker_engine(app, db, session_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !digest.is_empty() {
-        eng.lock().await.pending_context_digest = Some(digest);
-    }
-
     let outcome = SwitchOutcome {
         old_tool: sess.tool,
         new_tool: tool,
@@ -2020,6 +2042,29 @@ async fn switch_worker_tool_inner(
         reason,
         quota_basis,
     };
+    let eng = match worker_engine(app, db, session_id).await {
+        Ok(eng) => eng,
+        Err(err) if automatic_failover => {
+            eprintln!(
+                "[weft][quota] committed worker fail-over for session {session_id}, but eager engine reconstruction failed: {err}"
+            );
+            insert_switch_marker(app, db, dir.thread_id, Some(session_id), &outcome).await;
+            emit_engine_switched(
+                app,
+                dir.thread_id,
+                Some(session_id),
+                Some(sess.direction_id),
+                &outcome,
+                Some(crate::tool_command::effective(None, &outcome.new_tool)),
+            );
+            return Ok(outcome);
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    if !digest.is_empty() {
+        eng.lock().await.pending_context_digest = Some(digest);
+    }
+
     insert_switch_marker(app, db, dir.thread_id, Some(session_id), &outcome).await;
     emit_engine_switched(
         app,
@@ -2109,6 +2154,21 @@ fn release_quota_failover_slot(key: QuotaFailoverKey) {
 
 fn quota_failover_engine_key(thread_id: i32, session_id: Option<i32>) -> i64 {
     session_id.map(i64::from).unwrap_or_else(|| lead_key(thread_id))
+}
+
+/// Per-engine switch serialization. A manual switch takes this before reading
+/// its durable route; quota failover takes it before claiming the final idle
+/// handoff. Keeping the guard outside EngineInner means it remains effective
+/// while a switch temporarily removes the cached engine to rebuild it.
+fn engine_switch_gate(engine_key: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static GATES: std::sync::OnceLock<
+        dashmap::DashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    > = std::sync::OnceLock::new();
+    let gates = GATES.get_or_init(dashmap::DashMap::new);
+    gates
+        .entry(engine_key)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 fn can_commit_quota_failover(inner: &engine::EngineInner, expected_tool: &str) -> bool {
@@ -2254,6 +2314,12 @@ async fn maybe_failover_on_quota(
         }
         crate::engine_routing::FailoverDecision::SwitchTo { tool, .. } => tool.as_str(),
     };
+    // A manual switch that arrived first holds this through its durable write
+    // and engine rebuild. If we acquire it first, the later manual call waits,
+    // then reads the post-failover state rather than racing a stale snapshot.
+    let _switch_gate = engine_switch_gate(quota_failover_engine_key(thread_id, session_id))
+        .lock_owned()
+        .await;
     // Claim the cooldown slot before the short final engine handoff. A second
     // turn-end callback then cannot race this one into a duplicate switch.
     if !claim_quota_failover_slot(key) {
@@ -2395,6 +2461,22 @@ mod quota_failover_tests {
         assert!(!can_commit_quota_failover(&inner, "claude"));
         inner.quota_failover_committing = true;
         assert!(!can_commit_quota_failover(&inner, "codex"));
+    }
+
+    #[tokio::test]
+    async fn engine_switch_gate_serializes_manual_and_quota_handoffs() {
+        let key = -900_002;
+        let first = engine_switch_gate(key).lock_owned().await;
+        let second = engine_switch_gate(key);
+        assert!(
+            second.try_lock().is_err(),
+            "a quota handoff must wait while a manual switch owns the same engine gate"
+        );
+        drop(first);
+        assert!(
+            second.try_lock().is_ok(),
+            "the next switch may claim the gate after the first completes"
+        );
     }
 
 }

@@ -919,6 +919,64 @@ pub async fn update_plan_proposal_cas(
     Ok(res.rows_affected > 0)
 }
 
+/// Atomically record a reused lane's approval and its explicit manual route.
+/// The worktree has already materialized before this is called, but the plan
+/// must never become approved without the manual pin that justified dispatch.
+/// A first plan write takes SQLite's writer lock before the session check, so a
+/// concurrent worker either wins first (and this rejects) or waits and reads
+/// the committed manual route when it creates its session.
+pub async fn commit_reused_approval_with_direction_pin_cas(
+    db: &Db,
+    thread_id: i32,
+    new_proposal: &str,
+    expected_proposal: &str,
+    expected_status: &str,
+    direction_id: i32,
+    tool: &str,
+) -> Result<bool> {
+    use sea_orm::TransactionTrait;
+
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let txn = db.0.begin().await?;
+    let plan_write = plan::Entity::update_many()
+        .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
+        .col_expr(plan::Column::Status, Expr::value(expected_status.to_string()))
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .filter(plan::Column::Proposal.eq(expected_proposal))
+        .filter(plan::Column::Status.eq(expected_status))
+        .exec(&txn)
+        .await?;
+    if plan_write.rows_affected == 0 {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+
+    let opened_session = session::Entity::find()
+        .filter(session::Column::DirectionId.eq(direction_id))
+        .one(&txn)
+        .await?;
+    if opened_session.is_some() {
+        txn.rollback().await?;
+        anyhow::bail!("direction {direction_id} opened while approving its manual route");
+    }
+    let direction_write = direction::Entity::update_many()
+        .col_expr(direction::Column::Tool, Expr::value(tool))
+        .col_expr(direction::Column::EnginePinned, Expr::value(true))
+        .filter(direction::Column::Id.eq(direction_id))
+        .filter(direction::Column::ThreadId.eq(thread_id))
+        .filter(direction::Column::EnginePinned.eq(false))
+        .exec(&txn)
+        .await?;
+    if direction_write.rows_affected == 0 {
+        txn.rollback().await?;
+        anyhow::bail!("direction {direction_id} became manually pinned while approving its route");
+    }
+
+    txn.commit().await?;
+    ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    Ok(true)
+}
+
 /// Mark a thread's plan "confirmed" ONLY if its proposal AND status are still what the caller
 /// read at the start — i.e. no re-propose and no concurrent confirm landed in between. Unlike
 /// `update_plan_proposal_cas` (which pins expected==new status), this flips a NON-confirmed
@@ -5809,6 +5867,65 @@ mod tests {
         let plan = get_plan(&db, thread.id).await.unwrap().unwrap();
         assert_eq!(plan.proposal, "before");
         assert_eq!(plan.status, "proposed");
+        let after = get_direction(&db, direction.id).await.unwrap().unwrap();
+        assert_eq!(after.tool, "codex");
+        assert!(!after.engine_pinned);
+    }
+
+    #[tokio::test]
+    async fn reused_approval_commits_manual_pin_with_the_plan_decision() {
+        let db = mem().await;
+        let (_, _repo, thread, direction) = worker_fixture(&db).await;
+        upsert_plan(&db, thread.id, "before", "proposed", "1")
+            .await
+            .unwrap();
+
+        let applied = commit_reused_approval_with_direction_pin_cas(
+            &db,
+            thread.id,
+            "after",
+            "before",
+            "proposed",
+            direction.id,
+            "opencode",
+        )
+        .await
+        .unwrap();
+
+        assert!(applied);
+        let plan = get_plan(&db, thread.id).await.unwrap().unwrap();
+        assert_eq!(plan.proposal, "after");
+        let after = get_direction(&db, direction.id).await.unwrap().unwrap();
+        assert_eq!(after.tool, "opencode");
+        assert!(after.engine_pinned);
+    }
+
+    #[tokio::test]
+    async fn reused_approval_rolls_back_when_a_worker_session_exists() {
+        let db = mem().await;
+        let (_, repo, thread, direction) = worker_fixture(&db).await;
+        upsert_plan(&db, thread.id, "before", "proposed", "1")
+            .await
+            .unwrap();
+        create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
+            .await
+            .unwrap();
+
+        let err = commit_reused_approval_with_direction_pin_cas(
+            &db,
+            thread.id,
+            "after",
+            "before",
+            "proposed",
+            direction.id,
+            "opencode",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("opened while approving"));
+        let plan = get_plan(&db, thread.id).await.unwrap().unwrap();
+        assert_eq!(plan.proposal, "before");
         let after = get_direction(&db, direction.id).await.unwrap().unwrap();
         assert_eq!(after.tool, "codex");
         assert!(!after.engine_pinned);
