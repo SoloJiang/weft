@@ -244,7 +244,7 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
             >
               <AlertTriangle size={13} className="mt-0.5 shrink-0" />
               <span>
-                <strong className="font-semibold">{t("scope.engineRouteBlocked")}</strong>{" "}
+                <strong className="font-semibold">{t("scope.engineBlocked")}</strong>{" "}
                 {t(routeReasonKey(blockedRoute.reason))}. {t("scope.engineRouteBlockedHint")}
               </span>
             </div>
