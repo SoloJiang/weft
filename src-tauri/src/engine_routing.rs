@@ -227,12 +227,11 @@ pub fn resolve(request: &RouteRequest) -> RouteDecision {
         let Some(candidate) = candidate(&request.candidates, manual) else {
             return blocked(RouteReason::ManualToolUnavailable, request.hint);
         };
-        // An explicit user choice is never rewritten by an automatic policy,
-        // but it must still point at a command the worker can actually spawn.
-        // Stale choices block without falling through to another engine.
-        if !candidate.installed {
-            return blocked(RouteReason::ManualToolUnavailable, request.hint);
-        }
+        // An explicit user choice is never rewritten by an automatic policy.
+        // UI pickers only offer spawnable commands, but an existing/manual pin
+        // must remain authoritative if its command later disappears. The
+        // eventual spawn reports that concrete error rather than silently
+        // routing the participant to a different engine.
         return selected(
             manual,
             RoutingSource::Manual,
@@ -956,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_pin_wins_even_when_quota_is_exceeded() {
+    fn manual_pin_wins_even_when_unavailable_or_quota_is_exceeded() {
         let out = resolve(&request(
             true,
             Some(EngineId::Claude),
@@ -964,7 +963,7 @@ mod tests {
             RoutingHint::Normal,
             vec![
                 candidate(EngineId::Codex, true, Some(QuotaStatus::Ok)),
-                candidate(EngineId::Claude, true, Some(QuotaStatus::Exceeded)),
+                candidate(EngineId::Claude, false, Some(QuotaStatus::Exceeded)),
             ],
         ));
         assert_eq!(out.selected(), Some(EngineId::Claude));
@@ -1451,23 +1450,6 @@ mod tests {
         ));
         assert_eq!(out.selected(), Some(EngineId::Claude));
         assert_eq!(out.reason, RouteReason::QuotaUnknown);
-    }
-
-    #[test]
-    fn manual_non_spawnable_candidate_is_blocked_without_fallback() {
-        let out = resolve(&request(
-            true,
-            Some(EngineId::Codex),
-            EngineId::Claude,
-            RoutingHint::Normal,
-            vec![
-                candidate(EngineId::Codex, false, Some(QuotaStatus::Ok)),
-                candidate(EngineId::Claude, true, Some(QuotaStatus::Ok)),
-            ],
-        ));
-        assert!(out.blocked);
-        assert_eq!(out.selected(), None);
-        assert_eq!(out.reason, RouteReason::ManualToolUnavailable);
     }
 
     #[test]
