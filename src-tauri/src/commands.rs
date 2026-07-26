@@ -1059,6 +1059,31 @@ pub async fn verify_direction(db: State<'_, Db>, direction_id: i32) -> R<Vec<Rep
 // review skill INSIDE the worker's own conversation (frontend sends the slash
 // command), and the repo's PR harness stays the authority (§7: 别重造 review/CI).
 
+async fn create_direction_for_explicit_tool(
+    db: &Db,
+    thread_id: i32,
+    name: &str,
+    tool: &str,
+    repo_id: i32,
+    reason: &str,
+    mandate: &str,
+    base_branch: &str,
+) -> anyhow::Result<entities::direction::Model> {
+    let dir = repo::create_direction_with_engine_pin(
+        db,
+        thread_id,
+        name,
+        tool,
+        repo_id,
+        reason,
+        mandate,
+        base_branch,
+        true,
+    )
+    .await?;
+    Ok(dir)
+}
+
 #[tauri::command]
 pub async fn create_direction(
     db: State<'_, Db>,
@@ -1070,7 +1095,7 @@ pub async fn create_direction(
     mandate: Option<String>,
     base_branch: Option<String>,
 ) -> R<entities::direction::Model> {
-    let dir = repo::create_direction(
+    let dir = create_direction_for_explicit_tool(
         &db,
         thread_id,
         &name,
@@ -2680,6 +2705,34 @@ mod tests {
         sh(&p, &["git", "add", "-A"]);
         sh(&p, &["git", "commit", "-q", "-m", "init"]);
         p
+    }
+
+    #[tokio::test]
+    async fn direct_direction_creation_pins_the_explicit_tool() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, workspace.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+
+        let direction = create_direction_for_explicit_tool(
+            &db,
+            thread.id,
+            "manual task",
+            "opencode",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(direction.tool, "opencode");
+        assert!(direction.engine_pinned);
     }
 
     /// R47-2: `register_repo` must capture `base_ref_is_default` HONESTLY.

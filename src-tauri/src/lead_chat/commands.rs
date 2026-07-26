@@ -1272,8 +1272,10 @@ pub(crate) async fn chat_open_worker_impl(
     let resumed = native.is_some();
     let sess = match prior {
         Some(s) if s.native_session_id.is_some() => s,
-        _ => repo::create_session(db, direction_id, repo_id, &dir.tool, &wt.path).await?,
+        _ => repo::create_session_for_current_direction(db, direction_id, repo_id, &wt.path)
+            .await?,
     };
+    let session_tool = sess.tool.clone();
     crate::engine_routing::mirror_direction_route(db, dir.thread_id, direction_id, sess.id).await;
 
     let base = app.state::<crate::BusBase>().0.clone();
@@ -1281,14 +1283,14 @@ pub(crate) async fn chat_open_worker_impl(
         &base,
         dir.thread_id,
         &direction_id.to_string(),
-        &dir.tool,
+        &session_tool,
         &cwd,
     );
     let ask = crate::bus::inject::inject_ask_hook(
         &base,
         dir.thread_id,
         &direction_id.to_string(),
-        &dir.tool,
+        &session_tool,
         &cwd,
     );
     if let Ok(Some(th)) = repo::get_thread(db, dir.thread_id).await {
@@ -1306,7 +1308,7 @@ pub(crate) async fn chat_open_worker_impl(
         None => {
             let mut inner = engine::EngineInner {
                 thread_id: dir.thread_id,
-                tool: dir.tool.clone(),
+                tool: session_tool.clone(),
                 command: sess.command.clone(),
                 session_id: Some(sess.id),
                 cwd,
@@ -1380,13 +1382,13 @@ pub(crate) async fn chat_open_worker_impl(
         let _ = repo::set_direction_status(db, direction_id, phase).await;
     }
 
-    let command = crate::tool_command::effective(sess.command.as_deref(), &dir.tool);
+    let command = crate::tool_command::effective(sess.command.as_deref(), &session_tool);
     Ok(SessionInfo {
         session_id: sess.id,
         repo: wt.path.clone(),
         worktree: wt.path,
         branch: wt.branch,
-        tool: dir.tool,
+        tool: session_tool,
         command,
         resumed,
         native_id: native,
@@ -1672,6 +1674,27 @@ async fn insert_switch_marker(
     }
 }
 
+fn emit_engine_switched(
+    app: &AppHandle,
+    thread_id: i32,
+    session_id: Option<i32>,
+    direction_id: Option<i32>,
+    outcome: &SwitchOutcome,
+    command: Option<String>,
+) {
+    let _ = app.emit(
+        engine::EVENT,
+        engine::Push::EngineSwitched {
+            thread_id,
+            session_id,
+            direction_id,
+            tool: outcome.new_tool.clone(),
+            model: outcome.new_model.clone(),
+            command,
+        },
+    );
+}
+
 /// Stable, locale-independent code a failed switch rejects with, matched by
 /// `src/session/engineSwitch.ts` so the dialog renders translated copy from
 /// `src/i18n/{en,zh}.ts` instead of raw SQLite text. Same contract as
@@ -1862,6 +1885,7 @@ async fn switch_lead_tool_inner(
         quota_basis,
     };
     insert_switch_marker(app, db, thread_id, None, &outcome).await;
+    emit_engine_switched(app, thread_id, None, None, &outcome, None);
     Ok(outcome)
 }
 
@@ -1997,6 +2021,14 @@ async fn switch_worker_tool_inner(
         quota_basis,
     };
     insert_switch_marker(app, db, dir.thread_id, Some(session_id), &outcome).await;
+    emit_engine_switched(
+        app,
+        dir.thread_id,
+        Some(session_id),
+        Some(sess.direction_id),
+        &outcome,
+        Some(crate::tool_command::effective(None, &outcome.new_tool)),
+    );
     Ok(outcome)
 }
 

@@ -1607,11 +1607,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // see EngineSwitchDialog's doc for the three-layer semantics). The backend
   // already made the switch honest in its own record (a durable engine_switch
   // timeline marker, delivered like any other Push::Message); this action's
-  // job is patching the TWO bits of local state the event stream doesn't
-  // reach: `threads` (leadTool/leadModel — read by LeadTab/ChatComposer's
-  // badge) and `leadMeta` (the OLD tool's model/MCP/skills readings, which
-  // would otherwise linger under the NEW tool's badge until the next
-  // turn-triggered probe happens to overwrite them).
+  // job is eagerly patching the local state used by LeadTab/ChatComposer.
+  // `engine_switched` repeats the same patch for automatic quota failover,
+  // whose switch has no frontend invocation to update these caches.
   const switchLeadTool = useCallback(async (threadId: number, tool: string, model: string | null) => {
     const outcome = await api.switchLeadTool(threadId, tool, model, currentLang());
     setThreads((cur) =>
@@ -1632,8 +1630,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // `directionId` is the caller's (WorkerConversation already has it in scope)
   // — the backend also updates `direction.tool` (so a later reopen doesn't
   // revert the switch, see switch_worker_tool's doc), and the board reads
-  // that through `directionsByThread`, so it is patched the same way
-  // `renameDirection` patches a name change.
+  // that through `directionsByThread`, so it is patched eagerly here. The
+  // matching `engine_switched` event covers automatic quota failover and also
+  // refreshes any cached SessionInfo command.
   const switchWorkerTool = useCallback(
     async (threadId: number, directionId: number, sessionId: number, tool: string, model: string | null) => {
       const outcome = await api.switchWorkerTool(sessionId, tool, model);
@@ -1733,6 +1732,53 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               if (pr.status !== "proposed") setReviewingProposal(false);
             })
             .catch(() => {});
+        }
+      } else if (p.type === "engine_switched") {
+        if (p.session_id == null) {
+          setThreads((cur) =>
+            cur.map((thread) =>
+              thread.id === p.thread_id
+                ? { ...thread, lead_tool: p.tool, lead_model: p.model }
+                : thread,
+            ),
+          );
+          setLeadMeta((meta) => {
+            if (!(p.thread_id in meta)) return meta;
+            const next = { ...meta };
+            delete next[p.thread_id];
+            return next;
+          });
+        } else {
+          const sessionId = p.session_id;
+          if (p.direction_id != null) {
+            setDirections((directions) => ({
+              ...directions,
+              [p.thread_id]: (directions[p.thread_id] ?? []).map((direction) =>
+                direction.id === p.direction_id ? { ...direction, tool: p.tool } : direction,
+              ),
+            }));
+          }
+          setSessions((sessions) => {
+            const current = sessions[sessionId];
+            if (!current) return sessions;
+            return {
+              ...sessions,
+              [sessionId]: {
+                ...current,
+                info: {
+                  ...current.info,
+                  tool: p.tool,
+                  command: p.command ?? current.info.command,
+                },
+              },
+            };
+          });
+          setWorkerMeta((meta) => {
+            if (!(sessionId in meta)) return meta;
+            const next = { ...meta };
+            delete next[sessionId];
+            return next;
+          });
         }
       } else if (p.type === "finalize") {
         setLeadMessages((m) => ({

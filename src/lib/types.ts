@@ -384,6 +384,17 @@ export type LeadChatPush =
       queue: QueuedItem[];
     }
   | {
+      /** Durable tool identity changed; emitted for manual switches and quota failover. */
+      type: "engine_switched";
+      thread_id: number;
+      session_id: number | null;
+      direction_id: number | null;
+      tool: string;
+      model: string | null;
+      /** Present for workers, whose SessionInfo exposes the effective resume command. */
+      command: string | null;
+    }
+  | {
       type: "init";
       thread_id: number;
       session_id: number | null;

@@ -1422,12 +1422,10 @@ pub async fn approve_direction_with_pin(
         if let Some(route) = reuse_route.as_ref() {
             if matches!(route.source, crate::engine_routing::RoutingSource::Manual) {
                 if let Some(selected_tool) = route.selected() {
-                    if let Err(err) = repo::refresh_unpinned_direction_route_with_pin(
+                    if let Err(err) = repo::pin_unstarted_unpinned_direction_route(
                         db,
                         id,
-                        None,
                         selected_tool.as_str(),
-                        true,
                     )
                     .await
                     {

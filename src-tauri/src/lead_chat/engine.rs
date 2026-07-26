@@ -127,6 +127,17 @@ pub enum Push {
         recovered: bool,
         queue: Vec<QueuedItem>,
     },
+    /// Authoritative engine identity after either a human switch or an
+    /// automatic quota failover. Timeline markers explain the change, while
+    /// this event keeps cached thread/direction/session badges in sync.
+    EngineSwitched {
+        thread_id: i32,
+        session_id: Option<i32>,
+        direction_id: Option<i32>,
+        tool: String,
+        model: Option<String>,
+        command: Option<String>,
+    },
     Init {
         thread_id: i32,
         session_id: Option<i32>,
@@ -8921,6 +8932,26 @@ mod tests {
         })
         .unwrap();
         assert!(ordinary.get("seq").is_none());
+    }
+
+    #[test]
+    fn engine_switched_push_carries_authoritative_route_identity() {
+        let push = serde_json::to_value(Push::EngineSwitched {
+            thread_id: 7,
+            session_id: Some(9),
+            direction_id: Some(11),
+            tool: "claude".to_string(),
+            model: None,
+            command: Some("cc-claude".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(push["type"], "engine_switched");
+        assert_eq!(push["thread_id"], 7);
+        assert_eq!(push["session_id"], 9);
+        assert_eq!(push["direction_id"], 11);
+        assert_eq!(push["tool"], "claude");
+        assert_eq!(push["command"], "cc-claude");
     }
 
     #[test]
