@@ -602,6 +602,9 @@ pub async fn create_thread(
         slug: Set(unique_slug(title, &existing)),
         kind: Set(kind.to_string()),
         lead_tool: Set(lead_tool.to_string()),
+        // The configured/default tool is only a fallback. A user pin is set
+        // by the explicit switch/approval path, never by construction.
+        engine_pinned: Set(false),
         created_at: Set(now()),
         ..Default::default()
     };
@@ -641,6 +644,15 @@ pub async fn get_thread(db: &Db, thread_id: i32) -> Result<Option<thread::Model>
 pub async fn set_thread_tool(db: &Db, thread_id: i32, tool: &str) -> Result<()> {
     thread::Entity::update_many()
         .col_expr(thread::Column::LeadTool, Expr::value(tool.to_string()))
+        .filter(thread::Column::Id.eq(thread_id))
+        .exec(&db.0)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_thread_engine_pinned(db: &Db, thread_id: i32, pinned: bool) -> Result<()> {
+    thread::Entity::update_many()
+        .col_expr(thread::Column::EnginePinned, Expr::value(pinned))
         .filter(thread::Column::Id.eq(thread_id))
         .exec(&db.0)
         .await?;
@@ -727,6 +739,19 @@ pub async fn switch_lead_engine_txn(
     tool: &str,
     model: Option<&str>,
 ) -> Result<()> {
+    switch_lead_engine_txn_with_pin(db, thread_id, tool, model, true).await
+}
+
+/// `pinned` is false only for the structured automatic quota failover path.
+/// Keep it in the same transaction as the tool identity so an interrupted
+/// write cannot later reinterpret the route as a user choice.
+pub async fn switch_lead_engine_txn_with_pin(
+    db: &Db,
+    thread_id: i32,
+    tool: &str,
+    model: Option<&str>,
+    pinned: bool,
+) -> Result<()> {
     fail_write!("switch_lead_engine_txn");
     use sea_orm::TransactionTrait;
     let txn = db.0.begin().await?;
@@ -747,6 +772,7 @@ pub async fn switch_lead_engine_txn(
         .col_expr(thread::Column::LeadTool, Expr::value(tool))
         .col_expr(thread::Column::LeadCommand, Expr::value(Option::<String>::None))
         .col_expr(thread::Column::LeadModel, Expr::value(model.map(str::to_string)))
+        .col_expr(thread::Column::EnginePinned, Expr::value(pinned))
         .filter(thread::Column::Id.eq(thread_id))
         .exec(&txn)
         .await?;
@@ -1288,6 +1314,7 @@ pub async fn create_direction(
         status: Set("queued".to_string()),
         repo_id: Set(repo_id),
         reason: Set(reason.to_string()),
+        engine_pinned: Set(false),
         mandate: Set(normalize_mandate(mandate).to_string()),
         base_branch: Set(base_branch.trim().to_string()),
         target_branch: Set(base_branch.trim().to_string()),
@@ -1320,6 +1347,19 @@ pub async fn get_direction(db: &Db, direction_id: i32) -> Result<Option<directio
     Ok(direction::Entity::find_by_id(direction_id)
         .one(&db.0)
         .await?)
+}
+
+pub async fn set_direction_engine_pinned(
+    db: &Db,
+    direction_id: i32,
+    pinned: bool,
+) -> Result<()> {
+    direction::Entity::update_many()
+        .col_expr(direction::Column::EnginePinned, Expr::value(pinned))
+        .filter(direction::Column::Id.eq(direction_id))
+        .exec(&db.0)
+        .await?;
+    Ok(())
 }
 
 /// Set a direction's lifecycle status (agent- or human-driven). No-op if gone.
@@ -1380,12 +1420,26 @@ pub async fn switch_worker_engine_txn(
     tool: &str,
     model: Option<&str>,
 ) -> Result<()> {
+    switch_worker_engine_txn_with_pin(db, direction_id, session_id, tool, model, true).await
+}
+
+/// See [`switch_lead_engine_txn_with_pin`]. The direction and its live session
+/// carry the same provenance, so both are updated atomically.
+pub async fn switch_worker_engine_txn_with_pin(
+    db: &Db,
+    direction_id: i32,
+    session_id: i32,
+    tool: &str,
+    model: Option<&str>,
+    pinned: bool,
+) -> Result<()> {
     use sea_orm::TransactionTrait;
     let txn = db.0.begin().await?;
     // Write first — see `switch_lead_engine_txn` for why a deferred
     // read→write upgrade is not safe under WAL.
     let touched = direction::Entity::update_many()
         .col_expr(direction::Column::Tool, Expr::value(tool))
+        .col_expr(direction::Column::EnginePinned, Expr::value(pinned))
         .filter(direction::Column::Id.eq(direction_id))
         .exec(&txn)
         .await?;
@@ -1402,6 +1456,7 @@ pub async fn switch_worker_engine_txn(
     if let Some(s) = session::Entity::find_by_id(session_id).one(&txn).await? {
         let mut sa: session::ActiveModel = s.into();
         sa.tool = Set(tool.to_string());
+        sa.engine_pinned = Set(pinned);
         sa.command = Set(None);
         sa.model = Set(model.map(str::to_string));
         // The native-id clear rides the SAME row update (issue #96 pitfall 1).
@@ -1876,6 +1931,7 @@ pub async fn create_session(
         direction_id: Set(direction_id),
         repo_id: Set(repo_id),
         tool: Set(tool.to_string()),
+        engine_pinned: Set(direction.engine_pinned),
         cwd: Set(cwd.to_string()),
         native_session_id: Set(None),
         status: Set("starting".to_string()),
@@ -3769,11 +3825,17 @@ mod tests {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
         let a = ensure_curator_thread(&db, ws.id, "codex").await.unwrap();
+        assert!(
+            !get_thread(&db, a).await.unwrap().unwrap().engine_pinned,
+            "a configured/default curator engine is not a manual pin"
+        );
+        set_thread_engine_pinned(&db, a, true).await.unwrap();
         let b = ensure_curator_thread(&db, ws.id, "codex").await.unwrap();
         assert_eq!(a, b, "the same curator thread is reused");
         let t = get_thread(&db, a).await.unwrap().unwrap();
         assert_eq!(t.kind, "curator");
         assert_eq!(t.lead_tool, "codex", "uses the provided default tool, not hard-coded claude");
+        assert!(t.engine_pinned, "reusing a curator must preserve a user pin");
         // a normal issue coexists; the board view filters curator out.
         create_thread(&db, ws.id, "Real issue", "feature", "claude")
             .await
@@ -5133,6 +5195,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t.lead_tool, "codex");
+        assert!(!t.engine_pinned, "the configured default is not a manual pin");
     }
 
     #[tokio::test]
@@ -5361,6 +5424,56 @@ mod tests {
         // A missing session is tolerated (not an error) on the session half —
         // see the function doc — as long as the direction is real.
         assert!(switch_worker_engine_txn(&db, d.id, 9999, "codex", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn engine_pin_tracks_manual_choices_but_not_automatic_failover() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "Issue", "feature", "claude")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "main",
+            "claude",
+            repo.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = create_session(&db, direction.id, repo.id, "claude", "/tmp/cwd")
+            .await
+            .unwrap();
+        assert!(!thread.engine_pinned);
+        assert!(!direction.engine_pinned);
+        assert!(!session.engine_pinned);
+
+        switch_lead_engine_txn_with_pin(&db, thread.id, "codex", None, false)
+            .await
+            .unwrap();
+        switch_worker_engine_txn_with_pin(&db, direction.id, session.id, "codex", None, false)
+            .await
+            .unwrap();
+        assert!(!get_thread(&db, thread.id).await.unwrap().unwrap().engine_pinned);
+        assert!(!get_direction(&db, direction.id).await.unwrap().unwrap().engine_pinned);
+        assert!(!get_session(&db, session.id).await.unwrap().unwrap().engine_pinned);
+
+        switch_lead_engine_txn(&db, thread.id, "claude", None)
+            .await
+            .unwrap();
+        switch_worker_engine_txn(&db, direction.id, session.id, "claude", None)
+            .await
+            .unwrap();
+        assert!(get_thread(&db, thread.id).await.unwrap().unwrap().engine_pinned);
+        assert!(get_direction(&db, direction.id).await.unwrap().unwrap().engine_pinned);
+        assert!(get_session(&db, session.id).await.unwrap().unwrap().engine_pinned);
     }
 
     /// Two `Db` handles onto one WAL file, so a concurrent commit is a real
@@ -5683,6 +5796,7 @@ mod tests {
             .unwrap();
         assert_eq!(d.base_branch, "develop");
         assert_eq!(d.target_branch, "develop", "target defaults to the chosen base");
+        assert!(!d.engine_pinned);
 
         // Empty base → both empty (each resolves to the repo default later).
         let d2 = create_direction(&db, t.id, "y", "claude", r.id, "r", "plan+impl", "")
@@ -5690,6 +5804,7 @@ mod tests {
             .unwrap();
         assert_eq!(d2.base_branch, "");
         assert_eq!(d2.target_branch, "", "empty base leaves target empty (= repo default)");
+        assert!(!d2.engine_pinned);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -1010,9 +1010,9 @@ function EngineSwitchMarker({ content }: { content: Record<string, unknown> }) {
   const isQuotaFailover = content.reason === "quota_exceeded";
   const quotaBasis = typeof content.quota_basis === "string" ? content.quota_basis : "";
   return (
-    <div className="flex items-center gap-3 px-2 py-1.5">
-      <span className="h-px flex-1 bg-border" />
-      <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-ink-faint">
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px] text-ink-faint">
         {!sameTool && oldTool && (
           <>
             <ToolIcon tool={oldTool} size={12} />
@@ -1037,7 +1037,7 @@ function EngineSwitchMarker({ content }: { content: Record<string, unknown> }) {
           </span>
         )}
       </span>
-      <span className="h-px flex-1 bg-border" />
+      <span className="h-px min-w-4 flex-1 bg-border" />
     </div>
   );
 }
@@ -1047,6 +1047,7 @@ function quotaStatusLabel(t: (key: string) => string, status: string): string {
     ok: "settings.resourcesEngineQuotaOk",
     warning: "settings.resourcesEngineQuotaWarning",
     exceeded: "settings.resourcesEngineQuotaExceeded",
+    structured_exceeded: "settings.resourcesEngineQuotaExceeded",
   };
   const key = keys[status];
   return key ? t(key) : status;
@@ -1069,9 +1070,9 @@ function EngineRouteMarker({ content }: { content: Record<string, unknown> }) {
   const labelKey = labelKeys[source] ?? "session.engineRouteMarker";
   const label = source === "legacy" ? t("scope.engineLegacy", { tool: toolFullName(tool) }) : t(labelKey, { tool: toolFullName(tool) });
   return (
-    <div className="flex items-center gap-3 px-2 py-1.5">
-      <span className="h-px flex-1 bg-border" />
-      <span className="flex min-w-0 shrink-0 items-center gap-1.5 text-[11px] text-ink-faint">
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px] text-ink-faint">
         <ToolIcon tool={tool} size={12} />
         <span>{label}</span>
         <span className="truncate" title={t(routeReasonKey(reason))}>
@@ -1083,7 +1084,7 @@ function EngineRouteMarker({ content }: { content: Record<string, unknown> }) {
           </span>
         )}
       </span>
-      <span className="h-px flex-1 bg-border" />
+      <span className="h-px min-w-4 flex-1 bg-border" />
     </div>
   );
 }
@@ -1098,9 +1099,9 @@ function EngineRouteBlockedMarker({ content }: { content: Record<string, unknown
   const reason = typeof content.reason === "string" ? content.reason : "automatic_candidate_unavailable";
   const quotaStatus = typeof content.quota_status === "string" ? content.quota_status : "";
   return (
-    <div className="flex items-center gap-3 px-2 py-1.5">
-      <span className="h-px flex-1 bg-border" />
-      <span className="flex min-w-0 shrink-0 items-center gap-1.5 text-[11px] text-danger">
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px] text-danger">
         {tool && <ToolIcon tool={tool} size={12} />}
         {tool && fallback && <ArrowRight size={10} />}
         {fallback && <ToolIcon tool={fallback} size={12} />}
@@ -1123,7 +1124,7 @@ function EngineRouteBlockedMarker({ content }: { content: Record<string, unknown
         )}
         <span className="truncate">· {t("session.engineRouteBlockedHint")}</span>
       </span>
-      <span className="h-px flex-1 bg-border" />
+      <span className="h-px min-w-4 flex-1 bg-border" />
     </div>
   );
 }
@@ -1137,9 +1138,9 @@ function QuotaFailoverFailedMarker({ content }: { content: Record<string, unknow
   const fallback = typeof content.fallback === "string" ? content.fallback : "";
   const quotaBasis = typeof content.quota_basis === "string" ? content.quota_basis : "";
   return (
-    <div className="flex items-center gap-3 px-2 py-1.5">
-      <span className="h-px flex-1 bg-border" />
-      <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-danger">
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px] text-danger">
         <ToolIcon tool={tool} size={12} />
         <ArrowRight size={10} />
         <ToolIcon tool={fallback} size={12} />
@@ -1155,7 +1156,7 @@ function QuotaFailoverFailedMarker({ content }: { content: Record<string, unknow
           </span>
         )}
       </span>
-      <span className="h-px flex-1 bg-border" />
+      <span className="h-px min-w-4 flex-1 bg-border" />
     </div>
   );
 }

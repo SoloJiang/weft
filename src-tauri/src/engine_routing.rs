@@ -335,6 +335,7 @@ pub fn resolve(request: &RouteRequest) -> RouteDecision {
 pub enum FailoverSkipReason {
     Disabled,
     ManualPin,
+    NotStructuredExceeded,
     NotExceeded,
     NoFallback,
     CooldownActive,
@@ -363,6 +364,7 @@ pub fn resolve_failover(
     current: EngineId,
     enabled: bool,
     manual_pin: bool,
+    structured_exceeded: bool,
     current_quota: Option<QuotaStatus>,
     fallback: Option<&RouteCandidate>,
     cooldown_ok: bool,
@@ -372,6 +374,9 @@ pub fn resolve_failover(
     }
     if manual_pin {
         return FailoverDecision::Skip(FailoverSkipReason::ManualPin);
+    }
+    if !structured_exceeded {
+        return FailoverDecision::Skip(FailoverSkipReason::NotStructuredExceeded);
     }
     if current_quota != Some(QuotaStatus::Exceeded) {
         return FailoverDecision::Skip(FailoverSkipReason::NotExceeded);
@@ -471,6 +476,7 @@ pub async fn quota_failover_for_db(
     db: &Db,
     current: &str,
     manual_pin: bool,
+    structured_exceeded: bool,
     cooldown_ok: bool,
 ) -> FailoverDecision {
     let enabled = is_enabled(
@@ -495,6 +501,7 @@ pub async fn quota_failover_for_db(
         current,
         enabled,
         manual_pin,
+        structured_exceeded,
         current_quota,
         fallback,
         cooldown_ok,
@@ -733,48 +740,38 @@ pub async fn mirror_direction_route(db: &Db, thread_id: i32, direction_id: i32, 
     .await;
 }
 
-/// Manual pin detection is intentionally based on durable user/manual markers,
-/// not on the current tool string (an automatic route also writes that string).
-/// This keeps quota fail-over from overwriting an explicit switch or approval.
+/// Manual pin detection is persisted alongside the engine identity. Timeline
+/// rows are an audit trail, not a source of truth: history can be pruned and a
+/// legacy row has no marker from which to infer whether a human chose it.
 pub async fn has_manual_pin(
     db: &Db,
     thread_id: i32,
     session_id: Option<i32>,
     direction_id: Option<i32>,
 ) -> bool {
-    let messages = repo::list_lead_messages(db, thread_id)
-        .await
-        .unwrap_or_default();
-    messages.into_iter().rev().any(|message| {
-        if message.session_id != session_id && message.session_id.is_some() {
-            return false;
-        }
-        if message.kind == "engine_switch" && message.session_id == session_id {
-            return serde_json::from_str::<serde_json::Value>(&message.content)
+    match session_id {
+        Some(session_id) => {
+            let session_pinned = repo::get_session(db, session_id)
+                .await
                 .ok()
-                .and_then(|value| value.get("reason").cloned())
-                .is_some_and(|reason| reason.is_null());
+                .flatten()
+                .is_some_and(|session| session.engine_pinned);
+            let direction_pinned = match direction_id {
+                Some(direction_id) => repo::get_direction(db, direction_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|direction| direction.engine_pinned),
+                None => false,
+            };
+            session_pinned || direction_pinned
         }
-        if message.kind != "engine_route" {
-            return false;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
-            return false;
-        };
-        if value.get("source").and_then(|source| source.as_str()) != Some("manual") {
-            return false;
-        }
-        if message.session_id == session_id {
-            return true;
-        }
-        let Some(direction_id) = direction_id else {
-            return false;
-        };
-        value
-            .get("direction_id")
-            .and_then(|id| id.as_i64())
-            .is_some_and(|id| id == i64::from(direction_id))
-    })
+        None => repo::get_thread(db, thread_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|thread| thread.engine_pinned),
+    }
 }
 
 #[cfg(test)]
@@ -942,6 +939,7 @@ mod tests {
                 EngineId::Codex,
                 false,
                 false,
+                true,
                 Some(QuotaStatus::Exceeded),
                 Some(&fallback),
                 true,
@@ -951,6 +949,7 @@ mod tests {
         assert_eq!(
             resolve_failover(
                 EngineId::Codex,
+                true,
                 true,
                 true,
                 Some(QuotaStatus::Exceeded),
@@ -969,11 +968,29 @@ mod tests {
                 EngineId::Codex,
                 true,
                 false,
+                true,
                 Some(QuotaStatus::Exceeded),
                 Some(&fallback),
                 true,
             ),
             FailoverDecision::Blocked(FailoverBlockedReason::BothAutomaticCandidatesExceeded)
+        );
+    }
+
+    #[test]
+    fn quota_failover_requires_a_structured_exceeded_signal() {
+        let fallback = candidate(EngineId::Claude, true, Some(QuotaStatus::Ok));
+        assert_eq!(
+            resolve_failover(
+                EngineId::Codex,
+                true,
+                false,
+                false,
+                Some(QuotaStatus::Exceeded),
+                Some(&fallback),
+                true,
+            ),
+            FailoverDecision::Skip(FailoverSkipReason::NotStructuredExceeded)
         );
     }
 }

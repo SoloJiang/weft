@@ -1768,7 +1768,8 @@ async fn switch_lead_tool_inner(
     // clear are the two halves of `revive::has_resumable_context`, and
     // committing them together is what makes the defect this PR fixes
     // structurally impossible rather than merely guarded.
-    repo::switch_lead_engine_txn(db, thread_id, &tool, model.as_deref())
+    let pinned = reason.is_none();
+    repo::switch_lead_engine_txn_with_pin(db, thread_id, &tool, model.as_deref(), pinned)
         .await
         .map_err(|e| switch_failure(&format!("thread {thread_id}"), interrupted, e))?;
 
@@ -1868,7 +1869,15 @@ async fn switch_worker_tool_inner(
     // both halves of the tool write itself (`direction.tool` for the
     // cold-recreate path, `session.tool`/`model` for the live one), which is
     // why the marker and the native-id clear simply joined it.
-    repo::switch_worker_engine_txn(db, sess.direction_id, session_id, &tool, model.as_deref())
+    let pinned = reason.is_none();
+    repo::switch_worker_engine_txn_with_pin(
+        db,
+        sess.direction_id,
+        session_id,
+        &tool,
+        model.as_deref(),
+        pinned,
+    )
         .await
         .map_err(|e| switch_failure(&format!("session {session_id}"), interrupted, e))?;
 
@@ -1965,9 +1974,14 @@ pub fn spawn_quota_failover_check(
     thread_id: i32,
     session_id: Option<i32>,
     tool: String,
+    structured_exceeded: bool,
 ) {
+    if !structured_exceeded {
+        return;
+    }
     tauri::async_runtime::spawn(async move {
-        maybe_failover_on_quota(&app, &db, thread_id, session_id, &tool).await;
+        maybe_failover_on_quota(&app, &db, thread_id, session_id, &tool, structured_exceeded)
+            .await;
     });
 }
 
@@ -1987,6 +2001,7 @@ async fn maybe_failover_on_quota(
     thread_id: i32,
     session_id: Option<i32>,
     tool: &str,
+    structured_exceeded: bool,
 ) {
     let key: QuotaFailoverKey = (thread_id, session_id);
     let cooldown_ok = !quota_failover_cooldown_active(key);
@@ -2010,6 +2025,7 @@ async fn maybe_failover_on_quota(
         db,
         tool,
         manual_pin,
+        structured_exceeded,
         cooldown_ok,
     )
     .await;

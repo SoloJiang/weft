@@ -55,6 +55,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0041LeadMessageThreadKindIdx),
             Box::new(M0042ThreadLeadModel),
             Box::new(M0043SessionModel),
+            Box::new(M0044EngineRoutingPin),
         ]
     }
 }
@@ -1931,6 +1932,74 @@ impl MigrationTrait for M0043SessionModel {
                     .to_owned(),
             )
             .await
+    }
+}
+
+/// Records whether a tool identity came from a user choice rather than the
+/// global/default routing policy. Existing rows intentionally migrate as
+/// pinned: an upgrade must never redirect a currently known task.
+pub struct M0044EngineRoutingPin;
+impl MigrationName for M0044EngineRoutingPin {
+    fn name(&self) -> &str {
+        "m0044_engine_routing_pin"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0044EngineRoutingPin {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for (table, column) in [
+            ("thread", "engine_pinned"),
+            ("direction", "engine_pinned"),
+            ("session", "engine_pinned"),
+        ] {
+            let result = manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new(table))
+                        .add_column(
+                            ColumnDef::new(Alias::new(column))
+                                .boolean()
+                                .not_null()
+                                .default(true),
+                        )
+                        .to_owned(),
+                )
+                .await;
+            match result {
+                Ok(()) => {}
+                Err(err) if err.to_string().to_lowercase().contains("duplicate column") => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        // The curator is a Weft-owned repository assistant, not a historical
+        // user choice. Keep it on the shared global policy after upgrading.
+        use sea_orm::{ConnectionTrait, Statement};
+        let db = manager.get_connection();
+        db.execute(Statement::from_string(
+            db.get_database_backend(),
+            "UPDATE thread SET engine_pinned = 0 WHERE kind = 'curator'".to_string(),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for (table, column) in [
+            ("session", "engine_pinned"),
+            ("direction", "engine_pinned"),
+            ("thread", "engine_pinned"),
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new(table))
+                        .drop_column(Alias::new(column))
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
     }
 }
 

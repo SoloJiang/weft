@@ -959,6 +959,17 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                 return Err(err);
             }
         };
+        if let Err(err) = repo::set_direction_engine_pinned(
+            db,
+            dir.id,
+            matches!(route.source, crate::engine_routing::RoutingSource::Manual),
+        )
+        .await
+        {
+            let _ = repo::delete_direction(db, dir.id).await;
+            rollback_attempt(db, &created_now, &recreated_reused).await;
+            return Err(err);
+        }
         if let Err(err) = materialize::materialize_direction(db, dir.id).await {
             // The failing lane has no worktree yet; drop its row, then roll back
             // the earlier (materialized) lanes and undo any reused-lane recreations so a
@@ -1096,6 +1107,7 @@ pub async fn approve_direction_with_pin(
     // CAS → materialize, so the existing CAS-then-materialize-then-revert ordering is race-free.
     let gate = thread_gate(thread_id);
     let _gate = gate.lock().await;
+    let manual_tool = manual_tool.filter(|tool| !tool.trim().is_empty());
     if let Some(tool) = manual_tool {
         if !crate::detect::TOOL_PRIORITY.contains(&tool) {
             anyhow::bail!(
@@ -1321,6 +1333,16 @@ pub async fn approve_direction_with_pin(
         &resolved.base_branch,
     )
     .await?;
+    if let Err(err) = repo::set_direction_engine_pinned(
+        db,
+        dir.id,
+        matches!(route.source, crate::engine_routing::RoutingSource::Manual),
+    )
+    .await
+    {
+        let _ = repo::delete_direction(db, dir.id).await;
+        return Err(err);
+    }
     if let Err(err) = materialize::materialize_direction(db, dir.id).await {
         // Roll back the just-created row so a corrected retry starts clean and
         // doesn't hit the idempotent fast-path with a worktree-less task.
@@ -3994,6 +4016,7 @@ mod tests {
             tool: "codex".to_string(),
             repo_id: 1,
             reason: "r".to_string(),
+            engine_pinned: false,
             status: "queued".to_string(),
             mandate: "plan+impl".to_string(),
             base_branch: "HEAD".to_string(),
@@ -4035,6 +4058,7 @@ mod tests {
             tool: "codex".to_string(),
             repo_id: 1,
             reason: "r".to_string(),
+            engine_pinned: false,
             status: "queued".to_string(),
             mandate: "plan+impl".to_string(),
             base_branch: base.to_string(),
@@ -4096,6 +4120,7 @@ mod tests {
             tool: "codex".to_string(),
             repo_id: 1,
             reason: "r".to_string(),
+            engine_pinned: false,
             status: "queued".to_string(),
             mandate: "plan+impl".to_string(),
             base_branch: base.to_string(),

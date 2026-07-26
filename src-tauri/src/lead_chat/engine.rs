@@ -213,6 +213,10 @@ pub struct Outgoing {
 #[derive(Default)]
 pub struct TurnState {
     pub busy: bool,
+    /// Set only by a structured provider signal observed while this exact turn
+    /// is active. A generic error plus an old account snapshot is never enough
+    /// to move work to another provider.
+    pub quota_exceeded: bool,
     pub queue: VecDeque<Outgoing>,
     /// A bus wake landed while this engine was busy. Rather than queue one "read
     /// your inbox" turn per wake, we remember the wake's FIFO position — the
@@ -232,6 +236,7 @@ impl TurnState {
             return false;
         }
         self.busy = true;
+        self.quota_exceeded = false;
         true
     }
 
@@ -248,6 +253,7 @@ impl TurnState {
             false
         } else {
             self.busy = true;
+            self.quota_exceeded = false;
             true
         }
     }
@@ -257,7 +263,7 @@ impl TurnState {
     /// reached, synthesize one invisible inbox-read turn; then the rest; finally
     /// go idle.
     pub fn on_turn_end(&mut self) -> Option<Outgoing> {
-        match self.bus_read_pos {
+        let next = match self.bus_read_pos {
             // The wake sits at the front: read the inbox now (stays busy).
             Some(0) => {
                 self.bus_read_pos = None;
@@ -285,7 +291,9 @@ impl TurnState {
                     None
                 }
             },
-        }
+        };
+        self.quota_exceeded = false;
+        next
     }
 
     /// 删除某条仍排队的消息；true=删掉了。
@@ -362,6 +370,17 @@ impl TurnState {
         self.queue = next;
         true
     }
+}
+
+/// L3 failover is permitted only at an idle failed-turn boundary. When a queued
+/// user message or coalesced inbox read already owns the next turn, leave this
+/// engine alone rather than race a healthy follow-up turn with a switch.
+fn should_attempt_quota_failover(
+    status: &str,
+    structured_exceeded: bool,
+    still_busy: bool,
+) -> bool {
+    status == "error" && structured_exceeded && !still_busy
 }
 
 /// Per-turn dialects (codex `exec --json`, opencode `run --format json`) spawn
@@ -3065,6 +3084,12 @@ async fn codex_consumer(
         Arc::new(crossbeam_skiplist::SkipMap::new());
     while let Some(msg) = rx.recv().await {
         match msg {
+            ThreadMsg::QuotaExceeded => {
+                let mut inner = eng.lock().await;
+                if inner.turn.busy {
+                    inner.turn.quota_exceeded = true;
+                }
+            }
             ThreadMsg::Event(ChatEvent::TextDelta { text, item, agent_thread }) => {
                 let mut inner = eng.lock().await;
                 note_turn_activity(&app, &db, &eng, &mut inner);
@@ -3312,6 +3337,7 @@ async fn codex_consumer(
                 let mut inner = eng.lock().await;
                 let thread_id = inner.thread_id;
                 let session_id = inner.session_id;
+                let structured_exceeded = inner.turn.quota_exceeded;
                 if let Some(ct) = context_tokens {
                     inner.last_context_tokens = Some(ct);
                     let _ = app.emit(
@@ -3417,13 +3443,14 @@ async fn codex_consumer(
                 // candidate for an auto fail-over — decoupled (own task, see
                 // `spawn_quota_failover_check`) so it can safely re-lock `eng`
                 // without deadlocking THIS task.
-                if status == "error" {
+                if should_attempt_quota_failover(status, structured_exceeded, still_busy) {
                     crate::lead_chat::commands::spawn_quota_failover_check(
                         app.clone(),
                         db.clone(),
                         thread_id,
                         session_id,
                         tool_for_quota_check,
+                        structured_exceeded,
                     );
                 }
                 // This turn is over: drop its active-turn id so a subsequent
@@ -6222,6 +6249,11 @@ fn spawn_reader(
             if let Some(snapshot) = crate::adapters::adapter_for(&inner.tool)
                 .and_then(|a| a.quota_signal(&line))
             {
+                if inner.turn.busy
+                    && snapshot.status == crate::engine_quota::QuotaStatus::Exceeded
+                {
+                    inner.turn.quota_exceeded = true;
+                }
                 crate::engine_quota::report(snapshot);
             }
             let event = crate::adapters::adapter_for(&inner.tool)
@@ -6458,6 +6490,7 @@ fn spawn_reader(
                     is_error,
                     context_tokens,
                 } => {
+                    let structured_exceeded = inner.turn.quota_exceeded;
                     if let Some(ct) = context_tokens {
                         inner.last_context_tokens = Some(ct);
                         let _ = app.emit(
@@ -6634,13 +6667,14 @@ fn spawn_reader(
                     // `codex_consumer`'s TurnEnd arm — decoupled (own task) so
                     // it can safely re-lock `eng` without deadlocking THIS task,
                     // which is still holding `inner` right here.
-                    if status == "error" {
+                    if should_attempt_quota_failover(status, structured_exceeded, still_busy) {
                         crate::lead_chat::commands::spawn_quota_failover_check(
                             app.clone(),
                             db.clone(),
                             thread_id,
                             inner.session_id,
                             inner.tool.clone(),
+                            structured_exceeded,
                         );
                     }
                 }
@@ -7177,6 +7211,26 @@ mod tests {
         assert!(t.busy); // popped → still busy
         assert!(t.on_turn_end().is_none()); // empty queue → idle
         assert!(!t.busy);
+    }
+
+    #[test]
+    fn quota_evidence_is_scoped_to_one_turn() {
+        let mut turn = TurnState::default();
+        assert!(turn.try_begin_send());
+        turn.quota_exceeded = true;
+        assert!(turn.on_turn_end().is_none());
+        assert!(!turn.quota_exceeded);
+
+        assert!(turn.try_begin_send());
+        assert!(!turn.quota_exceeded);
+    }
+
+    #[test]
+    fn quota_failover_requires_an_idle_failed_turn_boundary() {
+        assert!(should_attempt_quota_failover("error", true, false));
+        assert!(!should_attempt_quota_failover("error", true, true));
+        assert!(!should_attempt_quota_failover("complete", true, false));
+        assert!(!should_attempt_quota_failover("error", false, false));
     }
 
     #[test]

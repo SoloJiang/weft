@@ -365,6 +365,27 @@ pub fn turn_error_text(params: &Value) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
+/// True only for a machine-readable quota cause attached to this completed
+/// turn. Do not inspect the display message: generic transport, auth, or tool
+/// errors may contain similar words but must never trigger a provider switch.
+pub fn turn_reports_quota_exceeded(params: &Value) -> bool {
+    let error = &params["turn"]["error"];
+    let mut codes = [
+        error["code"].as_str(),
+        error["type"].as_str(),
+        error["kind"].as_str(),
+        error["details"]["code"].as_str(),
+    ]
+    .into_iter()
+    .flatten();
+    codes.any(|code| {
+        matches!(
+            code.trim().to_ascii_lowercase().as_str(),
+            "rate_limit_exceeded" | "rate_limit_reached" | "quota_exceeded" | "usage_limit_exceeded"
+        )
+    })
+}
+
 /// A codex app-server `RateLimitSnapshot` (the `rateLimits` field of an
 /// `account/rateLimits/updated` notification, or of an `account/rateLimits/read`
 /// response) → an [`crate::engine_quota::QuotaSnapshot`] for "codex" (issue #97).
@@ -564,6 +585,10 @@ fn cap_out(s: &str) -> String {
 pub enum ThreadMsg {
     /// A streaming event for the session's timeline.
     Event(ChatEvent),
+    /// A structured quota-exceeded cause attached to the active turn. It is
+    /// delivered before that turn's `TurnEnd`, allowing the engine to make a
+    /// failover decision at the safe boundary only.
+    QuotaExceeded,
     /// A liveness ping (e.g. command output-delta while a long command runs) that
     /// carries no timeline change — the consumer uses it only to refresh the
     /// runaway-guard's last-activity clock so a busy command isn't idle-killed.
@@ -865,6 +890,10 @@ impl Client {
                         // turn/completed — surface it as text before the TurnEnd so
                         // the row shows the real cause, not error_before_output.
                         if method == "turn/completed" {
+                            if turn_reports_quota_exceeded(&params) {
+                                self.route_resolved(tid.as_deref(), ThreadMsg::QuotaExceeded)
+                                    .await;
+                            }
                             if let Some(text) = turn_error_text(&params) {
                                 self.route_resolved(
                                     tid.as_deref(),
@@ -1574,6 +1603,19 @@ mod tests {
         );
         // A clean turn carries no error text.
         assert!(turn_error_text(&json!({"turn":{"status":"completed"}})).is_none());
+    }
+
+    #[test]
+    fn turn_quota_detection_requires_a_structured_code() {
+        assert!(turn_reports_quota_exceeded(&json!({
+            "turn": {"error": {"code": "rate_limit_reached"}}
+        })));
+        assert!(turn_reports_quota_exceeded(&json!({
+            "turn": {"error": {"details": {"code": "quota_exceeded"}}}
+        })));
+        assert!(!turn_reports_quota_exceeded(&json!({
+            "turn": {"error": {"message": "rate limit exceeded"}}
+        })));
     }
 
     #[test]

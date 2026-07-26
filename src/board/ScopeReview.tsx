@@ -7,9 +7,6 @@ import type { ResolvedDirection } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { PlanSummary } from "../session/blocks/PlanSummary";
 import { latestPlanCard, type ParsedPlanCard } from "../session/planCard";
-import { ToolIcon, toolFullName } from "../components/ToolIcon";
-import { routeLabelKey, routeReasonKey, routeToolName } from "../lib/engineRoutingDisplay";
-import { cn } from "../lib/cn";
 
 // One sub-task lane: exactly one write repo per direction (scope rework). The
 // old read/write/none taxonomy is gone from this gate — every lane here is a
@@ -228,7 +225,6 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
 function ScopeLaneRow({ lane, index, confirming }: { lane: ScopeLane; index: number; confirming: boolean }) {
   const { t } = useTranslation();
   const { setProposalDirectionBase, proposal } = useStore();
-  const route = lane.direction.route;
   // Per-proposal version: changes on EVERY re-proposal (R50-2). Threaded into BaseBranchField so a
   // re-propose with the same name/repo/base still resets a dirty (unblurred) base edit.
   const proposalVersion = proposal?.created_at ?? "";
@@ -250,18 +246,6 @@ function ScopeLaneRow({ lane, index, confirming }: { lane: ScopeLane; index: num
 
       <div className="min-w-0">
         <div className="truncate text-[12.5px] font-medium text-ink">{lane.direction.name}</div>
-        {route && (
-          <div className="mt-1 flex min-w-0 flex-col gap-0.5 text-[10.5px] text-ink-faint">
-            <span className={cn("inline-flex items-center gap-1", route.blocked && "text-danger")}>
-              {route.tool && <ToolIcon tool={route.tool} size={11} />}
-              {t(routeLabelKey(route), { tool: toolFullName(routeToolName(route)) })}
-            </span>
-            <span className="truncate" title={t(routeReasonKey(route.reason))}>
-              {t(routeReasonKey(route.reason))}
-            </span>
-            {route.blocked && <span>{t("scope.engineRouteBlockedHint")}</span>}
-          </div>
-        )}
         {!lane.repoKnown && (
           <div className="mt-0.5 flex items-center gap-1 text-[10.5px] text-waiting">
             <AlertTriangle size={10} />
