@@ -281,8 +281,10 @@ export const en = {
     engineReason: "{{reason}}",
     batchEngine: "Run this batch with",
     batchEngineAutomatic: "Automatic routing",
-    batchEngineHint: "Leave automatic routing selected, or pin one installed engine for every task here.",
-    batchEnginePinned: "Pinned for every task in this batch: {{tool}}",
+    batchEngineHint:
+      "Leave automatic routing selected, or pin one installed engine for tasks that have not started. Existing pinned or active tasks keep their current engine.",
+    batchEnginePinned:
+      "Pinned for unstarted tasks in this batch: {{tool}}. Existing pinned or active tasks keep their current engine.",
     routeReason: {
       automatic_disabled: "automatic routing is off",
       manual_pin: "manual choice wins",
