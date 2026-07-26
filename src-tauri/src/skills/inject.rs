@@ -63,6 +63,7 @@ const BUILTIN_MERGE_PREFLIGHT: &str = include_str!("builtin_merge_preflight.md")
 
 fn write_builtin(cwd: &Path, name: &str, content: &str) {
     if has_repo_owned_builtin(cwd, name) {
+        remove_managed_builtin_counterparts(cwd, name);
         return; // an unmarked same-name skill in either target wins everywhere
     }
 
@@ -71,6 +72,7 @@ fn write_builtin(cwd: &Path, name: &str, content: &str) {
         let file = dir.join("SKILL.md");
         if let Ok(existing) = std::fs::read_to_string(&file) {
             if !existing.contains(BUILTIN_MARKER) {
+                remove_managed_builtin_counterparts(cwd, name);
                 return; // preserve whole dual-target override semantics if it races
             }
             if existing == content {
@@ -94,6 +96,21 @@ fn has_repo_owned_builtin(cwd: &Path, name: &str) -> bool {
             Err(_) => true,
         }
     })
+}
+
+/// A repository override in either tool-specific directory must hide the
+/// built-in from every tool. Remove only our marked entry, leaving the
+/// repository-owned file and its directory intact.
+fn remove_managed_builtin_counterparts(cwd: &Path, name: &str) {
+    for d in TARGET_DIRS {
+        let file = cwd.join(d).join(name).join("SKILL.md");
+        let Ok(existing) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        if existing.contains(BUILTIN_MARKER) {
+            let _ = std::fs::remove_file(file);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -173,8 +190,8 @@ mod tests {
         for owner_target in TARGET_DIRS {
             let tmp = tempfile::tempdir().unwrap();
             let cwd = tmp.path();
+            materialize_builtins(cwd);
             let owned = cwd.join(owner_target).join("weft-preflight-merge/SKILL.md");
-            std::fs::create_dir_all(owned.parent().unwrap()).unwrap();
             std::fs::write(&owned, "repo-owned").unwrap();
 
             materialize_builtins(cwd);

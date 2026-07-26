@@ -14,19 +14,22 @@ Use this protocol before approving or carrying out any pull request merge or pro
 - Never merge, reset, check out, or run validation in the original working tree. Use a uniquely named temporary detached worktree for the entire rehearsal.
 - Never push, force-push, update a remote ref, call a GitHub merge API, or perform a remote merge automatically.
 - Register cleanup before creating the temporary worktree. Cleanup must run on success, a conflict, validation failure, and interruption.
+- Treat validation as code execution. For an external or otherwise untrusted candidate, do not run its validation commands in the normal agent environment. Require explicit human trust confirmation or use a credential-free isolated sandbox/container; otherwise report that validation was withheld and limit the preflight to non-executing inspection.
 
 ## Protocol
 
-1. Resolve the refs before changing anything. Identify the repository's current target/base ref, its remote, and the candidate head ref or SHA. Fetch the latest relevant refs from that remote (including the target/base ref and the candidate ref when it is remote-backed), then resolve and record the post-fetch candidate head SHA and base SHA. Do not use a stale pre-fetch base SHA.
+1. Resolve the refs before changing anything. Identify the target/base repository and ref, then separately identify the candidate head repository and ref or provider-specific PR ref. Fetch the latest base from the target remote. Fetch the candidate from its head remote or provider-specific PR ref, not by assuming its branch exists on the target remote. Resolve and record the post-fetch base SHA and candidate SHA, and for a pull request verify the fetched candidate SHA exactly matches the hosting provider's advertised head SHA. Do not use stale pre-fetch SHAs.
 
-2. Create a unique temporary directory and detached worktree, for example under the system temporary directory with a timestamp, process id, and random suffix. Add it at the candidate head with `git worktree add --detach <temporary-worktree> <candidate-head-sha>`. Do not use the original working tree as the worktree or as the merge workspace.
+2. Create a unique temporary directory and detached worktree, for example under the system temporary directory with a timestamp, process id, and random suffix. Add it at the latest base SHA with `git worktree add --detach <temporary-worktree> <base-sha>`. Do not use the original working tree as the worktree or as the merge workspace.
 
-3. In the temporary worktree, merge the latest base into the candidate head locally with a non-fast-forward, non-committing merge such as `git merge --no-commit --no-ff <base-sha>`. This keeps the rehearsal disposable while exercising the real merge semantics.
+3. In the temporary worktree, rehearse the real target-side operation: the base is the current side and the candidate is merged into it. Reproduce the repository's selected merge method exactly. For an ordinary merge, use a non-fast-forward, non-committing command such as `git merge --no-commit --no-ff <candidate-sha>`; if the selected method is squash or rebase, use its equivalent local rehearsal instead. This keeps the rehearsal disposable while preserving direction-sensitive merge-driver semantics.
 
    - If the merge reports textual conflicts or otherwise fails, stop before validation. Capture `git status --short` and the affected paths, including `git diff --name-only --diff-filter=U` when available. Report the conflict status and paths, then clean up.
    - Do not resolve conflicts silently, choose a side automatically, or continue to validation after a conflicted merge.
 
-4. Only after a clean merge, inspect the target repository's existing validation ladder: its contributor instructions, CI configuration, Makefile/task runner, and package scripts. Run the checks that repository already defines, in its documented order.
+4. Only after a clean merge, decide whether validation may execute. For an external or otherwise untrusted candidate, an ordinary temporary worktree is not a sandbox: it can still access credentials, the home directory, network, and shared Git state. Obtain explicit human trust confirmation or use a credential-free isolated sandbox/container before running candidate-controlled commands. Without one of those conditions, report the clean/conflicted merge result and that validation was not run.
+
+   When validation is authorized, inspect the target repository's existing validation ladder: its contributor instructions, CI configuration, Makefile/task runner, and package scripts. Run the checks that repository already defines, in its documented order.
 
    - A Cargo project must include `cargo check` from the appropriate manifest/workspace, plus any other existing Rust checks required by that repository.
    - A JavaScript project must use its existing package-manager scripts from `package.json` or workspace configuration (for example, the repository's `pnpm` scripts); do not substitute a universal command list.
