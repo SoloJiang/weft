@@ -216,20 +216,24 @@ fn refresh_tool_path() -> String {
     merged
 }
 
-/// Whether a bare `Command::new(program)` can resolve an executable using the
-/// PATH Weft passes to agent processes. This deliberately does NOT consult the
-/// Codex app-bundle fallback: that fallback is useful for diagnostics/version
-/// display, but a bare spawn cannot reach it. Absolute command overrides are
-/// checked directly, including the Unix executable bit.
-pub fn is_spawnable(program: &str) -> bool {
+/// Resolve the executable that a bare `Command::new(program)` can reach using
+/// the PATH Weft passes to agent processes. This deliberately does NOT consult
+/// the Codex app-bundle fallback: that fallback is useful for diagnostics and
+/// version display, but a bare spawn cannot reach it. Absolute command
+/// overrides are checked directly, including the Unix executable bit.
+pub fn resolve_spawnable_tool_path(program: &str) -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(program);
     if p.is_absolute() {
-        return path_is_spawnable(p);
+        return path_is_spawnable(p).then(|| p.to_path_buf());
     }
-    if spawnable_path_on_path(program, &tool_path()).is_some() {
-        return true;
-    }
-    spawnable_path_on_path(program, &refresh_tool_path()).is_some()
+    spawnable_path_on_path(program, &tool_path())
+        .or_else(|| spawnable_path_on_path(program, &refresh_tool_path()))
+}
+
+/// Whether a bare `Command::new(program)` can resolve an executable using the
+/// PATH Weft passes to agent processes.
+pub fn is_spawnable(program: &str) -> bool {
+    resolve_spawnable_tool_path(program).is_some()
 }
 
 /// Existing callers use this name for the same bare-command preflight.

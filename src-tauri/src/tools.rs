@@ -25,13 +25,36 @@ pub struct ToolStatus {
 // default-tool priority (codex > claude > opencode).
 const TOOLS: [&str; 3] = ["codex", "claude", "opencode"];
 
+/// The executable used for the version probe, plus whether that exact path is
+/// reachable by a bare session spawn. Prefer the spawnable PATH match over a
+/// diagnostics-only match: an earlier non-executable file must not hide a later
+/// working CLI with the same name.
+fn probe_target(
+    spawnable_path: Option<std::path::PathBuf>,
+    diagnostic_path: Option<std::path::PathBuf>,
+) -> Option<(std::path::PathBuf, bool)> {
+    let spawnable = spawnable_path.is_some();
+    spawnable_path
+        .or(diagnostic_path)
+        .map(|path| (path, spawnable))
+}
+
 fn probe(tool: &str) -> ToolStatus {
     use crate::detect::ToolDiagnostic as Diag;
     let mut diagnostics = Vec::new();
     // Probe the user-configured command (alias) for this identity, so Settings
     // reports install status for the binary sessions actually spawn.
     let command = crate::tool_command::command_for(tool);
-    let Some(path) = crate::detect::resolve_tool_path(&command) else {
+    let spawnable_path = crate::detect::resolve_spawnable_tool_path(&command);
+    // Only fall back to the diagnostics resolver when a session cannot spawn
+    // this command. It may point at the macOS Codex.app bundle or a
+    // non-executable PATH file, both useful to report but not to select.
+    let diagnostic_path = if spawnable_path.is_none() {
+        crate::detect::resolve_tool_path(&command)
+    } else {
+        None
+    };
+    let Some((path, path_is_spawnable)) = probe_target(spawnable_path, diagnostic_path) else {
         diagnostics.push(Diag::missing_target(tool));
         return ToolStatus {
             tool: tool.into(),
@@ -78,7 +101,7 @@ fn probe(tool: &str) -> ToolStatus {
             (false, None)
         }
     };
-    let spawnable = installed && crate::detect::is_spawnable(&command);
+    let spawnable = installed && path_is_spawnable;
     let meets_min = version
         .as_deref()
         .map(|v| crate::detect::meets_min(tool, v))
@@ -119,4 +142,27 @@ pub async fn default_tool(db: &crate::store::Db) -> String {
         .ok()
         .flatten();
     crate::detect::resolve_default_tool(configured.as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_target_prefers_a_spawnable_path_over_diagnostic_only_match() {
+        let diagnostic = std::path::PathBuf::from("/first/codex");
+        let runnable = std::path::PathBuf::from("/second/codex");
+
+        assert_eq!(
+            probe_target(Some(runnable.clone()), Some(diagnostic)),
+            Some((runnable, true))
+        );
+    }
+
+    #[test]
+    fn probe_target_keeps_a_diagnostic_only_path_non_spawnable() {
+        let diagnostic = std::path::PathBuf::from("/Applications/Codex.app/codex");
+
+        assert_eq!(probe_target(None, Some(diagnostic.clone())), Some((diagnostic, false)));
+    }
 }
