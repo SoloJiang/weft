@@ -638,16 +638,21 @@ pub async fn get_thread(db: &Db, thread_id: i32) -> Result<Option<thread::Model>
     Ok(thread::Entity::find_by_id(thread_id).one(&db.0).await?)
 }
 
-/// Update only a thread's persisted lead tool. Automatic routing uses this
-/// when a previously blocked, not-yet-started lead becomes eligible; manual
-/// switches use the transactional switch path instead.
-pub async fn set_thread_tool(db: &Db, thread_id: i32, tool: &str) -> Result<()> {
-    thread::Entity::update_many()
+/// Refresh an initial automatic lead route only while no manual choice has
+/// landed. The conditional write prevents a stale resolver result from
+/// overwriting a concurrent manual pin.
+pub async fn refresh_unpinned_thread_route(
+    db: &Db,
+    thread_id: i32,
+    tool: &str,
+) -> Result<bool> {
+    let write = thread::Entity::update_many()
         .col_expr(thread::Column::LeadTool, Expr::value(tool.to_string()))
         .filter(thread::Column::Id.eq(thread_id))
+        .filter(thread::Column::EnginePinned.eq(false))
         .exec(&db.0)
         .await?;
-    Ok(())
+    Ok(write.rows_affected != 0)
 }
 
 pub async fn set_thread_engine_pinned(db: &Db, thread_id: i32, pinned: bool) -> Result<()> {
@@ -1400,12 +1405,25 @@ pub async fn refresh_unpinned_direction_route(
     session_id: Option<i32>,
     tool: &str,
 ) -> Result<()> {
+    refresh_unpinned_direction_route_with_pin(db, direction_id, session_id, tool, false).await
+}
+
+/// See [`refresh_unpinned_direction_route`]. A reused, never-started direction
+/// can receive an explicit manual selection during a retry, which must become
+/// a pin in the same conditional write as its refreshed tool.
+pub async fn refresh_unpinned_direction_route_with_pin(
+    db: &Db,
+    direction_id: i32,
+    session_id: Option<i32>,
+    tool: &str,
+    engine_pinned: bool,
+) -> Result<()> {
     use sea_orm::TransactionTrait;
 
     let txn = db.0.begin().await?;
     let direction_write = direction::Entity::update_many()
         .col_expr(direction::Column::Tool, Expr::value(tool))
-        .col_expr(direction::Column::EnginePinned, Expr::value(false))
+        .col_expr(direction::Column::EnginePinned, Expr::value(engine_pinned))
         .filter(direction::Column::Id.eq(direction_id))
         .filter(direction::Column::EnginePinned.eq(false))
         .exec(&txn)
@@ -1417,7 +1435,7 @@ pub async fn refresh_unpinned_direction_route(
     if let Some(session_id) = session_id {
         let session_write = session::Entity::update_many()
             .col_expr(session::Column::Tool, Expr::value(tool))
-            .col_expr(session::Column::EnginePinned, Expr::value(false))
+            .col_expr(session::Column::EnginePinned, Expr::value(engine_pinned))
             .col_expr(session::Column::Command, Expr::value(Option::<String>::None))
             .col_expr(session::Column::Model, Expr::value(Option::<String>::None))
             .col_expr(
@@ -5551,6 +5569,28 @@ mod tests {
         assert_eq!(refreshed_session.command, None);
         assert_eq!(refreshed_session.model, None);
         assert_eq!(refreshed_session.native_session_id, None);
+    }
+
+    #[tokio::test]
+    async fn refresh_unpinned_thread_route_never_overwrites_a_manual_pin() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let thread = create_thread(&db, ws.id, "Issue", "feature", "codex")
+            .await
+            .unwrap();
+
+        assert!(refresh_unpinned_thread_route(&db, thread.id, "claude")
+            .await
+            .unwrap());
+        assert_eq!(get_thread(&db, thread.id).await.unwrap().unwrap().lead_tool, "claude");
+
+        set_thread_engine_pinned(&db, thread.id, true).await.unwrap();
+        assert!(!refresh_unpinned_thread_route(&db, thread.id, "codex")
+            .await
+            .unwrap());
+        let current = get_thread(&db, thread.id).await.unwrap().unwrap();
+        assert_eq!(current.lead_tool, "claude");
+        assert!(current.engine_pinned);
     }
 
     #[tokio::test]

@@ -491,6 +491,32 @@ pub async fn get_resolved(db: &Db, thread_id: i32) -> Result<Option<ResolvedProp
     Ok(Some(resolved))
 }
 
+/// Recover the routing hint for a materialized direction from the server-owned
+/// `direction_id` recorded in the persisted proposal. Direction rows predate
+/// planner hints, so the plan remains the compatible source of this intent.
+pub(crate) async fn direction_routing_hint(
+    db: &Db,
+    thread_id: i32,
+    direction_id: i32,
+) -> Result<crate::engine_routing::RoutingHint> {
+    let Some(plan) = repo::get_plan(db, thread_id).await? else {
+        return Ok(crate::engine_routing::RoutingHint::default());
+    };
+    let raw = serde_json::from_str::<Value>(&plan.proposal).unwrap_or_else(|_| Value::Null);
+    let Some(directions) = raw.get("directions").and_then(Value::as_array) else {
+        return Ok(crate::engine_routing::RoutingHint::default());
+    };
+    let Some(index) = directions.iter().position(|direction| {
+        direction
+            .get("direction_id")
+            .and_then(Value::as_i64)
+            == Some(i64::from(direction_id))
+    }) else {
+        return Ok(crate::engine_routing::RoutingHint::default());
+    };
+    Ok(hint_from_value(&raw, index))
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ResolvedProposal {
     pub thread_id: i32,
@@ -911,6 +937,45 @@ pub async fn confirm_with_manual_tool(
             ) {
                 rollback_attempt(db, &created_now, &recreated_reused).await;
                 return Err(err);
+            }
+            // A direction left behind before the plan CAS has never started a
+            // worker. Re-check its current eligible route before consuming the
+            // proposal; otherwise confirmation can succeed only for the later
+            // worker open to reject the stale provider.
+            let unstarted = !ex.engine_pinned
+                && repo::latest_session_for(db, ex_id, repo_ref.id).await?.is_none();
+            if unstarted {
+                let route = crate::engine_routing::resolve_for_db(
+                    db,
+                    manual_tool,
+                    &legacy_tool,
+                    d.hint,
+                )
+                .await;
+                let Some(selected_tool) = route.selected() else {
+                    crate::engine_routing::record_decision(
+                        db,
+                        thread_id,
+                        None,
+                        Some(ex_id),
+                        "planner_confirm",
+                        &route,
+                    )
+                    .await;
+                    rollback_attempt(db, &created_now, &recreated_reused).await;
+                    anyhow::bail!("engine_route_blocked:{}", route.reason_code());
+                };
+                if matches!(route.source, crate::engine_routing::RoutingSource::Manual) {
+                    repo::refresh_unpinned_direction_route_with_pin(
+                        db,
+                        ex_id,
+                        None,
+                        selected_tool.as_str(),
+                        true,
+                    )
+                    .await?;
+                }
+                committed_route_markers.push((ex_id, route));
             }
             // Detect whether this reused lane's worktree dir was RECLAIMED (row present but the
             // on-disk dir is gone) BEFORE we materialize it — materialize will then RECREATE it. If
@@ -1689,6 +1754,33 @@ mod tests {
         let directions = stored["directions"].as_array().unwrap();
         assert_eq!(directions[0]["hint"], "normal");
         assert_eq!(directions[1]["hint"], "normal");
+    }
+
+    #[tokio::test]
+    async fn direction_routing_hint_uses_the_persisted_direction_id() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = repo::create_thread(&db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let proposal = serde_json::json!({
+            "directions": [
+                {"name": "normal", "repo": "api", "direction_id": 41, "hint": "normal"},
+                {"name": "deep", "repo": "api", "direction_id": 42, "hint": "deep"}
+            ]
+        });
+        repo::upsert_plan(&db, thread.id, &proposal.to_string(), "confirmed", &now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            direction_routing_hint(&db, thread.id, 42).await.unwrap(),
+            crate::engine_routing::RoutingHint::Deep
+        );
+        assert_eq!(
+            direction_routing_hint(&db, thread.id, 999).await.unwrap(),
+            crate::engine_routing::RoutingHint::Normal
+        );
     }
 
     #[test]
@@ -2553,6 +2645,92 @@ mod tests {
         let direction = repo::get_direction(&db, interrupted.id).await.unwrap().unwrap();
         assert_eq!(direction.tool, "opencode");
         assert!(direction.engine_pinned, "retry must preserve the inserted pin");
+
+        let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn confirm_rechecks_an_unstarted_reused_direction_with_its_hint() {
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-recheck-route-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            root.join("api").to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED, "true")
+            .await
+            .unwrap();
+        let proposal = serde_json::json!({
+            "rationale": "r",
+            "directions": [{
+                "name": "api work",
+                "repo": "api",
+                "reason": "r",
+                "mandate": "plan+impl",
+                "base_branch": "",
+                "hint": "deep"
+            }]
+        });
+        save_proposal_value(&db, thread.id, &proposal).await.unwrap();
+        let interrupted = repo::create_direction(
+            &db,
+            thread.id,
+            "api work",
+            "codex",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let current_exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::tool_command::set_overrides(std::collections::HashMap::from([
+            ("codex".to_string(), current_exe.clone()),
+            ("claude".to_string(), current_exe),
+        ]));
+        let ids_result = confirm(&db, thread.id).await;
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+        let ids = ids_result.unwrap();
+
+        assert_eq!(ids, vec![interrupted.id]);
+        let marker = repo::list_lead_messages(&db, thread.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.kind == "engine_route")
+            .unwrap();
+        let route: Value = serde_json::from_str(&marker.content).unwrap();
+        assert_eq!(route["tool"], "claude");
+        assert_eq!(route["hint"], "deep");
 
         let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;

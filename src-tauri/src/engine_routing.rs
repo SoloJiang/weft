@@ -674,7 +674,13 @@ fn is_later_lead_route_or_switch(message: &crate::store::entities::lead_message:
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
         return false;
     };
-    !matches!(value.get("direction_id"), Some(direction_id) if !direction_id.is_null())
+    if matches!(value.get("direction_id"), Some(direction_id) if !direction_id.is_null()) {
+        return false;
+    }
+    matches!(
+        value.get("operation").and_then(|operation| operation.as_str()),
+        Some("lead_start" | "new_thread" | "new_issue" | "curator_start" | "concierge_start")
+    )
 }
 
 /// Reconcile the initial route of an unstarted, unpinned lead. A blocked marker
@@ -737,13 +743,15 @@ pub async fn prepare_initial_lead(
         record_decision(db, thread.id, None, None, "lead_start", &decision).await;
         anyhow::bail!("engine_route_blocked:{}", decision.reason_code());
     };
-    if tool.as_str() != thread.lead_tool {
-        repo::set_thread_tool(db, thread.id, tool.as_str()).await?;
+    if !repo::refresh_unpinned_thread_route(db, thread.id, tool.as_str()).await? {
+        return repo::get_thread(db, thread.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("thread {} disappeared while refreshing its route", thread.id));
     }
     record_decision(db, thread.id, None, None, "lead_start", &decision).await;
-    let mut refreshed = thread.clone();
-    refreshed.lead_tool = tool.as_str().to_string();
-    Ok(refreshed)
+    repo::get_thread(db, thread.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread {} disappeared while recording its route", thread.id))
 }
 
 /// Copy the direction-level route explanation into the worker's own timeline,
@@ -1012,6 +1020,62 @@ mod tests {
             "system",
             "engine_route",
             &worker_route,
+            "complete",
+        )
+        .await
+        .unwrap();
+
+        let outcome = prepare_initial_lead(&db, &thread).await;
+        match outcome {
+            Ok(resolved) => assert_ne!(resolved.lead_tool, "not-a-tool"),
+            Err(err) => assert!(err.to_string().starts_with("engine_route_blocked:")),
+        }
+    }
+
+    #[tokio::test]
+    async fn curator_analysis_route_does_not_suppress_blocked_lead_recovery() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::set_setting(&db, K_AUTOMATIC_ROUTING_ENABLED, "true")
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "curator", "curator", "not-a-tool")
+            .await
+            .unwrap();
+        let blocked = serde_json::json!({
+            "source": "blocked",
+            "operation": "curator_start",
+            "hint": "deep",
+            "direction_id": null,
+        })
+        .to_string();
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "system",
+            "engine_route_blocked",
+            &blocked,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let analysis_route = serde_json::json!({
+            "source": "automatic",
+            "operation": "curator_analysis",
+            "hint": "deep",
+            "direction_id": null,
+        })
+        .to_string();
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            2,
+            "system",
+            "engine_route",
+            &analysis_route,
             "complete",
         )
         .await

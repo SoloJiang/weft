@@ -383,6 +383,20 @@ fn should_attempt_quota_failover(
     status == "error" && structured_exceeded && !still_busy
 }
 
+fn structured_codex_exhaustion_snapshot(tool: &str) -> Option<crate::engine_quota::QuotaSnapshot> {
+    if tool != "codex" {
+        return None;
+    }
+    Some(crate::engine_quota::QuotaSnapshot {
+        tool: "codex".to_string(),
+        status: crate::engine_quota::QuotaStatus::Exceeded,
+        used_percent: None,
+        resets_at: None,
+        window_label: None,
+        observed_at: crate::engine_quota::now_unix(),
+    })
+}
+
 /// Per-turn dialects (codex `exec --json`, opencode `run --format json`) spawn
 /// one process per human turn; only claude keeps a long-lived stream process.
 pub fn per_turn(tool: &str) -> bool {
@@ -3099,9 +3113,17 @@ async fn codex_consumer(
     while let Some(msg) = rx.recv().await {
         match msg {
             ThreadMsg::QuotaExceeded => {
-                let mut inner = eng.lock().await;
-                if inner.turn.busy {
-                    inner.turn.quota_exceeded = true;
+                let snapshot = {
+                    let mut inner = eng.lock().await;
+                    if inner.turn.busy {
+                        inner.turn.quota_exceeded = true;
+                        structured_codex_exhaustion_snapshot(&inner.tool)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(snapshot) = snapshot {
+                    crate::engine_quota::report(snapshot);
                 }
             }
             ThreadMsg::Event(ChatEvent::TextDelta { text, item, agent_thread }) => {
@@ -7238,6 +7260,18 @@ mod tests {
 
         assert!(turn.try_begin_send());
         assert!(!turn.quota_exceeded);
+    }
+
+    #[test]
+    fn structured_codex_exhaustion_snapshot_is_global_but_codex_only() {
+        let snapshot = structured_codex_exhaustion_snapshot("codex").unwrap();
+        assert_eq!(snapshot.tool, "codex");
+        assert_eq!(snapshot.status, crate::engine_quota::QuotaStatus::Exceeded);
+        assert_eq!(snapshot.used_percent, None);
+        assert_eq!(snapshot.resets_at, None);
+        assert_eq!(snapshot.window_label, None);
+        assert!(structured_codex_exhaustion_snapshot("claude").is_none());
+        assert!(structured_codex_exhaustion_snapshot("opencode").is_none());
     }
 
     #[test]

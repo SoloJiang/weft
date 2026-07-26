@@ -1221,6 +1221,11 @@ pub(crate) async fn chat_open_worker_impl(
         && prior
             .as_ref()
             .map_or(true, |session| session.native_session_id.is_none());
+    let route_hint = if can_refresh_initial_route {
+        crate::planner::direction_routing_hint(db, dir.thread_id, direction_id).await?
+    } else {
+        crate::engine_routing::RoutingHint::Normal
+    };
     let legacy_tool = crate::tools::default_tool(db).await;
     let route = crate::engine_routing::resolve_for_db(
         db,
@@ -1230,7 +1235,7 @@ pub(crate) async fn chat_open_worker_impl(
             Some(&dir.tool)
         },
         &legacy_tool,
-        crate::engine_routing::RoutingHint::Normal,
+        route_hint,
     )
     .await;
     if route.blocked {
