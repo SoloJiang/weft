@@ -78,14 +78,13 @@ pub fn more_severe(a: QuotaStatus, b: QuotaStatus) -> QuotaStatus {
 
 /// Derive a status from a used-percent reading plus an explicit "the engine
 /// itself says this is actually exhausted" flag (codex's `rateLimitReachedType`
-/// being set, claude's `status == "rejected"`) — the ONE place both engines'
-/// mappings funnel through, so the warn/exceeded cutoffs can't drift apart.
+/// being set, claude's `status == "rejected"`). A percentage remains advisory,
+/// including 100%, until the provider explicitly rejects the engine.
 pub fn status_for(used_percent: Option<u32>, reached: bool) -> QuotaStatus {
     if reached {
         return QuotaStatus::Exceeded;
     }
     match used_percent {
-        Some(p) if p >= 100 => QuotaStatus::Exceeded,
         Some(p) if p >= WARN_THRESHOLD_PERCENT => QuotaStatus::Warning,
         _ => QuotaStatus::Ok,
     }
@@ -197,7 +196,7 @@ mod tests {
         assert_eq!(status_for(Some(79), false), QuotaStatus::Ok);
         assert_eq!(status_for(Some(80), false), QuotaStatus::Warning);
         assert_eq!(status_for(Some(99), false), QuotaStatus::Warning);
-        assert_eq!(status_for(Some(100), false), QuotaStatus::Exceeded);
+        assert_eq!(status_for(Some(100), false), QuotaStatus::Warning);
         // The explicit "reached" flag wins even over a low/absent percent —
         // codex can report `rateLimitReachedType` without a fresh usedPercent
         // in a sparse rolling update.

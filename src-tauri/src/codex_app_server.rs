@@ -1670,11 +1670,12 @@ mod tests {
     fn codex_quota_snapshot_single_window_only() {
         use crate::engine_quota::QuotaStatus;
         // Only primary present (a freshly-created account has no secondary yet).
+        // A full percentage is advisory until the provider sends a reached type.
         let snapshot = codex_quota_snapshot(&json!({
             "primary": {"usedPercent": 100, "resetsAt": 1_700_100_000},
         }))
         .expect("usable snapshot");
-        assert_eq!(snapshot.status, QuotaStatus::Exceeded);
+        assert_eq!(snapshot.status, QuotaStatus::Warning);
         assert_eq!(snapshot.window_label.as_deref(), Some("primary"));
     }
 

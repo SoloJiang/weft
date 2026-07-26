@@ -1267,6 +1267,34 @@ pub async fn create_direction(
     mandate: &str,
     base_branch: &str,
 ) -> Result<direction::Model> {
+    create_direction_with_engine_pin(
+        db,
+        thread_id,
+        name,
+        tool,
+        repo_id,
+        reason,
+        mandate,
+        base_branch,
+        false,
+    )
+    .await
+}
+
+/// Create a direction with the provenance of its selected engine. Manual routing
+/// must persist the pin in the same insert as the direction so a process exit
+/// cannot leave an otherwise reusable direction unpinned.
+pub async fn create_direction_with_engine_pin(
+    db: &Db,
+    thread_id: i32,
+    name: &str,
+    tool: &str,
+    repo_id: i32,
+    reason: &str,
+    mandate: &str,
+    base_branch: &str,
+    engine_pinned: bool,
+) -> Result<direction::Model> {
     let t = thread::Entity::find_by_id(thread_id)
         .one(&db.0)
         .await?
@@ -1314,7 +1342,7 @@ pub async fn create_direction(
         status: Set("queued".to_string()),
         repo_id: Set(repo_id),
         reason: Set(reason.to_string()),
-        engine_pinned: Set(false),
+        engine_pinned: Set(engine_pinned),
         mandate: Set(normalize_mandate(mandate).to_string()),
         base_branch: Set(base_branch.trim().to_string()),
         target_branch: Set(base_branch.trim().to_string()),
@@ -5890,12 +5918,22 @@ mod tests {
         let t = create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
 
         // A concrete base → stored, and target_branch defaults to it.
-        let d = create_direction(&db, t.id, "x", "claude", r.id, "r", "plan+impl", "develop")
-            .await
-            .unwrap();
+        let d = create_direction_with_engine_pin(
+            &db,
+            t.id,
+            "x",
+            "claude",
+            r.id,
+            "r",
+            "plan+impl",
+            "develop",
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(d.base_branch, "develop");
         assert_eq!(d.target_branch, "develop", "target defaults to the chosen base");
-        assert!(!d.engine_pinned);
+        assert!(d.engine_pinned, "the pin must be part of the inserted direction");
 
         // Empty base → both empty (each resolves to the repo default later).
         let d2 = create_direction(&db, t.id, "y", "claude", r.id, "r", "plan+impl", "")

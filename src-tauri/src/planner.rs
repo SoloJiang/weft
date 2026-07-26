@@ -962,7 +962,7 @@ pub async fn confirm_with_manual_tool(
             rollback_attempt(db, &created_now, &recreated_reused).await;
             anyhow::bail!("engine_route_blocked:{}", route.reason_code());
         };
-        let dir = match repo::create_direction(
+        let dir = match repo::create_direction_with_engine_pin(
             db,
             thread_id,
             &d.name,
@@ -971,6 +971,7 @@ pub async fn confirm_with_manual_tool(
             &d.reason,
             &d.mandate,
             &d.base_branch,
+            matches!(route.source, crate::engine_routing::RoutingSource::Manual),
         )
         .await
         {
@@ -980,17 +981,6 @@ pub async fn confirm_with_manual_tool(
                 return Err(err);
             }
         };
-        if let Err(err) = repo::set_direction_engine_pinned(
-            db,
-            dir.id,
-            matches!(route.source, crate::engine_routing::RoutingSource::Manual),
-        )
-        .await
-        {
-            let _ = repo::delete_direction(db, dir.id).await;
-            rollback_attempt(db, &created_now, &recreated_reused).await;
-            return Err(err);
-        }
         if let Err(err) = materialize::materialize_direction(db, dir.id).await {
             // The failing lane has no worktree yet; drop its row, then roll back
             // the earlier (materialized) lanes and undo any reused-lane recreations so a
@@ -1346,7 +1336,7 @@ pub async fn approve_direction_with_pin(
         .await;
         anyhow::bail!("engine_route_blocked:{}", route.reason_code());
     };
-    let dir = repo::create_direction(
+    let dir = repo::create_direction_with_engine_pin(
         db,
         thread_id,
         &resolved.name,
@@ -1355,18 +1345,9 @@ pub async fn approve_direction_with_pin(
         &resolved.reason,
         &resolved.mandate,
         &resolved.base_branch,
-    )
-    .await?;
-    if let Err(err) = repo::set_direction_engine_pinned(
-        db,
-        dir.id,
         matches!(route.source, crate::engine_routing::RoutingSource::Manual),
     )
-    .await
-    {
-        let _ = repo::delete_direction(db, dir.id).await;
-        return Err(err);
-    }
+    .await?;
     if let Err(err) = materialize::materialize_direction(db, dir.id).await {
         // Roll back the just-created row so a corrected retry starts clean and
         // doesn't hit the idempotent fast-path with a worktree-less task.
@@ -2501,6 +2482,77 @@ mod tests {
         let route: Value = serde_json::from_str(&route_marker.content).unwrap();
         assert_eq!(route["source"], "manual");
         assert_eq!(route["tool"], "opencode");
+
+        let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn confirm_retry_reuses_atomically_pinned_manual_direction() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-pinned-retry-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            root.join("api").to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        let proposal = Proposal {
+            rationale: "r".into(),
+            directions: vec![ProposedDirection {
+                name: "api work".into(),
+                repo: "api".into(),
+                reason: "r".into(),
+                mandate: "plan+impl".into(),
+                base_branch: "".into(),
+                decision: "".into(),
+                direction_id: 0,
+            }],
+        };
+        save_proposal(&db, thread.id, &proposal).await.unwrap();
+
+        // Model an exit after the direction insert and before the plan CAS. The
+        // retry must reuse the row without losing the original manual provenance.
+        let interrupted = repo::create_direction_with_engine_pin(
+            &db,
+            thread.id,
+            "api work",
+            "opencode",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let ids = confirm_with_manual_tool(&db, thread.id, Some("opencode"))
+            .await
+            .unwrap();
+
+        assert_eq!(ids, vec![interrupted.id]);
+        let direction = repo::get_direction(&db, interrupted.id).await.unwrap().unwrap();
+        assert_eq!(direction.tool, "opencode");
+        assert!(direction.engine_pinned, "retry must preserve the inserted pin");
 
         let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
