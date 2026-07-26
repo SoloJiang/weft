@@ -145,6 +145,30 @@ mod tests {
     }
 
     #[test]
+    fn stale_merge_preflight_builtin_upgrades_in_both_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+
+        materialize_builtins(cwd);
+        for target in TARGET_DIRS {
+            let file = cwd
+                .join(target)
+                .join("weft-preflight-merge/SKILL.md");
+            std::fs::write(&file, format!("{BUILTIN_MARKER}\nold {target}"))
+                .unwrap();
+        }
+
+        materialize_builtins(cwd);
+
+        for target in TARGET_DIRS {
+            let file = cwd
+                .join(target)
+                .join("weft-preflight-merge/SKILL.md");
+            assert_eq!(std::fs::read_to_string(file).unwrap(), BUILTIN_MERGE_PREFLIGHT);
+        }
+    }
+
+    #[test]
     fn builtin_override_in_either_target_blocks_both_targets() {
         for owner_target in TARGET_DIRS {
             let tmp = tempfile::tempdir().unwrap();
