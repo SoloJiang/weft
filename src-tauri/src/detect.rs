@@ -443,7 +443,16 @@ fn which_on_path(tool: &str, path: &str) -> Option<std::path::PathBuf> {
 }
 
 fn spawnable_path_on_path(tool: &str, path: &str) -> Option<std::path::PathBuf> {
-    which_on_path(tool, path).filter(|candidate| path_is_spawnable(candidate))
+    let names = executable_name_candidates(tool, windows_pathext().as_deref());
+    for directory in std::env::split_paths(path) {
+        for name in &names {
+            let candidate = directory.join(name);
+            if path_is_spawnable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -623,5 +632,31 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
         assert!(is_spawnable(executable.to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawnable_path_search_skips_a_non_executable_earlier_match() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let blocked = first.path().join("codex");
+        let runnable = second.path().join("codex");
+        std::fs::write(&blocked, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&runnable, b"#!/bin/sh\n").unwrap();
+
+        let mut blocked_permissions = std::fs::metadata(&blocked).unwrap().permissions();
+        blocked_permissions.set_mode(0o644);
+        std::fs::set_permissions(&blocked, blocked_permissions).unwrap();
+        let mut runnable_permissions = std::fs::metadata(&runnable).unwrap().permissions();
+        runnable_permissions.set_mode(0o755);
+        std::fs::set_permissions(&runnable, runnable_permissions).unwrap();
+
+        let path = std::env::join_paths([first.path(), second.path()])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(spawnable_path_on_path("codex", &path), Some(runnable));
     }
 }
