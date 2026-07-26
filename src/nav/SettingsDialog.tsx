@@ -675,6 +675,8 @@ function AutomationSettings() {
   // narrow, rarely-touched preference with no other consumer.
   const [quotaFailover, setQuotaFailoverState] = useState(false);
   const [quotaFailoverLoaded, setQuotaFailoverLoaded] = useState(false);
+  const [automaticRouting, setAutomaticRoutingState] = useState(false);
+  const [automaticRoutingLoaded, setAutomaticRoutingLoaded] = useState(false);
 
   useEffect(() => {
     void api.imGetSettings().then((s) => {
@@ -684,6 +686,10 @@ function AutomationSettings() {
     void api.getQuotaFailoverEnabled().then((enabled) => {
       setQuotaFailoverState(enabled);
       setQuotaFailoverLoaded(true);
+    });
+    void api.getAutomaticEngineRoutingEnabled().then((enabled) => {
+      setAutomaticRoutingState(enabled);
+      setAutomaticRoutingLoaded(true);
     });
   }, []);
 
@@ -699,12 +705,24 @@ function AutomationSettings() {
   }
 
   async function toggleQuotaFailover(on: boolean) {
+    if (on && !window.confirm(t("settings.quotaFailoverConfirm"))) return;
     const prev = quotaFailover;
     setQuotaFailoverState(on);
     try {
       await api.setQuotaFailoverEnabled(on);
     } catch (err) {
       setQuotaFailoverState(prev);
+      throw err;
+    }
+  }
+
+  async function toggleAutomaticRouting(on: boolean) {
+    const prev = automaticRouting;
+    setAutomaticRoutingState(on);
+    try {
+      await api.setAutomaticEngineRoutingEnabled(on);
+    } catch (err) {
+      setAutomaticRoutingState(prev);
       throw err;
     }
   }
@@ -736,6 +754,25 @@ function AutomationSettings() {
           )}
         </SettingRow>
       </SettingsGroup>
+      <SettingsGroup title={t("settings.engineRoutingGroup")}>
+        <SettingRow
+          label={t("settings.automaticRoutingTitle")}
+          hint={t("settings.automaticRoutingHint")}
+        >
+          {automaticRoutingLoaded ? (
+            <Toggle
+              on={automaticRouting}
+              onChange={(v) => void toggleAutomaticRouting(v)}
+              label={t("settings.automaticRoutingTitle")}
+            />
+          ) : (
+            <div
+              aria-hidden
+              className="h-[22px] w-[38px] shrink-0 rounded-full bg-border-strong/40"
+            />
+          )}
+        </SettingRow>
+      </SettingsGroup>
       <SettingsGroup title={t("settings.quotaFailoverGroup")}>
         <SettingRow label={t("settings.quotaFailoverTitle")} hint={t("settings.quotaFailoverHint")}>
           {quotaFailoverLoaded ? (
@@ -751,6 +788,9 @@ function AutomationSettings() {
             />
           )}
         </SettingRow>
+        <p className="px-3 pb-3 text-[11px] leading-relaxed text-ink-faint">
+          {t("settings.quotaFailoverDisclosure")}
+        </p>
       </SettingsGroup>
       <SettingsGroup title={t("settings.reviewGroup")}>
         <SettingRow label={t("settings.reviewSkill")} hint={t("settings.reviewSkillHint")}>

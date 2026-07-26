@@ -1785,7 +1785,47 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     // `repo-graph-updated` otherwise fires only when the (minutes-long) run ends —
     // without this, a reprofiled-but-unselected card sits stale for the whole run.
     emit_graph_updated(ws);
-    let tool = crate::tools::default_tool(db).await;
+    let legacy_tool = crate::tools::default_tool(db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        db,
+        None,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Deep,
+    )
+    .await;
+    if route.blocked {
+        if let Ok(Some(curator_thread)) =
+            crate::store::repo::curator_thread_for_workspace(db, repo.workspace_id).await
+        {
+            crate::engine_routing::record_decision(
+                db,
+                curator_thread,
+                None,
+                None,
+                "curator_analysis",
+                &route,
+            )
+            .await;
+        }
+        return Err(anyhow::anyhow!("engine-routing-blocked:{}", route.reason_code()));
+    }
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
+    if let Ok(Some(curator_thread)) =
+        crate::store::repo::curator_thread_for_workspace(db, repo.workspace_id).await
+    {
+        crate::engine_routing::record_decision(
+            db,
+            curator_thread,
+            None,
+            None,
+            "curator_analysis",
+            &route,
+        )
+        .await;
+    }
     let prompt = build_repo_class_prompt(&repo.name, cwd);
     // Capture HEAD BEFORE the (minutes-long) run so the stored `profiled_commit`
     // reflects the tree the agent actually classified. If the checkout advances
@@ -2186,7 +2226,47 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     let cwd = common_ancestor(&paths)
         .filter(|anc| !is_too_broad(anc))
         .unwrap_or_else(|| Path::new(&profiled[0].0.local_git_path).to_path_buf());
-    let tool = crate::tools::default_tool(db).await;
+    let legacy_tool = crate::tools::default_tool(db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        db,
+        None,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Deep,
+    )
+    .await;
+    if route.blocked {
+        if let Ok(Some(curator_thread)) =
+            crate::store::repo::curator_thread_for_workspace(db, workspace_id).await
+        {
+            crate::engine_routing::record_decision(
+                db,
+                curator_thread,
+                None,
+                None,
+                "curator_relations",
+                &route,
+            )
+            .await;
+        }
+        anyhow::bail!("engine-routing-blocked:{}", route.reason_code());
+    }
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
+    if let Ok(Some(curator_thread)) =
+        crate::store::repo::curator_thread_for_workspace(db, workspace_id).await
+    {
+        crate::engine_routing::record_decision(
+            db,
+            curator_thread,
+            None,
+            None,
+            "curator_relations",
+            &route,
+        )
+        .await;
+    }
     // The relations pass is workspace-level, not tied to one repo's detail panel,
     // so its stream is discarded — it shares the runner only for the transport fix.
     let mut fresh_markdown: Option<String> = None;

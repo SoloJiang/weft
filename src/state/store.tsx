@@ -2523,13 +2523,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
       );
       try {
-        const dirId = await api.approveWriteTrigger(item.thread_id, item.index, tool ?? defaultTool);
+        const dirId = await api.approveWriteTrigger(item.thread_id, item.index, tool);
         void dispatchDirection(dirId);
       } finally {
         await refreshNeeds();
       }
     },
-    [dispatchDirection, refreshNeeds, defaultTool, activeThreadId, refreshProposal],
+    [dispatchDirection, refreshNeeds, activeThreadId, refreshProposal],
   );
 
   const denyWriteTrigger = useCallback(

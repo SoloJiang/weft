@@ -297,8 +297,8 @@ export const api = {
   // Write triggers: lead-proposed repo writes awaiting human approve/deny.
   writeTriggers: (workspaceId: number) =>
     invoke<WriteTrigger[]>("write_triggers", { workspaceId }),
-  approveWriteTrigger: (threadId: number, index: number, tool: string) =>
-    invoke<number>("approve_write_trigger", { threadId, index, tool }),
+  approveWriteTrigger: (threadId: number, index: number, tool?: string) =>
+    invoke<number>("approve_write_trigger", { threadId, index, tool: tool ?? null }),
   denyWriteTrigger: (threadId: number, index: number) =>
     invoke<void>("deny_write_trigger", { threadId, index }),
 
@@ -322,6 +322,10 @@ export const api = {
   detectTools: () => invoke<ToolStatus[]>("detect_tools"),
   getDefaultTool: () => invoke<DefaultToolInfo>("get_default_tool"),
   setDefaultTool: (tool: string) => invoke<void>("set_default_tool", { tool }),
+  getAutomaticEngineRoutingEnabled: () =>
+    invoke<boolean>("get_automatic_engine_routing_enabled"),
+  setAutomaticEngineRoutingEnabled: (enabled: boolean) =>
+    invoke<void>("set_automatic_engine_routing_enabled", { enabled }),
   // issue #97: auto fail-over to the fallback engine on a quota-exceeded turn.
   // Opt-in — off by default, since switching engines mid-task ships that
   // engine's own history digest to a DIFFERENT provider.

@@ -12,6 +12,7 @@ use crate::materialize;
 use crate::store::{repo, Db};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Deserialize a JSON string OR null into a String (null/absent → ""). The lead
 /// tool may emit `base_branch: null` for "use the repo default"; without this,
@@ -83,6 +84,12 @@ pub struct ResolvedDirection {
     pub mandate: String,
     pub base_branch: String,
     pub decision: String,
+    /// Optional normalized planner hint. The lead may request only `normal` or
+    /// `deep`; the server defaults malformed/old proposals to `normal`.
+    pub hint: crate::engine_routing::RoutingHint,
+    /// The current global-policy preview shown before approval. The actual
+    /// decision is re-resolved at dispatch time.
+    pub route: Option<crate::engine_routing::RouteDecision>,
     /// The direction id this lane was materialized into (0 = unset). Carried through from the
     /// stored proposal so the confirmed fast-path can re-dispatch by recorded id (no matching).
     pub direction_id: i32,
@@ -106,6 +113,8 @@ pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDire
         mandate: repo::normalize_mandate(&dir.mandate).to_string(),
         base_branch: dir.base_branch.clone(),
         decision: dir.decision.clone(),
+        hint: crate::engine_routing::RoutingHint::default(),
+        route: None,
         direction_id: dir.direction_id,
     }
 }
@@ -276,9 +285,18 @@ fn thread_gate(thread_id: i32) -> std::sync::Arc<tokio::sync::Mutex<()>> {
 /// before storing. This is safe: approve/deny never route through save_proposal, so no
 /// server-set decision is lost.
 pub async fn save_proposal(db: &Db, thread_id: i32, proposal: &Proposal) -> Result<()> {
+    let input = serde_json::to_value(proposal)?;
+    save_proposal_value(db, thread_id, &input).await
+}
+
+/// Store a proposal received across an untrusted JSON boundary. Keeping this
+/// raw-value seam lets older typed callers remain source-compatible while the
+/// optional planner `hint` survives round-trips through human edits and the
+/// server-owned decision/id fields. Unknown hints are normalized to `normal`.
+pub async fn save_proposal_value(db: &Db, thread_id: i32, input: &Value) -> Result<()> {
     let gate = thread_gate(thread_id);
     let _gate = gate.lock().await;
-    let mut p = proposal.clone();
+    let mut p: Proposal = serde_json::from_value(input.clone())?;
     for d in &mut p.directions {
         d.decision = String::new();
         // TRUST BOUNDARY (mirror of the decision scrub): the lead must NEVER assign a direction
@@ -288,7 +306,12 @@ pub async fn save_proposal(db: &Db, thread_id: i32, proposal: &Proposal) -> Resu
         // sets it only via confirm/approve. Reset to 0 (unset) before storing.
         d.direction_id = 0;
     }
-    let json = serde_json::to_string(&p)?;
+    let prior = repo::get_plan(db, thread_id)
+        .await?
+        .and_then(|plan| serde_json::from_str::<Value>(&plan.proposal).ok());
+    let mut value = serde_json::to_value(&p)?;
+    normalize_hints(&mut value, input, prior.as_ref());
+    let json = serde_json::to_string(&value)?;
     // Bump the proposal VERSION on EVERY re-propose (R50-2). `upsert_plan` uses `version` as the
     // INSERT created_at but PRESERVES created_at on UPDATE; for a re-propose (existing row) the
     // explicit set_plan_created_at below applies the fresh version so the frontend reliably resets
@@ -297,6 +320,69 @@ pub async fn save_proposal(db: &Db, thread_id: i32, proposal: &Proposal) -> Resu
     repo::upsert_plan(db, thread_id, &json, "proposed", &version).await?;
     repo::set_plan_created_at(db, thread_id, &version).await?;
     Ok(())
+}
+
+/// Read the optional planner hint without making it part of the long-standing
+/// `ProposedDirection` Rust struct. That struct is used by a large test/DB
+/// surface; keeping the extension in plan JSON preserves old constructors and
+/// old rows while still giving the server a strict, normalized binary hint.
+fn hint_from_value(value: &Value, index: usize) -> crate::engine_routing::RoutingHint {
+    value
+        .get("directions")
+        .and_then(Value::as_array)
+        .and_then(|directions| directions.get(index))
+        .and_then(|direction| direction.get("hint"))
+        .and_then(Value::as_str)
+        .map(|hint| crate::engine_routing::RoutingHint::parse(Some(hint)))
+        .unwrap_or_default()
+}
+
+fn hint_for_direction(value: &Value, name: &str, repo_name: &str) -> Option<String> {
+    value
+        .get("directions")
+        .and_then(Value::as_array)
+        .and_then(|directions| {
+            directions.iter().find(|direction| {
+                direction.get("name").and_then(Value::as_str) == Some(name)
+                    && direction.get("repo").and_then(Value::as_str) == Some(repo_name)
+            })
+        })
+        .and_then(|direction| direction.get("hint"))
+        .and_then(Value::as_str)
+        .map(|hint| crate::engine_routing::RoutingHint::parse(Some(hint)).as_str().to_string())
+}
+
+fn normalize_hints(value: &mut Value, input: &Value, prior: Option<&Value>) {
+    let Some(directions) = value.get_mut("directions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let input_directions = input.get("directions").and_then(Value::as_array);
+    for (index, direction) in directions.iter_mut().enumerate() {
+        let Some(object) = direction.as_object_mut() else {
+            continue;
+        };
+        let input_hint = input_directions
+            .and_then(|items| items.get(index))
+            .and_then(|item| item.get("hint"))
+            .and_then(Value::as_str);
+        let prior_hint = if input_hint.is_none() {
+            let name = object.get("name").and_then(Value::as_str).unwrap_or_default();
+            let repo_name = object.get("repo").and_then(Value::as_str).unwrap_or_default();
+            prior.and_then(|old| hint_for_direction(old, name, repo_name))
+        } else {
+            None
+        };
+        let hint = crate::engine_routing::RoutingHint::parse(input_hint.or(prior_hint.as_deref()));
+        object.insert("hint".to_string(), Value::String(hint.as_str().to_string()));
+    }
+}
+
+fn proposal_json_with_hints(proposal: &Proposal, baseline: &str) -> Result<String> {
+    let mut value = serde_json::to_value(proposal)?;
+    let prior = serde_json::from_str::<Value>(baseline).ok();
+    let input = value.clone();
+    normalize_hints(&mut value, &input, prior.as_ref());
+    Ok(serde_json::to_string(&value)?)
 }
 
 /// Withdraw a thread's pending proposal (the lead's first-class "cancel/retract").
@@ -360,12 +446,16 @@ async fn resolved_from_plan(
     p: &crate::store::entities::plan::Model,
 ) -> Result<ResolvedProposal> {
     let proposal: Proposal = serde_json::from_str(&p.proposal).unwrap_or_default();
+    let raw = serde_json::from_str::<Value>(&p.proposal).unwrap_or_else(|_| Value::Null);
     let repos = workspace_repos(db, thread_id).await?;
-    let directions = proposal
+    let mut directions: Vec<ResolvedDirection> = proposal
         .directions
         .iter()
         .map(|d| resolve(d, &repos))
         .collect();
+    for (index, direction) in directions.iter_mut().enumerate() {
+        direction.hint = hint_from_value(&raw, index);
+    }
     Ok(ResolvedProposal {
         thread_id,
         rationale: proposal.rationale,
@@ -382,7 +472,22 @@ pub async fn get_resolved(db: &Db, thread_id: i32) -> Result<Option<ResolvedProp
     let Some(p) = repo::get_plan(db, thread_id).await? else {
         return Ok(None);
     };
-    Ok(Some(resolved_from_plan(db, thread_id, &p).await?))
+    let mut resolved = resolved_from_plan(db, thread_id, &p).await?;
+    let legacy = crate::tools::default_tool(db).await;
+    for direction in &mut resolved.directions {
+        if direction.decision.is_empty() {
+            direction.route = Some(
+                crate::engine_routing::resolve_for_db(
+                    db,
+                    None,
+                    &legacy,
+                    direction.hint,
+                )
+                .await,
+            );
+        }
+    }
+    Ok(Some(resolved))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -648,7 +753,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         return Ok(matching);
     }
     let existing_dirs = repo::list_directions(db, thread_id).await?;
-    let tool = crate::tools::default_tool(db).await;
+    let legacy_tool = crate::tools::default_tool(db).await;
     // Parse the RAW start-snapshot proposal once: we RECORD each materialized lane's direction id
     // into `proposal.directions[idx].direction_id` as we go, then persist the UPDATED proposal in
     // the final CAS so the confirmed fast-path can re-dispatch by recorded id (no re-matching). Its
@@ -816,11 +921,31 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             dispatch_ids.push(ex_id);
             continue;
         }
+        let route = crate::engine_routing::resolve_for_db(
+            db,
+            None,
+            &legacy_tool,
+            d.hint,
+        )
+        .await;
+        let Some(selected_tool) = route.selected() else {
+            crate::engine_routing::record_decision(
+                db,
+                thread_id,
+                None,
+                None,
+                "planner_confirm",
+                &route,
+            )
+            .await;
+            rollback_attempt(db, &created_now, &recreated_reused).await;
+            anyhow::bail!("engine_route_blocked:{}", route.reason_code());
+        };
         let dir = match repo::create_direction(
             db,
             thread_id,
             &d.name,
-            &tool,
+            selected_tool.as_str(),
             d.repo.repo_id,
             &d.reason,
             &d.mandate,
@@ -843,6 +968,15 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             return Err(err);
         }
         created_now.push(dir.id);
+        crate::engine_routing::record_decision(
+            db,
+            thread_id,
+            None,
+            Some(dir.id),
+            "planner_confirm",
+            &route,
+        )
+        .await;
         // RECORD the freshly-created direction's id on this lane so the confirmed fast-path
         // re-dispatches it directly (no re-matching). Persisted by the final commit_confirmed_plan_cas.
         if let Some(pd) = proposal.directions.get_mut(idx) {
@@ -865,7 +999,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     // bailed without marking confirmed). The !applied branch is kept purely defensively: should it
     // ever fire, roll back the lanes created in this attempt and bail so the plan is NOT left
     // "confirmed" with stale lanes.
-    let new_json = serde_json::to_string(&proposal)?;
+    let new_json = proposal_json_with_hints(&proposal, &start_plan.proposal)?;
     if !repo::commit_confirmed_plan_cas(
         db,
         thread_id,
@@ -923,11 +1057,16 @@ fn fully_decided(p: &Proposal) -> bool {
 /// thread_gate hold), so this CAS is expected to always apply in production — kept
 /// defensive (like `confirm`'s final commit) rather than propagated as an error, because the
 /// caller's OWN action (the approve/deny that got us here) already succeeded regardless.
-async fn auto_settle_if_fully_decided(db: &Db, thread_id: i32, proposal: &Proposal) {
+async fn auto_settle_if_fully_decided(
+    db: &Db,
+    thread_id: i32,
+    proposal: &Proposal,
+    baseline: &str,
+) {
     if !fully_decided(proposal) {
         return;
     }
-    if let Ok(json) = serde_json::to_string(proposal) {
+    if let Ok(json) = proposal_json_with_hints(proposal, baseline) {
         let _ = repo::mark_plan_confirmed_cas(db, thread_id, &json, "proposed").await;
     }
 }
@@ -940,16 +1079,30 @@ async fn auto_settle_if_fully_decided(db: &Db, thread_id: i32, proposal: &Propos
 /// Idempotent on re-approve: if the direction already exists, its id is
 /// returned and a differing `tool` pick is ignored — the first pick wins.
 pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str) -> Result<i32> {
+    approve_direction_with_pin(db, thread_id, index, Some(tool)).await
+}
+
+/// Approve one lane with an optional explicit manual pin. `None` is the
+/// automatic-routing path used by the Needs-you card when the user has not
+/// selected an override; `Some` is a user choice and therefore always wins.
+pub async fn approve_direction_with_pin(
+    db: &Db,
+    thread_id: i32,
+    index: usize,
+    manual_tool: Option<&str>,
+) -> Result<i32> {
     // Serialize all plan mutations for this thread (see `thread_gate`): a concurrent
     // approve/confirm/save_proposal for the same thread can no longer interleave with this read →
     // CAS → materialize, so the existing CAS-then-materialize-then-revert ordering is race-free.
     let gate = thread_gate(thread_id);
     let _gate = gate.lock().await;
-    if !crate::detect::TOOL_PRIORITY.contains(&tool) {
-        anyhow::bail!(
-            "unknown tool {tool:?}; expected one of {:?}",
-            crate::detect::TOOL_PRIORITY
-        );
+    if let Some(tool) = manual_tool {
+        if !crate::detect::TOOL_PRIORITY.contains(&tool) {
+            anyhow::bail!(
+                "unknown tool {tool:?}; expected one of {:?}",
+                crate::detect::TOOL_PRIORITY
+            );
+        }
     }
     let plan = repo::get_plan(db, thread_id)
         .await?
@@ -960,6 +1113,10 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         .get(index)
         .ok_or_else(|| anyhow::anyhow!("write trigger {index} out of range"))?
         .clone();
+    let hint = hint_from_value(
+        &serde_json::from_str::<Value>(&plan.proposal).unwrap_or_else(|_| Value::Null),
+        index,
+    );
     let repos = workspace_repos(db, thread_id).await?;
     let resolved = resolve(&pd, &repos);
     if !resolved.repo.known {
@@ -1109,9 +1266,10 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
             if let Some(d) = reverted.directions.get_mut(index) {
                 d.decision = String::new();
             }
-            if let (Ok(approved_json), Ok(reverted_json)) =
-                (serde_json::to_string(&proposal), serde_json::to_string(&reverted))
-            {
+            if let (Ok(approved_json), Ok(reverted_json)) = (
+                proposal_json_with_hints(&proposal, &plan.proposal),
+                proposal_json_with_hints(&reverted, &plan.proposal),
+            ) {
                 let _ = repo::update_plan_proposal_cas(
                     db,
                     thread_id,
@@ -1129,14 +1287,34 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
             }
             return Err(err);
         }
-        auto_settle_if_fully_decided(db, thread_id, &proposal).await;
+        auto_settle_if_fully_decided(db, thread_id, &proposal, &plan.proposal).await;
         return Ok(id);
     }
+    let legacy_tool = crate::tools::default_tool(db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        db,
+        manual_tool,
+        &legacy_tool,
+        hint,
+    )
+    .await;
+    let Some(selected_tool) = route.selected() else {
+        crate::engine_routing::record_decision(
+            db,
+            thread_id,
+            None,
+            None,
+            "planner_approve",
+            &route,
+        )
+        .await;
+        anyhow::bail!("engine_route_blocked:{}", route.reason_code());
+    };
     let dir = repo::create_direction(
         db,
         thread_id,
         &resolved.name,
-        tool,
+        selected_tool.as_str(),
         resolved.repo.repo_id,
         &resolved.reason,
         &resolved.mandate,
@@ -1165,7 +1343,16 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         let _ = materialize::rollback_direction(db, dir.id).await;
         return Err(err);
     }
-    auto_settle_if_fully_decided(db, thread_id, &proposal).await;
+    crate::engine_routing::record_decision(
+        db,
+        thread_id,
+        None,
+        Some(dir.id),
+        "planner_approve",
+        &route,
+    )
+    .await;
+    auto_settle_if_fully_decided(db, thread_id, &proposal, &plan.proposal).await;
     Ok(dir.id)
 }
 
@@ -1187,7 +1374,7 @@ pub async fn deny_direction(db: &Db, thread_id: i32, index: usize) -> Result<(St
     pd.decision = "denied".to_string();
     let info = (pd.name.clone(), pd.repo.clone());
     persist_decision(db, thread_id, &proposal, &plan).await?;
-    auto_settle_if_fully_decided(db, thread_id, &proposal).await;
+    auto_settle_if_fully_decided(db, thread_id, &proposal, &plan.proposal).await;
     Ok(info)
 }
 
@@ -1272,7 +1459,7 @@ async fn persist_decision(
     proposal: &Proposal,
     plan: &crate::store::entities::plan::Model,
 ) -> Result<()> {
-    let json = serde_json::to_string(proposal)?;
+    let json = proposal_json_with_hints(proposal, &plan.proposal)?;
     // CAS on the proposal we read (`plan.proposal`): if a lead re-proposal landed between
     // our read and this write, the stored proposal no longer matches, and we reject rather
     // than clobbering the fresh re-propose with our stale full proposal (the frontend's
@@ -1294,6 +1481,8 @@ pub struct PendingWrite {
     pub repo_name: String,
     pub reason: String,
     pub base_branch: String,
+    pub hint: crate::engine_routing::RoutingHint,
+    pub route: Option<crate::engine_routing::RouteDecision>,
 }
 
 /// The pending write declarations for a thread (known repo + undecided).
@@ -1315,6 +1504,8 @@ pub async fn pending_writes(db: &Db, thread_id: i32) -> Result<Vec<PendingWrite>
                 repo_name: d.repo.repo_name.clone(),
                 reason: d.reason.clone(),
                 base_branch: d.base_branch.clone(),
+                hint: d.hint,
+                route: d.route.clone(),
             });
         }
     }

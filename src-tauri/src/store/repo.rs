@@ -485,6 +485,21 @@ fn curator_thread_key(workspace_id: i32) -> String {
     format!("curator.thread.{workspace_id}")
 }
 
+/// Return the hidden curator thread id when it has already been created. This
+/// is read-only and never creates a chat just to attach an analysis marker.
+pub async fn curator_thread_for_workspace(db: &Db, workspace_id: i32) -> Result<Option<i32>> {
+    let Some(id) = get_setting(db, &curator_thread_key(workspace_id))
+        .await?
+        .and_then(|value| value.parse::<i32>().ok())
+    else {
+        return Ok(None);
+    };
+    match get_thread(db, id).await? {
+        Some(thread) if thread.kind == "curator" => Ok(Some(id)),
+        _ => Ok(None),
+    }
+}
+
 /// Get-or-create the hidden curator-chat thread for a workspace (mirrors the
 /// Concierge get-or-create). The id is stable (persisted in app_setting); the
 /// thread is `kind="curator"` so board views can filter it out.
@@ -618,6 +633,18 @@ pub async fn get_repo(db: &Db, repo_id: i32) -> Result<Option<repo_ref::Model>> 
 
 pub async fn get_thread(db: &Db, thread_id: i32) -> Result<Option<thread::Model>> {
     Ok(thread::Entity::find_by_id(thread_id).one(&db.0).await?)
+}
+
+/// Update only a thread's persisted lead tool. Automatic routing uses this
+/// when a previously blocked, not-yet-started lead becomes eligible; manual
+/// switches use the transactional switch path instead.
+pub async fn set_thread_tool(db: &Db, thread_id: i32, tool: &str) -> Result<()> {
+    thread::Entity::update_many()
+        .col_expr(thread::Column::LeadTool, Expr::value(tool.to_string()))
+        .filter(thread::Column::Id.eq(thread_id))
+        .exec(&db.0)
+        .await?;
+    Ok(())
 }
 
 /// Display-title only; slug stays (see rename_workspace).

@@ -1,0 +1,979 @@
+//! One global engine-routing policy shared by every Weft-owned agent surface.
+//!
+//! The resolver is deliberately pure at its decision boundary.  The small async
+//! wrapper below only reads the global settings, installed commands, and the
+//! structured quota hub before handing plain values to [`resolve`].  No agent
+//! payload can select a tool: the only planner hint accepted by the wrapper is
+//! `normal` or `deep`, and the tool pool is closed here to Codex and Claude.
+
+use crate::engine_quota::{QuotaSnapshot, QuotaStatus};
+use crate::store::{repo, Db};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+pub const K_AUTOMATIC_ROUTING_ENABLED: &str = "automatic_engine_routing";
+pub const K_QUOTA_FAILOVER_ENABLED: &str = "quota_failover_on_exceeded";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineId {
+    Claude,
+    Codex,
+    Opencode,
+}
+
+impl EngineId {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Opencode => "opencode",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "opencode" => Some(Self::Opencode),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingHint {
+    #[default]
+    Normal,
+    Deep,
+}
+
+impl RoutingHint {
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("deep") => Self::Deep,
+            _ => Self::Normal,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Deep => "deep",
+        }
+    }
+
+    fn preferred(self) -> EngineId {
+        match self {
+            Self::Normal => EngineId::Codex,
+            Self::Deep => EngineId::Claude,
+        }
+    }
+
+    fn alternate(self) -> EngineId {
+        match self {
+            Self::Normal => EngineId::Claude,
+            Self::Deep => EngineId::Codex,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingSource {
+    Manual,
+    Automatic,
+    Legacy,
+    Blocked,
+}
+
+impl RoutingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Automatic => "automatic",
+            Self::Legacy => "legacy",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteReason {
+    AutomaticDisabled,
+    ManualPin,
+    NormalPreference,
+    DeepPreference,
+    PreferredWarning,
+    PreferredUnavailable,
+    QuotaUnknown,
+    LegacyFallback,
+    NoAutomaticCandidate,
+    AutomaticCandidateUnavailable,
+    BothAutomaticCandidatesExceeded,
+    InvalidManualTool,
+    ManualToolUnavailable,
+}
+
+impl RouteReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AutomaticDisabled => "automatic_disabled",
+            Self::ManualPin => "manual_pin",
+            Self::NormalPreference => "normal_preference",
+            Self::DeepPreference => "deep_preference",
+            Self::PreferredWarning => "preferred_warning",
+            Self::PreferredUnavailable => "preferred_unavailable",
+            Self::QuotaUnknown => "quota_unknown",
+            Self::LegacyFallback => "legacy_fallback",
+            Self::NoAutomaticCandidate => "no_automatic_candidate",
+            Self::AutomaticCandidateUnavailable => "automatic_candidate_unavailable",
+            Self::BothAutomaticCandidatesExceeded => "both_automatic_candidates_exceeded",
+            Self::InvalidManualTool => "invalid_manual_tool",
+            Self::ManualToolUnavailable => "manual_tool_unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RouteCandidate {
+    pub tool: EngineId,
+    pub installed: bool,
+    pub quota: Option<QuotaStatus>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteRequest {
+    pub automatic_enabled: bool,
+    pub manual_tool: Option<EngineId>,
+    pub legacy_tool: EngineId,
+    pub hint: RoutingHint,
+    pub candidates: Vec<RouteCandidate>,
+}
+
+/// The one decision returned to callers.  A blocked result has no tool by
+/// construction, so callers cannot accidentally launch a known-exhausted or
+/// otherwise ineligible engine.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RouteDecision {
+    pub tool: Option<EngineId>,
+    pub source: RoutingSource,
+    pub reason: RouteReason,
+    pub hint: RoutingHint,
+    pub quota: Option<QuotaStatus>,
+    pub blocked: bool,
+}
+
+impl RouteDecision {
+    pub fn selected(&self) -> Option<EngineId> {
+        if self.blocked {
+            None
+        } else {
+            self.tool
+        }
+    }
+
+    pub fn reason_code(&self) -> &'static str {
+        self.reason.as_str()
+    }
+}
+
+fn candidate<'a>(candidates: &'a [RouteCandidate], tool: EngineId) -> Option<&'a RouteCandidate> {
+    candidates.iter().find(|candidate| candidate.tool == tool)
+}
+
+fn quota_rank(status: Option<QuotaStatus>) -> u8 {
+    match status {
+        Some(QuotaStatus::Ok) => 0,
+        None => 1,
+        Some(QuotaStatus::Warning) => 2,
+        Some(QuotaStatus::Exceeded) => 3,
+    }
+}
+
+fn selected(
+    tool: EngineId,
+    source: RoutingSource,
+    reason: RouteReason,
+    hint: RoutingHint,
+    quota: Option<QuotaStatus>,
+) -> RouteDecision {
+    RouteDecision {
+        tool: Some(tool),
+        source,
+        reason,
+        hint,
+        quota,
+        blocked: false,
+    }
+}
+
+fn blocked(reason: RouteReason, hint: RoutingHint) -> RouteDecision {
+    RouteDecision {
+        tool: None,
+        source: RoutingSource::Blocked,
+        reason,
+        hint,
+        quota: None,
+        blocked: true,
+    }
+}
+
+/// Resolve a new participant or an unstarted dispatch.
+pub fn resolve(request: &RouteRequest) -> RouteDecision {
+    if let Some(manual) = request.manual_tool {
+        let Some(candidate) = candidate(&request.candidates, manual) else {
+            return blocked(RouteReason::ManualToolUnavailable, request.hint);
+        };
+        // An explicit user pin is never rewritten by an automatic policy. If
+        // its command is currently missing, let the normal spawn error explain
+        // that fact rather than silently choosing another engine.
+        return selected(
+            manual,
+            RoutingSource::Manual,
+            RouteReason::ManualPin,
+            request.hint,
+            candidate.quota,
+        );
+    }
+
+    let legacy = candidate(&request.candidates, request.legacy_tool);
+    if !request.automatic_enabled {
+        let quota = legacy.and_then(|candidate| candidate.quota);
+        return selected(
+            request.legacy_tool,
+            RoutingSource::Legacy,
+            RouteReason::AutomaticDisabled,
+            request.hint,
+            quota,
+        );
+    }
+
+    let preferred = request.hint.preferred();
+    let alternate = request.hint.alternate();
+    let preferred_candidate = candidate(&request.candidates, preferred);
+    let alternate_candidate = candidate(&request.candidates, alternate);
+    let both_exceeded = [preferred_candidate, alternate_candidate]
+        .into_iter()
+        .all(|candidate| {
+            candidate.is_some_and(|candidate| {
+                candidate.installed && candidate.quota == Some(QuotaStatus::Exceeded)
+            })
+        });
+
+    let mut eligible: Vec<&RouteCandidate> = [preferred_candidate, alternate_candidate]
+        .into_iter()
+        .flatten()
+        .filter(|candidate| candidate.installed && candidate.quota != Some(QuotaStatus::Exceeded))
+        .collect();
+    eligible.sort_by_key(|candidate| {
+        let preference = if candidate.tool == preferred { 0 } else { 1 };
+        (quota_rank(candidate.quota), preference)
+    });
+
+    if let Some(choice) = eligible.first().copied() {
+        let reason = if choice.tool == preferred {
+            match choice.quota {
+                Some(QuotaStatus::Warning) => RouteReason::PreferredWarning,
+                None => RouteReason::QuotaUnknown,
+                Some(QuotaStatus::Ok) => match request.hint {
+                    RoutingHint::Normal => RouteReason::NormalPreference,
+                    RoutingHint::Deep => RouteReason::DeepPreference,
+                },
+                Some(QuotaStatus::Exceeded) => RouteReason::PreferredUnavailable,
+            }
+        } else {
+            match preferred_candidate {
+                Some(candidate) if candidate.quota == Some(QuotaStatus::Warning) => {
+                    RouteReason::PreferredWarning
+                }
+                _ => RouteReason::PreferredUnavailable,
+            }
+        };
+        return selected(
+            choice.tool,
+            RoutingSource::Automatic,
+            reason,
+            request.hint,
+            choice.quota,
+        );
+    }
+
+    if both_exceeded {
+        return blocked(RouteReason::BothAutomaticCandidatesExceeded, request.hint);
+    }
+
+    // OpenCode remains a manual/legacy engine, never an automatic fallback.
+    // A configured Codex/Claude legacy identity can still preserve the old
+    // default behavior when the automatic pool has no usable reading.
+    if request.legacy_tool != EngineId::Opencode {
+        if let Some(legacy) = legacy {
+            if legacy.installed && legacy.quota != Some(QuotaStatus::Exceeded) {
+                return selected(
+                    request.legacy_tool,
+                    RoutingSource::Legacy,
+                    RouteReason::LegacyFallback,
+                    request.hint,
+                    legacy.quota,
+                );
+            }
+        }
+    }
+
+    if preferred_candidate.is_some_and(|candidate| candidate.quota == Some(QuotaStatus::Exceeded))
+        || alternate_candidate
+            .is_some_and(|candidate| candidate.quota == Some(QuotaStatus::Exceeded))
+    {
+        return blocked(RouteReason::AutomaticCandidateUnavailable, request.hint);
+    }
+    blocked(RouteReason::NoAutomaticCandidate, request.hint)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailoverSkipReason {
+    Disabled,
+    ManualPin,
+    NotExceeded,
+    NoFallback,
+    CooldownActive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailoverBlockedReason {
+    FallbackUnavailable,
+    BothAutomaticCandidatesExceeded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailoverDecision {
+    SwitchTo {
+        tool: EngineId,
+        quota: Option<QuotaStatus>,
+    },
+    Skip(FailoverSkipReason),
+    Blocked(FailoverBlockedReason),
+}
+
+/// Resolve the only automatic mid-task transition.  The caller invokes this
+/// exclusively at the existing failed-turn boundary; this function itself never
+/// knows about or interrupts a healthy engine.
+pub fn resolve_failover(
+    current: EngineId,
+    enabled: bool,
+    manual_pin: bool,
+    current_quota: Option<QuotaStatus>,
+    fallback: Option<&RouteCandidate>,
+    cooldown_ok: bool,
+) -> FailoverDecision {
+    if !enabled {
+        return FailoverDecision::Skip(FailoverSkipReason::Disabled);
+    }
+    if manual_pin {
+        return FailoverDecision::Skip(FailoverSkipReason::ManualPin);
+    }
+    if current_quota != Some(QuotaStatus::Exceeded) {
+        return FailoverDecision::Skip(FailoverSkipReason::NotExceeded);
+    }
+    let expected = match current {
+        EngineId::Claude => EngineId::Codex,
+        EngineId::Codex => EngineId::Claude,
+        EngineId::Opencode => return FailoverDecision::Skip(FailoverSkipReason::NoFallback),
+    };
+    let Some(fallback) = fallback else {
+        return FailoverDecision::Skip(FailoverSkipReason::NoFallback);
+    };
+    if fallback.tool != expected || !fallback.installed {
+        return FailoverDecision::Blocked(FailoverBlockedReason::FallbackUnavailable);
+    }
+    if fallback.quota == Some(QuotaStatus::Exceeded) {
+        return FailoverDecision::Blocked(FailoverBlockedReason::BothAutomaticCandidatesExceeded);
+    }
+    if !cooldown_ok {
+        return FailoverDecision::Skip(FailoverSkipReason::CooldownActive);
+    }
+    FailoverDecision::SwitchTo {
+        tool: expected,
+        quota: fallback.quota,
+    }
+}
+
+fn is_enabled(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1" | "true" | "on" | "yes"))
+}
+
+fn snapshots_by_tool() -> Vec<QuotaSnapshot> {
+    crate::engine_quota::all()
+}
+
+fn candidate_for(tool: EngineId, snapshots: &[QuotaSnapshot]) -> RouteCandidate {
+    let command = crate::tool_command::command_for(tool.as_str());
+    let installed = crate::detect::resolve_tool_path(&command).is_some();
+    let quota = snapshots
+        .iter()
+        .find(|snapshot| snapshot.tool == tool.as_str())
+        .map(|snapshot| snapshot.status);
+    RouteCandidate {
+        tool,
+        installed,
+        quota,
+    }
+}
+
+fn candidate_list() -> Vec<RouteCandidate> {
+    let snapshots = snapshots_by_tool();
+    [EngineId::Codex, EngineId::Claude, EngineId::Opencode]
+        .into_iter()
+        .map(|tool| candidate_for(tool, &snapshots))
+        .collect()
+}
+
+/// Read the one global setting and resolve a request against the live local
+/// installation/quota state. Invalid manual identities are blocked rather than
+/// silently transformed into a different engine.
+pub async fn resolve_for_db(
+    db: &Db,
+    manual_tool: Option<&str>,
+    legacy_tool: &str,
+    hint: RoutingHint,
+) -> RouteDecision {
+    let automatic_enabled = is_enabled(
+        repo::get_setting(db, K_AUTOMATIC_ROUTING_ENABLED)
+            .await
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
+    let legacy = EngineId::parse(legacy_tool).unwrap_or(EngineId::Codex);
+    let Some(manual_tool) = manual_tool else {
+        return resolve(&RouteRequest {
+            automatic_enabled,
+            manual_tool: None,
+            legacy_tool: legacy,
+            hint,
+            candidates: candidate_list(),
+        });
+    };
+    let Some(manual) = EngineId::parse(manual_tool) else {
+        return blocked(RouteReason::InvalidManualTool, hint);
+    };
+    resolve(&RouteRequest {
+        automatic_enabled,
+        manual_tool: Some(manual),
+        legacy_tool: legacy,
+        hint,
+        candidates: candidate_list(),
+    })
+}
+
+pub async fn quota_failover_for_db(
+    db: &Db,
+    current: &str,
+    manual_pin: bool,
+    cooldown_ok: bool,
+) -> FailoverDecision {
+    let enabled = is_enabled(
+        repo::get_setting(db, K_QUOTA_FAILOVER_ENABLED)
+            .await
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
+    let Some(current) = EngineId::parse(current) else {
+        return FailoverDecision::Skip(FailoverSkipReason::NoFallback);
+    };
+    let candidates = candidate_list();
+    let current_quota = candidate(&candidates, current).and_then(|candidate| candidate.quota);
+    let fallback_tool = match current {
+        EngineId::Claude => Some(EngineId::Codex),
+        EngineId::Codex => Some(EngineId::Claude),
+        EngineId::Opencode => None,
+    };
+    let fallback = fallback_tool.and_then(|tool| candidate(&candidates, tool));
+    resolve_failover(
+        current,
+        enabled,
+        manual_pin,
+        current_quota,
+        fallback,
+        cooldown_ok,
+    )
+}
+
+fn quota_code(quota: Option<QuotaStatus>) -> Option<&'static str> {
+    match quota {
+        Some(QuotaStatus::Ok) => Some("ok"),
+        Some(QuotaStatus::Warning) => Some("warning"),
+        Some(QuotaStatus::Exceeded) => Some("exceeded"),
+        None => None,
+    }
+}
+
+/// Persist an automatic/manual route decision as a normal timeline marker.  It
+/// is intentionally best-effort: a marker failure must not turn a successful
+/// engine start into a failed start, while the selected engine itself remains
+/// the durable thread/direction/session value.
+pub async fn record_decision(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    direction_id: Option<i32>,
+    operation: &str,
+    decision: &RouteDecision,
+) {
+    if decision.source == RoutingSource::Legacy && decision.reason == RouteReason::AutomaticDisabled
+    {
+        return;
+    }
+    let kind = if decision.blocked {
+        "engine_route_blocked"
+    } else {
+        "engine_route"
+    };
+    let content = json!({
+        "tool": decision.tool.map(EngineId::as_str),
+        "source": decision.source.as_str(),
+        "reason": decision.reason.as_str(),
+        "hint": decision.hint.as_str(),
+        "quota_status": quota_code(decision.quota),
+        "direction_id": direction_id,
+        "operation": operation,
+    })
+    .to_string();
+    let turn_id = match repo::next_turn_id(db, thread_id).await {
+        Ok(turn) => turn,
+        Err(err) => {
+            eprintln!("[weft] engine-route marker turn lookup failed: {err}");
+            return;
+        }
+    };
+    match repo::insert_lead_message(
+        db, thread_id, session_id, turn_id, "system", kind, &content, "complete",
+    )
+    .await
+    {
+        Ok(message) => {
+            if let Some(app) = crate::APP_HANDLE.get() {
+                use tauri::Emitter;
+                let _ = app.emit(
+                    crate::lead_chat::engine::EVENT,
+                    crate::lead_chat::engine::Push::Message { thread_id, message },
+                );
+            }
+        }
+        Err(err) => eprintln!("[weft] engine-route marker insert failed: {err}"),
+    }
+}
+
+pub async fn record_failover_blocked(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    current: &str,
+    fallback: Option<&str>,
+    reason: &str,
+) {
+    let content = json!({
+        "tool": current,
+        "fallback": fallback,
+        "source": "quota_failover",
+        "reason": reason,
+        "quota_status": "exceeded",
+    })
+    .to_string();
+    let turn_id = match repo::next_turn_id(db, thread_id).await {
+        Ok(turn) => turn,
+        Err(err) => {
+            eprintln!("[weft] quota-route marker turn lookup failed: {err}");
+            return;
+        }
+    };
+    match repo::insert_lead_message(
+        db,
+        thread_id,
+        session_id,
+        turn_id,
+        "system",
+        "engine_route_blocked",
+        &content,
+        "complete",
+    )
+    .await
+    {
+        Ok(message) => {
+            if let Some(app) = crate::APP_HANDLE.get() {
+                use tauri::Emitter;
+                let _ = app.emit(
+                    crate::lead_chat::engine::EVENT,
+                    crate::lead_chat::engine::Push::Message { thread_id, message },
+                );
+            }
+        }
+        Err(err) => eprintln!("[weft] quota-route marker insert failed: {err}"),
+    }
+}
+
+/// Re-check only a lead that was previously blocked before it has ever started.
+/// Existing healthy/running leads never enter this path, and an old thread with
+/// no route marker is deliberately left on its persisted legacy tool.
+pub async fn prepare_blocked_lead(
+    db: &Db,
+    thread: &crate::store::entities::thread::Model,
+) -> anyhow::Result<crate::store::entities::thread::Model> {
+    // A status row means this participant has already been started at least
+    // once. Initial routing is not a license to rebalance it on a later
+    // resume, even if the quota/installation snapshot has changed.
+    if repo::lead_status(db, thread.id)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Ok(thread.clone());
+    }
+    let messages = repo::list_lead_messages(db, thread.id)
+        .await
+        .unwrap_or_default();
+    let Some((blocked_index, blocked_marker)) =
+        messages.iter().enumerate().rev().find(|(_, message)| {
+            let message = *message;
+            if message.session_id.is_some() || message.kind != "engine_route_blocked" {
+                return false;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
+                return false;
+            };
+            let source = value.get("source").and_then(|source| source.as_str());
+            let operation = value
+                .get("operation")
+                .and_then(|operation| operation.as_str());
+            source != Some("quota_failover")
+                && matches!(
+                    operation,
+                    Some("new_thread")
+                        | Some("new_issue")
+                        | Some("curator_start")
+                        | Some("concierge_start")
+                )
+        })
+    else {
+        return Ok(thread.clone());
+    };
+    // Once the blocked initial route has been resolved, a later route/switch
+    // marker is the durable witness that this participant has already made its
+    // one pre-start choice. Do not reinterpret it on a later resume or move a
+    // healthy task because the availability snapshot changed.
+    if messages.iter().skip(blocked_index + 1).any(|message| {
+        message.session_id.is_none()
+            && (message.kind == "engine_route" || message.kind == "engine_switch")
+    }) {
+        return Ok(thread.clone());
+    }
+    let hint = serde_json::from_str::<serde_json::Value>(&blocked_marker.content)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("hint")
+                .and_then(|hint| hint.as_str())
+                .map(|hint| RoutingHint::parse(Some(hint)))
+        })
+        .unwrap_or_default();
+    let decision = resolve_for_db(db, None, &thread.lead_tool, hint).await;
+    let Some(tool) = decision.selected() else {
+        anyhow::bail!("engine_route_blocked:{}", decision.reason_code());
+    };
+    if tool.as_str() != thread.lead_tool {
+        repo::set_thread_tool(db, thread.id, tool.as_str()).await?;
+    }
+    record_decision(db, thread.id, None, None, "lead_start", &decision).await;
+    let mut refreshed = thread.clone();
+    refreshed.lead_tool = tool.as_str().to_string();
+    Ok(refreshed)
+}
+
+/// Copy the direction-level route explanation into the worker's own timeline,
+/// once a session id exists.  This keeps both the lead/board and worker session
+/// surfaces honest without creating a second routing policy.
+pub async fn mirror_direction_route(db: &Db, thread_id: i32, direction_id: i32, session_id: i32) {
+    let messages = repo::list_lead_messages(db, thread_id)
+        .await
+        .unwrap_or_default();
+    if messages
+        .iter()
+        .any(|message| message.session_id == Some(session_id) && message.kind == "engine_route")
+    {
+        return;
+    }
+    let Some(source) = messages.into_iter().rev().find(|message| {
+        if message.kind != "engine_route" || message.session_id.is_some() {
+            return false;
+        }
+        serde_json::from_str::<serde_json::Value>(&message.content)
+            .ok()
+            .and_then(|value| value.get("direction_id").and_then(|id| id.as_i64()))
+            .is_some_and(|id| id == i64::from(direction_id))
+    }) else {
+        return;
+    };
+    let turn_id = match repo::next_turn_id(db, thread_id).await {
+        Ok(turn) => turn,
+        Err(_) => return,
+    };
+    let _ = repo::insert_lead_message(
+        db,
+        thread_id,
+        Some(session_id),
+        turn_id,
+        "system",
+        "engine_route",
+        &source.content,
+        "complete",
+    )
+    .await;
+}
+
+/// Manual pin detection is intentionally based on durable user/manual markers,
+/// not on the current tool string (an automatic route also writes that string).
+/// This keeps quota fail-over from overwriting an explicit switch or approval.
+pub async fn has_manual_pin(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    direction_id: Option<i32>,
+) -> bool {
+    let messages = repo::list_lead_messages(db, thread_id)
+        .await
+        .unwrap_or_default();
+    messages.into_iter().rev().any(|message| {
+        if message.session_id != session_id && message.session_id.is_some() {
+            return false;
+        }
+        if message.kind == "engine_switch" && message.session_id == session_id {
+            return serde_json::from_str::<serde_json::Value>(&message.content)
+                .ok()
+                .and_then(|value| value.get("reason").cloned())
+                .is_some_and(|reason| reason.is_null());
+        }
+        if message.kind != "engine_route" {
+            return false;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
+            return false;
+        };
+        if value.get("source").and_then(|source| source.as_str()) != Some("manual") {
+            return false;
+        }
+        if message.session_id == session_id {
+            return true;
+        }
+        let Some(direction_id) = direction_id else {
+            return false;
+        };
+        value
+            .get("direction_id")
+            .and_then(|id| id.as_i64())
+            .is_some_and(|id| id == i64::from(direction_id))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(tool: EngineId, installed: bool, quota: Option<QuotaStatus>) -> RouteCandidate {
+        RouteCandidate {
+            tool,
+            installed,
+            quota,
+        }
+    }
+
+    fn request(
+        automatic_enabled: bool,
+        manual_tool: Option<EngineId>,
+        legacy_tool: EngineId,
+        hint: RoutingHint,
+        candidates: Vec<RouteCandidate>,
+    ) -> RouteRequest {
+        RouteRequest {
+            automatic_enabled,
+            manual_tool,
+            legacy_tool,
+            hint,
+            candidates,
+        }
+    }
+
+    #[test]
+    fn routing_disabled_preserves_legacy_tool() {
+        let out = resolve(&request(
+            false,
+            None,
+            EngineId::Opencode,
+            RoutingHint::Normal,
+            vec![candidate(
+                EngineId::Codex,
+                true,
+                Some(QuotaStatus::Exceeded),
+            )],
+        ));
+        assert_eq!(out.selected(), Some(EngineId::Opencode));
+        assert_eq!(out.reason, RouteReason::AutomaticDisabled);
+    }
+
+    #[test]
+    fn normal_prefers_codex_and_deep_prefers_claude() {
+        let candidates = vec![
+            candidate(EngineId::Codex, true, Some(QuotaStatus::Ok)),
+            candidate(EngineId::Claude, true, Some(QuotaStatus::Ok)),
+        ];
+        assert_eq!(
+            resolve(&request(
+                true,
+                None,
+                EngineId::Opencode,
+                RoutingHint::Normal,
+                candidates.clone()
+            ))
+            .selected(),
+            Some(EngineId::Codex)
+        );
+        assert_eq!(
+            resolve(&request(
+                true,
+                None,
+                EngineId::Opencode,
+                RoutingHint::Deep,
+                candidates
+            ))
+            .selected(),
+            Some(EngineId::Claude)
+        );
+    }
+
+    #[test]
+    fn manual_pin_wins_even_when_quota_is_exceeded() {
+        let out = resolve(&request(
+            true,
+            Some(EngineId::Claude),
+            EngineId::Codex,
+            RoutingHint::Normal,
+            vec![
+                candidate(EngineId::Codex, true, Some(QuotaStatus::Ok)),
+                candidate(EngineId::Claude, true, Some(QuotaStatus::Exceeded)),
+            ],
+        ));
+        assert_eq!(out.selected(), Some(EngineId::Claude));
+        assert_eq!(out.source, RoutingSource::Manual);
+    }
+
+    #[test]
+    fn warning_is_soft_and_does_not_force_a_running_switch() {
+        let out = resolve(&request(
+            true,
+            None,
+            EngineId::Opencode,
+            RoutingHint::Normal,
+            vec![
+                candidate(EngineId::Codex, true, Some(QuotaStatus::Warning)),
+                candidate(EngineId::Claude, true, Some(QuotaStatus::Ok)),
+            ],
+        ));
+        assert_eq!(out.selected(), Some(EngineId::Claude));
+        assert_eq!(out.reason, RouteReason::PreferredWarning);
+    }
+
+    #[test]
+    fn exceeded_candidate_is_excluded() {
+        let out = resolve(&request(
+            true,
+            None,
+            EngineId::Opencode,
+            RoutingHint::Normal,
+            vec![
+                candidate(EngineId::Codex, true, Some(QuotaStatus::Exceeded)),
+                candidate(EngineId::Claude, true, Some(QuotaStatus::Ok)),
+            ],
+        ));
+        assert_eq!(out.selected(), Some(EngineId::Claude));
+        assert_eq!(out.reason, RouteReason::PreferredUnavailable);
+    }
+
+    #[test]
+    fn both_exhausted_are_blocked_without_opencode_auto_selection() {
+        let out = resolve(&request(
+            true,
+            None,
+            EngineId::Opencode,
+            RoutingHint::Normal,
+            vec![
+                candidate(EngineId::Codex, true, Some(QuotaStatus::Exceeded)),
+                candidate(EngineId::Claude, true, Some(QuotaStatus::Exceeded)),
+                candidate(EngineId::Opencode, true, Some(QuotaStatus::Ok)),
+            ],
+        ));
+        assert!(out.blocked);
+        assert_eq!(out.reason, RouteReason::BothAutomaticCandidatesExceeded);
+    }
+
+    #[test]
+    fn opencode_is_not_an_automatic_fallback_when_the_pool_is_unavailable() {
+        let out = resolve(&request(
+            true,
+            None,
+            EngineId::Opencode,
+            RoutingHint::Normal,
+            vec![
+                candidate(EngineId::Codex, false, None),
+                candidate(EngineId::Claude, false, None),
+                candidate(EngineId::Opencode, true, Some(QuotaStatus::Ok)),
+            ],
+        ));
+        assert!(out.blocked);
+        assert_eq!(out.reason, RouteReason::NoAutomaticCandidate);
+    }
+
+    #[test]
+    fn quota_failover_is_opt_in_and_respects_manual_pin() {
+        let fallback = candidate(EngineId::Claude, true, Some(QuotaStatus::Ok));
+        assert_eq!(
+            resolve_failover(
+                EngineId::Codex,
+                false,
+                false,
+                Some(QuotaStatus::Exceeded),
+                Some(&fallback),
+                true,
+            ),
+            FailoverDecision::Skip(FailoverSkipReason::Disabled)
+        );
+        assert_eq!(
+            resolve_failover(
+                EngineId::Codex,
+                true,
+                true,
+                Some(QuotaStatus::Exceeded),
+                Some(&fallback),
+                true,
+            ),
+            FailoverDecision::Skip(FailoverSkipReason::ManualPin)
+        );
+    }
+
+    #[test]
+    fn quota_failover_blocks_when_both_candidates_are_exhausted() {
+        let fallback = candidate(EngineId::Claude, true, Some(QuotaStatus::Exceeded));
+        assert_eq!(
+            resolve_failover(
+                EngineId::Codex,
+                true,
+                false,
+                Some(QuotaStatus::Exceeded),
+                Some(&fallback),
+                true,
+            ),
+            FailoverDecision::Blocked(FailoverBlockedReason::BothAutomaticCandidatesExceeded)
+        );
+    }
+}

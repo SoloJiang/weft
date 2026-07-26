@@ -233,6 +233,7 @@ pub async fn lead_engine(
     if let Some(e) = state.get(lead_key(thread_id)) {
         return Ok(e);
     }
+    let t = crate::engine_routing::prepare_blocked_lead(db, &t).await?;
     let cwd = ensure_lead_cwd(thread_id)?;
     let base = app.state::<crate::BusBase>().0.clone();
     let is_concierge = t.kind == "concierge";
@@ -1204,6 +1205,21 @@ pub(crate) async fn chat_open_worker_impl(
         anyhow::bail!("worktree directory no longer exists for that direction+repo");
     }
 
+    // The persisted direction tool is the task's manual/previous route pin.
+    // Run it through the shared resolver for validation and mirror any
+    // automatic planner decision into this worker's own durable timeline.
+    let legacy_tool = crate::tools::default_tool(db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        db,
+        Some(&dir.tool),
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Normal,
+    )
+    .await;
+    if route.blocked {
+        anyhow::bail!("engine_route_blocked:{}", route.reason_code());
+    }
+
     // Resume an earlier conversation when this slot already captured one.
     let prior = repo::latest_session_for(db, direction_id, repo_id).await?;
     let native = prior.as_ref().and_then(|s| s.native_session_id.clone());
@@ -1212,6 +1228,7 @@ pub(crate) async fn chat_open_worker_impl(
         Some(s) if s.native_session_id.is_some() => s,
         _ => repo::create_session(db, direction_id, repo_id, &dir.tool, &wt.path).await?,
     };
+    crate::engine_routing::mirror_direction_route(db, dir.thread_id, direction_id, sess.id).await;
 
     let base = app.state::<crate::BusBase>().0.clone();
     let inj = crate::bus::inject::inject(
@@ -1562,6 +1579,10 @@ pub struct SwitchOutcome {
     /// distinctly so an auto fail-over is never mistaken for something the
     /// user clicked.
     pub reason: Option<String>,
+    /// Structured basis for an automatic quota switch. Human switches leave
+    /// this absent; the frontend localizes the stable value instead of parsing
+    /// free-form error text.
+    pub quota_basis: Option<String>,
 }
 
 /// A durable, visible timeline marker for a switch — same "system-owned,
@@ -1581,6 +1602,7 @@ async fn insert_switch_marker(
         "old_model": outcome.old_model,
         "new_model": outcome.new_model,
         "reason": outcome.reason,
+        "quota_basis": outcome.quota_basis,
     })
     .to_string();
     match repo::insert_lead_message(
@@ -1685,7 +1707,7 @@ pub async fn switch_lead_tool(
     model: Option<String>,
     lang: Option<String>,
 ) -> Result<SwitchOutcome, String> {
-    switch_lead_tool_inner(&app, &db, thread_id, tool, model, lang, None).await
+    switch_lead_tool_inner(&app, &db, thread_id, tool, model, lang, None, None).await
 }
 
 /// The body of [`switch_lead_tool`], taking plain refs instead of Tauri's
@@ -1704,6 +1726,7 @@ async fn switch_lead_tool_inner(
     model: Option<String>,
     lang: Option<String>,
     reason: Option<String>,
+    quota_basis: Option<String>,
 ) -> Result<SwitchOutcome, String> {
     if !KNOWN_TOOLS.contains(&tool.as_str()) {
         return Err(format!("unknown tool {tool:?}"));
@@ -1763,6 +1786,7 @@ async fn switch_lead_tool_inner(
         old_model: before.lead_model,
         new_model: model,
         reason,
+        quota_basis,
     };
     insert_switch_marker(app, db, thread_id, None, &outcome).await;
     Ok(outcome)
@@ -1796,7 +1820,7 @@ pub async fn switch_worker_tool(
     tool: String,
     model: Option<String>,
 ) -> Result<SwitchOutcome, String> {
-    switch_worker_tool_inner(&app, &db, session_id, tool, model, None).await
+    switch_worker_tool_inner(&app, &db, session_id, tool, model, None, None).await
 }
 
 /// The body of [`switch_worker_tool`] — see [`switch_lead_tool_inner`]'s doc
@@ -1809,6 +1833,7 @@ async fn switch_worker_tool_inner(
     tool: String,
     model: Option<String>,
     reason: Option<String>,
+    quota_basis: Option<String>,
 ) -> Result<SwitchOutcome, String> {
     if !KNOWN_TOOLS.contains(&tool.as_str()) {
         return Err(format!("unknown tool {tool:?}"));
@@ -1860,6 +1885,7 @@ async fn switch_worker_tool_inner(
         old_model: sess.model,
         new_model: model,
         reason,
+        quota_basis,
     };
     insert_switch_marker(app, db, dir.thread_id, Some(session_id), &outcome).await;
     Ok(outcome)
@@ -1872,25 +1898,13 @@ async fn switch_worker_tool_inner(
 /// opt-in: switching engines mid-task ships that engine's own history digest
 /// to a DIFFERENT provider, a cost/privacy tradeoff only the user should turn
 /// on (surfaced as a toggle in Settings → Automation).
-pub const K_QUOTA_FAILOVER_ENABLED: &str = "quota_failover_on_exceeded";
+pub const K_QUOTA_FAILOVER_ENABLED: &str = crate::engine_routing::K_QUOTA_FAILOVER_ENABLED;
 
 /// The reason tag [`maybe_failover_on_quota`] stamps on the [`SwitchOutcome`]
 /// it produces, so the timeline marker (and anything else reading
 /// `engine_switch` rows) can tell an auto fail-over apart from a switch the
 /// user clicked.
 pub const QUOTA_FAILOVER_REASON: &str = "quota_exceeded";
-
-/// The other half of Weft's two-engine fail-over pool, or `None` when `tool`
-/// isn't one Weft knows a fallback for (opencode, or a future/unknown
-/// identity — no auto-switch target). Pure: every case is a plain unit test,
-/// no DB/AppHandle required.
-fn fallback_tool(tool: &str) -> Option<&'static str> {
-    match tool {
-        "claude" => Some("codex"),
-        "codex" => Some("claude"),
-        _ => None,
-    }
-}
 
 /// Minimum gap between two auto fail-overs of the SAME (thread, session) —
 /// the storm-breaker alongside the "fallback isn't ALSO exceeded" check in
@@ -1909,13 +1923,9 @@ fn quota_failover_cooldowns() -> &'static std::sync::Mutex<std::collections::Has
     COOLDOWNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Read-only peek: would [`claim_quota_failover_slot`] currently refuse
-/// `key`? Doesn't mutate — [`decide_quota_failover`] folds this into its
-/// otherwise-pure "should we switch" verdict so the cooldown gate is covered
-/// by that function's own unit tests. `maybe_failover_on_quota` still calls
-/// the MUTATING `claim_quota_failover_slot` right before actually
-/// dispatching a switch (a peek alone can't claim: two decisions racing for
-/// the same key could otherwise both read "not active" and both switch).
+/// Read-only peek used before resolving the shared routing decision. The
+/// mutating claim still happens immediately before dispatch so two concurrent
+/// turn-end callbacks cannot both switch the same session.
 fn quota_failover_cooldown_active(key: QuotaFailoverKey) -> bool {
     let cooldowns = quota_failover_cooldowns()
         .lock()
@@ -1961,75 +1971,10 @@ pub fn spawn_quota_failover_check(
     });
 }
 
-/// The verdict [`decide_quota_failover`] returns: switch to a concrete
-/// fallback, or skip (with a reason — not user-facing, just gives tests and
-/// the debug log a concrete case instead of a bare `false`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailoverDecision {
-    SwitchTo(&'static str),
-    Skip(FailoverSkipReason),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailoverSkipReason {
-    Disabled,
-    NotExceeded,
-    NoFallback,
-    FallbackAlsoExceeded,
-    CooldownActive,
-}
-
-/// issue #97: EVERY branch of "should we auto-switch away from `tool`, and to
-/// whom" — pulled out of [`maybe_failover_on_quota`] into one pure function
-/// (no DB/AppHandle/global state — every input is a plain value the caller
-/// already resolved) so a regression in this judgment fails a fast unit test
-/// instead of silently no-oping. Review note (issue #97, mirroring the #139
-/// P0 lesson this issue's brief calls out by name): mutation-testing
-/// `maybe_failover_on_quota`'s OLD all-in-one body found that replacing its
-/// entire implementation with a no-op left every existing test green — this
-/// split is the fix. `maybe_failover_on_quota`'s only remaining untested seam
-/// is the final dispatch: a thin, one-line-per-branch match on `session_id`
-/// that reuses #139's already-shipped switch machinery verbatim.
-///
-/// Gate order (first match wins):
-///   1. [`K_QUOTA_FAILOVER_ENABLED`] must be on (opt-in — see its doc);
-///   2. `status` must be [`crate::engine_quota::QuotaStatus::Exceeded`]
-///      (structured — never a guess from turn-failure text);
-///   3. [`fallback_tool`] must know a fallback for `tool`;
-///   4. that fallback must NOT also be known-exceeded — the loop-breaker:
-///      two simultaneously exhausted engines must never ping-pong;
-///   5. `cooldown_ok` must be true — the storm-breaker (see
-///      [`quota_failover_cooldown_active`]).
-fn decide_quota_failover(
-    tool: &str,
-    enabled: bool,
-    status: Option<crate::engine_quota::QuotaStatus>,
-    fallback_status: Option<crate::engine_quota::QuotaStatus>,
-    cooldown_ok: bool,
-) -> FailoverDecision {
-    use crate::engine_quota::QuotaStatus;
-    if !enabled {
-        return FailoverDecision::Skip(FailoverSkipReason::Disabled);
-    }
-    if status != Some(QuotaStatus::Exceeded) {
-        return FailoverDecision::Skip(FailoverSkipReason::NotExceeded);
-    }
-    let Some(fallback) = fallback_tool(tool) else {
-        return FailoverDecision::Skip(FailoverSkipReason::NoFallback);
-    };
-    if fallback_status == Some(QuotaStatus::Exceeded) {
-        return FailoverDecision::Skip(FailoverSkipReason::FallbackAlsoExceeded);
-    }
-    if !cooldown_ok {
-        return FailoverDecision::Skip(FailoverSkipReason::CooldownActive);
-    }
-    FailoverDecision::SwitchTo(fallback)
-}
-
-/// issue #97: auto-switch a thread/session away from `tool` onto its
-/// fallback engine when [`decide_quota_failover`] says to. Thin wiring only —
-/// resolve the impure inputs (setting, hub readings, cooldown peek), delegate
-/// the judgment call to the pure function, then dispatch. Reuses
+/// issue #97: auto-switch a thread/session away from `tool` using the shared
+/// engine-routing resolver. Thin wiring only — resolve the impure inputs
+/// (setting, installed tools, structured quota readings, cooldown peek),
+/// delegate the judgment call to the shared function, then dispatch. Reuses
 /// [`switch_lead_tool_inner`]/[`switch_worker_tool_inner`] VERBATIM — the
 /// exact six-step teardown/persist/reconstruct sequence #139 shipped and
 /// reviewed, never a hand-rolled partial tool/model update. Every failure is
@@ -2043,22 +1988,59 @@ async fn maybe_failover_on_quota(
     session_id: Option<i32>,
     tool: &str,
 ) {
-    let enabled = matches!(
-        repo::get_setting(db, K_QUOTA_FAILOVER_ENABLED)
+    let key: QuotaFailoverKey = (thread_id, session_id);
+    let cooldown_ok = !quota_failover_cooldown_active(key);
+    let direction_id = if let Some(session_id) = session_id {
+        repo::get_session(db, session_id)
             .await
             .ok()
             .flatten()
-            .as_deref(),
-        Some("1") | Some("true")
-    );
-    let status = crate::engine_quota::current(tool).map(|s| s.status);
-    let fallback_status = fallback_tool(tool).and_then(crate::engine_quota::current).map(|s| s.status);
-    let key: QuotaFailoverKey = (thread_id, session_id);
-    let cooldown_ok = !quota_failover_cooldown_active(key);
-
-    let fallback = match decide_quota_failover(tool, enabled, status, fallback_status, cooldown_ok) {
-        FailoverDecision::Skip(_) => return,
-        FailoverDecision::SwitchTo(fallback) => fallback,
+            .map(|session| session.direction_id)
+    } else {
+        None
+    };
+    let manual_pin = crate::engine_routing::has_manual_pin(
+        db,
+        thread_id,
+        session_id,
+        direction_id,
+    )
+    .await;
+    let decision = crate::engine_routing::quota_failover_for_db(
+        db,
+        tool,
+        manual_pin,
+        cooldown_ok,
+    )
+    .await;
+    let fallback = match decision {
+        crate::engine_routing::FailoverDecision::Skip(_) => return,
+        crate::engine_routing::FailoverDecision::Blocked(reason) => {
+            let fallback = match crate::engine_routing::EngineId::parse(tool) {
+                Some(crate::engine_routing::EngineId::Claude) => Some("codex"),
+                Some(crate::engine_routing::EngineId::Codex) => Some("claude"),
+                _ => None,
+            };
+            let reason = match reason {
+                crate::engine_routing::FailoverBlockedReason::FallbackUnavailable => {
+                    "automatic_candidate_unavailable"
+                }
+                crate::engine_routing::FailoverBlockedReason::BothAutomaticCandidatesExceeded => {
+                    "both_automatic_candidates_exceeded"
+                }
+            };
+            crate::engine_routing::record_failover_blocked(
+                db,
+                thread_id,
+                session_id,
+                tool,
+                fallback,
+                reason,
+            )
+            .await;
+            return;
+        }
+        crate::engine_routing::FailoverDecision::SwitchTo { tool, .. } => tool.as_str(),
     };
     // Re-check-and-claim for real right before dispatching: closes the tiny
     // race between the peek above and here (two concurrent calls for the
@@ -2072,12 +2054,29 @@ async fn maybe_failover_on_quota(
     let reason = Some(QUOTA_FAILOVER_REASON.to_string());
     let result = match session_id {
         Some(sid) => {
-            switch_worker_tool_inner(app, db, sid, fallback.to_string(), None, reason)
+            switch_worker_tool_inner(
+                app,
+                db,
+                sid,
+                fallback.to_string(),
+                None,
+                reason,
+                Some("exceeded".to_string()),
+            )
                 .await
                 .map(|_| ())
         }
         None => {
-            switch_lead_tool_inner(app, db, thread_id, fallback.to_string(), None, None, reason)
+            switch_lead_tool_inner(
+                app,
+                db,
+                thread_id,
+                fallback.to_string(),
+                None,
+                None,
+                reason,
+                Some("exceeded".to_string()),
+            )
                 .await
                 .map(|_| ())
         }
@@ -2104,7 +2103,13 @@ async fn insert_quota_failover_failed_marker(
     error: &str,
 ) {
     let turn_id = repo::next_turn_id(db, thread_id).await.unwrap_or(1);
-    let content = serde_json::json!({ "tool": tool, "fallback": fallback, "error": error }).to_string();
+    let content = serde_json::json!({
+        "tool": tool,
+        "fallback": fallback,
+        "error": error,
+        "quota_basis": "exceeded",
+    })
+    .to_string();
     match repo::insert_lead_message(
         db,
         thread_id,
@@ -2127,15 +2132,6 @@ async fn insert_quota_failover_failed_marker(
 #[cfg(test)]
 mod quota_failover_tests {
     use super::*;
-    use crate::engine_quota::QuotaStatus;
-
-    #[test]
-    fn fallback_tool_alternates_claude_and_codex_only() {
-        assert_eq!(fallback_tool("claude"), Some("codex"));
-        assert_eq!(fallback_tool("codex"), Some("claude"));
-        assert_eq!(fallback_tool("opencode"), None);
-        assert_eq!(fallback_tool("unknown-future-tool"), None);
-    }
 
     #[test]
     fn quota_failover_cooldown_blocks_immediate_repeat_then_releases() {
@@ -2159,81 +2155,6 @@ mod quota_failover_tests {
         assert!(claim_quota_failover_slot(other));
     }
 
-    // ---- decide_quota_failover: the P1 fix — every gate as a plain unit test ----
-
-    #[test]
-    fn decide_switches_to_the_fallback_on_the_happy_path() {
-        assert_eq!(
-            decide_quota_failover("claude", true, Some(QuotaStatus::Exceeded), Some(QuotaStatus::Ok), true),
-            FailoverDecision::SwitchTo("codex")
-        );
-        assert_eq!(
-            decide_quota_failover("codex", true, Some(QuotaStatus::Exceeded), None, true),
-            FailoverDecision::SwitchTo("claude"),
-            "no fallback reading yet (never observed) is NOT the same as exceeded"
-        );
-    }
-
-    #[test]
-    fn decide_skips_when_disabled_even_if_everything_else_would_switch() {
-        assert_eq!(
-            decide_quota_failover("claude", false, Some(QuotaStatus::Exceeded), Some(QuotaStatus::Ok), true),
-            FailoverDecision::Skip(FailoverSkipReason::Disabled)
-        );
-    }
-
-    #[test]
-    fn decide_skips_when_not_exceeded() {
-        for status in [None, Some(QuotaStatus::Ok), Some(QuotaStatus::Warning)] {
-            assert_eq!(
-                decide_quota_failover("claude", true, status, Some(QuotaStatus::Ok), true),
-                FailoverDecision::Skip(FailoverSkipReason::NotExceeded),
-                "status {status:?} must not switch"
-            );
-        }
-    }
-
-    #[test]
-    fn decide_skips_when_the_tool_has_no_known_fallback() {
-        assert_eq!(
-            decide_quota_failover("opencode", true, Some(QuotaStatus::Exceeded), None, true),
-            FailoverDecision::Skip(FailoverSkipReason::NoFallback)
-        );
-    }
-
-    #[test]
-    fn decide_skips_when_the_fallback_is_also_exceeded() {
-        assert_eq!(
-            decide_quota_failover(
-                "claude",
-                true,
-                Some(QuotaStatus::Exceeded),
-                Some(QuotaStatus::Exceeded),
-                true
-            ),
-            FailoverDecision::Skip(FailoverSkipReason::FallbackAlsoExceeded),
-            "two simultaneously exhausted engines must never ping-pong"
-        );
-    }
-
-    #[test]
-    fn decide_skips_when_the_cooldown_is_active() {
-        assert_eq!(
-            decide_quota_failover("claude", true, Some(QuotaStatus::Exceeded), Some(QuotaStatus::Ok), false),
-            FailoverDecision::Skip(FailoverSkipReason::CooldownActive)
-        );
-    }
-
-    #[test]
-    fn decide_gate_order_disabled_wins_over_every_other_reason() {
-        // Every OTHER gate would also fail here (no fallback for "opencode",
-        // fallback_status irrelevant) — Disabled must still be the reported
-        // reason, proving the check-order the doc comment promises.
-        assert_eq!(
-            decide_quota_failover("opencode", false, Some(QuotaStatus::Exceeded), None, false),
-            FailoverDecision::Skip(FailoverSkipReason::Disabled)
-        );
-    }
 }
 
 #[tauri::command]

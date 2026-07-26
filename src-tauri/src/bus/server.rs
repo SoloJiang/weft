@@ -880,7 +880,7 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
                 }
             };
             let n = proposal.directions.len();
-            match crate::planner::save_proposal(db, thread, &proposal).await {
+            match crate::planner::save_proposal_value(db, thread, args).await {
                 Ok(()) => {
                     // Anchor the proposal in the chat timeline at the moment it
                     // happened — the console renders it as an interactive card.
@@ -990,6 +990,8 @@ fn planner_specs() -> Value {
                     "reason": str_prop(),
                     "mandate": { "type": "string", "enum": ["plan+impl", "impl-only"],
                         "description": "Granularity of the role: plan+impl (default) — the worker plans its own task first, then builds; impl-only — the task is small/fully specified, the worker builds straight away. Do NOT write the task's implementation plan yourself; that is the worker's job." },
+                    "hint": { "type": "string", "enum": ["normal", "deep"],
+                        "description": "Optional routing hint only: normal prefers Codex for cheap batches; deep prefers Claude for deeper reasoning. This is not a tool choice." },
                     "base_branch": { "type": "string",
                         "description": "Branch in the target repo to branch the new work OFF. Leave empty to use the repo's default branch (main/master). Set it only when the repo merges into a non-default branch (develop/staging/a release branch)." }
                 }, "required": ["name", "repo", "reason"] } }

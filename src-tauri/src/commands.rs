@@ -631,12 +631,40 @@ pub async fn cancel_reanalyze_workspace_deps(workspace_id: i32) -> R<()> {
 /// so the frontend can open its lead-chat surface for dependency calibration.
 #[tauri::command]
 pub async fn open_curator_chat(db: State<'_, Db>, workspace_id: i32) -> R<i32> {
-    // Stamp the curator thread with the user's configured default tool so the
-    // calibration chat is usable for codex/opencode users (not hard-coded claude).
-    let tool = crate::tools::default_tool(&db).await;
-    repo::ensure_curator_thread(&db, workspace_id, &tool)
+    if let Some(existing) = repo::curator_thread_for_workspace(&db, workspace_id)
         .await
-        .map_err(e)
+        .map_err(e)?
+    {
+        return Ok(existing);
+    }
+    // The curator is one more Weft-owned surface: it shares the global policy,
+    // with a deep hint because repository calibration benefits from deeper
+    // reasoning. OpenCode remains a legacy/manual fallback only.
+    let legacy_tool = crate::tools::default_tool(&db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        &db,
+        None,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Deep,
+    )
+    .await;
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
+    let thread_id = repo::ensure_curator_thread(&db, workspace_id, &tool)
+        .await
+        .map_err(e)?;
+    crate::engine_routing::record_decision(
+        &db,
+        thread_id,
+        None,
+        None,
+        "curator_start",
+        &route,
+    )
+    .await;
+    Ok(thread_id)
 }
 
 /// Return the analyst-synthesized markdown repo-map for a workspace, or `None`
@@ -756,10 +784,31 @@ pub async fn create_thread(
     title: String,
     kind: String,
 ) -> R<entities::thread::Model> {
-    let tool = crate::tools::default_tool(&db).await;
-    repo::create_thread(&db, workspace_id, &title, &kind, &tool)
+    let legacy_tool = crate::tools::default_tool(&db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        &db,
+        None,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Normal,
+    )
+    .await;
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
+    let thread = repo::create_thread(&db, workspace_id, &title, &kind, &tool)
         .await
-        .map_err(e)
+        .map_err(e)?;
+    crate::engine_routing::record_decision(
+        &db,
+        thread.id,
+        None,
+        None,
+        "new_thread",
+        &route,
+    )
+    .await;
+    Ok(thread)
 }
 
 #[tauri::command]
@@ -865,9 +914,9 @@ pub async fn get_proposal(
 pub async fn save_proposal(
     db: State<'_, Db>,
     thread_id: i32,
-    proposal: crate::planner::Proposal,
+    proposal: serde_json::Value,
 ) -> R<()> {
-    crate::planner::save_proposal(&db, thread_id, &proposal)
+    crate::planner::save_proposal_value(&db, thread_id, &proposal)
         .await
         .map_err(e)
 }
@@ -1435,6 +1484,34 @@ pub async fn set_default_tool(db: State<'_, Db>, tool: String) -> R<()> {
         .map_err(e)
 }
 
+/// Whether the one global automatic engine-routing policy is enabled. Unset is
+/// deliberately false so existing default-tool/manual behavior is unchanged
+/// for upgraded databases.
+#[tauri::command]
+pub async fn get_automatic_engine_routing_enabled(db: State<'_, Db>) -> R<bool> {
+    Ok(matches!(
+        repo::get_setting(&db, crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED)
+            .await
+            .map_err(e)?
+            .as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    ))
+}
+
+#[tauri::command]
+pub async fn set_automatic_engine_routing_enabled(
+    db: State<'_, Db>,
+    enabled: bool,
+) -> R<()> {
+    repo::set_setting(
+        &db,
+        crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(e)
+}
+
 /// issue #97: whether Weft should auto-switch a thread/session to its
 /// fallback engine when the current one reports its usage limit as exceeded
 /// (`crate::lead_chat::commands::maybe_failover_on_quota`). Opt-in, default
@@ -1442,7 +1519,7 @@ pub async fn set_default_tool(db: State<'_, Db>, tool: String) -> R<()> {
 #[tauri::command]
 pub async fn get_quota_failover_enabled(db: State<'_, Db>) -> R<bool> {
     Ok(matches!(
-        repo::get_setting(&db, crate::lead_chat::commands::K_QUOTA_FAILOVER_ENABLED)
+        repo::get_setting(&db, crate::engine_routing::K_QUOTA_FAILOVER_ENABLED)
             .await
             .map_err(e)?
             .as_deref(),
@@ -1454,7 +1531,7 @@ pub async fn get_quota_failover_enabled(db: State<'_, Db>) -> R<bool> {
 pub async fn set_quota_failover_enabled(db: State<'_, Db>, enabled: bool) -> R<()> {
     repo::set_setting(
         &db,
-        crate::lead_chat::commands::K_QUOTA_FAILOVER_ENABLED,
+        crate::engine_routing::K_QUOTA_FAILOVER_ENABLED,
         if enabled { "1" } else { "0" },
     )
     .await
@@ -1565,6 +1642,8 @@ pub struct WriteTrigger {
     pub repo_name: String,
     pub reason: String,
     pub base_branch: String,
+    pub hint: crate::engine_routing::RoutingHint,
+    pub route: Option<crate::engine_routing::RouteDecision>,
 }
 
 /// Every pending write declaration across the workspace's threads — the
@@ -1588,6 +1667,8 @@ pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<Write
                 repo_name: p.repo_name,
                 reason: p.reason,
                 base_branch: p.base_branch,
+                hint: p.hint,
+                route: p.route,
             });
         }
     }
@@ -1625,11 +1706,18 @@ pub async fn approve_write_trigger(
     asks: tauri::State<'_, crate::ask::AskRegistry>,
     thread_id: i32,
     index: usize,
-    tool: String,
+    tool: Option<String>,
 ) -> R<i32> {
-    approve_write_trigger_and_propagate_read_only(&db, &asks, thread_id, index, &tool)
-        .await
-        .map_err(e)
+    let id = crate::planner::approve_direction_with_pin(
+        &db,
+        thread_id,
+        index,
+        tool.as_deref(),
+    )
+    .await
+    .map_err(e)?;
+    asks.grant_read_only_issue(thread_id);
+    Ok(id)
 }
 
 /// Deny a write declaration: mark denied + relay to the lead's bus inbox.

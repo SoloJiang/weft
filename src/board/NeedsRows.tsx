@@ -16,6 +16,7 @@ import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { PermissionConfirmationCard } from "../components/ConfirmationCard";
+import { routeLabelKey, routeReasonKey, routeToolName } from "../lib/engineRoutingDisplay";
 
 export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
   const { approveWriteTrigger, denyWriteTrigger, selectThread, defaultTool, installedTools } =
@@ -23,7 +24,8 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
   const [picked, setPicked] = useState<string | null>(null);
-  const tool = picked ?? defaultTool;
+  const route = item.route;
+  const tool = picked ?? route?.tool ?? defaultTool;
   const installed = installedTools.filter((tl) => tl.installed);
   const context = [item.thread_title, item.name].filter(Boolean).join(" · ");
 
@@ -58,6 +60,16 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
       <p className="px-3.5 pb-1 pt-1.5 text-[14px] leading-relaxed text-ink">
         {item.reason}
       </p>
+      {route && (
+        <div className="flex flex-col gap-0.5 px-3.5 pb-2 text-[11px] text-ink-faint">
+          <span className={cn("inline-flex items-center gap-1", route.blocked && "text-danger")}>
+            {route.tool && <ToolIcon tool={route.tool} size={12} />}
+            {t(routeLabelKey(route), { tool: toolFullName(routeToolName(route)) })}
+          </span>
+          <span>{t(routeReasonKey(route.reason))}</span>
+          {route.blocked && <span>{t("scope.engineRouteBlockedHint")}</span>}
+        </div>
+      )}
       {item.base_branch && (
         <div className="px-3.5 pb-2">
           <span
@@ -82,7 +94,7 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
           variant="primary"
           disabled={busy}
           title={t("needs.approveRunTitle")}
-          onClick={() => void act(() => approveWriteTrigger(item, tool))}
+          onClick={() => void act(() => approveWriteTrigger(item, picked ? tool : undefined))}
         >
           <Check size={13} />
           {t("needs.approveRun")}
