@@ -25,10 +25,13 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
   const [busy, setBusy] = useState(false);
   const [picked, setPicked] = useState<string | null>(null);
   const route = item.route;
+  const blocked = route?.blocked === true;
   const tool = picked ?? route?.tool ?? defaultTool;
   const installed = installedTools.filter((tl) => tl.installed);
-  const soleBlockedManualTool = route?.blocked && installed.length === 1 ? installed[0]?.tool : undefined;
-  const manualTool = picked ?? soleBlockedManualTool;
+  const manualTool = picked ?? undefined;
+  const approvalBlocked = blocked && picked === null;
+  const pickerVisible = installed.length > 1 || blocked;
+  const pickerTool = blocked ? picked : tool;
   const context = [item.thread_title, item.name].filter(Boolean).join(" · ");
 
   async function act(fn: () => Promise<void>) {
@@ -94,14 +97,14 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
       <div className="flex flex-wrap items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">
         <Button
           variant="primary"
-          disabled={busy}
-          title={t("needs.approveRunTitle")}
+          disabled={busy || approvalBlocked}
+          title={approvalBlocked ? t("scope.engineRouteBlockedHint") : t("needs.approveRunTitle")}
           onClick={() => void act(() => approveWriteTrigger(item, manualTool))}
         >
           <Check size={13} />
           {t("needs.approveRun")}
         </Button>
-        {installed.length > 1 && (
+        {pickerVisible && (
           <div
             title={t("needs.runWith")}
             className="inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-bg p-0.5"
@@ -111,10 +114,12 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
                 key={tl.tool}
                 type="button"
                 title={toolFullName(tl.tool)}
+                aria-label={toolFullName(tl.tool)}
+                aria-pressed={pickerTool === tl.tool}
                 onClick={() => setPicked(tl.tool)}
                 className={cn(
                   "grid h-6 w-7 place-items-center rounded-[var(--radius-sm)] transition-opacity duration-150",
-                  tool === tl.tool ? "bg-raised" : "opacity-40 hover:opacity-80",
+                  pickerTool === tl.tool ? "bg-raised" : "opacity-40 hover:opacity-80",
                 )}
               >
                 <ToolIcon tool={tl.tool} size={13} />
