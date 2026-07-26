@@ -413,15 +413,9 @@ fn snapshots_by_tool() -> Vec<QuotaSnapshot> {
 fn candidate_for(tool: EngineId, snapshots: &[QuotaSnapshot]) -> RouteCandidate {
     let command = crate::tool_command::command_for(tool.as_str());
     // A route must only select a command that the eventual bare
-    // `Command::new(command)` spawn can reach. On Unix, the app-bundle fallback
-    // in `resolve_tool_path` is intentionally excluded because it is not added
-    // to that spawn's PATH. Windows keeps the existing resolver until its
-    // PATHEXT-aware equivalent is available.
-    let installed = if cfg!(windows) {
-        crate::detect::resolve_tool_path(&command).is_some()
-    } else {
-        crate::detect::resolves_on_path(&command)
-    };
+    // `Command::new(command)` spawn can reach. This excludes the Codex app
+    // bundle fallback on Unix and uses PATHEXT-aware lookup for Windows shims.
+    let installed = crate::detect::resolves_on_path(&command);
     let quota = snapshots
         .iter()
         .find(|snapshot| snapshot.tool == tool.as_str())

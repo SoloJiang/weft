@@ -397,11 +397,44 @@ pub fn resolve_tool_path(tool: &str) -> Option<std::path::PathBuf> {
     which_on_path(tool, &refresh_tool_path())
 }
 
+/// Candidate executable names a bare Windows process spawn may resolve. On
+/// non-Windows callers pass `None`, keeping the exact command name only.
+fn executable_name_candidates(tool: &str, windows_pathext: Option<&str>) -> Vec<String> {
+    let mut names = vec![tool.to_string()];
+    let Some(windows_pathext) = windows_pathext else {
+        return names;
+    };
+    if std::path::Path::new(tool).extension().is_some() {
+        return names;
+    }
+    for extension in windows_pathext.split(';').map(str::trim).filter(|ext| !ext.is_empty()) {
+        let extension = if extension.starts_with('.') {
+            extension.to_string()
+        } else {
+            format!(".{extension}")
+        };
+        names.push(format!("{tool}{extension}"));
+    }
+    names
+}
+
+fn windows_pathext() -> Option<String> {
+    if cfg!(windows) {
+        return Some(
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string()),
+        );
+    }
+    None
+}
+
 fn which_on_path(tool: &str, path: &str) -> Option<std::path::PathBuf> {
+    let names = executable_name_candidates(tool, windows_pathext().as_deref());
     for dir in std::env::split_paths(path) {
-        let cand = dir.join(tool);
-        if cand.is_file() {
-            return Some(cand);
+        for name in &names {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
         }
     }
     None
@@ -436,6 +469,18 @@ mod tests {
         assert_eq!(merge_path("/a", ""), "/a");
         assert_eq!(merge_path("", "/a::/a"), "/a");
         assert_eq!(merge_path("/a:/b", "/b:/a"), "/a:/b");
+    }
+
+    #[test]
+    fn windows_executable_candidates_honor_pathext_for_bare_commands() {
+        assert_eq!(
+            executable_name_candidates("codex", Some(".COM;.EXE;.BAT;.CMD")),
+            vec!["codex", "codex.COM", "codex.EXE", "codex.BAT", "codex.CMD"]
+        );
+        assert_eq!(
+            executable_name_candidates("codex.exe", Some(".COM;.EXE;.BAT;.CMD")),
+            vec!["codex.exe"]
+        );
     }
 
     #[test]
