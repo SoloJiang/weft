@@ -70,6 +70,10 @@ fn write_builtin(cwd: &Path, name: &str, content: &str) {
     for d in TARGET_DIRS {
         let dir = cwd.join(d).join(name);
         let file = dir.join("SKILL.md");
+        if !builtin_write_path_is_safe(cwd, &dir, &file) {
+            remove_managed_builtin_counterparts(cwd, name);
+            return; // unsafe local path has the same precedence as an override
+        }
         if let Ok(existing) = std::fs::read_to_string(&file) {
             if !existing.contains(BUILTIN_MARKER) {
                 remove_managed_builtin_counterparts(cwd, name);
@@ -79,7 +83,10 @@ fn write_builtin(cwd: &Path, name: &str, content: &str) {
                 continue; // already current
             }
         }
-        if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&file, content).is_ok() {
+        if std::fs::create_dir_all(&dir).is_ok()
+            && builtin_write_path_is_safe(cwd, &dir, &file)
+            && std::fs::write(&file, content).is_ok()
+        {
             crate::git::git_exclude(cwd, &format!("{d}/{name}"));
         }
     }
@@ -87,7 +94,12 @@ fn write_builtin(cwd: &Path, name: &str, content: &str) {
 
 fn has_repo_owned_builtin(cwd: &Path, name: &str) -> bool {
     TARGET_DIRS.iter().any(|d| {
-        match std::fs::read_to_string(cwd.join(d).join(name).join("SKILL.md")) {
+        let dir = cwd.join(d).join(name);
+        let file = dir.join("SKILL.md");
+        if !builtin_write_path_is_safe(cwd, &dir, &file) {
+            return true;
+        }
+        match std::fs::read_to_string(file) {
             Ok(existing) => !existing.contains(BUILTIN_MARKER),
             Err(_) => false,
         }
@@ -135,6 +147,48 @@ fn managed_builtin_file_is_safe(cwd: &Path, dir: &Path, file: &Path) -> bool {
         return false;
     };
     canonical_dir.starts_with(&canonical_cwd) && canonical_file.starts_with(&canonical_dir)
+}
+
+/// Refuse to create or update a builtin through a path that resolves outside
+/// the worker cwd. Unsafe entries are treated as repository-owned overrides.
+fn builtin_write_path_is_safe(cwd: &Path, dir: &Path, file: &Path) -> bool {
+    let Ok(canonical_cwd) = cwd.canonicalize() else {
+        return false;
+    };
+    let Ok(relative_dir) = dir.strip_prefix(cwd) else {
+        return false;
+    };
+
+    let mut current = canonical_cwd.clone();
+    for component in relative_dir.components() {
+        let std::path::Component::Normal(component) = component else {
+            return false;
+        };
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return false,
+            Ok(_) => {
+                let Ok(canonical_current) = current.canonicalize() else {
+                    return false;
+                };
+                if !canonical_current.starts_with(&canonical_cwd) {
+                    return false;
+                }
+                current = canonical_current;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+        }
+    }
+
+    match std::fs::symlink_metadata(file) {
+        Ok(metadata) if metadata.file_type().is_symlink() => false,
+        Ok(_) => file
+            .canonicalize()
+            .is_ok_and(|canonical_file| canonical_file.starts_with(&current)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +327,55 @@ mod tests {
             BUILTIN_MERGE_PREFLIGHT
         );
         assert!(linked.is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn builtin_does_not_write_through_a_symlinked_skill_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let global_skill = outside.path().join("global-skill");
+        std::fs::create_dir_all(&global_skill).unwrap();
+
+        let linked = cwd.join(".agents/skills/weft-preflight-merge");
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        symlink(&global_skill, &linked).unwrap();
+
+        materialize_builtins(cwd);
+
+        assert!(!global_skill.join("SKILL.md").exists());
+        assert!(linked.is_symlink());
+        assert!(!cwd
+            .join(".claude/skills/weft-preflight-merge/SKILL.md")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn builtin_does_not_write_through_a_symlinked_skill_file() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let global_file = outside.path().join("SKILL.md");
+        let stale = format!("{BUILTIN_MARKER}\nstale global builtin");
+        std::fs::write(&global_file, &stale).unwrap();
+
+        let linked = cwd.join(".agents/skills/weft-preflight-merge/SKILL.md");
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        symlink(&global_file, &linked).unwrap();
+
+        materialize_builtins(cwd);
+
+        assert_eq!(std::fs::read_to_string(&global_file).unwrap(), stale);
+        assert!(linked.is_symlink());
+        assert!(!cwd
+            .join(".claude/skills/weft-preflight-merge/SKILL.md")
+            .exists());
     }
 
     fn mkskill(base: &std::path::Path, name: &str) -> ParsedSkill {
