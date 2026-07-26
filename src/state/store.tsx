@@ -100,27 +100,6 @@ export function isInFlight(state: TurnState): boolean {
   return state === "busy" || state === "stalled";
 }
 
-/** Split a thread's in-flight engines into running vs stalled counts — its worker
- * sessions (matched by directionIds) PLUS its lead (leadTurn has no session row).
- * Single source of truth so the workspace card and the nav row can't drift. */
-export function threadLiveCounts(
-  sessions: Record<number, OpenSession>,
-  directionIds: number[],
-  leadState: TurnState | undefined,
-): { running: number; stalled: number } {
-  const inThread = Object.values(sessions).filter((s) =>
-    directionIds.includes(s.directionId),
-  );
-  return {
-    running:
-      inThread.filter((s) => s.status === "running").length +
-      (leadState === "busy" ? 1 : 0),
-    stalled:
-      inThread.filter((s) => s.status === "stalled").length +
-      (leadState === "stalled" ? 1 : 0),
-  };
-}
-
 /** A NeedItem the human must actually act on — excludes a display-only NOTICE
  *  (the self-clearing stall hint, `answerable: false`): it surfaces in the
  *  Needs-you queue as an FYI row but has no answer to give and clears itself
