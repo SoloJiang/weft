@@ -447,6 +447,13 @@ fn candidate_for(tool: EngineId, snapshots: &[QuotaSnapshot]) -> RouteCandidate 
     // native Windows executable lookup, without treating arbitrary PATHEXT
     // script entries as launchable by an extensionless command.
     let installed = crate::detect::is_spawnable(&command);
+    #[cfg(test)]
+    // Planner unit tests exercise route ownership and transactions, not the
+    // runner image's incidental CLI inventory. An unconfigured identity is a
+    // deterministic available fixture; availability tests install an explicit
+    // override (for example a missing absolute path) and still use the real
+    // spawnability predicate above.
+    let installed = installed || command == tool.as_str();
     let quota = snapshots
         .iter()
         .find(|snapshot| snapshot.tool == tool.as_str())
