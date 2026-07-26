@@ -366,10 +366,10 @@ pub(crate) fn pick_default_tool(user: Option<&str>, installed: impl Fn(&str) -> 
         .to_string()
 }
 
-/// Resolve the effective default tool against the real PATH (and the Codex
-/// app-bundle fallback), honoring the user's explicit choice when present. A
-/// tool counts as installed when its configured command (alias) resolves, so an
-/// aliased CLI is eligible as the default.
+/// Resolve the effective default tool against the real executable PATH,
+/// honoring the user's explicit choice when present. A tool counts as eligible
+/// only when its configured command (alias) is spawnable, so an aliased CLI is
+/// eligible while a diagnostics-only app-bundle fallback is not.
 pub fn resolve_default_tool(user: Option<&str>) -> String {
     pick_default_tool(user, |t| {
         is_spawnable(&crate::tool_command::command_for(t))
