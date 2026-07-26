@@ -101,6 +101,9 @@ fn remove_managed_builtin_counterparts(cwd: &Path, name: &str) {
     for d in TARGET_DIRS {
         let dir = cwd.join(d).join(name);
         let file = dir.join("SKILL.md");
+        if !managed_builtin_file_is_safe(cwd, &dir, &file) {
+            continue;
+        }
         let Ok(existing) = std::fs::read_to_string(&file) else {
             continue;
         };
@@ -109,6 +112,29 @@ fn remove_managed_builtin_counterparts(cwd: &Path, name: &str) {
             let _ = std::fs::remove_dir(dir);
         }
     }
+}
+
+/// Only remove the exact builtin file we created under this session cwd. A
+/// symlinked skill directory or file may point at a user-managed global skill.
+fn managed_builtin_file_is_safe(cwd: &Path, dir: &Path, file: &Path) -> bool {
+    let Ok(dir_meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if dir_meta.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(file_meta) = std::fs::symlink_metadata(file) else {
+        return false;
+    };
+    if file_meta.file_type().is_symlink() {
+        return false;
+    }
+    let (Ok(canonical_cwd), Ok(canonical_dir), Ok(canonical_file)) =
+        (cwd.canonicalize(), dir.canonicalize(), file.canonicalize())
+    else {
+        return false;
+    };
+    canonical_dir.starts_with(&canonical_cwd) && canonical_file.starts_with(&canonical_dir)
 }
 
 #[cfg(test)]
@@ -218,6 +244,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn builtin_override_does_not_remove_a_symlinked_counterpart() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let global_skill = outside.path().join("global-skill");
+        std::fs::create_dir_all(&global_skill).unwrap();
+        let global_file = global_skill.join("SKILL.md");
+        std::fs::write(&global_file, BUILTIN_MERGE_PREFLIGHT).unwrap();
+
+        let linked = cwd.join(".agents/skills/weft-preflight-merge");
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        symlink(&global_skill, &linked).unwrap();
+        let override_file = cwd.join(".claude/skills/weft-preflight-merge/SKILL.md");
+        std::fs::create_dir_all(override_file.parent().unwrap()).unwrap();
+        std::fs::write(&override_file, "repo-owned").unwrap();
+
+        materialize_builtins(cwd);
+
+        assert_eq!(
+            std::fs::read_to_string(global_file).unwrap(),
+            BUILTIN_MERGE_PREFLIGHT
+        );
+        assert!(linked.is_symlink());
     }
 
     fn mkskill(base: &std::path::Path, name: &str) -> ParsedSkill {
