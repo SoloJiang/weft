@@ -858,18 +858,17 @@ pub async fn mirror_direction_route(db: &Db, thread_id: i32, direction_id: i32, 
     }) else {
         return;
     };
+    let source_content = source.content.clone();
     // A session can be created before native startup, then be reopened after
-    // its unpinned direction is re-resolved. Reuse the old mirror only when it
-    // is byte-for-byte the current authoritative direction marker; otherwise
-    // append the newer marker so the timeline retains both route decisions.
-    if messages.iter().rev().any(|message| {
-        message.session_id == Some(session_id)
-            && message.kind == "engine_route"
-            && message.content == source.content
-    }) {
+    // its unpinned direction is re-resolved. Only its LATEST mirror can prove
+    // the worker is already explained by the current route: an A -> B -> A
+    // route history needs a fresh final A marker even though an older A exists.
+    let latest_mirror = messages.iter().rev().find(|message| {
+        message.session_id == Some(session_id) && message.kind == "engine_route"
+    });
+    if latest_mirror.is_some_and(|message| message.content == source_content) {
         return;
     }
-    let source_content = source.content.clone();
     let turn_id = match repo::next_turn_id(db, thread_id).await {
         Ok(turn) => turn,
         Err(_) => return,
@@ -1290,6 +1289,22 @@ mod tests {
 
         mirror_direction_route(&db, thread.id, 7, 19).await;
         mirror_direction_route(&db, thread.id, 7, 19).await;
+        // Returning to a prior route still needs a fresh mirror: the newest
+        // worker marker is Claude at this point even though Codex appeared
+        // earlier in its timeline.
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            4,
+            "system",
+            "engine_route",
+            &old_route,
+            "complete",
+        )
+        .await
+        .unwrap();
+        mirror_direction_route(&db, thread.id, 7, 19).await;
 
         let mirrors: Vec<_> = repo::list_lead_messages(&db, thread.id)
             .await
@@ -1299,9 +1314,10 @@ mod tests {
                 message.session_id == Some(19) && message.kind == "engine_route"
             })
             .collect();
-        assert_eq!(mirrors.len(), 2);
+        assert_eq!(mirrors.len(), 3);
         assert_eq!(mirrors[0].content, old_route);
         assert_eq!(mirrors[1].content, new_route);
+        assert_eq!(mirrors[2].content, old_route);
     }
 
     #[test]

@@ -193,13 +193,16 @@ pub fn clear_for_test() {
 }
 
 #[cfg(test)]
+/// Serialize every test that mutates the process-global quota hub, including
+/// callers in sibling modules such as `tool_command`.
+pub(crate) fn hub_test_lock() -> &'static Mutex<()> {
+    static TEST_HUB_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_HUB_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hub_test_lock() -> &'static Mutex<()> {
-        static TEST_HUB_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        TEST_HUB_LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[test]
     fn status_for_thresholds() {
