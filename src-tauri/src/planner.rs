@@ -73,7 +73,8 @@ pub struct ScopeEntry {
 
 /// A direction resolved against the workspace's repos, ready for the UI / confirm.
 /// The tool is absent from the resolved form; it is provided by the human on the
-/// approval card (approve_direction) or taken from the workspace default (confirm).
+/// approval card (approve_direction), an explicit batch override, or the workspace default
+/// (confirm).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ResolvedDirection {
     pub name: String,
@@ -502,9 +503,21 @@ pub struct ResolvedProposal {
     pub directions: Vec<ResolvedDirection>,
 }
 
+/// Confirm the stored proposal using the existing automatic/default route.
+///
+/// Kept as a wrapper so callers that do not offer a manual batch choice retain
+/// the original call shape and behavior.
+pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
+    confirm_with_manual_tool(db, thread_id, None).await
+}
+
 /// Confirm the stored proposal: create each direction with its known-repo scope
-/// and materialize its worktrees. Marks the plan confirmed. Unknown repo names
-/// are skipped (they never resolved to a worktree-able repo).
+/// and materialize its worktrees. `manual_tool`, when present, is one explicit
+/// user choice applied to every pending known-repo lane in this batch. It is a
+/// pin, never an automatic candidate or a quota failover.
+///
+/// Marks the plan confirmed. Unknown repo names are skipped (they never
+/// resolved to a worktree-able repo).
 ///
 /// Atomic: if ANY lane fails to create or materialize, ALL lanes created in this
 /// attempt are rolled back (worktree on disk + branch + DB rows) and the error is
@@ -514,7 +527,11 @@ pub struct ResolvedProposal {
 /// Idempotent on a fully-confirmed plan: if the plan is already "confirmed" the
 /// existing direction ids are returned without re-creating anything (covers the
 /// dispatch-retry case where the frontend calls confirm again to redispatch workers).
-pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
+pub async fn confirm_with_manual_tool(
+    db: &Db,
+    thread_id: i32,
+    manual_tool: Option<&str>,
+) -> Result<Vec<i32>> {
     // Serialize all plan mutations for this thread: held across the whole confirm (read → reuse/
     // create → materialize → CAS commit) so no concurrent confirm/approve/deny/save_proposal can
     // interleave. This is what makes the read→commit dance atomic and the TOCTOU races impossible.
@@ -927,7 +944,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         }
         let route = crate::engine_routing::resolve_for_db(
             db,
-            None,
+            manual_tool,
             &legacy_tool,
             d.hint,
         )
@@ -2410,6 +2427,82 @@ mod tests {
         let _second = confirm(&db, t.id).await.unwrap();
         assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1, "no duplicate direction on re-confirm");
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn confirm_with_manual_opencode_pins_each_created_direction() {
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-manual-opencode-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _repo = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            root.join("api").to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        let proposal = Proposal {
+            rationale: "r".into(),
+            directions: vec![ProposedDirection {
+                name: "api work".into(),
+                repo: "api".into(),
+                reason: "r".into(),
+                mandate: "plan+impl".into(),
+                base_branch: "".into(),
+                decision: "".into(),
+                direction_id: 0,
+            }],
+        };
+        save_proposal(&db, thread.id, &proposal).await.unwrap();
+
+        let current_exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::tool_command::set_overrides(std::collections::HashMap::from([(
+            "opencode".to_string(),
+            current_exe,
+        )]));
+        let ids_result = confirm_with_manual_tool(&db, thread.id, Some("opencode")).await;
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+        let ids = ids_result.unwrap();
+
+        assert_eq!(ids.len(), 1);
+        let direction = repo::get_direction(&db, ids[0]).await.unwrap().unwrap();
+        assert_eq!(direction.tool, "opencode");
+        assert!(direction.engine_pinned, "manual batch tool must persist as a pin");
+        let route_marker = repo::list_lead_messages(&db, thread.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.kind == "engine_route")
+            .unwrap();
+        let route: Value = serde_json::from_str(&route_marker.content).unwrap();
+        assert_eq!(route["source"], "manual");
+        assert_eq!(route["tool"], "opencode");
+
+        let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);

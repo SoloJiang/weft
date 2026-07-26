@@ -5,6 +5,9 @@ import { AlertTriangle, Check, GitBranch, Sparkles, X } from "lucide-react";
 import { useStore } from "../state/store";
 import type { ResolvedDirection } from "../lib/types";
 import { Button } from "../components/ui/Button";
+import { Select } from "../components/ui/Select";
+import { ToolIcon, toolFullName } from "../components/ToolIcon";
+import { routeReasonKey } from "../lib/engineRoutingDisplay";
 import { PlanSummary } from "../session/blocks/PlanSummary";
 import { latestPlanCard, type ParsedPlanCard } from "../session/planCard";
 
@@ -46,13 +49,39 @@ const CONFIRM_LABEL_KEY: Record<ConfirmMode, string> = {
   scopeOnly: "scope.confirm",
 };
 
+const BATCH_AUTOMATIC_VALUE = "__automatic__";
+
 export function ScopeReview({ onClose }: { onClose: () => void }) {
-  const { proposal, confirmProposal, approvePlanCard, threads, activeThreadId, repos, leadMessages } =
-    useStore();
+  const {
+    proposal,
+    confirmProposal,
+    approvePlanCard,
+    threads,
+    activeThreadId,
+    repos,
+    leadMessages,
+    installedTools,
+  } = useStore();
   const { t } = useTranslation();
   const [confirming, setConfirming] = useState(false);
+  const [manualTool, setManualTool] = useState<string | null>(null);
   const dirs = proposal?.directions ?? [];
   const thread = threads.find((th) => th.id === activeThreadId);
+  const installed = useMemo(
+    () => installedTools.filter((tool) => tool.installed),
+    [installedTools],
+  );
+  const batchEngineOptions = useMemo(
+    () => [
+      { value: BATCH_AUTOMATIC_VALUE, label: t("scope.batchEngineAutomatic") },
+      ...installed.map((tool) => ({ value: tool.tool, label: toolFullName(tool.tool) })),
+    ],
+    [installed, t],
+  );
+  const blockedRoute = useMemo(() => {
+    const blockedLane = dirs.find((direction) => direction.decision === "" && direction.route?.blocked);
+    return blockedLane?.route ?? null;
+  }, [dirs]);
 
   const lanes = useMemo<ScopeLane[]>(
     () =>
@@ -99,7 +128,7 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
         const delivered = await approvePlanCard(tid, planCard.message.id, planCard.title);
         if (!delivered) return;
       }
-      await confirmProposal();
+      await confirmProposal(manualTool ?? undefined);
     } finally {
       setConfirming(false);
     }
@@ -198,24 +227,56 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
       </div>
 
       <div className="shrink-0 border-t border-border bg-bg/95 px-5 py-3 backdrop-blur">
-        <div className="mx-auto flex w-full max-w-[820px] items-center gap-3">
-          {/* Issue #103: approving dispatch also propagates a read-only
-              auto-allow to this issue's workers (backend: confirm_proposal →
-              grant_read_only_issue) — an "informed decision" caption so the
-              scope-widening isn't a silent side effect. Purely presentational;
-              no new state, doesn't touch `confirm()`'s own logic. */}
-          <span className="min-w-0 flex-1 text-[11px] leading-snug text-ink-faint">
-            {t("scope.readOnlyPropagationNote")}
-          </span>
-          <Button
-            className="ml-auto shrink-0"
-            variant="primary"
-            onClick={() => void confirm()}
-            disabled={confirming || dirs.length === 0}
-          >
-            <GitBranch size={14} />
-            {confirming ? t("scope.confirming") : t(CONFIRM_LABEL_KEY[confirmMode], { count: dirs.length })}
-          </Button>
+        <div className="mx-auto flex w-full max-w-[820px] flex-col gap-2.5">
+          {blockedRoute && !manualTool ? (
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-[var(--radius-md)] border border-danger/35 bg-danger/10 px-3 py-2 text-[11px] leading-snug text-danger"
+            >
+              <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+              <span>
+                <strong className="font-semibold">{t("scope.engineRouteBlocked")}</strong>{" "}
+                {t(routeReasonKey(blockedRoute.reason))}. {t("scope.engineRouteBlockedHint")}
+              </span>
+            </div>
+          ) : null}
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="min-w-0 flex-1">
+              <div className="mb-1 flex items-center gap-1.5 text-[11px] font-medium text-ink-faint">
+                <ToolIcon tool={manualTool ?? ""} size={12} />
+                <span>{t("scope.batchEngine")}</span>
+              </div>
+              <Select
+                value={manualTool ?? BATCH_AUTOMATIC_VALUE}
+                onValueChange={(value) => {
+                  if (value === BATCH_AUTOMATIC_VALUE) {
+                    setManualTool(null);
+                    return;
+                  }
+                  setManualTool(value);
+                }}
+                options={batchEngineOptions}
+                ariaLabel={t("scope.batchEngine")}
+              />
+              <div className="mt-1 text-[10.5px] leading-snug text-ink-faint">
+                {manualTool
+                  ? t("scope.batchEnginePinned", { tool: toolFullName(manualTool) })
+                  : t("scope.batchEngineHint")}
+              </div>
+            </div>
+            <span className="min-w-0 flex-1 text-[11px] leading-snug text-ink-faint">
+              {t("scope.readOnlyPropagationNote")}
+            </span>
+            <Button
+              className="ml-auto shrink-0"
+              variant="primary"
+              onClick={() => void confirm()}
+              disabled={confirming || dirs.length === 0}
+            >
+              <GitBranch size={14} />
+              {confirming ? t("scope.confirming") : t(CONFIRM_LABEL_KEY[confirmMode], { count: dirs.length })}
+            </Button>
+          </div>
         </div>
       </div>
     </div>

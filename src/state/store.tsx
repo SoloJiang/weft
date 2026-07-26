@@ -402,7 +402,7 @@ interface Store {
   proposal: ResolvedProposal | null;
   refreshProposal: (threadId: number) => Promise<void>;
   saveProposal: (proposal: Proposal) => Promise<void>;
-  confirmProposal: () => Promise<void>;
+  confirmProposal: (manualTool?: string) => Promise<void>;
   setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string) => Promise<void>;
   /** Approve a plan_card: post `plan_decision` to the lead, then persist the settled
    *  state. Shared by the chat plan_card's own Approve button and the merged
@@ -2376,7 +2376,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // confirm/approve abort while the thread still has ANY unrecovered lane failure.
   const baseSaveFailed = useRef<Map<number, Set<string>>>(new Map());
 
-  const confirmProposal = useCallback(async () => {
+  const confirmProposal = useCallback(async (manualTool?: string) => {
     if (activeThreadId == null) return;
     // Flush any in-flight base-branch save before materializing. If it REJECTED
     // (e.g. a re-propose moved the lane, or a DB error), the backend still holds the
@@ -2405,10 +2405,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // branch above: toast, refresh to the real state, and return so a retry acts on it).
     let ids: number[];
     try {
-      ids = await api.confirmProposal(activeThreadId);
+      ids = await api.confirmProposal(activeThreadId, manualTool);
     } catch (err) {
       console.error(err);
-      toast(i18n.t("scope.confirmFailed"), "danger");
+      const routeBlocked = routeBlockedErrorMessage(rawErrorMessage(err));
+      if (routeBlocked) {
+        toast(routeBlocked, "danger");
+      } else {
+        toast(i18n.t("scope.confirmFailed"), "danger");
+      }
       await refreshProposal(activeThreadId);
       return;
     }

@@ -272,6 +272,10 @@ export const zh = {
     engineLegacy: "默认 · {{tool}}",
     engineBlocked: "自动路由已阻塞",
     engineReason: "{{reason}}",
+    batchEngine: "本次批量确认使用",
+    batchEngineAutomatic: "自动路由",
+    batchEngineHint: "保持自动路由，或为本次确认的全部任务 pin 一个已安装引擎。",
+    batchEnginePinned: "本批全部任务已 pin：{{tool}}",
     routeReason: {
       automatic_disabled: "自动路由已关闭",
       manual_pin: "手动选择优先",

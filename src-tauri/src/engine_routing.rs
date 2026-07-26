@@ -1082,6 +1082,25 @@ mod tests {
     }
 
     #[test]
+    fn explicit_opencode_override_wins_when_automatic_pool_is_blocked() {
+        let out = resolve(&request(
+            true,
+            Some(EngineId::Opencode),
+            EngineId::Codex,
+            RoutingHint::Normal,
+            vec![
+                candidate(EngineId::Codex, true, Some(QuotaStatus::Exceeded)),
+                candidate(EngineId::Claude, true, Some(QuotaStatus::Exceeded)),
+                candidate(EngineId::Opencode, true, Some(QuotaStatus::Ok)),
+            ],
+        ));
+        assert_eq!(out.selected(), Some(EngineId::Opencode));
+        assert_eq!(out.source, RoutingSource::Manual);
+        assert_eq!(out.reason, RouteReason::ManualPin);
+        assert!(!out.blocked);
+    }
+
+    #[test]
     fn opencode_is_not_an_automatic_fallback_when_the_pool_is_unavailable() {
         let out = resolve(&request(
             true,

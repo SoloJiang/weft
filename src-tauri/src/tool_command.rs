@@ -48,6 +48,15 @@ pub fn set_overrides(map: HashMap<String, String>) {
         .collect();
 }
 
+/// Tests in multiple modules temporarily replace this process-global map. Keep
+/// those mutations serialized so an unrelated routing test cannot observe a
+/// half-configured command override.
+#[cfg(test)]
+pub(crate) fn override_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 /// Validate a configured OVERRIDE: either a bare PATH-resolved name
 /// (`cc-claude`) or an ABSOLUTE executable path (`/opt/homebrew/bin/claude` — a
 /// GUI-launched install whose CLI isn't on Weft's augmented PATH, which is
@@ -186,6 +195,7 @@ mod tests {
     // separate tests racing on `set_overrides` would be nondeterministic.
     #[test]
     fn global_override_and_pin_resolution() {
+        let _override_lock = override_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         // No override configured → the identity is its own command.
         set_overrides(HashMap::new());
         assert_eq!(command_for("claude"), "claude");

@@ -279,6 +279,10 @@ export const en = {
     engineLegacy: "Default · {{tool}}",
     engineBlocked: "Automatic routing blocked",
     engineReason: "{{reason}}",
+    batchEngine: "Run this batch with",
+    batchEngineAutomatic: "Automatic routing",
+    batchEngineHint: "Leave automatic routing selected, or pin one installed engine for every task here.",
+    batchEnginePinned: "Pinned for every task in this batch: {{tool}}",
     routeReason: {
       automatic_disabled: "automatic routing is off",
       manual_pin: "manual choice wins",

@@ -975,7 +975,16 @@ async fn confirm_proposal_and_propagate_read_only(
     asks: &crate::ask::AskRegistry,
     thread_id: i32,
 ) -> anyhow::Result<Vec<i32>> {
-    let ids = crate::planner::confirm(db, thread_id).await?;
+    confirm_proposal_and_propagate_read_only_with_manual_tool(db, asks, thread_id, None).await
+}
+
+async fn confirm_proposal_and_propagate_read_only_with_manual_tool(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+    manual_tool: Option<&str>,
+) -> anyhow::Result<Vec<i32>> {
+    let ids = crate::planner::confirm_with_manual_tool(db, thread_id, manual_tool).await?;
     asks.grant_read_only_issue(thread_id);
     Ok(ids)
 }
@@ -987,8 +996,14 @@ pub async fn confirm_proposal(
     db: State<'_, Db>,
     asks: tauri::State<'_, crate::ask::AskRegistry>,
     thread_id: i32,
+    manual_tool: Option<String>,
 ) -> R<Vec<i32>> {
-    confirm_proposal_and_propagate_read_only(&db, &asks, thread_id)
+    confirm_proposal_and_propagate_read_only_with_manual_tool(
+        &db,
+        &asks,
+        thread_id,
+        manual_tool.as_deref(),
+    )
         .await
         .map_err(e)
 }
