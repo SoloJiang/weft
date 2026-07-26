@@ -16,7 +16,7 @@ type ScopeConfirmInputs = {
   confirming: boolean;
   routeBlocked: boolean;
   manualTool: string | null;
-  installedToolNames: readonly string[];
+  spawnableToolNames: readonly string[];
 };
 
 export function scopeConfirmStateOf({
@@ -24,17 +24,17 @@ export function scopeConfirmStateOf({
   confirming,
   routeBlocked,
   manualTool,
-  installedToolNames,
+  spawnableToolNames,
 }: ScopeConfirmInputs): ScopeConfirmState {
   const selectedTool = manualTool;
-  const installedManualTool = installedManualToolOf(manualTool, installedToolNames);
+  const spawnableManualTool = spawnableManualToolOf(manualTool, spawnableToolNames);
 
   if (confirming) {
     return {
       kind: "confirming",
       selectedTool,
-      manualTool: installedManualTool,
-      showBlockedRoute: routeBlocked && installedManualTool === undefined,
+      manualTool: spawnableManualTool,
+      showBlockedRoute: routeBlocked && spawnableManualTool === undefined,
     };
   }
   if (dirCount === 0) {
@@ -46,11 +46,11 @@ export function scopeConfirmStateOf({
     };
   }
   if (manualTool !== null) {
-    if (installedManualTool !== undefined) {
+    if (spawnableManualTool !== undefined) {
       return {
         kind: "explicitValid",
         selectedTool,
-        manualTool: installedManualTool,
+        manualTool: spawnableManualTool,
         showBlockedRoute: false,
       };
     }
@@ -77,12 +77,12 @@ export function scopeConfirmStateOf({
   };
 }
 
-function installedManualToolOf(
+function spawnableManualToolOf(
   manualTool: string | null,
-  installedToolNames: readonly string[],
+  spawnableToolNames: readonly string[],
 ): string | undefined {
   if (manualTool === null) return undefined;
-  if (!installedToolNames.includes(manualTool)) return undefined;
+  if (!spawnableToolNames.includes(manualTool)) return undefined;
   return manualTool;
 }
 

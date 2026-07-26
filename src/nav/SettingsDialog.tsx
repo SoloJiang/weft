@@ -34,6 +34,7 @@ import { toolFullName } from "../components/ToolIcon";
 import { currentLang, setLang, type Lang } from "../i18n";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
+import { spawnableToolsOf } from "../lib/toolStatus.ts";
 import {
   ensureNotifyPermission,
   notifyPermission,
@@ -216,7 +217,7 @@ function GeneralSettings() {
   } = useStore();
   const [lang, setLangState] = useState<Lang>(currentLang());
 
-  const installed = installedTools.filter((tl) => tl.installed);
+  const spawnable = spawnableToolsOf(installedTools);
 
   // Per-tool command overrides ("aliases", e.g. claude → cc-claude). `draft`
   // holds in-progress edits; `saved` is what the backend persisted, so a Save
@@ -338,14 +339,14 @@ function GeneralSettings() {
     <div className="flex flex-col gap-10">
       <SettingsGroup title={t("settings.defaults")}>
         <SettingRow label={t("settings.defaultTool")} hint={t("settings.defaultToolHint")}>
-          {installed.length === 0 ? (
+          {spawnable.length === 0 ? (
             <span className="text-[12px] text-waiting">{t("settings.noTools")}</span>
           ) : (
             <div className="flex flex-col items-end gap-1">
               <Segmented
                 value={defaultTool}
                 onChange={setDefaultTool}
-                options={installed.map((tl) => ({ value: tl.tool, label: toolFullName(tl.tool) }))}
+                options={spawnable.map((tl) => ({ value: tl.tool, label: toolFullName(tl.tool) }))}
               />
               {configuredTool && configuredTool !== defaultTool && (
                 <span className="text-[11px] text-waiting">

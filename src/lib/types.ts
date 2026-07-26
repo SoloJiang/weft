@@ -691,6 +691,7 @@ export interface ToolDiagnostic {
 export interface ToolStatus {
   tool: string;
   installed: boolean;
+  spawnable: boolean;
   version: string | null;
   path: string | null;
   meets_min: boolean;

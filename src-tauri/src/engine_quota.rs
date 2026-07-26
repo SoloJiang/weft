@@ -204,8 +204,10 @@ pub fn clear_for_test() {
 }
 
 #[cfg(test)]
-/// Serialize every test that mutates the process-global quota hub, including
-/// callers in sibling modules such as `tool_command`.
+/// Serialize every test that mutates the process-global quota hub. The
+/// `tool_command::override_test_lock` is an alias to this same synchronous
+/// mutex because changing overrides also clears the hub. It is intentionally a
+/// sync mutex, including for async tests that serialize their setup sequence.
 pub(crate) fn hub_test_lock() -> &'static Mutex<()> {
     static TEST_HUB_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     TEST_HUB_LOCK.get_or_init(|| Mutex::new(()))
@@ -345,9 +347,6 @@ mod tests {
     #[test]
     fn pinned_old_command_cannot_repopulate_the_current_routing_snapshot() {
         let _test_hub_lock = hub_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let _override_lock = crate::tool_command::override_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         clear_for_test();
         crate::tool_command::set_overrides(std::collections::HashMap::from([(
             "claude".to_string(),

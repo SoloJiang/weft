@@ -9,6 +9,10 @@ use serde::Serialize;
 pub struct ToolStatus {
     pub tool: String,
     pub installed: bool,
+    /// Whether the configured command can be reached by the same bare spawn
+    /// path used by agent sessions. This is false for the macOS Codex.app
+    /// diagnostic fallback even when `installed` is true.
+    pub spawnable: bool,
     pub version: Option<String>,
     pub path: Option<String>,
     pub meets_min: bool,
@@ -32,6 +36,7 @@ fn probe(tool: &str) -> ToolStatus {
         return ToolStatus {
             tool: tool.into(),
             installed: false,
+            spawnable: false,
             version: None,
             path: None,
             meets_min: true,
@@ -73,6 +78,7 @@ fn probe(tool: &str) -> ToolStatus {
             (false, None)
         }
     };
+    let spawnable = installed && crate::detect::is_spawnable(&command);
     let meets_min = version
         .as_deref()
         .map(|v| crate::detect::meets_min(tool, v))
@@ -89,6 +95,7 @@ fn probe(tool: &str) -> ToolStatus {
     ToolStatus {
         tool: tool.into(),
         installed,
+        spawnable,
         version,
         path: Some(path_str),
         meets_min,

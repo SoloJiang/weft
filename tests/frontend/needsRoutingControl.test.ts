@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import type { EngineRouteDecision, ToolStatus } from "../../src/lib/types.ts";
 import { needsRoutingControlOf } from "../../src/board/needsRoutingControl.ts";
 
-function tool(name: string, installed = true): ToolStatus {
+function tool(name: string, installed = true, spawnable = installed): ToolStatus {
   return {
     tool: name,
     installed,
+    spawnable,
     version: null,
     path: null,
     meets_min: true,
@@ -70,7 +71,7 @@ test("an explicit installed selection enables approval and becomes the manual to
   assert.equal(state.manualTool, "opencode");
 });
 
-test("a picked tool disappearing from the refreshed installed list stays invalid and disabled", () => {
+test("a picked tool that is installed but no longer spawnable stays invalid and disabled", () => {
   const beforeRefresh = needsRoutingControlOf({
     route: route({ blocked: true, source: "blocked", tool: null }),
     picked: "codex",
@@ -80,7 +81,7 @@ test("a picked tool disappearing from the refreshed installed list stays invalid
   const afterRefresh = needsRoutingControlOf({
     route: route({ blocked: true, source: "blocked", tool: null }),
     picked: "codex",
-    installedTools: [tool("codex", false), tool("opencode")],
+    installedTools: [tool("codex", true, false), tool("opencode")],
     defaultTool: "codex",
   });
 

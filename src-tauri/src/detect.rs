@@ -216,23 +216,25 @@ fn refresh_tool_path() -> String {
     merged
 }
 
-/// Does `program` resolve on the augmented PATH — the SAME way a bare
-/// `Command::new(program)` spawn will? Re-probes once on a miss (like
-/// [`resolve_tool_path`]) but does NOT consult the Codex app-bundle fallback,
-/// which a bare PATH spawn can't reach.
-pub fn resolves_on_path(program: &str) -> bool {
-    // Absolute executable paths are valid overrides/pins (see tool_command) and
-    // don't live on PATH: the file's existence IS the resolution check — without
-    // this, the send pre-flight reports agent_not_found for a configured
-    // absolute CLI that Command::new would spawn just fine.
+/// Whether a bare `Command::new(program)` can resolve an executable using the
+/// PATH Weft passes to agent processes. This deliberately does NOT consult the
+/// Codex app-bundle fallback: that fallback is useful for diagnostics/version
+/// display, but a bare spawn cannot reach it. Absolute command overrides are
+/// checked directly, including the Unix executable bit.
+pub fn is_spawnable(program: &str) -> bool {
     let p = std::path::Path::new(program);
     if p.is_absolute() {
-        return p.is_file();
+        return path_is_spawnable(p);
     }
-    if which_on_path(program, &tool_path()).is_some() {
+    if spawnable_path_on_path(program, &tool_path()).is_some() {
         return true;
     }
-    which_on_path(program, &refresh_tool_path()).is_some()
+    spawnable_path_on_path(program, &refresh_tool_path()).is_some()
+}
+
+/// Existing callers use this name for the same bare-command preflight.
+pub fn resolves_on_path(program: &str) -> bool {
+    is_spawnable(program)
 }
 
 /// Prewarm the augmented PATH at startup so the first agent spawn doesn't pay the
@@ -366,7 +368,7 @@ pub(crate) fn pick_default_tool(user: Option<&str>, installed: impl Fn(&str) -> 
 /// aliased CLI is eligible as the default.
 pub fn resolve_default_tool(user: Option<&str>) -> String {
     pick_default_tool(user, |t| {
-        resolve_tool_path(&crate::tool_command::command_for(t)).is_some()
+        is_spawnable(&crate::tool_command::command_for(t))
     })
 }
 
@@ -438,6 +440,24 @@ fn which_on_path(tool: &str, path: &str) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+fn spawnable_path_on_path(tool: &str, path: &str) -> Option<std::path::PathBuf> {
+    which_on_path(tool, path).filter(|candidate| path_is_spawnable(candidate))
+}
+
+#[cfg(unix)]
+fn path_is_spawnable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn path_is_spawnable(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 #[cfg(test)]
@@ -584,5 +604,24 @@ mod tests {
         let path = format!("/usr/bin:{}", bin.display());
         assert_eq!(which_on_path("codex", &path), Some(bin.join("codex")));
         assert!(which_on_path("absent", &path).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawnable_absolute_path_requires_execute_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let executable = tmp.path().join("codex");
+        std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        assert!(!is_spawnable(executable.to_str().unwrap()));
+
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        assert!(is_spawnable(executable.to_str().unwrap()));
     }
 }

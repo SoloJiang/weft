@@ -1,4 +1,5 @@
 import type { EngineRouteDecision, ToolStatus } from "../lib/types";
+import { spawnableToolsOf } from "../lib/toolStatus.ts";
 
 export type NeedsRoutingControlKind =
   | "loading"
@@ -48,15 +49,15 @@ export interface NeedsRoutingControlInput {
  */
 export function needsRoutingControlOf(input: NeedsRoutingControlInput): NeedsRoutingControl {
   const route = input.route ?? null;
-  const pickerOptions = input.installedTools.filter((tool) => tool.installed);
+  const pickerOptions = spawnableToolsOf(input.installedTools);
 
   if (input.installedTools.length === 0) {
     return createRoutingControl("loading", route, pickerOptions, input.picked, input.defaultTool);
   }
 
   if (input.picked !== null) {
-    const pickedIsInstalled = pickerOptions.some((tool) => tool.tool === input.picked);
-    const kind = pickedIsInstalled ? "explicitValid" : "explicitInvalid";
+    const pickedIsSpawnable = pickerOptions.some((tool) => tool.tool === input.picked);
+    const kind = pickedIsSpawnable ? "explicitValid" : "explicitInvalid";
     return createRoutingControl(kind, route, pickerOptions, input.picked, input.defaultTool);
   }
 

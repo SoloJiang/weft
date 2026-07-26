@@ -8,6 +8,7 @@ import { Button } from "../components/ui/Button";
 import { Select } from "../components/ui/Select";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { routeReasonKey } from "../lib/engineRoutingDisplay";
+import { spawnableToolsOf } from "../lib/toolStatus.ts";
 import { PlanSummary } from "../session/blocks/PlanSummary";
 import { latestPlanCard, type ParsedPlanCard } from "../session/planCard";
 import { SCOPE_CONFIRM_DISABLED, scopeConfirmStateOf } from "./scopeConfirmState";
@@ -68,17 +69,14 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
   const [selectedManualTool, setSelectedManualTool] = useState<string | null>(null);
   const dirs = proposal?.directions ?? [];
   const thread = threads.find((th) => th.id === activeThreadId);
-  const installed = useMemo(
-    () => installedTools.filter((tool) => tool.installed),
-    [installedTools],
-  );
-  const installedToolNames = useMemo(() => installed.map((tool) => tool.tool), [installed]);
+  const spawnable = useMemo(() => spawnableToolsOf(installedTools), [installedTools]);
+  const spawnableToolNames = useMemo(() => spawnable.map((tool) => tool.tool), [spawnable]);
   const batchEngineOptions = useMemo(
     () => [
       { value: BATCH_AUTOMATIC_VALUE, label: t("scope.batchEngineAutomatic") },
-      ...installed.map((tool) => ({ value: tool.tool, label: toolFullName(tool.tool) })),
+      ...spawnable.map((tool) => ({ value: tool.tool, label: toolFullName(tool.tool) })),
     ],
-    [installed, t],
+    [spawnable, t],
   );
   const blockedRoute = useMemo(() => {
     const blockedLane = dirs.find((direction) => direction.decision === "" && direction.route?.blocked);
@@ -118,7 +116,7 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
     confirming,
     routeBlocked: blockedRoute !== null,
     manualTool: selectedManualTool,
-    installedToolNames,
+    spawnableToolNames,
   });
 
   if (!proposal) return null;

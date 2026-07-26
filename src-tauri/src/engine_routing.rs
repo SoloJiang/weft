@@ -10,8 +10,6 @@ use crate::engine_quota::{QuotaSnapshot, QuotaStatus};
 use crate::store::{repo, Db};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-#[cfg(unix)]
-use std::path::Path;
 
 pub const K_AUTOMATIC_ROUTING_ENABLED: &str = "automatic_engine_routing";
 pub const K_QUOTA_FAILOVER_ENABLED: &str = "quota_failover_on_exceeded";
@@ -229,9 +227,12 @@ pub fn resolve(request: &RouteRequest) -> RouteDecision {
         let Some(candidate) = candidate(&request.candidates, manual) else {
             return blocked(RouteReason::ManualToolUnavailable, request.hint);
         };
-        // An explicit user pin is never rewritten by an automatic policy. If
-        // its command is currently missing, let the normal spawn error explain
-        // that fact rather than silently choosing another engine.
+        // An explicit user choice is never rewritten by an automatic policy,
+        // but it must still point at a command the worker can actually spawn.
+        // Stale choices block without falling through to another engine.
+        if !candidate.installed {
+            return blocked(RouteReason::ManualToolUnavailable, request.hint);
+        }
         return selected(
             manual,
             RoutingSource::Manual,
@@ -288,6 +289,9 @@ pub fn resolve(request: &RouteRequest) -> RouteDecision {
             }
         } else {
             match preferred_candidate {
+                Some(candidate) if candidate.installed && candidate.quota.is_none() => {
+                    RouteReason::QuotaUnknown
+                }
                 Some(candidate) if candidate.quota == Some(QuotaStatus::Warning) => {
                     RouteReason::PreferredWarning
                 }
@@ -413,52 +417,13 @@ fn snapshots_by_tool() -> Vec<QuotaSnapshot> {
     crate::engine_quota::all()
 }
 
-#[cfg(unix)]
-fn is_executable_regular_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::metadata(path)
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(unix)]
-fn command_is_ready_on_path(command: &str, search_path: &str) -> bool {
-    let path = Path::new(command);
-    if path.is_absolute() {
-        return is_executable_regular_file(path);
-    }
-    std::env::split_paths(search_path)
-        .map(|directory| directory.join(command))
-        .any(|path| is_executable_regular_file(&path))
-}
-
-/// Match the eventual bare `Command::new(command)` spawn closely enough for
-/// automatic routing. Windows keeps the existing PATHEXT-aware detector; Unix
-/// additionally rejects regular files that the process cannot execute.
-fn command_is_ready(command: &str) -> bool {
-    if !crate::detect::resolves_on_path(command) {
-        return false;
-    }
-
-    #[cfg(windows)]
-    {
-        true
-    }
-
-    #[cfg(unix)]
-    {
-        command_is_ready_on_path(command, &crate::detect::tool_path())
-    }
-}
-
 fn candidate_for(tool: EngineId, snapshots: &[QuotaSnapshot]) -> RouteCandidate {
     let command = crate::tool_command::command_for(tool.as_str());
     // A route must only select a command that the eventual bare
     // `Command::new(command)` spawn can reach. This excludes the Codex app
     // bundle fallback on Unix, rejects non-executable files, and uses
     // PATHEXT-aware lookup for Windows shims.
-    let installed = command_is_ready(&command);
+    let installed = crate::detect::is_spawnable(&command);
     let quota = snapshots
         .iter()
         .find(|snapshot| snapshot.tool == tool.as_str())
@@ -785,10 +750,12 @@ pub async fn prepare_initial_lead(
     if thread.engine_pinned {
         return Ok(thread.clone());
     }
-    // A status row means this participant has already been started at least
-    // once. Initial routing is not a license to rebalance it on a later
-    // resume, even if the quota/installation snapshot has changed.
-    if repo::lead_status(db, thread.id).await?.is_some() {
+    // Either metadata field proves native startup happened. A native id without
+    // a status can be left by a crash between those writes, but it still owns
+    // the original provider and must never be resumed by a newly selected one.
+    if repo::lead_native_id(db, thread.id).await?.is_some()
+        || repo::lead_status(db, thread.id).await?.is_some()
+    {
         return Ok(thread.clone());
     }
     let messages = repo::list_lead_messages(db, thread.id).await?;
@@ -1006,7 +973,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn automatic_candidates_require_executable_regular_files() {
+    fn automatic_candidates_use_the_shared_spawnable_predicate() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1015,22 +982,12 @@ mod tests {
         let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
         permissions.set_mode(0o644);
         std::fs::set_permissions(&executable, permissions).unwrap();
-
-        let search_path = dir.path().to_string_lossy().into_owned();
-        assert!(!command_is_ready_on_path(
-            executable.to_str().unwrap(),
-            &search_path
-        ));
-        assert!(!command_is_ready_on_path("agent", &search_path));
+        assert!(!crate::detect::is_spawnable(executable.to_str().unwrap()));
 
         let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
-        assert!(command_is_ready_on_path(
-            executable.to_str().unwrap(),
-            &search_path
-        ));
-        assert!(command_is_ready_on_path("agent", &search_path));
+        assert!(crate::detect::is_spawnable(executable.to_str().unwrap()));
     }
 
     #[tokio::test]
@@ -1099,9 +1056,6 @@ mod tests {
 
     #[tokio::test]
     async fn initial_lead_rechecks_a_successful_marker_before_first_start() {
-        let _quota_hub_lock = crate::engine_quota::hub_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _override_lock = crate::tool_command::override_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1149,6 +1103,51 @@ mod tests {
         crate::engine_quota::clear_for_test();
 
         assert_eq!(recovered.lead_tool, "claude");
+    }
+
+    #[tokio::test]
+    async fn initial_lead_native_id_without_status_keeps_original_provider() {
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::engine_quota::clear_for_test();
+
+        let ready_command = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::tool_command::set_overrides(std::collections::HashMap::from([
+            ("codex".to_string(), "/definitely/missing-codex".to_string()),
+            ("claude".to_string(), ready_command),
+        ]));
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::set_setting(&db, K_AUTOMATIC_ROUTING_ENABLED, "true")
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        repo::set_lead_native_id(&db, thread.id, "codex-native-1")
+            .await
+            .unwrap();
+
+        let current_route = try_resolve_for_db(&db, None, "codex", RoutingHint::Normal)
+            .await
+            .unwrap();
+        assert_eq!(current_route.selected(), Some(EngineId::Claude));
+        assert!(repo::lead_status(&db, thread.id).await.unwrap().is_none());
+
+        let recovered = prepare_initial_lead(&db, &thread).await.unwrap();
+        assert_eq!(recovered.lead_tool, "codex");
+        assert_eq!(
+            repo::lead_native_id(&db, thread.id).await.unwrap().as_deref(),
+            Some("codex-native-1")
+        );
+
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+        crate::engine_quota::clear_for_test();
     }
 
     #[tokio::test]
@@ -1436,6 +1435,39 @@ mod tests {
         ));
         assert_eq!(out.selected(), Some(EngineId::Claude));
         assert_eq!(out.reason, RouteReason::PreferredUnavailable);
+    }
+
+    #[test]
+    fn alternate_ok_after_preferred_unknown_quota_reports_quota_unknown() {
+        let out = resolve(&request(
+            true,
+            None,
+            EngineId::Opencode,
+            RoutingHint::Normal,
+            vec![
+                candidate(EngineId::Codex, true, None),
+                candidate(EngineId::Claude, true, Some(QuotaStatus::Ok)),
+            ],
+        ));
+        assert_eq!(out.selected(), Some(EngineId::Claude));
+        assert_eq!(out.reason, RouteReason::QuotaUnknown);
+    }
+
+    #[test]
+    fn manual_non_spawnable_candidate_is_blocked_without_fallback() {
+        let out = resolve(&request(
+            true,
+            Some(EngineId::Codex),
+            EngineId::Claude,
+            RoutingHint::Normal,
+            vec![
+                candidate(EngineId::Codex, false, Some(QuotaStatus::Ok)),
+                candidate(EngineId::Claude, true, Some(QuotaStatus::Ok)),
+            ],
+        ));
+        assert!(out.blocked);
+        assert_eq!(out.selected(), None);
+        assert_eq!(out.reason, RouteReason::ManualToolUnavailable);
     }
 
     #[test]

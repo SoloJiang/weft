@@ -3204,9 +3204,6 @@ mod tests {
 
     #[tokio::test]
     async fn reused_route_preview_and_confirm_keep_existing_engine_when_automatic_blocked() {
-        let _quota_hub_lock = crate::engine_quota::hub_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _override_lock = crate::tool_command::override_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());

@@ -8,7 +8,7 @@ test("scope confirmation requires an explicit override for a blocked route", () 
     confirming: false,
     routeBlocked: true,
     manualTool: null,
-    installedToolNames: ["opencode"],
+    spawnableToolNames: ["opencode"],
   });
   assert.equal(blockedAutomatic.kind, "automaticBlocked");
   assert.equal(SCOPE_CONFIRM_DISABLED[blockedAutomatic.kind], true);
@@ -18,7 +18,7 @@ test("scope confirmation requires an explicit override for a blocked route", () 
     confirming: false,
     routeBlocked: true,
     manualTool: "opencode",
-    installedToolNames: ["opencode"],
+    spawnableToolNames: ["opencode"],
   });
   assert.equal(overridden.kind, "explicitValid");
   assert.equal(overridden.manualTool, "opencode");
@@ -31,7 +31,7 @@ test("a stale explicit selection becomes invalid after the installed tools refre
     confirming: false,
     routeBlocked: true,
     manualTool: "opencode",
-    installedToolNames: ["codex"],
+    spawnableToolNames: ["codex"],
   });
 
   assert.equal(state.kind, "explicitInvalid");
@@ -46,7 +46,7 @@ test("automatic routing remains available without an explicit selection", () => 
     confirming: false,
     routeBlocked: false,
     manualTool: null,
-    installedToolNames: ["codex"],
+    spawnableToolNames: ["codex"],
   });
 
   assert.equal(state.kind, "automaticAvailable");
