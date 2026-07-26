@@ -224,7 +224,9 @@ fn refresh_tool_path() -> String {
 pub fn resolve_spawnable_tool_path(program: &str) -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(program);
     if p.is_absolute() {
-        return path_is_spawnable(p).then(|| p.to_path_buf());
+        return spawnable_absolute_path_candidates(program, cfg!(windows))
+            .into_iter()
+            .find(|candidate| path_is_spawnable(candidate));
     }
     spawnable_path_on_path(program, &tool_path())
         .or_else(|| spawnable_path_on_path(program, &refresh_tool_path()))
@@ -403,8 +405,9 @@ pub fn resolve_tool_path(tool: &str) -> Option<std::path::PathBuf> {
     which_on_path(tool, &refresh_tool_path())
 }
 
-/// Candidate executable names a bare Windows process spawn may resolve. On
-/// non-Windows callers pass `None`, keeping the exact command name only.
+/// Candidate names used by diagnostic PATH lookup. On non-Windows callers pass
+/// `None`, keeping the exact command name only; Windows diagnostics intentionally
+/// include PATHEXT script entries even though automatic routing does not.
 fn executable_name_candidates(tool: &str, windows_pathext: Option<&str>) -> Vec<String> {
     let mut names = vec![tool.to_string()];
     let Some(windows_pathext) = windows_pathext else {
@@ -447,7 +450,7 @@ fn which_on_path(tool: &str, path: &str) -> Option<std::path::PathBuf> {
 }
 
 fn spawnable_path_on_path(tool: &str, path: &str) -> Option<std::path::PathBuf> {
-    let names = executable_name_candidates(tool, windows_pathext().as_deref());
+    let names = spawnable_executable_name_candidates(tool, cfg!(windows));
     for directory in std::env::split_paths(path) {
         for name in &names {
             let candidate = directory.join(name);
@@ -457,6 +460,26 @@ fn spawnable_path_on_path(tool: &str, path: &str) -> Option<std::path::PathBuf> 
         }
     }
     None
+}
+
+/// Candidate names that the worker's bare process spawn can resolve.
+/// Windows process creation appends ".exe" for an extensionless name; it does
+/// not search arbitrary PATHEXT entries. Explicit ".cmd"/".bat" commands stay
+/// valid because Rust's Windows command implementation invokes cmd.exe for
+/// those explicit paths.
+fn spawnable_executable_name_candidates(tool: &str, windows: bool) -> Vec<String> {
+    if windows && std::path::Path::new(tool).extension().is_none() {
+        return vec![format!("{tool}.exe")];
+    }
+    vec![tool.to_string()]
+}
+
+fn spawnable_absolute_path_candidates(program: &str, windows: bool) -> Vec<std::path::PathBuf> {
+    let path = std::path::Path::new(program);
+    if windows && path.extension().is_none() {
+        return vec![path.with_extension("exe"), path.to_path_buf()];
+    }
+    vec![path.to_path_buf()]
 }
 
 #[cfg(unix)]
@@ -513,6 +536,37 @@ mod tests {
         assert_eq!(
             executable_name_candidates("codex.exe", Some(".COM;.EXE;.BAT;.CMD")),
             vec!["codex.exe"]
+        );
+    }
+
+    #[test]
+    fn windows_spawnable_candidates_do_not_expand_pathext_scripts() {
+        assert_eq!(
+            spawnable_executable_name_candidates("codex", true),
+            vec!["codex.exe"]
+        );
+        assert_eq!(
+            spawnable_executable_name_candidates("codex.cmd", true),
+            vec!["codex.cmd"]
+        );
+        assert_eq!(
+            spawnable_executable_name_candidates("codex.bat", true),
+            vec!["codex.bat"]
+        );
+    }
+
+    #[test]
+    fn windows_spawnable_absolute_candidates_prefer_native_executable() {
+        assert_eq!(
+            spawnable_absolute_path_candidates("/tools/codex", true),
+            vec![
+                std::path::PathBuf::from("/tools/codex.exe"),
+                std::path::PathBuf::from("/tools/codex"),
+            ]
+        );
+        assert_eq!(
+            spawnable_absolute_path_candidates("/tools/codex.cmd", true),
+            vec![std::path::PathBuf::from("/tools/codex.cmd")]
         );
     }
 

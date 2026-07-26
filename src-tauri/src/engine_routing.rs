@@ -99,6 +99,15 @@ impl RoutingSource {
     }
 }
 
+/// Distinguishes a persisted manual identity from a new manual selection.
+/// Retained identities remain authoritative when their command disappears;
+/// fresh selections must still be launchable at the backend decision point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManualRouteIntent {
+    Retained,
+    Fresh,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteReason {
@@ -223,10 +232,24 @@ fn blocked(reason: RouteReason, hint: RoutingHint) -> RouteDecision {
 
 /// Resolve a new participant or an unstarted dispatch.
 pub fn resolve(request: &RouteRequest) -> RouteDecision {
+    resolve_with_manual_intent(request, ManualRouteIntent::Retained)
+}
+
+/// Resolve a route while making the origin of a manual identity explicit.
+/// Existing callers use resolve and therefore retain persisted-pin semantics.
+/// New UI choices should use ManualRouteIntent::Fresh so a command that
+/// disappeared between UI selection and confirmation is blocked.
+pub fn resolve_with_manual_intent(
+    request: &RouteRequest,
+    manual_intent: ManualRouteIntent,
+) -> RouteDecision {
     if let Some(manual) = request.manual_tool {
         let Some(candidate) = candidate(&request.candidates, manual) else {
             return blocked(RouteReason::ManualToolUnavailable, request.hint);
         };
+        if manual_intent == ManualRouteIntent::Fresh && !candidate.installed {
+            return blocked(RouteReason::ManualToolUnavailable, request.hint);
+        }
         // An explicit user choice is never rewritten by an automatic policy.
         // UI pickers only offer spawnable commands, but an existing/manual pin
         // must remain authoritative if its command later disappears. The
@@ -421,7 +444,8 @@ fn candidate_for(tool: EngineId, snapshots: &[QuotaSnapshot]) -> RouteCandidate 
     // A route must only select a command that the eventual bare
     // `Command::new(command)` spawn can reach. This excludes the Codex app
     // bundle fallback on Unix, rejects non-executable files, and uses
-    // PATHEXT-aware lookup for Windows shims.
+    // native Windows executable lookup, without treating arbitrary PATHEXT
+    // script entries as launchable by an extensionless command.
     let installed = crate::detect::is_spawnable(&command);
     let quota = snapshots
         .iter()
@@ -451,18 +475,41 @@ pub async fn try_resolve_for_db(
     legacy_tool: &str,
     hint: RoutingHint,
 ) -> anyhow::Result<RouteDecision> {
+    try_resolve_for_db_with_manual_intent(
+        db,
+        manual_tool,
+        legacy_tool,
+        hint,
+        ManualRouteIntent::Retained,
+    )
+    .await
+}
+
+/// Read live policy/command state and resolve a route with an explicit manual
+/// intent. Use ManualRouteIntent::Fresh for a newly submitted UI choice and
+/// ManualRouteIntent::Retained for a persisted pin or legacy identity.
+pub async fn try_resolve_for_db_with_manual_intent(
+    db: &Db,
+    manual_tool: Option<&str>,
+    legacy_tool: &str,
+    hint: RoutingHint,
+    manual_intent: ManualRouteIntent,
+) -> anyhow::Result<RouteDecision> {
     let legacy = EngineId::parse(legacy_tool).unwrap_or(EngineId::Codex);
     if let Some(manual_tool) = manual_tool {
         let Some(manual) = EngineId::parse(manual_tool) else {
             return Ok(blocked(RouteReason::InvalidManualTool, hint));
         };
-        return Ok(resolve(&RouteRequest {
-            automatic_enabled: false,
-            manual_tool: Some(manual),
-            legacy_tool: legacy,
-            hint,
-            candidates: candidate_list(),
-        }));
+        return Ok(resolve_with_manual_intent(
+            &RouteRequest {
+                automatic_enabled: false,
+                manual_tool: Some(manual),
+                legacy_tool: legacy,
+                hint,
+                candidates: candidate_list(),
+            },
+            manual_intent,
+        ));
     }
 
     let automatic_enabled = is_enabled(
@@ -489,7 +536,28 @@ pub async fn resolve_for_db(
     legacy_tool: &str,
     hint: RoutingHint,
 ) -> RouteDecision {
-    match try_resolve_for_db(db, manual_tool, legacy_tool, hint).await {
+    resolve_for_db_with_manual_intent(
+        db,
+        manual_tool,
+        legacy_tool,
+        hint,
+        ManualRouteIntent::Retained,
+    )
+    .await
+}
+
+/// Compatibility boundary for callers that need a direct decision while
+/// selecting the manual identity semantics explicitly.
+pub async fn resolve_for_db_with_manual_intent(
+    db: &Db,
+    manual_tool: Option<&str>,
+    legacy_tool: &str,
+    hint: RoutingHint,
+    manual_intent: ManualRouteIntent,
+) -> RouteDecision {
+    match try_resolve_for_db_with_manual_intent(db, manual_tool, legacy_tool, hint, manual_intent)
+        .await
+    {
         Ok(decision) => decision,
         Err(err) => {
             eprintln!("[weft][routing] policy read failed; route blocked: {err}");
@@ -968,6 +1036,27 @@ mod tests {
         ));
         assert_eq!(out.selected(), Some(EngineId::Claude));
         assert_eq!(out.source, RoutingSource::Manual);
+    }
+
+    #[test]
+    fn fresh_manual_choice_blocks_when_command_is_unavailable() {
+        let out = resolve_with_manual_intent(
+            &request(
+                true,
+                Some(EngineId::Claude),
+                EngineId::Codex,
+                RoutingHint::Normal,
+                vec![
+                    candidate(EngineId::Codex, true, Some(QuotaStatus::Ok)),
+                    candidate(EngineId::Claude, false, None),
+                ],
+            ),
+            ManualRouteIntent::Fresh,
+        );
+        assert!(out.blocked);
+        assert_eq!(out.selected(), None);
+        assert_eq!(out.source, RoutingSource::Blocked);
+        assert_eq!(out.reason, RouteReason::ManualToolUnavailable);
     }
 
     #[cfg(unix)]
