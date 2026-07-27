@@ -774,6 +774,14 @@ export const en = {
       "This can send recent conversation context from one provider to the other after a structured quota-exceeded turn. It never interrupts a healthy turn.",
     quotaFailoverConfirm:
       "Enable automatic quota fail-over? Recent conversation context may be sent from one provider to the other after a quota-exceeded turn.",
+    autoMergeGroup: "Auto-merge",
+    autoMergeTitle: "Auto-merge when truly mergeable",
+    autoMergeHint:
+      "When a tracked PR/MR reaches this repo's truly-mergeable bar (CI green, review approved, no conflicts) and a fresh, unstalled check confirms it still holds, squash-merge it automatically — no per-merge prompt. Off by default: this performs an irreversible action (merging code) with nobody confirming that specific merge. Every attempt, success or failure, leaves a marker on the PR's timeline.",
+    autoMergeDisclosure:
+      "Only applies to PR/MR rows Weft is already tracking (via register_pr) on a host with merge support (currently GitHub). A stale or currently-failing status check skips the row instead of merging on an old snapshot.",
+    autoMergeConfirm:
+      "Enable auto-merge? Weft will squash-merge a tracked PR/MR on its own, without asking you, once it reaches this repo's truly-mergeable bar. This cannot be undone once it happens.",
     engineRoutingGroup: "Engine routing",
     automaticRoutingTitle: "Let Weft choose engines automatically",
     automaticRoutingHint:

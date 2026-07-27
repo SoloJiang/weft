@@ -332,6 +332,13 @@ export const api = {
   getQuotaFailoverEnabled: () => invoke<boolean>("get_quota_failover_enabled"),
   setQuotaFailoverEnabled: (enabled: boolean) =>
     invoke<void>("set_quota_failover_enabled", { enabled }),
+  // issue #110 T3: squash-merge a tracked PR/MR automatically once it
+  // reaches this repo's truly-mergeable bar. Opt-in — off by default, since
+  // this performs an irreversible action (merging code) with no human
+  // confirming the specific merge.
+  getPrAutoMergeEnabled: () => invoke<boolean>("get_pr_auto_merge_enabled"),
+  setPrAutoMergeEnabled: (enabled: boolean) =>
+    invoke<void>("set_pr_auto_merge_enabled", { enabled }),
   // Per-tool command overrides ("aliases", e.g. claude → cc-claude): identity →
   // command. Empty map when none configured.
   getToolCommands: () => invoke<Record<string, string>>("get_tool_commands"),

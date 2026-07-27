@@ -748,6 +748,14 @@ export const zh = {
       "开启后，结构化额度达限的 turn 可能把最近的对话上下文从一家厂商发给另一家；健康运行中的 turn 不会被中断。",
     quotaFailoverConfirm:
       "要开启额度自动 fail-over 吗？额度达限后，最近的对话上下文可能会从一家厂商发送给另一家。",
+    autoMergeGroup: "自动合并",
+    autoMergeTitle: "达标后自动合并",
+    autoMergeHint:
+      "当被跟踪的 PR/MR 达到本仓库「truly mergeable」的标准（CI 全绿、review 通过、无冲突），且经过一次新鲜、未失联的复查确认这一状态仍然成立，Weft 会自动 squash 合并——不会再逐条询问你。默认关闭：这是一个不可撤销的动作（合并代码），且没有人确认这一次具体的合并。每次尝试无论成功失败，都会在 PR 的时间线留下标记。",
+    autoMergeDisclosure:
+      "只对 Weft 已经在跟踪（通过 register_pr）、且宿主支持合并的 PR/MR 生效（目前仅 GitHub）。状态过期或探测正在失败的行会被跳过，不会用旧快照去合并。",
+    autoMergeConfirm:
+      "要开启自动合并吗？一旦被跟踪的 PR/MR 达到「truly mergeable」标准，Weft 会自行 squash 合并，不会再问你。这个动作一旦发生就无法撤销。",
     engineRoutingGroup: "引擎路由",
     automaticRoutingTitle: "允许 Weft 自动选择引擎",
     automaticRoutingHint:

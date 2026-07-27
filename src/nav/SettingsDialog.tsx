@@ -678,6 +678,11 @@ function AutomationSettings() {
   const [quotaFailoverLoaded, setQuotaFailoverLoaded] = useState(false);
   const [automaticRouting, setAutomaticRoutingState] = useState(false);
   const [automaticRoutingLoaded, setAutomaticRoutingLoaded] = useState(false);
+  // issue #110 T3: auto-merge a tracked PR/MR once it clears this repo's
+  // truly-mergeable bar. Own local+effect pair (mirrors quotaFailover just
+  // above) — a narrow, rarely-touched preference with no other consumer.
+  const [autoMerge, setAutoMergeState] = useState(false);
+  const [autoMergeLoaded, setAutoMergeLoaded] = useState(false);
 
   useEffect(() => {
     void api.imGetSettings().then((s) => {
@@ -691,6 +696,10 @@ function AutomationSettings() {
     void api.getAutomaticEngineRoutingEnabled().then((enabled) => {
       setAutomaticRoutingState(enabled);
       setAutomaticRoutingLoaded(true);
+    });
+    void api.getPrAutoMergeEnabled().then((enabled) => {
+      setAutoMergeState(enabled);
+      setAutoMergeLoaded(true);
     });
   }, []);
 
@@ -724,6 +733,18 @@ function AutomationSettings() {
       await api.setAutomaticEngineRoutingEnabled(on);
     } catch (err) {
       setAutomaticRoutingState(prev);
+      throw err;
+    }
+  }
+
+  async function toggleAutoMerge(on: boolean) {
+    if (on && !window.confirm(t("settings.autoMergeConfirm"))) return;
+    const prev = autoMerge;
+    setAutoMergeState(on);
+    try {
+      await api.setPrAutoMergeEnabled(on);
+    } catch (err) {
+      setAutoMergeState(prev);
       throw err;
     }
   }
@@ -791,6 +812,25 @@ function AutomationSettings() {
         </SettingRow>
         <p className="px-3 pb-3 text-[11px] leading-relaxed text-ink-faint">
           {t("settings.quotaFailoverDisclosure")}
+        </p>
+      </SettingsGroup>
+      <SettingsGroup title={t("settings.autoMergeGroup")}>
+        <SettingRow label={t("settings.autoMergeTitle")} hint={t("settings.autoMergeHint")}>
+          {autoMergeLoaded ? (
+            <Toggle
+              on={autoMerge}
+              onChange={(v) => void toggleAutoMerge(v)}
+              label={t("settings.autoMergeTitle")}
+            />
+          ) : (
+            <div
+              aria-hidden
+              className="h-[22px] w-[38px] shrink-0 rounded-full bg-border-strong/40"
+            />
+          )}
+        </SettingRow>
+        <p className="px-3 pb-3 text-[11px] leading-relaxed text-ink-faint">
+          {t("settings.autoMergeDisclosure")}
         </p>
       </SettingsGroup>
       <SettingsGroup title={t("settings.reviewGroup")}>
