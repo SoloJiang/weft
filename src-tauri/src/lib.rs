@@ -181,6 +181,15 @@ pub fn run() {
         .manage(commands::GuardrailState::default())
         .manage(power::PowerGuard::default())
         .manage(process_quota::ProcessQuotaGovernor::default())
+        // Issue #110 T3 follow-up: the auto-merge executor's per-(row,
+        // head_sha) merge-attempt backoff, promoted from a plain local
+        // `HashMap` to managed state so `commands::retry_pr_tracking_core`
+        // (the Needs-you "Retry" button's backend) can reach in and clear a
+        // row's exhausted entry — see `host::automerge::MergeBackoffState`'s
+        // doc. Registered here (not lazily inside `spawn_pr_automerge_watch`)
+        // so it exists before EITHER consumer — the sweep loop below and the
+        // `retry_pr_tracking` command — can possibly run.
+        .manage(host::automerge::MergeBackoffState::default())
         .manage(bus)
         .manage(asks)
         .manage(BusBase(bus_base))

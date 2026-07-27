@@ -40,6 +40,30 @@
 //!      timeline marker is inserted either way (see
 //!      [`insert_automerge_marker`]'s doc).
 //!
+//! FOLLOW-UP (issue #110 T3 seam + retry hardening): steps 1-5 above live in
+//! [`evaluate_row`], which returns a plain [`RowVerdict`] instead of
+//! performing the mutating call itself — `maybe_merge_one` only proceeds to
+//! steps 6-7 on a `RowVerdict::Merge`. That split exists so the exact
+//! property steps 1-5 encode (the FINAL authorization must use FRESH data,
+//! never step 1's stale verdict) is directly testable: a test asserts on
+//! `evaluate_row`'s return value, so it is structurally impossible for any
+//! test of it — including this follow-up's own mutation self-check, see
+//! `tests::` below — to reach [`run_gh_merge`], this file's only
+//! `Command::new("gh")` site (reaching it for real would mean actually
+//! shelling out to the operator's own authenticated `gh`). Steps 4 and 7's
+//! fresh reads go through an injected [`HostResolver`] — a plain,
+//! non-capturing `fn` pointer, defaulting to `super::resolve_host` at the
+//! real call site (`run_automerge_sweep`) — instead of calling that free
+//! function directly, closing the gap an independent review found: neither
+//! call site had any way to substitute a fake `PrHost`, so the "fresh, not
+//! stale" property above had ZERO regression coverage (reverting step 5 to
+//! reuse step 1's `pre_decision` left `cargo test --lib host::` 101/101
+//! green). Step 3's backoff moved from a plain local `HashMap` into
+//! [`MergeBackoffState`], Tauri-managed state — not for testability, but so
+//! `commands::retry_pr_tracking_core` (the Needs-you "Retry" button's
+//! backend) can reach in and clear a row's exhausted entry; see that
+//! struct's own doc for why the backoff itself stays in-memory-only.
+//!
 //! Review round 1 on this PR found the original version skipped steps 2/3/5
 //! entirely and only ever re-read fresh state AFTER attempting the merge
 //! (step 7 existed, steps 4-5 did not) — meaning the mutating call in step 6
@@ -104,10 +128,89 @@ const MAX_READY_AGE_SECS: i64 = 600;
 /// lands. Without this, a persistently-failing merge (missing merge
 /// permission, a repo that rejects squash merges, ...) would retry — and
 /// post a fresh failure marker — every sweep tick forever (review round 1
-/// P2). Small and in-memory (see `spawn_pr_automerge_watch`'s
-/// `merge_failures` map): a process restart or a fresh push both
-/// legitimately deserve a clean slate.
+/// P2). Small and in-memory (see [`MergeBackoffState`]): a process restart or
+/// a fresh push both legitimately deserve a clean slate — and so, now, does
+/// a human clicking the Needs-you "Retry" button (`commands::
+/// retry_pr_tracking_core`).
 const MAX_MERGE_ATTEMPTS_PER_HEAD: u32 = 3;
+
+/// Cloneable handle to the per-(row, head_sha) merge-FAILURE backoff table
+/// (step 3, this module's doc) — Tauri-managed state (`.manage(...)` in
+/// `lib.rs`, fetched via `AppHandle::try_state`), not a plain local `HashMap`
+/// owned by `spawn_pr_automerge_watch`'s loop the way an earlier version of
+/// this file had it. The ONLY reason it moved: `commands::
+/// retry_pr_tracking_core` (the Needs-you "Retry" button's backend) needs a
+/// door to reach in and forget a row's exhausted streak, and a plain
+/// task-local `HashMap` has none. Mirrors `bus::BusRegistry`'s exact shape
+/// (`Arc<Mutex<_>>` behind a `#[derive(Clone)]` newtype) for the same reason:
+/// cheap to clone, safe to hand a copy into every sweep call, no lifetime
+/// coupling to any one `AppHandle` borrow.
+///
+/// STAYS in-memory-only (never persisted to the `pull_request` table, unlike
+/// `probe_fail_count`) — a process restart or a fresh push both legitimately
+/// deserve a clean slate (this module's doc, step 3), and [`clear`]'s Retry
+/// reach-in deliberately does not change that. [`clear`] also deliberately
+/// has no rate limit of its OWN beyond the ordinary per-attempt gate: a human
+/// clicking Retry only ever grants `MAX_MERGE_ATTEMPTS_PER_HEAD` MORE
+/// attempts, and every one of those still has to clear the FULL gate (fresh
+/// CI-green/review-approved/conflict-free — `gate::decide_auto_merge`, step 5)
+/// before `run_gh_merge` is attempted again — Retry cannot make this feature
+/// merge anything it would otherwise refuse; it can only let a target that
+/// already looks ready keep trying. Same precedent `register_pull_request`
+/// already set for `probe_fail_count`'s own unlimited reset.
+///
+/// [`clear`]: MergeBackoffState::clear
+#[derive(Default, Clone)]
+pub struct MergeBackoffState {
+    inner: std::sync::Arc<std::sync::Mutex<HashMap<i32, (String, u32)>>>,
+}
+
+impl MergeBackoffState {
+    /// Step 3's check: has this row exhausted its attempts against EXACTLY
+    /// this `head_sha`? A different (e.g. newer) `head_sha` always reads as
+    /// fresh, even with a nonzero streak recorded against some OTHER sha.
+    /// `pub(crate)`, not private: `commands::tests` (a different module)
+    /// asserts on it directly rather than through the indirect, mutating
+    /// `clear`'s return value — see `retry_pr_tracking_also_clears_an_
+    /// exhausted_merge_attempt_backoff`.
+    pub(crate) fn is_exhausted(&self, pr_id: i32, head_sha: &str) -> bool {
+        let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&pr_id)
+            .is_some_and(|(last_sha, count)| last_sha == head_sha && *count >= MAX_MERGE_ATTEMPTS_PER_HEAD)
+    }
+
+    /// Step 6 success bookkeeping: a merge finally landed, forget any prior
+    /// failure streak for this row entirely.
+    fn record_success(&self, pr_id: i32) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(&pr_id);
+    }
+
+    /// Step 6 failure bookkeeping: bump (or start) the streak for this exact
+    /// `head_sha`, resetting it first if the head moved since the last
+    /// recorded failure. Returns whether THIS attempt just crossed the
+    /// exhaustion threshold (for the marker's `attempts_exhausted` field).
+    /// `pub(crate)` for the same cross-module test reason as `is_exhausted`
+    /// (`commands::tests` seeds an exhausted entry directly, without needing
+    /// to route through a real, failing `run_gh_merge` call).
+    pub(crate) fn record_failure(&self, pr_id: i32, head_sha: &str) -> bool {
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = map.entry(pr_id).or_insert_with(|| (head_sha.to_string(), 0));
+        if entry.0 != head_sha {
+            *entry = (head_sha.to_string(), 0);
+        }
+        entry.1 += 1;
+        entry.1 >= MAX_MERGE_ATTEMPTS_PER_HEAD
+    }
+
+    /// The Retry button's reach-in (`commands::retry_pr_tracking_core`):
+    /// forget this row's backoff entirely, regardless of its current streak
+    /// or which `head_sha` it was recorded against. Returns whether an entry
+    /// actually existed, so a caller can distinguish "there was something
+    /// stuck here" from "this row had no merge-attempt history at all".
+    pub fn clear(&self, pr_id: i32) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(&pr_id).is_some()
+    }
+}
 
 /// Start the runtime PR/MR auto-merge sweep. Call once at app setup,
 /// alongside `host::monitor::spawn_pr_watch` (see `lib.rs`) — NOT instead of
@@ -122,16 +225,10 @@ pub fn spawn_pr_automerge_watch(app: AppHandle) {
         if sweep_secs == 0 {
             return; // disabled
         }
-        // Owned by this task for the process's whole life, threaded through
-        // every sweep — the per-(row, head_sha) merge-failure backoff state.
-        // Mirrors `host::monitor::spawn_pr_watch`'s own `notices` map
-        // ownership shape exactly, for exactly the same reason (a single
-        // task owns the state; no global/static needed).
-        let mut merge_failures: HashMap<i32, (String, u32)> = HashMap::new();
-        run_automerge_sweep(&app, &mut merge_failures).await;
+        run_automerge_sweep(&app).await;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(sweep_secs)).await;
-            run_automerge_sweep(&app, &mut merge_failures).await;
+            run_automerge_sweep(&app).await;
         }
     });
 }
@@ -140,11 +237,11 @@ pub fn spawn_pr_automerge_watch(app: AppHandle) {
 /// is off (the default for almost every install) rather than doing real
 /// per-row work just to gate on `enabled` — same shape as `host::monitor::
 /// run_pr_sweep`'s own `try_state` guards. This EARLY check is an efficiency
-/// short-circuit only: `maybe_merge_one` re-reads `enabled` fresh, per row,
+/// short-circuit only: `evaluate_row` re-reads `enabled` fresh, per row,
 /// immediately before its own final authorization (step 5 in this module's
 /// doc) — so a mid-pass toggle-off still takes effect within the same pass,
 /// it just does not save the listing query itself.
-async fn run_automerge_sweep(app: &AppHandle, merge_failures: &mut HashMap<i32, (String, u32)>) {
+async fn run_automerge_sweep(app: &AppHandle) {
     let Some(db) = app.try_state::<Db>() else {
         return;
     };
@@ -153,6 +250,11 @@ async fn run_automerge_sweep(app: &AppHandle, merge_failures: &mut HashMap<i32, 
     if !auto_merge_enabled(&db).await {
         return;
     }
+
+    let Some(backoff) = app.try_state::<MergeBackoffState>() else {
+        return;
+    };
+    let backoff = backoff.inner().clone();
 
     // No probe-failure ceiling here (`i32::MAX`, effectively "don't exclude
     // anything at the query level") — unlike `host::monitor`'s own sweep,
@@ -169,27 +271,51 @@ async fn run_automerge_sweep(app: &AppHandle, merge_failures: &mut HashMap<i32, 
         }
     };
     for pr in open {
-        maybe_merge_one(app, &db, pr, merge_failures).await;
+        maybe_merge_one(app, &db, pr, &backoff, super::resolve_host).await;
     }
 }
 
-/// Gate one row twice (pre-filter, then final authorization against fresh
-/// state), and if it clears both, execute + confirm + record the merge
-/// attempt. No-op (silently) for every `Skip` verdict at any stage — a
-/// blocked or indeterminate row already has `host::monitor`'s own Needs-you
-/// notice telling the human why, when that is warranted; this feature only
-/// speaks up when it actually ACTS (see `insert_automerge_marker`'s doc).
-/// See this module's own doc for the full numbered flow.
-async fn maybe_merge_one(
-    app: &AppHandle,
-    db: &Db,
-    pr: pull_request::Model,
-    merge_failures: &mut HashMap<i32, (String, u32)>,
-) {
-    let Some(host_kind) = HostKind::parse(&pr.host_kind) else {
-        return; // unrecognized host_kind on the row — nothing sane to do
-    };
+/// The `resolve_host`-shaped seam steps 4 and 7 (this module's doc) call
+/// through, instead of hard-coding `super::resolve_host` at each site. A
+/// plain, non-capturing `fn` pointer — `resolve_host` itself already has
+/// exactly this signature (zero captures), so passing it needs no wrapping;
+/// a test double does too (see `tests::` below), and being `Copy + Send +
+/// 'static`, either moves into `spawn_blocking`'s closure exactly as freely
+/// as the hard-coded call it replaces. `host::monitor` (and `host::judge`)
+/// deliberately do NOT gain this seam: only `automerge.rs`'s own two
+/// fresh-read call sites needed to become testable, and this crate's
+/// read-only boundary (`host/mod.rs`'s module doc) means `monitor.rs` stays
+/// untouched, byte-for-byte, by this file's own follow-up work.
+type HostResolver = fn(HostKind) -> Result<Box<dyn super::PrHost>, HostError>;
 
+/// [`evaluate_row`]'s return: whether `maybe_merge_one` should actually
+/// attempt [`run_gh_merge`], and if so, against exactly which `head_sha` —
+/// always the one step 4 just fetched, NEVER the row's original,
+/// possibly-stale one.
+#[derive(Debug, PartialEq, Eq)]
+enum RowVerdict {
+    Skip,
+    Merge { head_sha: String },
+}
+
+/// Steps 1 through 5 of this module's flow (see module doc): the ENTIRE
+/// decision of whether this row is safe to merge RIGHT NOW, stopping at (and
+/// never past) the FINAL authorization. Split out from the mutating tail
+/// (steps 6-7, still in `maybe_merge_one`) specifically so this — the exact
+/// property review round 1 added (`gate::decide_auto_merge` called a SECOND
+/// time, fed only data from a fresh read, step 1's verdict never reused) —
+/// is directly testable in isolation: a test asserts on the returned
+/// [`RowVerdict`], never on whether a real merge happened, so it is
+/// structurally impossible for any test of this function — including this
+/// follow-up's own mutation self-check, `tests::` below — to reach
+/// [`run_gh_merge`].
+async fn evaluate_row(
+    db: &Db,
+    pr: &pull_request::Model,
+    host_kind: HostKind,
+    backoff: &MergeBackoffState,
+    resolver: HostResolver,
+) -> RowVerdict {
     // Step 1: cheap DB-level pre-filter using STORED (possibly stale) state.
     let now = repo::now_unix();
     let stored_lifecycle = gate::parse_lifecycle(&pr.lifecycle);
@@ -211,7 +337,7 @@ async fn maybe_merge_one(
         MAX_READY_AGE_SECS,
     );
     if pre_decision != AutoMergeDecision::Merge {
-        return;
+        return RowVerdict::Skip;
     }
 
     // Step 2: defensive existence check — see this module's doc. A deleted
@@ -221,33 +347,32 @@ async fn maybe_merge_one(
     // fix, or a narrow delete-vs-sweep timing race.
     match repo::get_thread(db, pr.thread_id).await {
         Ok(Some(_)) => {}
-        Ok(None) => return, // orphaned — nothing to merge into, nowhere to post a marker
+        Ok(None) => return RowVerdict::Skip, // orphaned — nowhere to post a marker
         Err(e) => {
             eprintln!(
                 "[weft][automerge] pr #{}: could not confirm the owning thread still exists: {e}",
                 pr.id
             );
-            return;
+            return RowVerdict::Skip;
         }
     }
 
     // Step 3: per-(row, head_sha) backoff after repeated failed attempts.
-    if let Some((last_sha, count)) = merge_failures.get(&pr.id) {
-        if last_sha == &pr.head_sha && *count >= MAX_MERGE_ATTEMPTS_PER_HEAD {
-            return;
-        }
+    if backoff.is_exhausted(pr.id, &pr.head_sha) {
+        return RowVerdict::Skip;
     }
 
-    // Step 4: fresh, live read — the ONLY thing this feature ever trusts to
-    // actually authorize a merge attempt (step 5). Mirrors `host::monitor`'s
-    // own `check_one` exactly (same `spawn_blocking` discipline).
+    // Step 4: fresh, live read via the INJECTED resolver — the ONLY thing
+    // this feature ever trusts to actually authorize a merge attempt (step
+    // 5). Mirrors `host::monitor`'s own `check_one` exactly (same
+    // `spawn_blocking` discipline).
     let target = PrTarget {
         owner: pr.host_owner.clone(),
         repo: pr.host_repo.clone(),
         number: pr.number,
     };
     let fresh = tokio::task::spawn_blocking(move || {
-        super::resolve_host(host_kind).and_then(|h| h.fetch_status(&target))
+        resolver(host_kind).and_then(|h| h.fetch_status(&target))
     })
     .await
     .unwrap_or_else(|join_err| {
@@ -260,7 +385,7 @@ async fn maybe_merge_one(
         Ok(s) => s,
         Err(e) => {
             let _ = repo::mark_pull_request_probe_error(db, pr.id, &e.message()).await;
-            return; // couldn't confirm live state — never merge on a guess
+            return RowVerdict::Skip; // couldn't confirm live state — never merge on a guess
         }
     };
     let fresh_readiness = judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
@@ -288,8 +413,34 @@ async fn maybe_merge_one(
         MAX_READY_AGE_SECS,
     );
     if final_decision != AutoMergeDecision::Merge {
-        return; // downgraded since the pre-filter — silent, like any other skip
+        return RowVerdict::Skip; // downgraded since the pre-filter — silent, like any other skip
     }
+    RowVerdict::Merge { head_sha: snapshot.head_sha }
+}
+
+/// Gate one row twice (pre-filter, then final authorization against fresh
+/// state — both in [`evaluate_row`]), and if it clears both, execute +
+/// confirm + record the merge attempt. No-op (silently) for every `Skip`
+/// verdict — a blocked or indeterminate row already has `host::monitor`'s own
+/// Needs-you notice telling the human why, when that is warranted; this
+/// feature only speaks up when it actually ACTS (see
+/// `insert_automerge_marker`'s doc). See this module's own doc for the full
+/// numbered flow, and [`evaluate_row`]'s doc for why steps 1-5 live there.
+async fn maybe_merge_one(
+    app: &AppHandle,
+    db: &Db,
+    pr: pull_request::Model,
+    backoff: &MergeBackoffState,
+    resolver: HostResolver,
+) {
+    let Some(host_kind) = HostKind::parse(&pr.host_kind) else {
+        return; // unrecognized host_kind on the row — nothing sane to do
+    };
+
+    let head_sha = match evaluate_row(db, &pr, host_kind, backoff, resolver).await {
+        RowVerdict::Skip => return,
+        RowVerdict::Merge { head_sha } => head_sha,
+    };
 
     // Step 6: the ONE mutating call, off the async runtime, using the FRESH
     // head_sha (never the stale row's) and the row's recorded host_base (GHE
@@ -300,9 +451,9 @@ async fn maybe_merge_one(
     let owner = pr.host_owner.clone();
     let repo_name = pr.host_repo.clone();
     let number = pr.number;
-    let head_sha = snapshot.head_sha.clone();
+    let head_sha_for_merge = head_sha.clone();
     let merge_result = tokio::task::spawn_blocking(move || {
-        run_gh_merge(&host_base, &owner, &repo_name, number, &head_sha)
+        run_gh_merge(&host_base, &owner, &repo_name, number, &head_sha_for_merge)
     })
     .await
     .unwrap_or_else(|join_err| Err(format!("internal: merge task join error: {join_err}")));
@@ -310,25 +461,17 @@ async fn maybe_merge_one(
     // Track consecutive failures per (row, head_sha) for step 3's backoff.
     let attempts_exhausted = match &merge_result {
         Ok(()) => {
-            merge_failures.remove(&pr.id);
+            backoff.record_success(pr.id);
             false
         }
-        Err(_) => {
-            let entry = merge_failures
-                .entry(pr.id)
-                .or_insert_with(|| (snapshot.head_sha.clone(), 0));
-            if entry.0 != snapshot.head_sha {
-                *entry = (snapshot.head_sha.clone(), 0);
-            }
-            entry.1 += 1;
-            entry.1 >= MAX_MERGE_ATTEMPTS_PER_HEAD
-        }
+        Err(_) => backoff.record_failure(pr.id, &head_sha),
     };
 
-    // Step 7: regardless of outcome, one more fresh read + persist + marker.
+    // Step 7: regardless of outcome, one more fresh read (same injected
+    // resolver as step 4) + persist + marker.
     let target2 = PrTarget { owner: pr.host_owner.clone(), repo: pr.host_repo.clone(), number: pr.number };
     let confirmed = tokio::task::spawn_blocking(move || {
-        super::resolve_host(host_kind).and_then(|h| h.fetch_status(&target2))
+        resolver(host_kind).and_then(|h| h.fetch_status(&target2))
     })
     .await
     .unwrap_or_else(|join_err| {
@@ -401,8 +544,9 @@ fn lifecycle_state_tag(lifecycle: PrLifecycle) -> &'static str {
 /// this, and this file only calls it (via `spawn_blocking` — review round 1
 /// Codex P2: a synchronous `Command::output()` call directly on the async
 /// runtime would occupy a Tokio worker for the whole `gh` round trip) from
-/// `maybe_merge_one`, gated by TWO `gate::decide_auto_merge` calls, the
-/// second against data read immediately before this call.
+/// `maybe_merge_one`, gated by TWO `gate::decide_auto_merge` calls (both in
+/// `evaluate_row`), the second against data read immediately before this
+/// call.
 ///
 /// `--match-head-commit` makes GitHub itself refuse the merge if `head_sha`
 /// has moved since the judgement this attempt is based on — server-side
@@ -591,6 +735,7 @@ fn is_enabled(raw: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::{CiStatus, ConflictStatus, MergeReadiness, PrHost, PrSnapshot, ReviewStatus};
     use sea_orm::ConnectionTrait;
 
     // --- run_gh_merge: guards that must fire before any process spawns ----
@@ -725,5 +870,245 @@ mod tests {
         let checked = try_auto_merge_enabled(&db).await;
         assert!(checked.is_err(), "the underlying error must still be observable to a caller that wants it");
         assert!(!auto_merge_enabled(&db).await, "the fail-closed wrapper must return false, never true, on a read error");
+    }
+
+    // --- MergeBackoffState: exhaustion / success / Retry-clear semantics --
+
+    #[test]
+    fn merge_backoff_exhausts_after_max_attempts_and_a_new_head_sha_gets_a_clean_slate() {
+        let backoff = MergeBackoffState::default();
+        assert!(!backoff.is_exhausted(1, "sha1"));
+        for _ in 0..MAX_MERGE_ATTEMPTS_PER_HEAD {
+            backoff.record_failure(1, "sha1");
+        }
+        assert!(backoff.is_exhausted(1, "sha1"));
+        assert!(
+            !backoff.is_exhausted(1, "sha2"),
+            "a different head_sha must not inherit the exhausted streak — a new commit is always a clean slate"
+        );
+    }
+
+    #[test]
+    fn merge_backoff_a_success_forgets_the_streak() {
+        let backoff = MergeBackoffState::default();
+        backoff.record_failure(1, "sha1");
+        backoff.record_failure(1, "sha1");
+        backoff.record_success(1);
+        assert!(!backoff.is_exhausted(1, "sha1"));
+    }
+
+    #[test]
+    fn merge_backoff_record_failure_reports_exactly_when_this_attempt_crosses_the_threshold() {
+        let backoff = MergeBackoffState::default();
+        assert!(!backoff.record_failure(1, "sha1")); // 1
+        assert!(!backoff.record_failure(1, "sha1")); // 2
+        assert!(backoff.record_failure(1, "sha1"), "the 3rd (== MAX) failure must report exhausted"); // 3
+    }
+
+    #[test]
+    fn merge_backoff_clear_removes_an_exhausted_entry_and_un_sticks_the_row() {
+        // Task B's own regression guard, at the unit level: this is exactly
+        // what `commands::retry_pr_tracking_core` now calls on Retry — see
+        // `commands::tests::retry_pr_tracking_also_clears_an_exhausted_
+        // merge_attempt_backoff` for the integration-level version.
+        let backoff = MergeBackoffState::default();
+        assert!(!backoff.clear(1), "nothing to clear yet");
+        for _ in 0..MAX_MERGE_ATTEMPTS_PER_HEAD {
+            backoff.record_failure(1, "sha1");
+        }
+        assert!(backoff.is_exhausted(1, "sha1"));
+        assert!(backoff.clear(1), "an entry existed and was removed");
+        assert!(!backoff.is_exhausted(1, "sha1"), "Retry must actually un-stick the row, not just report success");
+    }
+
+    // --- evaluate_row: the fresh-vs-stale safety property ------------------
+    //
+    // `evaluate_row` (steps 1-5) is the ONLY thing standing between "the
+    // stored row looked ready a while ago" and "actually attempt a merge".
+    // Every test below seeds the STORED row as fully ready (so `pre_decision`
+    // — step 1 — would say `Merge` all on its own) and injects a FRESH read
+    // that is NOT ready: exactly the scenario a caller that reused step 1's
+    // stale verdict for step 5 would get wrong. Because `evaluate_row` only
+    // ever returns a `RowVerdict` (it never itself calls `run_gh_merge`),
+    // NONE of these tests can shell out to `gh` — including under the
+    // mutation self-check below.
+    //
+    // MUTATION SELF-CHECK (see PR body for the full transcript): with step
+    // 5's body temporarily changed from
+    //   `let final_decision = gate::decide_auto_merge(enabled_now, ...);`
+    // to
+    //   `let final_decision = pre_decision;`
+    // (discarding the fresh snapshot and `enabled_now` entirely — the exact
+    // regression an independent review demonstrated has ZERO coverage today),
+    // `evaluate_row_refuses_when_the_fresh_read_shows_ci_failing_even_though_
+    // the_stored_row_was_ready` and `evaluate_row_refuses_when_the_fresh_
+    // read_shows_the_pr_already_merged` both went from green to a hard
+    // failure (`RowVerdict::Merge { .. }` instead of the expected `Skip`).
+    // Reverting the mutation restored both to green with no other changes.
+
+    struct FakeHost(PrSnapshot);
+
+    impl PrHost for FakeHost {
+        fn kind(&self) -> HostKind {
+            HostKind::GitHub
+        }
+        fn fetch_status(&self, _target: &PrTarget) -> Result<PrSnapshot, HostError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn resolver_fresh_ci_failing(_: HostKind) -> Result<Box<dyn PrHost>, HostError> {
+        Ok(Box::new(FakeHost(PrSnapshot {
+            head_sha: "fresh_sha_ci_failing".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: PrLifecycle::Open,
+            ci: CiStatus::Failing,
+            review: ReviewStatus::Approved,
+            conflict: ConflictStatus::Clean,
+        })))
+    }
+
+    fn resolver_fresh_already_merged(_: HostKind) -> Result<Box<dyn PrHost>, HostError> {
+        Ok(Box::new(FakeHost(PrSnapshot {
+            head_sha: "fresh_sha_already_merged".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: PrLifecycle::Merged,
+            ci: CiStatus::Passing,
+            review: ReviewStatus::Approved,
+            conflict: ConflictStatus::Clean,
+        })))
+    }
+
+    fn resolver_fresh_fully_ready(_: HostKind) -> Result<Box<dyn PrHost>, HostError> {
+        Ok(Box::new(FakeHost(PrSnapshot {
+            head_sha: "fresh_sha_fully_ready".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: PrLifecycle::Open,
+            ci: CiStatus::Passing,
+            review: ReviewStatus::Approved,
+            conflict: ConflictStatus::Clean,
+        })))
+    }
+
+    /// A tracked row whose STORED state is fully ready (`pre_decision` —
+    /// step 1 — reads `Merge`) and the opt-in switch is on — the exact
+    /// precondition every test above needs, isolated here once. Deliberately
+    /// fake, obviously-nonexistent owner/repo (this suite never reaches
+    /// `run_gh_merge`, but names it defensively anyway — the same posture
+    /// this file's OWN `run_gh_merge` guard tests already use, e.g.
+    /// `evil.example.org`).
+    async fn seam_fixture(db: &Db) -> pull_request::Model {
+        let ws = repo::create_workspace(db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(db, ws.id, "widgets", "/tmp/widgets", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(db, ws.id, "issue", "feature", "codex").await.unwrap();
+        let direction = repo::create_direction(
+            db, thread.id, "ship it", "codex", repo_ref.id, "why", "impl-only", "",
+        )
+        .await
+        .unwrap();
+        let pr = repo::register_pull_request(
+            db,
+            thread.id,
+            direction.id,
+            repo_ref.id,
+            "github",
+            "github.com",
+            "weft-automerge-seam-test-fixture",
+            "does-not-exist",
+            42,
+            "https://github.com/weft-automerge-seam-test-fixture/does-not-exist/pull/42",
+            "seam fixture",
+        )
+        .await
+        .unwrap();
+        let stored = PrSnapshot {
+            head_sha: "stored_sha_before_fresh_read".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: PrLifecycle::Open,
+            ci: CiStatus::Passing,
+            review: ReviewStatus::Approved,
+            conflict: ConflictStatus::Clean,
+        };
+        repo::apply_pull_request_snapshot(db, pr.id, &stored, &MergeReadiness::Ready).await.unwrap();
+        repo::set_setting(db, K_AUTO_MERGE_ENABLED, "1").await.unwrap();
+        repo::get_pull_request(db, pr.id).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn evaluate_row_refuses_when_the_fresh_read_shows_ci_failing_even_though_the_stored_row_was_ready() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let backoff = MergeBackoffState::default();
+
+        let verdict = evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_ci_failing).await;
+
+        assert_eq!(
+            verdict,
+            RowVerdict::Skip,
+            "the FRESH read (CI failing) must win over the STORED row's own Ready verdict"
+        );
+        // Property 2: the persisted row must now reflect the FRESH snapshot
+        // (proving step 4 actually used it) — NOT the stored one this
+        // fixture originally seeded it with.
+        let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.head_sha, "fresh_sha_ci_failing");
+        assert_eq!(gate::parse_ci(&reloaded.ci_status), CiStatus::Failing);
+    }
+
+    #[tokio::test]
+    async fn evaluate_row_refuses_when_the_fresh_read_shows_the_pr_already_merged() {
+        // The module doc's own "double-merge safety across a crash" scenario:
+        // someone else merged it since the stored snapshot was taken.
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let backoff = MergeBackoffState::default();
+
+        let verdict = evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_already_merged).await;
+
+        assert_eq!(verdict, RowVerdict::Skip);
+    }
+
+    #[tokio::test]
+    async fn evaluate_row_authorizes_with_the_fresh_head_sha_when_everything_checks_out() {
+        // Positive-path complement: when the fresh read agrees the row is
+        // ready, the returned `head_sha` must be the FRESH one — never the
+        // stale row's originally-registered sha — so `maybe_merge_one`'s
+        // step 6 can never accidentally `--match-head-commit` against stale
+        // data either.
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let backoff = MergeBackoffState::default();
+
+        let verdict = evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_fully_ready).await;
+
+        assert_eq!(verdict, RowVerdict::Merge { head_sha: "fresh_sha_fully_ready".to_string() });
+    }
+
+    #[tokio::test]
+    async fn evaluate_row_respects_the_backoff_even_when_the_stored_row_still_looks_ready() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let backoff = MergeBackoffState::default();
+        for _ in 0..MAX_MERGE_ATTEMPTS_PER_HEAD {
+            backoff.record_failure(pr.id, &pr.head_sha);
+        }
+
+        let verdict = evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_fully_ready).await;
+
+        assert_eq!(
+            verdict,
+            RowVerdict::Skip,
+            "step 3's backoff must stop the row before step 4 is ever reached, exhausted or not"
+        );
     }
 }

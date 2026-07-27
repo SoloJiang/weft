@@ -364,7 +364,7 @@ export const en = {
     detailTruncated: "… {{n}} more characters truncated",
     actionRequired: "This needs your action — it won't clear itself.",
     retryTracking: "Retry",
-    retryTrackingTitle: "Reset the failed-check streak and let Weft try tracking this PR/MR again",
+    retryTrackingTitle: "Reset the failed-check streak and any paused auto-merge attempts, and let Weft try again",
     retryTrackingStarted: "Retry requested — Weft will re-check shortly.",
     retryTrackingNothingToRetry: "Nothing to retry — this may already be resolved.",
     retryTrackingFailed: "Couldn't retry tracking. Try again in a moment.",
@@ -470,7 +470,7 @@ export const en = {
     autoMergeStateMerged: "confirmed merged",
     autoMergeStateClosed: "closed without merging",
     autoMergeStateUnknown: "could not confirm current state",
-    autoMergeAttemptsExhausted: "Stopped retrying after {{count}} consecutive failures on this commit",
+    autoMergeAttemptsExhausted: "Stopped retrying after {{count}} consecutive failures on this commit — push a new commit to try again",
   },
   diff: {
     tab: "Diff",
