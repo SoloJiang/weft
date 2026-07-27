@@ -2044,7 +2044,7 @@ impl MigrationTrait for M0045PullRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{gateway_components_to_backend, M0044EngineRoutingPin};
+    use super::{gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest};
 
     #[test]
     fn gateway_tier_rewritten_to_backend() {
@@ -2352,6 +2352,55 @@ mod tests {
             let pinned: bool = row.try_get("", "engine_pinned").unwrap();
             assert!(!pinned, "an existing engine_pinned value must survive: {sql}");
         }
+    }
+
+    /// M0045 (issue #110 adversarial review P2): the natural-key unique
+    /// index actually exists and is enforced AT THE DB LEVEL — not just by
+    /// `repo::register_pull_request`'s application-level find-then-upsert,
+    /// which a raw insert bypasses entirely. Without this, deleting the
+    /// migration's `.unique()` call by accident would silently stop being
+    /// caught by anything: the app-level upsert still LOOKS correct in every
+    /// test that goes through it, since it never races itself.
+    #[tokio::test]
+    async fn m0045_natural_key_unique_index_rejects_a_raw_duplicate_insert() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        M0045PullRequest.up(&SchemaManager::new(&db)).await.unwrap();
+
+        let insert_sql = |number: i32| -> String {
+            format!(
+                "INSERT INTO pull_request \
+                 (thread_id, direction_id, repo_id, host_kind, host_base, host_owner, host_repo, \
+                  number, url, title, head_sha, base_ref, lifecycle, ci_status, review_status, \
+                  conflict_status, merge_readiness, last_checked_at, last_error, probe_fail_count, \
+                  created_at) \
+                 VALUES (1, 1, 1, 'github', 'github.com', 'acme', 'widgets', {number}, \
+                  '', '', '', '', 'open', '', '', '', '', '', '', 0, '1')"
+            )
+        };
+
+        // First insert succeeds.
+        db.execute(Statement::from_string(backend, insert_sql(1)))
+            .await
+            .unwrap();
+
+        // A RAW second insert with the SAME natural key (host_kind,
+        // host_owner, host_repo, number) — bypassing
+        // `register_pull_request`'s find-then-upsert entirely — must be
+        // rejected by the index itself.
+        let dup = db.execute(Statement::from_string(backend, insert_sql(1))).await;
+        assert!(
+            dup.is_err(),
+            "a raw duplicate insert on the natural key must be rejected by idx_pull_request_natural_key"
+        );
+
+        // A genuinely different number is unaffected — the index is scoped
+        // to the whole natural key, not falsely global on e.g. just the host.
+        let distinct = db.execute(Statement::from_string(backend, insert_sql(2))).await;
+        assert!(distinct.is_ok(), "a different PR number must still insert cleanly");
     }
 
     /// M0037: code_checkpoint exists after migration and round-trips a row.
