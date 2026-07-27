@@ -20,6 +20,7 @@ import type {
   PermissionAsk,
   ProcessQuotaStatus,
   Proposal,
+  ReadOnlyGrants,
   RepoChecks,
   RepoGraph,
   RepoRef,
@@ -133,8 +134,8 @@ export const api = {
     invoke<ResolvedProposal | null>("get_proposal", { threadId }),
   saveProposal: (threadId: number, proposal: Proposal) =>
     invoke<void>("save_proposal", { threadId, proposal }),
-  confirmProposal: (threadId: number) =>
-    invoke<number[]>("confirm_proposal", { threadId }),
+  confirmProposal: (threadId: number, manualTool?: string) =>
+    invoke<number[]>("confirm_proposal", { threadId, manualTool: manualTool ?? null }),
   setProposalDirectionBase: (threadId: number, index: number, name: string, repo: string, expectedBase: string, expectedVersion: string, base: string) =>
     invoke<void>("set_proposal_direction_base", { threadId, index, name, repo, expectedBase, expectedVersion, base }),
   createDirection: (
@@ -273,17 +274,37 @@ export const api = {
   revokeAuthGrant: (thread: number, dir: string | null, actionKey: string | null) =>
     invoke<void>("revoke_auth_grant", { thread, dir, actionKey }),
 
+  // Read-only auto-allow grants (issue #103) — in-memory only, NEVER persisted
+  // (contrast the Full/Always grants above): a live snapshot, not something
+  // restored at boot.
+  readOnlyGrants: () => invoke<ReadOnlyGrants>("read_only_grants"),
+  // "Release all read-only for this session": resolves the open ReadOnly-tier
+  // backlog in (thread, dir) to Allow and installs a forward-looking rule for
+  // the rest of the session. Returns how many open asks were just released.
+  releaseSessionReadOnly: (thread: number, dir: string) =>
+    invoke<number>("release_session_read_only", { thread, dir }),
+  // Revoke a read-only grant. dir=null revokes the whole issue's propagation;
+  // dir set revokes just that one session's batch grant.
+  revokeReadOnlyGrant: (thread: number, dir: string | null) =>
+    invoke<void>("revoke_read_only_grant", { thread, dir }),
+
   // Needs-you: open agent→human questions, aggregated across the workspace.
   needsYou: (workspaceId: number) =>
     invoke<NeedItem[]>("needs_you", { workspaceId }),
   answerAsk: (threadId: number, askId: number, text: string) =>
     invoke<void>("answer_ask", { threadId, askId, text }),
+  // The Needs-you "retry" action for the one notice that doesn't clear itself
+  // (a PR/MR the monitor gave up on): resets that direction's tracked PR/MR
+  // probe-failure streak(s), same effect as the agent re-calling `register_pr`.
+  // Resolves to how many rows were reset (0 = nothing to retry, not an error).
+  retryPrTracking: (directionId: number) =>
+    invoke<number>("retry_pr_tracking", { directionId }),
 
   // Write triggers: lead-proposed repo writes awaiting human approve/deny.
   writeTriggers: (workspaceId: number) =>
     invoke<WriteTrigger[]>("write_triggers", { workspaceId }),
-  approveWriteTrigger: (threadId: number, index: number, tool: string) =>
-    invoke<number>("approve_write_trigger", { threadId, index, tool }),
+  approveWriteTrigger: (threadId: number, index: number, tool?: string) =>
+    invoke<number>("approve_write_trigger", { threadId, index, tool: tool ?? null }),
   denyWriteTrigger: (threadId: number, index: number) =>
     invoke<void>("deny_write_trigger", { threadId, index }),
 
@@ -307,6 +328,23 @@ export const api = {
   detectTools: () => invoke<ToolStatus[]>("detect_tools"),
   getDefaultTool: () => invoke<DefaultToolInfo>("get_default_tool"),
   setDefaultTool: (tool: string) => invoke<void>("set_default_tool", { tool }),
+  getAutomaticEngineRoutingEnabled: () =>
+    invoke<boolean>("get_automatic_engine_routing_enabled"),
+  setAutomaticEngineRoutingEnabled: (enabled: boolean) =>
+    invoke<void>("set_automatic_engine_routing_enabled", { enabled }),
+  // issue #97: auto fail-over to the fallback engine on a quota-exceeded turn.
+  // Opt-in — off by default, since switching engines mid-task ships that
+  // engine's own history digest to a DIFFERENT provider.
+  getQuotaFailoverEnabled: () => invoke<boolean>("get_quota_failover_enabled"),
+  setQuotaFailoverEnabled: (enabled: boolean) =>
+    invoke<void>("set_quota_failover_enabled", { enabled }),
+  // issue #110 T3: squash-merge a tracked PR/MR automatically once it
+  // reaches this repo's truly-mergeable bar. Opt-in — off by default, since
+  // this performs an irreversible action (merging code) with no human
+  // confirming the specific merge.
+  getPrAutoMergeEnabled: () => invoke<boolean>("get_pr_auto_merge_enabled"),
+  setPrAutoMergeEnabled: (enabled: boolean) =>
+    invoke<void>("set_pr_auto_merge_enabled", { enabled }),
   // Per-tool command overrides ("aliases", e.g. claude → cc-claude): identity →
   // command. Empty map when none configured.
   getToolCommands: () => invoke<Record<string, string>>("get_tool_commands"),

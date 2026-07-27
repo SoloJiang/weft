@@ -24,6 +24,7 @@ import {
   shouldApplyProcessQuotaStatus,
   type ProcessQuotaNotice,
 } from "../lib/processQuota";
+import { routeReasonKey } from "../lib/engineRoutingDisplay";
 import { STORAGE_KEYS } from "../lib/storageKeys";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
@@ -39,6 +40,7 @@ import type {
   ProcessQuotaStatus,
   Proposal,
   QueuedItem,
+  ReadOnlyGrants,
   RepoChecks,
   RepoEdge,
   RepoProfile,
@@ -99,35 +101,17 @@ export function isInFlight(state: TurnState): boolean {
   return state === "busy" || state === "stalled";
 }
 
-/** Split a thread's in-flight engines into running vs stalled counts — its worker
- * sessions (matched by directionIds) PLUS its lead (leadTurn has no session row).
- * Single source of truth so the workspace card and the nav row can't drift. */
-export function threadLiveCounts(
-  sessions: Record<number, OpenSession>,
-  directionIds: number[],
-  leadState: TurnState | undefined,
-): { running: number; stalled: number } {
-  const inThread = Object.values(sessions).filter((s) =>
-    directionIds.includes(s.directionId),
-  );
-  return {
-    running:
-      inThread.filter((s) => s.status === "running").length +
-      (leadState === "busy" ? 1 : 0),
-    stalled:
-      inThread.filter((s) => s.status === "stalled").length +
-      (leadState === "stalled" ? 1 : 0),
-  };
-}
-
-/** A NeedItem the human must actually act on — excludes a display-only NOTICE
- *  (the self-clearing stall hint, `answerable: false`): it surfaces in the
- *  Needs-you queue as an FYI row but has no answer to give and clears itself
- *  automatically once the task recovers. Single source of truth for every
- *  "needs you" badge/count/urgent-flag so a stall notice can't inflate a number
- *  that promises "N things need your action" (issue #105). */
+/** A NeedItem the human must actually act on — excludes EITHER display-only
+ *  NOTICE kind (`item.kind !== "question"`: the self-clearing stall hint, the
+ *  stopped-worker hint, or the non-self-clearing PR/MR give-up notice). Every
+ *  notice surfaces in the Needs-you queue as an FYI row but has no answer to
+ *  give. Single source of truth for every "needs you" badge/count/urgent-flag
+ *  so a notice can't inflate a number that promises "N things need your
+ *  action" (issue #105) — even the one notice kind that, unlike the others,
+ *  won't clear itself; see `NeedsRows.tsx`'s `AskRow` for how that one is
+ *  instead made visually unmissable. */
 export function isPendingNeed(item: NeedItem): boolean {
-  return item.answerable;
+  return item.kind === "question";
 }
 
 /** Workspace-wide "needs you" count: real agent questions (excludes
@@ -166,6 +150,15 @@ function rawErrorMessage(error: unknown): string {
   return "";
 }
 
+function routeBlockedErrorMessage(raw: string): string | null {
+  const prefix = "engine_route_blocked:";
+  if (!raw.startsWith(prefix)) return null;
+  const reason = raw.slice(prefix.length);
+  return i18n.t("lead.engineRouteBlocked", {
+    reason: i18n.t(routeReasonKey(reason)),
+  });
+}
+
 /** A send that never created a message row (queue-full race, worktree/session
  *  mid-rewind, "turn ended while persisting", a missing agent binary before any
  *  row lands, …) has no row to carry a delivery receipt — the composer
@@ -178,12 +171,26 @@ function notifySendFailed(error: unknown) {
     msg = i18n.t("lead.queueFull");
   } else if (raw.includes("acp_session_open_failed")) {
     msg = i18n.t("session.acpSessionOpenFailed");
+  } else if (raw.includes("engine_switch_in_progress")) {
+    msg = i18n.t("session.switchInProgress");
   } else {
-    msg = i18n.t("lead.sendFailedGeneric", {
-      reason: raw || i18n.t("lead.sendFailedUnknown"),
-    });
+    const routeBlocked = routeBlockedErrorMessage(raw);
+    if (routeBlocked) {
+      msg = routeBlocked;
+    } else {
+      msg = i18n.t("lead.sendFailedGeneric", { reason: raw || i18n.t("lead.sendFailedUnknown") });
+    }
   }
   toast(msg, "danger");
+}
+
+/** Background worker starts have no composer to restore a draft or report a
+ * rejected promise. Process-quota pauses already have a persistent UI state;
+ * every other failure must become visible instead of being dropped by a `void`
+ * dispatch/revive caller. */
+function notifyBackgroundWorkerDispatchFailed(error: unknown) {
+  if (isProcessQuotaDegradedError(error)) return;
+  notifySendFailed(error);
 }
 
 interface Store {
@@ -310,6 +317,19 @@ interface Store {
     dir: string | null,
     actionKey: string | null,
   ) => Promise<void>;
+  /** Read-only auto-allow scopes (issue #103) — in-memory only, NEVER persisted
+   *  across a restart (contrast `authGrants`): the session-scoped "release all
+   *  read-only" batch grants and the issue-wide dispatch-approval propagation. */
+  readOnlyGrants: ReadOnlyGrants;
+  /** "Release all read-only for this session" (issue #103's core batch
+   *  action): resolves the open ReadOnly-tier backlog in (thread, dir) to
+   *  Allow and trusts the rest of the session going forward. A Write/
+   *  NetworkOrCredential/Unknown ask in the same session is untouched. */
+  releaseSessionReadOnly: (thread: number, dir: string) => Promise<void>;
+  /** Revoke a read-only grant. dir=null revokes the whole issue's propagation
+   *  (set at dispatch-approval time); dir set revokes just that one session's
+   *  batch grant. */
+  revokeReadOnlyGrant: (thread: number, dir: string | null) => Promise<void>;
   /** Lead-proposed write declarations awaiting human approve/deny. */
   writeTriggers: WriteTrigger[];
   approveWriteTrigger: (item: WriteTrigger, tool?: string) => Promise<void>;
@@ -322,6 +342,11 @@ interface Store {
   refreshNeeds: () => Promise<void>;
   answerAsk: (item: NeedItem, text: string) => Promise<void>;
   goToAsk: (item: NeedItem) => Promise<void>;
+  /** "Retry" for the ONE Needs-you notice kind that doesn't clear itself (a
+   *  given-up PR/MR): resets its tracked probe-failure streak so the
+   *  background monitor resumes sweeping it. Resolves once the reset lands;
+   *  the card itself clears on the monitor's next sweep tick, not instantly. */
+  retryPrTracking: (item: NeedItem) => Promise<void>;
   /** Single-source jump for any worker reference carrying a bus-style
    *  (thread, dir) pair — board cards, needs-you rows, anywhere a worker's
    *  name is shown. `dir` is the direction id as a string (backend convention,
@@ -398,7 +423,7 @@ interface Store {
   proposal: ResolvedProposal | null;
   refreshProposal: (threadId: number) => Promise<void>;
   saveProposal: (proposal: Proposal) => Promise<void>;
-  confirmProposal: () => Promise<void>;
+  confirmProposal: (manualTool?: string) => Promise<void>;
   setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string) => Promise<void>;
   /** Approve a plan_card: post `plan_decision` to the lead, then persist the settled
    *  state. Shared by the chat plan_card's own Approve button and the merged
@@ -576,6 +601,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [authGrants, setAuthGrants] = useState<GrantSnapshot>({
     full: [],
     always: [],
+  });
+  const [readOnlyGrants, setReadOnlyGrants] = useState<ReadOnlyGrants>({
+    issue: [],
+    session: [],
   });
   const [writeTriggers, setWriteTriggers] = useState<WriteTrigger[]>([]);
   const [needsByWorkspace, setNeedsByWorkspace] = useState<Record<number, number>>({});
@@ -1507,10 +1536,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         try {
           await spawnWorker(directionId, w.repo_id, false);
         } catch (error) {
-          // The persistent quota bar already explains the pause. Background
-          // auto-dispatch must not leak a rejected promise while degraded.
-          if (isProcessQuotaDegradedError(error)) continue;
-          throw error;
+          notifyBackgroundWorkerDispatchFailed(error);
+          return;
         }
       }
     },
@@ -1531,7 +1558,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // Skip reclaimed worktrees (exists=false): a resume would drive a worker
       // into a missing cwd.
       for (const w of wts.filter((w) => w.exists)) {
-        await driveDirection(directionId, w.repo_id, false);
+        try {
+          await driveDirection(directionId, w.repo_id, false);
+        } catch (error) {
+          notifyBackgroundWorkerDispatchFailed(error);
+          return;
+        }
       }
     },
     [driveDirection],
@@ -1597,11 +1629,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // see EngineSwitchDialog's doc for the three-layer semantics). The backend
   // already made the switch honest in its own record (a durable engine_switch
   // timeline marker, delivered like any other Push::Message); this action's
-  // job is patching the TWO bits of local state the event stream doesn't
-  // reach: `threads` (leadTool/leadModel — read by LeadTab/ChatComposer's
-  // badge) and `leadMeta` (the OLD tool's model/MCP/skills readings, which
-  // would otherwise linger under the NEW tool's badge until the next
-  // turn-triggered probe happens to overwrite them).
+  // job is eagerly patching the local state used by LeadTab/ChatComposer.
+  // `engine_switched` repeats the same patch for automatic quota failover,
+  // whose switch has no frontend invocation to update these caches.
   const switchLeadTool = useCallback(async (threadId: number, tool: string, model: string | null) => {
     const outcome = await api.switchLeadTool(threadId, tool, model, currentLang());
     setThreads((cur) =>
@@ -1622,8 +1652,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // `directionId` is the caller's (WorkerConversation already has it in scope)
   // — the backend also updates `direction.tool` (so a later reopen doesn't
   // revert the switch, see switch_worker_tool's doc), and the board reads
-  // that through `directionsByThread`, so it is patched the same way
-  // `renameDirection` patches a name change.
+  // that through `directionsByThread`, so it is patched eagerly here. The
+  // matching `engine_switched` event covers automatic quota failover and also
+  // refreshes any cached SessionInfo command.
   const switchWorkerTool = useCallback(
     async (threadId: number, directionId: number, sessionId: number, tool: string, model: string | null) => {
       const outcome = await api.switchWorkerTool(sessionId, tool, model);
@@ -1723,6 +1754,53 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               if (pr.status !== "proposed") setReviewingProposal(false);
             })
             .catch(() => {});
+        }
+      } else if (p.type === "engine_switched") {
+        if (p.session_id == null) {
+          setThreads((cur) =>
+            cur.map((thread) =>
+              thread.id === p.thread_id
+                ? { ...thread, lead_tool: p.tool, lead_model: p.model }
+                : thread,
+            ),
+          );
+          setLeadMeta((meta) => {
+            if (!(p.thread_id in meta)) return meta;
+            const next = { ...meta };
+            delete next[p.thread_id];
+            return next;
+          });
+        } else {
+          const sessionId = p.session_id;
+          if (p.direction_id != null) {
+            setDirections((directions) => ({
+              ...directions,
+              [p.thread_id]: (directions[p.thread_id] ?? []).map((direction) =>
+                direction.id === p.direction_id ? { ...direction, tool: p.tool } : direction,
+              ),
+            }));
+          }
+          setSessions((sessions) => {
+            const current = sessions[sessionId];
+            if (!current) return sessions;
+            return {
+              ...sessions,
+              [sessionId]: {
+                ...current,
+                info: {
+                  ...current.info,
+                  tool: p.tool,
+                  command: p.command ?? current.info.command,
+                },
+              },
+            };
+          });
+          setWorkerMeta((meta) => {
+            if (!(sessionId in meta)) return meta;
+            const next = { ...meta };
+            delete next[sessionId];
+            return next;
+          });
         }
       } else if (p.type === "finalize") {
         setLeadMessages((m) => ({
@@ -2140,6 +2218,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       console.error(e);
     }
+    // Read-only auto-allow scopes (issue #103) — in-memory only, so this poll
+    // (plus the explicit refreshes after confirmProposal/approveWriteTrigger/
+    // releaseSessionReadOnly/revokeReadOnlyGrant below) is the only way the
+    // frontend's copy stays honest; the backend's own gate never depends on it.
+    try {
+      setReadOnlyGrants(await api.readOnlyGrants());
+    } catch (e) {
+      console.error(e);
+    }
     if (activeWorkspaceId == null) {
       setNeeds([]);
       setWriteTriggers([]);
@@ -2366,7 +2453,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // confirm/approve abort while the thread still has ANY unrecovered lane failure.
   const baseSaveFailed = useRef<Map<number, Set<string>>>(new Map());
 
-  const confirmProposal = useCallback(async () => {
+  const confirmProposal = useCallback(async (manualTool?: string) => {
     if (activeThreadId == null) return;
     // Flush any in-flight base-branch save before materializing. If it REJECTED
     // (e.g. a re-propose moved the lane, or a DB error), the backend still holds the
@@ -2395,16 +2482,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // branch above: toast, refresh to the real state, and return so a retry acts on it).
     let ids: number[];
     try {
-      ids = await api.confirmProposal(activeThreadId);
+      ids = await api.confirmProposal(activeThreadId, manualTool);
     } catch (err) {
       console.error(err);
-      toast(i18n.t("scope.confirmFailed"), "danger");
+      const routeBlocked = routeBlockedErrorMessage(rawErrorMessage(err));
+      if (routeBlocked) {
+        toast(routeBlocked, "danger");
+      } else {
+        toast(i18n.t("scope.confirmFailed"), "danger");
+      }
       await refreshProposal(activeThreadId);
       return;
     }
     setProposal(null);
     setReviewingProposal(false);
     await loadThreadChildren(activeThreadId);
+    // Approving dispatch just propagated issue #103's read-only auto-allow to
+    // the whole issue backend-side (confirm_proposal); refresh so the "read-only
+    // trusted" indicator appears without waiting for the next poll. Best-effort
+    // — the backend's own gate never depends on this frontend copy being fresh.
+    try {
+      setReadOnlyGrants(await api.readOnlyGrants());
+    } catch (e) {
+      console.error(e);
+    }
     // Automation-first: dispatch every new task's worker immediately.
     for (const id of ids) void dispatchDirection(id);
   }, [activeThreadId, loadThreadChildren, dispatchDirection, refreshProposal]);
@@ -2490,6 +2591,27 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [refreshNeeds],
   );
 
+  const retryPrTracking = useCallback(async (item: NeedItem) => {
+    // No optimistic removal: the backend monitor only retracts/replaces this
+    // notice on its NEXT sweep tick (up to `WEFT_PR_SWEEP_SECS`, default 60s)
+    // once it re-checks the row — not synchronously with this call — so the
+    // card staying put for a moment is correct, not a bug. A toast confirms
+    // the click actually did something in the meantime.
+    try {
+      const resetCount = await api.retryPrTracking(item.direction_id);
+      // One condition drives both the copy and the tone, decided once rather
+      // than re-checked per property (CLAUDE.md's single-discriminant rule).
+      const view =
+        resetCount > 0
+          ? { key: "needs.retryTrackingStarted", tone: "success" as const }
+          : { key: "needs.retryTrackingNothingToRetry", tone: "warning" as const };
+      toast(i18n.t(view.key), view.tone);
+    } catch (err) {
+      console.error(err);
+      toast(i18n.t("needs.retryTrackingFailed"), "danger");
+    }
+  }, []);
+
   const approveWriteTrigger = useCallback(
     async (item: WriteTrigger, tool?: string) => {
       // Flush any in-flight base-branch save first. If it REJECTED (re-propose moved
@@ -2521,13 +2643,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
       );
       try {
-        const dirId = await api.approveWriteTrigger(item.thread_id, item.index, tool ?? defaultTool);
+        const dirId = await api.approveWriteTrigger(item.thread_id, item.index, tool);
         void dispatchDirection(dirId);
       } finally {
         await refreshNeeds();
       }
     },
-    [dispatchDirection, refreshNeeds, defaultTool, activeThreadId, refreshProposal],
+    [dispatchDirection, refreshNeeds, activeThreadId, refreshProposal],
   );
 
   const denyWriteTrigger = useCallback(
@@ -2636,6 +2758,48 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     },
     [],
   );
+
+  // "Release all read-only for this session" (issue #103's core batch action).
+  // Optimistic: drop this session's open read_only asks locally (mirrors
+  // answerPermission), then reconcile with backend truth — the SAME pattern as
+  // revokeAuthGrant above, because the backend, not this optimistic guess, is
+  // the actual gate: a Write/NetworkOrCredential/Unknown ask in this session is
+  // never touched here or there.
+  const releaseSessionReadOnly = useCallback(async (thread: number, dir: string) => {
+    setAsks((cur) => cur.filter((a) => !(a.thread === thread && a.dir === dir && a.risk === "read_only")));
+    try {
+      const n = await api.releaseSessionReadOnly(thread, dir);
+      if (n > 0) toast(i18n.t("grants.readOnlyReleased", { count: n }));
+    } catch (e) {
+      console.error(e);
+    }
+    try {
+      setReadOnlyGrants(await api.readOnlyGrants());
+      setAsks(await api.pendingAsks());
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
+
+  const revokeReadOnlyGrant = useCallback(async (thread: number, dir: string | null) => {
+    // optimistic: drop the matching scope locally so the indicator clears at once
+    setReadOnlyGrants((cur) => ({
+      issue: dir === null ? cur.issue.filter((t) => t !== thread) : cur.issue,
+      session: cur.session.filter((g) => !(g.thread === thread && (dir === null || g.dir === dir))),
+    }));
+    try {
+      await api.revokeReadOnlyGrant(thread, dir);
+    } catch (e) {
+      console.error(e);
+    }
+    // reconcile with backend truth (in-memory only, but still: a concurrent
+    // grant/revoke from another view must win over this optimistic guess)
+    try {
+      setReadOnlyGrants(await api.readOnlyGrants());
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
 
   // Single entry for "jump to the worker this reference is about" — reused by
   // every surface that shows a bus-delivered (thread, dir) pair (Needs-you
@@ -2914,6 +3078,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     asks,
     authGrants,
     revokeAuthGrant,
+    readOnlyGrants,
+    releaseSessionReadOnly,
+    revokeReadOnlyGrant,
     writeTriggers,
     approveWriteTrigger,
     denyWriteTrigger,
@@ -2922,6 +3089,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     openNeeds,
     refreshNeeds,
     answerAsk,
+    retryPrTracking,
     goToAsk,
     goToDirectionRef,
     answerPermission,

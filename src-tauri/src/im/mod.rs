@@ -1236,7 +1236,7 @@ async fn consume_human_event(
             // record it in CardIndex: a later Answered/Cancelled then finds
             // nothing to patch (take_human → None), which is exactly right for
             // a notice that never carries an answer.
-            if !ask.answerable {
+            if !ask.kind.is_answerable() {
                 let notice = format!("{title} · {from}\n{}", ask.text);
                 if let Err(e) = ch.send_text(&owner, &notice).await {
                     eprintln!("[weft][im] send stall notice: {e}");
@@ -1664,8 +1664,21 @@ async fn ensure_im_concierge_thread(
     } else {
         format!("飞书群聊 · {chat_id}")
     };
-    let tool = crate::tools::default_tool(db).await;
+    let legacy_tool = crate::tools::default_tool(db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        db,
+        None,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Normal,
+    )
+    .await;
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
     let thread = crate::store::repo::create_thread(db, ws_id, &title, "concierge", &tool).await?;
+    crate::engine_routing::record_decision(db, thread.id, None, None, "concierge_start", &route)
+        .await;
     crate::store::repo::bind_im_route(db, thread.id, "feishu_concierge", chat_id, im_thread_ref)
         .await?;
     Ok(thread.id)
@@ -2086,7 +2099,11 @@ mod tests {
             text: "x".to_string(),
             ts: 0,
             answered: false,
-            answerable,
+            kind: if answerable {
+                crate::bus::state::AskKind::Question
+            } else {
+                crate::bus::state::AskKind::Notice
+            },
         };
         // An answerable question IS forwarded as an IM answer card.
         consume_human_event(

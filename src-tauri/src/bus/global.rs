@@ -498,8 +498,20 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
 }
 
 async fn create_issue(db: &Db, ws: i32, title: &str, kind: &str) -> anyhow::Result<Value> {
-    let tool = crate::tools::default_tool(db).await;
+    let legacy_tool = crate::tools::default_tool(db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        db,
+        None,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Normal,
+    )
+    .await;
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
     let t = repo::create_thread(db, ws, title, kind, &tool).await?;
+    crate::engine_routing::record_decision(db, t.id, None, None, "new_issue", &route).await;
     Ok(json!({
         "issue_id": t.id,
         "workspace_id": t.workspace_id,

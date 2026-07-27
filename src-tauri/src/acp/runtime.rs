@@ -53,6 +53,10 @@ pub enum SessionEvent {
         summary: String,
         detail: String,
         intent_key: String,
+        /// What the request wants to do, classified from the `toolCall` while
+        /// its structure is still here. `intent_key` is the always-grant
+        /// cache token and is far too lossy to re-derive this from.
+        intent: super::permission::PermissionIntent,
         options: Vec<Value>,
     },
 }
@@ -81,6 +85,39 @@ struct SessionRoute {
     always: AlwaysCache,
     /// Optional auto-reply for tests / dangerous mode short-circuit at route layer.
     auto_want: Option<Want>,
+}
+
+/// Whether an outstanding JSON-RPC reply still protects a pooled client from
+/// being retired. "No routes, none opening, none expected" is required either
+/// way — this only decides what a non-empty `pending` means in that state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPolicy {
+    /// Ordinary route teardown: an outstanding reply means the peer is still
+    /// working on something, so keep the child alive for it.
+    Protects,
+    /// After the agent ignored `session/cancel`: the reply is never coming and
+    /// its route is already gone, so it must not pin the child.
+    Abandoned,
+}
+
+/// A pooled client's liveness counters at one instant.
+#[derive(Debug, Clone, Copy)]
+struct RouteState {
+    sessions: usize,
+    opening: usize,
+    expecting: u32,
+    pending: usize,
+}
+
+/// Whether a pooled client in this state may be retired. Split out from the
+/// locking so the policy itself is directly testable.
+fn may_retire(state: RouteState, policy: PendingPolicy) -> bool {
+    let unused = state.sessions == 0 && state.opening == 0 && state.expecting == 0;
+    let replies_settled = match policy {
+        PendingPolicy::Protects => state.pending == 0,
+        PendingPolicy::Abandoned => true,
+    };
+    unused && replies_settled
 }
 
 struct Inner {
@@ -462,6 +499,7 @@ impl ClientHandle {
             .unwrap_or_default();
         let (summary, detail) = summary_from_params(&params);
         let intent = intent_key_from_params(&params);
+        let what = super::permission::intent_from_params(&params);
         let req_key = Self::permission_id_key(&id);
 
         let (auto, gen) = {
@@ -507,6 +545,7 @@ impl ClientHandle {
                             summary: summary.clone(),
                             detail: detail.clone(),
                             intent_key: intent.clone(),
+                            intent: what.clone(),
                             options: options.clone(),
                         })
                         .is_ok()
@@ -749,6 +788,28 @@ impl ClientHandle {
     /// Drop this program-keyed pool entry when no routes remain so command-pin
     /// changes do not accumulate orphan ACP children for the app lifetime.
     async fn maybe_reap_if_idle(&self) {
+        self.reap_if_unused(PendingPolicy::Protects).await
+    }
+
+    /// Retire the client even though replies are still outstanding — the
+    /// force-reset path, taken only after the agent ignored `session/cancel`.
+    ///
+    /// That ignored cancel is exactly why the ordinary check cannot be used:
+    /// the wedged `session/prompt` stays in `pending` (its own ceiling is 24h),
+    /// so [`maybe_reap_if_idle`] refuses forever and the child stays pooled.
+    /// The next send then calls `client()`, gets this same handle back, finds a
+    /// live child via `ensure_connected`, and prompts the very agent that is
+    /// still running the abandoned turn — which either races it or is rejected
+    /// as busy. Retiring is safe here precisely because the route checks still
+    /// apply: with no sessions, none opening and none expected, whatever is
+    /// left in `pending` belongs to a route that has already been torn down.
+    /// Dropping `Inner` releases those senders, so their callers fail fast
+    /// instead of waiting out the ceiling.
+    pub async fn retire_after_ignored_cancel(&self) {
+        self.reap_if_unused(PendingPolicy::Abandoned).await
+    }
+
+    async fn reap_if_unused(&self, pending_policy: PendingPolicy) {
         // Same lock as client() acquisition — empty-check + pool remove are
         // atomic w.r.t. a concurrent get-or-create for this key.
         let _create = CREATE_LOCK.lock().await;
@@ -759,10 +820,15 @@ impl ClientHandle {
         let key = pool_key(self.backend_id, &program);
         let empty = {
             if let Some(inner) = self.inner.lock().await.as_ref() {
-                inner.sessions.is_empty()
-                    && inner.opening_sessions.is_empty()
-                    && inner.expecting_session == 0
-                    && inner.pending.is_empty()
+                may_retire(
+                    RouteState {
+                        sessions: inner.sessions.len(),
+                        opening: inner.opening_sessions.len(),
+                        expecting: inner.expecting_session,
+                        pending: inner.pending.len(),
+                    },
+                    pending_policy,
+                )
             } else {
                 true
             }
@@ -1054,6 +1120,57 @@ fn _pathbuf_ty(_: PathBuf) {}
 
 #[cfg(test)]
 mod tests {
+    use super::{may_retire, PendingPolicy, RouteState};
+
+    fn state(sessions: usize, opening: usize, expecting: u32, pending: usize) -> RouteState {
+        RouteState {
+            sessions,
+            opening,
+            expecting,
+            pending,
+        }
+    }
+
+    /// The force-reset case. An agent that ignored `session/cancel` leaves its
+    /// `session/prompt` in `pending` for up to 24h; while that pins the client,
+    /// the next send gets the same pooled handle and prompts the very agent
+    /// still running the abandoned turn.
+    #[test]
+    fn an_abandoned_reply_does_not_pin_a_client_whose_routes_are_gone() {
+        assert!(
+            !may_retire(state(0, 0, 0, 1), PendingPolicy::Protects),
+            "the ordinary path keeps the child while a reply may still arrive"
+        );
+        assert!(
+            may_retire(state(0, 0, 0, 1), PendingPolicy::Abandoned),
+            "after an ignored cancel the outstanding reply must not pin the child"
+        );
+    }
+
+    /// `Abandoned` relaxes ONLY the reply check. A client still serving a route
+    /// — or one mid-`session/new` — must survive either way, or a force reset
+    /// on one session would kill another session's live agent.
+    #[test]
+    fn live_routes_block_retirement_under_every_policy() {
+        for policy in [PendingPolicy::Protects, PendingPolicy::Abandoned] {
+            assert!(
+                !may_retire(state(1, 0, 0, 0), policy),
+                "{policy:?}: a live session still needs its child"
+            );
+            assert!(
+                !may_retire(state(0, 1, 0, 0), policy),
+                "{policy:?}: a session being opened still needs its child"
+            );
+            assert!(
+                !may_retire(state(0, 0, 1, 0), policy),
+                "{policy:?}: an expected session still needs its child"
+            );
+            assert!(
+                may_retire(state(0, 0, 0, 0), policy),
+                "{policy:?}: fully unused clients are retired"
+            );
+        }
+    }
 
     #[test]
     fn config_options_from_session_new_fixture() {

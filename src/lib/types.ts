@@ -29,6 +29,35 @@ export interface ResourceOwnerCount {
   count: number;
 }
 
+/** An engine's usage-limit standing (issue #97) — mirrors the Rust
+ *  `engine_quota::QuotaStatus` discriminant as-is; the warn/exceeded cutoffs
+ *  live in Rust (`engine_quota::status_for`), not re-derived here. */
+export type EngineQuotaLevel = "ok" | "warning" | "exceeded";
+
+/** One engine's most recently observed quota signal (`engine_quota::QuotaSnapshot`).
+ *  `tool` crosses the IPC boundary as a plain string (not narrowed to `Tool`) —
+ *  same defensive-typing reason `ResourceOwnerCount.kind` is a plain string. */
+export interface EngineQuotaSnapshot {
+  tool: string;
+  status: EngineQuotaLevel;
+  usedPercent: number | null;
+  /** Unix seconds the window resets, when the source reported one. */
+  resetsAt: number | null;
+  windowLabel: string | null;
+  observedAt: number;
+}
+
+/** One server-owned route decision/preview. `reason` is a stable code mapped
+ * to bilingual copy by the frontend; it is never free-form agent text. */
+export interface EngineRouteDecision {
+  tool: string | null;
+  source: "manual" | "automatic" | "legacy" | "blocked";
+  reason: string;
+  hint: "normal" | "deep";
+  quota: EngineQuotaLevel | null;
+  blocked: boolean;
+}
+
 /** Read-only local-runtime dashboard snapshot (issue #112). Combines the three
  *  process-tree safety-net axes — no sampling happens here, this only aggregates
  *  what `process_quota` / `proc_registry` / `session_gate` already track. */
@@ -41,6 +70,9 @@ export interface ResourceDashboardSnapshot {
   byOwner: ResourceOwnerCount[];
   activeSessions: number;
   maxSessions: number;
+  /** Per-engine usage-limit snapshots (issue #97). An engine never observed
+   *  this run is simply absent — not a fabricated "ok" reading. */
+  engineQuota: EngineQuotaSnapshot[];
 }
 
 export interface Workspace {
@@ -96,6 +128,7 @@ export interface SwitchOutcome {
   new_tool: string;
   old_model: string | null;
   new_model: string | null;
+  quota_basis?: string | null;
 }
 
 export interface FileDiff {
@@ -283,8 +316,24 @@ export interface LeadMessage {
      *  timeline; content is {"from_message_id": number, "deleted": number}. */
     | "rewind"
     /** Marker row for an engine/model switch (issue #96/#98); content is
-     *  {"old_tool","new_tool","old_model","new_model"} (models nullable). */
-    | "engine_switch";
+     *  {"old_tool","new_tool","old_model","new_model","reason"} (models and
+     *  reason nullable — reason is "quota_exceeded" for issue #97's auto
+     *  fail-over, absent for a human-initiated switch). */
+    | "engine_switch"
+    /** Marker row for a FAILED auto fail-over attempt (issue #97); content is
+     *  {"tool","fallback","error"} — the attempted switch never completed, so
+     *  `tool` is unchanged (unlike "engine_switch", there is no old/new pair). */
+    | "quota_failover_failed"
+    /** Marker for a server-owned initial route decision. */
+    | "engine_route"
+    /** Persistent blocked state when no automatic candidate is eligible. */
+    | "engine_route_blocked"
+    /** Marker row for one auto-merge attempt (issue #110 T3), success or
+     *  failure; content is {"merged","abbrev","number","base_ref","reason",
+     *  "state","state_error","attempts_exhausted","attempts_max"} — plain
+     *  facts only, never pre-composed prose, so `ChatTimeline.tsx`'s
+     *  `AutoMergeMarker` can render it in either UI language. */
+    | "pr_auto_merge";
   /** kind-shaped JSON string, e.g. {"text": "..."} for kind=text */
   content: string;
   status: "streaming" | "complete" | "interrupted" | "error" | "queued";
@@ -339,6 +388,17 @@ export type LeadChatPush =
        *  running-tool label on recovery but still clears it on a real/promoted turn. */
       recovered?: boolean;
       queue: QueuedItem[];
+    }
+  | {
+      /** Durable tool identity changed; emitted for manual switches and quota failover. */
+      type: "engine_switched";
+      thread_id: number;
+      session_id: number | null;
+      direction_id: number | null;
+      tool: string;
+      model: string | null;
+      /** Present for workers, whose SessionInfo exposes the effective resume command. */
+      command: string | null;
     }
   | {
       type: "init";
@@ -585,6 +645,8 @@ export interface ProposedDirection {
   mandate?: string;
   base_branch?: string;
   decision?: string;
+  /** Optional normalized planner hint; the server defaults old/malformed rows to normal. */
+  hint?: "normal" | "deep";
 }
 export interface Proposal {
   rationale: string;
@@ -606,6 +668,8 @@ export interface ResolvedDirection {
   /** the chosen base branch; "" = the repo's default branch. */
   base_branch: string;
   decision: string;
+  hint: "normal" | "deep";
+  route?: EngineRouteDecision | null;
 }
 export interface ResolvedProposal {
   thread_id: number;
@@ -635,6 +699,7 @@ export interface ToolDiagnostic {
 export interface ToolStatus {
   tool: string;
   installed: boolean;
+  spawnable: boolean;
   version: string | null;
   path: string | null;
   meets_min: boolean;
@@ -725,6 +790,27 @@ export interface GrantSnapshot {
   always: AlwaysGrant[];
 }
 
+/** One session's "release all read-only" batch grant (issue #103). */
+export interface ReadOnlySessionGrant {
+  thread: number;
+  dir: string;
+}
+
+/** In-memory-only read-only auto-allow scopes (issue #103) — NEVER persisted
+ *  across a restart, unlike `GrantSnapshot`: a deliberately safer default for a
+ *  broader, often automatically-granted trust (see `ask.rs`'s
+ *  `Inner::read_only_session`/`read_only_issue` doc). `issue` = thread ids
+ *  whose WHOLE issue (every worker, including one spawned later) auto-allows a
+ *  `read_only`-tier ask — set when the human approves that issue's dispatch.
+ *  `session` = individual (thread, dir) sessions granted via the "release this
+ *  session's read-only" batch action. Either way, a `write` / `unknown` /
+ *  `network_or_credential` ask NEVER auto-allows through this — only
+ *  `read_only`. */
+export interface ReadOnlyGrants {
+  issue: number[];
+  session: ReadOnlySessionGrant[];
+}
+
 /** A lead-proposed write declaration awaiting human approve/deny (Needs you). */
 export interface WriteTrigger {
   thread_id: number;
@@ -735,7 +821,22 @@ export interface WriteTrigger {
   reason: string;
   /** the lead's chosen base branch for this write; "" = the repo's default branch. */
   base_branch: string;
+  hint: "normal" | "deep";
+  route?: EngineRouteDecision | null;
 }
+
+/** Discriminates what a `NeedItem` represents and how the Needs-you card
+ *  should render it — mirrors Rust `bus::AskKind`. Replaces the old
+ *  `answerable: boolean`, now that a display-only NOTICE itself splits in
+ *  two: most notices (the stall hint, the stopped-worker hint, an ordinary
+ *  PR/MR update) are retracted automatically by a background process once the
+ *  condition they describe changes ("notice"), but the ONE PR/MR "gave up
+ *  tracking" notice (`host::judge::give_up_text`) is not ("notice_action_
+ *  required") — nothing will ever re-check and clear it without an explicit
+ *  external re-trigger. Rendering the generic "clears itself automatically"
+ *  footer under that one directly contradicts its own body text, which is
+ *  the bug this discriminant exists to let `AskRow` avoid. */
+export type NeedKind = "question" | "notice" | "notice_action_required";
 
 /** An open agent→human question, aggregated workspace-wide for "Needs you". */
 export interface NeedItem {
@@ -746,9 +847,7 @@ export interface NeedItem {
   direction_name: string;
   text: string;
   ts: number;
-  /** `false` for a display-only NOTICE (the self-clearing stall hint) — rendered
-   * without an answer box; answering is refused backend-side. */
-  answerable: boolean;
+  kind: NeedKind;
 }
 
 /** IM 话题绑定行：issue ↔ 飞书话题 1:1 映射（M2-5）。 */

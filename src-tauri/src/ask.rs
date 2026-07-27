@@ -217,14 +217,20 @@ const CRED_NET_MARKERS: &[&str] = &[
     // product (`src/network/mod.rs`, `tokenizer.py` both matched before this
     // fix), so a raw substring check produced frequent false positives on
     // the MOST severe tier, eroding trust in the badge exactly the way
-    // under-classifying would. `_token`/`token=` keep a punctuation-anchored
-    // signal for shell-variable/assignment shapes (`$GITHUB_TOKEN`,
-    // `AUTH_TOKEN`, `token=xyz`) without matching a bare path segment or
-    // module/file name. The literal `"network":`/`"token":` JSON-key forms
-    // that used to live here were superseded by `has_json_key` (round-3
-    // review: those two literals missed single-quoted pseudo-JSON and a
-    // space before the colon — see `matches_cred_net`).
-    "_token",
+    // under-classifying would. `token=` keeps a punctuation-anchored signal
+    // for the assignment shape (`token=xyz`, `AUTH_TOKEN=xyz`) without
+    // matching a bare path segment or module/file name. The literal
+    // `"network":`/`"token":` JSON-key forms that used to live here were
+    // superseded by the credential-key check (round-3 review: those two literals
+    // missed single-quoted pseudo-JSON and a space before the colon — see
+    // `matches_cred_net`).
+    //
+    // The other two "token" shapes are NOT plain substring entries: `_token`
+    // (shell variable / credential file) and `--token` (CLI option) both need
+    // a boundary check to avoid matching the middle of a longer name, so they
+    // live in `has_anchored_token`. `_token` was a bare entry here until
+    // round-4 — see that function for why every `*_token*.rs` source file a
+    // coding agent edits was reading as the most severe tier.
     "token=",
 ];
 
@@ -288,11 +294,23 @@ const READ_ONLY_COMMAND_WORDS: &[&str] = &[
 /// listed (`is_universally_safe_flag`).
 ///
 /// KNOWN, ACCEPTED precision loss: a short flag with a DIRECTLY-ATTACHED
-/// value (`-M50%`, `-n5`, no space) unbundles character-by-character and
-/// will usually fail the whitelist even though the space-separated form
-/// (`-M 50%`, `-n 5`) passes — this only ever pushes a legitimate invocation
-/// toward `Write`, never the other way, so it's accepted rather than adding
-/// per-flag arity metadata for marginal precision.
+/// value (`-M50%`, no space) unbundles character-by-character, so each
+/// character of the VALUE has to clear the whitelist on its own — `-m50%`
+/// yields `-m`/`-5`/`-0`/`-%`, and the unrecognized `-%` drops `git diff
+/// -M50%` to `Write` even though the space-separated `-M 50%` passes. This
+/// only ever pushes a legitimate invocation toward `Write`, never the other
+/// way, so it's accepted rather than adding per-flag arity metadata for
+/// marginal precision.
+///
+/// Round-4 review: this paragraph used to claim an attached value "will
+/// usually fail", citing `-n5` alongside `-M50%`. That was wrong about
+/// `-n5`, and the distinction is worth stating precisely because it decides
+/// whether a very common invocation reads as `ReadOnly` or `Write`: a purely
+/// NUMERIC attached value passes, because every digit fragment it unbundles
+/// into (`-5`) is count-shaped and therefore accepted for any command by
+/// `is_universally_safe_flag`. `head -n5` unbundles to `-n` (on `head`'s
+/// whitelist) + `-5` (universally safe) and classifies `ReadOnly`, exactly
+/// like `head -n 5` — see `attached_numeric_short_flag_value_still_passes`.
 ///
 /// `find` is NOT here: its flags (`-delete`, `-exec`, `-name`, …) are
 /// multi-letter SINGLE-dash tokens that do NOT POSIX-bundle the way these
@@ -319,6 +337,17 @@ const READ_ONLY_COMMAND_WORDS: &[&str] = &[
 /// below happens to have no UNSAFE lowercase counterpart to an intended
 /// uppercase-safe flag, so this is a precision tradeoff, not a safety one —
 /// but it's worth remembering before adding a new entry.
+///
+/// The flip side, and the reason this is called out twice: some entries here
+/// exist ONLY as the lowercased form of a flag that is uppercase-only in the
+/// real command, so they look like typos or dead weight when read against
+/// `--help`. `grep`'s `-g` is one — there is no lowercase `grep -g`, but
+/// `grep -G` (`--basic-regexp`, present in both GNU and BSD grep) arrives
+/// here lowercased, and deleting the entry would demote a perfectly
+/// read-only `grep -G 'pat' file` to `Write`. Round-4 review flagged it as a
+/// dead entry on exactly that reading; `grep_basic_regexp_flag_is_read_only`
+/// now pins the behavior so the next reader gets an answer from the test
+/// suite instead of a plausible-looking cleanup.
 const FLAG_POLICIES: &[(&str, &[&str])] = &[
     (
         "ls",
@@ -508,37 +537,417 @@ fn contains_marker(haystack_lower: &str, markers: &[&str]) -> bool {
     markers.iter().any(|m| haystack_lower.contains(m))
 }
 
-/// Whether `haystack` (lowercased) contains a JSON-object-KEY-shaped mention
-/// of `key` — tolerant of single OR double quotes and optional whitespace
-/// before the colon (`"network":`, `'network':`, `"network" :`). Round-3
-/// review: a single literal substring (`"network":`, no space, double-quote
-/// only) missed single-quoted pseudo-JSON and a space before the colon —
-/// both were found in real MCP-args-shaped text. Still anchored to "this
-/// looks like a JSON key" (quote…quote…colon), NOT a bare word, so unlike
-/// word-boundary matching it does NOT match a file path segment (a path
-/// never contains a quote character) — safe to use in `classify_file` too.
-fn has_json_key(haystack: &str, key: &str) -> bool {
-    for quote in ['"', '\''] {
-        let quoted = format!("{quote}{key}{quote}");
-        if let Some(pos) = haystack.find(&quoted) {
-            let after = &haystack[pos + quoted.len()..];
-            if after.trim_start().starts_with(':') {
+/// Every JSON-object-KEY-shaped position in `haystack`: the text inside a
+/// quoted run (single OR double quotes; JSON backslash escapes are NOT
+/// honored — see the body comment on why round-4 removed the escape skip)
+/// that is immediately followed — modulo whitespace — by a colon. Tolerating
+/// both quote styles and a space before the colon (`"network":`,
+/// `'network':`, `"network" :`) is round-3's finding: a single literal
+/// substring missed all three variations, which real MCP-args-shaped text
+/// does use.
+///
+/// The KEY position is the whole point. A value is not a key, and — because
+/// a key must sit between two quotes — a bare file path can never be one (a
+/// path contains no quote characters), which is what makes this safe to run
+/// over `classify_file`/`classify_command` haystacks too.
+///
+/// Scanning ALL positions rather than only the first occurrence also fixes a
+/// latent round-3 bug: the previous `haystack.find`-based check stopped at
+/// the first quoted `"token"` it saw, so a benign VALUE mention earlier in
+/// the blob (`{"a": "token", "token": "sk-…"}`) made it miss the real key
+/// that followed.
+fn json_keys(haystack: &str) -> Vec<&str> {
+    let bytes = haystack.as_bytes();
+    let mut keys = Vec::new();
+    // A quote character with no further occurrence can never close a run;
+    // remembering that (instead of rescanning the tail for every later quote
+    // of the same kind) keeps this linear on quote-heavy text.
+    let mut unclosable = [false; 2];
+    let mut i = 0;
+    while i < bytes.len() {
+        let kind = match bytes[i] {
+            b'"' => 0,
+            b'\'' => 1,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if unclosable[kind] {
+            i += 1;
+            continue;
+        }
+        let quote = bytes[i];
+        let start = i + 1;
+        let mut j = start;
+        let mut closing = None;
+        while j < bytes.len() {
+            // Backslash escapes are deliberately NOT honored here. This scan
+            // is the FALLBACK for text that is not valid JSON, where `\` has
+            // no agreed meaning — and skipping `\"` pairs was what made the
+            // scan quadratic (round-4 review, P1): a skip jumps OVER later
+            // quote bytes, so the per-quote scans stop telescoping and each
+            // escaped quote gets re-scanned to the end of its string. Real
+            // JSON never reaches here (see `has_cred_key`), so nothing is
+            // lost by treating every quote byte as an ordinary delimiter.
+            if bytes[j] == quote {
+                closing = Some(j);
+                break;
+            }
+            j += 1;
+        }
+        // An unterminated quote is ordinary text (an apostrophe in prose),
+        // not the start of a run — skip past it and keep looking rather than
+        // abandoning the rest of the blob.
+        let Some(end) = closing else {
+            unclosable[kind] = true;
+            i += 1;
+            continue;
+        };
+        // `start`/`end` both sit adjacent to an ASCII quote byte, so these
+        // slices are always on char boundaries.
+        if haystack[end + 1..].trim_start().starts_with(':') {
+            keys.push(&haystack[start..end]);
+            // A confirmed key means these two quotes really were a matched
+            // pair, so it's safe to skip past the whole run.
+            i = end + 1;
+            continue;
+        }
+        // NOT a key — which also means this pairing may have been spurious,
+        // so back off ONE character rather than consuming the run. Round-4
+        // review: in `it's here: {'network': true}` the apostrophe in "it's"
+        // pairs with the OPENING quote of `'network'`; jumping past that run
+        // swallowed the real key's opening quote and the credential-shaped
+        // key was never found (a recall regression against the round-3
+        // exact-key search this replaced). Backing off re-examines the quote
+        // at `end` as a potential opener, which is what finds it. With the
+        // escape skip gone (above), each scan now stops at the IMMEDIATELY
+        // next same-kind quote, so the per-quote scans telescope and the
+        // whole walk is linear in the haystack length.
+        i += 1;
+    }
+    keys
+}
+
+/// Words that make a JSON key credential/network-shaped. Matched with the
+/// SAME camelCase-aware tokenizer used for verb-matching (`words`), so
+/// `accessToken`/`apiToken`/`auth_token`/`GITHUB_TOKEN` all reduce to an
+/// exact "token" word — while `tokens`/`maxTokens` (an LLM budget parameter,
+/// plural) do not.
+const CRED_KEY_WORDS: &[&str] = &["token", "network"];
+
+/// Keys whose value is a TRANSPORT ENVELOPE — a slot where a caller puts a
+/// Whether a key names an HTTP HEADER slot — the one field shape where a whole
+/// serialized request gets stuffed into a string AND where credentials actually
+/// ride. This predicate is what SCOPES the encoded-JSON unwrap.
+///
+/// Round-5 review, P2: unwrapping every string value indiscriminately
+/// re-created #138's cried-wolf false positive through another door —
+/// `{"path":"config.json","content":"{\"network\":{\"timeout\":10}}"}` is an
+/// ordinary JSON file write with no credential in it and came out
+/// `NetworkOrCredential`. The distinction is not "is this string JSON" but "is
+/// this field a place a REQUEST gets serialized into".
+///
+/// `body` and `payload` were in this set and are now deliberately OUT, which is
+/// round-6 review's P2 and a correction to my own reasoning: I had already
+/// excluded `data` for being ambiguous enough to hold arbitrary domain
+/// documents, and `body` fails that very test harder. GitHub issues, PRs,
+/// comments, Slack, email and Jira all name their domain content `body`, so
+/// `{"body":"{\"network\":{\"timeout\":10}}"}` on an issue-creation tool was
+/// upgraded to the top tier for posting a JSON snippet. That is a large share of
+/// real MCP traffic to put behind an ambiguous name.
+///
+/// Their marginal RECALL was small, which is what makes the trade easy: a
+/// credential in a request body usually carries its own signal already
+/// (`client_secret` and `password` hit `CRED_NET_MARKERS`, `refresh_token` hits
+/// `has_anchored_token`), and a real HTTP call that puts its secret in a header
+/// is still caught here. KNOWN, ACCEPTED residual: a credential key visible ONLY
+/// inside an encoded body (`{"body":"{\"apiToken\":\"x\"}"}`) no longer reaches
+/// the top tier. Conditioning `body` on a sibling `url`/`method` would recover
+/// it and is the obvious next step IF real traffic shows it is needed —
+/// inventing that schema inference now, with no such evidence, is not worth the
+/// machinery on a glance-level hint.
+///
+/// Matched per-TOKEN with a suffix test rather than by equality, which is
+/// round-6 review's other P2. `words` splits camelCase but not acronym runs, so
+/// `HTTPHeaders` tokenizes to one opaque `httpheaders` and an equality lookup
+/// missed it — the same encoded-header case this change exists to catch. A
+/// suffix test accepts `headers`, `requestHeaders`, `http_headers`,
+/// `HTTPHeaders`, `rawHTTPHeaders` and `headersJson` alike, and stays local to
+/// this lookup: teaching `words` about acronyms would reach every verb and
+/// credential-key match in this file, a blast radius far beyond the finding.
+fn is_transport_key(key_words: &[String]) -> bool {
+    key_words
+        .iter()
+        .any(|w| w.ends_with("headers") || w.ends_with("header"))
+}
+
+/// How the key walk should treat a string VALUE it reaches. ONE discriminated
+/// state rather than a pair of booleans, because the three cases are genuinely
+/// distinct and `Exhausted` must not be re-derivable from the other two: a
+/// transport-named key sitting INSIDE an already-decoded document would
+/// otherwise switch decoding back on and make the unwrap depth unbounded after
+/// all (`{"body":"{\"body\":\"{\\\"apiToken\\\"…\"}"}`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EncodedJson {
+    /// Not an envelope slot — a string here is just a string.
+    Opaque,
+    /// THIS slot is a transport envelope: a string that is an encoded JSON
+    /// document gets ONE re-parse.
+    Decodable,
+    /// Already inside a re-parsed document — no further decoding, ever.
+    Exhausted,
+}
+
+/// Whether any OBJECT KEY anywhere in `value` is credential/network-shaped.
+/// Recurses into nested objects and arrays; a string VALUE is never a key,
+/// however key-shaped its contents look. Recursion is bounded because
+/// `serde_json` enforces its own nesting limit while parsing, so a `Value`
+/// that exists at all is shallow enough to walk.
+///
+/// `encoded` carries the string-value policy down the walk. It starts `Opaque`
+/// at the args root and becomes `Decodable` for the DIRECT value of a
+/// header-shaped key (`is_transport_key`) — so the same encoded document is
+/// decoded under `headers` and ignored under `content` or `body`. It never climbs back out of `Exhausted`.
+/// See `embedded_json_has_cred_key` for why, and for why exactly one layer.
+///
+/// `Decodable` propagates through ARRAYS but NOT through nested objects, and
+/// round-5 review's second P2 is why. Carrying it to every descendant re-opened
+/// the false positive one level in: `{"body":{"content":"{\"apiToken\":\"x\"}"}}`
+/// decoded a `content` field just because an ancestor was named `body`, which
+/// contradicts this change's own rule. The line that holds: an ENVELOPE is a
+/// string (or a list of them) sitting in the slot. Once the walk is inside an
+/// OBJECT, that payload was already serialized structurally and its keys are
+/// being read normally anyway — so a string deeper in is domain data of that
+/// object, whatever it is named. Each key still gets its own transport test on
+/// the way down, so a nested `{"request":{"body":"…"}}` is still decoded.
+fn json_value_has_cred_key(value: &serde_json::Value, encoded: EncodedJson) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, child)| {
+            let key_words = words(key);
+            if has_word(&key_words, CRED_KEY_WORDS) {
                 return true;
             }
+            let child_encoded = match encoded {
+                EncodedJson::Exhausted => EncodedJson::Exhausted,
+                _ if is_transport_key(&key_words) => EncodedJson::Decodable,
+                _ => EncodedJson::Opaque,
+            };
+            json_value_has_cred_key(child, child_encoded)
+        }),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| json_value_has_cred_key(item, encoded)),
+        serde_json::Value::String(text) if encoded == EncodedJson::Decodable => {
+            embedded_json_has_cred_key(text)
         }
+        _ => false,
     }
-    false
+}
+
+/// Whether a string value is worth handing back to the parser: it has to LOOK
+/// like a JSON object or array.
+///
+/// This is a COST guard, not a correctness one — prose, file paths, and code
+/// snippets (round-4's `const c = {'networkMode': true};`) do not open with a
+/// bracket, so the overwhelmingly common string value never reaches
+/// `serde_json` at all. Deleting this check would not change any verdict, since
+/// the parser rejects those same inputs on its own; it would only pay for the
+/// attempt.
+fn looks_like_encoded_json(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
+/// Whether `text` — a string VALUE out of the args blob — is itself an encoded
+/// JSON object/array carrying a credential-shaped KEY.
+///
+/// Post-#138 review: double encoding was the one realistic shape the
+/// key-position anchoring gave up on outright.
+/// `{"headers":"{\"apiToken\":\"sk-1\"}"}` classified as `Unknown` — the same
+/// tier as a call carrying no signal whatsoever — because `apiToken` is a key
+/// one layer down and tier 1 only ever saw the outer `headers`. That is the
+/// ORDINARY shape of an HTTP-proxy MCP tool (raw request headers or body
+/// forwarded as a string), which is precisely where a credential rides, and
+/// the pre-#138 whole-blob scan did catch it.
+///
+/// This does not walk back #138, and TWO things keep it from doing so. A KEY is
+/// still the only thing that counts, in both layers — what made the old blob
+/// scan cry wolf was matching VALUES and PATHS (`{"path":"src/token_bucket.rs"}`,
+/// a `content` value that merely mentions a network key). And the unwrap only
+/// runs inside a header slot (`is_transport_key`), so an encoded
+/// document reached through `content` is never opened at all. Round-5 review
+/// caught that the second guard was missing: without it, writing an ordinary
+/// `config.json` whose contents have a `network` key landed on the top tier —
+/// the same harm, one more door. The pre-filter below is NOT one of the two
+/// guards; it only saves the parser a pointless attempt.
+///
+/// EXACTLY ONE extra layer, which is what `EncodedJson::Exhausted` enforces —
+/// a transport-named key inside the decoded document cannot switch decoding
+/// back on. Triple encoding therefore stays undetected, a deliberate, pinned
+/// boundary (see `double_encoded_json_credential_keys_are_found`) rather than an
+/// unbounded unwrap loop over server-controlled text. One layer also keeps the
+/// cost linear, which round-4's P1 makes non-negotiable on this path: each
+/// string is parsed at most once and never re-entered, and the strings are
+/// disjoint slices of the blob, so the total parse work stays O(blob).
+fn embedded_json_has_cred_key(text: &str) -> bool {
+    if !looks_like_encoded_json(text) {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(text)
+        .is_ok_and(|value| json_value_has_cred_key(&value, EncodedJson::Exhausted))
+}
+
+/// Whether a credential/network-shaped KEY appears in this call, in two
+/// tiers of decreasing confidence.
+///
+/// 1. If the caller hands over a `payload` (only `classify_other` has one —
+///    an MCP call's raw args) and it parses as real JSON, walk the PARSED
+///    keys. This is exact: a key is a key, a string value's contents are
+///    never keys, escapes are the parser's problem, and it is linear.
+///    Production traffic always lands here — `bus::server::summarize` builds
+///    `args_text` with `serde_json::to_string`. One narrow exception to "a
+///    string value's contents are never keys": inside a TRANSPORT ENVELOPE
+///    (`is_transport_key`) an encoded JSON document gets one re-parse,
+///    because there its keys are the call's own parameters — see
+///    `embedded_json_has_cred_key`.
+/// 2. Otherwise fall back to the textual quote scan (`json_keys`), which
+///    covers non-JSON haystacks (a shell command, a file path) and the
+///    pseudo-JSON shapes round-3 found in hand-written payloads
+///    (single-quoted keys, a space before the colon).
+///
+/// Round-4 review, P2: tier 1 exists because the textual scan cannot tell a
+/// key from key-shaped text sitting inside a value, and said yes to
+/// `{"path":"src/config.ts","content":"const c = {'networkMode': true};"}` —
+/// an ordinary file write whose CONTENT merely mentions a network key. That
+/// is precisely the cried-wolf false positive this whole change removes, so
+/// a scanner that can be fooled by file content is not good enough where a
+/// real parser is available. The scan stays only for the inputs a parser
+/// cannot accept.
+///
+/// Takes ORIGINAL-CASE text. `words` is what makes `accessToken` split into
+/// ["access", "token"], and it can only see that boundary while the capital
+/// `T` is still there — a pre-lowercased `accesstoken` tokenizes to one
+/// opaque word and matches nothing. (`words` lowercases its own output, so
+/// the comparison against `CRED_KEY_WORDS` is still case-insensitive, and
+/// separator-delimited shapes like `GITHUB_TOKEN` work either way.)
+fn has_cred_key(text: &str, payload: Option<&str>) -> bool {
+    let parsed = payload.and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok());
+    if let Some(value) = parsed {
+        // `Opaque`: the args ROOT is not itself an envelope. Only descending
+        // through a header-shaped key (`is_transport_key`) turns decoding on.
+        return json_value_has_cred_key(&value, EncodedJson::Opaque);
+    }
+    json_keys(text)
+        .iter()
+        .any(|key| has_word(&words(key), CRED_KEY_WORDS))
+}
+
+/// Whether `haystack_lower` passes a token as a COMPLETE `--token` long
+/// option (`--token sk-1`, `--token=sk-1`, `["--token", "sk-1"]`), as
+/// opposed to merely starting one.
+///
+/// This is the one credential shape with no JSON key to anchor on, so
+/// `classify_other`'s narrowing needs it — but it cannot be a plain
+/// `CRED_NET_MARKERS` substring. Round-4 review caught that a raw `--token`
+/// entry also fires on `--tokens 500` and `--tokenizer bpe`, ordinary
+/// LLM/NLP options, which both re-creates the exact false positive this
+/// whole change removes AND contradicts `CRED_KEY_WORDS`' deliberate refusal
+/// of plural `tokens`/`maxTokens`. An alphanumeric, `-`, or `_` directly
+/// after `--token` means a DIFFERENT option (`--token-file` is its own flag,
+/// not this one); anything else — whitespace, `=`, a quote, `,`, `]`, or end
+/// of input — is an argument boundary.
+///
+/// Deliberately double-dashed: a single-dash `-token` would match the tail
+/// of an ordinary kebab-case source path (`src/auth/refresh-token.rs`),
+/// while a path segment never carries a `--` prefix.
+/// Characters that continue an identifier, a filename, or a CLI option, and
+/// therefore are NOT a boundary. `.` is in here specifically because it is
+/// what separates a source file from a credential: `generate_token.py` and
+/// `oauth_token_store.rs` are code, `auth_token` and `$GITHUB_TOKEN` are not.
+fn is_identifier_continuation(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+}
+
+/// The punctuation-anchored "token" shapes, with whether each must also START
+/// a token to count.
+///
+/// `--token` MUST (`true`): without a leading boundary, `feature--token` — a
+/// branch name whose tail merely reads as the flag — matches.
+///
+/// `_token` must NOT (`false`): it is a SUFFIX by construction. The whole
+/// point is to match the tail of `$GITHUB_TOKEN` / `auth_token`, where the
+/// character before the underscore is an ordinary identifier character.
+const ANCHORED_TOKEN_MARKERS: &[(&str, bool)] = &[("--token", true), ("_token", false)];
+/// Whether `haystack_lower` contains one of `ANCHORED_TOKEN_MARKERS` as a
+/// COMPLETE token rather than as a fragment of a longer one.
+///
+/// Both entries need a TRAILING boundary, and for the same reason: without
+/// one, the marker matches the middle of a longer name. `--tokens 500` and
+/// `--tokenizer bpe` are ordinary LLM/NLP options, not credentials — and
+/// `generate_token.py`, `oauth_token_store.rs`, `refresh_token_test.go` are
+/// ordinary SOURCE FILES, which a coding agent edits constantly. Flagging
+/// those as the most severe tier is the same cried-wolf harm this whole
+/// change removes, so `_token` gets the same boundary discipline `--token`
+/// got rather than staying a bare substring.
+///
+/// What survives, because none of these continue the identifier: `$GITHUB_TOKEN`
+/// and `cat ~/.config/auth_token` (end of input), `AUTH_TOKEN=x` (`=`),
+/// `{"auth_token": "x"}` (a quote), `x-auth_token: abc` (`:`).
+///
+/// KNOWN, ACCEPTED cost: a credential name that keeps going loses the marker
+/// — `GITHUB_TOKEN_FILE=/run/secrets/x`, `auth_token.json`. Those name a
+/// PATH to a secret rather than the secret itself, which is the credential-
+/// path markers' job (`.env`, `.netrc`, …), and this direction only ever
+/// costs an over-flag, never a missed one, for the ordinary-source-file case
+/// that made the marker misfire far more often than it fired.
+fn has_anchored_token(haystack_lower: &str) -> bool {
+    ANCHORED_TOKEN_MARKERS.iter().any(|(marker, needs_leading)| {
+        haystack_lower.match_indices(marker).any(|(pos, m)| {
+            let opens = !needs_leading
+                || !haystack_lower[..pos]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_identifier_continuation);
+            let ends = !haystack_lower[pos + m.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_identifier_continuation);
+            opens && ends
+        })
+    })
 }
 
 /// The single check every `classify_*` function uses for "does this text
-/// show network access or a credential": the flat substring list PLUS the
-/// quote/spacing-tolerant JSON-key check for "network"/"token" (round-3
-/// review — see `has_json_key`). One function so command/file/other never
-/// drift apart on which of the two checks they remember to run.
-fn matches_cred_net(haystack_lower: &str) -> bool {
-    contains_marker(haystack_lower, CRED_NET_MARKERS)
-        || has_json_key(haystack_lower, "network")
-        || has_json_key(haystack_lower, "token")
+/// show network access or a credential": the flat substring list, the
+/// boundary-checked anchored `token` shapes (`has_anchored_token`), and
+/// the credential-key check
+/// (round-3/round-4 — see `has_cred_key`). One function so command/file/other
+/// never drift apart on which of the three checks they remember to run.
+///
+/// `text` is everything worth scanning — for `classify_other` that is the
+/// tool name AND its args, since a secret or URL can show up in either.
+/// `payload` is the raw argument blob on its own, when the caller has one, so
+/// the key check can parse it instead of guessing at its structure; callers
+/// without a structured payload pass `None`.
+///
+/// The two are NOT scanned uniformly, and the difference is `has_cred_key`'s:
+/// `contains_marker` and `has_anchored_token` see all of `text`, but the key
+/// check reads `payload` ALONE whenever that payload is real JSON (its tier
+/// 1) and only falls back to `text` otherwise. So a credential-shaped key can
+/// only ever be found in the args, never in the tool name — which costs
+/// nothing, since a tool name is a bare identifier with no key positions in
+/// it (no quotes, no colon) for either tier to find.
+///
+/// Pass ORIGINAL-CASE text. The substring markers and the flag check are
+/// matched case-insensitively (lowercased right here, so no caller has to
+/// remember), but the key check needs the original camelCase — see
+/// `has_cred_key`.
+fn matches_cred_net(text: &str, payload: Option<&str>) -> bool {
+    let lower = text.to_ascii_lowercase();
+    contains_marker(&lower, CRED_NET_MARKERS)
+        || has_anchored_token(&lower)
+        || has_cred_key(text, payload)
 }
 
 /// True when `trimmed` (already lowercased) starts with `word` as a whole
@@ -721,10 +1130,12 @@ fn is_read_only_command(lower: &str) -> bool {
 /// of mutation, so an unrecognized (or compound, or flagged-destructive)
 /// command is never waved through as read-only.
 fn classify_command(cmd: &str) -> RiskLevel {
-    let lower = cmd.to_ascii_lowercase();
-    if matches_cred_net(&lower) {
+    // Original case — `matches_cred_net` lowercases for its own substring
+    // markers, and its key check needs the camelCase boundaries intact.
+    if matches_cred_net(cmd, None) {
         return RiskLevel::NetworkOrCredential;
     }
+    let lower = cmd.to_ascii_lowercase();
     if is_read_only_command(&lower) {
         return RiskLevel::ReadOnly;
     }
@@ -737,12 +1148,10 @@ fn classify_command(cmd: &str) -> RiskLevel {
 /// unrecognized tool name touching a file doesn't default to a guess either
 /// way.
 fn classify_file(tool_name: &str, path: &str) -> RiskLevel {
-    let haystack = format!(
-        "{} {}",
-        tool_name.to_ascii_lowercase(),
-        path.to_ascii_lowercase()
-    );
-    if matches_cred_net(&haystack) {
+    // Original case — `matches_cred_net` lowercases for its substring markers
+    // itself, and its key check needs the camelCase boundaries intact.
+    let haystack = format!("{tool_name} {path}");
+    if matches_cred_net(&haystack, None) {
         return RiskLevel::NetworkOrCredential;
     }
     let w = words(tool_name);
@@ -758,11 +1167,34 @@ fn classify_file(tool_name: &str, path: &str) -> RiskLevel {
 /// Any other tool call's tier (MCP tools, `WebFetch`/`WebSearch`/`TodoWrite`,
 /// a Codex permission-scope escalation, …): a couple of high-confidence
 /// exact-name overrides, then credential/network markers scanned across BOTH
-/// the tool name and its args (a secret/URL can show up in either — see
-/// `matches_cred_net`), then a camelCase/compound "token" key (round-3
-/// review — see below), then a write verb in EITHER the tool name OR the
-/// args (round-2 review, issue #101 P0-b — see below), then the tool name's
-/// own read-only verb, else `Unknown`.
+/// the tool name and its args (a secret/URL can show up in either — including
+/// a camelCase/compound credential KEY like `accessToken`; see
+/// `matches_cred_net`), then a write verb in EITHER the tool name OR the args
+/// (round-2 review, issue #101 P0-b — see below), then the tool name's own
+/// read-only verb, else `Unknown`.
+///
+/// Round-4 review: the credential check here used to ALSO tokenize the entire
+/// stringified args blob and fire on an exact "token" word anywhere in it,
+/// key or value. Round-3 justified that as bounded ("args_text is never a
+/// bare file path the way `tokenizer.py` is") — but that only held for the
+/// two argument names `bus::server::summarize` routes AWAY from here
+/// (`file_path`/`filePath`); every other file-touching MCP tool lands in this
+/// function with its path sitting in the blob. The widely-used
+/// `@modelcontextprotocol/server-filesystem` names its argument `path`, so
+/// `{"path":"src/token_bucket.rs"}` — an utterly ordinary source-file write —
+/// came out `NetworkOrCredential`, the top tier. That is the SAME "cried
+/// wolf" harm round-2 removed bare "network"/"token" from `CRED_NET_MARKERS`
+/// to fix (see that list's comment), re-entering through a different door,
+/// and it works directly against issue #101's goal of a badge that tells you
+/// at a glance which cards deserve a closer look.
+///
+/// So the check now lives in `matches_cred_net`, anchored to JSON KEY
+/// position (`has_cred_key`) — where a credential parameter actually
+/// appears, and where a path never can. KNOWN, ACCEPTED recall loss: a
+/// secret quoted only in a VALUE with no credential-shaped key and no
+/// punctuation anchor (`{"comment":"rotate the api token"}`) no longer
+/// reaches the top tier. That is a glance-level hint, not the gate — the
+/// human still sees the full args via `DetailPreview` before allowing.
 fn classify_other(tool_name: &str, args_text: &str) -> RiskLevel {
     // High-confidence overrides for common built-ins that would otherwise be
     // UNDER-classified by the generic scan below: both tokenize to a word
@@ -772,29 +1204,12 @@ fn classify_other(tool_name: &str, args_text: &str) -> RiskLevel {
     if tool_name.eq_ignore_ascii_case("WebFetch") || tool_name.eq_ignore_ascii_case("WebSearch") {
         return RiskLevel::NetworkOrCredential;
     }
-    let haystack = format!(
-        "{} {}",
-        tool_name.to_ascii_lowercase(),
-        args_text.to_ascii_lowercase()
-    );
-    if matches_cred_net(&haystack) {
+    // Original case — see `classify_file` / `matches_cred_net`.
+    let haystack = format!("{tool_name} {args_text}");
+    if matches_cred_net(&haystack, Some(args_text)) {
         return RiskLevel::NetworkOrCredential;
     }
     let args_words = words(args_text);
-    // Round-3 review: `matches_cred_net`'s literal anchors (`_token`,
-    // `token=`, the `has_json_key` check) never match a camelCase/compound
-    // key like `accessToken`/`apiToken` — no underscore, no adjacent
-    // quote+colon around the LITERAL word "token" (the key IS "accessToken",
-    // not "token"). The SAME camelCase-aware tokenizer already used for
-    // verb-matching below splits "accessToken" into ["access","token"], so
-    // an EXACT "token" word catches it. Scoped to `classify_other` only
-    // (never `classify_file`/`classify_command`): args_text is never a bare
-    // file path the way `tokenizer.py` is, so this can't reintroduce the
-    // round-2 P2 false positive — a path segment "tokenizer" tokenizes to
-    // ["tokenizer"], which is NOT the exact word "token".
-    if has_word(&args_words, &["token"]) {
-        return RiskLevel::NetworkOrCredential;
-    }
     let name_words = words(tool_name);
     // `tool_name` is a deliberate, structured identifier; `args_text` is
     // arbitrary content the MCP SERVER controls — issue #101's own
@@ -911,6 +1326,31 @@ impl GrantSnapshot {
     }
 }
 
+/// One session's read-only auto-allow scope, for the frontend's revoke UI
+/// (`ReadOnlyGrants::session`). Distinct from `FullGrant`/`AlwaysGrant`: this is
+/// a QUERY snapshot only — it is never written into `GrantSnapshot` or the
+/// store (see `Inner::read_only_session`'s doc for why a read-only grant is
+/// never persisted).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ReadOnlySessionGrant {
+    pub thread: i32,
+    pub dir: String,
+}
+
+/// Current in-memory read-only auto-allow scopes (issue #103), for the
+/// frontend to show "this session"/"this issue" as read-only-trusted and offer
+/// a one-click revoke — mirrors `GrantSnapshot`'s role for Full/Always, but
+/// this shape is NEVER itself persisted (see `Inner::read_only_session`'s doc).
+/// `issue` = thread ids with the whole-issue grant (set at dispatch-approval
+/// time, `AskRegistry::grant_read_only_issue`); `session` = individual
+/// (thread, dir) sessions granted via the "release this session's read-only"
+/// batch action (`AskRegistry::grant_read_only_session`).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Default)]
+pub struct ReadOnlyGrants {
+    pub issue: Vec<i32>,
+    pub session: Vec<ReadOnlySessionGrant>,
+}
+
 /// A persist request to the SINGLE ordered writer (the `auth_persist` consumer).
 /// `ack`, when present, is signalled with the store-write result once THIS message
 /// is written — so a grant-changing command can await durability and surface a
@@ -949,6 +1389,35 @@ struct Inner {
     /// Dangerous mode: when on, EVERY ask from EVERY agent auto-allows (never
     /// surfaced). The global "skip all permission prompts" setting.
     dangerous: bool,
+    /// (thread, dir) sessions with a "release all read-only for this session"
+    /// batch grant (issue #103) — auto-allows any FUTURE ask this session gets
+    /// classified `RiskLevel::ReadOnly` (see `classify_risk` / `auto_decision`),
+    /// same tier as the backlog this grant sweeps at the moment it's set (see
+    /// `AskRegistry::grant_read_only_session`). In-memory ONLY: deliberately
+    /// NEVER mirrored to `persist` — see `read_only_issue`'s doc for why this
+    /// and its sibling field both skip persistence entirely.
+    read_only_session: HashSet<(i32, String)>,
+    /// Thread ids with an ISSUE-WIDE read-only auto-allow (issue #103's
+    /// dispatch-approval propagation — `AskRegistry::grant_read_only_issue`):
+    /// covers EVERY dir under the thread, present when granted OR spawned
+    /// later — a worker created after the grant still inherits it, which is
+    /// the whole point (no more "worker starts, asks `pwd`" after the human
+    /// already approved the issue's dispatch). Checked in `auto_decision`
+    /// alongside `read_only_session`; ONLY ever short-circuits a
+    /// `RiskLevel::ReadOnly` ask — a Write/NetworkOrCredential/Unknown ask
+    /// always still surfaces, no matter how broad this set gets.
+    ///
+    /// In-memory ONLY, deliberately NEVER persisted (contrast `full`/`always`,
+    /// #87/#89): `grant_snapshot`/`seed_grants` don't touch this field (or
+    /// `read_only_session`) at all, so a restart always starts every session
+    /// un-trusted again. This is the MORE conservative lifetime on purpose — a
+    /// read-only grant is broader than any single Always rule (it covers a
+    /// WHOLE risk class, on a WHOLE issue, including workers that don't exist
+    /// yet), and #87's own round-1 history is the reason: an unbounded standing
+    /// grant that outlives a restart is exactly the shape of thing that had to
+    /// be walked back before Full/Always earned persistence (and Always only
+    /// after #89 made it precise). This grant doesn't get that same trust.
+    read_only_issue: HashSet<i32>,
     /// IM 桥的通知器：装上后 Ask 开/答/撤事件外发；未装时零开销。
     notify: Option<tokio::sync::mpsc::UnboundedSender<AskEvent>>,
     /// transcript 结算痕迹消费者（与 IM 桥独立的第二订阅，始终在桌面端装上）。
@@ -1005,6 +1474,32 @@ impl Inner {
                 ack: None,
             });
         }
+    }
+
+    /// Resolve every ask in `hit` to Allow (持锁内调用). The caller has already
+    /// filtered `hit` to exactly the asks a read-only batch/issue grant covers
+    /// (`RiskLevel::ReadOnly` plus whatever scope predicate applies) — this is
+    /// just the shared wake-and-remove tail of
+    /// `AskRegistry::grant_read_only_session`/`grant_read_only_issue`, mirroring
+    /// `answer`'s own covered-asks sweep. Returns how many were resolved.
+    /// Deliberately does NOT call `emit_persist` — a read-only grant is never
+    /// persisted (see `read_only_session`'s doc on this struct).
+    fn resolve_read_only(&mut self, hit: Vec<Ask>) -> usize {
+        let ids: HashSet<u64> = hit.iter().map(|a| a.id).collect();
+        self.open.retain(|a| !ids.contains(&a.id));
+        for ask in &hit {
+            if let Some(tx) = self.waiters.remove(&ask.id) {
+                let _ = tx.send(Decision::Allow);
+            }
+        }
+        let n = hit.len();
+        for ask in hit {
+            self.emit(AskEvent::Resolved {
+                ask,
+                answer: Answer::Allow,
+            });
+        }
+        n
     }
 
     /// Remove the standing grants matching (thread, dir, action_key) and RETURN
@@ -1189,8 +1684,20 @@ impl AskRegistry {
     /// A standing rule's verdict for an incoming ask, checked BEFORE surfacing:
     /// full access or a matching always-allow → auto-allow (never shown). Matches
     /// on the canonical `action_key` (see `Ask::action_key`), NOT the lossy
-    /// display summary — issue #89.
-    pub fn auto_decision(&self, thread: i32, dir: &str, action_key: &str) -> Option<Decision> {
+    /// display summary — issue #89. `risk` is the SAME `classify_risk` tier the
+    /// ask itself carries (see `Ask::risk`) — it gates the read-only batch/issue
+    /// grants (issue #103): they auto-allow ONLY a `RiskLevel::ReadOnly` ask,
+    /// checked by value equality against what `classify_risk` already decided.
+    /// This function never re-derives or loosens that judgment; a Write/
+    /// NetworkOrCredential/Unknown ask falls through to `None` (surfaces)
+    /// exactly as it would if no read-only grant existed at all.
+    pub fn auto_decision(
+        &self,
+        thread: i32,
+        dir: &str,
+        risk: RiskLevel,
+        action_key: &str,
+    ) -> Option<Decision> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.dangerous {
             return Some(Decision::Allow);
@@ -1200,6 +1707,16 @@ impl AskRegistry {
             return Some(Decision::Allow);
         }
         if g.always.get(&k).is_some_and(|s| s.contains(action_key)) {
+            return Some(Decision::Allow);
+        }
+        // Read-only batch/issue grants (issue #103): a session granted "release
+        // all read-only" (`read_only_session`) or a whole issue granted at
+        // dispatch-approval time (`read_only_issue`) auto-allows a ReadOnly-tier
+        // ask — never anything else, by construction (the `risk ==` check gates
+        // the whole branch, not just a sub-case).
+        if risk == RiskLevel::ReadOnly
+            && (g.read_only_issue.contains(&thread) || g.read_only_session.contains(&k))
+        {
             return Some(Decision::Allow);
         }
         None
@@ -1375,6 +1892,102 @@ impl AskRegistry {
             .grant_snapshot()
     }
 
+    /// Batch-approve every ask (open right now, or arriving later this session)
+    /// classified `RiskLevel::ReadOnly` for one (thread, dir) session — issue
+    /// #103's "release all read-only for this session". In-memory only, NEVER
+    /// persisted (see `Inner::read_only_session`'s doc: unlike Full/Always, this
+    /// does not survive a restart). Immediately resolves every currently open
+    /// ReadOnly ask in this session to Allow — a Write/NetworkOrCredential/
+    /// Unknown ask in the SAME session is left untouched, still open, still
+    /// needs a real answer — and installs the forward-looking rule so a LATER
+    /// ReadOnly ask in this session doesn't re-prompt either. Returns how many
+    /// open asks were just resolved, so the caller can report "released N".
+    pub fn grant_read_only_session(&self, thread: i32, dir: &str) -> usize {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.read_only_session.insert((thread, dir.to_string()));
+        let hit: Vec<Ask> = g
+            .open
+            .iter()
+            .filter(|a| a.risk == RiskLevel::ReadOnly && a.thread == thread && a.dir == dir)
+            .cloned()
+            .collect();
+        g.resolve_read_only(hit)
+    }
+
+    /// Issue-wide counterpart of `grant_read_only_session` (issue #103's
+    /// dispatch-approval propagation): every dir under `thread` — present now,
+    /// or created later (a worker spawned after this call still inherits it) —
+    /// auto-allows a `RiskLevel::ReadOnly` ask. In-memory only, NEVER persisted
+    /// (see `Inner::read_only_issue`'s doc). Sweeps every currently open
+    /// ReadOnly ask across the WHOLE thread (any dir) to Allow; leaves every
+    /// Write/NetworkOrCredential/Unknown ask open. Returns how many were
+    /// resolved.
+    pub fn grant_read_only_issue(&self, thread: i32) -> usize {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.read_only_issue.insert(thread);
+        let hit: Vec<Ask> = g
+            .open
+            .iter()
+            .filter(|a| a.risk == RiskLevel::ReadOnly && a.thread == thread)
+            .cloned()
+            .collect();
+        g.resolve_read_only(hit)
+    }
+
+    /// Revoke one session's read-only batch grant (issue #103). Returns whether
+    /// it was actually set. Does NOT retroactively re-surface any ask this
+    /// grant already resolved to Allow — like revoking Full/Always, it only
+    /// stops covering FUTURE asks.
+    pub fn revoke_read_only_session(&self, thread: i32, dir: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read_only_session
+            .remove(&(thread, dir.to_string()))
+    }
+
+    /// Revoke a whole issue's read-only propagation (issue #103) — CASCADES to
+    /// every session-scoped grant under this thread too, not just the
+    /// issue-wide flag. Without this, a session separately granted via
+    /// `grant_read_only_session` (the per-ask "release this session's
+    /// read-only" action) would silently keep auto-allowing after the human
+    /// revoked the issue-wide grant from the board chip, even though its
+    /// revoke-dialog copy promises "every worker under this issue will stop
+    /// auto-allowing read-only requests" — and the chip itself, gated only on
+    /// the `issue` set (see `ReadOnlyTrustChip`), would have already
+    /// disappeared, handing the human a false "nothing is trusted anymore"
+    /// impression while a worker's session grant quietly lived on. Mirrors
+    /// `purge_thread`'s existing cascade (both sets cleared together there
+    /// too, for the same "issue revoke means the WHOLE issue" reasoning — see
+    /// its doc). Unconditional: always leaves `thread` with zero read-only
+    /// trust of any kind, regardless of what existed before, which is the
+    /// simplest correct reading of "revoke the whole issue's propagation".
+    /// Returns whether the issue-wide flag itself had been set.
+    pub fn revoke_read_only_issue(&self, thread: i32) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let had_issue = g.read_only_issue.remove(&thread);
+        g.read_only_session.retain(|(t, _)| *t != thread);
+        had_issue
+    }
+
+    /// Current read-only auto-allow scopes, for the frontend's "read-only
+    /// trusted" indicator + revoke (issue #103). See `ReadOnlyGrants`'s doc:
+    /// this is a QUERY snapshot only, never itself persisted.
+    pub fn read_only_grants(&self) -> ReadOnlyGrants {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        ReadOnlyGrants {
+            issue: g.read_only_issue.iter().copied().collect(),
+            session: g
+                .read_only_session
+                .iter()
+                .map(|(thread, dir)| ReadOnlySessionGrant {
+                    thread: *thread,
+                    dir: dir.clone(),
+                })
+                .collect(),
+        }
+    }
+
     /// Remove the standing grants matching (thread, dir, action_key), emit the
     /// reduced snapshot fire-and-forget, and RETURN exactly what was removed
     /// (both `full` and `always` — the removed-set, computed under one lock,
@@ -1456,6 +2069,15 @@ impl AskRegistry {
             self.cancel(id);
         }
         self.revoke_thread(thread);
+        // Read-only grants (issue #103) aren't in `GrantSnapshot`/`revoke_thread`
+        // at all (never persisted — see `Inner::read_only_session`'s doc), so
+        // they need their own cleanup here. Hygiene, not safety, like the rest
+        // of this function's doc: a stale thread id left in these sets is inert
+        // forever either way (AUTOINCREMENT never reuses it), but a long-running
+        // app session shouldn't accumulate dead entries.
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.read_only_issue.remove(&thread);
+        g.read_only_session.retain(|(t, _)| *t != thread);
     }
 
     /// Delete-time cleanup of ONE task's `(thread, dir)` footprint: cancel its open
@@ -1474,6 +2096,13 @@ impl AskRegistry {
             self.cancel(id);
         }
         self.revoke_grant(thread, dir, None);
+        // Same hygiene note as `purge_thread`: this session's read-only grant
+        // (issue #103) isn't covered by `revoke_grant` (never persisted).
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read_only_session
+            .remove(&(thread, dir.to_string()));
     }
 
     /// All Asks across threads (for the workspace-wide Needs-you surface).
@@ -2030,7 +2659,7 @@ mod tests {
 
     #[test]
     fn other_single_quoted_and_spaced_json_keys_are_credential_shaped() {
-        // `has_json_key` tolerates single quotes and whitespace before the
+        // `json_keys` tolerates single quotes and whitespace before the
         // colon — variations a hand-written or non-standard-JSON MCP payload
         // might use.
         for args_text in [r#"{'network': true}"#, r#"{"network" : true}"#] {
@@ -2044,30 +2673,789 @@ mod tests {
 
     #[test]
     fn other_json_key_check_requires_a_colon_not_just_a_quoted_word() {
-        // `has_json_key` specifically requires the quoted word to be
+        // The fallback scan specifically requires the quoted word to be
         // followed by a colon (a KEY position) — a quoted VALUE that merely
         // contains the word must not match it, else it would just be a
         // differently-shaped substring check with extra steps.
-        assert!(!has_json_key(r#"{"description": "a network issue"}"#, "network"));
-        assert!(has_json_key(r#"{"network": true}"#, "network"));
+        assert!(!has_cred_key(r#"{"description": "a network issue"}"#, None));
+        assert!(has_cred_key(r#"{"network": true}"#, None));
     }
 
     #[test]
-    fn other_bare_token_word_anywhere_in_args_is_upgrade_only_over_caution() {
-        // Unlike `has_json_key` (key-position only), the camelCase-aware
-        // word-boundary check for "token" (see `classify_other`) does NOT
-        // distinguish a key from a value — "token" appearing ANYWHERE in
-        // args_text is treated as a signal. This is a DELIBERATE, documented
-        // over-caution tradeoff (consistent with WRITE_TOOL_WORDS's own
-        // args_text scan, which has the same key/value-agnostic shape): a
-        // benign mention ("please rotate the token") costs an occasional
-        // over-flagged card, never a missed dangerous one.
+    fn json_keys_scans_every_position_not_just_the_first() {
+        // The round-3 `haystack.find`-based check stopped at the FIRST
+        // quoted occurrence: a benign value mention earlier in the blob hid
+        // the real credential key that came after it.
+        let args = r#"{"a": "token", "apiToken": "sk-1"}"#;
+        assert_eq!(json_keys(args), vec!["a", "apiToken"]);
+        assert!(has_cred_key(args, None));
+    }
+
+    #[test]
+    fn json_keys_survives_an_unterminated_quote() {
+        // An apostrophe in prose is not the start of a quoted run. Bailing
+        // out at the first unclosable quote would blind the scan to every
+        // key after it.
+        assert!(has_cred_key(r#"{"msg": "don't", "accessToken": "sk-1"}"#, None));
+        assert!(has_cred_key(r#"it's here: {"network": true}"#, None));
+    }
+
+    #[test]
+    fn value_contents_are_never_treated_as_keys() {
+        // Round-4 review P2: the textual scan cannot tell a key from
+        // key-shaped text inside a VALUE, and said yes to a file write whose
+        // content merely mentions a network key — the exact cried-wolf false
+        // positive this change exists to remove. Parsing the payload settles
+        // it structurally.
+        //
+        // The one exception added post-#138 does not reach these: an encoded
+        // JSON document is re-parsed for keys only inside a TRANSPORT ENVELOPE
+        // (`is_transport_key`), and `content` is not one. So a file's
+        // contents are never opened for keys no matter what they hold — see
+        // `encoded_json_unwrap_is_scoped_to_transport_fields`.
+        for args_text in [
+            r#"{"path":"src/config.ts","content":"const c = {'networkMode': true};"}"#,
+            r#"{"path":"src/a.ts","content":"const c = {\"accessToken\": x};"}"#,
+            r##"{"path":"src/a.py","content":"# see 'token': the auth doc"}"##,
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Other { tool_name: "write_file", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} must not be flagged network/credential"
+            );
+        }
+        // A real key at the SAME nesting depth as those values still fires.
         assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "write_file",
+                args_text: r#"{"path":"src/a.ts","accessToken":"sk-1"}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+    }
+
+    #[test]
+    fn parsed_payload_finds_keys_at_any_depth() {
+        // The parsed walk must recurse through objects AND arrays, not just
+        // look at the top level.
+        for args_text in [
+            r#"{"env":{"GITHUB_TOKEN":"sk-1"}}"#,
+            r#"{"steps":[{"with":{"apiToken":"sk-1"}}]}"#,
+            r#"[{"accessToken":"sk-1"}]"#,
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} should be network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_payloads_do_not_blow_the_stack() {
+        // `json_value_has_cred_key` recurses, and `args_text` is
+        // server-controlled. What keeps that safe is that `serde_json`
+        // enforces its own nesting limit while PARSING, so a `Value` that
+        // exists at all is shallow enough to walk — and anything deeper
+        // simply fails to parse and degrades to the (iterative) textual scan
+        // rather than reaching the recursion. Measured here: nesting parses
+        // up to ~126 and is rejected beyond, with no depth crashing.
+        for depth in [100usize, 128, 5_000, 100_000] {
+            let payload = format!(
+                "{}{}{}",
+                r#"{"a":"#.repeat(depth),
+                r#"{"apiToken":"sk-1"}"#,
+                "}".repeat(depth)
+            );
+            assert_eq!(
+                classify_risk(RiskSignal::Other {
+                    tool_name: "get_status",
+                    args_text: &payload
+                }),
+                RiskLevel::NetworkOrCredential,
+                "depth {depth} lost the key"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_quote_payloads_stay_linear() {
+        // Round-4 review P1: skipping `\"` pairs made the scan jump OVER
+        // later quote bytes, so the per-quote scans stopped telescoping and
+        // every escaped quote was re-scanned to the end of its string. A
+        // 40 KB payload took ~375ms in one call, on the permission-ask path.
+        // BOTH paths need covering. A valid-JSON payload goes to the parser;
+        // an invalid one (single-quoted key here) falls back to the textual
+        // scan, which is where the escape skip lived — a valid-JSON case
+        // alone would never execute that code and could not catch its
+        // return.
+        let escaped = r#"\""#.repeat(100_000);
+        for payload in [
+            format!(r#"{{"content":"{escaped}"}}"#),
+            format!(r#"{{'content':"{escaped}"}}"#),
+        ] {
+            let started = std::time::Instant::now();
+            let risk = classify_risk(RiskSignal::Other {
+                tool_name: "write_file",
+                args_text: &payload,
+            });
+            let elapsed = started.elapsed();
+            assert_ne!(risk, RiskLevel::NetworkOrCredential);
+            // Linear is milliseconds here; the quadratic version needed
+            // minutes at this size. A 5s bound fails the bug without being
+            // sensitive to CI load.
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "{} byte payload took {elapsed:?} — scan is not linear",
+                payload.len()
+            );
+        }
+    }
+
+    #[test]
+    fn double_encoded_json_credential_keys_are_found() {
+        // Post-#138 review. Anchoring the check to KEY position closed the
+        // `token_bucket.rs` cried-wolf false positive, but it also made
+        // DOUBLE-ENCODED args invisible: an HTTP-proxy MCP tool forwards raw
+        // request headers/body as a STRING, and tier 1 only saw the outer
+        // `headers` key. `{"headers":"{\"apiToken\":\"sk-1\"}"}` came out
+        // `Unknown` — the same tier as a call with no signal at all — which is
+        // the shape a credential most plausibly arrives in.
+        for (tool_name, args_text) in [
+            // The review's verbatim reproduction.
+            ("call_api", r#"{"headers":"{\"apiToken\":\"sk-1\"}"}"#),
+            // The body half of the same shape, and a network key rather than a
+            // credential one.
+            ("call_api", r#"{"headers":"{\"auth_token\":\"sk-1\"}"}"#),
+            ("call_api", r#"{"headers":"{\"network\":true}"}"#),
+            // An encoded ARRAY is the same case; so is a key nested inside the
+            // encoded document rather than at its top level.
+            ("proxy", r#"{"requestHeaders":"[{\"accessToken\":\"sk-1\"}]"}"#),
+            ("proxy", r#"{"HTTPHeaders":"{\"a\":{\"apiToken\":\"sk-1\"}}"}"#),
+            // Leading whitespace before the bracket must not defeat the
+            // pre-filter — a proxied body is often pretty-printed.
+            ("call_api", r#"{"headers":"  {\"apiToken\":\"sk-1\"}"}"#),
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Other { tool_name, args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} should be network/credential"
+            );
+        }
+
+        // Why fixing this is a COHERENCE win, not just a recall win: the
+        // escape-blind textual fallback (tier 2) already found the key here,
+        // because `apiToken\` reads as a quoted run followed by a colon. So
+        // the supposedly-exact tier 1 was strictly NARROWER than the tier it
+        // exists to improve on. Production always takes tier 1 (`summarize`
+        // stringifies with serde), so that inversion was the whole bug.
+        assert!(has_cred_key(r#"{"headers":"{\"apiToken\":\"sk-1\"}"}"#, None));
+
+        // KNOWN, ACCEPTED residual — pinned deliberately, exactly like
+        // `github_token_file=…` in `has_anchored_token`'s doc. The unwrap is
+        // ONE layer, so TRIPLE encoding is still invisible. An unbounded unwrap
+        // loop over server-controlled text is the thing not worth buying, and
+        // this tier is a glance-level hint, never the gate — the human still
+        // sees the full args via `DetailPreview` before allowing.
+        //
+        // `body` at EVERY layer on purpose. With a neutral outer key this would
+        // pass for the wrong reason — the transport scoping alone would stop it
+        // at layer 1, and the one-layer rule would go untested. Naming a
+        // transport field all the way down is what forces `EncodedJson` to be
+        // the thing under test: layer 1 decodes, and the inner `body` must NOT
+        // re-enable decoding.
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: r#"{"headers":"{\"headers\":\"{\\\"apiToken\\\":\\\"sk-1\\\"}\"}"}"#
+            }),
+            RiskLevel::Unknown,
+            "triple encoding is the documented boundary; update the doc if this changes"
+        );
+
+        // The OTHER accepted residual, from round-6: a credential key visible
+        // only inside an encoded BODY. `body` cannot license decoding — too many
+        // non-HTTP tools use it for domain content — and the recall it costs is
+        // small because a real body credential usually carries its own signal.
+        // Pinned so the trade is a decision on record, not a silent gap; see
+        // `is_transport_key` for the sibling-`url` refinement if traffic ever
+        // justifies it.
+        assert_ne!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: r#"{"body":"{\"apiToken\":\"sk-1\"}"}"#
+            }),
+            RiskLevel::NetworkOrCredential,
+            "encoded-body-only credentials are a documented residual"
+        );
+        // And the shapes that DO still carry their own signal, so the residual
+        // above is narrow rather than a hole: these need no decoding at all.
+        for args_text in [
+            r#"{"body":"{\"client_secret\":\"s\"}"}"#,
+            r#"{"body":"{\"password\":\"p\"}"}"#,
+            r#"{"body":"{\"refresh_token\":\"r\"}"}"#,
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Other { tool_name: "call_api", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} should still fire on its own marker"
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_json_unwrap_keeps_the_key_position_discipline() {
+        // The unwrap must not re-open any of the false positives #138 removed.
+        // What protects them is that BOTH layers still only ever match a KEY:
+        // a path is not a key, a prose mention is not a key, and neither a path
+        // nor a code snippet is a parseable JSON document to find keys in.
+        for (tool_name, args_text) in [
+            // Round-4's verbatim P2 case: file CONTENT that merely mentions a
+            // network key. Opens with `const`, so it is never re-parsed.
+            (
+                "write_file",
+                r#"{"path":"src/config.ts","content":"const c = {'networkMode': true};"}"#,
+            ),
+            // The motivating regression, untouched.
+            ("write_file", r#"{"path":"src/token_bucket.rs","content":"x"}"#),
+            // Writing a real JSON file with benign keys.
+            (
+                "write_file",
+                r#"{"path":"tsconfig.json","content":"{\"compilerOptions\":{\"strict\":true}}"}"#,
+            ),
+            // Round-5 review P2, verbatim: a JSON file whose contents DO carry a
+            // credential-shaped key. This is the case the first cut of this
+            // change got wrong, and the one the `tsconfig.json` line above could
+            // not catch — its keys happen not to match, so it passed either way.
+            // Testing only the benign-key half tested nothing about scoping.
+            (
+                "write_file",
+                r#"{"path":"config.json","content":"{\"network\":{\"timeout\":10}}"}"#,
+            ),
+            (
+                "write_file",
+                r#"{"path":"src/fixtures/auth.json","content":"{\"apiToken\":\"sk-test\"}"}"#,
+            ),
+            // Same document, reached through the other content-ish field names a
+            // file-editing MCP tool uses.
+            ("edit_file", r#"{"path":"a.json","new_string":"{\"apiToken\":\"x\"}"}"#),
+            ("write_file", r#"{"path":"a.json","text":"{\"network\":true}"}"#),
+            // Round-6 review P2, verbatim: `body` is what an issue/PR/comment
+            // tool calls its domain content, so posting a JSON snippet must not
+            // reach the top tier. This one is still `Write` (create/comment are
+            // write verbs) — the point is that it is not the CREDENTIAL tier.
+            ("create_issue", r#"{"title":"cfg","body":"{\"network\":{\"timeout\":10}}"}"#),
+            ("add_comment", r#"{"body":"{\"apiToken\":\"redacted\"}"}"#),
+            // An encoded document whose credential-shaped text sits in a VALUE
+            // is still not a key, one layer down just as at the top.
+            ("call_api", r#"{"headers":"{\"comment\":\"rotate the api token\"}"}"#),
+            // Bracket-leading but NOT JSON: the parse fails and the value is
+            // simply text again, not a source of keys.
+            ("run_cmd", r#"{"cmd":"[not json] token: sk-1"}"#),
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Other { tool_name, args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} must not be flagged network/credential"
+            );
+        }
+        // The pre-filter decides no verdict on its own (see its doc — the
+        // parser rejects the same inputs anyway), so nothing above can fail if
+        // it regresses. Assert it directly, or it would be untested.
+        assert!(!looks_like_encoded_json("const c = {'networkMode': true};"));
+        assert!(!looks_like_encoded_json("src/token_bucket.rs"));
+        assert!(looks_like_encoded_json(r#"{"apiToken":"sk-1"}"#));
+        assert!(looks_like_encoded_json("  [1,2]"));
+    }
+
+    #[test]
+    fn encoded_json_unwrap_is_scoped_to_transport_fields() {
+        // The sharpest statement of round-5's fix: ONE encoded document, and the
+        // verdict turns entirely on the name of the field holding it. Under a
+        // transport envelope its keys are the call's own parameters; under a
+        // content field they belong to a document the agent is merely writing.
+        // Asserting both halves against the SAME payload is what makes this a
+        // test of the discriminator rather than of two unrelated inputs.
+        let doc = r#"{\"apiToken\":\"sk-1\"}"#;
+        for envelope in [
+            "headers",
+            "header",
+            "requestHeaders",
+            "request_headers",
+            // Acronym-glued forms: `words` yields one opaque `httpheaders`
+            // token, so the suffix test is what catches these.
+            "HTTPHeaders",
+            "rawHTTPHeaders",
+            "headersJson",
+        ] {
+            let args_text = format!(r#"{{"{envelope}":"{doc}"}}"#);
+            assert_eq!(
+                classify_risk(RiskSignal::Other {
+                    tool_name: "call_api",
+                    args_text: &args_text
+                }),
+                RiskLevel::NetworkOrCredential,
+                "{envelope:?} is a transport envelope and should be unwrapped"
+            );
+        }
+        for plain in [
+            "content", "contents", "text", "new_string", "source", "data", "note",
+            // Round-6 review P2: `body`/`payload` are what GitHub issues, PRs,
+            // comments, Slack, email and Jira call their DOMAIN content, so they
+            // cannot license decoding. Accepted recall cost, see
+            // `is_transport_key`.
+            "body", "payload", "requestBody",
+        ] {
+            let args_text = format!(r#"{{"{plain}":"{doc}"}}"#);
+            assert_ne!(
+                classify_risk(RiskSignal::Other {
+                    tool_name: "call_api",
+                    args_text: &args_text
+                }),
+                RiskLevel::NetworkOrCredential,
+                "{plain:?} is not a transport envelope and must not be unwrapped"
+            );
+        }
+        // `Decodable` reaches an ARRAY of envelopes — a list of encoded
+        // documents in the slot is still the slot.
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: r#"{"headers":["{\"apiToken\":\"sk-1\"}"]}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+        // A transport key nested under a NEUTRAL one is still tested on its own,
+        // so the scoping is about the slot, not about depth.
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: r#"{"request":{"headers":"{\"apiToken\":\"sk-1\"}"}}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+        // But it does NOT flow through a nested OBJECT — round-5 review's second
+        // P2, verbatim. Once inside an object the payload was already serialized
+        // structurally and its keys are read normally, so a string deeper in is
+        // that object's domain data; decoding it because an ANCESTOR was named
+        // `body` is the same false positive one level in.
+        assert_ne!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: r#"{"headers":{"content":"{\"apiToken\":\"fixture\"}"}}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+        // Nor does it leak sideways: a sibling of a transport field is not one.
+        assert_ne!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: r#"{"headers":"{\"ok\":1}","content":"{\"apiToken\":\"sk-1\"}"}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+    }
+
+    #[test]
+    fn encoded_json_unwrap_stays_linear() {
+        // Round-4 P1 made linearity non-negotiable on this path: a quadratic
+        // scan cost ~375ms on a 40 KB payload, on the permission-ask path. A
+        // second parse per string value is only safe because each string is
+        // parsed AT MOST once and never re-entered, and the strings are
+        // disjoint slices of the blob — so the total parse work stays O(blob).
+        //
+        // Every shape is PAIRED: a benign twin expecting `Unknown` and a twin
+        // with a credential key placed LAST expecting the top tier. The benign
+        // half alone cannot detect a decoder that silently stopped running —
+        // verified by mutation, it passes with decoding disabled, since
+        // `Unknown` on a payload with no credential key holds either way. So the
+        // benign half guards "a big blob does not become a false positive" and
+        // the credential half guards "this workload is actually still measured".
+        //
+        // Keys are DISTINCT (`k0`, `k1`, …) on purpose. `{"a":1,"a":1,…}` looks
+        // like a big document but collapses to a single entry once parsed —
+        // serde_json's `Map` de-duplicates — so it would exercise the parse
+        // while leaving the WALK O(1), quietly testing half of what it claims.
+        let pairs = (0..25_000)
+            .map(|i| format!(r#""k{i}":1"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        // One ~275 KB embedded document that parses and walks fully.
+        let valid_inner = format!("{{{pairs}}}");
+        // The same size, unterminated: serde_json parses the whole thing before
+        // failing at EOF, the worst case for the parse-then-discard branch.
+        let invalid_inner = format!("{{{pairs}");
+        // The same size again, with the credential key LAST so neither the
+        // parse nor `any()`'s short-circuit can skip the bulk of the work.
+        let cred_inner = format!(r#"{{{pairs},"apiToken":"sk-1"}}"#);
+        // ~20 000 SEPARATE string values, i.e. 20 000 distinct re-parses rather
+        // than one big one — the other way this could go super-linear.
+        //
+        // Under `body`, not at the root, and round-5 review's first P2 is why: a
+        // ROOT array is walked as `Opaque`, so after transport scoping none of
+        // these strings reached the parser and this shape silently stopped
+        // measuring the workload its own comment describes. `Decodable`
+        // propagates through arrays, so one transport key at the top puts every
+        // element on the decoding path.
+        let elements = std::iter::repeat(r#""{\"k\":1}""#)
+            .take(20_000)
+            .collect::<Vec<_>>()
+            .join(",");
+        let many = format!(r#"{{"headers":[{elements}]}}"#);
+        // The same 20 000 with a credential key in the LAST element. Without
+        // this, moving the array off the decoding path would go UNDETECTED all
+        // over again — the benign shape is fast and `Unknown` whether or not a
+        // single string is ever decoded, which is exactly how the root-array
+        // version passed while measuring nothing. This one fails if the
+        // elements stop being reached, and still has to scan all of them.
+        let many_cred = format!(r#"{{"headers":[{elements},"{{\"apiToken\":\"sk-1\"}}"]}}"#);
+        let embed = |inner: &str| format!(r#"{{"headers":"{}"}}"#, inner.replace('"', "\\\""));
+        for (payload, expected) in [
+            (embed(&valid_inner), RiskLevel::Unknown),
+            (embed(&invalid_inner), RiskLevel::Unknown),
+            (many, RiskLevel::Unknown),
+            (embed(&cred_inner), RiskLevel::NetworkOrCredential),
+            (many_cred, RiskLevel::NetworkOrCredential),
+        ] {
+            let started = std::time::Instant::now();
+            let risk = classify_risk(RiskSignal::Other {
+                tool_name: "call_api",
+                args_text: &payload,
+            });
+            let elapsed = started.elapsed();
+            assert_eq!(risk, expected, "{} byte payload misclassified", payload.len());
+            // Same bound and rationale as `escaped_quote_payloads_stay_linear`:
+            // linear is milliseconds at this size, so 5s fails a regression
+            // without being sensitive to CI load.
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "{} byte payload took {elapsed:?} — the unwrap is not linear",
+                payload.len()
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_encoded_json_does_not_blow_the_stack() {
+        // Same argument as `deeply_nested_payloads_do_not_blow_the_stack`, now
+        // for the inner parse: `serde_json`'s own nesting limit bounds the walk
+        // of the RE-PARSED value too, and the one-layer rule means the two
+        // depths add rather than compound. Nothing here may crash; the shallow
+        // case must still find its key, and the over-limit cases simply fail to
+        // parse and yield no keys.
+        //
+        // Note the difference from that sibling: there, an over-limit payload
+        // fails the OUTER parse and degrades to the textual scan, which finds
+        // the key anyway — so every depth stays `NetworkOrCredential`. Here the
+        // outer `{"headers": "…"}` is two levels deep and always parses, so tier 2
+        // never runs and an unparseable inner document simply yields nothing.
+        //
+        // The depths deliberately straddle serde_json's ~128 limit WIDE rather
+        // than sitting on it: asserting a flip at exactly 128 would make this
+        // test a tripwire for that library's internal constant, which is not
+        // what it is here to guard.
+        for (depth, expected) in [
+            (100usize, RiskLevel::NetworkOrCredential),
+            (1_000, RiskLevel::Unknown),
+            (20_000, RiskLevel::Unknown),
+        ] {
+            let inner = format!(
+                "{}{}{}",
+                r#"{"a":"#.repeat(depth),
+                r#"{"apiToken":"sk-1"}"#,
+                "}".repeat(depth)
+            );
+            let payload = format!(r#"{{"headers":"{}"}}"#, inner.replace('"', "\\\""));
+            assert_eq!(
+                classify_risk(RiskSignal::Other {
+                    tool_name: "call_api",
+                    args_text: &payload
+                }),
+                expected,
+                "embedded depth {depth} misclassified"
+            );
+        }
+    }
+
+    #[test]
+    fn json_keys_finds_a_single_quoted_key_after_a_contraction() {
+        // Round-4 review: the apostrophe in "it's" pairs with the OPENING
+        // quote of `'network'`. Consuming that mispairing as a finished run
+        // swallowed the real key's opening quote and lost the key entirely —
+        // a recall regression against the round-3 exact-key search, and one
+        // the SAME-quote-kind case above (`it's` + a DOUBLE-quoted key) could
+        // not catch. Backing off one character on a non-key run finds it.
+        assert_eq!(json_keys(r#"it's here: {'network': true}"#), vec!["network"]);
+        assert!(has_cred_key(r#"it's here: {'network': true}"#, None));
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "get_status",
+                args_text: r#"it's here: {'network': true}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+        // The well-formed cases must not regress from the same change.
+        assert_eq!(
+            json_keys(r#"{"a": "token", "apiToken": "sk-1"}"#),
+            vec!["a", "apiToken"]
+        );
+    }
+
+    #[test]
+    fn token_flag_needs_an_argument_boundary() {
+        // Round-4 review: as a raw substring marker, `--token` also fired on
+        // `--tokens`/`--tokenizer` — ordinary LLM/NLP options — recreating
+        // the very false positive this change removes and contradicting
+        // CRED_KEY_WORDS' deliberate refusal of plural `tokens`/`maxTokens`.
+        for args_text in [
+            r#"{"args":["--tokens","500"]}"#,
+            r#"{"cmd":"llm --tokenizer bpe"}"#,
+            r#"{"args":["--token-file","/tmp/t"]}"#,
+            r#"{"args":["--token_file","/tmp/t"]}"#,
+            // A complete flag is bounded on BOTH sides, by the SAME
+            // continuation set — these are branch names whose tail happens
+            // to read as the flag.
+            r#"{"cmd":"git checkout feature--token"}"#,
+            r#"{"cmd":"git checkout feature_--token"}"#,
+            r#"{"cmd":"git checkout feature---token"}"#,
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} must not be flagged network/credential"
+            );
+        }
+        assert_ne!(
+            classify_risk(RiskSignal::Command("python train.py --tokens 500")),
+            RiskLevel::NetworkOrCredential
+        );
+        // Every real argument boundary still counts.
+        for args_text in [
+            r#"{"args":["--token","sk-1"]}"#,
+            r#"{"cmd":"deploy --token=sk-1"}"#,
+            r#"{"cmd":"deploy --token sk-1"}"#,
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} should be network/credential"
+            );
+        }
+        assert!(has_anchored_token("deploy --token"));
+    }
+
+    #[test]
+    fn cred_json_key_needs_the_original_case_to_see_camelcase() {
+        // `words` splits on the capital T; pre-lowercasing the haystack (as
+        // every `classify_*` used to do before handing it over) collapses
+        // "accessToken" into one opaque word and the key check goes blind.
+        // This is the seam that makes `matches_cred_net` own the lowercasing.
+        assert!(has_cred_key(r#"{"accessToken": "sk-1"}"#, None));
+        assert!(!has_cred_key(
+            &r#"{"accessToken": "sk-1"}"#.to_ascii_lowercase(),
+            None
+        ));
+        // Separator-delimited shapes survive lowercasing either way.
+        assert!(has_cred_key(r#"{"GITHUB_TOKEN": "sk-1"}"#, None));
+        assert!(has_cred_key(r#"{"auth_token": "sk-1"}"#, None));
+    }
+
+    // ---- round-4 independent review (issue #101, follow-up to PR #134): the
+    // camelCase "token" word check scanned the WHOLE stringified args blob,
+    // not just key positions, so any MCP tool naming its path argument
+    // anything other than `file_path`/`filePath` (e.g.
+    // `@modelcontextprotocol/server-filesystem`, which uses `path`) flagged
+    // ordinary source-file writes as the MOST severe tier. ----
+
+    #[test]
+    fn other_ordinary_source_paths_with_a_token_segment_are_not_credentials() {
+        // The exact reproduction from the review, plus the sibling path
+        // shapes a coding agent hits every day. All are plain file writes.
+        for args_text in [
+            r#"{"path":"src/token_bucket.rs","content":"pub struct Bucket;"}"#,
+            r#"{"path":"src/token.rs","content":"x"}"#,
+            r#"{"path":"src/auth/token_refresh.rs","content":"x"}"#,
+            r#"{"path":"src/auth/refresh-token.rs","content":"x"}"#,
+            r#"{"uri":"file:///repo/src/nlp/tokenizer.py"}"#,
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Other { tool_name: "write_file", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} must not be flagged network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn other_credential_shaped_keys_still_reach_the_top_tier() {
+        // The narrowing must not cost recall on the shapes a credential
+        // actually takes: camelCase keys, snake_case keys, screaming-snake
+        // env keys, a nested key, and a `--token` CLI flag inside an args
+        // array (the one shape with no key to anchor on — kept alive by the
+        // `--token` marker in CRED_NET_MARKERS).
+        for args_text in [
+            r#"{"accessToken": "sk-1"}"#,
+            r#"{"apiToken": "sk-1"}"#,
+            r#"{"auth_token": "sk-1"}"#,
+            r#"{"env": {"GITHUB_TOKEN": "sk-1"}}"#,
+            r#"{"networkMode": "host"}"#,
+            r#"{"command": "deploy", "args": ["--token", "sk-1"]}"#,
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} should be network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn other_token_in_a_value_no_longer_upgrades_but_write_verbs_still_do() {
+        // Round-3 deliberately fired on "token" anywhere in the blob, key or
+        // value, and pinned `{"comment": "rotate the api token soon"}` as an
+        // accepted over-flag. Round-4 reverses THAT specific call — a value
+        // mention is now a glance-level miss, not a red badge — because the
+        // same blob-wide scan was what turned every token-named source path
+        // red. This is the deliberate recall trade recorded in
+        // `classify_other`'s doc comment.
+        assert_ne!(
             classify_risk(RiskSignal::Other {
                 tool_name: "get_status",
                 args_text: r#"{"comment": "rotate the api token soon"}"#
             }),
             RiskLevel::NetworkOrCredential
+        );
+        // The UPGRADE-ONLY architecture is untouched: args are still scanned
+        // for write verbs, and a reassuring tool name still cannot pull a
+        // destructive args payload back down (issue #101 P0-b).
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "get_status",
+                args_text: r#"{"path":"src/token_bucket.rs","op":"delete_all"}"#
+            }),
+            RiskLevel::Write
+        );
+    }
+
+    #[test]
+    fn snake_case_token_source_files_are_not_credentials() {
+        // The `_token` marker was a bare substring until round-4, so every
+        // ordinary snake_case source file with a token segment read as the
+        // MOST severe tier — and unlike the args-blob scan this fires through
+        // `classify_file` too, so a plain `Read` of one was red as well.
+        // Same cried-wolf harm, a third door into it.
+        let paths = [
+            "src/generate_token.py",
+            "src/oauth_token_store.rs",
+            "src/auth/refresh_token_test.go",
+        ];
+        for path in paths {
+            assert_ne!(
+                classify_risk(RiskSignal::File { tool_name: "Read", path }),
+                RiskLevel::NetworkOrCredential,
+                "Read {path:?} must not be flagged network/credential"
+            );
+            assert_ne!(
+                classify_risk(RiskSignal::File { tool_name: "Write", path }),
+                RiskLevel::NetworkOrCredential,
+                "Write {path:?} must not be flagged network/credential"
+            );
+            let args_text = format!(r#"{{"path":"{path}","content":"x"}}"#);
+            assert_ne!(
+                classify_risk(RiskSignal::Other {
+                    tool_name: "write_file",
+                    args_text: &args_text
+                }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} must not be flagged network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn token_suffix_still_fires_at_a_real_boundary() {
+        // The narrowing must not cost the shapes `_token` exists for. Asserted
+        // on the predicate itself, because at the `classify_risk` level most
+        // of these ALSO trip a marker of their own (`curl `, `token=`) and
+        // would pass even with `_token` deleted outright — a test that cannot
+        // fail is not a guard.
+        for text in [
+            "echo $github_token",            // shell variable, end of input
+            "cat ~/.config/auth_token",      // credential file, no extension
+            "export auth_token=abc",         // assignment
+            r#"{"auth_token": "sk-1"}"#,     // json key, quote
+            r#"curl -h "x-auth_token: abc""#, // header, colon
+            "run --token sk-1",              // the sibling anchored shape
+        ] {
+            assert!(has_anchored_token(text), "{text:?} lost its anchor");
+        }
+        for text in [
+            "src/generate_token.py",
+            "src/oauth_token_store.rs",
+            "src/auth/refresh_token_test.go",
+            "github_token_file=/run/secrets/x", // accepted cost, see the fn doc
+        ] {
+            assert!(!has_anchored_token(text), "{text:?} should not anchor");
+        }
+        // End to end on the two commands that DO isolate `_token` — `echo`
+        // and `cat` are read-only-shaped, so nothing else can be lifting them.
+        for cmd in ["echo $GITHUB_TOKEN", "cat ~/.config/auth_token"] {
+            assert_eq!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::NetworkOrCredential,
+                "{cmd:?} should be network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn file_paths_with_a_token_segment_are_not_credentials() {
+        // `classify_file` never had the blob scan, but it shares
+        // `matches_cred_net` — pin that the shared path stays clean too.
+        for path in [
+            "src/token_bucket.rs",
+            "src/token.rs",
+            "src/auth/refresh-token.rs",
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::File { tool_name: "Write", path }),
+                RiskLevel::NetworkOrCredential,
+                "{path:?} must not be flagged network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn attached_numeric_short_flag_value_still_passes() {
+        // Round-4 review of FLAG_POLICIES' doc comment: it claimed an
+        // attached short-flag value "will usually fail the whitelist" and
+        // cited `-n5`. Wrong for the numeric case — `-n5` unbundles to `-n`
+        // (on head's whitelist) + `-5` (count-shaped, universally safe).
+        for cmd in ["head -n5 file.txt", "head -n 5 file.txt", "tail -n20 log"] {
+            assert_eq!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::ReadOnly,
+                "{cmd:?} should be read-only"
+            );
+        }
+        // The non-numeric attached value the paragraph is actually about:
+        // `-M50%` unbundles to `-m`/`-5`/`-0`/`-%`, and `-%` is unrecognized.
+        assert_eq!(
+            classify_risk(RiskSignal::Command("git diff -M50%")),
+            RiskLevel::Write
+        );
+    }
+
+    #[test]
+    fn grep_basic_regexp_flag_is_read_only() {
+        // Round-4 review read grep's `-g` entry as dead (no lowercase `-g`
+        // exists in GNU or BSD grep — true). It is the LOWERCASED form of
+        // `-G`/`--basic-regexp`, which both greps do have: `classify_command`
+        // lowercases before `flags_in_token` runs. Deleting the entry would
+        // demote this read-only invocation to `Write`.
+        assert_eq!(
+            classify_risk(RiskSignal::Command("grep -G 'a.c' file.txt")),
+            RiskLevel::ReadOnly
         );
     }
 
@@ -2281,6 +3669,77 @@ mod tests {
         println!("\n--- transcript complete: every example above matches its post-fix expectation ---\n");
     }
 
+    /// Round-4 independent review transcript (issue #101, fast-follow to PR
+    /// #134): round-3 closed a recall gap on camelCase credential KEYS by
+    /// tokenizing the ENTIRE stringified args blob and firing on an exact
+    /// "token" word anywhere in it. Its own justification — "args_text is
+    /// never a bare file path" — held only for the two argument names
+    /// `bus::server::summarize` routes away from `classify_other`
+    /// (`file_path`/`filePath`). Every other file-touching MCP tool lands
+    /// here WITH its path in the blob, so this re-opened round-2's P2
+    /// cried-wolf false positive through a different door. Run with `cargo
+    /// test --lib ask::tests::round_4_review_examples_transcript --
+    /// --nocapture` to see the transcript.
+    #[test]
+    fn round_4_review_examples_transcript() {
+        println!("\n--- issue #101 round-4 review: before/after transcript ---");
+
+        println!("\n[P2] ordinary source paths in non-`file_path` MCP args (must NOT be NetworkOrCredential):");
+        for (tool_name, args_text) in [
+            // The review's verbatim reproduction. `server-filesystem` names
+            // this argument `path`, so it never reaches `classify_file`.
+            ("write_file", r#"{"path":"src/token_bucket.rs","content":"..."}"#),
+            ("write_file", r#"{"path":"src/token.rs","content":"x"}"#),
+            ("write_file", r#"{"path":"src/auth/token_refresh.rs","content":"x"}"#),
+            ("edit_file", r#"{"path":"src/auth/refresh-token.rs","content":"x"}"#),
+            // This one fired through the SEPARATE round-2 `_token` substring
+            // marker rather than the args-blob scan, so it survived the first
+            // pass of this fix and needed the marker's own boundary check —
+            // see `has_anchored_token`.
+            ("write_file", r#"{"path":"src/generate_token.py","content":"x"}"#),
+        ] {
+            let risk = classify_risk(RiskSignal::Other { tool_name, args_text });
+            println!("  {tool_name:?} args={args_text:?} -> {risk:?} (pre-fix: NetworkOrCredential)");
+            assert_ne!(
+                risk,
+                RiskLevel::NetworkOrCredential,
+                "{tool_name:?}/{args_text:?} still a false positive"
+            );
+        }
+
+        println!("\n[recall] real credential shapes must STILL be NetworkOrCredential (no overcorrection):");
+        for (tool_name, args_text) in [
+            ("get_status", r#"{"accessToken": "sk-1"}"#),
+            ("get_status", r#"{"apiToken": "sk-1"}"#),
+            ("get_status", r#"{"auth_token": "sk-1"}"#),
+            ("get_status", r#"{"env": {"GITHUB_TOKEN": "sk-1"}}"#),
+            ("run_cmd", r#"{"args": ["--token", "sk-1"]}"#),
+        ] {
+            let risk = classify_risk(RiskSignal::Other { tool_name, args_text });
+            println!("  {tool_name:?} args={args_text:?} -> {risk:?} (expected: NetworkOrCredential)");
+            assert_eq!(
+                risk,
+                RiskLevel::NetworkOrCredential,
+                "{tool_name:?}/{args_text:?} lost to the narrowing"
+            );
+        }
+
+        println!("\n[P3] FLAG_POLICIES doc corrections (behavior pinned, docs were wrong/misread):");
+        for (cmd, expected) in [
+            // Doc claimed an attached short-flag value "will usually fail";
+            // a NUMERIC one passes via `is_universally_safe_flag`.
+            ("head -n5 file.txt", RiskLevel::ReadOnly),
+            // grep's `-g` entry was read as dead; it is the lowercased `-G`.
+            ("grep -G 'a.c' file.txt", RiskLevel::ReadOnly),
+        ] {
+            let risk = classify_risk(RiskSignal::Command(cmd));
+            println!("  {cmd:?} -> {risk:?} (expected: {expected:?})");
+            assert_eq!(risk, expected, "{cmd:?} misclassified");
+        }
+
+        println!("\n--- transcript complete: every example above matches its post-fix expectation ---\n");
+    }
+
     #[tokio::test]
     async fn request_then_answer_delivers_decision() {
         let r = AskRegistry::new();
@@ -2314,17 +3773,17 @@ mod tests {
             "Run: npm test",
         );
         // no rule yet
-        assert!(r.auto_decision(1, "10", "Run: npm test").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "Run: npm test").is_none());
         assert!(r.answer(id, Answer::Always));
         // same action in the same task now auto-allows
         assert_eq!(
-            r.auto_decision(1, "10", "Run: npm test"),
+            r.auto_decision(1, "10", RiskLevel::Unknown, "Run: npm test"),
             Some(Decision::Allow)
         );
         // a different action still asks
-        assert!(r.auto_decision(1, "10", "Run: rm -rf /").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "Run: rm -rf /").is_none());
         // another task is unaffected
-        assert!(r.auto_decision(2, "10", "Run: npm test").is_none());
+        assert!(r.auto_decision(2, "10", RiskLevel::Unknown, "Run: npm test").is_none());
     }
 
     /// Issue #89's core in-memory acceptance case: two asks share the SAME lossy
@@ -2355,11 +3814,11 @@ mod tests {
         assert!(r.answer(id_a, Answer::Always));
         // the exact action just granted auto-allows...
         assert_eq!(
-            r.auto_decision(1, "10", "npm test\necho safe"),
+            r.auto_decision(1, "10", RiskLevel::Unknown, "npm test\necho safe"),
             Some(Decision::Allow)
         );
         // ...but a different action that merely shares the display summary does not.
-        assert!(r.auto_decision(1, "10", "npm test\nrm -rf /").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "npm test\nrm -rf /").is_none());
         // B was NOT swept up by A's Always answer — it's still open, unresolved.
         assert_eq!(r.open().iter().map(|a| a.id).collect::<Vec<_>>(), vec![id_b]);
     }
@@ -2376,7 +3835,7 @@ mod tests {
         assert!(r.open().is_empty());
         // and any future ask auto-allows
         assert_eq!(
-            r.auto_decision(1, "10", "Run: anything"),
+            r.auto_decision(1, "10", RiskLevel::Unknown, "Run: anything"),
             Some(Decision::Allow)
         );
     }
@@ -2512,15 +3971,15 @@ mod tests {
             }],
         });
         // full → anything in (1,"10") auto-allows
-        assert_eq!(r.auto_decision(1, "10", "Run: anything"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "Run: anything"), Some(Decision::Allow));
         // always → only the exact action_key in (2,"20")
         assert_eq!(
-            r.auto_decision(2, "20", "Run: npm test"),
+            r.auto_decision(2, "20", RiskLevel::Unknown, "Run: npm test"),
             Some(Decision::Allow)
         );
-        assert!(r.auto_decision(2, "20", "Run: other").is_none());
+        assert!(r.auto_decision(2, "20", RiskLevel::Unknown, "Run: other").is_none());
         // an unrelated key is unaffected
-        assert!(r.auto_decision(3, "30", "x").is_none());
+        assert!(r.auto_decision(3, "30", RiskLevel::Unknown, "x").is_none());
     }
 
     #[test]
@@ -2562,7 +4021,7 @@ mod tests {
         assert!(r.answer(id, Answer::Always));
         // auto-allows this exact action in memory...
         assert_eq!(
-            r.auto_decision(1, "10", "npm test"),
+            r.auto_decision(1, "10", RiskLevel::Unknown, "npm test"),
             Some(Decision::Allow)
         );
         // ...and IS durably persisted — the send is synchronous inside answer(),
@@ -2662,9 +4121,9 @@ mod tests {
         r.set_persist_notifier(tx);
         r.revoke_thread(1);
         // thread 1 grants gone, thread 2 intact
-        assert!(r.auto_decision(1, "10", "anything").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "anything").is_none());
         assert_eq!(
-            r.auto_decision(2, "20", "anything"),
+            r.auto_decision(2, "20", RiskLevel::Unknown, "anything"),
             Some(Decision::Allow)
         );
         let snap = rx
@@ -2709,8 +4168,8 @@ mod tests {
         // and the round-tripped value seeds real behavior
         let r = AskRegistry::new();
         r.seed_grants(back);
-        assert_eq!(r.auto_decision(1, "10", "z"), Some(Decision::Allow));
-        assert_eq!(r.auto_decision(2, "", "Run: x"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "z"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(2, "", RiskLevel::Unknown, "Run: x"), Some(Decision::Allow));
     }
 
     #[test]
@@ -2752,8 +4211,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         r.set_persist_notifier(tx);
         r.revoke_grant(1, "10", None);
-        assert!(r.auto_decision(1, "10", "a").is_none());
-        assert!(r.auto_decision(1, "10", "anything").is_none()); // full gone too
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "a").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "anything").is_none()); // full gone too
         let snap = rx
             .try_recv()
             .expect("one-click revoke persists the cleared set")
@@ -2785,8 +4244,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         r.set_persist_notifier(tx);
         r.revoke_grant(1, "10", Some("a"));
-        assert!(r.auto_decision(1, "10", "a").is_none()); // dropped
-        assert_eq!(r.auto_decision(1, "10", "b"), Some(Decision::Allow)); // kept
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "a").is_none()); // dropped
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "b"), Some(Decision::Allow)); // kept
         let snap = rx
             .try_recv()
             .expect("a granular always-revoke must persist the reduced set")
@@ -2817,7 +4276,7 @@ mod tests {
         });
         r.revoke_grant(1, "10", Some("a"));
         // full access is a separate rule — dropping one always must not touch it
-        assert_eq!(r.auto_decision(1, "10", "anything"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "anything"), Some(Decision::Allow));
     }
 
     #[test]
@@ -2856,17 +4315,17 @@ mod tests {
         // dir=None → the whole issue (every dir under the thread) is cleared
         let r = seeded();
         r.revoke(1, None, None);
-        assert!(r.auto_decision(1, "10", "x").is_none());
-        assert!(r.auto_decision(1, "11", "b").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "x").is_none());
+        assert!(r.auto_decision(1, "11", RiskLevel::Unknown, "b").is_none());
         // dir=Some, action_key=None → only that one task; the sibling task survives
         let r = seeded();
         r.revoke(1, Some("10"), None);
-        assert!(r.auto_decision(1, "10", "x").is_none());
-        assert_eq!(r.auto_decision(1, "11", "b"), Some(Decision::Allow));
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "x").is_none());
+        assert_eq!(r.auto_decision(1, "11", RiskLevel::Unknown, "b"), Some(Decision::Allow));
         // dir=Some, action_key=Some → only that always-rule; full access stays
         let r = seeded();
         r.revoke(1, Some("10"), Some("a"));
-        assert_eq!(r.auto_decision(1, "10", "anything"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "anything"), Some(Decision::Allow));
     }
 
     #[test]
@@ -2878,7 +4337,7 @@ mod tests {
         // the ask is still open, so answering it Full is a SUCCESS (found + answered)
         // — the command must not report "expired" while the grant is being created.
         assert!(r.answer(id, Answer::Full));
-        assert_eq!(r.auto_decision(1, "10", "anything"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "anything"), Some(Decision::Allow));
         // a genuinely unknown / already-answered ask still returns false
         assert!(!r.answer(id, Answer::Full));
     }
@@ -2924,8 +4383,8 @@ mod tests {
             }]
         );
         // ...and it IS cleared from memory (auto_decision no longer allows it).
-        assert!(r.auto_decision(1, "10", "a").is_none());
-        assert_eq!(r.auto_decision(1, "11", "b"), Some(Decision::Allow));
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "a").is_none());
+        assert_eq!(r.auto_decision(1, "11", RiskLevel::Unknown, "b"), Some(Decision::Allow));
         // revoking nothing returns an empty set
         assert!(r.revoke(2, Some("99"), None).is_empty());
     }
@@ -2953,7 +4412,7 @@ mod tests {
                 dir: "10".into()
             }]
         );
-        assert!(r.auto_decision(1, "10", "x").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "x").is_none());
         assert!(
             rx.try_recv().is_err(),
             "revoke_no_emit must not emit a persist message"
@@ -2988,7 +4447,7 @@ mod tests {
         r.purge_thread(1);
 
         // thread 1's grant is revoked...
-        assert!(r.auto_decision(1, "10", "x").is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "x").is_none());
         // ...and its open asks cancelled, while another thread's ask survives.
         let open: Vec<u64> = r.open().iter().map(|a| a.id).collect();
         assert_eq!(open, vec![keep]);
@@ -3033,10 +4492,339 @@ mod tests {
         r.purge_dir(1, "10");
 
         // (1,"10") grant + ask gone; the sibling dir (1,"11") is untouched.
-        assert!(r.auto_decision(1, "10", "x").is_none());
-        assert_eq!(r.auto_decision(1, "11", "x"), Some(Decision::Allow));
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "x").is_none());
+        assert_eq!(r.auto_decision(1, "11", RiskLevel::Unknown, "x"), Some(Decision::Allow));
         let open: Vec<u64> = r.open().iter().map(|a| a.id).collect();
         assert_eq!(open, vec![keep_id]);
         assert!(!open.contains(&drop_id));
+    }
+
+    // ---- issue #103: read-only batch/issue grants -----------------------------
+    //
+    // The safety boundary this whole feature exists to respect: ONLY
+    // RiskLevel::ReadOnly may ever auto-allow through either grant.
+    // Unknown is the classifier's honest "can't tell" fallback (never a stand-in
+    // for "probably safe" — see RiskLevel's own doc) and must NEVER be swept by
+    // this feature; Write/NetworkOrCredential obviously must not either. Every
+    // test below that grants read-only trust also asserts the OTHER tiers are
+    // still gated, not just that ReadOnly passes.
+
+    #[test]
+    fn read_only_session_grant_allows_read_only_but_gates_everything_else() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::ReadOnly, "pwd"),
+            Some(Decision::Allow)
+        );
+        // Write, NetworkOrCredential, and Unknown must ALL still surface —
+        // Unknown especially: it is the classifier's honest "can't tell"
+        // fallback, never a stand-in for "probably safe".
+        assert!(r.auto_decision(1, "10", RiskLevel::Write, "rm -rf x").is_none());
+        assert!(r
+            .auto_decision(1, "10", RiskLevel::NetworkOrCredential, "curl x")
+            .is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "mystery_tool").is_none());
+    }
+
+    #[test]
+    fn read_only_session_grant_does_not_leak_to_a_different_session() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        // a different dir under the SAME thread is unaffected...
+        assert!(r.auto_decision(1, "11", RiskLevel::ReadOnly, "pwd").is_none());
+        // ...and so is a different thread entirely.
+        assert!(r.auto_decision(2, "10", RiskLevel::ReadOnly, "pwd").is_none());
+    }
+
+    #[test]
+    fn read_only_issue_grant_allows_read_only_but_gates_everything_else() {
+        let r = AskRegistry::new();
+        r.grant_read_only_issue(1);
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::ReadOnly, "pwd"),
+            Some(Decision::Allow)
+        );
+        assert!(r.auto_decision(1, "10", RiskLevel::Write, "rm -rf x").is_none());
+        assert!(r
+            .auto_decision(1, "10", RiskLevel::NetworkOrCredential, "curl x")
+            .is_none());
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "mystery_tool").is_none());
+    }
+
+    /// The whole point of the ISSUE-wide grant vs. the session one: it covers a
+    /// dir that didn't exist yet at grant time — a worker spawned AFTER dispatch
+    /// was approved still inherits the trust (issue #103's motivating pain
+    /// point: "approve dispatch, worker starts, still asks `pwd`").
+    #[test]
+    fn read_only_issue_grant_covers_a_dir_created_after_the_grant() {
+        let r = AskRegistry::new();
+        r.grant_read_only_issue(1);
+        // "77" never existed when the grant was made — simulated by simply never
+        // having requested/seen it before this call.
+        assert_eq!(
+            r.auto_decision(1, "77", RiskLevel::ReadOnly, "ls"),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn read_only_issue_grant_does_not_leak_to_a_different_thread() {
+        let r = AskRegistry::new();
+        r.grant_read_only_issue(1);
+        assert!(r.auto_decision(2, "10", RiskLevel::ReadOnly, "pwd").is_none());
+    }
+
+    /// Session and issue grants are independent, non-substitutable scopes: one
+    /// being set doesn't imply the other.
+    #[test]
+    fn session_grant_alone_does_not_cover_a_sibling_dir_the_issue_grant_would() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        assert!(r.auto_decision(1, "11", RiskLevel::ReadOnly, "ls").is_none());
+    }
+
+    #[test]
+    fn grant_read_only_session_sweeps_open_read_only_backlog_but_leaves_others_open() {
+        let r = AskRegistry::new();
+        let (ro_id, mut ro_rx) =
+            r.request(1, "10", "codex", "ls", "ls", RiskLevel::ReadOnly, "ls");
+        let (write_id, _write_rx) = r.request(
+            1,
+            "10",
+            "codex",
+            "Run: rm -rf x",
+            "rm -rf x",
+            RiskLevel::Write,
+            "Run: rm -rf x",
+        );
+        let (unknown_id, _unknown_rx) = r.request(
+            1,
+            "10",
+            "codex",
+            "mystery_tool",
+            "{}",
+            RiskLevel::Unknown,
+            "mystery_tool",
+        );
+
+        let n = r.grant_read_only_session(1, "10");
+        assert_eq!(n, 1, "only the ReadOnly ask should be swept");
+
+        // the ReadOnly ask's waiter woke with Allow — the send is synchronous
+        // inside grant_read_only_session, so try_recv sees it immediately (same
+        // reasoning as the persist-notifier try_recv calls above).
+        assert_eq!(
+            ro_rx.try_recv().expect("read-only ask should resolve"),
+            Decision::Allow
+        );
+        // ...and it left the open list, while Write/Unknown are still sitting
+        // there waiting for a real human answer.
+        let open: std::collections::HashSet<u64> = r.open().iter().map(|a| a.id).collect();
+        assert!(!open.contains(&ro_id));
+        assert!(open.contains(&write_id));
+        assert!(open.contains(&unknown_id));
+    }
+
+    #[test]
+    fn grant_read_only_issue_sweeps_open_read_only_backlog_across_every_dir() {
+        let r = AskRegistry::new();
+        let (id_a, mut rx_a) = r.request(1, "10", "codex", "ls", "ls", RiskLevel::ReadOnly, "ls");
+        let (id_b, mut rx_b) =
+            r.request(1, "20", "codex", "cat x", "cat x", RiskLevel::ReadOnly, "cat x");
+        let (write_id, _w) = r.request(
+            1,
+            "10",
+            "codex",
+            "Run: rm -rf x",
+            "rm -rf x",
+            RiskLevel::Write,
+            "Run: rm -rf x",
+        );
+
+        let n = r.grant_read_only_issue(1);
+        assert_eq!(n, 2);
+        assert_eq!(rx_a.try_recv().expect("dir 10's ask should resolve"), Decision::Allow);
+        assert_eq!(rx_b.try_recv().expect("dir 20's ask should resolve"), Decision::Allow);
+
+        let open: std::collections::HashSet<u64> = r.open().iter().map(|a| a.id).collect();
+        assert!(!open.contains(&id_a) && !open.contains(&id_b));
+        assert!(open.contains(&write_id));
+    }
+
+    /// The events a read-only sweep emits must read as an ordinary Allow — an
+    /// IM-bridge/trail consumer watching `AskEvent::Resolved` can't tell (and
+    /// doesn't need to tell) a batch sweep from the human clicking Allow on that
+    /// one ask, mirroring how `set_dangerous`'s backlog release already works.
+    #[tokio::test]
+    async fn read_only_sweep_emits_resolved_with_answer_allow() {
+        let r = AskRegistry::new();
+        let (id, _rx) = r.request(1, "10", "codex", "ls", "ls", RiskLevel::ReadOnly, "ls");
+        let (tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        let snap: Vec<u64> = r.set_notifier(tx).iter().map(|a| a.id).collect();
+        assert_eq!(snap, vec![id]);
+        r.grant_read_only_session(1, "10");
+        match notify_rx.recv().await.unwrap() {
+            AskEvent::Resolved { ask, answer } => {
+                assert_eq!(ask.id, id);
+                assert_eq!(answer, Answer::Allow);
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revoke_read_only_session_stops_future_auto_allow() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        assert!(r.revoke_read_only_session(1, "10"));
+        assert!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls").is_none());
+        // revoking again (already gone) is a harmless false, not a panic.
+        assert!(!r.revoke_read_only_session(1, "10"));
+    }
+
+    #[test]
+    fn revoke_read_only_issue_stops_future_auto_allow() {
+        let r = AskRegistry::new();
+        r.grant_read_only_issue(1);
+        assert!(r.revoke_read_only_issue(1));
+        assert!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls").is_none());
+        assert!(!r.revoke_read_only_issue(1));
+    }
+
+    /// Regression for the exact bug an independent review caught: a session
+    /// separately granted (the per-ask "release this session's read-only"
+    /// action) must NOT survive a later issue-wide revoke — the board chip's
+    /// revoke dialog promises "every worker under this issue will stop", and
+    /// that promise must actually hold, not just for the issue-wide flag but
+    /// for any session grant coexisting under the same thread. Mutation
+    /// check: delete the `read_only_session.retain` line from
+    /// `revoke_read_only_issue` and this test goes red (the session grant
+    /// would still auto_decision Allow after the "revoke" call returns).
+    #[test]
+    fn revoke_read_only_issue_also_clears_a_coexisting_session_grant_on_the_same_thread() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        r.grant_read_only_issue(1);
+        assert!(r.revoke_read_only_issue(1));
+        // neither the issue-wide sweep NOR the earlier, separately-granted
+        // session grant may still auto-allow — the human's mental model on
+        // revoke is "this issue no longer auto-allows", full stop.
+        assert!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls").is_none());
+        assert_eq!(
+            r.read_only_grants(),
+            ReadOnlyGrants::default(),
+            "both the issue flag and the coexisting session grant must be gone"
+        );
+    }
+
+    /// A session grant on a DIFFERENT thread must be untouched by revoking
+    /// issue #1's propagation — the cascade is scoped to `thread`, not global.
+    #[test]
+    fn revoke_read_only_issue_does_not_touch_a_session_grant_on_another_thread() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(2, "20");
+        r.grant_read_only_issue(1);
+        r.revoke_read_only_issue(1);
+        assert_eq!(
+            r.auto_decision(2, "20", RiskLevel::ReadOnly, "ls"),
+            Some(Decision::Allow),
+            "thread 2's own session grant must survive revoking thread 1's issue grant"
+        );
+    }
+
+    /// Revoking a read-only grant is forward-only: it must not retroactively
+    /// re-surface an ask the grant already resolved to Allow while it was
+    /// active (mirrors how Full/Always revoke behaves — see `revoke`'s doc).
+    #[test]
+    fn revoking_read_only_grant_does_not_resurrect_an_already_swept_ask() {
+        let r = AskRegistry::new();
+        let (id, mut rx) = r.request(1, "10", "codex", "ls", "ls", RiskLevel::ReadOnly, "ls");
+        r.grant_read_only_session(1, "10");
+        assert_eq!(rx.try_recv().expect("ask should resolve"), Decision::Allow);
+        r.revoke_read_only_session(1, "10");
+        // the swept ask is gone for good, not somehow back in the open list.
+        assert!(!r.open().iter().any(|a| a.id == id));
+    }
+
+    /// Core invariant this feature must never violate (explicit regression
+    /// test, not just an absence of code touching GrantSnapshot): a read-only
+    /// grant — session OR issue — must be completely invisible to the
+    /// persistence layer. `grant_snapshot`/`seed_grants` are Full/Always' own
+    /// mechanism (#87/#89); read-only grants never go through them, so a
+    /// restart (seeding a FRESH registry from an OLD one's snapshot) always
+    /// starts every session un-trusted again.
+    #[test]
+    fn read_only_grants_never_appear_in_the_persisted_snapshot() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        r.grant_read_only_issue(2);
+        let snap = r.snapshot_grants();
+        assert!(snap.is_empty(), "read-only grants must never reach GrantSnapshot");
+
+        // Simulated restart: seed a fresh registry from the (empty) snapshot —
+        // the read-only trust does NOT come back.
+        let revived = AskRegistry::new();
+        revived.seed_grants(snap);
+        assert!(revived
+            .auto_decision(1, "10", RiskLevel::ReadOnly, "ls")
+            .is_none());
+        assert!(revived
+            .auto_decision(2, "20", RiskLevel::ReadOnly, "ls")
+            .is_none());
+    }
+
+    #[test]
+    fn read_only_grants_query_reflects_current_scopes() {
+        let r = AskRegistry::new();
+        assert_eq!(r.read_only_grants(), ReadOnlyGrants::default());
+        r.grant_read_only_session(1, "10");
+        r.grant_read_only_issue(2);
+        let snap = r.read_only_grants();
+        assert_eq!(snap.issue, vec![2]);
+        assert_eq!(
+            snap.session,
+            vec![ReadOnlySessionGrant {
+                thread: 1,
+                dir: "10".into(),
+            }]
+        );
+        r.revoke_read_only_session(1, "10");
+        r.revoke_read_only_issue(2);
+        assert_eq!(r.read_only_grants(), ReadOnlyGrants::default());
+    }
+
+    /// Full access and a read-only session/issue grant are independent
+    /// mechanisms — granting one must not be mistaken for (or leak into) the
+    /// other's coverage.
+    #[test]
+    fn read_only_session_grant_does_not_imply_full_access() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        // Full would cover a Write ask too; a read-only grant must not.
+        assert!(r.auto_decision(1, "10", RiskLevel::Write, "rm -rf x").is_none());
+    }
+
+    #[test]
+    fn purge_thread_clears_both_read_only_session_and_issue_grants() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        r.grant_read_only_issue(1);
+        r.purge_thread(1);
+        assert!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls").is_none());
+        assert_eq!(r.read_only_grants(), ReadOnlyGrants::default());
+    }
+
+    #[test]
+    fn purge_dir_clears_only_that_dirs_read_only_session_grant() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+        r.grant_read_only_session(1, "11");
+        r.purge_dir(1, "10");
+        assert!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls").is_none());
+        assert_eq!(
+            r.auto_decision(1, "11", RiskLevel::ReadOnly, "ls"),
+            Some(Decision::Allow)
+        );
     }
 }

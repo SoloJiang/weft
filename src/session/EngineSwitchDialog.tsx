@@ -7,7 +7,8 @@ import { Button } from "../components/ui/Button";
 import { Field, Input } from "../components/ui/Input";
 import { Segmented } from "../components/ui/Segmented";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
-import { modelSupported, switchKindOf } from "./engineSwitch";
+import { spawnableToolsOf } from "../lib/toolStatus.ts";
+import { modelSupported, switchErrorCodeOf, switchKindOf, SWITCH_ERROR_I18N } from "./engineSwitch";
 
 /** Which layer this dialog changes (issue #96 pitfall #4: "switching the lead
  *  ≠ switching a worker ≠ changing the global default" — the dogfooding
@@ -63,19 +64,24 @@ export function EngineSwitchDialog({
     wasOpen.current = open;
   }, [open, currentTool, currentModel]);
 
-  const installed = installedTools.filter((tl) => tl.installed);
+  const spawnable = spawnableToolsOf(installedTools);
+  const selectedToolIsSpawnable = spawnable.some((candidate) => candidate.tool === tool);
   const modelOk = modelSupported(tool);
   const isReload = switchKindOf(currentTool, tool) === "reload";
 
   async function confirm() {
-    if (busy) return;
+    if (busy || !selectedToolIsSpawnable) return;
     setBusy(true);
     setErr(null);
     try {
       await onConfirm(tool, modelOk ? model.trim() || null : null);
       onOpenChange(false);
     } catch (e) {
-      setErr(String(e));
+      // The one backend rejection with a stable code gets translated copy;
+      // everything else still surfaces its raw message, so an unrelated
+      // failure is never explained away with the wrong sentence.
+      const code = switchErrorCodeOf(e);
+      setErr(code ? t(SWITCH_ERROR_I18N[code]) : String(e));
       if (import.meta.env.DEV) console.error("engine switch failed:", String(e));
       setBusy(false);
     }
@@ -93,13 +99,13 @@ export function EngineSwitchDialog({
           </div>
 
           <Field label={t("session.switchToolLabel")}>
-            {installed.length === 0 ? (
+            {spawnable.length === 0 ? (
               <span className="text-[12px] text-waiting">{t("settings.noTools")}</span>
             ) : (
               <Segmented
                 value={tool}
                 onChange={setTool}
-                options={installed.map((tl) => ({
+                options={spawnable.map((tl) => ({
                   value: tl.tool,
                   label: toolFullName(tl.tool),
                   icon: <ToolIcon tool={tl.tool} size={12} />,
@@ -132,7 +138,12 @@ export function EngineSwitchDialog({
             <Button type="button" variant="ghost" disabled={busy} onClick={() => onOpenChange(false)}>
               {t("common.cancel")}
             </Button>
-            <Button type="button" variant="primary" disabled={busy} onClick={() => void confirm()}>
+            <Button
+              type="button"
+              variant="primary"
+              disabled={busy || !selectedToolIsSpawnable}
+              onClick={() => void confirm()}
+            >
               {t(isReload ? "session.switchReloadConfirm" : "session.switchConfirm")}
             </Button>
           </div>

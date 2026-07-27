@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, Check, CheckCheck, Copy, Sparkles, Undo2, type LucideIcon } from "lucide-react";
+import { ArrowRight, Check, CheckCheck, CircleAlert, Copy, Sparkles, Undo2, type LucideIcon } from "lucide-react";
 import type { LeadMessage, PermissionAsk, QueuedItem, ResolvedProposal } from "../lib/types";
 import { receiptStateOf, type ReceiptState } from "../state/leadSnapshot";
 import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
@@ -34,6 +34,7 @@ import type { useRepoActions } from "./useRepoActions";
 import type { ChatHistoryStatus } from "../state/chatHistory";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { switchKindOf } from "./engineSwitch";
+import { routeReasonKey } from "../lib/engineRoutingDisplay";
 
 type RunAction = ReturnType<typeof useRepoActions>["run"];
 
@@ -636,6 +637,30 @@ function TimelineRow({
     return <EngineSwitchMarker content={c} />;
   }
 
+  // A FAILED auto fail-over attempt (issue #97 review P2): without this, a
+  // transient error during the switch would leave the user's engine sitting
+  // exhausted with no visible sign Weft even tried — same "system-owned,
+  // always part of the record" treatment as a successful switch marker.
+  if (m.kind === "quota_failover_failed") {
+    return <QuotaFailoverFailedMarker content={c} />;
+  }
+
+  if (m.kind === "engine_route") {
+    return <EngineRouteMarker content={c} />;
+  }
+
+  if (m.kind === "engine_route_blocked") {
+    return <EngineRouteBlockedMarker content={c} />;
+  }
+
+  // issue #110 T3: a completed (success or failure) auto-merge attempt —
+  // same durable, system-owned marker treatment as the others above.
+  // Structured content only (never pre-composed prose — review round 1
+  // Codex P1), so this renders correctly in either UI language.
+  if (m.kind === "pr_auto_merge") {
+    return <AutoMergeMarker content={c} />;
+  }
+
   if (m.kind === "tool") {
     const content = parse(m.content);
     const name = typeof content.name === "string" ? content.name : "tool";
@@ -990,10 +1015,15 @@ function EngineSwitchMarker({ content }: { content: Record<string, unknown> }) {
     ? t("session.engineReloadedMarker", { tool: toolFullName(newTool) })
     : t("session.engineSwitchedMarker", { from: toolFullName(oldTool), to: toolFullName(newTool) });
   const modelChanged = oldModel !== newModel;
+  // issue #97: Weft's own auto fail-over (never a switch the user clicked) is
+  // tagged with this reason so it reads unmistakably as automatic — a claimed
+  // engine switch must always be visibly honest about WHO triggered it.
+  const isQuotaFailover = content.reason === "quota_exceeded";
+  const quotaBasis = typeof content.quota_basis === "string" ? content.quota_basis : "";
   return (
-    <div className="flex items-center gap-3 px-2 py-1.5">
-      <span className="h-px flex-1 bg-border" />
-      <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-ink-faint">
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px] text-ink-faint">
         {!sameTool && oldTool && (
           <>
             <ToolIcon tool={oldTool} size={12} />
@@ -1007,8 +1037,231 @@ function EngineSwitchMarker({ content }: { content: Record<string, unknown> }) {
             {newModel ?? t("session.engineModelCleared")}
           </span>
         )}
+        {isQuotaFailover && (
+          <span className="rounded-full border border-waiting/30 bg-waiting/15 px-1.5 py-0.5 text-[10px] font-medium text-waiting">
+            {t("session.engineSwitchedQuotaReason")}
+          </span>
+        )}
+        {isQuotaFailover && quotaBasis && (
+          <span className="rounded-full border border-waiting/30 bg-waiting/10 px-1.5 py-0.5 text-[10px] text-waiting">
+            {t("session.engineRouteQuotaBasis", { status: quotaStatusLabel(t, quotaBasis) })}
+          </span>
+        )}
       </span>
-      <span className="h-px flex-1 bg-border" />
+      <span className="h-px min-w-4 flex-1 bg-border" />
+    </div>
+  );
+}
+
+function quotaStatusLabel(t: (key: string) => string, status: string): string {
+  const keys: Record<string, string> = {
+    ok: "settings.resourcesEngineQuotaOk",
+    warning: "settings.resourcesEngineQuotaWarning",
+    exceeded: "settings.resourcesEngineQuotaExceeded",
+    structured_exceeded: "settings.resourcesEngineQuotaExceeded",
+  };
+  const key = keys[status];
+  return key ? t(key) : status;
+}
+
+/** Durable record of the server-owned initial engine route decision. This is
+ * intentionally compact: users see the selected engine and one stable reason,
+ * while the decision remains auditable after the session is reopened. */
+function EngineRouteMarker({ content }: { content: Record<string, unknown> }) {
+  const { t } = useTranslation();
+  const tool = typeof content.tool === "string" ? content.tool : "";
+  const source = typeof content.source === "string" ? content.source : "automatic";
+  const reason = typeof content.reason === "string" ? content.reason : "automatic_candidate_unavailable";
+  const quotaStatus = typeof content.quota_status === "string" ? content.quota_status : "";
+  const labelKeys: Record<string, string> = {
+    automatic: "session.engineRouteMarker",
+    manual: "session.engineRouteManualMarker",
+    legacy: "session.engineRouteMarker",
+  };
+  const labelKey = labelKeys[source] ?? "session.engineRouteMarker";
+  const label = source === "legacy" ? t("scope.engineLegacy", { tool: toolFullName(tool) }) : t(labelKey, { tool: toolFullName(tool) });
+  return (
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px] text-ink-faint">
+        <ToolIcon tool={tool} size={12} />
+        <span>{label}</span>
+        <span className="truncate" title={t(routeReasonKey(reason))}>
+          · {t(routeReasonKey(reason))}
+        </span>
+        {quotaStatus && (
+          <span className="rounded-full border border-border px-1.5 py-0.5 text-[10px]">
+            {t("session.engineRouteQuotaBasis", { status: quotaStatusLabel(t, quotaStatus) })}
+          </span>
+        )}
+      </span>
+      <span className="h-px min-w-4 flex-1 bg-border" />
+    </div>
+  );
+}
+
+/** Durable, actionable record for a blocked route. It is separate from the
+ * selected-route marker so an exhausted pool cannot look like a successful
+ * launch after a reload. */
+function EngineRouteBlockedMarker({ content }: { content: Record<string, unknown> }) {
+  const { t } = useTranslation();
+  const tool = typeof content.tool === "string" ? content.tool : "";
+  const fallback = typeof content.fallback === "string" ? content.fallback : "";
+  const reason = typeof content.reason === "string" ? content.reason : "automatic_candidate_unavailable";
+  const quotaStatus = typeof content.quota_status === "string" ? content.quota_status : "";
+  return (
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px] text-danger">
+        {tool && <ToolIcon tool={tool} size={12} />}
+        {tool && fallback && <ArrowRight size={10} />}
+        {fallback && <ToolIcon tool={fallback} size={12} />}
+        {tool && fallback && (
+          <span>
+            {t("session.engineRouteBlockedTransition", {
+              from: toolFullName(tool),
+              to: toolFullName(fallback),
+            })}
+          </span>
+        )}
+        <span>{t("session.engineRouteBlockedMarker")}</span>
+        <span className="truncate" title={t(routeReasonKey(reason))}>
+          · {t(routeReasonKey(reason))}
+        </span>
+        {quotaStatus && (
+          <span className="rounded-full border border-danger/30 px-1.5 py-0.5 text-[10px]">
+            {t("session.engineRouteQuotaBasis", { status: quotaStatusLabel(t, quotaStatus) })}
+          </span>
+        )}
+        <span className="truncate">· {t("session.engineRouteBlockedHint")}</span>
+      </span>
+      <span className="h-px min-w-4 flex-1 bg-border" />
+    </div>
+  );
+}
+
+/** Native `title` tooltips render verbatim with no CSS truncation available —
+ *  cap it so a multi-KB CLI stack trace doesn't produce an unusable OS
+ *  tooltip (issue #97 review P2 follow-up). */
+function truncateForTooltip(text: string, max: number): string {
+  const trimmed = text.trim();
+  return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
+}
+
+/** issue #97 review P2: a failed auto fail-over attempt — same quiet centered
+ *  divider as `EngineSwitchMarker`, but a danger tone since nothing actually
+ *  changed.
+ *
+ *  Independent re-review follow-up: the old copy ("Auto fail-over X → Y
+ *  failed") left the user to infer two of the three things they actually
+ *  need — this now spells out "still on {{from}}" outright, reuses
+ *  `EngineSwitchMarker`'s own `engineSwitchedQuotaReason` badge (unconditional
+ *  here, unlike the success marker's `reason === "quota_exceeded"` check —
+ *  every marker of this kind exists BECAUSE quota was exceeded), and puts the
+ *  backend's real `content.error` — previously shown nowhere, not even a
+ *  tooltip — one hover away via a native `title`. */
+function QuotaFailoverFailedMarker({ content }: { content: Record<string, unknown> }) {
+  const { t } = useTranslation();
+  const tool = typeof content.tool === "string" ? content.tool : "";
+  const fallback = typeof content.fallback === "string" ? content.fallback : "";
+  const error = typeof content.error === "string" ? content.error : "";
+  return (
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px] text-danger">
+        <ToolIcon tool={tool} size={12} />
+        <ArrowRight size={10} />
+        <ToolIcon tool={fallback} size={12} />
+        <span>
+          {t("session.quotaFailoverFailedMarker", {
+            from: toolFullName(tool),
+            to: toolFullName(fallback),
+          })}
+        </span>
+        <span className="rounded-full border border-danger/30 bg-danger/10 px-1.5 py-0.5 text-[10px] font-medium text-danger">
+          {t("session.engineSwitchedQuotaReason")}
+        </span>
+        {error && (
+          <span
+            title={truncateForTooltip(error, 240)}
+            className="inline-flex shrink-0 cursor-help text-danger/80"
+          >
+            <CircleAlert size={12} />
+          </span>
+        )}
+      </span>
+      <span className="h-px min-w-4 flex-1 bg-border" />
+    </div>
+  );
+}
+
+const AUTO_MERGE_STATE_KEYS: Record<string, string> = {
+  open: "session.autoMergeStateOpen",
+  merged: "session.autoMergeStateMerged",
+  closed: "session.autoMergeStateClosed",
+};
+
+/** issue #110 T3: durable record of one auto-merge attempt, success or
+ *  failure — same quiet centered-divider treatment as the markers above,
+ *  danger tone only when the attempt actually failed (a successful merge
+ *  reads neutral, matching `EngineSwitchMarker`'s own tone for a completed,
+ *  non-alarming automatic action). Raw, non-localizable diagnostics
+ *  (`reason` / `state_error` — the host's/OS's own passthrough text) render
+ *  as a hover tooltip, the same pattern `QuotaFailoverFailedMarker` already
+ *  established for its own `error` field, rather than inline untranslated
+ *  prose. */
+/** The raw diagnostic to hover-reveal, if any. A merged marker never carries
+ *  one; otherwise the host's own `reason` wins, and `state_error` only stands
+ *  in when the lifecycle itself came back unrecognized. Kept as a function
+ *  rather than a chained `?:` so each case reads on its own line. */
+function autoMergeDiagnostic(m: {
+  merged: boolean;
+  reason: string;
+  state: string;
+  stateError: string;
+}): string {
+  if (m.merged) return "";
+  if (m.reason) return m.reason;
+  if (m.state === "unknown") return m.stateError;
+  return "";
+}
+
+function AutoMergeMarker({ content }: { content: Record<string, unknown> }) {
+  const { t } = useTranslation();
+  const merged = content.merged === true;
+  const abbrev = typeof content.abbrev === "string" ? content.abbrev : "PR";
+  const number = typeof content.number === "number" ? content.number : 0;
+  const baseRef = typeof content.base_ref === "string" ? content.base_ref : "";
+  const reason = typeof content.reason === "string" ? content.reason : "";
+  const state = typeof content.state === "string" ? content.state : "unknown";
+  const stateError = typeof content.state_error === "string" ? content.state_error : "";
+  const attemptsExhausted = content.attempts_exhausted === true;
+  const attemptsMax = typeof content.attempts_max === "number" ? content.attempts_max : 0;
+  const stateKey = AUTO_MERGE_STATE_KEYS[state] ?? "session.autoMergeStateUnknown";
+  const tone = merged ? "text-ink-faint" : "text-danger";
+  const diagnostic = autoMergeDiagnostic({ merged, reason, state, stateError });
+  return (
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className={cn("flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px]", tone)}>
+        <span>
+          {merged
+            ? t("session.autoMergeSucceeded", { abbrev, number, base: baseRef })
+            : t("session.autoMergeFailed", { abbrev, number })}
+        </span>
+        <span className="truncate">· {t(stateKey)}</span>
+        {diagnostic && (
+          <span title={truncateForTooltip(diagnostic, 240)} className="inline-flex shrink-0 cursor-help text-danger/80">
+            <CircleAlert size={12} />
+          </span>
+        )}
+        {attemptsExhausted && (
+          <span className="rounded-full border border-danger/30 bg-danger/10 px-1.5 py-0.5 text-[10px] font-medium text-danger">
+            {t("session.autoMergeAttemptsExhausted", { count: attemptsMax })}
+          </span>
+        )}
+      </span>
+      <span className="h-px min-w-4 flex-1 bg-border" />
     </div>
   );
 }

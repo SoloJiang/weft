@@ -255,6 +255,7 @@ export const en = {
     receiptConsumed: "Agent started",
     sendFailedGeneric: "Send failed: {{reason}}",
     sendFailedUnknown: "unknown error",
+    engineRouteBlocked: "Engine routing is blocked: {{reason}}",
   },
   scope: {
     addReposFirst: "Add repos to this workspace first.",
@@ -272,7 +273,37 @@ export const en = {
     confirming: "Creating…",
     baseBranch: "Base branch",
     baseBranchHint: "Branch the work off this (blank = the repo's default branch)",
+    engine: "Engine",
+    engineAutomatic: "Auto · {{tool}}",
+    engineManual: "Pinned · {{tool}}",
+    engineLegacy: "Default · {{tool}}",
+    engineBlocked: "Automatic routing blocked",
+    engineReason: "{{reason}}",
+    batchEngine: "Run this batch with",
+    batchEngineAutomatic: "Automatic routing",
+    batchEngineHint:
+      "Leave automatic routing selected, or pin one installed engine for tasks that have not started. Existing pinned or active tasks keep their current engine.",
+    batchEnginePinned:
+      "Pinned for unstarted tasks in this batch: {{tool}}. Existing pinned or active tasks keep their current engine.",
+    routeReason: {
+      automatic_disabled: "automatic routing is off",
+      manual_pin: "manual choice wins",
+      normal_preference: "normal work prefers Codex",
+      deep_preference: "deep work prefers Claude",
+      preferred_warning: "preferred engine is near its quota; using the safer available option",
+      preferred_unavailable: "preferred engine is unavailable",
+      quota_unknown: "quota is not known yet",
+      legacy_fallback: "automatic candidates unavailable; using the default tool",
+      no_automatic_candidate: "no automatic candidate is installed",
+      automatic_candidate_unavailable: "automatic candidates are unavailable or exhausted",
+      both_automatic_candidates_exceeded: "Codex and Claude are both quota-exhausted",
+      invalid_manual_tool: "manual engine choice is invalid",
+      manual_tool_unavailable: "manual engine choice is unavailable",
+    },
+    engineRouteBlockedHint: "Choose a manual engine or enable an eligible automatic candidate, then retry.",
     planSummary: "Plan summary",
+    readOnlyPropagationNote:
+      "Approving also lets these workers run read-only checks (like git status) without asking — revocable anytime from the board.",
   },
   notify: {
     needsTitle: "Needs you",
@@ -309,11 +340,14 @@ export const en = {
     denyTitle: "Deny this request and let the agent decide what to do",
     fullAccess: "Full access",
     fullAccessTitle: "Auto-approve everything from this task",
+    releaseReadOnly: "Release all read-only for this session",
+    releaseReadOnlyTitle:
+      "Auto-allow every read-only request in this session from now on (writes and network/credential requests still ask)",
     emptyTitle: "Nothing needs you",
     emptyBody:
       "When an agent hits a decision only you can make, it asks here. Answer once and the reply goes straight back to its inbox, so you never have to go hunting for the session.",
     answerPlaceholder: "Answer {{name}}…",
-    selfClearing: "No reply needed — clears itself when the task resumes.",
+    selfClearing: "No reply needed — clears itself automatically once it's resolved.",
     openDirection: "Open this task",
     wantsToWrite: "wants to modify",
     approveRun: "Approve & run",
@@ -329,6 +363,12 @@ export const en = {
     riskUnknown: "Unknown risk",
     riskUnknownTitle: "Couldn't classify this call — review the arguments before approving",
     detailTruncated: "… {{n}} more characters truncated",
+    actionRequired: "This needs your action — it won't clear itself.",
+    retryTracking: "Retry",
+    retryTrackingTitle: "Reset the failed-check streak and let Weft try tracking this PR/MR again",
+    retryTrackingStarted: "Retry requested — Weft will re-check shortly.",
+    retryTrackingNothingToRetry: "Nothing to retry — this may already be resolved.",
+    retryTrackingFailed: "Couldn't retry tracking. Try again in a moment.",
   },
   tool: {
     input: "Input",
@@ -414,9 +454,29 @@ export const en = {
     switchReloadConfirm: "Reload",
     switchedToast: "Switched {{from}} → {{to}}",
     switchReloadedToast: "{{tool}} reloaded",
-    engineSwitchedMarker: "Engine switched",
+    switchInProgress: "The engine is switching after a quota limit was reached. Try again in a moment.",
+    switchFailed:
+      "The switch didn't go through — this session is still on its current engine, and nothing it was doing was affected. Try again.",
+    switchFailedInterrupted:
+      "The switch didn't go through — this session is still on its current engine, but the turn that was running was interrupted. Try again.",
+    engineSwitchedMarker: "Engine switched {{from}} → {{to}}",
     engineReloadedMarker: "Engine reloaded",
     engineModelCleared: "no override",
+    engineSwitchedQuotaReason: "auto — quota exceeded",
+    engineRouteMarker: "Auto-routed to {{tool}}",
+    engineRouteManualMarker: "Pinned to {{tool}}",
+    engineRouteBlockedMarker: "Automatic routing blocked",
+    engineRouteBlockedTransition: "{{from}} → {{to}}",
+    engineRouteQuotaBasis: "quota: {{status}}",
+    engineRouteBlockedHint: "Choose a manual engine or change the global routing setting, then retry.",
+    quotaFailoverFailedMarker: "Auto fail-over to {{to}} failed — still on {{from}}",
+    autoMergeSucceeded: "Auto-merged {{abbrev}} #{{number}} into {{base}}",
+    autoMergeFailed: "Auto-merge of {{abbrev}} #{{number}} failed",
+    autoMergeStateOpen: "still open, not merged",
+    autoMergeStateMerged: "confirmed merged",
+    autoMergeStateClosed: "closed without merging",
+    autoMergeStateUnknown: "could not confirm current state",
+    autoMergeAttemptsExhausted: "Stopped retrying after {{count}} consecutive failures on this commit",
   },
   diff: {
     tab: "Diff",
@@ -478,6 +538,13 @@ export const en = {
     engine: "Engine",
     engineUnknown: "Unknown",
     switchEngine: "Switch…",
+    // Issue #103: read-only auto-allow status for this session (in-memory
+    // only — never survives a restart, never covers writes or network/
+    // credential requests).
+    access: "Access",
+    readOnlyIssueTrusted: "Read-only trusted (whole issue)",
+    readOnlySessionTrusted: "Read-only trusted (this session)",
+    revokeReadOnlyTrust: "Revoke",
   },
   observe: {
     answerPlaceholder: "Type a reply, press Enter",
@@ -719,6 +786,26 @@ export const en = {
     remoteStandby: "Remote standby",
     remoteStandbyHint:
       "Keep the system awake while the bridge is enabled, so Feishu commands can reach Weft anytime. Best on AC power; closing the lid still sleeps.",
+    quotaFailoverGroup: "Quota fail-over",
+    quotaFailoverTitle: "Auto-switch on quota exceeded",
+    quotaFailoverHint:
+      "When an engine reports its usage limit exceeded, automatically switch the affected lead/task to the other engine (claude ⇄ codex) so work can continue. Off by default — switching sends a condensed history digest to the OTHER provider, which has a cost and privacy tradeoff only you should opt into. See Resources for current usage per engine.",
+    quotaFailoverDisclosure:
+      "This can send recent conversation context from one provider to the other after a structured quota-exceeded turn. It never interrupts a healthy turn.",
+    quotaFailoverConfirm:
+      "Enable automatic quota fail-over? Recent conversation context may be sent from one provider to the other after a quota-exceeded turn.",
+    autoMergeGroup: "Auto-merge",
+    autoMergeTitle: "Auto-merge when truly mergeable",
+    autoMergeHint:
+      "When a tracked PR/MR reaches this repo's truly-mergeable bar (CI actually green — not just unconfigured — GitHub's own review decision approved, no conflicts) and a fresh, unstalled check confirms it still holds, squash-merge it automatically — no per-merge prompt. Off by default: this performs an irreversible action (merging code) with nobody confirming that specific merge. Turning this on can immediately, silently merge every already-ready tracked PR/MR on its very first check, not only ones that become ready afterward. Every attempt, success or failure, leaves a marker on the PR's timeline.",
+    autoMergeDisclosure:
+      "Only applies to PR/MR rows Weft is already tracking (via register_pr) on a host with merge support (currently GitHub). A stale or currently-failing status check skips the row instead of merging on an old snapshot. This does NOT independently check unresolved review discussion threads or a repo-specific bot-approval convention (e.g. a review bot's 👍) — only GitHub's own aggregate review decision. If your repo relies on those, turn on GitHub's own branch protection (\"Require conversation resolution before merging\", a required reviewer) so an unmet condition refuses the merge server-side.",
+    autoMergeConfirm:
+      "Enable auto-merge? Weft will squash-merge every tracked PR/MR that already meets — or next reaches — this repo's truly-mergeable bar, on its own, without asking you each time, possibly several at once right away. It goes by GitHub's own review decision only: it does not check for unresolved review threads or a review bot's approval. This cannot be undone once it happens.",
+    engineRoutingGroup: "Engine routing",
+    automaticRoutingTitle: "Let Weft choose engines automatically",
+    automaticRoutingHint:
+      "Global opt-in for new leads, tasks, curator chat, and read-only analysis. Normal work prefers Codex; deep work prefers Claude. Manual engine choices remain pinned.",
     detecting: "Detecting…",
     installed: "installed",
     installedVersion: "v{{version}}",
@@ -855,6 +942,15 @@ export const en = {
     resourcesQuotaWarning: "Warning",
     resourcesQuotaDegraded: "Degraded",
     resourcesQuotaNoLimit: "This platform doesn't report a process limit.",
+    resourcesEngineQuotaGroup: "Engine quota",
+    resourcesEngineQuotaOk: "Normal",
+    resourcesEngineQuotaWarning: "Approaching limit",
+    resourcesEngineQuotaExceeded: "Limit reached",
+    resourcesEngineQuotaEmpty: "No quota signal observed yet this run — check back after sending a message.",
+    resourcesEngineQuotaPercent: "{{percent}}% used",
+    resourcesEngineQuotaResetsDays: "resets in {{days}}d {{hours}}h",
+    resourcesEngineQuotaResetsHours: "resets in {{hours}}h {{minutes}}m",
+    resourcesEngineQuotaResetsMinutes: "resets in {{minutes}}m",
     resourcesTreeGroup: "Process tree",
     resourcesTreeTotal_one: "{{count}} process",
     resourcesTreeTotal_other: "{{count}} processes",
@@ -925,6 +1021,17 @@ export const en = {
     revokeFailed: "Couldn't revoke access — it's still active. Please try again.",
     grantNotSaved:
       "Access granted for now, but couldn't be saved — you may be asked again after a restart.",
+    // Issue #103: read-only auto-allow — a SEPARATE, narrower, in-memory-only
+    // grant from Full/Always above (never survives a restart, never covers
+    // writes or network/credential requests).
+    readOnlyIssue: "Read-only trusted",
+    readOnlyIssueTitle:
+      "Approving this issue's dispatch auto-allows read-only requests from every one of its workers — click to revoke",
+    revokeReadOnlyTitle: "Revoke read-only trust?",
+    revokeReadOnlyIssueBody:
+      "Every worker under this issue will stop auto-allowing read-only requests — the next one will ask you again. This does not affect Full access or always-allow rules.",
+    readOnlyReleased_one: "Released {{count}} read-only request.",
+    readOnlyReleased_other: "Released {{count}} read-only requests.",
   },
   ai: {
     shellSnippet: "Shell snippet",

@@ -8,6 +8,10 @@ pub struct Model {
     pub direction_id: i32,
     pub repo_id: i32,
     pub tool: String,
+    /// Carries the direction/manual-switch provenance into the live worker so
+    /// quota failover cannot overwrite an explicit engine selection.
+    #[sea_orm(default_value = true)]
+    pub engine_pinned: bool,
     /// Optional per-session command pin overriding the global tool→command map.
     /// NULL = follow the global override; set to freeze this worker to its prior
     /// command when the user excludes existing sessions from a later override.

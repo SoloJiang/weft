@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { FolderTree, GitCompare, Info } from "lucide-react";
 import { isInFlight, isPendingNeed, useStore } from "../state/store";
 import { api } from "../lib/api";
+import { readOnlyRevokeDir, readOnlyScopeOf } from "../lib/grants";
 import type { EnabledSkill, ObserveRef, RewindMode } from "../lib/types";
 import { ChatTimeline } from "./ChatTimeline";
 import { LeadEmptyState } from "./LeadEmptyState";
@@ -58,6 +59,8 @@ export function WorkerConversation() {
     setActiveSidePanel,
     switchWorkerTool,
     installedTools,
+    readOnlyGrants,
+    revokeReadOnlyGrant,
   } = useStore();
   const { t } = useTranslation();
   const directionId = viewing?.directionId ?? null;
@@ -118,6 +121,14 @@ export function WorkerConversation() {
     directionId == null
       ? []
       : asks.filter((a) => a.dir === String(directionId));
+
+  // Issue #103: this worker session's read-only auto-allow scope (for the
+  // SessionInfoPanel "Access" status + revoke) — same (thread, dir) identity
+  // `workerAsks`/`releaseSessionReadOnly` already use.
+  const readOnlyScope =
+    threadId == null || directionId == null
+      ? "none"
+      : readOnlyScopeOf(readOnlyGrants, threadId, String(directionId));
 
   // History lives in the thread timeline; hydrate it (worker rows ride along).
   useEffect(() => {
@@ -400,6 +411,16 @@ export function WorkerConversation() {
           onReload={onReload}
           onSwitchEngine={sid != null ? () => setSwitchOpen(true) : undefined}
           busy={busy}
+          readOnlyScope={readOnlyScope}
+          onRevokeReadOnlyTrust={
+            threadId == null || readOnlyScope === "none"
+              ? undefined
+              : () =>
+                  void revokeReadOnlyGrant(
+                    threadId,
+                    readOnlyRevokeDir(readOnlyScope, String(directionId)),
+                  )
+          }
         />
       )}
       {ref && (

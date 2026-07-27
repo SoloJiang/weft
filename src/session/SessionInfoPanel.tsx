@@ -1,7 +1,8 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { X, ChevronRight, ChevronDown, RefreshCw } from "lucide-react";
+import { X, ChevronRight, ChevronDown, RefreshCw, Eye } from "lucide-react";
 import type { SessionMeta, EnabledSkill, Direction } from "../lib/types";
+import type { ReadOnlyScope } from "../lib/grants";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 
 
@@ -26,6 +27,8 @@ export function SessionInfoPanel({
   onReload,
   onSwitchEngine,
   busy,
+  readOnlyScope,
+  onRevokeReadOnlyTrust,
 }: {
   meta: SessionMeta | undefined;
   skills: EnabledSkill[];
@@ -44,6 +47,13 @@ export function SessionInfoPanel({
   onSwitchEngine?: () => void;
   /** turn 进行中:重载灰掉(re-spawn 在下次 send 生效)。 */
   busy?: boolean;
+  /** 本会话的只读自动放行范围(issue #103)——"issue"=派发批准时整个 issue 继承,
+   *  "session"=本会话单独放行,"none"/省略 → 不渲染 Access 段。只影响
+   *  `read_only` 档;Write/NetworkOrCredential/Unknown 恒不受影响。 */
+  readOnlyScope?: ReadOnlyScope;
+  /** 撤销当前 readOnlyScope 对应的授权(session→撤本会话,issue→撤整个 issue，
+   *  调用方决定 dir 是 null 还是本会话)。省略 readOnlyScope 为 "none" 时不需要。 */
+  onRevokeReadOnlyTrust?: () => void;
 }) {
   const { t } = useTranslation();
 
@@ -142,6 +152,37 @@ export function SessionInfoPanel({
             )}
           </div>
         </Section>
+
+        {/* Access — issue #103's read-only auto-allow, when this session is
+            currently trusted. Only ever renders a STATUS + revoke; granting
+            happens at the point of an ask (the permission card's dropdown), not
+            here — mirrors the board's InheritedAccessChip (status + one-click
+            revoke, no "grant" affordance of its own). Absent entirely when
+            readOnlyScope is "none"/undefined, same as Sub-tasks/MCP hiding when
+            empty. */}
+        {readOnlyScope && readOnlyScope !== "none" && (
+          <Section key="access" title={t("sessionInfo.access")}>
+            <div className="-mx-1.5 mt-1.5 flex items-center gap-2 rounded-[var(--radius-sm)] px-1.5 py-1">
+              <Eye size={14} className="shrink-0 text-success" />
+              <span className="min-w-0 truncate text-[12.5px] text-ink">
+                {t(
+                  readOnlyScope === "issue"
+                    ? "sessionInfo.readOnlyIssueTrusted"
+                    : "sessionInfo.readOnlySessionTrusted",
+                )}
+              </span>
+              {onRevokeReadOnlyTrust && (
+                <button
+                  type="button"
+                  onClick={onRevokeReadOnlyTrust}
+                  className="ml-auto shrink-0 whitespace-nowrap text-[11px] font-medium text-brand transition-colors hover:text-ink hover:underline"
+                >
+                  {t("sessionInfo.revokeReadOnlyTrust")}
+                </button>
+              )}
+            </div>
+          </Section>
+        )}
 
         {/* Sub-tasks — created directions, newest first. Lead-only. The header
             stays put (most task-relevant → not hideable); the list caps at 3. */}

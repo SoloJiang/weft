@@ -22,6 +22,10 @@ pub struct Model {
     /// in Needs-you and kept for audit.
     #[sea_orm(default_value = "")]
     pub reason: String,
+    /// Explicit engine selections are pins. Legacy rows stay pinned; a new
+    /// route-derived direction is explicitly created unpinned.
+    #[sea_orm(default_value = true)]
+    pub engine_pinned: bool,
     /// Worker mandate, assigned with the role: "plan+impl" (plan its own
     /// direction first, then build) or "impl-only" (fully scoped — build
     /// straight away). The brief renders per-mandate.

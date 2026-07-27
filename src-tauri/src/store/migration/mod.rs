@@ -1,7 +1,7 @@
 use crate::store::entities::{
     app_setting, backup_config, code_checkpoint, direction, im_route, lead_message, plan,
-    repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread, workspace,
-    worktree,
+    pull_request, repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread,
+    workspace, worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -55,6 +55,8 @@ impl MigratorTrait for Migrator {
             Box::new(M0041LeadMessageThreadKindIdx),
             Box::new(M0042ThreadLeadModel),
             Box::new(M0043SessionModel),
+            Box::new(M0044EngineRoutingPin),
+            Box::new(M0045PullRequest),
         ]
     }
 }
@@ -1934,9 +1936,115 @@ impl MigrationTrait for M0043SessionModel {
     }
 }
 
+/// Records whether a tool identity came from a user choice rather than the
+/// global/default routing policy. Existing rows intentionally migrate as
+/// pinned: an upgrade must never redirect a currently known task. Legacy
+/// curator rows remain pinned as well because older versions did not persist
+/// enough provenance to distinguish a default from an explicit engine choice.
+pub struct M0044EngineRoutingPin;
+impl MigrationName for M0044EngineRoutingPin {
+    fn name(&self) -> &str {
+        "m0044_engine_routing_pin"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0044EngineRoutingPin {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for (table, column) in [
+            ("thread", "engine_pinned"),
+            ("direction", "engine_pinned"),
+            ("session", "engine_pinned"),
+        ] {
+            let result = manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new(table))
+                        .add_column(
+                            ColumnDef::new(Alias::new(column))
+                                .boolean()
+                                .not_null()
+                                .default(true),
+                        )
+                        .to_owned(),
+                )
+                .await;
+            match result {
+                Ok(()) => {}
+                Err(err) if err.to_string().to_lowercase().contains("duplicate column") => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for (table, column) in [
+            ("session", "engine_pinned"),
+            ("direction", "engine_pinned"),
+            ("thread", "engine_pinned"),
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new(table))
+                        .drop_column(Alias::new(column))
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Issue #110 T1: the tracked-PR/MR entity — a real DB row (repo, task,
+/// host-normalized state) so "what is this PR/MR waiting on" is a store fact
+/// the background monitor (`crate::host::monitor`) can read and update, not
+/// something that only lives in an agent's turn or a chat session's memory.
+pub struct M0045PullRequest;
+impl MigrationName for M0045PullRequest {
+    fn name(&self) -> &str {
+        "m0045_pull_request"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0045PullRequest {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut stmt = schema.create_table_from_entity(pull_request::Entity);
+        stmt.if_not_exists();
+        manager.create_table(stmt).await?;
+        // Belt-and-suspenders alongside `repo::register_pull_request`'s
+        // application-level find-then-upsert: guarantees the natural key
+        // (host_kind, host_owner, host_repo, number) can never duplicate at
+        // the DB level even under a race the app layer doesn't catch.
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_pull_request_natural_key")
+                    .table(Alias::new("pull_request"))
+                    .col(Alias::new("host_kind"))
+                    .col(Alias::new("host_owner"))
+                    .col(Alias::new("host_repo"))
+                    .col(Alias::new("number"))
+                    .unique()
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("pull_request")).to_owned())
+            .await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::gateway_components_to_backend;
+    use super::{gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest};
 
     #[test]
     fn gateway_tier_rewritten_to_backend() {
@@ -2160,6 +2268,139 @@ mod tests {
             meta.contains("idx_lead_message_thread_kind_session"),
             "meta lookup must use the composite index prefix, got: {meta}"
         );
+    }
+
+    /// M0044: legacy curator rows stay conservatively pinned. The old schema
+    /// has no provenance to distinguish a default engine from a manual pick,
+    /// so migration must not opt any existing row into automatic fail-over.
+    #[tokio::test]
+    async fn m0044_legacy_curator_is_pinned_and_existing_values_survive_rerun() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        for sql in [
+            "CREATE TABLE thread (id INTEGER PRIMARY KEY, kind TEXT NOT NULL)",
+            "CREATE TABLE direction (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE session (id INTEGER PRIMARY KEY)",
+            "INSERT INTO thread (id, kind) VALUES (1, 'curator'), (2, 'feature')",
+            "INSERT INTO direction (id) VALUES (1)",
+            "INSERT INTO session (id) VALUES (1)",
+        ] {
+            db.execute(Statement::from_string(backend, sql.to_owned()))
+                .await
+                .unwrap();
+        }
+
+        M0044EngineRoutingPin
+            .up(&SchemaManager::new(&db))
+            .await
+            .unwrap();
+
+        for sql in [
+            "SELECT engine_pinned FROM thread WHERE id = 1",
+            "SELECT engine_pinned FROM thread WHERE id = 2",
+            "SELECT engine_pinned FROM direction WHERE id = 1",
+            "SELECT engine_pinned FROM session WHERE id = 1",
+        ] {
+            let row = db
+                .query_one(Statement::from_string(backend, sql.to_owned()))
+                .await
+                .unwrap()
+                .unwrap();
+            let pinned: bool = row.try_get("", "engine_pinned").unwrap();
+            assert!(pinned, "legacy rows must migrate as pinned: {sql}");
+        }
+
+        db.execute(Statement::from_string(
+            backend,
+            "UPDATE thread SET engine_pinned = 0 WHERE id = 1".to_owned(),
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_string(
+            backend,
+            "UPDATE direction SET engine_pinned = 0 WHERE id = 1".to_owned(),
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_string(
+            backend,
+            "UPDATE session SET engine_pinned = 0 WHERE id = 1".to_owned(),
+        ))
+        .await
+        .unwrap();
+
+        // A retry against an already-upgraded database must leave explicit
+        // values untouched, including the curator row.
+        M0044EngineRoutingPin
+            .up(&SchemaManager::new(&db))
+            .await
+            .unwrap();
+
+        for sql in [
+            "SELECT engine_pinned FROM thread WHERE id = 1",
+            "SELECT engine_pinned FROM direction WHERE id = 1",
+            "SELECT engine_pinned FROM session WHERE id = 1",
+        ] {
+            let row = db
+                .query_one(Statement::from_string(backend, sql.to_owned()))
+                .await
+                .unwrap()
+                .unwrap();
+            let pinned: bool = row.try_get("", "engine_pinned").unwrap();
+            assert!(!pinned, "an existing engine_pinned value must survive: {sql}");
+        }
+    }
+
+    /// M0045 (issue #110 adversarial review P2): the natural-key unique
+    /// index actually exists and is enforced AT THE DB LEVEL — not just by
+    /// `repo::register_pull_request`'s application-level find-then-upsert,
+    /// which a raw insert bypasses entirely. Without this, deleting the
+    /// migration's `.unique()` call by accident would silently stop being
+    /// caught by anything: the app-level upsert still LOOKS correct in every
+    /// test that goes through it, since it never races itself.
+    #[tokio::test]
+    async fn m0045_natural_key_unique_index_rejects_a_raw_duplicate_insert() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        M0045PullRequest.up(&SchemaManager::new(&db)).await.unwrap();
+
+        let insert_sql = |number: i32| -> String {
+            format!(
+                "INSERT INTO pull_request \
+                 (thread_id, direction_id, repo_id, host_kind, host_base, host_owner, host_repo, \
+                  number, url, title, head_sha, base_ref, lifecycle, ci_status, review_status, \
+                  conflict_status, merge_readiness, last_checked_at, last_error, probe_fail_count, \
+                  created_at) \
+                 VALUES (1, 1, 1, 'github', 'github.com', 'acme', 'widgets', {number}, \
+                  '', '', '', '', 'open', '', '', '', '', '', '', 0, '1')"
+            )
+        };
+
+        // First insert succeeds.
+        db.execute(Statement::from_string(backend, insert_sql(1)))
+            .await
+            .unwrap();
+
+        // A RAW second insert with the SAME natural key (host_kind,
+        // host_owner, host_repo, number) — bypassing
+        // `register_pull_request`'s find-then-upsert entirely — must be
+        // rejected by the index itself.
+        let dup = db.execute(Statement::from_string(backend, insert_sql(1))).await;
+        assert!(
+            dup.is_err(),
+            "a raw duplicate insert on the natural key must be rejected by idx_pull_request_natural_key"
+        );
+
+        // A genuinely different number is unaffected — the index is scoped
+        // to the whole natural key, not falsely global on e.g. just the host.
+        let distinct = db.execute(Statement::from_string(backend, insert_sql(2))).await;
+        assert!(distinct.is_ok(), "a different PR number must still insert cleanly");
     }
 
     /// M0037: code_checkpoint exists after migration and round-trips a row.

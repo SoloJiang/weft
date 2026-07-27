@@ -2,11 +2,14 @@ import { useEffect, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { Layers, Plus, SquarePen, X } from "lucide-react";
-import { isPendingNeed, threadLiveCounts, useStore } from "../state/store";
+import { isPendingNeed, useStore } from "../state/store";
+import { selectThreadActivity } from "../state/threadActivity";
 import type { NeedItem, PermissionAsk, ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
+import { ThreadActivity } from "../components/ui/ThreadActivity";
 import { CreateThreadDialog, CreateWorkspaceDialog } from "../nav/dialogs";
 import { InheritedAccessChip } from "../components/InheritedAccessChip";
+import { ReadOnlyTrustChip } from "../components/ReadOnlyTrustChip";
 import { inheritedAccessOf } from "../lib/grants";
 import { cn } from "../lib/cn";
 
@@ -174,21 +177,24 @@ function EmptyBoard() {
 }
 
 function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
-  const { sessions, needs, asks, checksByDirection, openNeeds, leadTurn, authGrants } =
+  const { sessions, needs, asks, checksByDirection, openNeeds, leadTurn, authGrants, readOnlyGrants } =
     useStore();
   const { t } = useTranslation();
-  // Split the in-flight count so a stalled worker OR lead is visible on the card
-  // itself (not just the drill-in board): running = green pulse, stalled = amber.
-  const { running, stalled } = threadLiveCounts(
-    sessions,
-    o.direction_ids,
-    leadTurn[o.thread_id]?.state,
-  );
+  const activity = selectThreadActivity({
+    workerSessions: Object.values(sessions),
+    directionIds: o.direction_ids,
+    leadState: leadTurn[o.thread_id]?.state,
+  });
   // Full access and always-allow rules both count: either is a standing grant
   // that carries over (#89 makes Always persist across restarts too), so the
   // marker and its one-click revoke must cover both. The chip re-derives the
   // kind-accurate copy from this same helper.
   const inherited = inheritedAccessOf(authGrants, o.thread_id) !== null;
+  // Issue #103: dispatch approval propagated a read-only auto-allow to the
+  // whole issue. A SEPARATE, narrower grant from Full/Always above — in-memory
+  // only, never survives a restart, never covers Write/NetworkOrCredential/
+  // Unknown — so it gets its own marker rather than folding into `inherited`.
+  const readOnlyTrusted = readOnlyGrants.issue.includes(o.thread_id);
   const done = o.statuses.filter((s) => s === "done").length;
   const attention = threadAttentionCount(o, needs, asks);
   const failing = o.direction_ids.filter((id) =>
@@ -243,9 +249,10 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
           </span>
         )}
         {inherited && <InheritedAccessChip threadId={o.thread_id} />}
+        {readOnlyTrusted && <ReadOnlyTrustChip threadId={o.thread_id} />}
       </div>
 
-      {(o.direction_ids.length > 0 || running > 0 || stalled > 0) && (
+      {(o.direction_ids.length > 0 || activity.kind !== "idle") && (
         <div className="flex items-center gap-2">
           {o.direction_ids.length > 0 && (
             <>
@@ -260,24 +267,7 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
               </span>
             </>
           )}
-          {running > 0 && (
-            <span
-              title={t("workspace.live", { count: running })}
-              className="flex items-center gap-1 text-[11px] tabular-nums text-running"
-            >
-              <span className="weft-pulse h-1.5 w-1.5 rounded-full bg-running" />
-              {running}
-            </span>
-          )}
-          {stalled > 0 && (
-            <span
-              title={t("workspace.stalled", { count: stalled })}
-              className="flex items-center gap-1 text-[11px] tabular-nums text-waiting"
-            >
-              <span className="h-1.5 w-1.5 rounded-full bg-waiting" />
-              {stalled}
-            </span>
-          )}
+          <ThreadActivity activity={activity} className="text-[11px]" />
           {failing > 0 && (
             <span
               title={t("workspace.failing", { count: failing })}

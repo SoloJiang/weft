@@ -255,11 +255,32 @@ pub(crate) fn normalize_ws(s: &str) -> String {
 /// 1-based position of `target` among `texts` under [`normalize_ws`] identity.
 /// The engine computes a fallback cut ordinal from DB rows with this, so it
 /// matches the transcript-side normalized matching exactly. 0 = no match.
+///
+/// An EMPTY target is "no match" here because that is claude's rule, not a
+/// universal one: [`user_text`] skips a transcript user line carrying no text
+/// blocks, so an empty target is genuinely unaddressable in that dialect and
+/// counting it would only trade a clear "no anchor" error for a confusing
+/// "text not found" one. Dialects that DO record an empty prompt verbatim use
+/// [`ordinal_of_prompt`].
 pub(crate) fn ordinal_of(texts: &[String], target: &str) -> usize {
-    let want = normalize_ws(target);
-    if want.is_empty() {
+    if normalize_ws(target).is_empty() {
         return 0;
     }
+    ordinal_of_prompt(texts, target)
+}
+
+/// [`ordinal_of`] for dialects where an empty prompt is still an addressable
+/// message — ACP in particular.
+///
+/// `session/prompt` always sends a text block, `{"type":"text","text":""}`
+/// even for an image-only message (images ride as sibling image blocks rather
+/// than the spilled-path appendix per-turn tools get). So "" is a real entry
+/// in the transcript, and `fork_omp_at`'s matcher already treats it as one —
+/// but the engine's `ordinal == 0` guard rejected it upstream, so rewinding a
+/// non-first image-only message failed as "no rewind anchor" and the matcher
+/// never ran.
+pub(crate) fn ordinal_of_prompt(texts: &[String], target: &str) -> usize {
+    let want = normalize_ws(target);
     texts.iter().filter(|t| normalize_ws(t) == want).count()
 }
 
@@ -545,27 +566,16 @@ fn omp_user_body_matches(body: &str, want_norm: &str, is_first_user: bool) -> bo
     false
 }
 
-/// Cut-before rewind for omp ACP sessions.
+/// Line index of the `ordinal`-th user prompt whose text blocks match `text`,
+/// i.e. where a cut-before rewind should truncate. `None` = no such prompt.
 ///
-/// ACP `session/fork` only does full-history copy. We rewrite the on-disk
-/// `~/.omp/agent/sessions/<encoded-cwd>/*_<id>.jsonl` to keep entries strictly
-/// before the Nth matching user message, mint a new session id, and return it
-/// so the engine can `session/load` next turn. Spike-verified: hand-cut files
-/// load and only see the kept prefix (omp 17.1.1).
-pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> Result<Option<String>> {
-    if ordinal == 0 {
-        return Err(anyhow!("ordinal is 1-based"));
-    }
-    let Some(src) = find_omp_session_file(cwd, session_id)? else {
-        return Err(anyhow!("omp_session_not_found"));
-    };
-    let raw = std::fs::read_to_string(&src)
-        .with_context(|| format!("read omp session {}", src.display()))?;
-    let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+/// Split from [`fork_omp_at`]'s file IO so the matching rule — including the
+/// empty-text (image-only) prompt that [`ordinal_of_prompt`] can now address —
+/// is testable end to end without a session file on disk.
+fn omp_cut_index(lines: &[&str], text: &str, ordinal: usize) -> Option<usize> {
     let want = normalize_ws(text);
     let mut user_hits = 0usize;
     let mut seen_users = 0usize;
-    let mut cut_at = None;
     for (i, line) in lines.iter().enumerate() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -603,11 +613,30 @@ pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> 
         }
         user_hits += 1;
         if user_hits == ordinal {
-            cut_at = Some(i);
-            break;
+            return Some(i);
         }
     }
-    let Some(cut) = cut_at else {
+    None
+}
+
+/// Cut-before rewind for omp ACP sessions.
+///
+/// ACP `session/fork` only does full-history copy. We rewrite the on-disk
+/// `~/.omp/agent/sessions/<encoded-cwd>/*_<id>.jsonl` to keep entries strictly
+/// before the Nth matching user message, mint a new session id, and return it
+/// so the engine can `session/load` next turn. Spike-verified: hand-cut files
+/// load and only see the kept prefix (omp 17.1.1).
+pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> Result<Option<String>> {
+    if ordinal == 0 {
+        return Err(anyhow!("ordinal is 1-based"));
+    }
+    let Some(src) = find_omp_session_file(cwd, session_id)? else {
+        return Err(anyhow!("omp_session_not_found"));
+    };
+    let raw = std::fs::read_to_string(&src)
+        .with_context(|| format!("read omp session {}", src.display()))?;
+    let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    let Some(cut) = omp_cut_index(&lines, text, ordinal) else {
         return Err(anyhow!("omp_user_not_found"));
     };
     if cut == 0 {
@@ -1413,34 +1442,112 @@ mod tests {
         assert!(found.is_ok());
     }
 
-    #[test]
-    fn omp_user_text_block_required_not_tool_result() {
-        let tool = serde_json::json!({
-            "type":"message",
-            "message":{"role":"user","content":[
-                {"type":"tool_result","tool_use_id":"t1","content":"ok"}
-            ]}
-        });
-        let arr = tool.pointer("/message/content").and_then(|c| c.as_array()).unwrap();
-        let has = arr.iter().any(|b| {
-            b.get("type").and_then(|t| t.as_str()) == Some("text")
-                || b.get("text").and_then(|t| t.as_str()).is_some()
-        });
-        assert!(!has);
-        let img = serde_json::json!({
-            "type":"message",
-            "message":{"role":"user","content":[
-                {"type":"text","text":""},
-                {"type":"image"}
-            ]}
-        });
-        let arr = img.pointer("/message/content").and_then(|c| c.as_array()).unwrap();
-        let has = arr.iter().any(|b| {
-            b.get("type").and_then(|t| t.as_str()) == Some("text")
-                || b.get("text").and_then(|t| t.as_str()).is_some()
-        });
-        assert!(has);
+    fn omp_user_line(blocks: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "message",
+            "message": { "role": "user", "content": blocks }
+        })
+        .to_string()
     }
 
+    fn omp_assistant_line(text: &str) -> String {
+        serde_json::json!({
+            "type": "message",
+            "message": { "role": "assistant", "content": [{"type":"text","text":text}] }
+        })
+        .to_string()
+    }
 
+    /// What omp actually records for an image-only message: `prompt()` always
+    /// emits a text block, so the text is EMPTY rather than absent.
+    fn image_only_line() -> String {
+        omp_user_line(serde_json::json!([
+            {"type":"text","text":""},
+            {"type":"image","mimeType":"image/png","data":"AAAA"}
+        ]))
+    }
+
+    /// Tool results are role=user too, but carry no text block — they must
+    /// never be mistaken for an (empty-bodied) user prompt.
+    #[test]
+    fn omp_cut_skips_tool_results_which_have_no_text_block() {
+        let tool_result = omp_user_line(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"t1","content":"ok"}
+        ]));
+        let lines: Vec<&str> = vec![&tool_result];
+
+        assert_eq!(
+            omp_cut_index(&lines, "", 1),
+            None,
+            "a tool_result row is not an empty user prompt"
+        );
+    }
+
+    /// The whole upstream path for a NON-FIRST image-only rewind: the DB-side
+    /// ordinal has to survive into the transcript cut. A matcher-level check
+    /// cannot catch this — `ordinal_of` zeroed the empty target and the engine
+    /// rejected the rewind as "no anchor" before the matcher ever ran.
+    #[test]
+    fn image_only_omp_prompt_rewinds_end_to_end() {
+        let first = omp_user_line(serde_json::json!([{"type":"text","text":"hello"}]));
+        let reply = omp_assistant_line("hi");
+        let tool_result = omp_user_line(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"t1","content":"ok"}
+        ]));
+        let image_only = image_only_line();
+        let after = omp_assistant_line("nice picture");
+        let lines: Vec<&str> = vec![&first, &reply, &tool_result, &image_only, &after];
+
+        // The engine reconstructs these dispatched texts from the DB rows; the
+        // image-only row's is empty because ACP keeps images out of the text.
+        let dispatched = vec!["hello".to_string(), String::new()];
+        assert_eq!(
+            ordinal_of(&dispatched, ""),
+            0,
+            "claude's transcript cannot address an empty prompt"
+        );
+        let ordinal = ordinal_of_prompt(&dispatched, "");
+        assert_eq!(ordinal, 1, "ACP can: it is the first empty-bodied prompt");
+
+        assert_eq!(
+            omp_cut_index(&lines, "", ordinal),
+            Some(3),
+            "cut before the image-only prompt itself"
+        );
+    }
+
+    /// Two image-only messages share the empty identity, so the ordinal is the
+    /// only thing telling them apart — it must select the right one.
+    #[test]
+    fn the_ordinal_picks_between_two_image_only_prompts() {
+        let first = omp_user_line(serde_json::json!([{"type":"text","text":"hello"}]));
+        let a = image_only_line();
+        let reply = omp_assistant_line("one");
+        let b = image_only_line();
+        let lines: Vec<&str> = vec![&first, &a, &reply, &b];
+
+        let dispatched = vec!["hello".to_string(), String::new(), String::new()];
+        assert_eq!(ordinal_of_prompt(&dispatched, ""), 2, "counts up to the target");
+
+        assert_eq!(omp_cut_index(&lines, "", 1), Some(1));
+        assert_eq!(omp_cut_index(&lines, "", 2), Some(3));
+        assert_eq!(omp_cut_index(&lines, "", 3), None, "only two exist");
+    }
+
+    /// The first prompt carries the system prepend, whose relaxed match must
+    /// not swallow an empty target — that would cut the whole session away.
+    #[test]
+    fn a_system_prepended_first_prompt_never_matches_an_empty_target() {
+        let first = omp_user_line(serde_json::json!([
+            {"type":"text","text":"SYSTEM PREAMBLE\n\nhello"}
+        ]));
+        let image_only = image_only_line();
+        let lines: Vec<&str> = vec![&first, &image_only];
+
+        assert_eq!(
+            omp_cut_index(&lines, "", 1),
+            Some(1),
+            "the empty target is the image-only prompt, not the prepended first turn"
+        );
+    }
 }

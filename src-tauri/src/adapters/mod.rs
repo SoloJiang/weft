@@ -64,6 +64,15 @@ pub trait AgentAdapter: Send + Sync {
 
     fn parse_line(&self, line: &str) -> ChatEvent;
     fn extract_native_id(&self, line: &str) -> Option<String>;
+    /// Issue #97: a structured usage-limit reading from this line, independent
+    /// of the main `ChatEvent` classification (mirrors `extract_native_id`'s
+    /// side-channel shape) — `None` by default; only claude currently has a
+    /// verified proactive wire signal (`rate_limit_event`). codex's equivalent
+    /// (`account/rateLimits/*`) is account-scoped, not per-line, so it's handled
+    /// separately in `codex_app_server.rs`, not through this per-turn-dialect path.
+    fn quota_signal(&self, _line: &str) -> Option<crate::engine_quota::QuotaSnapshot> {
+        None
+    }
 
     fn interrupt(&self) -> Interrupt;
     /// Stdin payload for a `Protocol` interrupt (claude); empty otherwise.
@@ -120,6 +129,9 @@ impl AgentAdapter for ClaudeAdapter {
     }
     fn extract_native_id(&self, line: &str) -> Option<String> {
         proto::extract_native("claude", line)
+    }
+    fn quota_signal(&self, line: &str) -> Option<crate::engine_quota::QuotaSnapshot> {
+        proto::claude_quota_snapshot(line)
     }
     fn interrupt(&self) -> Interrupt {
         Interrupt::Protocol
@@ -445,6 +457,18 @@ mod tests {
         assert!(!omp.per_turn() && omp.is_connection());
         assert_eq!(omp.interrupt(), Interrupt::Connection);
         assert!(adapter_for("mystery").is_none());
+    }
+
+    #[test]
+    fn quota_signal_only_claude_reads_it_others_default_none() {
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"},"uuid":"u","session_id":"s"}"#;
+        assert!(ClaudeAdapter.quota_signal(line).is_some());
+        // codex/opencode dialects never emit this line shape; the default no-op
+        // must not mistake it for one of theirs.
+        assert!(CodexExecAdapter.quota_signal(line).is_none());
+        assert!(OpenCodeAdapter.quota_signal(line).is_none());
+        assert!(CodexAppServerAdapter.quota_signal(line).is_none());
+        assert!(ClaudeAdapter.quota_signal("not json").is_none());
     }
 
     #[test]

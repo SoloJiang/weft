@@ -1,8 +1,9 @@
 //! All DB reads/writes go through here. Keeps SeaORM specifics out of commands.
 
 use super::entities::{
-    app_setting, code_checkpoint, direction, im_route, lead_message, plan, repo_profile,
-    repo_ref, session, skill_enable, skill_source, test_plan, thread, workspace, worktree,
+    app_setting, code_checkpoint, direction, im_route, lead_message, plan, pull_request,
+    repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread, workspace,
+    worktree,
 };
 use super::Db;
 use crate::slug::unique_slug;
@@ -12,6 +13,93 @@ use sea_orm::{
     TryIntoModel,
 };
 use std::collections::HashMap;
+
+/// A manual route selected for a reused direction before its first native
+/// conversation. `session_id` is present only when an interrupted initial
+/// open left a session row behind; that row must move with the direction so a
+/// later cold open cannot recover the stale tool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitialDirectionRoutePin {
+    pub direction_id: i32,
+    pub session_id: Option<i32>,
+    pub tool: String,
+}
+
+/// Test-only DB-write failure injection.
+///
+/// Why it exists: several already-shipped degradation paths differ from their
+/// happy path ONLY when a single store write fails while the writes around it
+/// succeed. `lead_chat::engine::recover_from_freeze`'s marker-gated native-id
+/// clear (issue #93, PR #133) is the canonical one — and a mutation run proved
+/// the entire suite stayed green with that gate deleted, because nothing in this
+/// crate could make one chosen write fail on demand. The alternative, faking the
+/// post-failure DB rows by hand, is worse than no test at all: it asserts a
+/// shape production may never produce (a lesson this repo has already paid for).
+/// This makes the REAL write return a REAL `Err`.
+///
+/// Boundary — why it cannot leak into production:
+///   * The module is `#[cfg(test)]`, so it exists only while this crate is
+///     compiled as its own test target (`cargo test --lib`). `cargo build`, the
+///     Tauri bundle, and even this crate's `tests/*.rs` integration binaries
+///     link the lib WITHOUT `cfg(test)`, so the arming API is simply absent.
+///   * Call sites go through [`fail_write`], whose entire body sits inside a
+///     `#[cfg(test)]` block: in a production build it expands to nothing — no
+///     branch, no atomic, no static, no symbol. Zero runtime cost, not "cheap".
+///   * Nothing is armed by default and nothing consults an env var, so even in
+///     the test build a write fails only for the task that armed it.
+///
+/// Scope is the TASK, not the process (`tokio::task_local!`), which is what
+/// keeps this from becoming the process-global-static hazard the session-gate
+/// tests needed a serializing lock for: two tests can arm different writes — or
+/// the same one — concurrently without seeing each other, and a panicking test
+/// disarms by unwinding out of the scope. The trade-off is the spawn boundary: a
+/// write performed on a task `spawn`ed from inside the scope does NOT inherit
+/// the arming. Every current seam point is awaited directly, so that holds; a
+/// future caller that spawns needs a different mechanism, not a wider scope.
+#[cfg(test)]
+pub(crate) mod fail_write {
+    use std::future::Future;
+
+    tokio::task_local! {
+        /// The one write name armed for the current task, if any.
+        static ARMED: &'static str;
+    }
+
+    /// Run `fut` with the store write named `name` forced to return `Err`.
+    /// Every other write inside `fut` behaves normally — that selectivity is
+    /// the whole point: the paths under test are the ones where the neighbours
+    /// of a failed write all succeeded.
+    pub(crate) async fn while_failing<T>(name: &'static str, fut: impl Future<Output = T>) -> T {
+        ARMED.scope(name, fut).await
+    }
+
+    /// Whether the calling task armed `name`. Only [`super::fail_write`] calls
+    /// this; outside a `while_failing` scope `try_with` fails, i.e. "not armed".
+    pub(crate) fn is_armed(name: &str) -> bool {
+        ARMED.try_with(|armed| *armed == name).unwrap_or(false)
+    }
+
+    /// The error an armed write returns. Deliberately self-identifying: if this
+    /// text ever surfaces in a real log, the seam escaped its test build.
+    pub(crate) fn injected(name: &str) -> anyhow::Error {
+        anyhow::anyhow!("injected store-write failure at `{name}` (test-only seam)")
+    }
+}
+
+/// Mark a store write as injectable by [`fail_write`]'s `name`. Expands to
+/// NOTHING outside `cfg(test)` — see that module's doc for the boundary. Place
+/// it as the first statement of a write that returns `anyhow::Result`, so an
+/// armed failure lands before any partial mutation.
+macro_rules! fail_write {
+    ($name:literal) => {
+        #[cfg(test)]
+        {
+            if $crate::store::repo::fail_write::is_armed($name) {
+                return Err($crate::store::repo::fail_write::injected($name));
+            }
+        }
+    };
+}
 
 fn now() -> String {
     // RFC3339 without pulling chrono: seconds since epoch is enough for ordering.
@@ -409,6 +497,21 @@ fn curator_thread_key(workspace_id: i32) -> String {
     format!("curator.thread.{workspace_id}")
 }
 
+/// Return the hidden curator thread id when it has already been created. This
+/// is read-only and never creates a chat just to attach an analysis marker.
+pub async fn curator_thread_for_workspace(db: &Db, workspace_id: i32) -> Result<Option<i32>> {
+    let Some(id) = get_setting(db, &curator_thread_key(workspace_id))
+        .await?
+        .and_then(|value| value.parse::<i32>().ok())
+    else {
+        return Ok(None);
+    };
+    match get_thread(db, id).await? {
+        Some(thread) if thread.kind == "curator" => Ok(Some(id)),
+        _ => Ok(None),
+    }
+}
+
 /// Get-or-create the hidden curator-chat thread for a workspace (mirrors the
 /// Concierge get-or-create). The id is stable (persisted in app_setting); the
 /// thread is `kind="curator"` so board views can filter it out.
@@ -511,6 +614,9 @@ pub async fn create_thread(
         slug: Set(unique_slug(title, &existing)),
         kind: Set(kind.to_string()),
         lead_tool: Set(lead_tool.to_string()),
+        // The configured/default tool is only a fallback. A user pin is set
+        // by the explicit switch/approval path, never by construction.
+        engine_pinned: Set(false),
         created_at: Set(now()),
         ..Default::default()
     };
@@ -544,6 +650,32 @@ pub async fn get_thread(db: &Db, thread_id: i32) -> Result<Option<thread::Model>
     Ok(thread::Entity::find_by_id(thread_id).one(&db.0).await?)
 }
 
+/// Refresh an initial automatic lead route only while no manual choice has
+/// landed. The conditional write prevents a stale resolver result from
+/// overwriting a concurrent manual pin.
+pub async fn refresh_unpinned_thread_route(
+    db: &Db,
+    thread_id: i32,
+    tool: &str,
+) -> Result<bool> {
+    let write = thread::Entity::update_many()
+        .col_expr(thread::Column::LeadTool, Expr::value(tool.to_string()))
+        .filter(thread::Column::Id.eq(thread_id))
+        .filter(thread::Column::EnginePinned.eq(false))
+        .exec(&db.0)
+        .await?;
+    Ok(write.rows_affected != 0)
+}
+
+pub async fn set_thread_engine_pinned(db: &Db, thread_id: i32, pinned: bool) -> Result<()> {
+    thread::Entity::update_many()
+        .col_expr(thread::Column::EnginePinned, Expr::value(pinned))
+        .filter(thread::Column::Id.eq(thread_id))
+        .exec(&db.0)
+        .await?;
+    Ok(())
+}
+
 /// Display-title only; slug stays (see rename_workspace).
 pub async fn rename_thread(db: &Db, thread_id: i32, title: &str) -> Result<thread::Model> {
     let title = validate_display_name(title, "issue title")?;
@@ -565,6 +697,48 @@ pub async fn rename_thread(db: &Db, thread_id: i32, title: &str) -> Result<threa
     Ok(a.update(&db.0).await?)
 }
 
+/// Test-only rendezvous immediately after a switch transaction's FIRST
+/// statement — the point where "did this take the write lock yet?" is
+/// answerable (PR #140 review round 15).
+///
+/// A barrier rather than a signal, and placed AFTER the statement rather than
+/// before, because neither alternative works: a probe before the first
+/// statement leaves a scheduling gap and cannot discriminate, and a plain
+/// signal after it would let the test race ahead. Note also why the test does
+/// not simply hold the write lock and watch the switch block — with the lock
+/// held, a write-first transaction's opening statement blocks INSIDE the
+/// critical section, so a rendezvous placed after it could never be reached
+/// and the correct implementation would deadlock. Nothing is held while the
+/// probe runs; the test asks a third connection whether the lock is taken.
+///
+/// `#[cfg(test)]` throughout, like `fail_write` (#144): production builds
+/// contain no expansion at all.
+#[cfg(test)]
+pub(crate) mod txn_probe {
+    tokio::task_local! {
+        pub static AFTER_FIRST_STATEMENT: std::sync::Arc<tokio::sync::Barrier>;
+    }
+}
+
+/// Rendezvous with an armed [`txn_probe`], or nothing at all.
+macro_rules! probe_after_first_statement {
+    () => {
+        #[cfg(test)]
+        {
+            let armed = crate::store::repo::txn_probe::AFTER_FIRST_STATEMENT
+                .try_with(std::sync::Arc::clone)
+                .ok();
+            if let Some(barrier) = armed {
+                // TWICE: the first rendezvous tells the test the statement has
+                // run, the second holds the transaction here while the test
+                // probes the lock. Between them it touches nothing.
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
+    };
+}
+
 /// Switch a thread's lead engine identity + model override (issue #96/#98).
 /// `model=None` clears any override (follow the CLI's own default). Also
 /// clears `lead_command`: a per-tool alias pin (e.g. `claude` → `cc-claude`)
@@ -576,21 +750,87 @@ pub async fn rename_thread(db: &Db, thread_id: i32, title: &str) -> Result<threa
 /// this stays a plain, independently-testable field update. No-op fields
 /// (same tool, same model) still write through — callers may use this to
 /// force-reload an engine so an externally-edited CLI config takes effect.
-pub async fn switch_thread_tool(
+pub async fn switch_lead_engine_txn(
     db: &Db,
     thread_id: i32,
     tool: &str,
     model: Option<&str>,
-) -> Result<thread::Model> {
-    let m = thread::Entity::find_by_id(thread_id)
-        .one(&db.0)
+) -> Result<()> {
+    switch_lead_engine_txn_with_pin(db, thread_id, tool, model, true).await
+}
+
+/// `pinned` is false only for the structured automatic quota failover path.
+/// Keep it in the same transaction as the tool identity so an interrupted
+/// write cannot later reinterpret the route as a user choice.
+pub async fn switch_lead_engine_txn_with_pin(
+    db: &Db,
+    thread_id: i32,
+    tool: &str,
+    model: Option<&str>,
+    pinned: bool,
+) -> Result<()> {
+    fail_write!("switch_lead_engine_txn");
+    use sea_orm::TransactionTrait;
+    let txn = db.0.begin().await?;
+    // The FIRST statement is a write, deliberately. `begin()` opens a DEFERRED
+    // transaction, and under WAL a deferred read→write upgrade fails with
+    // SQLITE_BUSY_SNAPSHOT whenever ANY other writer commits after the
+    // snapshot — a stale snapshot the busy timeout cannot repair, unlike
+    // ordinary writer contention. `insert_lead_message` documents the same
+    // hazard and is why it is not a transaction at all. Weft's background
+    // activity/status writes make it reachable here, and the cost is high: the
+    // command has already torn the live engine down by this point, so a
+    // spurious abort is not a no-op. Taking the write lock with the opening
+    // statement means every read below runs under it.
+    //
+    // An UPDATE … WHERE rather than find-then-update for that reason:
+    // `rows_affected` carries the "thread is gone" case that the read used to.
+    let touched = thread::Entity::update_many()
+        .col_expr(thread::Column::LeadTool, Expr::value(tool))
+        .col_expr(thread::Column::LeadCommand, Expr::value(Option::<String>::None))
+        .col_expr(thread::Column::LeadModel, Expr::value(model.map(str::to_string)))
+        .col_expr(thread::Column::EnginePinned, Expr::value(pinned))
+        .filter(thread::Column::Id.eq(thread_id))
+        .exec(&txn)
+        .await?;
+    if touched.rows_affected == 0 {
+        anyhow::bail!("thread {thread_id} not found");
+    }
+    probe_after_first_statement!();
+
+    // The native-id clear, in the SAME transaction — the identical strip
+    // `set_lead_native_id_opt(.., None)` performs, against `txn`. The lead's
+    // native id lives in a `kind = "meta"` row rather than a column, which is
+    // why this is spelled out here instead of reusing that function.
+    if let Some(meta) = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("meta"))
+        .one(&txn)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
-    let mut a: thread::ActiveModel = m.into();
-    a.lead_tool = Set(tool.to_string());
-    a.lead_command = Set(None);
-    a.lead_model = Set(model.map(str::to_string));
-    Ok(a.update(&db.0).await?)
+    {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&meta.content).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("native_id");
+        }
+        if v.as_object().is_some_and(|o| o.is_empty()) {
+            lead_message::Entity::delete_by_id(meta.id).exec(&txn).await?;
+        } else {
+            let mut ma: lead_message::ActiveModel = meta.into();
+            ma.content = Set(v.to_string());
+            ma.update(&txn).await?;
+        }
+    }
+    // …and the grace marker is written in the SAME commit. This is the whole
+    // fix: "the native id is gone" and "there is evidence this surface ran"
+    // are two halves of one invariant (`revive::has_resumable_context`), and a
+    // transaction is what makes them unable to disagree. Everything else this
+    // PR tried — stamping first and gating, retracting on failure, a pending
+    // kind promoted later — existed only to make an EARLIER stamp safe, and
+    // none of it is needed once the two writes are atomic.
+    insert_marker_row(&txn, thread_id, None, MARKER_KIND_RECOVERED).await?;
+    txn.commit().await?;
+    Ok(())
 }
 
 pub async fn get_plan(db: &Db, thread_id: i32) -> Result<Option<plan::Model>> {
@@ -691,6 +931,130 @@ pub async fn update_plan_proposal_cas(
     Ok(res.rows_affected > 0)
 }
 
+/// Persist one selected route under a transaction that has already claimed the
+/// SQLite writer lock with its plan update.
+///
+/// A sessionless route must remain sessionless. A `session_id` identifies the
+/// latest interrupted initial session: it may be updated only while it has not
+/// captured a native conversation or become independently pinned. The planner
+/// checks the in-memory live-engine registry before choosing that shape; this
+/// store boundary keeps the durable native-session race fail-closed.
+async fn pin_initial_direction_route(
+    txn: &sea_orm::DatabaseTransaction,
+    thread_id: i32,
+    pin: &InitialDirectionRoutePin,
+    operation: &str,
+) -> Result<()> {
+    let direction_write = direction::Entity::update_many()
+        .col_expr(direction::Column::Tool, Expr::value(pin.tool.clone()))
+        .col_expr(direction::Column::EnginePinned, Expr::value(true))
+        .filter(direction::Column::Id.eq(pin.direction_id))
+        .filter(direction::Column::ThreadId.eq(thread_id))
+        .filter(direction::Column::EnginePinned.eq(false))
+        .exec(txn)
+        .await?;
+    if direction_write.rows_affected == 0 {
+        anyhow::bail!(
+            "direction {} became manually pinned while {operation} its route",
+            pin.direction_id
+        );
+    }
+
+    let Some(session_id) = pin.session_id else {
+        let opened_session = session::Entity::find()
+            .filter(session::Column::DirectionId.eq(pin.direction_id))
+            .one(txn)
+            .await?;
+        if opened_session.is_some() {
+            anyhow::bail!(
+                "direction {} opened while {operation} its manual route",
+                pin.direction_id
+            );
+        }
+        return Ok(());
+    };
+
+    let latest_session = session::Entity::find()
+        .filter(session::Column::DirectionId.eq(pin.direction_id))
+        .order_by_desc(session::Column::Id)
+        .one(txn)
+        .await?;
+    let can_refresh_session = latest_session.is_some_and(|session| {
+        session.id == session_id
+            && session.native_session_id.is_none()
+            && !session.engine_pinned
+    });
+    if !can_refresh_session {
+        anyhow::bail!(
+            "direction {} opened while {operation} its manual route",
+            pin.direction_id
+        );
+    }
+
+    let session_write = session::Entity::update_many()
+        .col_expr(session::Column::Tool, Expr::value(pin.tool.clone()))
+        .col_expr(session::Column::EnginePinned, Expr::value(true))
+        .col_expr(session::Column::Command, Expr::value(Option::<String>::None))
+        .col_expr(session::Column::Model, Expr::value(Option::<String>::None))
+        .col_expr(
+            session::Column::NativeSessionId,
+            Expr::value(Option::<String>::None),
+        )
+        .filter(session::Column::Id.eq(session_id))
+        .filter(session::Column::DirectionId.eq(pin.direction_id))
+        .filter(session::Column::EnginePinned.eq(false))
+        .filter(session::Column::NativeSessionId.is_null())
+        .exec(txn)
+        .await?;
+    if session_write.rows_affected == 0 {
+        anyhow::bail!(
+            "session {session_id} became established while {operation} its manual route"
+        );
+    }
+    Ok(())
+}
+
+/// Atomically record a reused lane's approval and its explicit manual route.
+/// The worktree has already materialized before this is called, but the plan
+/// must never become approved without the manual pin that justified dispatch.
+/// A first plan write takes SQLite's writer lock before the session check, so a
+/// concurrent worker either wins first (and this rejects) or waits and reads
+/// the committed manual route when it creates its session.
+pub async fn commit_reused_approval_with_direction_pin_cas(
+    db: &Db,
+    thread_id: i32,
+    new_proposal: &str,
+    expected_proposal: &str,
+    expected_status: &str,
+    manual_pin: &InitialDirectionRoutePin,
+) -> Result<bool> {
+    use sea_orm::TransactionTrait;
+
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let txn = db.0.begin().await?;
+    let plan_write = plan::Entity::update_many()
+        .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
+        .col_expr(plan::Column::Status, Expr::value(expected_status.to_string()))
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .filter(plan::Column::Proposal.eq(expected_proposal))
+        .filter(plan::Column::Status.eq(expected_status))
+        .exec(&txn)
+        .await?;
+    if plan_write.rows_affected == 0 {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+
+    if let Err(err) = pin_initial_direction_route(&txn, thread_id, manual_pin, "approving").await {
+        let _ = txn.rollback().await;
+        return Err(err);
+    }
+
+    txn.commit().await?;
+    ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    Ok(true)
+}
+
 /// Mark a thread's plan "confirmed" ONLY if its proposal AND status are still what the caller
 /// read at the start — i.e. no re-propose and no concurrent confirm landed in between. Unlike
 /// `update_plan_proposal_cas` (which pins expected==new status), this flips a NON-confirmed
@@ -752,6 +1116,51 @@ pub async fn commit_confirmed_plan_cas(
         ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
     }
     Ok(res.rows_affected > 0)
+}
+
+/// Commit a confirmed plan and the manual route pins selected for reused,
+/// not-yet-established directions in one transaction. A failed confirmation
+/// must not leave a direction or an interrupted initial session pinned to a
+/// route the plan never consumed.
+pub async fn commit_confirmed_plan_with_direction_pins_cas(
+    db: &Db,
+    thread_id: i32,
+    new_proposal: &str,
+    expected_proposal: &str,
+    expected_status: &str,
+    manual_pins: &[InitialDirectionRoutePin],
+) -> Result<bool> {
+    use sea_orm::TransactionTrait;
+
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let txn = db.0.begin().await?;
+    let plan_write = plan::Entity::update_many()
+        .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
+        .col_expr(plan::Column::Status, Expr::value("confirmed"))
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .filter(plan::Column::Proposal.eq(expected_proposal))
+        .filter(plan::Column::Status.eq(expected_status))
+        .exec(&txn)
+        .await?;
+    if plan_write.rows_affected == 0 {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+
+    for manual_pin in manual_pins {
+        // The plan write above is the transaction's first statement, so it
+        // holds SQLite's writer lock before this read. A worker session that
+        // committed first is visible here; one that starts later must wait for
+        // this pin and then re-read the current direction route before insert.
+        if let Err(err) = pin_initial_direction_route(&txn, thread_id, manual_pin, "confirming").await {
+            let _ = txn.rollback().await;
+            return Err(err);
+        }
+    }
+
+    txn.commit().await?;
+    ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    Ok(true)
 }
 
 pub async fn get_repo_profile(db: &Db, repo_id: i32) -> Result<Option<repo_profile::Model>> {
@@ -1044,6 +1453,34 @@ pub async fn create_direction(
     mandate: &str,
     base_branch: &str,
 ) -> Result<direction::Model> {
+    create_direction_with_engine_pin(
+        db,
+        thread_id,
+        name,
+        tool,
+        repo_id,
+        reason,
+        mandate,
+        base_branch,
+        false,
+    )
+    .await
+}
+
+/// Create a direction with the provenance of its selected engine. Manual routing
+/// must persist the pin in the same insert as the direction so a process exit
+/// cannot leave an otherwise reusable direction unpinned.
+pub async fn create_direction_with_engine_pin(
+    db: &Db,
+    thread_id: i32,
+    name: &str,
+    tool: &str,
+    repo_id: i32,
+    reason: &str,
+    mandate: &str,
+    base_branch: &str,
+    engine_pinned: bool,
+) -> Result<direction::Model> {
     let t = thread::Entity::find_by_id(thread_id)
         .one(&db.0)
         .await?
@@ -1091,6 +1528,7 @@ pub async fn create_direction(
         status: Set("queued".to_string()),
         repo_id: Set(repo_id),
         reason: Set(reason.to_string()),
+        engine_pinned: Set(engine_pinned),
         mandate: Set(normalize_mandate(mandate).to_string()),
         base_branch: Set(base_branch.trim().to_string()),
         target_branch: Set(base_branch.trim().to_string()),
@@ -1123,6 +1561,128 @@ pub async fn get_direction(db: &Db, direction_id: i32) -> Result<Option<directio
     Ok(direction::Entity::find_by_id(direction_id)
         .one(&db.0)
         .await?)
+}
+
+pub async fn set_direction_engine_pinned(
+    db: &Db,
+    direction_id: i32,
+    pinned: bool,
+) -> Result<()> {
+    direction::Entity::update_many()
+        .col_expr(direction::Column::EnginePinned, Expr::value(pinned))
+        .filter(direction::Column::Id.eq(direction_id))
+        .exec(&db.0)
+        .await?;
+    Ok(())
+}
+
+/// Refresh the initial automatic route of a direction that has never been
+/// manually pinned. When a session row already exists but has no native
+/// conversation, both persistent identities move together so the next open
+/// cannot recreate the stale engine selected at plan-confirm time.
+pub async fn refresh_unpinned_direction_route(
+    db: &Db,
+    direction_id: i32,
+    session_id: Option<i32>,
+    tool: &str,
+) -> Result<()> {
+    refresh_unpinned_direction_route_with_pin(db, direction_id, session_id, tool, false).await
+}
+
+/// See [`refresh_unpinned_direction_route`]. A reused, never-started direction
+/// can receive an explicit manual selection during a retry, which must become
+/// a pin in the same conditional write as its refreshed tool.
+pub async fn refresh_unpinned_direction_route_with_pin(
+    db: &Db,
+    direction_id: i32,
+    session_id: Option<i32>,
+    tool: &str,
+    engine_pinned: bool,
+) -> Result<()> {
+    use sea_orm::TransactionTrait;
+
+    let txn = db.0.begin().await?;
+    let direction_write = direction::Entity::update_many()
+        .col_expr(direction::Column::Tool, Expr::value(tool))
+        .col_expr(direction::Column::EnginePinned, Expr::value(engine_pinned))
+        .filter(direction::Column::Id.eq(direction_id))
+        .filter(direction::Column::EnginePinned.eq(false))
+        .exec(&txn)
+        .await?;
+    if direction_write.rows_affected == 0 {
+        anyhow::bail!("direction {direction_id} became manually pinned while refreshing its route");
+    }
+
+    if let Some(session_id) = session_id {
+        let session_write = session::Entity::update_many()
+            .col_expr(session::Column::Tool, Expr::value(tool))
+            .col_expr(session::Column::EnginePinned, Expr::value(engine_pinned))
+            .col_expr(session::Column::Command, Expr::value(Option::<String>::None))
+            .col_expr(session::Column::Model, Expr::value(Option::<String>::None))
+            .col_expr(
+                session::Column::NativeSessionId,
+                Expr::value(Option::<String>::None),
+            )
+            .filter(session::Column::Id.eq(session_id))
+            .filter(session::Column::DirectionId.eq(direction_id))
+            .filter(session::Column::EnginePinned.eq(false))
+            // A freshly captured native id establishes a real conversation.
+            // Do not clear it under a stale automatic-route snapshot.
+            .filter(session::Column::NativeSessionId.is_null())
+            .exec(&txn)
+            .await;
+        let session_write = match session_write {
+            Ok(session_write) => session_write,
+            Err(err) => {
+                let _ = txn.rollback().await;
+                return Err(err.into());
+            }
+        };
+        if session_write.rows_affected == 0 {
+            let _ = txn.rollback().await;
+            anyhow::bail!(
+                "session {session_id} became established or pinned while refreshing its route"
+            );
+        }
+    }
+
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Persist a manual route only while a direction is still sessionless. The
+/// direction update takes SQLite's writer lock before the session check, so a
+/// concurrent worker open either commits first (this returns an error) or waits
+/// and observes the manual route before it creates its session.
+pub async fn pin_unstarted_unpinned_direction_route(
+    db: &Db,
+    direction_id: i32,
+    tool: &str,
+) -> Result<()> {
+    use sea_orm::TransactionTrait;
+
+    let txn = db.0.begin().await?;
+    let direction_write = direction::Entity::update_many()
+        .col_expr(direction::Column::Tool, Expr::value(tool))
+        .col_expr(direction::Column::EnginePinned, Expr::value(true))
+        .filter(direction::Column::Id.eq(direction_id))
+        .filter(direction::Column::EnginePinned.eq(false))
+        .exec(&txn)
+        .await?;
+    if direction_write.rows_affected == 0 {
+        txn.rollback().await?;
+        anyhow::bail!("direction {direction_id} became manually pinned while pinning its route");
+    }
+    let opened_session = session::Entity::find()
+        .filter(session::Column::DirectionId.eq(direction_id))
+        .one(&txn)
+        .await?;
+    if opened_session.is_some() {
+        txn.rollback().await?;
+        anyhow::bail!("direction {direction_id} opened while pinning its manual route");
+    }
+    txn.commit().await?;
+    Ok(())
 }
 
 /// Set a direction's lifecycle status (agent- or human-driven). No-op if gone.
@@ -1176,32 +1736,65 @@ pub async fn rename_direction(db: &Db, direction_id: i32, name: &str) -> Result<
 /// the caller's lookup and this write — moot, not a failure, same posture as
 /// the old `switch_session_tool`); the direction half is required (not found
 /// is a real error, same as before).
-pub async fn switch_worker_tool_txn(
+pub async fn switch_worker_engine_txn(
     db: &Db,
     direction_id: i32,
     session_id: i32,
     tool: &str,
     model: Option<&str>,
-) -> Result<direction::Model> {
+) -> Result<()> {
+    switch_worker_engine_txn_with_pin(db, direction_id, session_id, tool, model, true).await
+}
+
+/// See [`switch_lead_engine_txn_with_pin`]. The direction and its live session
+/// carry the same provenance, so both are updated atomically.
+pub async fn switch_worker_engine_txn_with_pin(
+    db: &Db,
+    direction_id: i32,
+    session_id: i32,
+    tool: &str,
+    model: Option<&str>,
+    pinned: bool,
+) -> Result<()> {
     use sea_orm::TransactionTrait;
     let txn = db.0.begin().await?;
-    let d = direction::Entity::find_by_id(direction_id)
+    // Write first — see `switch_lead_engine_txn` for why a deferred
+    // read→write upgrade is not safe under WAL.
+    let touched = direction::Entity::update_many()
+        .col_expr(direction::Column::Tool, Expr::value(tool))
+        .col_expr(direction::Column::EnginePinned, Expr::value(pinned))
+        .filter(direction::Column::Id.eq(direction_id))
+        .exec(&txn)
+        .await?;
+    if touched.rows_affected == 0 {
+        anyhow::bail!("direction {direction_id} not found");
+    }
+    probe_after_first_statement!();
+    let thread_id = direction::Entity::find_by_id(direction_id)
         .one(&txn)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
-    let mut da: direction::ActiveModel = d.into();
-    da.tool = Set(tool.to_string());
-    let updated = da.update(&txn).await?;
+        .map(|d| d.thread_id)
+        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} vanished mid-transaction"))?;
 
     if let Some(s) = session::Entity::find_by_id(session_id).one(&txn).await? {
         let mut sa: session::ActiveModel = s.into();
         sa.tool = Set(tool.to_string());
+        sa.engine_pinned = Set(pinned);
         sa.command = Set(None);
         sa.model = Set(model.map(str::to_string));
+        // The native-id clear rides the SAME row update (issue #96 pitfall 1).
+        // It used to be a separate write after this transaction committed,
+        // which meant a failure there left the new tool paired with the OLD
+        // engine's native id — a pair `worker_engine` would then try to resume
+        // across engines, and one that no grace window repairs (adversarial
+        // re-review of PR #140, round 6). Atomic here, that pair cannot exist.
+        sa.native_session_id = Set(None);
         sa.update(&txn).await?;
     }
+    // Same commit as the writes above — see the lead twin.
+    insert_marker_row(&txn, thread_id, Some(session_id), MARKER_KIND_RECOVERED).await?;
     txn.commit().await?;
-    Ok(updated)
+    Ok(())
 }
 
 /// A direction's diff "vs target" config: `(stored, base_ref)` where `stored`
@@ -1444,6 +2037,15 @@ pub async fn delete_repo_cascade(
         .filter(repo_profile::Column::RepoId.eq(repo_id))
         .exec(&db.0)
         .await?;
+    // issue #110 T3 review: a tracked PR/MR row (`register_pr`) has no FK to
+    // cascade it away, and until this fix nothing deleted it when its repo
+    // went away — the auto-merge sweep would keep tracking (and could keep
+    // merging) a PR whose repo the user just deleted. See
+    // `delete_thread_cascade`'s matching fix for the full reasoning.
+    pull_request::Entity::delete_many()
+        .filter(pull_request::Column::RepoId.eq(repo_id))
+        .exec(&db.0)
+        .await?;
     repo_ref::Entity::delete_by_id(repo_id).exec(&db.0).await?;
     // Best-effort: invalidate the now-stale workspace map doc (see top of fn).
     if let Some(ws) = workspace_id {
@@ -1516,6 +2118,12 @@ pub async fn delete_workspace_cascade(
             .await?;
         test_plan::Entity::delete_many()
             .filter(test_plan::Column::ThreadId.eq(*thread_id))
+            .exec(&db.0)
+            .await?;
+        // issue #110 T3 review: see `delete_thread_cascade`'s matching fix —
+        // a tracked PR/MR row has no FK to cascade it away on its own.
+        pull_request::Entity::delete_many()
+            .filter(pull_request::Column::ThreadId.eq(*thread_id))
             .exec(&db.0)
             .await?;
     }
@@ -1644,6 +2252,17 @@ pub async fn delete_thread_cascade(
         .filter(test_plan::Column::ThreadId.eq(thread_id))
         .exec(&txn)
         .await?;
+    // issue #110 T3 review: a tracked PR/MR row (`register_pr` /
+    // `crate::host::monitor`/`crate::host::automerge`) has no FK relation to
+    // this thread, so without this it would silently outlive the issue that
+    // owned it — `host::automerge`'s sweep would keep tracking, and could
+    // still auto-merge, a PR belonging to an issue the user just deleted.
+    // Same transaction as the rest of this cascade for the same atomicity
+    // reason this function's own doc gives.
+    pull_request::Entity::delete_many()
+        .filter(pull_request::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
     txn.commit().await?;
     Ok(removed)
 }
@@ -1661,6 +2280,7 @@ pub async fn create_session(
         direction_id: Set(direction_id),
         repo_id: Set(repo_id),
         tool: Set(tool.to_string()),
+        engine_pinned: Set(direction.engine_pinned),
         cwd: Set(cwd.to_string()),
         native_session_id: Set(None),
         status: Set("starting".to_string()),
@@ -1669,6 +2289,66 @@ pub async fn create_session(
     }
     .insert(&db.0)
     .await?;
+    let accepted = match ensure_thread_workspace_accepts_writes(db, direction.thread_id).await {
+        Ok(_) => ensure_repo_workspace_accepts_writes(db, repo_id).await.map(|_| ()),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = accepted {
+        let _ = session::Entity::delete_by_id(inserted.id).exec(&db.0).await;
+        return Err(err);
+    }
+    Ok(inserted)
+}
+
+/// Create a worker session from the direction route currently stored in the
+/// database. The opening write reserves the route before it is read, so a
+/// concurrent manual pin cannot leave a newly inserted session on an older
+/// automatic tool.
+pub async fn create_session_for_current_direction(
+    db: &Db,
+    direction_id: i32,
+    repo_id: i32,
+    cwd: &str,
+) -> Result<session::Model> {
+    ensure_direction_workspace_accepts_writes(db, direction_id).await?;
+    ensure_repo_workspace_accepts_writes(db, repo_id).await?;
+
+    use sea_orm::TransactionTrait;
+
+    let txn = db.0.begin().await?;
+    // Acquire the writer lock before reading the route. A no-op assignment is
+    // enough and keeps the direction's durable values unchanged.
+    let lock = direction::Entity::update_many()
+        .col_expr(
+            direction::Column::EnginePinned,
+            Expr::col(direction::Column::EnginePinned).into(),
+        )
+        .filter(direction::Column::Id.eq(direction_id))
+        .exec(&txn)
+        .await?;
+    if lock.rows_affected == 0 {
+        txn.rollback().await?;
+        anyhow::bail!("direction {direction_id} not found");
+    }
+    let direction = direction::Entity::find_by_id(direction_id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
+    let inserted = session::ActiveModel {
+        direction_id: Set(direction_id),
+        repo_id: Set(repo_id),
+        tool: Set(direction.tool.clone()),
+        engine_pinned: Set(direction.engine_pinned),
+        cwd: Set(cwd.to_string()),
+        native_session_id: Set(None),
+        status: Set("starting".to_string()),
+        created_at: Set(now()),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await?;
+    txn.commit().await?;
+
     let accepted = match ensure_thread_workspace_accepts_writes(db, direction.thread_id).await {
         Ok(_) => ensure_repo_workspace_accepts_writes(db, repo_id).await.map(|_| ()),
         Err(err) => Err(err),
@@ -1765,18 +2445,65 @@ pub async fn set_session_native_id_opt(
 /// gain); read it as "the native context was deliberately reset and the next
 /// automated re-drive should back off for one grace window", of which a
 /// self-healed freeze is one cause and a human-initiated switch is another.
+///
+/// The switch path gates on this row the same way `recover_from_freeze` does,
+/// only harder: `lead_chat::commands::persist_switch` stamps it FIRST and
+/// aborts the entire switch if it fails, because a switch cannot fall back on
+/// "skip the clear and let it stall again" — by then the id belongs to an
+/// engine the thread no longer runs. Both writers therefore honour the same
+/// contract: this row exists before the native id is allowed to go missing.
+/// The grace marker's kind. Written by a freeze auto-recovery
+/// ([`mark_turn_freeze_recovered`]) and by an engine/model switch — the latter
+/// from inside its own transaction, so the row and the native-id clear it
+/// vouches for commit together.
+pub const MARKER_KIND_RECOVERED: &str = "turn_freeze_recovered";
+/// One grace-marker row, deletion-fenced like every other timeline insert.
+/// Generic over the connection so the switch transactions can use it
+/// inside the switch's transaction.
+async fn insert_marker_row<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    thread_id: i32,
+    session_id: Option<i32>,
+    kind: &str,
+) -> Result<i32> {
+    let res = conn
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO lead_message \
+             (thread_id, session_id, turn_id, role, kind, content, status, created_at) \
+             SELECT ?, ?, 0, 'system', ?, '{}', 'complete', ? \
+             WHERE EXISTS (SELECT 1 FROM thread WHERE id = ?)",
+            [
+                thread_id.into(),
+                session_id.into(),
+                kind.into(),
+                now().into(),
+                thread_id.into(),
+            ],
+        ))
+        .await?;
+    if res.rows_affected() == 0 {
+        anyhow::bail!("thread {thread_id} no longer exists (deleted)");
+    }
+    i32::try_from(res.last_insert_id()).map_err(|_| anyhow::anyhow!("marker id out of i32 range"))
+}
+
 pub async fn mark_turn_freeze_recovered(
     db: &Db,
     thread_id: i32,
     session_id: Option<i32>,
 ) -> Result<()> {
+    // Seam point: the failure this write's CALLERS must degrade correctly for
+    // (`engine::stamp_freeze_marker` → the gated native-id clear) has no other
+    // way to be reached from a test. See `fail_write`'s doc for the boundary.
+    fail_write!("mark_turn_freeze_recovered");
     insert_lead_message(
         db,
         thread_id,
         session_id,
         0,
         "system",
-        "turn_freeze_recovered",
+        MARKER_KIND_RECOVERED,
         "{}",
         "complete",
     )
@@ -1793,9 +2520,19 @@ pub async fn last_turn_freeze_recovery_secs(
     thread_id: i32,
     session_id: Option<i32>,
 ) -> Result<Option<u64>> {
+    last_marker_secs(db, thread_id, session_id, MARKER_KIND_RECOVERED).await
+}
+
+/// Newest marker of one kind for a (thread, session), as unix-seconds.
+async fn last_marker_secs(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    kind: &str,
+) -> Result<Option<u64>> {
     let q = lead_message::Entity::find()
         .filter(lead_message::Column::ThreadId.eq(thread_id))
-        .filter(lead_message::Column::Kind.eq("turn_freeze_recovered"))
+        .filter(lead_message::Column::Kind.eq(kind))
         .order_by_desc(lead_message::Column::Id);
     let q = match session_id {
         Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
@@ -2883,6 +3620,185 @@ pub async fn im_route_of_thread_ref(
         .await?)
 }
 
+// --- pull_request (issue #110 T1) ------------------------------------------
+//
+// Registration is agent-initiated (the `register_pr` bus tool, called right
+// after `gh pr create` / a future `glab mr create` succeeds); the background
+// monitor (`crate::host::monitor`) owns every write from then on. Both paths
+// funnel through the functions below so there is exactly one place that knows
+// the row shape.
+
+/// Find a tracked row by its natural host-side key. Registration upserts on
+/// this so re-registering the same PR/MR (e.g. after a restart, or a lead
+/// re-reporting it) updates context instead of duplicating the row.
+pub async fn find_pull_request(
+    db: &Db,
+    host_kind: &str,
+    host_owner: &str,
+    host_repo: &str,
+    number: i32,
+) -> Result<Option<pull_request::Model>> {
+    Ok(pull_request::Entity::find()
+        .filter(pull_request::Column::HostKind.eq(host_kind))
+        .filter(pull_request::Column::HostOwner.eq(host_owner))
+        .filter(pull_request::Column::HostRepo.eq(host_repo))
+        .filter(pull_request::Column::Number.eq(number))
+        .one(&db.0)
+        .await?)
+}
+
+pub async fn get_pull_request(db: &Db, id: i32) -> Result<Option<pull_request::Model>> {
+    Ok(pull_request::Entity::find_by_id(id).one(&db.0).await?)
+}
+
+/// Every row the monitor still needs to sweep — i.e. still `open` AND not
+/// (yet) given up on. `max_probe_fail_count` is the caller's give-up
+/// threshold (see `host::monitor::MAX_CONSECUTIVE_PROBE_FAILURES`): a row
+/// whose `probe_fail_count` has reached it stops being returned here — a
+/// persistently-failing probe (deleted PR, revoked auth) must not be retried
+/// forever, but a merged/closed row (this function's OTHER exclusion) and a
+/// row still under the threshold are unaffected.
+pub async fn list_open_pull_requests(
+    db: &Db,
+    max_probe_fail_count: i32,
+) -> Result<Vec<pull_request::Model>> {
+    Ok(pull_request::Entity::find()
+        .filter(pull_request::Column::Lifecycle.eq("open"))
+        .filter(pull_request::Column::ProbeFailCount.lt(max_probe_fail_count))
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn list_pull_requests_for_direction(
+    db: &Db,
+    direction_id: i32,
+) -> Result<Vec<pull_request::Model>> {
+    Ok(pull_request::Entity::find()
+        .filter(pull_request::Column::DirectionId.eq(direction_id))
+        .all(&db.0)
+        .await?)
+}
+
+/// Register a newly-opened PR/MR, or refresh an already-tracked one's context
+/// (thread/direction/repo can legitimately change across a re-registration —
+/// e.g. a direction's PR reopened under a new task after a rebase-and-reopen).
+#[allow(clippy::too_many_arguments)]
+pub async fn register_pull_request(
+    db: &Db,
+    thread_id: i32,
+    direction_id: i32,
+    repo_id: i32,
+    host_kind: &str,
+    host_base: &str,
+    host_owner: &str,
+    host_repo: &str,
+    number: i32,
+    url: &str,
+    title: &str,
+) -> Result<pull_request::Model> {
+    if let Some(existing) = find_pull_request(db, host_kind, host_owner, host_repo, number).await? {
+        let mut a: pull_request::ActiveModel = existing.into();
+        a.thread_id = Set(thread_id);
+        a.direction_id = Set(direction_id);
+        a.repo_id = Set(repo_id);
+        a.host_base = Set(host_base.to_string());
+        if !url.is_empty() {
+            a.url = Set(url.to_string());
+        }
+        if !title.is_empty() {
+            a.title = Set(title.to_string());
+        }
+        // A re-registration is this row's ONLY escape hatch once
+        // `probe_fail_count` has crossed the monitor's give-up threshold
+        // (`list_open_pull_requests` stops sweeping it — see that function's
+        // doc — and the sweep itself is the only OTHER path that ever resets
+        // this counter, via `apply_pull_request_snapshot` on a success it can
+        // now never reach). Without this reset, `register_pr`'s own
+        // documented contract ("re-calling it just refreshes context") would
+        // be false for exactly the row that most needs refreshing — a real
+        // dead end an adversarial review caught: a GitHub PR that's still
+        // alive but hit a transient failure streak (auth expired, an outage
+        // longer than the threshold) would fall out of monitoring FOREVER
+        // with no recovery path at all.
+        a.probe_fail_count = Set(0);
+        return Ok(a.update(&db.0).await?);
+    }
+    let a = pull_request::ActiveModel {
+        thread_id: Set(thread_id),
+        direction_id: Set(direction_id),
+        repo_id: Set(repo_id),
+        host_kind: Set(host_kind.to_string()),
+        host_base: Set(host_base.to_string()),
+        host_owner: Set(host_owner.to_string()),
+        host_repo: Set(host_repo.to_string()),
+        number: Set(number),
+        url: Set(url.to_string()),
+        title: Set(title.to_string()),
+        lifecycle: Set("open".to_string()),
+        created_at: Set(now()),
+        ..Default::default()
+    };
+    Ok(a.insert(&db.0).await?)
+}
+
+/// Apply a freshly, SUCCESSFULLY fetched snapshot: overwrite every observed
+/// field, clear any prior probe error, and stamp the check time. No-op if the
+/// row is gone (e.g. deleted concurrently). See
+/// `mark_pull_request_probe_error` for the failure counterpart, which
+/// deliberately leaves these observed fields untouched — a failed probe is a
+/// fact about the ATTEMPT, not new information about the PR/MR's real state.
+pub async fn apply_pull_request_snapshot(
+    db: &Db,
+    id: i32,
+    snapshot: &crate::host::PrSnapshot,
+    readiness: &crate::host::MergeReadiness,
+) -> Result<()> {
+    let Some(row) = pull_request::Entity::find_by_id(id).one(&db.0).await? else {
+        return Ok(());
+    };
+    let mut a: pull_request::ActiveModel = row.into();
+    a.head_sha = Set(snapshot.head_sha.clone());
+    a.base_ref = Set(snapshot.base_ref.clone());
+    if !snapshot.url.is_empty() {
+        a.url = Set(snapshot.url.clone());
+    }
+    if !snapshot.title.is_empty() {
+        a.title = Set(snapshot.title.clone());
+    }
+    a.lifecycle = Set(snapshot.lifecycle.as_str().to_string());
+    a.ci_status = Set(serde_json::to_string(&snapshot.ci).unwrap_or_default());
+    a.review_status = Set(serde_json::to_string(&snapshot.review).unwrap_or_default());
+    a.conflict_status = Set(serde_json::to_string(&snapshot.conflict).unwrap_or_default());
+    a.merge_readiness = Set(serde_json::to_string(readiness).unwrap_or_default());
+    a.last_checked_at = Set(now());
+    a.last_error = Set(String::new());
+    a.probe_fail_count = Set(0); // a success resets the consecutive-failure streak
+    a.update(&db.0).await?;
+    Ok(())
+}
+
+/// Record a failed probe attempt without touching the last known snapshot,
+/// and bump the consecutive-failure streak (`list_open_pull_requests` stops
+/// sweeping the row once this reaches the caller's give-up threshold).
+/// Returns the NEW streak count (`None` if the row is gone) so the caller can
+/// tell whether THIS attempt is the one that just crossed the threshold — the
+/// monitor uses that to give the row's Needs-you notice honestly different
+/// wording ("stopped checking, here's how to resume") instead of repeating
+/// the same transient-failure text forever after tracking has actually
+/// stopped.
+pub async fn mark_pull_request_probe_error(db: &Db, id: i32, message: &str) -> Result<Option<i32>> {
+    let Some(row) = pull_request::Entity::find_by_id(id).one(&db.0).await? else {
+        return Ok(None);
+    };
+    let next_fail_count = row.probe_fail_count.saturating_add(1);
+    let mut a: pull_request::ActiveModel = row.into();
+    a.last_checked_at = Set(now());
+    a.last_error = Set(message.to_string());
+    a.probe_fail_count = Set(next_fail_count);
+    a.update(&db.0).await?;
+    Ok(Some(next_fail_count))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2918,6 +3834,77 @@ mod tests {
                 .await
                 .unwrap();
         (ws, repo, thread, direction)
+    }
+
+    // ---- the test-only write-failure seam's own contract ----
+
+    /// The property every caller of [`fail_write`] depends on: arming ONE write
+    /// fails exactly that write and leaves its neighbours alone. Without that
+    /// selectivity the seam could not reproduce the situation the gated
+    /// degradation paths exist for — "this write failed, the ones around it
+    /// succeeded" — it would just look like a dead database.
+    #[tokio::test]
+    async fn fail_write_only_fails_the_armed_write() {
+        let db = mem().await;
+        let thread_id = live_thread(&db).await;
+
+        fail_write::while_failing("mark_turn_freeze_recovered", async {
+            assert!(
+                mark_turn_freeze_recovered(&db, thread_id, None).await.is_err(),
+                "the armed write must fail"
+            );
+            // A neighbour sharing the very same INSERT choke point
+            // (`insert_lead_message`) is untouched — the seam keys on the named
+            // write, not on the statement underneath it.
+            assert!(
+                insert_lead_message(&db, thread_id, None, 1, "assistant", "text", "{}", "complete")
+                    .await
+                    .is_ok(),
+                "an unarmed write through the same choke point must still succeed"
+            );
+            // …and so is the other write the freeze recovery performs around it.
+            assert!(set_lead_native_id_opt(&db, thread_id, None).await.is_ok());
+        })
+        .await;
+    }
+
+    /// Arming is scoped to the task that armed it, and ends with the scope:
+    /// nothing is left armed for the rest of the process (which is what lets
+    /// `cargo test`'s parallel threads arm freely without a serializing lock).
+    #[tokio::test]
+    async fn fail_write_arming_ends_with_its_scope() {
+        let db = mem().await;
+        let thread_id = live_thread(&db).await;
+
+        fail_write::while_failing("mark_turn_freeze_recovered", async {
+            assert!(mark_turn_freeze_recovered(&db, thread_id, None).await.is_err());
+        })
+        .await;
+
+        assert!(
+            mark_turn_freeze_recovered(&db, thread_id, None).await.is_ok(),
+            "outside the scope the same write must behave normally"
+        );
+    }
+
+    /// An armed write fails BEFORE it mutates anything — the seam has to model a
+    /// write that didn't happen, not a half-applied one, or every test built on
+    /// it would be asserting against a state production never reaches.
+    #[tokio::test]
+    async fn fail_write_leaves_no_partial_row() {
+        let db = mem().await;
+        let thread_id = live_thread(&db).await;
+
+        fail_write::while_failing("mark_turn_freeze_recovered", async {
+            let _ = mark_turn_freeze_recovered(&db, thread_id, None).await;
+        })
+        .await;
+
+        assert_eq!(
+            last_turn_freeze_recovery_secs(&db, thread_id, None).await.unwrap(),
+            None,
+            "no marker row may survive an injected failure"
+        );
     }
 
     #[tokio::test]
@@ -3104,6 +4091,32 @@ mod tests {
         assert!(
             get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
             "deleting a repo must invalidate the workspace map doc"
+        );
+    }
+
+    /// issue #110 T3 review: same fix as `delete_thread_cascade_removes_
+    /// tracked_pull_requests`, for a repo (rather than a whole issue) delete.
+    #[tokio::test]
+    async fn delete_repo_cascade_removes_tracked_pull_requests() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "T", "feature", "claude").await.unwrap();
+        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        let dir = create_direction(&db, t.id, "d", "claude", a.id, "reason", "plan+impl", "")
+            .await
+            .unwrap();
+        let pr = register_pull_request(
+            &db, t.id, dir.id, a.id, "github", "github.com", "acme", "widgets", 6,
+            "https://github.com/acme/widgets/pull/6", "fix bug",
+        )
+        .await
+        .unwrap();
+
+        delete_repo_cascade(&db, a.id).await.unwrap();
+
+        assert!(
+            get_pull_request(&db, pr.id).await.unwrap().is_none(),
+            "a deleted repo's tracked PR/MR rows must not outlive it"
         );
     }
 
@@ -3426,11 +4439,17 @@ mod tests {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
         let a = ensure_curator_thread(&db, ws.id, "codex").await.unwrap();
+        assert!(
+            !get_thread(&db, a).await.unwrap().unwrap().engine_pinned,
+            "a configured/default curator engine is not a manual pin"
+        );
+        set_thread_engine_pinned(&db, a, true).await.unwrap();
         let b = ensure_curator_thread(&db, ws.id, "codex").await.unwrap();
         assert_eq!(a, b, "the same curator thread is reused");
         let t = get_thread(&db, a).await.unwrap().unwrap();
         assert_eq!(t.kind, "curator");
         assert_eq!(t.lead_tool, "codex", "uses the provided default tool, not hard-coded claude");
+        assert!(t.engine_pinned, "reusing a curator must preserve a user pin");
         // a normal issue coexists; the board view filters curator out.
         create_thread(&db, ws.id, "Real issue", "feature", "claude")
             .await
@@ -4219,6 +5238,35 @@ mod tests {
         assert_eq!(list_worktrees(&db, None).await.unwrap().len(), 0);
     }
 
+    /// issue #110 T3 review: a tracked PR/MR row has no FK to the thread that
+    /// owns it, so without this fix it would silently outlive a deleted
+    /// issue — `host::automerge`'s sweep would keep tracking (and could
+    /// still auto-merge) a PR belonging to an issue the user just deleted.
+    #[tokio::test]
+    async fn delete_thread_cascade_removes_tracked_pull_requests() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "T", "feature", "claude").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true).await.unwrap();
+        let dir = create_direction(&db, t.id, "d", "claude", repo.id, "reason", "plan+impl", "")
+            .await
+            .unwrap();
+        let pr = register_pull_request(
+            &db, t.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 5,
+            "https://github.com/acme/widgets/pull/5", "fix bug",
+        )
+        .await
+        .unwrap();
+        assert!(get_pull_request(&db, pr.id).await.unwrap().is_some());
+
+        delete_thread_cascade(&db, t.id).await.unwrap();
+
+        assert!(
+            get_pull_request(&db, pr.id).await.unwrap().is_none(),
+            "a deleted issue's tracked PR/MR rows must not outlive it"
+        );
+    }
+
     #[tokio::test]
     async fn create_workspace_rejects_empty_name() {
         let db = mem().await;
@@ -4515,6 +5563,36 @@ mod tests {
         assert_eq!(scopes, vec![format!("ws:{}", keep_ws.id)]);
     }
 
+    /// issue #110 T3 review: same fix as `delete_thread_cascade_removes_
+    /// tracked_pull_requests`, for a whole-workspace delete.
+    #[tokio::test]
+    async fn delete_workspace_cascade_removes_tracked_pull_requests() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "delete me").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        let dir = create_direction(&db, thread.id, "d", "claude", repo.id, "reason", "plan+impl", "")
+            .await
+            .unwrap();
+        let pr = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 7,
+            "https://github.com/acme/widgets/pull/7", "fix bug",
+        )
+        .await
+        .unwrap();
+
+        delete_workspace_cascade(&db, ws.id).await.unwrap();
+
+        assert!(
+            get_pull_request(&db, pr.id).await.unwrap().is_none(),
+            "a deleted workspace's tracked PR/MR rows must not outlive it"
+        );
+    }
+
     #[tokio::test]
     async fn workspace_owned_writes_reject_deleted_workspace() {
         let db = mem().await;
@@ -4790,6 +5868,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t.lead_tool, "codex");
+        assert!(!t.engine_pinned, "the configured default is not a manual pin");
     }
 
     #[tokio::test]
@@ -4960,16 +6039,21 @@ mod tests {
         set_tool_command(&db, "claude", "cc-claude", false).await.unwrap();
         assert_eq!(get_thread(&db, t.id).await.unwrap().unwrap().lead_command.as_deref(), Some("claude"));
 
-        let switched = switch_thread_tool(&db, t.id, "codex", Some("gpt-5.5-high")).await.unwrap();
+        switch_lead_engine_txn(&db, t.id, "codex", Some("gpt-5.5-high"))
+            .await
+            .unwrap();
+        // Read back rather than trusting a returned model: what matters is
+        // what COMMITTED, and the transaction no longer hands one out.
+        let switched = get_thread(&db, t.id).await.unwrap().unwrap();
         assert_eq!(switched.lead_tool, "codex");
         assert_eq!(switched.lead_model.as_deref(), Some("gpt-5.5-high"));
         assert_eq!(switched.lead_command, None, "stale claude alias pin must be cleared");
 
         // A model override clears the same way when the caller passes None.
-        let cleared = switch_thread_tool(&db, t.id, "codex", None).await.unwrap();
-        assert_eq!(cleared.lead_model, None);
+        switch_lead_engine_txn(&db, t.id, "codex", None).await.unwrap();
+        assert_eq!(get_thread(&db, t.id).await.unwrap().unwrap().lead_model, None);
 
-        assert!(switch_thread_tool(&db, 9999, "codex", None).await.is_err());
+        assert!(switch_lead_engine_txn(&db, 9999, "codex", None).await.is_err());
     }
 
     #[tokio::test]
@@ -4992,7 +6076,7 @@ mod tests {
             a.update(&db.0).await.unwrap();
         }
 
-        switch_worker_tool_txn(&db, d.id, s.id, "opencode", Some("kimi-for-coding/k2p6"))
+        switch_worker_engine_txn(&db, d.id, s.id, "opencode", Some("kimi-for-coding/k2p6"))
             .await
             .unwrap();
 
@@ -5002,14 +6086,518 @@ mod tests {
         assert_eq!(s2.tool, "opencode");
         assert_eq!(s2.model.as_deref(), Some("kimi-for-coding/k2p6"));
         assert_eq!(s2.command, None, "stale claude alias pin must be cleared");
-        // Switching direction/session tool does not itself touch native id —
-        // that is the caller's (lead_chat::commands) job, layered separately.
-        assert_eq!(s2.native_session_id.as_deref(), Some("native-1"));
+        // The native-id clear rides this same transaction as of PR #140 round
+        // 6. It used to be a separate write the caller made afterwards, which
+        // could fail on its own and leave the new tool paired with the OLD
+        // engine's native id — a pair `worker_engine` would then try to resume
+        // across engines. Atomic here, that pair cannot exist.
+        assert_eq!(s2.native_session_id, None, "the switch clears it in the same write");
 
-        assert!(switch_worker_tool_txn(&db, 9999, s.id, "codex", None).await.is_err());
+        assert!(switch_worker_engine_txn(&db, 9999, s.id, "codex", None).await.is_err());
         // A missing session is tolerated (not an error) on the session half —
         // see the function doc — as long as the direction is real.
-        assert!(switch_worker_tool_txn(&db, d.id, 9999, "codex", None).await.is_ok());
+        assert!(switch_worker_engine_txn(&db, d.id, 9999, "codex", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn refresh_unpinned_direction_route_updates_a_no_native_initial_session_too() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "Issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "main",
+            "codex",
+            repo.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
+            .await
+            .unwrap();
+        {
+            let mut active: session::ActiveModel = get_session(&db, session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+            active.command = Set(Some("cc-codex".to_string()));
+            active.model = Set(Some("gpt-5.5-high".to_string()));
+            active.update(&db.0).await.unwrap();
+        }
+
+        refresh_unpinned_direction_route(&db, direction.id, Some(session.id), "claude")
+            .await
+            .unwrap();
+
+        let refreshed_direction = get_direction(&db, direction.id).await.unwrap().unwrap();
+        let refreshed_session = get_session(&db, session.id).await.unwrap().unwrap();
+        assert_eq!(refreshed_direction.tool, "claude");
+        assert!(!refreshed_direction.engine_pinned);
+        assert_eq!(refreshed_session.tool, "claude");
+        assert!(!refreshed_session.engine_pinned);
+        assert_eq!(refreshed_session.command, None);
+        assert_eq!(refreshed_session.model, None);
+        assert_eq!(refreshed_session.native_session_id, None);
+    }
+
+    #[tokio::test]
+    async fn refresh_unpinned_direction_route_preserves_a_newly_established_session() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "Issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "main",
+            "codex",
+            repo.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
+            .await
+            .unwrap();
+        set_session_native_id(&db, session.id, "native-1")
+            .await
+            .unwrap();
+
+        let err = refresh_unpinned_direction_route(&db, direction.id, Some(session.id), "claude")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("became established"));
+
+        let unchanged_direction = get_direction(&db, direction.id).await.unwrap().unwrap();
+        let unchanged_session = get_session(&db, session.id).await.unwrap().unwrap();
+        assert_eq!(unchanged_direction.tool, "codex");
+        assert!(!unchanged_direction.engine_pinned);
+        assert_eq!(unchanged_session.tool, "codex");
+        assert!(!unchanged_session.engine_pinned);
+        assert_eq!(unchanged_session.native_session_id.as_deref(), Some("native-1"));
+    }
+
+    #[tokio::test]
+    async fn refresh_unpinned_thread_route_never_overwrites_a_manual_pin() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let thread = create_thread(&db, ws.id, "Issue", "feature", "codex")
+            .await
+            .unwrap();
+
+        assert!(refresh_unpinned_thread_route(&db, thread.id, "claude")
+            .await
+            .unwrap());
+        assert_eq!(get_thread(&db, thread.id).await.unwrap().unwrap().lead_tool, "claude");
+
+        set_thread_engine_pinned(&db, thread.id, true).await.unwrap();
+        assert!(!refresh_unpinned_thread_route(&db, thread.id, "codex")
+            .await
+            .unwrap());
+        let current = get_thread(&db, thread.id).await.unwrap().unwrap();
+        assert_eq!(current.lead_tool, "claude");
+        assert!(current.engine_pinned);
+    }
+
+    #[tokio::test]
+    async fn manual_direction_pin_refuses_a_direction_that_already_opened() {
+        let db = mem().await;
+        let (_, repo, _, direction) = worker_fixture(&db).await;
+        create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
+            .await
+            .unwrap();
+
+        let err = pin_unstarted_unpinned_direction_route(&db, direction.id, "opencode")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("opened while pinning"));
+        let after = get_direction(&db, direction.id).await.unwrap().unwrap();
+        assert_eq!(after.tool, "codex");
+        assert!(!after.engine_pinned);
+    }
+
+    #[tokio::test]
+    async fn current_route_session_creation_observes_a_manual_pin() {
+        let db = mem().await;
+        let (_, repo, _, direction) = worker_fixture(&db).await;
+        pin_unstarted_unpinned_direction_route(&db, direction.id, "opencode")
+            .await
+            .unwrap();
+
+        let session = create_session_for_current_direction(&db, direction.id, repo.id, "/tmp/cwd")
+            .await
+            .unwrap();
+        assert_eq!(session.tool, "opencode");
+        assert!(session.engine_pinned);
+    }
+
+    #[tokio::test]
+    async fn confirmed_plan_pin_rolls_back_when_a_worker_session_exists() {
+        let db = mem().await;
+        let (_, repo, thread, direction) = worker_fixture(&db).await;
+        upsert_plan(&db, thread.id, "before", "proposed", "1")
+            .await
+            .unwrap();
+        create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
+            .await
+            .unwrap();
+
+        let err = commit_confirmed_plan_with_direction_pins_cas(
+            &db,
+            thread.id,
+            "after",
+            "before",
+            "proposed",
+            &[InitialDirectionRoutePin {
+                direction_id: direction.id,
+                session_id: None,
+                tool: "opencode".to_string(),
+            }],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("opened while confirming"));
+        let plan = get_plan(&db, thread.id).await.unwrap().unwrap();
+        assert_eq!(plan.proposal, "before");
+        assert_eq!(plan.status, "proposed");
+        let after = get_direction(&db, direction.id).await.unwrap().unwrap();
+        assert_eq!(after.tool, "codex");
+        assert!(!after.engine_pinned);
+    }
+
+    #[tokio::test]
+    async fn confirmed_plan_pin_updates_an_unestablished_session_atomically() {
+        let db = mem().await;
+        let (_, repo, thread, direction) = worker_fixture(&db).await;
+        upsert_plan(&db, thread.id, "before", "proposed", "1")
+            .await
+            .unwrap();
+        let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
+            .await
+            .unwrap();
+
+        let applied = commit_confirmed_plan_with_direction_pins_cas(
+            &db,
+            thread.id,
+            "after",
+            "before",
+            "proposed",
+            &[InitialDirectionRoutePin {
+                direction_id: direction.id,
+                session_id: Some(session.id),
+                tool: "opencode".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert!(applied);
+        let plan = get_plan(&db, thread.id).await.unwrap().unwrap();
+        assert_eq!(plan.proposal, "after");
+        assert_eq!(plan.status, "confirmed");
+        let direction = get_direction(&db, direction.id).await.unwrap().unwrap();
+        assert_eq!(direction.tool, "opencode");
+        assert!(direction.engine_pinned);
+        let session = get_session(&db, session.id).await.unwrap().unwrap();
+        assert_eq!(session.tool, "opencode");
+        assert!(session.engine_pinned);
+        assert!(session.native_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn reused_approval_commits_manual_pin_with_the_plan_decision() {
+        let db = mem().await;
+        let (_, _repo, thread, direction) = worker_fixture(&db).await;
+        upsert_plan(&db, thread.id, "before", "proposed", "1")
+            .await
+            .unwrap();
+
+        let applied = commit_reused_approval_with_direction_pin_cas(
+            &db,
+            thread.id,
+            "after",
+            "before",
+            "proposed",
+            &InitialDirectionRoutePin {
+                direction_id: direction.id,
+                session_id: None,
+                tool: "opencode".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(applied);
+        let plan = get_plan(&db, thread.id).await.unwrap().unwrap();
+        assert_eq!(plan.proposal, "after");
+        let after = get_direction(&db, direction.id).await.unwrap().unwrap();
+        assert_eq!(after.tool, "opencode");
+        assert!(after.engine_pinned);
+    }
+
+    #[tokio::test]
+    async fn reused_approval_updates_an_unestablished_session_atomically() {
+        let db = mem().await;
+        let (_, repo, thread, direction) = worker_fixture(&db).await;
+        upsert_plan(&db, thread.id, "before", "proposed", "1")
+            .await
+            .unwrap();
+        let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
+            .await
+            .unwrap();
+
+        let applied = commit_reused_approval_with_direction_pin_cas(
+            &db,
+            thread.id,
+            "after",
+            "before",
+            "proposed",
+            &InitialDirectionRoutePin {
+                direction_id: direction.id,
+                session_id: Some(session.id),
+                tool: "opencode".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(applied);
+        assert_eq!(get_plan(&db, thread.id).await.unwrap().unwrap().proposal, "after");
+        let direction = get_direction(&db, direction.id).await.unwrap().unwrap();
+        assert_eq!(direction.tool, "opencode");
+        assert!(direction.engine_pinned);
+        let session = get_session(&db, session.id).await.unwrap().unwrap();
+        assert_eq!(session.tool, "opencode");
+        assert!(session.engine_pinned);
+        assert!(session.native_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn reused_approval_rolls_back_when_a_worker_session_exists() {
+        let db = mem().await;
+        let (_, repo, thread, direction) = worker_fixture(&db).await;
+        upsert_plan(&db, thread.id, "before", "proposed", "1")
+            .await
+            .unwrap();
+        create_session(&db, direction.id, repo.id, "codex", "/tmp/cwd")
+            .await
+            .unwrap();
+
+        let err = commit_reused_approval_with_direction_pin_cas(
+            &db,
+            thread.id,
+            "after",
+            "before",
+            "proposed",
+            &InitialDirectionRoutePin {
+                direction_id: direction.id,
+                session_id: None,
+                tool: "opencode".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("opened while approving"));
+        let plan = get_plan(&db, thread.id).await.unwrap().unwrap();
+        assert_eq!(plan.proposal, "before");
+        let after = get_direction(&db, direction.id).await.unwrap().unwrap();
+        assert_eq!(after.tool, "codex");
+        assert!(!after.engine_pinned);
+    }
+
+    #[tokio::test]
+    async fn engine_pin_tracks_manual_choices_but_not_automatic_failover() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "Issue", "feature", "claude")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "main",
+            "claude",
+            repo.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = create_session(&db, direction.id, repo.id, "claude", "/tmp/cwd")
+            .await
+            .unwrap();
+        assert!(!thread.engine_pinned);
+        assert!(!direction.engine_pinned);
+        assert!(!session.engine_pinned);
+
+        switch_lead_engine_txn_with_pin(&db, thread.id, "codex", None, false)
+            .await
+            .unwrap();
+        switch_worker_engine_txn_with_pin(&db, direction.id, session.id, "codex", None, false)
+            .await
+            .unwrap();
+        assert!(!get_thread(&db, thread.id).await.unwrap().unwrap().engine_pinned);
+        assert!(!get_direction(&db, direction.id).await.unwrap().unwrap().engine_pinned);
+        assert!(!get_session(&db, session.id).await.unwrap().unwrap().engine_pinned);
+
+        switch_lead_engine_txn(&db, thread.id, "claude", None)
+            .await
+            .unwrap();
+        switch_worker_engine_txn(&db, direction.id, session.id, "claude", None)
+            .await
+            .unwrap();
+        assert!(get_thread(&db, thread.id).await.unwrap().unwrap().engine_pinned);
+        assert!(get_direction(&db, direction.id).await.unwrap().unwrap().engine_pinned);
+        assert!(get_session(&db, session.id).await.unwrap().unwrap().engine_pinned);
+    }
+
+    /// Two `Db` handles onto one WAL file, so a concurrent commit is a real
+    /// event rather than a simulated one. Migrations run once; the second
+    /// handle just opens the same file.
+    async fn shared_file_db(dir: &std::path::Path) -> (Db, Db) {
+        use sea_orm::ConnectionTrait;
+        let url = format!("sqlite://{}?mode=rwc", dir.join("weft.db").to_string_lossy());
+        let open = |url: String| async move {
+            let conn = sea_orm::Database::connect(url).await.unwrap();
+            conn.execute_unprepared("PRAGMA journal_mode=WAL;").await.unwrap();
+            conn.execute_unprepared("PRAGMA busy_timeout=2000;").await.unwrap();
+            conn
+        };
+        let a = open(url.clone()).await;
+        use sea_orm_migration::MigratorTrait;
+        crate::store::migration::Migrator::up(&a, None).await.unwrap();
+        let b = open(url).await;
+        (Db(a, false), Db(b, false))
+    }
+
+    /// PR #140 rounds 11/15: the switch transactions take the write lock with
+    /// their FIRST statement, because a deferred read→write upgrade is not
+    /// safe under WAL — `insert_lead_message` documents the same hazard and is
+    /// why it is not a transaction at all. The busy timeout cannot repair a
+    /// stale snapshot, and by the time this runs the command has already torn
+    /// the live engine down, so a spurious abort is not a harmless retry.
+    ///
+    /// DETERMINISTIC, with no sleeps: the transaction rendezvouses with the
+    /// test immediately after its first statement (`probe_after_first_statement!`),
+    /// and while it is parked there a THIRD connection asks the only question
+    /// that separates the two shapes — is the write lock already held?
+    ///
+    ///   - write-first: the opening `UPDATE` took it, so the probe is refused.
+    ///   - read-first:  the opening `SELECT` took nothing, so the probe wins,
+    ///                  and its commit then poisons the transaction's snapshot.
+    ///
+    /// Two earlier versions of this test were timing-based and could silently
+    /// stop discriminating on a loaded runner; this one has no timing in it.
+    #[tokio::test]
+    async fn the_switch_transaction_holds_the_write_lock_from_its_first_statement() {
+        use sea_orm::ConnectionTrait;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (a, probe) = shared_file_db(dir.path()).await;
+        let ws = create_workspace(&a, "ws").await.unwrap();
+        let t = create_thread(&a, ws.id, "Issue", "feature", "claude").await.unwrap();
+        // The probe must fail fast rather than wait for the lock, or it would
+        // block until the parked transaction commits.
+        probe.0.execute_unprepared("PRAGMA busy_timeout=0;").await.unwrap();
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        // A third handle for the transaction itself, so `a` stays available
+        // here for the read-back at the end.
+        let (writer, _spare) = shared_file_db(dir.path()).await;
+        let switching = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let tid = t.id;
+            tokio::spawn(async move {
+                txn_probe::AFTER_FIRST_STATEMENT
+                    .scope(barrier, switch_lead_engine_txn(&writer, tid, "codex", Some("opus")))
+                    .await
+            })
+        };
+
+        // Parked after its first statement — no clock involved, the barrier is
+        // what orders this.
+        barrier.wait().await;
+        let contended = probe
+            .0
+            .execute_unprepared("UPDATE thread SET title = 'probe' WHERE id = 1;")
+            .await;
+        assert!(
+            contended.is_err(),
+            "the transaction must already hold the write lock after its FIRST statement; a \
+             read-first shape would leave it free here and then abort on the stale snapshot"
+        );
+
+        barrier.wait().await;
+        switching.await.expect("join").expect("the switch itself must succeed");
+        let after = get_thread(&a, t.id).await.unwrap().unwrap();
+        assert_eq!(after.lead_tool, "codex");
+        assert_eq!(after.lead_model.as_deref(), Some("opus"));
+        assert!(last_turn_freeze_recovery_secs(&a, t.id, None).await.unwrap().is_some());
+    }
+
+    /// PR #140 round 6: the lead's tool/model write and its native-id clear are
+    /// ONE transaction, so they cannot half-apply.
+    ///
+    /// Same technique as the worker test below — force the SECOND half to fail
+    /// with a genuine DB error while the first is perfectly healthy, then
+    /// assert the first rolled back. The lead's native id lives in a
+    /// `kind = "meta"` lead_message row rather than a column, so renaming that
+    /// table away is what breaks the clear specifically.
+    ///
+    /// Without the transaction this leaves `lead_tool = "codex"` next to the
+    /// old engine's native id — the pair the next send would try to resume
+    /// across engines, and one no grace window repairs.
+    #[tokio::test]
+    async fn switch_lead_engine_txn_rolls_back_the_tool_when_the_native_clear_fails() {
+        use sea_orm::ConnectionTrait;
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        set_lead_native_id(&db, t.id, "lead-native-1").await.unwrap();
+
+        // Claimed BEFORE the table goes away — this is the switch's own step 0,
+        // and the transaction below is what would have promoted it.
+        db.0.execute_unprepared("ALTER TABLE lead_message RENAME TO lead_message_renamed_for_test")
+            .await
+            .unwrap();
+        let err = switch_lead_engine_txn(&db, t.id, "codex", Some("gpt-5.5-high")).await;
+        assert!(err.is_err(), "the native-id half must fail (table renamed away)");
+        db.0.execute_unprepared("ALTER TABLE lead_message_renamed_for_test RENAME TO lead_message")
+            .await
+            .unwrap();
+
+        let t2 = get_thread(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(
+            t2.lead_tool, "claude",
+            "lead_tool must be ROLLED BACK — a committed tool next to the old native id is \
+             exactly the half-applied pair this transaction exists to prevent"
+        );
+        assert_eq!(t2.lead_model, None);
+        assert_eq!(
+            lead_native_id(&db, t.id).await.unwrap().as_deref(),
+            Some("lead-native-1"),
+            "and the id is untouched, so the surface is still coherently on the OLD engine"
+        );
     }
 
     /// Adversarial re-review of PR #139, P1: the direction/session writes used
@@ -5024,7 +6612,7 @@ mod tests {
     /// a busy-snapshot race) while the direction half is perfectly healthy,
     /// then asserts the direction was rolled back too.
     #[tokio::test]
-    async fn switch_worker_tool_txn_rolls_back_direction_when_session_write_fails() {
+    async fn switch_worker_engine_txn_rolls_back_direction_when_session_write_fails() {
         use sea_orm::ConnectionTrait;
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
@@ -5043,7 +6631,8 @@ mod tests {
             .await
             .unwrap();
 
-        let err = switch_worker_tool_txn(&db, d.id, s.id, "opencode", Some("gpt-5.5-high")).await;
+        let err =
+            switch_worker_engine_txn(&db, d.id, s.id, "opencode", Some("gpt-5.5-high")).await;
         assert!(err.is_err(), "the session-table write must fail (table renamed away)");
 
         // Restore the table so the read-back below (and any other test using
@@ -5198,11 +6787,22 @@ mod tests {
         let t = create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
 
         // A concrete base → stored, and target_branch defaults to it.
-        let d = create_direction(&db, t.id, "x", "claude", r.id, "r", "plan+impl", "develop")
-            .await
-            .unwrap();
+        let d = create_direction_with_engine_pin(
+            &db,
+            t.id,
+            "x",
+            "claude",
+            r.id,
+            "r",
+            "plan+impl",
+            "develop",
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(d.base_branch, "develop");
         assert_eq!(d.target_branch, "develop", "target defaults to the chosen base");
+        assert!(d.engine_pinned, "the pin must be part of the inserted direction");
 
         // Empty base → both empty (each resolves to the repo default later).
         let d2 = create_direction(&db, t.id, "y", "claude", r.id, "r", "plan+impl", "")
@@ -5210,6 +6810,7 @@ mod tests {
             .unwrap();
         assert_eq!(d2.base_branch, "");
         assert_eq!(d2.target_branch, "", "empty base leaves target empty (= repo default)");
+        assert!(!d2.engine_pinned);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5858,5 +7459,215 @@ mod tests {
         let ids: Vec<i32> = msgs.iter().map(|m| m.id).collect();
         // COALESCE(seq, id) ordering: A → a.id, C → c.id, B → c.id+1
         assert_eq!(ids, vec![a.id, c.id, b.id], "B must sort after C once its seq > C.id");
+    }
+
+    // ---- pull_request (issue #110 T1) ----
+
+    #[tokio::test]
+    async fn register_pull_request_creates_then_upserts_by_natural_key() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+
+        let first = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 42,
+            "https://github.com/acme/widgets/pull/42", "first title",
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.lifecycle, "open");
+        assert_eq!(first.title, "first title");
+
+        // Re-registering the SAME (host_kind, owner, repo, number) updates the
+        // existing row instead of creating a second one.
+        let second = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 42,
+            "https://github.com/acme/widgets/pull/42", "updated title",
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.id, first.id, "must upsert, not duplicate");
+        assert_eq!(second.title, "updated title");
+
+        let all = pull_request::Entity::find().all(&db.0).await.unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_open_pull_requests_excludes_merged_and_closed() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let open = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 1, "", "",
+        )
+        .await
+        .unwrap();
+        let merged = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 2, "", "",
+        )
+        .await
+        .unwrap();
+        let mut a: pull_request::ActiveModel = merged.clone().into();
+        a.lifecycle = Set("merged".to_string());
+        a.update(&db.0).await.unwrap();
+
+        let listed = list_open_pull_requests(&db, 10).await.unwrap();
+        let ids: Vec<i32> = listed.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![open.id]);
+    }
+
+    /// P1 (issue #110 adversarial review): a row that has failed enough
+    /// CONSECUTIVE probes falls out of the sweep too — a persistently-broken
+    /// probe (deleted PR, revoked auth) must not be retried forever.
+    #[tokio::test]
+    async fn list_open_pull_requests_excludes_rows_past_the_probe_failure_threshold() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let healthy = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 1, "", "",
+        )
+        .await
+        .unwrap();
+        let broken = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 2, "", "",
+        )
+        .await
+        .unwrap();
+
+        // Under the threshold: still swept.
+        mark_pull_request_probe_error(&db, broken.id, "blip").await.unwrap();
+        let listed = list_open_pull_requests(&db, 2).await.unwrap();
+        assert_eq!(listed.len(), 2, "a single failure must not stop the sweep");
+
+        // At the threshold: no longer swept.
+        mark_pull_request_probe_error(&db, broken.id, "still broken").await.unwrap();
+        let listed = list_open_pull_requests(&db, 2).await.unwrap();
+        let ids: Vec<i32> = listed.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![healthy.id], "a row at the give-up threshold must fall out of the sweep");
+
+        // A later SUCCESS resets the streak — the row rejoins the sweep.
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: "abc".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Open,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        let readiness =
+            crate::host::judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+        apply_pull_request_snapshot(&db, broken.id, &snapshot, &readiness).await.unwrap();
+        let listed = list_open_pull_requests(&db, 2).await.unwrap();
+        assert_eq!(listed.len(), 2, "a success must reset the failure streak and rejoin the sweep");
+    }
+
+    /// P1-A (issue #110 adversarial review, round 3): a success is not the
+    /// ONLY way `probe_fail_count` can reset — a row already past the give-up
+    /// threshold can NEVER see another success (it has fallen out of the
+    /// sweep for good), so `register_pull_request`'s re-registration path is
+    /// its one remaining escape hatch. Without this, that tool's own
+    /// documented contract ("re-calling it just refreshes context") would be
+    /// false for exactly the row that most needs it.
+    #[tokio::test]
+    async fn re_registering_an_existing_pr_resets_the_probe_failure_streak() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let pr = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 4, "", "",
+        )
+        .await
+        .unwrap();
+
+        // Push it past a small give-up threshold — simulating the dead end:
+        // no success is coming (that's the whole point of "gave up"), so the
+        // ONLY thing that can still touch this row is a fresh registration.
+        mark_pull_request_probe_error(&db, pr.id, "still broken").await.unwrap();
+        mark_pull_request_probe_error(&db, pr.id, "still broken").await.unwrap();
+        let listed = list_open_pull_requests(&db, 2).await.unwrap();
+        assert!(listed.is_empty(), "must have fallen out of the sweep at the threshold");
+
+        // Re-registering the SAME PR (natural key unchanged) must reset the
+        // streak and bring it back into the sweep — the row was never
+        // actually resolved, but the human/agent asked weft to try again.
+        register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 4, "", "",
+        )
+        .await
+        .unwrap();
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.probe_fail_count, 0, "re-registration must reset the streak");
+        let listed = list_open_pull_requests(&db, 2).await.unwrap();
+        assert_eq!(listed.len(), 1, "the row must rejoin the sweep after re-registration");
+    }
+
+    #[tokio::test]
+    async fn apply_snapshot_overwrites_axes_and_clears_prior_error() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let pr = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 7, "", "",
+        )
+        .await
+        .unwrap();
+        mark_pull_request_probe_error(&db, pr.id, "boom: gh not authenticated")
+            .await
+            .unwrap();
+
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: "abc123".to_string(),
+            base_ref: "main".to_string(),
+            url: "https://github.com/acme/widgets/pull/7".to_string(),
+            title: "fix things".to_string(),
+            lifecycle: crate::host::PrLifecycle::Open,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        let readiness = crate::host::judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness)
+            .await
+            .unwrap();
+
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.head_sha, "abc123");
+        assert_eq!(reloaded.last_error, "", "a successful apply clears any prior probe error");
+        assert!(!reloaded.last_checked_at.is_empty());
+        assert!(reloaded.ci_status.contains("passing"));
+        assert!(reloaded.merge_readiness.contains("ready"));
+    }
+
+    #[tokio::test]
+    async fn probe_error_leaves_last_known_snapshot_untouched() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let pr = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 9, "", "",
+        )
+        .await
+        .unwrap();
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: "known-good-sha".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Open,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        let readiness = crate::host::judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness)
+            .await
+            .unwrap();
+
+        // A later probe failure (e.g. a transient network blip) must NOT erase
+        // the last known-good snapshot — only `last_checked_at`/`last_error` move.
+        mark_pull_request_probe_error(&db, pr.id, "network blip")
+            .await
+            .unwrap();
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.head_sha, "known-good-sha", "probe failure must not blank the last known snapshot");
+        assert_eq!(reloaded.last_error, "network blip");
     }
 }

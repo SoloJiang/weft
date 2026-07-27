@@ -365,6 +365,76 @@ pub fn turn_error_text(params: &Value) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
+/// True only for a machine-readable quota cause attached to this completed
+/// turn. Do not inspect the display message: generic transport, auth, or tool
+/// errors may contain similar words but must never trigger a provider switch.
+pub fn turn_reports_quota_exceeded(params: &Value) -> bool {
+    let error = &params["turn"]["error"];
+    let mut codes = [
+        error["code"].as_str(),
+        error["type"].as_str(),
+        error["kind"].as_str(),
+        error["details"]["code"].as_str(),
+    ]
+    .into_iter()
+    .flatten();
+    codes.any(|code| {
+        matches!(
+            code.trim().to_ascii_lowercase().as_str(),
+            "rate_limit_exceeded" | "rate_limit_reached" | "quota_exceeded" | "usage_limit_exceeded"
+        )
+    })
+}
+
+/// A codex app-server `RateLimitSnapshot` (the `rateLimits` field of an
+/// `account/rateLimits/updated` notification, or of an `account/rateLimits/read`
+/// response) → an [`crate::engine_quota::QuotaSnapshot`] for "codex" (issue #97).
+///
+/// Ground truth: openai/codex `codex-rs/app-server-protocol/src/protocol/v2/account.rs`.
+/// `primary`/`secondary` are independent rolling windows (`usedPercent`: 0-100
+/// int, `resetsAt`: unix seconds, both camelCase on the wire); `rateLimitReachedType`
+/// is present (any string variant) only once the account has ACTUALLY hit a
+/// limit — that field, not a bare `usedPercent >= 100`, is the authoritative
+/// "exceeded" signal, since a sparse rolling update can carry the reached-type
+/// without a fresh percent on either window. When both windows are present, the
+/// more severe one wins (picked by percent, ties favor `primary`). `None` when
+/// the payload carries nothing usable — never fabricates an `Ok` reading from an
+/// absent/malformed snapshot.
+pub(crate) fn codex_quota_snapshot(rate_limits: &Value) -> Option<crate::engine_quota::QuotaSnapshot> {
+    if !rate_limits.is_object() {
+        return None;
+    }
+    let reached = rate_limits["rateLimitReachedType"].as_str().is_some();
+    let window = |key: &str| -> Option<(u32, Option<i64>)> {
+        let w = &rate_limits[key];
+        let pct = w["usedPercent"].as_i64()?.clamp(0, 100) as u32;
+        Some((pct, w["resetsAt"].as_i64()))
+    };
+    let primary = window("primary").map(|(pct, resets)| (pct, resets, "primary"));
+    let secondary = window("secondary").map(|(pct, resets)| (pct, resets, "secondary"));
+    let picked = match (primary, secondary) {
+        (Some(p), Some(s)) => Some(if s.0 > p.0 { s } else { p }),
+        (Some(p), None) => Some(p),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    };
+    let (used_percent, resets_at, window_label) = match picked {
+        Some((pct, resets, label)) => (Some(pct), resets, Some(label.to_string())),
+        None => (None, None, None),
+    };
+    if used_percent.is_none() && !reached {
+        return None;
+    }
+    Some(crate::engine_quota::QuotaSnapshot {
+        tool: "codex".to_string(),
+        status: crate::engine_quota::status_for(used_percent, reached),
+        used_percent,
+        resets_at,
+        window_label,
+        observed_at: crate::engine_quota::now_unix(),
+    })
+}
+
 /// Running `ToolCall` from an app-server `item.started` tool item.
 fn appserver_tool_call(item: &Value) -> crate::lead_chat::proto::ToolCall {
     crate::lead_chat::proto::ToolCall {
@@ -515,6 +585,10 @@ fn cap_out(s: &str) -> String {
 pub enum ThreadMsg {
     /// A streaming event for the session's timeline.
     Event(ChatEvent),
+    /// A structured quota-exceeded cause attached to the active turn. It is
+    /// delivered before that turn's `TurnEnd`, allowing the engine to make a
+    /// failover decision at the safe boundary only.
+    QuotaExceeded,
     /// A liveness ping (e.g. command output-delta while a long command runs) that
     /// carries no timeline change — the consumer uses it only to refresh the
     /// runaway-guard's last-activity clock so a busy command isn't idle-killed.
@@ -534,6 +608,9 @@ pub enum ThreadMsg {
 }
 
 struct Inner {
+    /// Exact binary that spawned this app-server process. It stays immutable for
+    /// the connection's lifetime even if the global command override changes.
+    command: String,
     /// Channel to the dedicated stdin writer task. Holds no `ChildStdin` directly,
     /// so async writes never need the state lock.
     // Each entry is (bytes, optional flush-ack): the writer task acks AFTER
@@ -605,6 +682,11 @@ impl Client {
     /// Whether the connection is still alive (read_loop clears the inner on EOF).
     pub async fn is_alive(&self) -> bool {
         self.0.lock().await.is_some()
+    }
+
+    /// The immutable binary that owns this connection's account/quota events.
+    pub async fn spawned_command(&self) -> Option<String> {
+        self.0.lock().await.as_ref().map(|inner| inner.command.clone())
     }
 
     /// Same underlying connection? Lets a consumer tell a genuine disconnect (still
@@ -745,6 +827,7 @@ impl Client {
         });
 
         *g = Some(Inner {
+            command: program.to_string(),
             write_tx,
             next_id: 1,
             pending: HashMap::new(),
@@ -756,7 +839,10 @@ impl Client {
         drop(g);
 
         let me = self.clone();
-        tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
+        let read_quota_command = program.to_string();
+        tauri::async_runtime::spawn(async move {
+            me.read_loop(stdout, read_quota_command).await;
+        });
 
         // Handshake: initialize (await), then the `initialized` notification. If it
         // wedges/errors (auth/network/version), tear the half-open client down so a
@@ -778,12 +864,37 @@ impl Client {
             self.shutdown_and_reap().await;
             return Err(e);
         }
+        // Issue #97: prime the quota hub right away instead of waiting for the
+        // first `account/rateLimits/updated` push, which may not arrive until
+        // AFTER a turn already ran on this connection — decoupled task so a
+        // slow/unsupported endpoint can never delay the connection itself.
+        let quota_probe = self.clone();
+        let probe_quota_command = program.to_string();
+        tauri::async_runtime::spawn(async move {
+            quota_probe
+                .refresh_quota_snapshot(&probe_quota_command)
+                .await;
+        });
         Ok(())
+    }
+
+    /// Best-effort `account/rateLimits/read` → the engine_quota hub (issue #97).
+    /// Errors (older codex without this endpoint, a transient hiccup) are
+    /// swallowed: this is a proactive nice-to-have, never load-bearing for the
+    /// connection or a turn — the notification path (`read_loop`'s
+    /// `account/rateLimits/updated` branch) still populates the hub reactively
+    /// either way.
+    async fn refresh_quota_snapshot(&self, command: &str) {
+        if let Ok(result) = self.request("account/rateLimits/read", Value::Null).await {
+            if let Some(snapshot) = codex_quota_snapshot(&result["rateLimits"]) {
+                crate::engine_quota::report_for_command(snapshot, command);
+            }
+        }
     }
 
     /// Demux the server's stdout for the connection's lifetime: correlate replies
     /// by id, route notifications + approval requests to the owning thread.
-    async fn read_loop(&self, stdout: tokio::process::ChildStdout) {
+    async fn read_loop(&self, stdout: tokio::process::ChildStdout, quota_command: String) {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             match classify(&line) {
@@ -796,6 +907,10 @@ impl Client {
                         // turn/completed — surface it as text before the TurnEnd so
                         // the row shows the real cause, not error_before_output.
                         if method == "turn/completed" {
+                            if turn_reports_quota_exceeded(&params) {
+                                self.route_resolved(tid.as_deref(), ThreadMsg::QuotaExceeded)
+                                    .await;
+                            }
                             if let Some(text) = turn_error_text(&params) {
                                 self.route_resolved(
                                     tid.as_deref(),
@@ -829,6 +944,13 @@ impl Client {
                             ThreadMsg::AskResolved { request_id: params["requestId"].clone() },
                         )
                         .await;
+                    } else if method == "account/rateLimits/updated" {
+                        // Issue #97: account-scoped, no threadId to route on (and
+                        // no chat row to render) — land straight in the quota hub
+                        // instead of going through ChatEvent/route_resolved.
+                        if let Some(snapshot) = codex_quota_snapshot(&params["rateLimits"]) {
+                            crate::engine_quota::report_for_command(snapshot, &quota_command);
+                        }
                     }
                 }
                 Incoming::ServerRequest { id, method, params } => {
@@ -1093,6 +1215,7 @@ impl Client {
         let reg = configured.register(&child);
         let (write_tx, _write_rx) = mpsc::unbounded_channel();
         Client(Arc::new(Mutex::new(Some(Inner {
+            command: "codex".to_string(),
             write_tx,
             next_id: 1,
             pending: HashMap::new(),
@@ -1498,6 +1621,80 @@ mod tests {
         );
         // A clean turn carries no error text.
         assert!(turn_error_text(&json!({"turn":{"status":"completed"}})).is_none());
+    }
+
+    #[test]
+    fn turn_quota_detection_requires_a_structured_code() {
+        assert!(turn_reports_quota_exceeded(&json!({
+            "turn": {"error": {"code": "rate_limit_reached"}}
+        })));
+        assert!(turn_reports_quota_exceeded(&json!({
+            "turn": {"error": {"details": {"code": "quota_exceeded"}}}
+        })));
+        assert!(!turn_reports_quota_exceeded(&json!({
+            "turn": {"error": {"message": "rate limit exceeded"}}
+        })));
+    }
+
+    #[test]
+    fn codex_quota_snapshot_reads_the_more_severe_window() {
+        use crate::engine_quota::QuotaStatus;
+        // Real-shaped `RateLimitSnapshot` (openai/codex app-server-protocol v2):
+        // a healthy primary (5h) window, secondary (7d weekly) approaching its cap.
+        let snapshot = codex_quota_snapshot(&json!({
+            "limitId": "codex",
+            "limitName": null,
+            "primary": {"usedPercent": 20, "windowDurationMins": 300, "resetsAt": 1_700_003_600},
+            "secondary": {"usedPercent": 85, "windowDurationMins": 10080, "resetsAt": 1_700_500_000},
+            "credits": null,
+            "individualLimit": null,
+            "spendControlReached": null,
+            "planType": "plus",
+            "rateLimitReachedType": null,
+        }))
+        .expect("usable snapshot");
+        assert_eq!(snapshot.tool, "codex");
+        assert_eq!(snapshot.status, QuotaStatus::Warning);
+        assert_eq!(snapshot.used_percent, Some(85));
+        assert_eq!(snapshot.resets_at, Some(1_700_500_000));
+        assert_eq!(snapshot.window_label.as_deref(), Some("secondary"));
+    }
+
+    #[test]
+    fn codex_quota_snapshot_reached_type_wins_even_over_a_low_percent() {
+        use crate::engine_quota::QuotaStatus;
+        // A sparse rolling update: the account just got rejected, but this
+        // particular push carries a stale/low usedPercent alongside it — the
+        // reached-type flag must still win (see the function's own doc).
+        let snapshot = codex_quota_snapshot(&json!({
+            "primary": {"usedPercent": 12, "resetsAt": null},
+            "secondary": null,
+            "rateLimitReachedType": "rate_limit_reached",
+        }))
+        .expect("usable snapshot");
+        assert_eq!(snapshot.status, QuotaStatus::Exceeded);
+    }
+
+    #[test]
+    fn codex_quota_snapshot_none_for_empty_or_malformed_payload() {
+        assert!(codex_quota_snapshot(&json!(null)).is_none());
+        assert!(codex_quota_snapshot(&json!({})).is_none());
+        assert!(codex_quota_snapshot(&json!({"primary": null, "secondary": null, "rateLimitReachedType": null})).is_none());
+        // Malformed usedPercent (not a number) on both windows: nothing usable.
+        assert!(codex_quota_snapshot(&json!({"primary": {"usedPercent": "oops"}})).is_none());
+    }
+
+    #[test]
+    fn codex_quota_snapshot_single_window_only() {
+        use crate::engine_quota::QuotaStatus;
+        // Only primary present (a freshly-created account has no secondary yet).
+        // A full percentage is advisory until the provider sends a reached type.
+        let snapshot = codex_quota_snapshot(&json!({
+            "primary": {"usedPercent": 100, "resetsAt": 1_700_100_000},
+        }))
+        .expect("usable snapshot");
+        assert_eq!(snapshot.status, QuotaStatus::Warning);
+        assert_eq!(snapshot.window_label.as_deref(), Some("primary"));
     }
 
     #[test]

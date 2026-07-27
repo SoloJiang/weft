@@ -5,6 +5,7 @@
 //! itself (no auth; an accepted local-first tradeoff).
 
 use crate::ask::{AskRegistry, Decision};
+use crate::bus::builtin_allow;
 use crate::bus::BusRegistry;
 use crate::store::Db;
 use axum::{
@@ -72,6 +73,27 @@ pub fn router(bus: BusRegistry, db: Db, asks: AskRegistry) -> Router {
 // truly abandoned. Kept just under the hook/curl ceilings in inject.rs.
 const ASK_WAIT: Duration = Duration::from_secs(3600);
 
+/// The `?tool=` query parameter's fallback when a request omits it. Every
+/// hook consumer this repo controls hard-codes its own literal
+/// `tool=claude|codex|opencode` when it injects the `/ask` URL
+/// (`inject.rs::ask_url`), so a normal request never actually hits this
+/// default — but PR #146 promoted this same variable from a purely cosmetic
+/// card label into the LOOKUP KEY for `builtin_allow::safe_scope`'s
+/// auto-approval decision. Before that, defaulting to `"claude"` was
+/// harmless; after it, a missing/unrecognized `tool` would silently inherit
+/// whichever engine's row happens to sit at that string — today `claude`,
+/// the most PERMISSIVE of the three engines' allowlists — rather than
+/// degrading to "no scope, surface the card". `UNKNOWN_ENGINE` is guaranteed
+/// to match no `SAFE_BUILTINS` row (`safe_scope_is_exact_and_engine_keyed`
+/// and `dangerous_builtins_are_never_allowlisted` in `builtin_allow` check
+/// every real engine string; this is deliberately none of them), so a
+/// missing/forged `tool` param now always surfaces the Needs-you card
+/// instead of quietly borrowing the loosest engine's grants. It also makes
+/// the card's own tool label honest instead of mislabeling an unknown caller
+/// as "Claude Code" (`ToolIcon`/`toolFullName` on the frontend already
+/// degrade gracefully for an unrecognized string).
+const UNKNOWN_ENGINE: &str = "unknown";
+
 /// The Ask Bridge endpoint. A tool's permission hook POSTs its PreToolUse-style
 /// payload here and BLOCKS until the human answers in weft (→ allow/deny) or the
 /// wait elapses (→ an explicit deny, issue #96). Every weft-spawned engine runs
@@ -107,7 +129,7 @@ async fn handle_ask(
     State(db): State<Db>,
     Json(req): Json<Value>,
 ) -> Response {
-    let tool = q.get("tool").map(|s| s.as_str()).unwrap_or("claude");
+    let tool = q.get("tool").map(|s| s.as_str()).unwrap_or(UNKNOWN_ENGINE);
     let tool_name = req
         .get("tool_name")
         .and_then(|v| v.as_str())
@@ -130,9 +152,44 @@ async fn handle_ask(
 
     let (summary, detail, risk, action_key) = summarize(tool_name, req.get("tool_input"));
 
-    // A standing rule (full access / always-allow) decides without surfacing.
-    // Matches on the canonical action_key, NOT the (possibly lossy) summary.
-    if asks.auto_decision(thread, &dir, &action_key) == Some(Decision::Allow) {
+    // A read-only BUILTIN of the engine itself (claude's Read/Grep/Glob, …) is
+    // waved through, so a turn that reads twenty files doesn't cost twenty
+    // human clicks (issue #96's 23-minute freeze). Closed allowlist, and every
+    // condition below can only SUBTRACT approvals — see `bus::builtin_allow`
+    // for why this lives here instead of in the hook's matcher.
+    //
+    // Distinct from issue #103's read-only grant below, and deliberately
+    // narrower: that one is a HUMAN's explicit "trust every read-only action in
+    // this session/issue" and then covers the whole `ReadOnly` tier (a `pwd`
+    // Bash, an MCP read). This is the zero-configuration default for a handful
+    // of named builtins, so it also demands containment — which is why it can
+    // apply without anyone having granted anything.
+    match builtin_allow::safe_scope(tool, tool_name) {
+        // Nothing to point anywhere: the name alone settles it, so this needs
+        // neither the risk verdict nor the session's directories.
+        Some(builtin_allow::SafeScope::NoTarget) => {
+            return hook_decision("allow", "read-only builtin (auto-approved)");
+        }
+        // The arguments decide. BOTH the independent risk verdict (which is
+        // what still catches a credential-shaped file living INSIDE the
+        // worktree, e.g. its own `.env`) and containment in the session's own
+        // directories must agree before skipping the human.
+        Some(builtin_allow::SafeScope::ReadOnlyPath) => {
+            if risk == crate::ask::RiskLevel::ReadOnly {
+                let roots = session_roots(&db, thread, &dir).await;
+                if builtin_allow::paths_contained(req.get("tool_input"), &roots) {
+                    return hook_decision("allow", "read-only builtin (auto-approved)");
+                }
+            }
+        }
+        None => {}
+    }
+
+    // A standing rule (full access / always-allow / issue #103's read-only
+    // batch-or-issue grant) decides without surfacing. Matches on the
+    // canonical action_key, NOT the (possibly lossy) summary; `risk` gates the
+    // read-only grants (never widens Full/Always, which ignore it entirely).
+    if asks.auto_decision(thread, &dir, risk, &action_key) == Some(Decision::Allow) {
         return hook_decision("allow", "Auto-approved by a weft rule");
     }
 
@@ -182,6 +239,7 @@ const AUTO_APPROVED_INTERNAL_TOOLS: &[(&str, &str)] = &[
     ("weft_bus", "thread_state_set"),
     ("weft_bus", "announce_interface_change"),
     ("weft_bus", "set_task_status"),
+    ("weft_bus", "register_pr"),
     // weft_planner — lead read-only planning; proposals are confirmed by the
     // human downstream in the direction-confirm flow.
     ("weft_planner", "get_task"),
@@ -269,6 +327,81 @@ async fn session_injected(db: &Db, thread: i32, dir: &str, server: &str) -> bool
         Ok(Some(t)) => session_servers_for_kind(&t.kind).contains(&server),
         _ => false,
     }
+}
+
+/// The directories a session is entitled to READ without asking — the "working
+/// directory and additional directories" that claude's own permission model
+/// scopes `Read`/`Grep`/`Glob` to, expressed in weft's terms.
+///
+/// Derived from weft's OWN database, never from the hook payload: identity is
+/// the (thread, dir) pair in the URL path, and the paths come from the rows
+/// weft wrote when it created the session. A payload field (`cwd`) or an
+/// injected route file would both be things a repo could plant — see the
+/// planted-`.weft-codex-ask-url` defense in `codex::ensure_codex_hook_in` for
+/// the same threat.
+///
+/// - Worker lane (`dir` is a direction id): that direction's worktrees, one per
+///   repo it writes. NOT the canonical repos those worktrees came from —
+///   workers are isolated to their worktree by design, so reading the shared
+///   checkout stays a visible decision.
+/// - Lead (`dir` == `LEAD`): its scratch cwd (`<weft_home>/leads/<thread>`,
+///   see `lead_chat::commands::ensure_lead_cwd`) plus the local checkouts of
+///   its workspace's repos — a lead plans ACROSS those repos and reads them
+///   constantly, which is precisely the traffic that froze a lead for 23
+///   minutes in dogfooding.
+///
+/// Returns pre-canonicalized paths (`builtin_allow::contained` compares real
+/// locations, and this way each root is resolved once per ask rather than once
+/// per path). A root that can't be canonicalized — deleted worktree, repo moved
+/// out from under weft — is DROPPED rather than compared as a raw string.
+///
+/// FAILS CLOSED at every step: a DB error, a deleted thread/direction, or a
+/// direction belonging to a different thread all yield an empty (or narrowed)
+/// list, and `builtin_allow::paths_contained` then refuses every absolute path,
+/// so the call surfaces the Needs-you card exactly as it does today.
+async fn session_roots(db: &Db, thread: i32, dir: &str) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if dir != crate::bus::LEAD {
+        let Ok(direction_id) = dir.parse::<i32>() else {
+            return roots;
+        };
+        // Same ownership check `session_injected` makes: a direction id that
+        // isn't THIS thread's is a stale or forged route, not a session.
+        match crate::store::repo::get_direction(db, direction_id).await {
+            Ok(Some(d)) if d.thread_id == thread => {}
+            _ => return roots,
+        }
+        if let Ok(worktrees) = crate::store::repo::list_worktrees(db, Some(direction_id)).await {
+            roots.extend(worktrees.into_iter().map(|w| std::path::PathBuf::from(w.path)));
+        }
+        return canonicalized(roots);
+    }
+    let Ok(Some(thread_row)) = crate::store::repo::get_thread(db, thread).await else {
+        return roots;
+    };
+    if let Ok(home) = crate::paths::weft_home() {
+        roots.push(home.join("leads").join(thread.to_string()));
+    }
+    if let Ok(repos) = crate::store::repo::list_repos(db, thread_row.workspace_id).await {
+        roots.extend(
+            repos
+                .into_iter()
+                .map(|r| std::path::PathBuf::from(r.local_git_path)),
+        );
+    }
+    canonicalized(roots)
+}
+
+/// Resolve each root to its real location, dropping the ones that no longer
+/// exist. An empty string (an unset `local_git_path` on a legacy row) would
+/// canonicalize to the PROCESS's cwd and silently admit everything under it, so
+/// it is filtered before the syscall.
+fn canonicalized(roots: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    roots
+        .into_iter()
+        .filter(|p| !p.as_os_str().is_empty())
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect()
 }
 
 /// The PreToolUse hook response carrying a permission decision.
@@ -403,11 +536,15 @@ async fn handle(
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            // set_task_status writes the DB (the task is `dir`); the rest are
-            // in-memory bus ops.
+            // set_task_status and register_pr write the DB (the task is
+            // `dir`); the rest are in-memory bus ops.
             if name == "set_task_status" {
                 let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
                 set_task_status_tool(&db, &dir, status).await
+            } else if name == "register_pr" {
+                let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                register_pr_tool(&db, thread, &dir, url, title).await
             } else {
                 call_tool(&reg, thread, &dir, name, &args)
             }
@@ -433,6 +570,66 @@ async fn set_task_status_tool(db: &Db, dir: &str, status: &str) -> Value {
             Err(e) => text_result(format!("error: {e}")),
         },
         Err(_) => text_result("this session has no task to update".into()),
+    }
+}
+
+/// Bus tool: track a just-opened PR/MR (issue #110 T1). `dir` is the
+/// direction id from the URL path (same identity-can't-be-spoofed guarantee
+/// `set_task_status_tool` relies on) — the task that owns this PR/MR. Only
+/// `url` is required: everything else (host kind, owner, repo, number) is
+/// PARSED from it (`host::parse_pr_url`) rather than trusted as separate
+/// free-text args that could drift from the URL the agent actually got back
+/// from `gh pr create` / a future `glab mr create`. The background monitor
+/// (`host::monitor::spawn_pr_watch`) picks up newly-registered rows on its
+/// own next sweep — this tool only ever writes the DB row, never calls a host
+/// API itself.
+async fn register_pr_tool(db: &Db, thread: i32, dir: &str, url: &str, title: &str) -> Value {
+    let Some(parts) = crate::host::parse_pr_url(url) else {
+        return text_result(format!(
+            "could not parse a PR/MR number and repo from '{url}' — expected a GitHub pull request URL (…/pull/N) or a GitLab merge request URL (…/-/merge_requests/N)"
+        ));
+    };
+    // Reject an unimplemented host BEFORE creating a row, not after: a row
+    // for a host with no working `PrHost` backend would sweep-fail forever
+    // (every ~60s) with no way to self-clear (the readiness question never
+    // resolves) and no manual dismiss (a non-answerable Needs-you NOTICE has
+    // no close button — see `NeedsRows.tsx`'s `AskRow`). For GitLab
+    // specifically — the exact host this issue's user explicitly needs
+    // supported — that would mean the FIRST time anyone tries it, they get a
+    // permanently-stuck card. Fail the registration itself, honestly, instead.
+    if crate::host::resolve_host(parts.host_kind).is_err() {
+        return text_result(format!(
+            "{} tracking isn't supported yet — weft's PR/MR automation currently only implements GitHub. This {} was NOT registered; please track it yourself for now.",
+            parts.host_kind.native_noun(),
+            parts.host_kind.native_noun()
+        ));
+    }
+    let direction_id = dir.parse::<i32>().unwrap_or(0);
+    let repo_id = match crate::store::repo::get_direction(db, direction_id).await {
+        Ok(Some(d)) => d.repo_id,
+        _ => 0,
+    };
+    match crate::store::repo::register_pull_request(
+        db,
+        thread,
+        direction_id,
+        repo_id,
+        parts.host_kind.as_str(),
+        &parts.host_base,
+        &parts.owner,
+        &parts.repo,
+        parts.number,
+        url,
+        title,
+    )
+    .await
+    {
+        Ok(pr) => text_result(format!(
+            "tracking {} #{} — weft will monitor its CI/review/conflict state in the background and post to Needs-you if it needs your attention",
+            parts.host_kind.native_noun(),
+            pr.number
+        )),
+        Err(e) => text_result(format!("error: {e}")),
     }
 }
 
@@ -878,7 +1075,7 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
                 }
             };
             let n = proposal.directions.len();
-            match crate::planner::save_proposal(db, thread, &proposal).await {
+            match crate::planner::save_proposal_value(db, thread, args).await {
                 Ok(()) => {
                     // Anchor the proposal in the chat timeline at the moment it
                     // happened — the console renders it as an interactive card.
@@ -988,6 +1185,8 @@ fn planner_specs() -> Value {
                     "reason": str_prop(),
                     "mandate": { "type": "string", "enum": ["plan+impl", "impl-only"],
                         "description": "Granularity of the role: plan+impl (default) — the worker plans its own task first, then builds; impl-only — the task is small/fully specified, the worker builds straight away. Do NOT write the task's implementation plan yourself; that is the worker's job." },
+                    "hint": { "type": "string", "enum": ["normal", "deep"],
+                        "description": "Optional routing hint only: normal prefers Codex for cheap batches; deep prefers Claude for deeper reasoning. This is not a tool choice." },
                     "base_branch": { "type": "string",
                         "description": "Branch in the target repo to branch the new work OFF. Leave empty to use the repo's default branch (main/master). Set it only when the repo merges into a non-default branch (develop/staging/a release branch)." }
                 }, "required": ["name", "repo", "reason"] } }
@@ -1052,6 +1251,15 @@ fn tool_specs() -> Value {
             "description": "Move your task on the board as work really progresses: queued (not started), planning (working out this task's plan), working (actively building), review (done coding, awaiting the human's look), done (delivered/accepted). Reversible — set it back to working if the human asks for changes. Use this to keep the human's board honest instead of leaving it to guesswork.",
             "inputSchema": { "type": "object",
                 "properties": { "status": str_prop() }, "required": ["status"] }
+        },
+        {
+            "name": "register_pr",
+            "description": "Tell weft you just opened a pull request for this task, so it tracks CI, review, and conflict state in the background and posts to Needs-you if something needs you — instead of that state only living in this conversation (which doesn't survive a restart). Call this right after `gh pr create` succeeds, with the URL it printed. Re-calling it for the same PR (e.g. after a restart) just refreshes context, it does not duplicate tracking. GitHub only for now — a GitLab merge request URL is recognized but currently REJECTED (not yet supported), so don't rely on this for GitLab repos.",
+            "inputSchema": { "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The PR web URL, e.g. https://github.com/owner/repo/pull/123 — host, owner, repo, and number are all parsed from this." },
+                    "title": str_prop()
+                }, "required": ["url"] }
         }
     ])
 }
@@ -1074,9 +1282,13 @@ pub async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_weft_internal_tool, session_servers_for_kind, summarize};
+    use super::{
+        is_weft_internal_tool, register_pr_tool, serve, session_servers_for_kind, summarize,
+        tool_specs, UNKNOWN_ENGINE,
+    };
     use crate::ask::RiskLevel;
-    use serde_json::json;
+    use crate::store::Db;
+    use serde_json::{json, Value};
 
     /// Issue #89: a Claude/opencode multi-line command truncates `summary` to
     /// its first line for display, but `action_key` must carry the FULL command
@@ -1191,6 +1403,145 @@ mod tests {
         assert!(is_weft_internal_tool("mcp__weft_global__list_workspaces"));
     }
 
+    /// Issue #110: `register_pr` is a pure metadata/bookkeeping write (same
+    /// rationale as `set_task_status` — governed by weft's own Needs-you
+    /// surface downstream, no host-side effect), so it must be on the same
+    /// auto-approved footing.
+    #[test]
+    fn register_pr_is_auto_approved_like_set_task_status() {
+        assert!(is_weft_internal_tool("mcp__weft_bus__register_pr"));
+    }
+
+    /// The tool must actually be advertised to agents (`tools/list`), not just
+    /// silently auto-approved if called blind — otherwise no agent would ever
+    /// discover it exists.
+    #[test]
+    fn register_pr_is_advertised_in_tool_specs() {
+        let specs = tool_specs();
+        let names: Vec<&str> = specs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"register_pr"), "tool_specs: {names:?}");
+    }
+
+    fn tool_text(result: &Value) -> &str {
+        result["content"][0]["text"].as_str().unwrap_or("")
+    }
+
+    #[tokio::test]
+    async fn register_pr_tool_rejects_an_unparseable_url() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let result = register_pr_tool(&db, 1, "5", "not a valid pr url", "").await;
+        assert!(tool_text(&result).contains("could not parse"), "got: {}", tool_text(&result));
+    }
+
+    /// End-to-end through the exact path an agent's `register_pr` call takes:
+    /// URL parse → direction lookup (for `repo_id`) → DB upsert — confirming
+    /// the row lands attributed to the calling direction/thread, and that the
+    /// reply names the host's OWN vocabulary ("Pull request", not a neutral
+    /// "PR"/"change" — issue #110's UI-terminology requirement).
+    #[tokio::test]
+    async fn register_pr_tool_tracks_a_valid_github_pr_url() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let repo = crate::store::repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true)
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "codex")
+            .await
+            .unwrap();
+        let dir = crate::store::repo::create_direction(
+            &db, thread.id, "task", "codex", repo.id, "why", "impl-only", "",
+        )
+        .await
+        .unwrap();
+
+        let result = register_pr_tool(
+            &db,
+            thread.id,
+            &dir.id.to_string(),
+            "https://github.com/acme/widgets/pull/9",
+            "my title",
+        )
+        .await;
+        assert!(tool_text(&result).contains("Pull request #9"), "got: {}", tool_text(&result));
+
+        let tracked = crate::store::repo::find_pull_request(&db, "github", "acme", "widgets", 9)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tracked.direction_id, dir.id);
+        assert_eq!(tracked.thread_id, thread.id);
+        assert_eq!(tracked.repo_id, repo.id);
+        assert_eq!(tracked.title, "my title");
+        assert_eq!(tracked.lifecycle, "open");
+    }
+
+    /// `dir` "lead" (non-numeric) must still register the row rather than
+    /// erroring — see `register_pr_tool`'s doc: `direction_id`/`repo_id` fall
+    /// back to the "0 = unset" convention `direction.repo_id` already uses.
+    #[tokio::test]
+    async fn register_pr_tool_from_the_lead_falls_back_to_unset_direction() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "codex")
+            .await
+            .unwrap();
+
+        let result = register_pr_tool(
+            &db,
+            thread.id,
+            "lead",
+            "https://github.com/acme/widgets/pull/1",
+            "",
+        )
+        .await;
+        assert!(tool_text(&result).contains("Pull request #1"), "got: {}", tool_text(&result));
+        let tracked = crate::store::repo::find_pull_request(&db, "github", "acme", "widgets", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tracked.direction_id, 0);
+        assert_eq!(tracked.repo_id, 0);
+    }
+
+    /// P1 (issue #110 adversarial review): a GitLab MR URL parses cleanly
+    /// (`host::parse_pr_url` recognizes the shape) but `resolve_host(GitLab)`
+    /// has no working backend — registering it anyway would create a row
+    /// that fails every sweep FOREVER with no way to self-clear (readiness
+    /// never resolves) and no manual dismiss (a NOTICE has no close button).
+    /// Must be rejected at registration, honestly, with NOTHING written to
+    /// the DB — not silently accepted and left to fail later.
+    #[tokio::test]
+    async fn register_pr_tool_rejects_an_unsupported_gitlab_host_without_creating_a_row() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "codex")
+            .await
+            .unwrap();
+
+        let result = register_pr_tool(
+            &db,
+            thread.id,
+            "lead",
+            "https://gitlab.com/my-group/my-project/-/merge_requests/12",
+            "",
+        )
+        .await;
+        let text = tool_text(&result).to_lowercase();
+        assert!(text.contains("not registered"), "must clearly say it was not registered, got: {text}");
+        assert!(text.contains("support"), "must clearly explain WHY (unsupported host), got: {text}");
+
+        let tracked =
+            crate::store::repo::find_pull_request(&db, "gitlab", "my-group", "my-project", 12)
+                .await
+                .unwrap();
+        assert!(tracked.is_none(), "an unsupported host must never create a trackable (and un-clearable) row");
+    }
+
     #[test]
     fn opencode_flat_names_surface() {
         // opencode's `<server>_<tool>` form is ambiguous (weft names contain `_`),
@@ -1228,5 +1579,93 @@ mod tests {
         // Malformed names never match.
         assert!(!is_weft_internal_tool("mcp__weft_bus"));
         assert!(!is_weft_internal_tool("weft_bus__x"));
+    }
+
+    /// Fast companion to `missing_tool_query_param_does_not_inherit_claudes_allowlist`
+    /// below: the sentinel itself must resolve to no scope for both engines
+    /// that actually have `SAFE_BUILTINS` rows.
+    #[test]
+    fn unknown_engine_sentinel_matches_no_safe_builtins_row() {
+        assert_eq!(
+            crate::bus::builtin_allow::safe_scope(UNKNOWN_ENGINE, "Read"),
+            None
+        );
+        assert_eq!(
+            crate::bus::builtin_allow::safe_scope(UNKNOWN_ENGINE, "NotebookRead"),
+            None
+        );
+        assert_eq!(
+            crate::bus::builtin_allow::safe_scope(UNKNOWN_ENGINE, "TodoWrite"),
+            None
+        );
+        assert_eq!(
+            crate::bus::builtin_allow::safe_scope(UNKNOWN_ENGINE, "update_plan"),
+            None
+        );
+    }
+
+    /// PR #146 promoted the `?tool=` query param from a cosmetic card label
+    /// into the LOOKUP KEY for `builtin_allow::safe_scope`'s auto-approval
+    /// decision, but its default stayed `"claude"` — the most PERMISSIVE of
+    /// the three engines' allowlists. A request with no `tool` param (or an
+    /// unrecognized one) must surface the Needs-you card for a `Read`-shaped
+    /// call exactly like an unknown engine, never silently inherit claude's
+    /// `ReadOnlyPath` entry for `Read`. End-to-end through the real HTTP
+    /// endpoint (not just `safe_scope` in isolation), so this also proves
+    /// `handle_ask`'s query parsing — not just the constant — takes the fix.
+    #[tokio::test]
+    async fn missing_tool_query_param_does_not_inherit_claudes_allowlist() {
+        use crate::ask::{Answer, AskRegistry};
+        use crate::bus::BusRegistry;
+
+        let dir = std::env::temp_dir().join(format!(
+            "weft-ask-unknown-tool-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.rs");
+        std::fs::write(&file, b"fn main() {}\n").unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        crate::store::repo::add_repo_ref(&db, ws.id, "r", &root.to_string_lossy(), "main", "", true)
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "codex")
+            .await
+            .unwrap();
+
+        let asks = AskRegistry::new();
+        let (base, _h) = serve(BusRegistry::new(), db, asks.clone()).await.unwrap();
+
+        // Deliberately NO `?tool=` query parameter on this URL.
+        let url = format!("{base}/ask/{}/{}", thread.id, crate::bus::LEAD);
+        let client = reqwest::Client::new();
+        let body = json!({
+            "tool_name": "Read",
+            "tool_input": { "file_path": file.to_string_lossy().to_string() }
+        });
+
+        let (resp, ()) = tokio::join!(
+            async { client.post(url.as_str()).json(&body).send().await.unwrap() },
+            crate::hook_test_support::answer_first_ask(&asks, Answer::Allow),
+        );
+        let out: Value = resp.json().await.unwrap();
+        assert_eq!(
+            out["hookSpecificOutput"]["permissionDecision"], "allow",
+            "the human's own Allow must still reach the engine: {out}"
+        );
+        assert_eq!(
+            out["hookSpecificOutput"]["permissionDecisionReason"], "Approved in weft",
+            "a missing `tool` query param must surface the Needs-you card and \
+             wait for a human decision, not silently auto-approve via claude's \
+             Read allowlist entry (reason would read \"read-only builtin \
+             (auto-approved)\" if it had): {out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

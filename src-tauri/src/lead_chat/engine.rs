@@ -127,6 +127,17 @@ pub enum Push {
         recovered: bool,
         queue: Vec<QueuedItem>,
     },
+    /// Authoritative engine identity after either a human switch or an
+    /// automatic quota failover. Timeline markers explain the change, while
+    /// this event keeps cached thread/direction/session badges in sync.
+    EngineSwitched {
+        thread_id: i32,
+        session_id: Option<i32>,
+        direction_id: Option<i32>,
+        tool: String,
+        model: Option<String>,
+        command: Option<String>,
+    },
     Init {
         thread_id: i32,
         session_id: Option<i32>,
@@ -215,6 +226,10 @@ pub struct Outgoing {
 #[derive(Default)]
 pub struct TurnState {
     pub busy: bool,
+    /// Set only by a structured provider signal observed while this exact turn
+    /// is active. A generic error plus an old account snapshot is never enough
+    /// to move work to another provider.
+    pub quota_exceeded: bool,
     pub queue: VecDeque<Outgoing>,
     /// A bus wake landed while this engine was busy. Rather than queue one "read
     /// your inbox" turn per wake, we remember the wake's FIFO position — the
@@ -234,6 +249,7 @@ impl TurnState {
             return false;
         }
         self.busy = true;
+        self.quota_exceeded = false;
         true
     }
 
@@ -250,6 +266,7 @@ impl TurnState {
             false
         } else {
             self.busy = true;
+            self.quota_exceeded = false;
             true
         }
     }
@@ -259,7 +276,7 @@ impl TurnState {
     /// reached, synthesize one invisible inbox-read turn; then the rest; finally
     /// go idle.
     pub fn on_turn_end(&mut self) -> Option<Outgoing> {
-        match self.bus_read_pos {
+        let next = match self.bus_read_pos {
             // The wake sits at the front: read the inbox now (stays busy).
             Some(0) => {
                 self.bus_read_pos = None;
@@ -287,7 +304,9 @@ impl TurnState {
                     None
                 }
             },
-        }
+        };
+        self.quota_exceeded = false;
+        next
     }
 
     /// 删除某条仍排队的消息；true=删掉了。
@@ -364,6 +383,36 @@ impl TurnState {
         self.queue = next;
         true
     }
+}
+
+/// L3 failover is permitted only at an idle failed-turn boundary. When a queued
+/// user message or coalesced inbox read already owns the next turn, leave this
+/// engine alone rather than race a healthy follow-up turn with a switch.
+fn should_attempt_quota_failover(
+    status: &str,
+    structured_exceeded: bool,
+    still_busy: bool,
+) -> bool {
+    status == "error" && structured_exceeded && !still_busy
+}
+
+fn structured_codex_exhaustion_snapshot(
+    tool: &str,
+    previous: Option<&crate::engine_quota::QuotaSnapshot>,
+) -> Option<crate::engine_quota::QuotaSnapshot> {
+    if tool != "codex" {
+        return None;
+    }
+    Some(crate::engine_quota::QuotaSnapshot {
+        tool: "codex".to_string(),
+        status: crate::engine_quota::QuotaStatus::Exceeded,
+        // The structured exhaustion event says only that the limit was hit.
+        // Keep the richer account snapshot's reset/window metadata visible.
+        used_percent: previous.and_then(|snapshot| snapshot.used_percent),
+        resets_at: previous.and_then(|snapshot| snapshot.resets_at),
+        window_label: previous.and_then(|snapshot| snapshot.window_label.clone()),
+        observed_at: crate::engine_quota::now_unix(),
+    })
 }
 
 /// Per-turn dialects (codex `exec --json`, opencode `run --format json`) spawn
@@ -526,20 +575,28 @@ fn finalize_text(
     Some(out.text.clone())
 }
 
+/// Returns how many queued rows were finalized — `teardown_for_switch` needs
+/// it to answer "did this actually interrupt anything"; every other caller
+/// ignores it.
 async fn mark_queued_status(
     app: &AppHandle,
     db: &Db,
     thread_id: i32,
     session_id: Option<i32>,
     status: &str,
-) {
+) -> usize {
     match repo::set_queued_status(db, thread_id, session_id, status).await {
         Ok(rows) => {
+            let n = rows.len();
             for m in rows {
                 emit_finalize(app, thread_id, m.id, status);
             }
+            n
         }
-        Err(e) => eprintln!("[weft] queued message {status} finalize failed: {e}"),
+        Err(e) => {
+            eprintln!("[weft] queued message {status} finalize failed: {e}");
+            0
+        }
     }
 }
 
@@ -1634,6 +1691,11 @@ pub struct EngineInner {
     /// window where a concurrent send's turn would be silently interrupted
     /// and its rows deleted by the rewind's stop/truncate steps.
     pub rewinding: bool,
+    /// Set only for the tiny final handoff of an opt-in quota fail-over. A
+    /// send that wins before this flag is set keeps the existing engine; once
+    /// set, new sends fail visibly rather than starting a healthy turn that
+    /// the imminent switch would interrupt.
+    pub quota_failover_committing: bool,
     /// The worktree this worker runs in (None for the lead console): lets
     /// send's admission honor a worktree-level restore reservation without a
     /// DB lookup. Sibling sessions of one worktree share the same id.
@@ -1915,6 +1977,46 @@ impl LeadChatState {
     pub fn get_or_insert(&self, key: i64, eng: EngineRef) -> EngineRef {
         self.0.entry(key).or_insert(eng).value().clone()
     }
+
+    /// A cached worker is live only while it owns an active turn. An idle
+    /// resident process or a failed initial open carries no conversation and
+    /// may still follow the current initial-route policy.
+    pub fn worker_is_running(&self, session_id: i32) -> bool {
+        let Some(engine) = self.get(session_id as i64) else {
+            return false;
+        };
+        let Ok(inner) = engine.try_lock() else {
+            // A worker whose state is being changed is conservatively live: a
+            // route update must never race an in-flight turn transition.
+            return true;
+        };
+        !inner.stopped && inner.turn.busy
+    }
+
+    /// Remove an engine only when the caller still owns the exact cached Arc.
+    /// An initial-open failure must not tear down a newer engine that won a
+    /// concurrent reconstruction race.
+    pub fn remove_if_same(&self, key: i64, expected: &EngineRef) -> Option<EngineRef> {
+        self.0
+            .remove_if(&key, |_, current| Arc::ptr_eq(current, expected))
+            .map(|(_, engine)| engine)
+    }
+}
+
+/// Serialize a worker's first-route ownership across planner pinning and engine
+/// registration. A direction owns one worktree route, so `direction_id` is the
+/// right key even before a session row has been created.
+pub(crate) fn initial_worker_route_gate(
+    direction_id: i32,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static GATES: std::sync::OnceLock<
+        DashMap<i32, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    > = std::sync::OnceLock::new();
+    let gates = GATES.get_or_init(DashMap::new);
+    gates
+        .entry(direction_id)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 fn build_args(inner: &EngineInner) -> Vec<String> {
@@ -1981,7 +2083,7 @@ fn merge_init_slash_commands(
 async fn ensure_running_locked(
     app: &AppHandle,
     inner: &mut EngineInner,
-) -> anyhow::Result<Option<(tokio::process::ChildStdout, u64)>> {
+) -> anyhow::Result<Option<(tokio::process::ChildStdout, u64, String)>> {
     if inner.stopped {
         return Ok(None);
     }
@@ -2052,7 +2154,7 @@ async fn ensure_running_locked(
     inner.clock = TurnClock::default();
     inner.current = None;
     inner.interrupting = false;
-    Ok(Some((stdout, inner.generation)))
+    Ok(Some((stdout, inner.generation, program)))
 }
 
 /// Spawn the process if it isn't alive (fresh or `--resume`), wiring the reader.
@@ -2061,8 +2163,8 @@ pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow
     let mut inner = eng.lock().await;
     let reader = ensure_running_locked(app, &mut inner).await?;
     drop(inner);
-    if let Some((stdout, generation)) = reader {
-        spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
+    if let Some((stdout, generation, quota_command)) = reader {
+        spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation, quota_command);
     }
     Ok(())
 }
@@ -2338,8 +2440,14 @@ pub async fn send(
     // A rewind holds its reservation from the busy check to the final
     // truncate; sends error out for that window rather than racing the
     // rewind's stop/truncate steps.
-    if eng.lock().await.rewinding {
-        return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+    {
+        let inner = eng.lock().await;
+        if inner.rewinding {
+            return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+        }
+        if inner.quota_failover_committing {
+            return Err(anyhow::anyhow!("engine_switch_in_progress"));
+        }
     }
     // Skill-refresh: a flag set on idle means newly-injected skills are waiting.
     // Silently bounce the resident process so the relaunch (resume) reads them.
@@ -2358,7 +2466,12 @@ pub async fn send(
     };
     if skill_pending || cmd_now {
         let tool_for_shutdown = eng.lock().await.tool.clone();
-        let (tid, _sid, _texts, orphans, acp_asks) = stop_quiet(eng).await;
+        let StopQuietOutcome {
+            thread_id: tid,
+            orphans,
+            acp_asks,
+            ..
+        } = stop_quiet(eng).await;
         if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
             for id in acp_asks {
                 asks.inner().cancel(id);
@@ -2449,6 +2562,9 @@ pub async fn send(
         // rows deleted by the rewind's stop/truncate steps.
         if inner.rewinding {
             return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+        }
+        if inner.quota_failover_committing {
+            return Err(anyhow::anyhow!("engine_switch_in_progress"));
         }
         // A code restore holds a reservation on the whole WORKTREE: sibling
         // sessions of the same worktree must not start editing it mid-restore.
@@ -2973,14 +3089,21 @@ async fn spawn_codex_turn(
             let _ = client.resume_thread(&thread).await;
         }
         let rx = client.subscribe(&thread).await;
-        let (a, d, e, c, th) = (
+        let quota_command = match client.spawned_command().await {
+            Some(command) => command,
+            None => program.clone(),
+        };
+        let (a, d, e, c, th, quota_command) = (
             app.clone(),
             db.clone(),
             eng.clone(),
             client.clone(),
             thread.clone(),
+            quota_command,
         );
-        tauri::async_runtime::spawn(async move { codex_consumer(a, d, e, c, th, rx).await });
+        tauri::async_runtime::spawn(async move {
+            codex_consumer(a, d, e, c, th, quota_command, rx).await;
+        });
     }
     // stop_quiet may have run during the connect / start_thread / subscribe awaits
     // above, when there was no `codex_client` for it to shut down. If the stop won
@@ -3638,6 +3761,58 @@ async fn acp_emit_turn_end(
     }
 }
 
+/// How much of the reasoning stream the busy-line chip shows.
+const THOUGHT_TAIL_CHARS: usize = 160;
+
+/// A bounded tail of one turn's reasoning text, for the busy-line chip.
+///
+/// Kept bounded rather than accumulated: a turn's whole `agent_thought_chunk`
+/// stream can be arbitrarily long, and re-collecting it into a `Vec<char>` on
+/// every chunk just to slice off the last [`THOUGHT_TAIL_CHARS`] made the work
+/// quadratic in the reasoning length — on the same single task that forwards
+/// tool progress and answer tokens, so a long reasoning turn could starve its
+/// own liveness signal and read as stalled. Trimming on push keeps both the
+/// buffer and the per-chunk work proportional to the display window.
+#[derive(Default)]
+struct ThoughtTail {
+    buf: String,
+    /// Whether anything was dropped off the front — the chip's leading
+    /// ellipsis. Not recoverable from `buf` once it has been trimmed to size.
+    elided: bool,
+}
+
+impl ThoughtTail {
+    fn push(&mut self, text: &str) {
+        self.buf.push_str(text);
+        // Bounded by the window plus THIS chunk, never by the turn so far.
+        let len = self.buf.chars().count();
+        if len <= THOUGHT_TAIL_CHARS {
+            return;
+        }
+        let excess = len - THOUGHT_TAIL_CHARS;
+        let cut = self
+            .buf
+            .char_indices()
+            .nth(excess)
+            .map(|(i, _)| i)
+            .unwrap_or(self.buf.len());
+        self.buf.drain(..cut);
+        self.elided = true;
+    }
+
+    fn summary(&self) -> String {
+        if self.elided {
+            return format!("…{}", self.buf);
+        }
+        self.buf.clone()
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.elided = false;
+    }
+}
+
 async fn acp_consumer(
     app: AppHandle,
     db: Db,
@@ -3649,7 +3824,7 @@ async fn acp_consumer(
     use crate::acp::runtime::SessionEvent;
     use super::proto::ChatEvent;
     // Accumulated thought text for the busy-line chip (cleared on answer tokens).
-    let mut thought_buf = String::new();
+    let mut thought_buf = ThoughtTail::default();
     // Drop late events after stop/unsubscribe/teardown (reset_epoch advances).
     let start_epoch = eng.lock().await.reset_epoch;
     while let Some(msg) = rx.recv().await {
@@ -3684,17 +3859,10 @@ async fn acp_consumer(
                     let mut inner = eng.lock().await;
                     note_turn_activity(&app, &db, &eng, &mut inner);
                 }
-                thought_buf.push_str(&text);
+                thought_buf.push(&text);
                 // Live reasoning on the busy line so the turn doesn't look stuck
                 // before the first answer token. Show a tail window of the buffer.
-                let summary = {
-                    let chars: Vec<char> = thought_buf.chars().collect();
-                    if chars.len() > 160 {
-                        format!("…{}", chars[chars.len() - 160..].iter().collect::<String>())
-                    } else {
-                        thought_buf.clone()
-                    }
-                };
+                let summary = thought_buf.summary();
                 let thread_id = eng.lock().await.thread_id;
                 let session_id = eng.lock().await.session_id;
                 let _ = app.emit(
@@ -3872,6 +4040,7 @@ async fn acp_consumer(
                 summary,
                 detail,
                 intent_key,
+                intent,
                 options,
             } => {
                 let (thread_id, tool, dir, reject_now) = {
@@ -3896,34 +4065,42 @@ async fn acp_consumer(
                 let asks = app
                     .try_state::<crate::ask::AskRegistry>()
                     .map(|s| s.inner().clone());
+                // Risk tier for the Needs-you card (issue #101), from the
+                // classified `toolCall` rather than the lossy always-grant key.
+                // Computed BEFORE `auto_decision` because the read-only batch
+                // grants (issue #103) key on the tier: deriving it only in the
+                // `None` arm would make every ACP ask miss those grants.
+                let risk = crate::ask::classify_risk(match &intent {
+                    crate::acp::permission::PermissionIntent::Command(cmd) => {
+                        crate::ask::RiskSignal::Command(cmd)
+                    }
+                    crate::acp::permission::PermissionIntent::Read { path } => {
+                        crate::ask::RiskSignal::File {
+                            tool_name: "Read",
+                            path,
+                        }
+                    }
+                    crate::acp::permission::PermissionIntent::Write { path } => {
+                        crate::ask::RiskSignal::File {
+                            tool_name: "Edit",
+                            path,
+                        }
+                    }
+                    crate::acp::permission::PermissionIntent::Network => {
+                        crate::ask::RiskSignal::Network
+                    }
+                    crate::acp::permission::PermissionIntent::Other { kind } => {
+                        crate::ask::RiskSignal::Other {
+                            tool_name: kind,
+                            args_text: &detail,
+                        }
+                    }
+                });
                 let want = if let Some(asks) = asks {
-                    match asks.auto_decision(thread_id, &dir, &action_key) {
+                    match asks.auto_decision(thread_id, &dir, risk, &action_key) {
                         Some(crate::ask::Decision::Allow) => crate::acp::Want::AllowOnce,
                         Some(crate::ask::Decision::Deny) => crate::acp::Want::RejectOnce,
                         None => {
-                            // Risk tier for the Needs-you card (issue #101). ACP
-                            // intent_key is coarse (bash/read/edit/…); classify from
-                            // that + detail so the card matches other engines.
-                            let risk = crate::ask::classify_risk(
-                                if intent_key == "bash" || intent_key == "execute" {
-                                    crate::ask::RiskSignal::Command(&detail)
-                                } else if intent_key == "read" || intent_key == "search" {
-                                    crate::ask::RiskSignal::File {
-                                        tool_name: "Read",
-                                        path: &detail,
-                                    }
-                                } else if intent_key == "edit" || intent_key == "write" || intent_key == "delete" {
-                                    crate::ask::RiskSignal::File {
-                                        tool_name: "Edit",
-                                        path: &detail,
-                                    }
-                                } else {
-                                    crate::ask::RiskSignal::Other {
-                                        tool_name: &intent_key,
-                                        args_text: &detail,
-                                    }
-                                },
-                            );
                             let (id, rx) = asks.request(
                                 thread_id,
                                 &dir,
@@ -3974,6 +4151,23 @@ async fn acp_consumer(
     let _ = client; // keep handle for permission replies while loop runs
 }
 
+/// issue #97: whether a `text` delta arriving on codex_consumer's anonymous
+/// slot (`item: None`) is an exact repeat of what's already at the TAIL of the
+/// accumulated buffer. codex app-server's only `item:None` deltas are error
+/// surfacing (see `codex_consumer`'s `None` arm) — a top-level `error`
+/// notification can be followed by the SAME message again via
+/// `turn/completed`'s embedded `turn.error.message`
+/// (`codex_app_server::turn_error_text`), which otherwise doubles the bubble.
+/// `ends_with` (not a whole-buffer `==`) so a repeat that follows OTHER
+/// already-buffered text (e.g. a transient reconnect banner ahead of the real
+/// failure) is still caught, not just a bare first-delta repeat. An
+/// empty/whitespace-only `text` is never "duplicate" — it just has nothing to
+/// dedupe against and should flow through as a harmless no-op append.
+fn is_anonymous_slot_duplicate(buf: &str, text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty() && buf.trim_end().ends_with(text)
+}
+
 /// One long-lived task per codex session: consume the thread's app-server
 /// stream, driving the SAME timeline-row / Push pipeline the stdout reader uses,
 /// and flushing the queue on turn end. Mirrors [`spawn_reader`]'s event handling.
@@ -3983,6 +4177,7 @@ async fn codex_consumer(
     eng: EngineRef,
     client: crate::codex_app_server::Client,
     thread: String,
+    quota_command: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::codex_app_server::ThreadMsg>,
 ) {
     use super::proto::ChatEvent;
@@ -3994,6 +4189,23 @@ async fn codex_consumer(
         Arc::new(crossbeam_skiplist::SkipMap::new());
     while let Some(msg) = rx.recv().await {
         match msg {
+            ThreadMsg::QuotaExceeded => {
+                let tool = {
+                    let mut inner = eng.lock().await;
+                    if inner.turn.busy {
+                        inner.turn.quota_exceeded = true;
+                        Some(inner.tool.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(tool) = tool {
+                    let previous = crate::engine_quota::current(&tool);
+                    if let Some(snapshot) = structured_codex_exhaustion_snapshot(&tool, previous.as_ref()) {
+                        crate::engine_quota::report_for_command(snapshot, &quota_command);
+                    }
+                }
+            }
             ThreadMsg::Event(ChatEvent::TextDelta { text, item, agent_thread }) => {
                 let mut inner = eng.lock().await;
                 note_turn_activity(&app, &db, &eng, &mut inner);
@@ -4075,6 +4287,16 @@ async fn codex_consumer(
                         let Some(c) = inner.current.as_mut() else {
                             continue;
                         };
+                        // issue #97: codex app-server's ONLY `item:None` deltas are
+                        // error surfacing — a top-level `error` notification, then
+                        // possibly the SAME message again via `turn/completed`'s
+                        // embedded `turn.error.message` (see
+                        // `codex_app_server::turn_error_text`) — both land in this
+                        // same anonymous slot. Absorb the repeat instead of
+                        // doubling the bubble.
+                        if is_anonymous_slot_duplicate(&c.1, &text) {
+                            continue;
+                        }
                         c.1.push_str(&text);
                         let row = c.0;
                         if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
@@ -4231,6 +4453,7 @@ async fn codex_consumer(
                 let mut inner = eng.lock().await;
                 let thread_id = inner.thread_id;
                 let session_id = inner.session_id;
+                let structured_exceeded = inner.turn.quota_exceeded;
                 if let Some(ct) = context_tokens {
                     inner.last_context_tokens = Some(ct);
                     let _ = app.emit(
@@ -4329,7 +4552,23 @@ async fn codex_consumer(
                         queue: queue_items(&inner.turn),
                     },
                 );
+                let tool_for_quota_check = inner.tool.clone();
                 drop(inner);
+                // issue #97: a turn that just failed while the engine_quota hub's
+                // last-observed reading for this tool says Exceeded is a
+                // candidate for an auto fail-over — decoupled (own task, see
+                // `spawn_quota_failover_check`) so it can safely re-lock `eng`
+                // without deadlocking THIS task.
+                if should_attempt_quota_failover(status, structured_exceeded, still_busy) {
+                    crate::lead_chat::commands::spawn_quota_failover_check(
+                        app.clone(),
+                        db.clone(),
+                        thread_id,
+                        session_id,
+                        tool_for_quota_check,
+                        structured_exceeded,
+                    );
+                }
                 // This turn is over: drop its active-turn id so a subsequent
                 // interrupt won't target a finished turn (the flush below re-sets
                 // it for the next turn).
@@ -4473,7 +4712,9 @@ async fn codex_consumer(
                 let (tool, summary, detail, risk, action_key) =
                     codex_approval_fields(&method, &params);
                 let registry = app.state::<crate::ask::AskRegistry>().inner().clone();
-                match registry.auto_decision(thread_id, &dir, &action_key) {
+                // `risk` gates issue #103's read-only batch/issue grants inside
+                // auto_decision; it never widens Full/Always, which ignore it.
+                match registry.auto_decision(thread_id, &dir, risk, &action_key) {
                     // dangerous mode / full access / always-allow: reply inline (fast).
                     Some(d) => {
                         let allow = matches!(d, crate::ask::Decision::Allow);
@@ -4756,7 +4997,7 @@ async fn spawn_turn(
     inner.current = None;
     let generation = inner.generation;
     drop(inner);
-    spawn_reader(app, db, eng, stdout, generation);
+    spawn_reader(app, db, eng, stdout, generation, program);
     Ok(())
 }
 
@@ -4925,6 +5166,11 @@ async fn force_acp_turn_reset(
     if let (Some(c), Some(sid)) = (client.as_ref(), sid.as_deref()) {
         let _ = c.cancel(sid).await;
         c.unsubscribe(sid).await;
+        // `unsubscribe` reaps only when nothing is outstanding — and the wedged
+        // prompt IS outstanding, which is the whole reason this fallback ran.
+        // Left pooled, the next send gets this same handle back with a live
+        // child and prompts the agent still running the abandoned turn.
+        c.retire_after_ignored_cancel().await;
     }
     force_acp_finalize_drain(app, thread_id, session_id, turn_id, drain).await;
     emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
@@ -5085,8 +5331,15 @@ async fn send_hidden_inner(
         // Spawn the resident process under THIS lock, never releasing it before
         // the slot is reserved below. The reader task blocks on this lock and
         // proceeds once we drop it on return.
-        if let Some((stdout, generation)) = ensure_running_locked(app, &mut inner).await? {
-            spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
+        if let Some((stdout, generation, quota_command)) = ensure_running_locked(app, &mut inner).await? {
+            spawn_reader(
+                app.clone(),
+                db.clone(),
+                eng.clone(),
+                stdout,
+                generation,
+                quota_command,
+            );
         }
     }
     let out = Outgoing {
@@ -5525,8 +5778,35 @@ pub fn build_switch_digest(old_tool: &str, new_tool: &str, messages: &[lead_mess
 /// `STATUS_STOPPED` would wrongly render the freshly-switched thread/worker as
 /// taken-over/dead the moment the switch finishes, undermining the "switch
 /// succeeded" feedback the caller is about to surface.
-pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) {
-    let (thread_id, session_id, texts, orphans) = stop_quiet(eng).await;
+/// Returns whether this teardown actually interrupted work.
+///
+/// Not "was an engine cached" (PR #140 review round 13): a resident-but-idle
+/// engine — `revive::collect_stalled_leads` documents these, e.g. one the
+/// frontend opened for slash discovery — is removed and torn down with no turn
+/// to cut short. The switch's failure copy keys on this, and claiming an
+/// interruption that did not happen is the same class of lie as the "nothing
+/// changed" claims earlier rounds removed, pointing the other way.
+pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) -> bool {
+    let StopQuietOutcome {
+        thread_id,
+        session_id,
+        texts,
+        orphans,
+        acp_asks,
+        was_busy,
+    } = stop_quiet(eng).await;
+    // Same reason `stop` does it: a switch replaces this engine outright, so an
+    // ACP permission card still on screen belongs to a turn that no longer
+    // exists. Answering it — especially with Always/Full — would persist a
+    // grant against a torn-down session and, on the ACP side, reply to a
+    // request whose client was already cancelled and unsubscribed.
+    if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
+        for id in acp_asks {
+            asks.inner().cancel(id);
+        }
+    }
+    let had_open_rows = !texts.is_empty() || !orphans.is_empty();
+    let mut drained_queue = 0usize;
     if let Some(db) = app.try_state::<Db>() {
         persist_activity(&db, session_id, thread_id, "idle").await;
         finalize_orphan_tool_rows(app, &db, thread_id, orphans, "interrupted").await;
@@ -5540,7 +5820,7 @@ pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) {
             .await;
             emit_finalize(app, thread_id, id, "interrupted");
         }
-        mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
+        drained_queue = mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
     }
     let _ = app.emit(
         EVENT,
@@ -5552,6 +5832,7 @@ pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) {
             queue: Vec::new(),
         },
     );
+    was_busy || had_open_rows || drained_queue > 0
 }
 
 /// Explains the auto-recovery on the Needs-you feed (issue #93). Unlike the
@@ -5736,6 +6017,184 @@ async fn take_frozen_turn(eng: &EngineRef, turn_id: i32) -> FreezeClaim {
     FreezeClaim::Owned(taken)
 }
 
+/// Proof that the turn-freeze grace marker actually landed in the DB — step 3
+/// of [`recover_from_freeze`], and the precondition for its step 5.
+///
+/// Zero-sized with a private field, and produced ONLY by
+/// [`stamp_freeze_marker`] on a successful write. That is deliberate: the
+/// dependency it encodes ("clear the native id only if the marker is durable")
+/// used to be an `if` over a `bool` two screens below the write, and a mutation
+/// run showed deleting that `if` broke nothing any test could see. A witness
+/// cannot be produced by an accidental edit, and it makes the dataflow between
+/// the two steps visible at the signature rather than in a comment.
+#[must_use]
+pub(super) struct FreezeMarkerStamped(());
+
+/// Step 3 of [`recover_from_freeze`]: stamp the `turn_freeze_recovered`
+/// coordination marker. `None` — meaning step 5 MUST be skipped — when there is
+/// no DB at all, or when the write failed.
+///
+/// Split out of `recover_from_freeze`, together with
+/// [`clear_native_context_after_freeze`], for ONE reason: that function needs an
+/// `AppHandle`, and this crate cannot build one under `cargo test`. `AppHandle`
+/// here is the concrete `Wry` runtime (58 unparameterized uses in this file
+/// alone), while `tauri::test::mock_app` only yields `MockRuntime` — so the
+/// pair, and the invariant binding them, were unreachable from any test. These
+/// two take `&Db`/`&EngineRef`, both of which a test can build for real.
+///
+/// Returns `Option`, NOT `Result<Option<_>>`, and that is the load-bearing part
+/// of the signature rather than a shortcut (review round 1, P1 — pushed back).
+/// The only thing any caller can do with a failed stamp is skip the clear, which
+/// is exactly what `None` already says, so a `Result` would add a SECOND way to
+/// spell "no durable marker" (`Err(_)` alongside `Ok(None)`) whose only correct
+/// handling is to collapse into the first. Two representations of the gate's
+/// false case is precisely the room-to-get-it-wrong this witness type exists to
+/// remove — the original defect was a gate that could be dropped by accident.
+/// The error is not swallowed either: the *decision* is preserved in the return
+/// value and only the `DbErr` text is logged, because nothing upstream can act
+/// on it — `recover_from_freeze` returns `bool` and its sole caller is a
+/// detached `tauri::async_runtime::spawn` in `spawn_watchdog` that discards even
+/// that, so there is no caller to propagate to.
+pub(super) async fn stamp_freeze_marker(
+    db: Option<&Db>,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Option<FreezeMarkerStamped> {
+    let db = db?;
+    match repo::mark_turn_freeze_recovered(db, thread_id, session_id).await {
+        // The row id is the switch path's business (it may need to undo its own
+        // stamp); freeze recovery never retracts one, so it drops it here.
+        Ok(_) => Some(FreezeMarkerStamped(())),
+        Err(err) => {
+            eprintln!(
+                "[weft] turn-freeze recovery: failed to stamp coordination marker for thread {thread_id}: {err}"
+            );
+            None
+        }
+    }
+}
+
+/// Step 5 of [`recover_from_freeze`]: clear the native session id, BOTH mirrors
+/// (durable + in-memory), and only when `stamped` proves step 3 landed.
+///
+/// The gate is the point. `revive` reads a missing native id as "never ran"
+/// UNLESS a marker says the recovery cleared it
+/// (`revive::has_resumable_context`), so clearing after a failed stamp destroys
+/// the only evidence this session ever ran and leaves it permanently invisible
+/// to every stall sweep — the exact defect PR #133 removed, reintroduced through
+/// the error path.
+///
+/// Skipping the clear instead leaves the session with its native id and no
+/// marker, i.e. an ordinary stall: visible, re-drivable, and if the transport
+/// really is still wedged the next turn simply trips the freeze watchdog again
+/// and retries the whole recovery — with a fresh chance to stamp. That
+/// self-heals; permanent invisibility never does. Failing toward VISIBLE is
+/// deliberate: one extra re-drive is cheap, work silently stranded forever is
+/// not.
+///
+/// Both mirrors are gated together so they cannot desync (an earlier revision
+/// split them and that was a P1). The in-memory mirror is cleared even with no
+/// `Db` present — same as before this was extracted — since a missing `Db` is a
+/// test/teardown shape, not a failed write. The app-server connection was
+/// already dropped by the caller regardless, so a resumed conversation
+/// reconnects fresh even on the skip path.
+///
+/// Returns `()`, not `Result<()>`, because a failed `clear_native_id` is
+/// terminal HERE by design and not by omission (review round 1, P1 — pushed
+/// back). Aborting is not an available option at this point in
+/// `recover_from_freeze`: `take_frozen_turn` has already taken the app-server
+/// client and reset the turn in memory, so an early return would leak that
+/// connection, strand the drained rows as `streaming`, and leave the DB claiming
+/// `running` for a turn that is over. Handing the error upward would therefore
+/// buy the same `eprintln!` one frame higher while moving that reasoning away
+/// from the code it justifies. The state this failure leaves behind is the
+/// benign one either way: a session that kept its native id AND has a durable
+/// marker, which `revive::has_resumable_context` still reads as resumable.
+pub(super) async fn clear_native_context_after_freeze(
+    stamped: Option<&FreezeMarkerStamped>,
+    db: Option<&Db>,
+    eng: &EngineRef,
+    session_id: Option<i32>,
+    thread_id: i32,
+) {
+    if stamped.is_none() {
+        return;
+    }
+    if let Some(db) = db {
+        if let Err(err) = clear_native_id(db, session_id, thread_id).await {
+            eprintln!(
+                "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
+            );
+        }
+    }
+    eng.lock().await.native_id = None;
+}
+
+/// A default-ish [`EngineInner`] for tests. Lives out here rather than in this
+/// file's `mod tests` because `revive`'s own tests need it too (the freeze
+/// recovery's DB steps take an `&EngineRef`), and because a test-only
+/// constructor belongs next to the type it constructs — same placement as
+/// `codex_app_server::Client::test_stub`.
+#[cfg(test)]
+pub(super) fn test_inner(tool: &str) -> EngineInner {
+    EngineInner {
+        thread_id: 1,
+        tool: tool.into(),
+        command: None,
+        session_id: None,
+        cwd: "/tmp".into(),
+        extra_args: vec![],
+        system_prompt: String::new(),
+        native_id: None,
+        pending_context_digest: None,
+        slash_commands: vec![],
+        turn: TurnState::default(),
+        turn_id: 0,
+        ask_dir: "lead".into(),
+        clock: TurnClock::default(),
+        child: None,
+        child_reg: None,
+        child_permit: None,
+        stdin: None,
+        current: None,
+        open_texts: std::collections::HashMap::new(),
+        turn_saw_text: false,
+        interrupting: false,
+        generation: 0,
+        reset_epoch: 0,
+        pending_skill_refresh: false,
+        pending_command_refresh: false,
+        last_context_tokens: None,
+        last_model: None,
+        last_reasoning: None,
+        last_window: None,
+        last_mcp_servers: vec![],
+        last_tools: vec![],
+        probe_seq: 0,
+        probe_committed: 0,
+        current_origin_tag: None,
+        tool_rows: std::collections::HashMap::new(),
+        stopped: false,
+        codex_client: None,
+        acp_client: None,
+        acp_pending_asks: Vec::new(),
+        turn_user_row: None,
+        last_assistant_uuid: None,
+        rewinding: false,
+        quota_failover_committing: false,
+        worktree_id: None,
+    }
+}
+
+/// A live [`EngineRef`] carrying `native_id` — the in-memory half of what the
+/// freeze recovery's native-id clear touches. Test-only.
+#[cfg(test)]
+pub(super) fn test_engine_ref(native_id: Option<&str>) -> EngineRef {
+    let mut inner = test_inner("codex");
+    inner.native_id = native_id.map(str::to_string);
+    Arc::new(tokio::sync::Mutex::new(inner))
+}
+
 /// Re-confirm and execute the turn-freeze auto-recovery (issue #93). The
 /// sweep's verdict was computed under a lock already dropped, so this re-runs
 /// the FULL check (busy + silent past `freeze_secs` + not legitimately blocked
@@ -5845,16 +6304,18 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
     // nothing (review round 4), so a declined recovery can't suppress a
     // legitimate re-drive for a whole window.
     //
-    // This marker is now the SOLE guard, and `marker_stamped` carries whether
-    // it landed all the way to the native-id clear below, which is GATED on
-    // it. That gate is not tidiness: `revive` reads a missing native id as
-    // "never ran" unless a marker says the recovery cleared it, so clearing
-    // after a failed insert would destroy the only evidence this session ever
-    // ran and strand it permanently — the very defect this PR removes, coming
-    // back through the error path. Skipping the clear leaves an ordinary,
-    // visible, re-drivable stall that self-heals (a still-wedged transport
-    // just trips the watchdog again, with a fresh chance to stamp). See the
-    // gate for the full reasoning.
+    // This marker is now the SOLE guard, and the `FreezeMarkerStamped` witness
+    // it yields carries whether it landed all the way to the native-id clear
+    // below, which REQUIRES it. That gate is not tidiness: `revive` reads a
+    // missing native id as "never ran" unless a marker says the recovery
+    // cleared it, so clearing after a failed insert would destroy the only
+    // evidence this session ever ran and strand it permanently — the very
+    // defect this PR removes, coming back through the error path. Skipping the
+    // clear leaves an ordinary, visible, re-drivable stall that self-heals (a
+    // still-wedged transport just trips the watchdog again, with a fresh chance
+    // to stamp). See [`clear_native_context_after_freeze`] for the full
+    // reasoning, and [`stamp_freeze_marker`] for why both steps live in their
+    // own functions rather than inline here.
     //
     // Aborting outright is not available as a fail-closed option: by this
     // point `take_frozen_turn` has taken the app-server client and reset the
@@ -5869,17 +6330,9 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
     // surviving transport to be re-driven back into. For the app-server
     // dialect no ordering window is left, since its only idle exposure is the
     // `persist_activity` below.
-    let marker_stamped = match app.try_state::<Db>() {
-        None => false,
-        Some(db) => match repo::mark_turn_freeze_recovered(&db, thread_id, session_id).await {
-            Ok(()) => true,
-            Err(err) => {
-                eprintln!(
-                    "[weft] turn-freeze recovery: failed to stamp coordination marker for thread {thread_id}: {err}"
-                );
-                false
-            }
-        },
+    let stamped = {
+        let db = app.try_state::<Db>();
+        stamp_freeze_marker(db.as_deref(), thread_id, session_id).await
     };
     if let Some((c, drain)) = taken {
         c.shutdown().await;
@@ -5957,34 +6410,19 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
         // did. Here, we are that "whatever".
         emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
     }
-    // Gated on the marker, and the gate is the point. `revive` now reads a
-    // missing native id as "never ran" UNLESS a marker says the recovery
-    // cleared it (`has_resumable_context`). So clearing the id after a FAILED
-    // marker write would destroy the only evidence that this session ever ran
-    // and leave it permanently invisible to the re-drive — the exact defect
-    // this PR exists to remove, reintroduced through the error path.
-    //
-    // Skipping the clear instead leaves the session with its native id and no
-    // marker, i.e. an ordinary stall: visible, re-drivable, and if the
-    // transport really is still wedged the next turn simply trips the freeze
-    // watchdog again and retries this whole recovery — with a fresh chance to
-    // stamp the marker. That self-heals; permanent invisibility never does.
-    // Failing toward VISIBLE is deliberate: one extra re-drive is cheap, work
-    // silently stranded forever is not.
-    //
-    // Both mirrors are gated together so they cannot desync (an earlier
-    // revision split them and that was a P1). The connection was already
-    // dropped above regardless, so a resumed conversation reconnects fresh
-    // even on this path.
-    if marker_stamped {
-        if let Some(db) = app.try_state::<Db>() {
-            if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
-                eprintln!(
-                    "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
-                );
-            }
-        }
-        eng.lock().await.native_id = None;
+    // Step 5, gated on the marker witness from step 3 — see
+    // [`clear_native_context_after_freeze`] for why that gate is the whole
+    // point, and why both native-id mirrors are gated together.
+    {
+        let db = app.try_state::<Db>();
+        clear_native_context_after_freeze(
+            stamped.as_ref(),
+            db.as_deref(),
+            eng,
+            session_id,
+            thread_id,
+        )
+        .await;
     }
     if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
         bus.ask_human(thread_id, &dir, &freeze_recovery_text(freeze_secs));
@@ -6237,20 +6675,76 @@ pub fn spawn_watchdog(app: AppHandle) {
     });
 }
 
+/// What a [`stop_quiet`] teardown tore down and left for its caller to finish.
+///
+/// Named fields rather than a tuple on purpose. This return grew twice in
+/// parallel — `was_busy` on main (PR #140) and `acp_asks` on this branch — and
+/// each growth silently invalidated every positional destructuring elsewhere.
+/// One such call site was missed while merging and only surfaced as a CI
+/// compile error on two platforms; with named fields a caller that ignores a
+/// new field keeps compiling and a caller that needs it says so by name.
+pub struct StopQuietOutcome {
+    pub thread_id: i32,
+    pub session_id: Option<i32>,
+    /// Open text rows to finalize: `(row id, accumulated text, agent thread tag)`.
+    pub texts: Vec<(i32, String, Option<String>)>,
+    /// Open tool rows to finalize: `(row id, args json)`.
+    pub orphans: Vec<(i32, serde_json::Value)>,
+    /// Open ACP permission requests to cancel in the `AskRegistry`, so an
+    /// Always/Full answer cannot land against a torn-down turn.
+    pub acp_asks: Vec<u64>,
+    /// Whether a turn was BUSY at the moment this reset it, captured inside the
+    /// same critical section (PR #140 review round 14). Read through a separate
+    /// `eng.lock()` beforehand it describes a different state from the one
+    /// actually reset — a send admitted in the gap gets interrupted while the
+    /// flag says `false`, a turn that finished cleanly reports `true` — and
+    /// `teardown_for_switch` turns that flag into a sentence shown to the user.
+    pub was_busy: bool,
+}
+
+/// What the ACP half of a teardown needs once the engine lock is released.
+struct AcpTeardown {
+    client: Option<crate::acp::runtime::ClientHandle>,
+    session_id: Option<String>,
+    asks: Vec<u64>,
+}
+
+/// Take the ACP handles for teardown AND invalidate the turn, as ONE step.
+///
+/// These belong together. Cancelling and unsubscribing an ACP session must
+/// happen without the engine lock (they take the runtime mutex), and `stopped`
+/// is not set until `stop_quiet` returns — so between releasing the lock and
+/// re-taking it the engine still looks like it belongs to the running turn. An
+/// in-flight prompt task that grabs the lock in that gap would still match its
+/// own `prompt_epoch`, pass `acp_emit_turn_end`'s ownership check, and dequeue
+/// and dispatch the NEXT queued prompt into an engine a terminal takeover is
+/// tearing down. Advancing `reset_epoch` before the lock is released makes
+/// every such task self-invalidate instead.
+///
+/// The bump also does its original job: invalidating any send that reserved
+/// against the turn just cleared — one whose Phase 1 ran before this stop but
+/// whose Phase 3 runs after, and a stop-then-restart that resets
+/// `stopped`/`busy` and would otherwise slip past those flags.
+/// `send_reservation_valid` compares the captured `reset_epoch`.
+fn take_acp_teardown_and_invalidate(inner: &mut EngineInner) -> AcpTeardown {
+    let client = inner.acp_client.take();
+    let session_id = inner.native_id.clone();
+    let asks = std::mem::take(&mut inner.acp_pending_asks);
+    inner.reset_epoch += 1;
+    AcpTeardown {
+        client,
+        session_id,
+        asks,
+    }
+}
+
 /// Kill the live child + reset turn state WITHOUT emitting a "stopped" event —
 /// the UI keeps its last (idle) state. Used by the skill-refresh restart so the
 /// bounce is invisible; `stop` wraps this and then emits "stopped".
-pub async fn stop_quiet(
-    eng: &EngineRef,
-) -> (
-    i32,
-    Option<i32>,
-    Vec<(i32, String, Option<String>)>,
-    Vec<(i32, serde_json::Value)>,
-    Vec<u64>,
-) {
+pub async fn stop_quiet(eng: &EngineRef) -> StopQuietOutcome {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
+    let was_busy = inner.turn.busy;
     // Open text rows: the anonymous slot PLUS the item-keyed app-server rows.
     // Hard stops also shut the codex client down, so the consumer's disconnect
     // cleanup never runs for them — without this drain an item row would stay
@@ -6281,9 +6775,11 @@ pub async fn stop_quiet(
     }
     // Cancel any in-flight ACP prompt and drop the session route so a late
     // acp_emit_turn_end cannot overwrite stopped → idle after takeover.
-    let acp = inner.acp_client.take();
-    let acp_sid = inner.native_id.clone();
-    let acp_asks = std::mem::take(&mut inner.acp_pending_asks);
+    let AcpTeardown {
+        client: acp,
+        session_id: acp_sid,
+        asks: acp_asks,
+    } = take_acp_teardown_and_invalidate(&mut inner);
     // Drop the engine lock before awaiting ACP cancel/unsubscribe (they take
     // the runtime mutex). Re-lock afterwards for the remaining field clears.
     drop(inner);
@@ -6310,12 +6806,14 @@ pub async fn stop_quiet(
     // turn inherits a stale true and a pre-output failure there would wrongly
     // suppress its error_before_output row.
     inner.turn_saw_text = false;
-    // Invalidate any send that reserved against the turn we just cleared — even one
-    // whose Phase 1 ran before this stop but whose Phase 3 runs after, and even a
-    // stop-then-restart (which resets `stopped`/`busy` and would otherwise slip
-    // past those flags). send_reservation_valid compares the captured reset_epoch.
-    inner.reset_epoch += 1;
-    (target.0, target.1, texts, orphan_tools, acp_asks)
+    StopQuietOutcome {
+        thread_id: target.0,
+        session_id: target.1,
+        texts,
+        orphans: orphan_tools,
+        acp_asks,
+        was_busy,
+    }
 }
 
 /// Stop the engine outright (e.g. before a terminal takeover or by the runaway
@@ -6325,7 +6823,14 @@ pub async fn stop_quiet(
 /// (which skips "stopped"). Distinct from "idle" so a cleanly-idle session can
 /// still be driven by a bus post.
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
-    let (thread_id, session_id, texts, orphans, acp_asks) = stop_quiet(eng).await;
+    let StopQuietOutcome {
+        thread_id,
+        session_id,
+        texts,
+        orphans,
+        acp_asks,
+        ..
+    } = stop_quiet(eng).await;
     let mut inner = eng.lock().await;
     inner.stopped = true;
     drop(inner);
@@ -6350,7 +6855,7 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
             .await;
             emit_finalize(app, thread_id, id, "interrupted");
         }
-        mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
+        let _ = mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
     }
     let _ = app.emit(
         EVENT,
@@ -6402,6 +6907,24 @@ pub struct RewindOutcome {
     /// True when the worktree was restored to the message's pre-turn
     /// checkpoint (modes code/both; conversation-only leaves it false).
     pub code_restored: bool,
+}
+
+/// The 1-based cut ordinal for `target` under the addressing rule of `tool`'s
+/// dialect.
+///
+/// The dialects disagree about ONE case: a message with no text. ACP always
+/// writes a text block (`{"type":"text","text":""}` for an image-only prompt,
+/// since images ride as sibling blocks rather than the spilled-path appendix
+/// per-turn tools append), so an empty prompt is a real, matchable entry. In a
+/// claude transcript the same message has no text block at all and
+/// `rewind::user_text` skips the line, so an empty target is unaddressable and
+/// a zero — which surfaces as "this session has no rewind anchor" — is the
+/// honest answer rather than a cut at the wrong line.
+fn rewind_ordinal(tool: &str, texts: &[String], target: &str) -> usize {
+    if crate::acp::backend_for(tool).is_some() {
+        return super::rewind::ordinal_of_prompt(texts, target);
+    }
+    super::rewind::ordinal_of(texts, target)
 }
 
 /// Rewind a worker session's OR the lead console's conversation to just
@@ -6523,7 +7046,7 @@ async fn rewind_reserved(
         .filter(|m| super::rewind::native_delivered(&m.role, &m.status))
         .map(|m| super::rewind::dispatched_text(per_turn_tool, m.id, &m.content))
         .collect();
-    let ordinal = super::rewind::ordinal_of(&user_texts, &match_text);
+    let ordinal = rewind_ordinal(&snap.tool, &user_texts, &match_text);
 
     // Resolve the session's worktree ONCE: mandatory for the code half,
     // best-effort for a conversation-only rewind (it only drives the
@@ -7089,6 +7612,7 @@ fn spawn_reader(
     eng: EngineRef,
     stdout: tokio::process::ChildStdout,
     generation: u64,
+    quota_command: String,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -7126,6 +7650,20 @@ fn spawn_reader(
                         },
                     );
                 }
+            }
+            // Issue #97: a structured usage-limit reading, independent of the
+            // main event classification below (claude's `rate_limit_event` can
+            // arrive on any line, not just the first) — lands in the
+            // account-scoped quota hub directly, never as a chat row.
+            if let Some(snapshot) = crate::adapters::adapter_for(&inner.tool)
+                .and_then(|a| a.quota_signal(&line))
+            {
+                if inner.turn.busy
+                    && snapshot.status == crate::engine_quota::QuotaStatus::Exceeded
+                {
+                    inner.turn.quota_exceeded = true;
+                }
+                crate::engine_quota::report_for_command(snapshot, &quota_command);
             }
             let event = crate::adapters::adapter_for(&inner.tool)
                 .map(|a| a.parse_line(&line))
@@ -7363,6 +7901,7 @@ fn spawn_reader(
                     is_error,
                     context_tokens,
                 } => {
+                    let structured_exceeded = inner.turn.quota_exceeded;
                     if let Some(ct) = context_tokens {
                         inner.last_context_tokens = Some(ct);
                         let _ = app.emit(
@@ -7535,6 +8074,20 @@ fn spawn_reader(
                             queue: queue_items(&inner.turn),
                         },
                     );
+                    // issue #97: same auto fail-over candidate check as
+                    // `codex_consumer`'s TurnEnd arm — decoupled (own task) so
+                    // it can safely re-lock `eng` without deadlocking THIS task,
+                    // which is still holding `inner` right here.
+                    if should_attempt_quota_failover(status, structured_exceeded, still_busy) {
+                        crate::lead_chat::commands::spawn_quota_failover_check(
+                            app.clone(),
+                            db.clone(),
+                            thread_id,
+                            inner.session_id,
+                            inner.tool.clone(),
+                            structured_exceeded,
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -7739,7 +8292,7 @@ fn spawn_reader(
                 },
             );
             drop(inner);
-            mark_queued_status(&app, &db, thread_id, session_id, queued_status).await;
+            let _ = mark_queued_status(&app, &db, thread_id, session_id, queued_status).await;
         }
     });
 }
@@ -7796,6 +8349,119 @@ fn emit_lead_delta(
 mod tests {
     use super::*;
 
+    /// An image-only message is addressable in ACP and not in claude, and the
+    /// rewind path has exactly one place that decides which rule applies.
+    #[test]
+    fn the_rewind_ordinal_rule_follows_the_dialect() {
+        let texts = vec!["hello".to_string(), String::new()];
+
+        assert_eq!(
+            rewind_ordinal("omp", &texts, ""),
+            1,
+            "ACP writes an empty text block, so the image-only prompt is addressable"
+        );
+        assert_eq!(
+            rewind_ordinal("claude", &texts, ""),
+            0,
+            "claude's transcript has no line to match, so refuse rather than mis-cut"
+        );
+
+        // Ordinary text targets are unaffected by the dialect.
+        for tool in ["omp", "claude", "opencode", "codex"] {
+            assert_eq!(rewind_ordinal(tool, &texts, "hello"), 1, "{tool}");
+        }
+    }
+
+    /// The whole point of the helper: a teardown that hands out the ACP client
+    /// has ALREADY invalidated the turn. Splitting these leaves a window in
+    /// which the engine lock is free, `stopped` is not yet set and the epoch
+    /// still matches, so an in-flight prompt task passes its ownership check
+    /// and dispatches the next queued prompt into an engine being torn down.
+    #[test]
+    fn acp_teardown_invalidates_the_turn_in_the_step_that_takes_the_client() {
+        let mut inner = test_inner("omp");
+        inner.native_id = Some("sess-1".into());
+        inner.acp_pending_asks = vec![7, 9];
+        let before = inner.reset_epoch;
+
+        let taken = take_acp_teardown_and_invalidate(&mut inner);
+
+        assert_eq!(
+            inner.reset_epoch,
+            before + 1,
+            "the epoch must already be advanced when the lock is released for the ACP awaits"
+        );
+        assert_eq!(taken.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(taken.asks, vec![7, 9]);
+        assert!(
+            inner.acp_pending_asks.is_empty(),
+            "asks move to the caller so they are cancelled exactly once"
+        );
+    }
+
+    /// The chip shows a tail, so the buffer holds a tail — a turn that reasons
+    /// for a megabyte must not park a megabyte on the consumer task.
+    #[test]
+    fn thought_tail_stays_bounded_across_a_long_reasoning_stream() {
+        let mut tail = ThoughtTail::default();
+        for _ in 0..1000 {
+            tail.push(&"x".repeat(500));
+        }
+
+        assert_eq!(
+            tail.buf.chars().count(),
+            THOUGHT_TAIL_CHARS,
+            "buffer must hold the display window, not the whole trace"
+        );
+        let summary = tail.summary();
+        assert!(summary.starts_with('…'), "elided tail keeps its ellipsis");
+        assert_eq!(summary.chars().count(), THOUGHT_TAIL_CHARS + 1);
+    }
+
+    /// Trimming happens on char boundaries: a tail cut mid-codepoint would
+    /// panic on `drain`, and the reasoning stream is routinely non-ASCII.
+    #[test]
+    fn thought_tail_trims_on_character_boundaries() {
+        let mut tail = ThoughtTail::default();
+        tail.push(&"思".repeat(THOUGHT_TAIL_CHARS + 40));
+
+        assert_eq!(tail.buf.chars().count(), THOUGHT_TAIL_CHARS);
+        assert!(tail.buf.chars().all(|c| c == '思'));
+    }
+
+    /// Short reasoning is shown whole — no ellipsis implying dropped text that
+    /// was never dropped — and a cleared tail starts clean again.
+    #[test]
+    fn thought_tail_under_the_window_is_verbatim_and_clears() {
+        let mut tail = ThoughtTail::default();
+        tail.push("planning the edit");
+        assert_eq!(tail.summary(), "planning the edit");
+
+        tail.push(&"y".repeat(THOUGHT_TAIL_CHARS));
+        assert!(tail.summary().starts_with('…'));
+
+        tail.clear();
+        tail.push("second turn");
+        assert_eq!(
+            tail.summary(),
+            "second turn",
+            "clear must drop the elision flag with the text"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_liveness_requires_an_active_turn() {
+        let state = LeadChatState::default();
+        let engine: EngineRef = Arc::new(tokio::sync::Mutex::new(test_inner("claude")));
+        state.get_or_insert(42, engine.clone());
+
+        assert!(!state.worker_is_running(42));
+        engine.lock().await.turn.busy = true;
+        assert!(state.worker_is_running(42));
+        engine.lock().await.turn.busy = false;
+        assert!(!state.worker_is_running(42));
+    }
+
     // ---- issue #99: sub-agent branch attribution (branch_of / text_row_content) ----
 
     #[test]
@@ -7828,6 +8494,51 @@ mod tests {
             serde_json::from_str(&text_row_content("hi", Some("sub-1"))).unwrap();
         assert_eq!(v["text"], "hi");
         assert_eq!(v["agentThread"], "sub-1");
+    }
+
+    // ---- issue #97: anonymous-slot usage-limit double-render fix ----
+
+    #[test]
+    fn anonymous_slot_dup_catches_the_exact_repeat() {
+        // The reported bug: an "error" notification lands the full message
+        // first (buf goes empty -> the message), then turn/completed's error
+        // text arrives with the SAME message — must be recognized as a repeat.
+        assert!(is_anonymous_slot_duplicate(
+            "usage limit reached",
+            "usage limit reached"
+        ));
+    }
+
+    #[test]
+    fn anonymous_slot_dup_ignores_a_first_delta_into_an_empty_buffer() {
+        // The very first delta on a freshly-opened row: nothing to repeat yet.
+        assert!(!is_anonymous_slot_duplicate("", "usage limit reached"));
+    }
+
+    #[test]
+    fn anonymous_slot_dup_does_not_eat_a_different_second_error() {
+        // Two DISTINCT errors in the same turn (e.g. a transient reconnect
+        // banner ahead of the real failure) must both survive.
+        assert!(!is_anonymous_slot_duplicate(
+            "Reconnecting to Codex…",
+            "usage limit reached"
+        ));
+    }
+
+    #[test]
+    fn anonymous_slot_dup_matches_a_repeat_after_other_buffered_text() {
+        // The repeat can follow OTHER already-buffered text, not just be the
+        // whole buffer verbatim — `ends_with`, not `==`.
+        assert!(is_anonymous_slot_duplicate(
+            "Reconnecting to Codex…usage limit reached",
+            "usage limit reached"
+        ));
+    }
+
+    #[test]
+    fn anonymous_slot_dup_ignores_whitespace_only_text() {
+        assert!(!is_anonymous_slot_duplicate("usage limit reached", "   "));
+        assert!(!is_anonymous_slot_duplicate("usage limit reached", ""));
     }
 
     fn test_tool_call(name: &str, collab_threads: Vec<String>) -> super::super::proto::ToolCall {
@@ -8026,6 +8737,50 @@ mod tests {
         assert!(t.busy); // popped → still busy
         assert!(t.on_turn_end().is_none()); // empty queue → idle
         assert!(!t.busy);
+    }
+
+    #[test]
+    fn quota_evidence_is_scoped_to_one_turn() {
+        let mut turn = TurnState::default();
+        assert!(turn.try_begin_send());
+        turn.quota_exceeded = true;
+        assert!(turn.on_turn_end().is_none());
+        assert!(!turn.quota_exceeded);
+
+        assert!(turn.try_begin_send());
+        assert!(!turn.quota_exceeded);
+    }
+
+    #[test]
+    fn structured_codex_exhaustion_snapshot_is_global_but_codex_only() {
+        let previous = crate::engine_quota::QuotaSnapshot {
+            tool: "codex".to_string(),
+            status: crate::engine_quota::QuotaStatus::Warning,
+            used_percent: Some(93),
+            resets_at: Some(crate::engine_quota::now_unix() + 3600),
+            window_label: Some("primary".to_string()),
+            observed_at: crate::engine_quota::now_unix(),
+        };
+        let snapshot = structured_codex_exhaustion_snapshot("codex", Some(&previous)).unwrap();
+        assert_eq!(snapshot.tool, "codex");
+        assert_eq!(snapshot.status, crate::engine_quota::QuotaStatus::Exceeded);
+        assert_eq!(snapshot.used_percent, Some(93));
+        assert_eq!(snapshot.resets_at, previous.resets_at);
+        assert_eq!(snapshot.window_label.as_deref(), Some("primary"));
+        let empty = structured_codex_exhaustion_snapshot("codex", None).unwrap();
+        assert_eq!(empty.used_percent, None);
+        assert_eq!(empty.resets_at, None);
+        assert_eq!(empty.window_label, None);
+        assert!(structured_codex_exhaustion_snapshot("claude", None).is_none());
+        assert!(structured_codex_exhaustion_snapshot("opencode", None).is_none());
+    }
+
+    #[test]
+    fn quota_failover_requires_an_idle_failed_turn_boundary() {
+        assert!(should_attempt_quota_failover("error", true, false));
+        assert!(!should_attempt_quota_failover("error", true, true));
+        assert!(!should_attempt_quota_failover("complete", true, false));
+        assert!(!should_attempt_quota_failover("error", false, false));
     }
 
     #[test]
@@ -8738,55 +9493,6 @@ mod tests {
         assert!(!per_turn("mystery"));
     }
 
-    fn test_inner(tool: &str) -> EngineInner {
-        EngineInner {
-            thread_id: 1,
-            tool: tool.into(),
-            command: None,
-            session_id: None,
-            cwd: "/tmp".into(),
-            extra_args: vec![],
-            system_prompt: String::new(),
-            native_id: None,
-            pending_context_digest: None,
-            slash_commands: vec![],
-            turn: TurnState::default(),
-            turn_id: 0,
-            ask_dir: "lead".into(),
-            clock: TurnClock::default(),
-            child: None,
-            child_reg: None,
-            child_permit: None,
-            stdin: None,
-            current: None,
-            open_texts: std::collections::HashMap::new(),
-            turn_saw_text: false,
-            interrupting: false,
-            generation: 0,
-            reset_epoch: 0,
-            pending_skill_refresh: false,
-            pending_command_refresh: false,
-            last_context_tokens: None,
-            last_model: None,
-            last_reasoning: None,
-            last_window: None,
-            last_mcp_servers: vec![],
-            last_tools: vec![],
-            probe_seq: 0,
-            probe_committed: 0,
-            current_origin_tag: None,
-            tool_rows: std::collections::HashMap::new(),
-            stopped: false,
-            codex_client: None,
-            acp_client: None,
-            acp_pending_asks: Vec::new(),
-            turn_user_row: None,
-            last_assistant_uuid: None,
-            rewinding: false,
-            worktree_id: None,
-        }
-    }
-
     #[test]
     fn mark_hidden_turn_started_sets_busy_and_clears_origin_tag() {
         let mut inner = test_inner("claude");
@@ -9045,6 +9751,129 @@ mod tests {
         // Still busy — this function never resets state when there's no
         // client to take; that stays the reader task's job for this dialect.
         assert!(eng.lock().await.turn.busy);
+    }
+
+    // ---- issue #93 / PR #133: the marker-gated native-id clear ----
+    //
+    // `recover_from_freeze` itself is unreachable from a test — it takes the
+    // concrete `AppHandle<Wry>`, see `stamp_freeze_marker`'s doc — so these
+    // drive the exact two functions it calls, in the order it calls them, over
+    // a real `Db` and a real `EngineRef`. The failure they need (the marker
+    // write failing while its neighbours succeed) comes from the test-only
+    // seam `repo::fail_write`, NOT from hand-built rows: the first revision of
+    // `revive`'s own freeze tests asserted a post-recovery shape production
+    // never produces, and that was worse than having no test.
+
+    /// A workspace + thread whose lead has already captured a native id — the
+    /// state a freeze recovery finds when it fires.
+    async fn freeze_fixture() -> (Db, i32) {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        repo::set_lead_native_id(&db, t.id, "nat-1").await.unwrap();
+        (db, t.id)
+    }
+
+    /// PR #133's core fix, which mutation testing showed had ZERO regression
+    /// protection (the whole suite stayed green with the gate deleted): when
+    /// `mark_turn_freeze_recovered` fails, the native-id clear must be skipped
+    /// — BOTH mirrors — so the session never lands in `native_id = None &&
+    /// marker = None`. `revive::has_resumable_context` reads that combination
+    /// as "never ran" and excludes it from every stall sweep; nothing
+    /// automated can recreate the id while it is excluded, so the exclusion is
+    /// permanent, not one window.
+    #[tokio::test]
+    async fn failed_freeze_marker_skips_the_native_id_clear() {
+        let (db, thread_id) = freeze_fixture().await;
+        let eng = test_engine_ref(Some("nat-1"));
+
+        let stamped = repo::fail_write::while_failing(
+            "mark_turn_freeze_recovered",
+            stamp_freeze_marker(Some(&db), thread_id, None),
+        )
+        .await;
+        assert!(
+            stamped.is_none(),
+            "a failed marker write must be reported as 'no witness', never swallowed"
+        );
+
+        clear_native_context_after_freeze(stamped.as_ref(), Some(&db), &eng, None, thread_id).await;
+
+        let marker = repo::last_turn_freeze_recovery_secs(&db, thread_id, None)
+            .await
+            .unwrap();
+        let durable = repo::lead_native_id(&db, thread_id).await.unwrap();
+        assert_eq!(marker, None, "precondition: the marker write really did fail");
+        // THE invariant, stated as the defect is stated.
+        assert!(
+            !(durable.is_none() && marker.is_none()),
+            "native_id=None && marker=None is the permanently-invisible shape PR #133 removed"
+        );
+        // …and satisfied by KEEPING the id (the only option left once the
+        // marker is gone), not by some other row appearing.
+        assert_eq!(durable.as_deref(), Some("nat-1"));
+        assert_eq!(
+            eng.lock().await.native_id.as_deref(),
+            Some("nat-1"),
+            "the in-memory mirror is gated too — splitting the two mirrors was a P1"
+        );
+    }
+
+    /// The positive control the test above needs to mean anything: with the
+    /// marker write succeeding, the clear DOES happen, both mirrors. Without
+    /// this, gutting `clear_native_context_after_freeze` into a no-op would
+    /// leave the failure test green.
+    #[tokio::test]
+    async fn stamped_freeze_marker_clears_both_native_id_mirrors() {
+        let (db, thread_id) = freeze_fixture().await;
+        let eng = test_engine_ref(Some("nat-1"));
+
+        let stamped = stamp_freeze_marker(Some(&db), thread_id, None).await;
+        assert!(stamped.is_some(), "an unarmed marker write must succeed");
+
+        clear_native_context_after_freeze(stamped.as_ref(), Some(&db), &eng, None, thread_id).await;
+
+        assert_eq!(repo::lead_native_id(&db, thread_id).await.unwrap(), None);
+        assert_eq!(eng.lock().await.native_id, None);
+        assert!(
+            repo::last_turn_freeze_recovery_secs(&db, thread_id, None)
+                .await
+                .unwrap()
+                .is_some(),
+            "…and the marker authorising the clear is durable, so `revive` still \
+             reads this session as resumable"
+        );
+    }
+
+    /// No `Db` registered (app teardown, or a test harness) must still clear
+    /// the in-memory mirror — the shape the pre-extraction code had, preserved
+    /// on purpose: a missing `Db` is not a failed write, and leaving a stale
+    /// native id in memory would make the next send resume the wedged session.
+    #[tokio::test]
+    async fn stamped_freeze_marker_clears_the_memory_mirror_without_a_db() {
+        let eng = test_engine_ref(Some("nat-1"));
+        let (db, thread_id) = freeze_fixture().await;
+        let stamped = stamp_freeze_marker(Some(&db), thread_id, None).await;
+
+        clear_native_context_after_freeze(stamped.as_ref(), None, &eng, None, thread_id).await;
+
+        assert_eq!(eng.lock().await.native_id, None);
+    }
+
+    /// No `Db` at all also means no marker can exist, so there is no witness
+    /// and nothing may be cleared — the same fail-visible direction as a
+    /// failed write.
+    #[tokio::test]
+    async fn no_db_yields_no_freeze_marker_witness() {
+        let eng = test_engine_ref(Some("nat-1"));
+
+        let stamped = stamp_freeze_marker(None, 1, None).await;
+        assert!(stamped.is_none());
+        clear_native_context_after_freeze(stamped.as_ref(), None, &eng, None, 1).await;
+
+        assert_eq!(eng.lock().await.native_id.as_deref(), Some("nat-1"));
     }
 
     // ---- session_gate: a cleared `child` must hand its slot back ----
@@ -9466,6 +10295,7 @@ mod tests {
             turn_user_row: None,
             last_assistant_uuid: None,
             rewinding: false,
+            quota_failover_committing: false,
             worktree_id: None,
         };
         let fresh = build_args(&inner);
@@ -9587,6 +10417,26 @@ mod tests {
         })
         .unwrap();
         assert!(ordinary.get("seq").is_none());
+    }
+
+    #[test]
+    fn engine_switched_push_carries_authoritative_route_identity() {
+        let push = serde_json::to_value(Push::EngineSwitched {
+            thread_id: 7,
+            session_id: Some(9),
+            direction_id: Some(11),
+            tool: "claude".to_string(),
+            model: None,
+            command: Some("cc-claude".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(push["type"], "engine_switched");
+        assert_eq!(push["thread_id"], 7);
+        assert_eq!(push["session_id"], 9);
+        assert_eq!(push["direction_id"], 11);
+        assert_eq!(push["tool"], "claude");
+        assert_eq!(push["command"], "cc-claude");
     }
 
     #[test]

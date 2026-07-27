@@ -2,10 +2,12 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import {
+  AlertTriangle,
   ArrowUpRight,
   Check,
   GitBranch,
   Layers,
+  RefreshCw,
   Send,
   X,
 } from "lucide-react";
@@ -16,6 +18,9 @@ import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { PermissionConfirmationCard } from "../components/ConfirmationCard";
+import { routeLabelKey, routeReasonKey, routeToolName } from "../lib/engineRoutingDisplay";
+import { needsRoutingControlOf } from "./needsRoutingControl";
+import { ASK_CARD_TONE, ASK_DOT_TONE, NOTICE_FOOTER_VIEW } from "./needsCardView";
 
 export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
   const { approveWriteTrigger, denyWriteTrigger, selectThread, defaultTool, installedTools } =
@@ -23,8 +28,12 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
   const [picked, setPicked] = useState<string | null>(null);
-  const tool = picked ?? defaultTool;
-  const installed = installedTools.filter((tl) => tl.installed);
+  const routingControl = needsRoutingControlOf({
+    route: item.route,
+    picked,
+    installedTools,
+    defaultTool,
+  });
   const context = [item.thread_title, item.name].filter(Boolean).join(" · ");
 
   async function act(fn: () => Promise<void>) {
@@ -58,6 +67,25 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
       <p className="px-3.5 pb-1 pt-1.5 text-[14px] leading-relaxed text-ink">
         {item.reason}
       </p>
+      {routingControl.route && (
+        <div className="flex flex-col gap-0.5 px-3.5 pb-2 text-[11px] text-ink-faint">
+          <span
+            className={cn(
+              "inline-flex items-center gap-1",
+              routingControl.showBlockedStatus && "text-danger",
+            )}
+          >
+            {routingControl.route.tool && (
+              <ToolIcon tool={routingControl.route.tool} size={12} />
+            )}
+            {t(routeLabelKey(routingControl.route), {
+              tool: toolFullName(routeToolName(routingControl.route)),
+            })}
+          </span>
+          <span>{t(routeReasonKey(routingControl.route.reason))}</span>
+          {routingControl.showBlockedStatus && <span>{t("scope.engineRouteBlockedHint")}</span>}
+        </div>
+      )}
       {item.base_branch && (
         <div className="px-3.5 pb-2">
           <span
@@ -69,30 +97,46 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
           </span>
         </div>
       )}
+      {/* Issue #103: approving this ALSO propagates a read-only auto-allow to
+          the whole issue (approve_write_trigger → grant_read_only_issue),
+          same as confirming the ScopeReview proposal — reuse its exact
+          disclosure caption so both dispatch-approval entry points are
+          equally upfront about the consequence, not just the batch one. */}
+      <p className="px-3.5 pb-2 text-[11px] leading-snug text-ink-faint">
+        {t("scope.readOnlyPropagationNote")}
+      </p>
       <div className="flex flex-wrap items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">
         <Button
           variant="primary"
-          disabled={busy}
-          title={t("needs.approveRunTitle")}
-          onClick={() => void act(() => approveWriteTrigger(item, tool))}
+          disabled={busy || routingControl.approvalDisabled}
+          title={
+            routingControl.approvalDisabled
+              ? t("scope.engineRouteBlockedHint")
+              : t("needs.approveRunTitle")
+          }
+          onClick={() => void act(() => approveWriteTrigger(item, routingControl.manualTool))}
         >
           <Check size={13} />
           {t("needs.approveRun")}
         </Button>
-        {installed.length > 1 && (
+        {routingControl.pickerVisible && (
           <div
             title={t("needs.runWith")}
             className="inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-bg p-0.5"
           >
-            {installed.map((tl) => (
+            {routingControl.pickerOptions.map((tl) => (
               <button
                 key={tl.tool}
                 type="button"
                 title={toolFullName(tl.tool)}
+                aria-label={toolFullName(tl.tool)}
+                aria-pressed={routingControl.pickerTool === tl.tool}
                 onClick={() => setPicked(tl.tool)}
                 className={cn(
                   "grid h-6 w-7 place-items-center rounded-[var(--radius-sm)] transition-opacity duration-150",
-                  tool === tl.tool ? "bg-raised" : "opacity-40 hover:opacity-80",
+                  routingControl.pickerTool === tl.tool
+                    ? "bg-raised"
+                    : "opacity-40 hover:opacity-80",
                 )}
               >
                 <ToolIcon tool={tl.tool} size={13} />
@@ -116,7 +160,7 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
 }
 
 export function PermissionRow({ ask }: { ask: PermissionAsk }) {
-  const { answerPermission, goToDirectionRef } = useStore();
+  const { answerPermission, releaseSessionReadOnly, goToDirectionRef } = useStore();
   const { t } = useTranslation();
   const context = [ask.thread_title, ask.dir_name].filter(Boolean).join(" · ");
   const contextLink = context ? (
@@ -136,6 +180,7 @@ export function PermissionRow({ ask }: { ask: PermissionAsk }) {
     <PermissionConfirmationCard
       ask={ask}
       onAnswer={(askId, answer) => void answerPermission(askId, answer)}
+      onReleaseSessionReadOnly={() => void releaseSessionReadOnly(ask.thread, ask.dir)}
       className="overflow-hidden rounded-[var(--radius-lg)] border-waiting/40 bg-waiting/10 px-3.5 pb-0 pt-3"
       actionsClassName="-mx-3.5 mt-1 self-stretch border-t border-border bg-bg/40 px-3.5 py-2.5"
       context={contextLink}
@@ -150,11 +195,51 @@ export function PermissionRow({ ask }: { ask: PermissionAsk }) {
   );
 }
 
+function NoticeFooter({
+  item,
+  retrying,
+  onRetry,
+}: {
+  item: NeedItem;
+  retrying: boolean;
+  onRetry: () => void;
+}) {
+  const { t } = useTranslation();
+  if (item.kind === "question") return null; // rendered as the answer form instead
+  const view = NOTICE_FOOTER_VIEW[item.kind];
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5 text-[12px]",
+        view.className,
+      )}
+    >
+      {view.icon === "alert" && <AlertTriangle size={13} className="shrink-0" />}
+      <p className="leading-relaxed">{t(view.textKey)}</p>
+      {item.kind === "notice_action_required" && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="ml-auto shrink-0"
+          disabled={retrying}
+          title={t("needs.retryTrackingTitle")}
+          onClick={onRetry}
+        >
+          <RefreshCw size={12} className={cn(retrying && "animate-spin")} />
+          {t("needs.retryTracking")}
+        </Button>
+      )}
+    </div>
+  );
+}
+
 export function AskRow({ item }: { item: NeedItem }) {
-  const { answerAsk, goToAsk } = useStore();
+  const { answerAsk, retryPrTracking, goToAsk } = useStore();
   const { t } = useTranslation();
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [retrying, setRetrying] = useState(false);
 
   async function submit() {
     if (!text.trim() || busy) return;
@@ -166,10 +251,20 @@ export function AskRow({ item }: { item: NeedItem }) {
     }
   }
 
+  async function retry() {
+    if (retrying) return;
+    setRetrying(true);
+    try {
+      await retryPrTracking(item);
+    } finally {
+      setRetrying(false);
+    }
+  }
+
   return (
-    <div className="overflow-hidden rounded-[var(--radius-lg)] border border-waiting/40 bg-waiting/10">
+    <div className={cn("overflow-hidden rounded-[var(--radius-lg)] border", ASK_CARD_TONE[item.kind])}>
       <div className="flex items-center gap-2 px-3.5 pt-3 text-[12px]">
-        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-waiting" />
+        <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", ASK_DOT_TONE[item.kind])} />
         {/* The worker reference itself is the primary jump target (not just the
             trailing icon below) — same handler, so hovering either affords the
             same one-click landing on its timeline. */}
@@ -203,7 +298,7 @@ export function AskRow({ item }: { item: NeedItem }) {
         {item.text}
       </p>
 
-      {item.answerable ? (
+      {item.kind === "question" ? (
         <form
           onSubmit={(event) => {
             event.preventDefault();
@@ -222,11 +317,7 @@ export function AskRow({ item }: { item: NeedItem }) {
           </Button>
         </form>
       ) : (
-        // Display-only NOTICE (self-clearing stall hint): no answer box — it
-        // retracts itself, and answering is refused backend-side.
-        <p className="border-t border-border bg-bg/40 px-3.5 py-2.5 text-[12px] text-ink-faint">
-          {t("needs.selfClearing")}
-        </p>
+        <NoticeFooter item={item} retrying={retrying} onRetry={() => void retry()} />
       )}
     </div>
   );

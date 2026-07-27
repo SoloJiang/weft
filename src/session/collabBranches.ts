@@ -99,6 +99,16 @@ const NESTABLE_KIND: Record<LeadMessage["kind"], boolean> = {
   // Same system-owned, always-top-level marker treatment as `rewind` (issue
   // #96/#98) — see EngineSwitchMarker in ChatTimeline.tsx.
   engine_switch: false,
+  // Same treatment — a failed auto fail-over attempt (issue #97) is also a
+  // system-owned marker, never a per-agent row.
+  quota_failover_failed: false,
+  // Routing decisions and blocked routing outcomes are durable system-owned
+  // markers, not conversation rows that belong inside a collab branch.
+  engine_route: false,
+  engine_route_blocked: false,
+  // A completed auto-merge attempt (issue #110 T3) is likewise a durable,
+  // system-owned marker, never a per-agent conversation row.
+  pr_auto_merge: false,
 };
 
 function parseContentObject(row: LeadMessage): Record<string, unknown> {

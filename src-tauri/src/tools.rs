@@ -9,6 +9,10 @@ use serde::Serialize;
 pub struct ToolStatus {
     pub tool: String,
     pub installed: bool,
+    /// Whether the configured command can be reached by the same bare spawn
+    /// path used by agent sessions. This is false for the macOS Codex.app
+    /// diagnostic fallback even when `installed` is true.
+    pub spawnable: bool,
     pub version: Option<String>,
     pub path: Option<String>,
     pub meets_min: bool,
@@ -17,9 +21,30 @@ pub struct ToolStatus {
     pub diagnostics: Vec<crate::detect::ToolDiagnostic>,
 }
 
-// Display order for Settings (default-tool picker + diagnostics): mirrors the
-// default-tool priority (codex > claude > opencode > omp).
-const TOOLS: [&str; 4] = ["codex", "claude", "opencode", "omp"];
+/// Every coding-agent identity weft drives, in Settings display order (which
+/// mirrors the default-tool priority: codex > claude > opencode > omp).
+///
+/// The SINGLE source for that set: `lead_chat::commands` validates
+/// engine-switch requests against this same list rather than its own copy.
+/// While they were separate constants, registering omp here made it appear in
+/// the picker and in `EngineSwitchDialog` while `switch_lead_tool` /
+/// `switch_worker_tool` still rejected it as `unknown tool "omp"` — offered
+/// everywhere, selectable nowhere.
+pub const TOOLS: [&str; 4] = ["codex", "claude", "opencode", "omp"];
+
+/// The executable used for the version probe, plus whether that exact path is
+/// reachable by a bare session spawn. Prefer the spawnable PATH match over a
+/// diagnostics-only match: an earlier non-executable file must not hide a later
+/// working CLI with the same name.
+fn probe_target(
+    spawnable_path: Option<std::path::PathBuf>,
+    diagnostic_path: Option<std::path::PathBuf>,
+) -> Option<(std::path::PathBuf, bool)> {
+    let spawnable = spawnable_path.is_some();
+    spawnable_path
+        .or(diagnostic_path)
+        .map(|path| (path, spawnable))
+}
 
 fn probe(tool: &str) -> ToolStatus {
     use crate::detect::ToolDiagnostic as Diag;
@@ -27,11 +52,21 @@ fn probe(tool: &str) -> ToolStatus {
     // Probe the user-configured command (alias) for this identity, so Settings
     // reports install status for the binary sessions actually spawn.
     let command = crate::tool_command::command_for(tool);
-    let Some(path) = crate::detect::resolve_tool_path(&command) else {
+    let spawnable_path = crate::detect::resolve_spawnable_tool_path(&command);
+    // Only fall back to the diagnostics resolver when a session cannot spawn
+    // this command. It may point at the macOS Codex.app bundle or a
+    // non-executable PATH file, both useful to report but not to select.
+    let diagnostic_path = if spawnable_path.is_none() {
+        crate::detect::resolve_tool_path(&command)
+    } else {
+        None
+    };
+    let Some((path, path_is_spawnable)) = probe_target(spawnable_path, diagnostic_path) else {
         diagnostics.push(Diag::missing_target(tool));
         return ToolStatus {
             tool: tool.into(),
             installed: false,
+            spawnable: false,
             version: None,
             path: None,
             meets_min: true,
@@ -73,6 +108,7 @@ fn probe(tool: &str) -> ToolStatus {
             (false, None)
         }
     };
+    let spawnable = installed && path_is_spawnable;
     let meets_min = version
         .as_deref()
         .map(|v| crate::detect::meets_min(tool, v))
@@ -89,6 +125,7 @@ fn probe(tool: &str) -> ToolStatus {
     ToolStatus {
         tool: tool.into(),
         installed,
+        spawnable,
         version,
         path: Some(path_str),
         meets_min,
@@ -112,4 +149,43 @@ pub async fn default_tool(db: &crate::store::Db) -> String {
         .ok()
         .flatten();
     crate::detect::resolve_default_tool(configured.as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Registering an ACP backend is what puts a tool in front of the user —
+    /// detect probes it, Settings lists it, `EngineSwitchDialog` offers it. If
+    /// it is missing from `TOOLS`, `switch_lead_tool`/`switch_worker_tool`
+    /// answer `unknown tool "…"` and the engine is unreachable by every path
+    /// that offered it. This asserts the registry can never get ahead of the
+    /// switch allowlist again, for the NEXT backend as much as for omp.
+    #[test]
+    fn every_registered_acp_backend_is_a_switchable_tool() {
+        for id in crate::acp::registered_ids() {
+            assert!(
+                TOOLS.contains(&id),
+                "ACP backend {id:?} is registered but not in TOOLS, so switching to it fails"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_target_prefers_a_spawnable_path_over_diagnostic_only_match() {
+        let diagnostic = std::path::PathBuf::from("/first/codex");
+        let runnable = std::path::PathBuf::from("/second/codex");
+
+        assert_eq!(
+            probe_target(Some(runnable.clone()), Some(diagnostic)),
+            Some((runnable, true))
+        );
+    }
+
+    #[test]
+    fn probe_target_keeps_a_diagnostic_only_path_non_spawnable() {
+        let diagnostic = std::path::PathBuf::from("/Applications/Codex.app/codex");
+
+        assert_eq!(probe_target(None, Some(diagnostic.clone())), Some((diagnostic, false)));
+    }
 }

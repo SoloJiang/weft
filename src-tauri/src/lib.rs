@@ -24,9 +24,27 @@ mod commands_backup;
 pub mod config;
 mod coordinator;
 mod curator;
+mod deps_bootstrap;
 mod detect;
+/// issue #97 额度感知:claude `rate_limit_event` / codex app-server
+/// `account/rateLimits/*` 的结构化解析结果落在这里(tool-keyed 全局快照),供
+/// Resources 面板展示与达限 fail-over 判断消费。
+mod engine_quota;
+/// One global, deterministic policy for automatic engine selection and the
+/// opt-in quota fail-over boundary. All lead/worker/planner/curator callers
+/// use this module instead of making local tool-choice decisions.
+pub(crate) mod engine_routing;
 mod gc;
 pub mod git;
+/// Issue #110 T1/T2: host abstraction (GitHub via `gh`, GitLab's shape
+/// reserved) + the background PR/MR monitor + the "truly mergeable"
+/// judgement. See `host::monitor` for the read-only boundary and
+/// `host::judge` for the judgement itself.
+pub mod host;
+/// Test-only: shared driver for the generated ask-hook scripts (see the module
+/// docs — one copy so claude's and codex's hook tests can't drift apart).
+#[cfg(test)]
+mod hook_test_support;
 pub mod im;
 mod inspect;
 pub mod lead_chat;
@@ -198,6 +216,14 @@ pub fn run() {
             // since a coordination deadlock can develop while the app is
             // already running, not only across a restart (issue #95).
             lead_chat::revive::spawn_stall_watch(app.handle().clone());
+            // Issue #110 T1: the PR/MR state-machine sweep — same
+            // process-level-background shape as the stall watch above, not
+            // tied to any one chat session's lifetime.
+            host::monitor::spawn_pr_watch(app.handle().clone());
+            // Issue #110 T3: the auto-merge executor — its OWN independent
+            // sweep loop (opt-in, default off), deliberately NOT chained off
+            // the read-only sweep above. See `host::automerge`'s module doc.
+            host::automerge::spawn_pr_automerge_watch(app.handle().clone());
             power::spawn_sweep(app.handle().clone());
             process_quota::spawn_monitor(app.handle().clone());
             gc::spawn_periodic(app.handle().clone());
@@ -263,6 +289,9 @@ pub fn run() {
             commands::answer_permission,
             commands::list_auth_grants,
             commands::revoke_auth_grant,
+            commands::read_only_grants,
+            commands::release_session_read_only,
+            commands::revoke_read_only_grant,
             commands::resolve_action_card,
             commands::set_dangerous_mode,
             commands::set_keep_awake,
@@ -281,6 +310,7 @@ pub fn run() {
             commands::approve_write_trigger,
             commands::deny_write_trigger,
             commands::answer_ask,
+            commands::retry_pr_tracking,
             lead_chat::commands::lead_send,
             lead_chat::commands::lead_interrupt,
             lead_chat::commands::lead_ensure,
@@ -319,6 +349,12 @@ pub fn run() {
             tools::detect_tools,
             commands::get_default_tool,
             commands::set_default_tool,
+            commands::get_automatic_engine_routing_enabled,
+            commands::set_automatic_engine_routing_enabled,
+            commands::get_quota_failover_enabled,
+            commands::set_quota_failover_enabled,
+            commands::get_pr_auto_merge_enabled,
+            commands::set_pr_auto_merge_enabled,
             commands::get_tool_commands,
             commands::set_tool_command,
             commands::list_skill_sources,
@@ -348,8 +384,25 @@ pub fn run() {
             commands_backup::backup_export_recovery_key,
             commands_backup::backup_restore,
         ])
-        .run(tauri::generate_context!())
-        .unwrap_or_else(|e| fatal("running tauri application", e));
+        .build(tauri::generate_context!())
+        .unwrap_or_else(|e| fatal("building tauri application", e))
+        .run(|_app, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                // ACP children are spawned into their own process group with no
+                // parent-death signal, and the pool that owns them is a
+                // process-static `LazyLock` — normal static teardown never drops
+                // its `Child` values, so the agent process and every tool it
+                // spawned would outlive the UI that was supervising them.
+                //
+                // Awaited rather than detached (unlike the backup flush on
+                // CloseRequested, which is only IO): this is the last moment the
+                // reap can still run, and a detached task dies with the process
+                // that was about to leak the children. `proc_registry::reap`
+                // SIGKILLs each process group in the descendant closure and then
+                // waits on an already-killed child, so this cannot hang.
+                tauri::async_runtime::block_on(acp::runtime::shutdown_all());
+            }
+        });
 }
 
 #[cfg(test)]

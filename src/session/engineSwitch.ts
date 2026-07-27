@@ -24,3 +24,43 @@ export type SwitchKind = "switch" | "reload";
 export function switchKindOf(oldTool: string, newTool: string): SwitchKind {
   return oldTool !== "" && oldTool === newTool ? "reload" : "switch";
 }
+
+/** Stable code `switch_lead_tool`/`switch_worker_tool` reject with when their
+ *  durable transaction does not commit (Rust: `SWITCH_FAILED_ERROR_CODE`). The
+ *  backend sends the CODE and logs the database detail, so this locale's copy
+ *  comes from `src/i18n/*.ts` rather than raw SQLite text.
+ *
+ *  Same shape as `isProcessQuotaDegradedError`: tauri commands reject with
+ *  strings today, while tests and future adapters may surface an `Error` or a
+ *  `{ code }` object. Anything else falls through to the caller's generic
+ *  handling, so an unrelated failure is never explained away as this one.
+ *
+ *  Two codes, keyed on what the user is LEFT with rather than on how the write
+ *  failed: switching an idle or never-opened surface interrupts nothing, so
+ *  claiming a turn was cut short would be as wrong as claiming nothing changed
+ *  after a real teardown.
+ *
+ *  Longest match wins, since `switch_failed` is a prefix of
+ *  `switch_failed_interrupted` and these are matched by substring. */
+export const SWITCH_ERROR_I18N: Record<string, string> = {
+  engine_switch_in_progress: "session.switchInProgress",
+  switch_failed_interrupted: "session.switchFailedInterrupted",
+  switch_failed: "session.switchFailed",
+};
+
+/** The ONE discriminated value the dialog maps from — a code, or null when the
+ *  rejection is an ordinary one to render verbatim. */
+export function switchErrorCodeOf(error: unknown): string | null {
+  const text = (() => {
+    if (typeof error === "string") return error;
+    if (error instanceof Error) return error.message;
+    if (typeof error === "object" && error !== null && "code" in error) return String(error.code);
+    return null;
+  })();
+  if (text === null) return null;
+  return (
+    Object.keys(SWITCH_ERROR_I18N)
+      .sort((a, b) => b.length - a.length)
+      .find((code) => text.includes(code)) ?? null
+  );
+}

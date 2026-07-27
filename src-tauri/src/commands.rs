@@ -631,12 +631,40 @@ pub async fn cancel_reanalyze_workspace_deps(workspace_id: i32) -> R<()> {
 /// so the frontend can open its lead-chat surface for dependency calibration.
 #[tauri::command]
 pub async fn open_curator_chat(db: State<'_, Db>, workspace_id: i32) -> R<i32> {
-    // Stamp the curator thread with the user's configured default tool so the
-    // calibration chat is usable for codex/opencode users (not hard-coded claude).
-    let tool = crate::tools::default_tool(&db).await;
-    repo::ensure_curator_thread(&db, workspace_id, &tool)
+    if let Some(existing) = repo::curator_thread_for_workspace(&db, workspace_id)
         .await
-        .map_err(e)
+        .map_err(e)?
+    {
+        return Ok(existing);
+    }
+    // The curator is one more Weft-owned surface: it shares the global policy,
+    // with a deep hint because repository calibration benefits from deeper
+    // reasoning. OpenCode remains a legacy/manual fallback only.
+    let legacy_tool = crate::tools::default_tool(&db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        &db,
+        None,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Deep,
+    )
+    .await;
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
+    let thread_id = repo::ensure_curator_thread(&db, workspace_id, &tool)
+        .await
+        .map_err(e)?;
+    crate::engine_routing::record_decision(
+        &db,
+        thread_id,
+        None,
+        None,
+        "curator_start",
+        &route,
+    )
+    .await;
+    Ok(thread_id)
 }
 
 /// Return the analyst-synthesized markdown repo-map for a workspace, or `None`
@@ -756,10 +784,31 @@ pub async fn create_thread(
     title: String,
     kind: String,
 ) -> R<entities::thread::Model> {
-    let tool = crate::tools::default_tool(&db).await;
-    repo::create_thread(&db, workspace_id, &title, &kind, &tool)
+    let legacy_tool = crate::tools::default_tool(&db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        &db,
+        None,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Normal,
+    )
+    .await;
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
+    let thread = repo::create_thread(&db, workspace_id, &title, &kind, &tool)
         .await
-        .map_err(e)
+        .map_err(e)?;
+    crate::engine_routing::record_decision(
+        &db,
+        thread.id,
+        None,
+        None,
+        "new_thread",
+        &route,
+    )
+    .await;
+    Ok(thread)
 }
 
 #[tauri::command]
@@ -852,10 +901,13 @@ pub async fn list_directions(
 /// workspace repos (ARCHITECTURE §4.10, §5.1). None if nothing proposed yet.
 #[tauri::command]
 pub async fn get_proposal(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     thread_id: i32,
 ) -> R<Option<crate::planner::ResolvedProposal>> {
-    crate::planner::get_resolved(&db, thread_id)
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
+    crate::planner::get_resolved_with_live_sessions(&db, thread_id, &is_session_live)
         .await
         .map_err(e)
 }
@@ -865,9 +917,9 @@ pub async fn get_proposal(
 pub async fn save_proposal(
     db: State<'_, Db>,
     thread_id: i32,
-    proposal: crate::planner::Proposal,
+    proposal: serde_json::Value,
 ) -> R<()> {
-    crate::planner::save_proposal(&db, thread_id, &proposal)
+    crate::planner::save_proposal_value(&db, thread_id, &proposal)
         .await
         .map_err(e)
 }
@@ -905,10 +957,80 @@ pub async fn set_proposal_direction_base(
     .map_err(e)
 }
 
+/// Confirm the stored proposal + propagate issue #103's read-only auto-allow
+/// to the whole issue. Extracted from the `#[tauri::command]` wrapper (mirrors
+/// `revoke_grant_durable`) so the propagation itself is directly testable
+/// without constructing a `tauri::State`.
+///
+/// Approving dispatch here IS the human's "I already trust this issue's
+/// worktree reads" decision (the issue's own motivating pain point — a worker
+/// started right after approval still asking `pwd`), so every dir under this
+/// thread — this call's new directions AND any spawned later (a re-dispatch, a
+/// subsequent write-trigger) — auto-allows a `RiskLevel::ReadOnly` ask from
+/// here on. Never widens beyond ReadOnly (see `AskRegistry::grant_read_only_issue`);
+/// in-memory only, so it does NOT survive a restart (contrast Full/Always) and
+/// is separately revocable (`revoke_read_only_grant`). Granted unconditionally
+/// on a successful confirm (including the idempotent re-dispatch retry path) —
+/// `HashSet::insert` is a no-op when already granted, so this is safe to call
+/// every time.
+async fn confirm_proposal_and_propagate_read_only(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+) -> anyhow::Result<Vec<i32>> {
+    confirm_proposal_and_propagate_read_only_with_manual_tool(db, asks, thread_id, None).await
+}
+
+async fn confirm_proposal_and_propagate_read_only_with_manual_tool(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+    manual_tool: Option<&str>,
+) -> anyhow::Result<Vec<i32>> {
+    let ids = crate::planner::confirm_with_manual_tool(db, thread_id, manual_tool).await?;
+    asks.grant_read_only_issue(thread_id);
+    Ok(ids)
+}
+
+async fn confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sessions(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+    manual_tool: Option<&str>,
+    is_session_live: &(dyn Fn(i32) -> bool + Send + Sync),
+) -> anyhow::Result<Vec<i32>> {
+    let ids = crate::planner::confirm_with_manual_tool_and_live_sessions(
+        db,
+        thread_id,
+        manual_tool,
+        is_session_live,
+    )
+    .await?;
+    asks.grant_read_only_issue(thread_id);
+    Ok(ids)
+}
+
 /// Confirm the stored proposal: create its directions + materialize worktrees.
+/// See `confirm_proposal_and_propagate_read_only` for the read-only propagation.
 #[tauri::command]
-pub async fn confirm_proposal(db: State<'_, Db>, thread_id: i32) -> R<Vec<i32>> {
-    crate::planner::confirm(&db, thread_id).await.map_err(e)
+pub async fn confirm_proposal(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+    thread_id: i32,
+    manual_tool: Option<String>,
+) -> R<Vec<i32>> {
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
+    confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sessions(
+        &db,
+        &asks,
+        thread_id,
+        manual_tool.as_deref(),
+        &is_session_live,
+    )
+        .await
+        .map_err(e)
 }
 
 /// The brief a worker for this direction would be dispatched with (§4.10).
@@ -962,6 +1084,31 @@ pub async fn verify_direction(db: State<'_, Db>, direction_id: i32) -> R<Vec<Rep
 // review skill INSIDE the worker's own conversation (frontend sends the slash
 // command), and the repo's PR harness stays the authority (§7: 别重造 review/CI).
 
+async fn create_direction_for_explicit_tool(
+    db: &Db,
+    thread_id: i32,
+    name: &str,
+    tool: &str,
+    repo_id: i32,
+    reason: &str,
+    mandate: &str,
+    base_branch: &str,
+) -> anyhow::Result<entities::direction::Model> {
+    let dir = repo::create_direction_with_engine_pin(
+        db,
+        thread_id,
+        name,
+        tool,
+        repo_id,
+        reason,
+        mandate,
+        base_branch,
+        true,
+    )
+    .await?;
+    Ok(dir)
+}
+
 #[tauri::command]
 pub async fn create_direction(
     db: State<'_, Db>,
@@ -973,7 +1120,7 @@ pub async fn create_direction(
     mandate: Option<String>,
     base_branch: Option<String>,
 ) -> R<entities::direction::Model> {
-    let dir = repo::create_direction(
+    let dir = create_direction_for_explicit_tool(
         &db,
         thread_id,
         &name,
@@ -1323,9 +1470,10 @@ pub struct NeedItem {
     pub direction_name: String,
     pub text: String,
     pub ts: u64,
-    /// `false` for a display-only NOTICE (the self-clearing stall hint): the UI
-    /// shows it without an answer box, and answering is refused backend-side.
-    pub answerable: bool,
+    /// See `bus::AskKind`. A `Question` shows an answer box; both NOTICE kinds
+    /// don't (answering is refused backend-side) — they differ in whether the
+    /// UI's generic "clears itself automatically" footer applies.
+    pub kind: crate::bus::AskKind,
 }
 
 /// Aggregate every open agent→human question across the workspace's threads.
@@ -1365,7 +1513,7 @@ pub async fn needs_you(
                 direction_name: dir_name,
                 text: a.text,
                 ts: a.ts,
-                answerable: a.answerable,
+                kind: a.kind,
             });
         }
     }
@@ -1400,6 +1548,82 @@ pub async fn set_default_tool(db: State<'_, Db>, tool: String) -> R<()> {
     repo::set_setting(&db, "default_tool", &tool)
         .await
         .map_err(e)
+}
+
+/// Whether the one global automatic engine-routing policy is enabled. Unset is
+/// deliberately false so existing default-tool/manual behavior is unchanged
+/// for upgraded databases.
+#[tauri::command]
+pub async fn get_automatic_engine_routing_enabled(db: State<'_, Db>) -> R<bool> {
+    Ok(matches!(
+        repo::get_setting(&db, crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED)
+            .await
+            .map_err(e)?
+            .as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    ))
+}
+
+#[tauri::command]
+pub async fn set_automatic_engine_routing_enabled(
+    db: State<'_, Db>,
+    enabled: bool,
+) -> R<()> {
+    repo::set_setting(
+        &db,
+        crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(e)
+}
+
+/// issue #97: whether Weft should auto-switch a thread/session to its
+/// fallback engine when the current one reports its usage limit as exceeded
+/// (`crate::lead_chat::commands::maybe_failover_on_quota`). Opt-in, default
+/// off — see `K_QUOTA_FAILOVER_ENABLED`'s doc for why.
+#[tauri::command]
+pub async fn get_quota_failover_enabled(db: State<'_, Db>) -> R<bool> {
+    Ok(matches!(
+        repo::get_setting(&db, crate::engine_routing::K_QUOTA_FAILOVER_ENABLED)
+            .await
+            .map_err(e)?
+            .as_deref(),
+        Some("1") | Some("true")
+    ))
+}
+
+#[tauri::command]
+pub async fn set_quota_failover_enabled(db: State<'_, Db>, enabled: bool) -> R<()> {
+    repo::set_setting(
+        &db,
+        crate::engine_routing::K_QUOTA_FAILOVER_ENABLED,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(e)
+}
+
+/// Issue #110 T3: whether Weft should squash-merge a tracked PR/MR on its own
+/// once it reaches this repo's truly-mergeable bar
+/// (`crate::host::automerge::spawn_pr_automerge_watch`). Opt-in, default OFF
+/// — see `crate::host::automerge::K_AUTO_MERGE_ENABLED`'s doc for why: this
+/// performs an irreversible action with no human confirming the specific
+/// merge.
+#[tauri::command]
+pub async fn get_pr_auto_merge_enabled(db: State<'_, Db>) -> R<bool> {
+    crate::host::automerge::try_auto_merge_enabled(&db).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn set_pr_auto_merge_enabled(db: State<'_, Db>, enabled: bool) -> R<()> {
+    repo::set_setting(
+        &db,
+        crate::host::automerge::K_AUTO_MERGE_ENABLED,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(e)
 }
 
 /// The user-configured coding-agent command overrides ("aliases"): identity →
@@ -1513,12 +1737,20 @@ pub struct WriteTrigger {
     pub repo_name: String,
     pub reason: String,
     pub base_branch: String,
+    pub hint: crate::engine_routing::RoutingHint,
+    pub route: Option<crate::engine_routing::RouteDecision>,
 }
 
 /// Every pending write declaration across the workspace's threads — the
 /// data behind the Needs-you "approve a write" cards.
 #[tauri::command]
-pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<WriteTrigger>> {
+pub async fn write_triggers(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    workspace_id: i32,
+) -> R<Vec<WriteTrigger>> {
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
     let threads: Vec<_> = repo::list_threads(&db, workspace_id)
         .await
         .map_err(e)?
@@ -1527,7 +1759,13 @@ pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<Write
         .collect();
     let mut out = Vec::new();
     for t in threads {
-        for p in crate::planner::pending_writes(&db, t.id).await.map_err(e)? {
+        for p in crate::planner::pending_writes_with_live_sessions(
+            &db,
+            t.id,
+            &is_session_live,
+        )
+        .await
+        .map_err(e)? {
             out.push(WriteTrigger {
                 thread_id: t.id,
                 thread_title: t.title.clone(),
@@ -1536,24 +1774,61 @@ pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<Write
                 repo_name: p.repo_name,
                 reason: p.reason,
                 base_branch: p.base_branch,
+                hint: p.hint,
+                route: p.route,
             });
         }
     }
     Ok(out)
 }
 
-/// Approve a write declaration: create its direction + materialize. Returns the
-/// new direction id so the caller can dispatch a worker.
-#[tauri::command]
-pub async fn approve_write_trigger(
-    db: State<'_, Db>,
+/// Approve a write declaration + propagate issue #103's read-only auto-allow to
+/// the whole issue. Extracted from the `#[tauri::command]` wrapper (mirrors
+/// `confirm_proposal_and_propagate_read_only`) so the propagation is directly
+/// testable without constructing a `tauri::State`.
+///
+/// Same trust decision as `confirm_proposal_and_propagate_read_only` (see its
+/// doc): approving ONE lane's dispatch outside the initial ScopeReview batch is
+/// still "the human approved this issue's dispatch to run", so it gets the
+/// identical grant. In-memory only, never widens beyond `RiskLevel::ReadOnly`,
+/// separately revocable (`revoke_read_only_grant`).
+async fn approve_write_trigger_and_propagate_read_only(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
     thread_id: i32,
     index: usize,
-    tool: String,
+    tool: &str,
+) -> anyhow::Result<i32> {
+    let id = crate::planner::approve_direction(db, thread_id, index, tool).await?;
+    asks.grant_read_only_issue(thread_id);
+    Ok(id)
+}
+
+/// Approve a write declaration: create its direction + materialize. Returns the
+/// new direction id so the caller can dispatch a worker. See
+/// `approve_write_trigger_and_propagate_read_only` for the read-only propagation.
+#[tauri::command]
+pub async fn approve_write_trigger(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+    thread_id: i32,
+    index: usize,
+    tool: Option<String>,
 ) -> R<i32> {
-    crate::planner::approve_direction(&db, thread_id, index, &tool)
-        .await
-        .map_err(e)
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
+    let id = crate::planner::approve_direction_with_pin_and_live_sessions(
+        &db,
+        thread_id,
+        index,
+        tool.as_deref(),
+        &is_session_live,
+    )
+    .await
+    .map_err(e)?;
+    asks.grant_read_only_issue(thread_id);
+    Ok(id)
 }
 
 /// Deny a write declaration: mark denied + relay to the lead's bus inbox.
@@ -1613,6 +1888,50 @@ pub fn answer_ask(
     } else {
         Err("that question was already answered or no longer exists".into())
     }
+}
+
+/// Core of [`retry_pr_tracking`], taking `&Db` directly so it's unit-testable
+/// without a Tauri `State`/`AppHandle` (the `&Db`/store-seam pattern this
+/// codebase already uses for command logic that doesn't actually need the
+/// runtime). Re-registers every still-`open` PR/MR tracked under `direction_id`
+/// with ITS OWN already-stored fields — a plain upsert-by-natural-key
+/// (`repo::register_pull_request`), so it resets `probe_fail_count` to 0
+/// exactly the way a fresh agent `register_pr` call would (see that
+/// function's doc), without shelling out anywhere or needing the agent at
+/// all. Safe to call on a direction with no given-up row: a still-healthy row
+/// is simply reset to a zero streak, which the next probe overwrites anyway —
+/// so this is the desktop-side "retry" action for the ONE Needs-you notice
+/// that does not clear itself (`host::judge::give_up_text`), without having
+/// to first prove precisely which row triggered it.
+async fn retry_pr_tracking_core(db: &Db, direction_id: i32) -> anyhow::Result<u32> {
+    let rows = repo::list_pull_requests_for_direction(db, direction_id).await?;
+    let mut reset = 0u32;
+    for row in rows.into_iter().filter(|r| r.lifecycle == "open") {
+        repo::register_pull_request(
+            db,
+            row.thread_id,
+            row.direction_id,
+            row.repo_id,
+            &row.host_kind,
+            &row.host_base,
+            &row.host_owner,
+            &row.host_repo,
+            row.number,
+            &row.url,
+            &row.title,
+        )
+        .await?;
+        reset += 1;
+    }
+    Ok(reset)
+}
+
+/// The Needs-you "retry tracking" button's backend: see
+/// [`retry_pr_tracking_core`]. Returns how many rows were reset (0 is not an
+/// error — the notice may already have been superseded by a later sweep).
+#[tauri::command]
+pub async fn retry_pr_tracking(db: State<'_, Db>, direction_id: i32) -> R<u32> {
+    retry_pr_tracking_core(&db, direction_id).await.map_err(e)
 }
 
 /// All pending permission Asks across the workspace (the Ask Bridge → Needs-you),
@@ -2137,6 +2456,58 @@ pub async fn revoke_auth_grant(
     revoke_grant_durable(&asks, thread, dir.as_deref(), action_key.as_deref()).await
 }
 
+/// Current read-only auto-allow scopes (issue #103) — in-memory only, NEVER
+/// persisted (see `ask::Inner::read_only_session`'s doc), so this is a live
+/// snapshot, not something restored at boot. Backs the frontend's "read-only
+/// trusted" indicators (session + issue-wide) and their revoke entry points.
+#[tauri::command]
+pub fn read_only_grants(
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+) -> R<crate::ask::ReadOnlyGrants> {
+    Ok(asks.read_only_grants())
+}
+
+/// "Release all read-only for this session" (issue #103's core batch action):
+/// resolves every currently open `RiskLevel::ReadOnly` ask in (thread, dir) to
+/// Allow and installs a forward-looking session-scoped rule so a later
+/// ReadOnly ask in the same session doesn't re-prompt either. A Write/
+/// NetworkOrCredential/Unknown ask in this session is left untouched — still
+/// open, still needs a real human answer (`AskRegistry::grant_read_only_session`
+/// is the actual enforcement; this command is a thin wrapper). In-memory only,
+/// never persisted. Returns how many open asks were just resolved, so the
+/// frontend can toast "released N".
+#[tauri::command]
+pub fn release_session_read_only(
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+    thread: i32,
+    dir: String,
+) -> R<usize> {
+    Ok(asks.grant_read_only_session(thread, &dir))
+}
+
+/// Revoke a read-only auto-allow grant (issue #103), at the granularity the
+/// caller passes: `dir == None` revokes the WHOLE issue's propagation
+/// (`grant_read_only_issue`'s counterpart); `dir == Some` revokes just that one
+/// session's batch grant. In-memory only — there is no durable write to roll
+/// back here (contrast `revoke_auth_grant`'s acked flush for Full/Always), so
+/// this can't fail short of the ask registry itself being gone.
+#[tauri::command]
+pub fn revoke_read_only_grant(
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+    thread: i32,
+    dir: Option<String>,
+) -> R<()> {
+    match dir {
+        Some(dir) => {
+            asks.revoke_read_only_session(thread, &dir);
+        }
+        None => {
+            asks.revoke_read_only_issue(thread);
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn bus_post_human(
     bus: tauri::State<'_, crate::bus::BusRegistry>,
@@ -2472,6 +2843,34 @@ mod tests {
         sh(&p, &["git", "add", "-A"]);
         sh(&p, &["git", "commit", "-q", "-m", "init"]);
         p
+    }
+
+    #[tokio::test]
+    async fn direct_direction_creation_pins_the_explicit_tool() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, workspace.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+
+        let direction = create_direction_for_explicit_tool(
+            &db,
+            thread.id,
+            "manual task",
+            "opencode",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(direction.tool, "opencode");
+        assert!(direction.engine_pinned);
     }
 
     /// R47-2: `register_repo` must capture `base_ref_is_default` HONESTLY.
@@ -2878,9 +3277,9 @@ mod tests {
         cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
 
         // the deleted workspace's grant is gone; the other workspace's survives
-        assert!(asks.auto_decision(thread.id, "", "anything").is_none());
+        assert!(asks.auto_decision(thread.id, "", crate::ask::RiskLevel::Unknown, "anything").is_none());
         assert_eq!(
-            asks.auto_decision(keep_thread.id, "", "anything"),
+            asks.auto_decision(keep_thread.id, "", crate::ask::RiskLevel::Unknown, "anything"),
             Some(crate::ask::Decision::Allow)
         );
     }
@@ -2926,7 +3325,12 @@ mod tests {
         });
         // active before the delete
         assert_eq!(
-            asks.auto_decision(keep_thread.id, &routed.id.to_string(), "x"),
+            asks.auto_decision(
+                keep_thread.id,
+                &routed.id.to_string(),
+                crate::ask::RiskLevel::Unknown,
+                "x"
+            ),
             Some(crate::ask::Decision::Allow)
         );
 
@@ -2935,7 +3339,12 @@ mod tests {
         // deleting the workspace that owns the routed repo revokes the repo-routed
         // direction's grant (which lives in another workspace's thread).
         assert!(asks
-            .auto_decision(keep_thread.id, &routed.id.to_string(), "x")
+            .auto_decision(
+                keep_thread.id,
+                &routed.id.to_string(),
+                crate::ask::RiskLevel::Unknown,
+                "x"
+            )
             .is_none());
     }
 
@@ -3019,13 +3428,28 @@ mod tests {
 
         // BOUND (dir_a) and REPO-ROUTED (dir_routed) grants revoked; dir_b survives.
         assert!(asks
-            .auto_decision(thread.id, &dir_a.id.to_string(), "x")
+            .auto_decision(
+                thread.id,
+                &dir_a.id.to_string(),
+                crate::ask::RiskLevel::Unknown,
+                "x"
+            )
             .is_none());
         assert!(asks
-            .auto_decision(thread.id, &dir_routed.id.to_string(), "x")
+            .auto_decision(
+                thread.id,
+                &dir_routed.id.to_string(),
+                crate::ask::RiskLevel::Unknown,
+                "x"
+            )
             .is_none());
         assert_eq!(
-            asks.auto_decision(thread.id, &dir_b.id.to_string(), "x"),
+            asks.auto_decision(
+                thread.id,
+                &dir_b.id.to_string(),
+                crate::ask::RiskLevel::Unknown,
+                "x"
+            ),
             Some(crate::ask::Decision::Allow)
         );
         // their open asks are cancelled — a post-delete answer can't re-grant them.
@@ -3074,7 +3498,7 @@ mod tests {
         assert!(r.is_err(), "a failed durable write must surface as an error");
         // the revoked Full grant is restored (memory matches the unchanged store)...
         assert_eq!(
-            asks.auto_decision(7, "42", "x"),
+            asks.auto_decision(7, "42", crate::ask::RiskLevel::Unknown, "x"),
             Some(crate::ask::Decision::Allow),
             "the Full grant must be restored on a failed write"
         );
@@ -3091,7 +3515,7 @@ mod tests {
         );
         // ...and the unrelated grant is untouched (no blind whole-set re-seed).
         assert_eq!(
-            asks.auto_decision(8, "99", "x"),
+            asks.auto_decision(8, "99", crate::ask::RiskLevel::Unknown, "x"),
             Some(crate::ask::Decision::Allow)
         );
     }
@@ -3174,5 +3598,260 @@ mod tests {
             .any(|ask| ask.id == repo_scoped_id));
         assert_ne!(remove_id, keep_id);
         assert_ne!(repo_scoped_id, keep_id);
+    }
+
+    // ---- issue #103: read-only propagation wiring (the command-layer glue,
+    // not `AskRegistry::grant_read_only_issue`'s own boundary — that's covered
+    // exhaustively in ask.rs's unit tests) ---------------------------------
+
+    /// Confirming the proposal (the human's "approve dispatch") propagates a
+    /// read-only auto-allow to the WHOLE issue. Uses a REAL git repo because
+    /// `planner::confirm` materializes a worktree; holds `ENV_LOCK` because
+    /// `WEFT_HOME` is a process-global env var shared with `planner.rs`'s own
+    /// confirm/materialize tests running in this same binary.
+    #[tokio::test]
+    async fn confirm_proposal_propagates_read_only_to_the_whole_issue_but_never_write() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-readonly-propagate-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        init_main_repo(&root, "api");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            root.join("api").to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
+            .await
+            .unwrap();
+        let proposal = crate::planner::Proposal {
+            rationale: "r".into(),
+            directions: vec![crate::planner::ProposedDirection {
+                name: "A".into(),
+                repo: "api".into(),
+                reason: "r".into(),
+                mandate: "".into(),
+                base_branch: "".into(),
+                decision: "".into(),
+                direction_id: 0,
+            }],
+        };
+        crate::planner::save_proposal(&db, t.id, &proposal).await.unwrap();
+
+        let asks = crate::ask::AskRegistry::new();
+        let ids = confirm_proposal_and_propagate_read_only(&db, &asks, t.id)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1, "the single lane should materialize");
+        let dir = ids[0].to_string();
+
+        // the propagated grant covers a ReadOnly ask on the JUST-created direction...
+        assert_eq!(
+            asks.auto_decision(t.id, &dir, crate::ask::RiskLevel::ReadOnly, "ls"),
+            Some(crate::ask::Decision::Allow)
+        );
+        // ...AND a direction that didn't exist at confirm time — the whole point of
+        // ISSUE-wide (not just per-dir) propagation: a worker spawned later still
+        // inherits it (issue #103's motivating pain point).
+        assert_eq!(
+            asks.auto_decision(t.id, "999999", crate::ask::RiskLevel::ReadOnly, "pwd"),
+            Some(crate::ask::Decision::Allow)
+        );
+        // but a Write/Unknown ask on the SAME direction still must ask — the
+        // safety boundary this feature exists to respect (#139's review lesson:
+        // what the UI claims was authorized, the backend must actually enforce,
+        // proven with a real assertion, not just an absence of a wider grant).
+        assert!(asks
+            .auto_decision(t.id, &dir, crate::ask::RiskLevel::Write, "rm -rf x")
+            .is_none());
+        assert!(asks
+            .auto_decision(t.id, &dir, crate::ask::RiskLevel::Unknown, "mystery_tool")
+            .is_none());
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// Approving ONE write-trigger lane outside the initial ScopeReview batch
+    /// propagates the SAME issue-wide read-only grant — the identical trust
+    /// decision (see `approve_write_trigger_and_propagate_read_only`'s doc).
+    #[tokio::test]
+    async fn approve_write_trigger_propagates_read_only_to_the_whole_issue_but_never_write() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-readonly-propagate-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        init_main_repo(&root, "api");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            root.join("api").to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
+            .await
+            .unwrap();
+        let proposal = crate::planner::Proposal {
+            rationale: "r".into(),
+            directions: vec![crate::planner::ProposedDirection {
+                name: "B".into(),
+                repo: "api".into(),
+                reason: "r".into(),
+                mandate: "".into(),
+                base_branch: "".into(),
+                decision: "".into(),
+                direction_id: 0,
+            }],
+        };
+        crate::planner::save_proposal(&db, t.id, &proposal).await.unwrap();
+
+        let asks = crate::ask::AskRegistry::new();
+        let dir_id =
+            approve_write_trigger_and_propagate_read_only(&db, &asks, t.id, 0, "claude")
+                .await
+                .unwrap();
+        let dir = dir_id.to_string();
+
+        assert_eq!(
+            asks.auto_decision(t.id, &dir, crate::ask::RiskLevel::ReadOnly, "cat README.md"),
+            Some(crate::ask::Decision::Allow)
+        );
+        // issue-wide: covers a dir that didn't exist at approve time too.
+        assert_eq!(
+            asks.auto_decision(t.id, "999999", crate::ask::RiskLevel::ReadOnly, "pwd"),
+            Some(crate::ask::Decision::Allow)
+        );
+        assert!(asks
+            .auto_decision(t.id, &dir, crate::ask::RiskLevel::Write, "rm -rf x")
+            .is_none());
+        assert!(asks
+            .auto_decision(
+                t.id,
+                &dir,
+                crate::ask::RiskLevel::NetworkOrCredential,
+                "curl evil"
+            )
+            .is_none());
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    // --- retry_pr_tracking (Needs-you "retry" button for the give-up notice) --
+
+    async fn pr_retry_fixture(
+        db: &Db,
+    ) -> (entities::thread::Model, entities::direction::Model, entities::repo_ref::Model) {
+        let ws = repo::create_workspace(db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(db, ws.id, "widgets", "/tmp/widgets", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            db, thread.id, "ship it", "codex", repo_ref.id, "why", "impl-only", "",
+        )
+        .await
+        .unwrap();
+        (thread, direction, repo_ref)
+    }
+
+    #[tokio::test]
+    async fn retry_pr_tracking_resets_a_given_up_rows_probe_failure_streak() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let (thread, dir, repo_ref) = pr_retry_fixture(&db).await;
+        let pr = repo::register_pull_request(
+            &db, thread.id, dir.id, repo_ref.id, "github", "github.com", "acme", "widgets", 4,
+            "https://github.com/acme/widgets/pull/4", "fix things",
+        )
+        .await
+        .unwrap();
+        // Drive it past a small give-up threshold, mirroring
+        // `host::monitor::MAX_CONSECUTIVE_PROBE_FAILURES` — the exact state
+        // that backs the "action required" Needs-you notice this button
+        // targets: `list_open_pull_requests` would now exclude this row.
+        repo::mark_pull_request_probe_error(&db, pr.id, "still broken").await.unwrap();
+        repo::mark_pull_request_probe_error(&db, pr.id, "still broken").await.unwrap();
+        let before = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert!(before.probe_fail_count >= 2);
+        assert!(
+            repo::list_open_pull_requests(&db, 2).await.unwrap().is_empty(),
+            "precondition: the row must actually have fallen out of the sweep"
+        );
+
+        let reset_count = retry_pr_tracking_core(&db, dir.id).await.unwrap();
+        assert_eq!(reset_count, 1);
+
+        let after = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(after.probe_fail_count, 0, "retry must reset the streak, same as a fresh register_pr");
+        assert_eq!(
+            repo::list_open_pull_requests(&db, 2).await.unwrap().len(),
+            1,
+            "the row must rejoin the sweep after a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_pr_tracking_ignores_merged_rows_and_a_direction_with_nothing_tracked() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let (thread, dir, repo_ref) = pr_retry_fixture(&db).await;
+
+        // A direction with no tracked PR/MR at all: a harmless no-op, not an
+        // error — the button must not fail just because the notice it targets
+        // was already superseded by a later sweep.
+        assert_eq!(retry_pr_tracking_core(&db, dir.id).await.unwrap(), 0);
+
+        // A merged row must be left alone — resetting a closed chapter's
+        // streak would be pointless (it will never be swept again either way)
+        // and `register_pull_request` would otherwise silently resurrect
+        // stale `open`-shaped bookkeeping for it.
+        let pr = repo::register_pull_request(
+            &db, thread.id, dir.id, repo_ref.id, "github", "github.com", "acme", "widgets", 5, "", "",
+        )
+        .await
+        .unwrap();
+        use sea_orm::{ActiveModelTrait, Set};
+        let mut a: entities::pull_request::ActiveModel = pr.clone().into();
+        a.lifecycle = Set("merged".to_string());
+        a.probe_fail_count = Set(3);
+        a.update(&db.0).await.unwrap();
+
+        assert_eq!(
+            retry_pr_tracking_core(&db, dir.id).await.unwrap(),
+            0,
+            "a merged row must not be touched"
+        );
+        let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.probe_fail_count, 3, "left exactly as it was");
     }
 }
