@@ -258,14 +258,7 @@ async fn run_stall_pass(
                     }
                 }
             }
-            for (thread_id, dir_id) in to_notify {
-                let id = bus.notify_human(
-                    thread_id,
-                    &dir_id.to_string(),
-                    &stopped_worker_notice_text(dir_id),
-                );
-                stopped_notices.insert(dir_id, (thread_id, id));
-            }
+            post_stopped_worker_notices(bus.inner(), stopped_notices, to_notify);
         }
         Err(e) => eprintln!("[weft][revive] stopped-worker pass failed: {e}"),
     }
@@ -621,6 +614,35 @@ fn diff_stopped_notices(
         .copied()
         .collect();
     (to_notify, to_retract)
+}
+
+/// Post the stopped-worker Needs-you notice for each direction [`diff_stopped_
+/// notices`] just flagged, and latch the resulting ask id into `stopped_
+/// notices` so a later sweep can retract it. This is the actual bus call site
+/// `run_stall_pass` invokes, pulled out so it is unit-testable against a real
+/// `BusRegistry::new()` with no `AppHandle`/Tauri runtime required — this
+/// crate's `AppHandle` is the concrete `Wry` runtime, while `tauri::test::
+/// mock_app` only yields a `MockRuntime` one, so a function taking `&AppHandle`
+/// is unreachable from any test (see `engine::stamp_freeze_marker`'s doc for
+/// the same wall, and `host::monitor`'s `apply_notice_action`/`post_notice`
+/// for the identical split there).
+///
+/// Always `notify_human` (the self-clearing `AskKind::Notice` kind) — recovery
+/// is detected by `diff_stopped_notices`'s `to_retract` side and retracted
+/// explicitly by the caller, so this call site must never drift to `notify_
+/// human_action_required`: that kind is NEVER retracted by a background sweep
+/// (see `AskKind`'s doc), which would leave a resolved stopped-worker episode's
+/// card stuck on screen forever with no manual dismiss (see `NeedsRows.tsx`'s
+/// `AskRow`).
+fn post_stopped_worker_notices(
+    bus: &crate::bus::BusRegistry,
+    stopped_notices: &mut std::collections::HashMap<i32, (i32, u64)>,
+    to_notify: Vec<(i32, i32)>,
+) {
+    for (thread_id, dir_id) in to_notify {
+        let id = bus.notify_human(thread_id, &dir_id.to_string(), &stopped_worker_notice_text(dir_id));
+        stopped_notices.insert(dir_id, (thread_id, id));
+    }
 }
 
 fn now_secs() -> u64 {
@@ -1863,6 +1885,32 @@ mod tests {
         let (to_notify, to_retract) = diff_stopped_notices(&[(1, 20), (1, 30)], &[10, 20]);
         assert_eq!(to_notify, vec![(1, 30)]);
         assert_eq!(to_retract, vec![10]);
+    }
+
+    /// Regression (PR #154 follow-up review): the stopped-worker notice's REAL
+    /// call site must keep posting `AskKind::Notice`. Every prior test proving
+    /// this "kind" behaves correctly went through `BusRegistry::notify_human`
+    /// directly or a hand-built `Ask`, never through this production function
+    /// — so a future edit that swaps this call site to `notify_human_action_
+    /// required` (or `ask_human`) would leave every existing test green. This
+    /// test calls the actual production function instead.
+    #[test]
+    fn post_stopped_worker_notices_posts_the_self_clearing_notice_kind() {
+        let bus = crate::bus::BusRegistry::new();
+        let mut stopped_notices = std::collections::HashMap::new();
+        post_stopped_worker_notices(&bus, &mut stopped_notices, vec![(7, 42)]);
+
+        let open = bus.open_asks(7);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].from, "42");
+        assert_eq!(
+            open[0].kind,
+            crate::bus::AskKind::Notice,
+            "a stopped-worker notice must stay the self-clearing kind — diff_stopped_notices's \
+             to_retract path is the only thing that ever clears it, and NoticeActionRequired is \
+             never retracted by a background sweep (see AskKind's doc)"
+        );
+        assert_eq!(stopped_notices.get(&42), Some(&(7, open[0].id)));
     }
 
     /// The resume prompt names the exact stalled worker bus ids so the lead can

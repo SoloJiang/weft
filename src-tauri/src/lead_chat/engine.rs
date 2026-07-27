@@ -4476,6 +4476,27 @@ enum SweepOutcome {
     },
 }
 
+/// The real bus call site [`post_stall_notice`] invokes, split out so it is
+/// unit-testable against a real `BusRegistry::new()` with no `AppHandle`/Tauri
+/// runtime required. This crate's `AppHandle` is the concrete `Wry` runtime
+/// (58+ unparameterized uses in this file alone), while `tauri::test::mock_app`
+/// only yields a `MockRuntime` one — so a function taking `&AppHandle` is
+/// unreachable from any test (see [`stamp_freeze_marker`]'s doc for the same
+/// wall, and `host::monitor`'s `apply_notice_action`/`post_notice` for the
+/// identical split there).
+///
+/// Always `notify_human` (the self-clearing `AskKind::Notice` kind) — a
+/// stalled turn always eventually recovers or ends, and `cancel_stall_notice`
+/// is the only thing that ever retracts this notice. Drifting this call to
+/// `notify_human_action_required` would leave it on screen forever (that kind
+/// is never retracted by a background sweep — see `AskKind`'s doc); drifting
+/// it to `ask_human` (`AskKind::Question`) would let a stray reply land in the
+/// asker's inbox after the notice goes stale, exactly the bug `post_stall_
+/// notice`'s own doc below describes.
+fn post_stall_notice_via(bus: &crate::bus::BusRegistry, thread: i32, dir: &str, stall_secs: u64) -> u64 {
+    bus.notify_human(thread, dir, &stall_notice_text(stall_secs))
+}
+
 /// Post the soft, self-clearing "task stalled" notice to Needs-you (also wakes the
 /// human + IM bridge). Returns the ask id, or None if the bus isn't mounted.
 /// A display-only NOTICE (`notify_human`), never an answerable question: it says
@@ -4484,7 +4505,7 @@ enum SweepOutcome {
 /// would inject a stray bus message into the task's inbox.
 fn post_stall_notice(app: &AppHandle, thread: i32, dir: &str, stall_secs: u64) -> Option<u64> {
     app.try_state::<crate::bus::BusRegistry>()
-        .map(|bus| bus.notify_human(thread, dir, &stall_notice_text(stall_secs)))
+        .map(|bus| post_stall_notice_via(bus.inner(), thread, dir, stall_secs))
 }
 
 /// Retract a previously-posted stall notice. `ask_id == 0` means "no notice was
@@ -7552,6 +7573,32 @@ mod tests {
         // decision 2), NOT a test-fast value. This trips if the production
         // default is silently shortened (e.g. back to the rejected 90s).
         assert_eq!(STALL_HINT_DEFAULT_SECS, 480);
+    }
+
+    /// Regression (PR #154 follow-up review): the stall notice's REAL call
+    /// site must keep posting `AskKind::Notice`. Every prior test proving
+    /// this "kind" behaves correctly — `bus::state::notify_human_is_a_non_
+    /// answerable_notice`, `im::mod::stall_notice_forwarded_as_text_to_im` —
+    /// either called `BusRegistry::notify_human` with a literal or hand-built
+    /// an `Ask` via a local `mk()` closure; neither one goes through
+    /// `post_stall_notice_via`, so a future edit that swaps this call site to
+    /// `notify_human_action_required` (or `ask_human`) would leave every
+    /// existing test green. This test calls the actual production function.
+    #[test]
+    fn post_stall_notice_via_posts_the_self_clearing_notice_kind() {
+        let bus = crate::bus::BusRegistry::new();
+        let id = post_stall_notice_via(&bus, 1, "10", 120);
+        let open = bus.open_asks(1);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, id);
+        assert_eq!(open[0].from, "10");
+        assert_eq!(
+            open[0].kind,
+            crate::bus::AskKind::Notice,
+            "a stall notice must stay the self-clearing kind — cancel_stall_notice is the only \
+             thing that ever retracts it, and NoticeActionRequired is never retracted by a \
+             background sweep (see AskKind's doc)"
+        );
     }
 
     // ── turn-freeze auto-recovery (issue #93) ──
