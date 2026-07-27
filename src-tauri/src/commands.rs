@@ -1604,6 +1604,28 @@ pub async fn set_quota_failover_enabled(db: State<'_, Db>, enabled: bool) -> R<(
     .map_err(e)
 }
 
+/// Issue #110 T3: whether Weft should squash-merge a tracked PR/MR on its own
+/// once it reaches this repo's truly-mergeable bar
+/// (`crate::host::automerge::spawn_pr_automerge_watch`). Opt-in, default OFF
+/// — see `crate::host::automerge::K_AUTO_MERGE_ENABLED`'s doc for why: this
+/// performs an irreversible action with no human confirming the specific
+/// merge.
+#[tauri::command]
+pub async fn get_pr_auto_merge_enabled(db: State<'_, Db>) -> R<bool> {
+    crate::host::automerge::try_auto_merge_enabled(&db).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn set_pr_auto_merge_enabled(db: State<'_, Db>, enabled: bool) -> R<()> {
+    repo::set_setting(
+        &db,
+        crate::host::automerge::K_AUTO_MERGE_ENABLED,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(e)
+}
+
 /// The user-configured coding-agent command overrides ("aliases"): identity →
 /// command (e.g. `claude` → `cc-claude`). Empty map when none are set.
 #[tauri::command]

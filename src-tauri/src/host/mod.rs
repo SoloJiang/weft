@@ -28,7 +28,21 @@
 //! guessing a hostname's kind from string content (`gitlab.mycompany.com` vs
 //! an internal domain with no recognizable name) entirely: the caller who
 //! just ran `gh pr create` / `glab mr create` already KNOWS which one it used.
+//!
+//! READ/WRITE BOUNDARY (issue #110 T3 added the write side): [`PrHost`]'s two
+//! methods, `kind` and `fetch_status`, are BOTH read-only — there is no
+//! mutating counterpart on the trait — so `monitor` and `github`'s `PrHost`
+//! impl are READ-ONLY by construction, not just by convention, and that
+//! stayed true through T3. The one mutating
+//! action this module tree performs (`gh pr merge`) lives ENTIRELY in
+//! [`automerge`], has its own independent spawned loop
+//! (`automerge::spawn_pr_automerge_watch`), and is never reachable from
+//! `monitor`'s sweep. [`gate`] is [`automerge`]'s pure decision function,
+//! split out the same way [`judge`] is split out from `monitor` — see
+//! `gate`'s and `automerge`'s own module docs for the full reasoning.
 
+pub mod automerge;
+pub mod gate;
 pub mod github;
 pub mod judge;
 pub mod monitor;

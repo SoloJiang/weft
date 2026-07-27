@@ -106,6 +106,9 @@ const NESTABLE_KIND: Record<LeadMessage["kind"], boolean> = {
   // markers, not conversation rows that belong inside a collab branch.
   engine_route: false,
   engine_route_blocked: false,
+  // A completed auto-merge attempt (issue #110 T3) is likewise a durable,
+  // system-owned marker, never a per-agent conversation row.
+  pr_auto_merge: false,
 };
 
 function parseContentObject(row: LeadMessage): Record<string, unknown> {

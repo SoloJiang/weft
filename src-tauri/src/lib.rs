@@ -219,6 +219,10 @@ pub fn run() {
             // process-level-background shape as the stall watch above, not
             // tied to any one chat session's lifetime.
             host::monitor::spawn_pr_watch(app.handle().clone());
+            // Issue #110 T3: the auto-merge executor — its OWN independent
+            // sweep loop (opt-in, default off), deliberately NOT chained off
+            // the read-only sweep above. See `host::automerge`'s module doc.
+            host::automerge::spawn_pr_automerge_watch(app.handle().clone());
             power::spawn_sweep(app.handle().clone());
             process_quota::spawn_monitor(app.handle().clone());
             gc::spawn_periodic(app.handle().clone());
@@ -348,6 +352,8 @@ pub fn run() {
             commands::set_automatic_engine_routing_enabled,
             commands::get_quota_failover_enabled,
             commands::set_quota_failover_enabled,
+            commands::get_pr_auto_merge_enabled,
+            commands::set_pr_auto_merge_enabled,
             commands::get_tool_commands,
             commands::set_tool_command,
             commands::list_skill_sources,

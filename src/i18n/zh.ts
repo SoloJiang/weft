@@ -446,6 +446,13 @@ export const zh = {
     engineRouteQuotaBasis: "额度：{{status}}",
     engineRouteBlockedHint: "请选择手动引擎或调整全局路由设置，然后重试。",
     quotaFailoverFailedMarker: "自动 fail-over 到 {{to}} 失败——仍在 {{from}} 上",
+    autoMergeSucceeded: "已自动合并 {{abbrev}} #{{number}} 到 {{base}}",
+    autoMergeFailed: "{{abbrev}} #{{number}} 自动合并失败",
+    autoMergeStateOpen: "仍是 open，未合并",
+    autoMergeStateMerged: "已确认 merged",
+    autoMergeStateClosed: "已关闭，未合并",
+    autoMergeStateUnknown: "暂时无法确认当前状态",
+    autoMergeAttemptsExhausted: "已连续失败 {{count}} 次，在这个 commit 更新前不会再自动重试",
   },
   diff: {
     tab: "改动",
@@ -754,6 +761,14 @@ export const zh = {
       "开启后，结构化额度达限的 turn 可能把最近的对话上下文从一家厂商发给另一家；健康运行中的 turn 不会被中断。",
     quotaFailoverConfirm:
       "要开启额度自动 fail-over 吗？额度达限后，最近的对话上下文可能会从一家厂商发送给另一家。",
+    autoMergeGroup: "自动合并",
+    autoMergeTitle: "达标后自动合并",
+    autoMergeHint:
+      "当被跟踪的 PR/MR 达到本仓库「truly mergeable」的标准（CI 真正跑绿——不是没配置——、GitHub 自己的 review decision 通过、无冲突），且经过一次新鲜、未失联的复查确认这一状态仍然成立，Weft 会自动 squash 合并——不会再逐条询问你。默认关闭：这是一个不可撤销的动作（合并代码），且没有人确认这一次具体的合并。开启后，第一次检查就可能立刻、静默合并所有已经达标的被跟踪 PR/MR，不只是之后才达标的那些。每次尝试无论成功失败，都会在 PR 的时间线留下标记。",
+    autoMergeDisclosure:
+      "只对 Weft 已经在跟踪（通过 register_pr）、且宿主支持合并的 PR/MR 生效（目前仅 GitHub）。状态过期或探测正在失败的行会被跳过，不会用旧快照去合并。这不会独立检查未解决的 review 讨论线程，也不会检查某个仓库专属的机器人批准约定（例如某个 review 机器人的 👍）——只看 GitHub 自己的聚合 review decision。如果你的仓库依赖这些，请开启 GitHub 自己的分支保护（「Require conversation resolution before merging」、必需的 reviewer），这样条件不满足时合并会在服务端被直接拒绝。",
+    autoMergeConfirm:
+      "要开启自动合并吗？Weft 会自动 squash 合并每一个已经达到、或之后达到本仓库「truly mergeable」标准的被跟踪 PR/MR——不会再逐条问你，可能一开启就立刻合并好几个。它只看 GitHub 自己的 review decision：不会检查未解决的 review 线程，也不看 review 机器人是否批准。这个动作一旦发生就无法撤销。",
     engineRoutingGroup: "引擎路由",
     automaticRoutingTitle: "允许 Weft 自动选择引擎",
     automaticRoutingHint:

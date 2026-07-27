@@ -464,6 +464,13 @@ export const en = {
     engineRouteQuotaBasis: "quota: {{status}}",
     engineRouteBlockedHint: "Choose a manual engine or change the global routing setting, then retry.",
     quotaFailoverFailedMarker: "Auto fail-over to {{to}} failed — still on {{from}}",
+    autoMergeSucceeded: "Auto-merged {{abbrev}} #{{number}} into {{base}}",
+    autoMergeFailed: "Auto-merge of {{abbrev}} #{{number}} failed",
+    autoMergeStateOpen: "still open, not merged",
+    autoMergeStateMerged: "confirmed merged",
+    autoMergeStateClosed: "closed without merging",
+    autoMergeStateUnknown: "could not confirm current state",
+    autoMergeAttemptsExhausted: "Stopped retrying after {{count}} consecutive failures on this commit",
   },
   diff: {
     tab: "Diff",
@@ -780,6 +787,14 @@ export const en = {
       "This can send recent conversation context from one provider to the other after a structured quota-exceeded turn. It never interrupts a healthy turn.",
     quotaFailoverConfirm:
       "Enable automatic quota fail-over? Recent conversation context may be sent from one provider to the other after a quota-exceeded turn.",
+    autoMergeGroup: "Auto-merge",
+    autoMergeTitle: "Auto-merge when truly mergeable",
+    autoMergeHint:
+      "When a tracked PR/MR reaches this repo's truly-mergeable bar (CI actually green — not just unconfigured — GitHub's own review decision approved, no conflicts) and a fresh, unstalled check confirms it still holds, squash-merge it automatically — no per-merge prompt. Off by default: this performs an irreversible action (merging code) with nobody confirming that specific merge. Turning this on can immediately, silently merge every already-ready tracked PR/MR on its very first check, not only ones that become ready afterward. Every attempt, success or failure, leaves a marker on the PR's timeline.",
+    autoMergeDisclosure:
+      "Only applies to PR/MR rows Weft is already tracking (via register_pr) on a host with merge support (currently GitHub). A stale or currently-failing status check skips the row instead of merging on an old snapshot. This does NOT independently check unresolved review discussion threads or a repo-specific bot-approval convention (e.g. a review bot's 👍) — only GitHub's own aggregate review decision. If your repo relies on those, turn on GitHub's own branch protection (\"Require conversation resolution before merging\", a required reviewer) so an unmet condition refuses the merge server-side.",
+    autoMergeConfirm:
+      "Enable auto-merge? Weft will squash-merge every tracked PR/MR that already meets — or next reaches — this repo's truly-mergeable bar, on its own, without asking you each time, possibly several at once right away. It goes by GitHub's own review decision only: it does not check for unresolved review threads or a review bot's approval. This cannot be undone once it happens.",
     engineRoutingGroup: "Engine routing",
     automaticRoutingTitle: "Let Weft choose engines automatically",
     automaticRoutingHint:
