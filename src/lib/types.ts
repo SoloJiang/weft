@@ -817,6 +817,19 @@ export interface WriteTrigger {
   route?: EngineRouteDecision | null;
 }
 
+/** Discriminates what a `NeedItem` represents and how the Needs-you card
+ *  should render it — mirrors Rust `bus::AskKind`. Replaces the old
+ *  `answerable: boolean`, now that a display-only NOTICE itself splits in
+ *  two: most notices (the stall hint, the stopped-worker hint, an ordinary
+ *  PR/MR update) are retracted automatically by a background process once the
+ *  condition they describe changes ("notice"), but the ONE PR/MR "gave up
+ *  tracking" notice (`host::judge::give_up_text`) is not ("notice_action_
+ *  required") — nothing will ever re-check and clear it without an explicit
+ *  external re-trigger. Rendering the generic "clears itself automatically"
+ *  footer under that one directly contradicts its own body text, which is
+ *  the bug this discriminant exists to let `AskRow` avoid. */
+export type NeedKind = "question" | "notice" | "notice_action_required";
+
 /** An open agent→human question, aggregated workspace-wide for "Needs you". */
 export interface NeedItem {
   ask_id: number;
@@ -826,9 +839,7 @@ export interface NeedItem {
   direction_name: string;
   text: string;
   ts: number;
-  /** `false` for a display-only NOTICE (the self-clearing stall hint) — rendered
-   * without an answer box; answering is refused backend-side. */
-  answerable: boolean;
+  kind: NeedKind;
 }
 
 /** IM 话题绑定行：issue ↔ 飞书话题 1:1 映射（M2-5）。 */

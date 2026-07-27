@@ -362,6 +362,12 @@ export const en = {
     riskUnknown: "Unknown risk",
     riskUnknownTitle: "Couldn't classify this call — review the arguments before approving",
     detailTruncated: "… {{n}} more characters truncated",
+    actionRequired: "This needs your action — it won't clear itself.",
+    retryTracking: "Retry",
+    retryTrackingTitle: "Reset the failed-check streak and let Weft try tracking this PR/MR again",
+    retryTrackingStarted: "Retry requested — Weft will re-check shortly.",
+    retryTrackingNothingToRetry: "Nothing to retry — this may already be resolved.",
+    retryTrackingFailed: "Couldn't retry tracking. Try again in a moment.",
   },
   tool: {
     input: "Input",
@@ -457,7 +463,7 @@ export const en = {
     engineRouteBlockedTransition: "{{from}} → {{to}}",
     engineRouteQuotaBasis: "quota: {{status}}",
     engineRouteBlockedHint: "Choose a manual engine or change the global routing setting, then retry.",
-    quotaFailoverFailedMarker: "Auto fail-over {{from}} → {{to}} failed",
+    quotaFailoverFailedMarker: "Auto fail-over to {{to}} failed — still on {{from}}",
   },
   diff: {
     tab: "Diff",

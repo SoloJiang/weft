@@ -279,14 +279,48 @@ fn contained(path: &str, roots: &[PathBuf]) -> bool {
 /// A path anchored at something other than a plain disk volume — a UNC share,
 /// a device path, a verbatim UNC. Inert on unix, where the parser never
 /// produces a `Prefix` component at all.
+///
+/// KNOWN, DOCUMENTED CI GAP (review round 2): this function's own test
+/// (`unc_and_device_paths_are_rejected_before_any_filesystem_call`) asserts
+/// `has_non_disk_prefix(&path) || !path.is_absolute()` on non-Windows, and a
+/// UNC-style STRING is never `is_absolute()` on unix in the first place — the
+/// right side of that `||` is unconditionally `true` there, so the assertion
+/// holds no matter what this function returns. A mutation that deletes this
+/// function's body entirely (always `false`) still passes that test on every
+/// platform this repo's CI actually runs (Windows is currently disabled in
+/// `.github/workflows/ci.yml`), because `PathBuf::from` on unix can never
+/// parse a `\\host\share\x`-style string into a `Component::Prefix` at all —
+/// there is no public std API to fabricate one outside of the platform's own
+/// path parser either, so this specific traversal-and-dispatch wiring has NO
+/// test that can exercise it with a real `Path` value except on an actual
+/// Windows target. `is_non_disk_prefix_kind` below pulls the one piece that
+/// CAN be asserted cross-platform — the disk/non-disk KIND decision, which
+/// `std::path::Prefix` (unlike `Component::Prefix`/`PrefixComponent`) is a
+/// plain public enum anyone can construct directly, parser or no parser — out
+/// into its own function precisely so a mutation to THAT decision has
+/// somewhere to be caught even where the surrounding traversal can't be
+/// exercised. The remaining gap (does `.components()` really route a real
+/// Windows path's prefix through it) stays open until Windows CI comes back;
+/// documented here rather than pretended away, the same way `is_multi_linked`
+/// documents its own "Windows hard links aren't detected" gap.
 fn has_non_disk_prefix(p: &Path) -> bool {
     p.components().any(|c| match c {
-        std::path::Component::Prefix(pre) => !matches!(
-            pre.kind(),
-            std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
-        ),
+        std::path::Component::Prefix(pre) => is_non_disk_prefix_kind(pre.kind()),
         _ => false,
     })
+}
+
+/// The DECISION half of `has_non_disk_prefix`: given the KIND a path prefix
+/// parsed to, is it something other than a plain disk volume. Isolated from
+/// the `Path`-walking half specifically so it can be unit tested by
+/// constructing `std::path::Prefix` values directly — see
+/// `has_non_disk_prefix`'s doc for why that traversal half has no way to be
+/// exercised with a genuine value on any platform this repo's CI runs today.
+fn is_non_disk_prefix_kind(kind: std::path::Prefix<'_>) -> bool {
+    !matches!(
+        kind,
+        std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+    )
 }
 
 /// A regular file reachable under MORE THAN ONE name.
@@ -352,18 +386,45 @@ fn resolved_target_is_read_only(resolved: &Path) -> bool {
     }) == crate::ask::RiskLevel::ReadOnly
 }
 
-/// Every absolute-path-shaped string anywhere in `input` is inside `roots`, and
-/// every `TARGET_KEYS` entry present is a contained absolute path.
+/// Every absolute-path-shaped string anywhere in `input` is inside `roots`,
+/// AND at least one `TARGET_KEYS` entry is present and is a contained
+/// absolute path.
 ///
 /// Two rules, because each covers what the other can't:
 ///
-/// 1. A `TARGET_KEYS` key that IS present must be a string AND absolute AND
-///    contained. This is what refuses `{"file_path": 42}` and
-///    `{"file_path": "~/.ssh/id_rsa"}` — values rule 2 would skip because
-///    neither is an absolute path string. A target key that is ABSENT is fine:
-///    `Glob` then defaults to the engine's own cwd, which weft set to a
-///    root when it spawned the session — a fact that only holds once the
-///    session RESOLVED, hence the empty-`roots` refusal below.
+/// 1. At least one `TARGET_KEYS` key MUST be present, and every one that IS
+///    present must be a string AND absolute AND contained. This is what
+///    refuses `{"file_path": 42}` and `{"file_path": "~/.ssh/id_rsa"}` —
+///    values rule 2 would skip because neither is an absolute path string —
+///    and is ALSO what refuses a `tool_input` naming no target key at all: an
+///    empty `{}`, an object like `{"pattern": "x"}` with no path-shaped key,
+///    or a value that isn't even a JSON object to begin with (`null`, a bare
+///    string, a number, a top-level array). Every CURRENT `ReadOnlyPath`
+///    builtin (`Read`, `NotebookRead`) names its target through exactly one
+///    `TARGET_KEYS` entry on EVERY real invocation, so a call missing one is
+///    not a shape the real CLI produces — it must be refused rather than
+///    falling through to rule 2, which (for a targetless object, or for any
+///    non-object value at all) has nothing left to reject and would
+///    otherwise approve on the same "found nothing to reject" logic the
+///    empty-`roots` case below already had to be defended against.
+///
+///    This used to be optional — back when `Glob` (which defaults to the
+///    engine's own cwd whenever its `path` argument is absent) was still on
+///    the allowlist. `Glob` was removed in PR #146 for an unrelated reason
+///    (a glob PATTERN is its own small language, and its expansion — not its
+///    spelling — decides what gets read), which also quietly retired the one
+///    legitimate reason a `ReadOnlyPath` call could omit every target key.
+///    Leaving the old allowance in place after that removal was itself a
+///    fresh fail-open: with no target key required, `tool_input: null` (or
+///    any other non-object payload) skipped rule 1 outright and rule 2 found
+///    no string to reject either, so the call passed on evidence of
+///    NOTHING — the wrong direction for a security predicate to default to.
+///    The real CLIs' `Read`/`NotebookRead` always send a proper `file_path`/
+///    `notebook_path` object, so this can only be reached by a local process
+///    that forges the `/ask` payload directly (this endpoint has no other
+///    auth — see `bus/server.rs`'s module doc) rather than by the engine
+///    itself; still a real hole in a module whose whole premise is "every
+///    failure lands on ask the human, never on allow".
 /// 2. Recursively, EVERY string value must stay inside the roots — absolute
 ///    ones by containment, relative ones by carrying no `..` component (see
 ///    `string_stays_in_root`). This is the rule that doesn't depend on knowing
@@ -398,25 +459,57 @@ fn resolved_target_is_read_only(resolved: &Path) -> bool {
 /// `session_roots` into a no-op for precisely the routes it exists to catch.
 /// (Caught in review by Codex on PR #146; this function's own test had
 /// asserted the permissive behavior as correct.)
+///
+/// Round 2's target-key requirement (rule 1, above) now ALSO refuses that
+/// same `Grep {"pattern": "TODO"}` shape unconditionally, independent of
+/// whether `roots` is empty — so this early check is doubly-guarded for an
+/// object-shaped, targetless call today. It stays load-bearing on its own for
+/// the ONE case rule 1 never sees at all: `input` entirely absent
+/// (`Option::None`, checked further down) unconditionally returns `true`
+/// there, and only THIS earlier empty-`roots` check stands between that and
+/// an unresolved session auto-approving a no-argument call.
 pub fn paths_contained(input: Option<&Value>, roots: &[PathBuf]) -> bool {
     if roots.is_empty() {
         return false;
     }
     let Some(v) = input else {
-        // No arguments at all: nothing points anywhere. A `Read`/`Glob` without
-        // arguments is malformed and the engine will reject it on its own.
+        // No arguments at all: nothing points anywhere. A `Read`/`NotebookRead`
+        // without arguments is malformed and the engine will reject it on its
+        // own before touching anything. Distinct from the object-shaped-but-
+        // targetless case below: this is the outer JSON-RPC payload omitting
+        // `tool_input` entirely, not the tool naming an empty/wrong-shaped one.
         return true;
     };
-    if let Some(obj) = v.as_object() {
-        for key in TARGET_KEYS {
-            let Some(target) = obj.get(*key) else {
-                continue;
-            };
-            match target.as_str() {
-                Some(s) if contained(s, roots) => {}
-                _ => return false,
-            }
+    // `tool_input` present but not a JSON object at all (`null`, a bare
+    // string, a number, a top-level array, ...) can never carry a
+    // `TARGET_KEYS` hit, so rule 1 has nothing to check on it — which must
+    // NOT be read as "nothing to reject". Falling through to rule 2 here
+    // would find nothing to walk either (a bare string with no `..`
+    // component "passes" rule 2 vacuously) and approve on the strength of
+    // finding no evidence at all, rather than positive evidence of
+    // containment. Refuse outright instead; see this function's doc for why
+    // every CURRENT `ReadOnlyPath` builtin's real schema is always an object.
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    let mut saw_target_key = false;
+    for key in TARGET_KEYS {
+        let Some(target) = obj.get(*key) else {
+            continue;
+        };
+        saw_target_key = true;
+        match target.as_str() {
+            Some(s) if contained(s, roots) => {}
+            _ => return false,
         }
+    }
+    if !saw_target_key {
+        // An object, but none of `TARGET_KEYS` is present. Same reasoning as
+        // the non-object case above: no positive evidence of a contained
+        // target is not the same thing as "nothing to reject", and every
+        // CURRENT `ReadOnlyPath` builtin always names its target through one
+        // of these keys, so this shape is not one the real CLI produces.
+        return false;
     }
     every_string_stays_in_root(v, roots)
 }
@@ -790,6 +883,25 @@ mod tests {
     /// A UNC / device path is refused BEFORE `canonicalize` is called on it, so
     /// the permission hook never dials a host the agent chose. Asserted via the
     /// prefix predicate, which is what runs ahead of the filesystem call.
+    ///
+    /// HONESTY NOTE (review round 2): the `#[cfg(not(windows))]` branch below
+    /// is NOT a real assertion on `has_non_disk_prefix` — a UNC-style STRING
+    /// is never `is_absolute()` on unix (backslashes aren't separators
+    /// there), so `!path.is_absolute()` is unconditionally `true` and the
+    /// `||` makes the whole line pass regardless of what
+    /// `has_non_disk_prefix` returns. A mutation that guts
+    /// `has_non_disk_prefix` to always return `false` still passes this test
+    /// on macOS and Linux — the only two platforms this repo's CI currently
+    /// runs (Windows is disabled in `.github/workflows/ci.yml`). What this
+    /// branch DOES honestly prove is the outer safety property ("never
+    /// reaches canonicalize"), just via the OTHER guard (`is_absolute()`) —
+    /// see `contained`'s early return — not via this one. The prefix
+    /// predicate's own disk/non-disk KIND decision is what
+    /// `non_disk_prefix_kinds_are_rejected_on_every_platform` (below) asserts
+    /// directly, on every platform, independent of this gap; the remaining
+    /// piece — whether `.components()` actually routes a genuine Windows
+    /// path's prefix through that decision — has no test that can exercise
+    /// it outside of a real Windows run.
     #[test]
     fn unc_and_device_paths_are_rejected_before_any_filesystem_call() {
         for p in [
@@ -801,7 +913,9 @@ mod tests {
             #[cfg(windows)]
             assert!(has_non_disk_prefix(&path), "{p} must be refused");
             // On unix these are not absolute at all, so `contained` refuses
-            // them one step earlier — either way, no filesystem call.
+            // them one step earlier — either way, no filesystem call. See the
+            // HONESTY NOTE above: this does NOT exercise `has_non_disk_prefix`
+            // itself on non-Windows.
             #[cfg(not(windows))]
             assert!(
                 has_non_disk_prefix(&path) || !path.is_absolute(),
@@ -811,6 +925,39 @@ mod tests {
         // An ordinary disk path is not caught by the prefix check.
         assert!(!has_non_disk_prefix(&PathBuf::from(r"C:\wt\src\main.rs")));
         assert!(!has_non_disk_prefix(&PathBuf::from("/wt/src/main.rs")));
+    }
+
+    /// `has_non_disk_prefix`'s decision logic, asserted directly against
+    /// hand-built `std::path::Prefix` values instead of through
+    /// `PathBuf::from`'s platform-specific string parser — which is what let
+    /// a mutation deleting the guard survive
+    /// `unc_and_device_paths_are_rejected_before_any_filesystem_call` on every
+    /// platform this repo's CI runs (see that test's HONESTY NOTE).
+    /// `std::path::Prefix` is an ordinary cross-platform enum with public
+    /// variant constructors — unlike `Component::Prefix`/`PrefixComponent`,
+    /// which only the platform's own path parser can produce — so building
+    /// its variants here exercises the real disk/non-disk decision on EVERY
+    /// platform, Windows included, with no parser standing in the way.
+    #[test]
+    fn non_disk_prefix_kinds_are_rejected_on_every_platform() {
+        use std::ffi::OsStr;
+        use std::path::Prefix;
+        for kind in [
+            Prefix::UNC(OsStr::new("host"), OsStr::new("share")),
+            Prefix::VerbatimUNC(OsStr::new("host"), OsStr::new("share")),
+            Prefix::Verbatim(OsStr::new("host")),
+            Prefix::DeviceNS(OsStr::new("PhysicalDrive0")),
+        ] {
+            assert!(
+                is_non_disk_prefix_kind(kind),
+                "{kind:?} must be treated as a non-disk prefix on every platform"
+            );
+        }
+        // The mirror: an ordinary disk (or verbatim-disk) prefix is NOT
+        // flagged — otherwise every ordinary Windows absolute path would be
+        // refused too.
+        assert!(!is_non_disk_prefix_kind(Prefix::Disk(b'C')));
+        assert!(!is_non_disk_prefix_kind(Prefix::VerbatimDisk(b'C')));
     }
 
     #[test]
@@ -841,16 +988,24 @@ mod tests {
         }
     }
 
+    /// Round 2 of this review: an object naming NONE of `TARGET_KEYS` used to
+    /// pass ("Glob without `path` searches the session's own cwd") back when
+    /// `Glob` was still on the allowlist. `Glob` left in PR #146 for an
+    /// unrelated reason, which quietly retired the one legitimate reason a
+    /// `ReadOnlyPath` call could omit every target key — `Read`/`NotebookRead`
+    /// always send theirs. Renamed from
+    /// `missing_target_key_is_fine_but_stray_absolute_paths_are_not` to match.
     #[test]
-    fn missing_target_key_is_fine_but_stray_absolute_paths_are_not() {
+    fn missing_target_key_is_refused_and_stray_absolute_paths_still_are() {
         let t = TempTree::new("missing");
-        // Glob without `path` searches the session's own cwd — a root.
-        assert!(paths_contained(
+        // No `TARGET_KEYS` entry at all: refused outright now (rule 1).
+        assert!(!paths_contained(
             Some(&json!({ "pattern": "TODO", "output_mode": "content" })),
             &t.roots()
         ));
-        // But an absolute path under ANY key — including one this module
-        // doesn't know — must still be contained (rule 2).
+        // An absolute path under ANY key — including one this module
+        // doesn't know — is refused independently by rule 2, whether or not
+        // rule 1 already refused the call.
         assert!(!paths_contained(
             Some(&json!({ "pattern": "TODO", "some_future_key": "/etc/passwd" })),
             &t.roots()
@@ -860,6 +1015,32 @@ mod tests {
             Some(&json!({ "opts": { "extra_dirs": ["/etc"] } })),
             &t.roots()
         ));
+    }
+
+    /// The vacuous-pass this review round closes: `tool_input` present but
+    /// NOT a JSON object (`null`, a bare non-path string, a number, a bool, a
+    /// top-level array) skipped rule 1 entirely (`v.as_object()` was `None`)
+    /// and rule 2 found no string worth rejecting either, so the call passed
+    /// on the strength of finding NOTHING wrong — always the wrong direction
+    /// for a security predicate. On the pre-fix code every case below
+    /// returned `true`; real `Read`/`NotebookRead` calls never take this
+    /// shape (see `paths_contained`'s doc), so the only way to reach it is a
+    /// local process forging the `/ask` payload directly.
+    #[test]
+    fn probe_non_object_tool_input_vacuously_passes_containment() {
+        let t = TempTree::new("non-object-input");
+        for bad in [
+            json!(null),
+            json!("innocuous text, not a path at all"),
+            json!(42),
+            json!(true),
+            json!(["src/main.rs"]),
+        ] {
+            assert!(
+                !paths_contained(Some(&bad), &t.roots()),
+                "a non-object tool_input must never vacuously pass containment: {bad}"
+            );
+        }
     }
 
     #[test]
@@ -974,36 +1155,45 @@ mod tests {
         }
     }
 
-    /// The mirror: ordinary relative arguments — the overwhelmingly common
-    /// case — must keep working, so the `..` refusal can't be "fixed" by
-    /// something that refuses every relative value.
+    /// The mirror: ordinary relative arguments sitting ALONGSIDE a valid,
+    /// contained target key — the overwhelmingly common shape a real
+    /// `Read`/`NotebookRead` call takes (extra harmless metadata next to
+    /// `file_path`) — must keep working, so neither the `..` refusal nor the
+    /// round-2 target-key requirement can be "fixed" by something that
+    /// refuses every relative value or every extra key. (Before round 2, this
+    /// test used bare `Glob`-shaped `{"pattern": ...}` objects with no target
+    /// key at all — that shape is now itself refused; see
+    /// `missing_target_key_is_refused_and_stray_absolute_paths_still_are`.)
     #[test]
     fn ordinary_relative_args_still_pass() {
         let t = TempTree::new("rel-ok");
+        let f = t.file("src/main.rs");
         for fine in [
-            json!({ "pattern": "**/*.rs" }),
-            json!({ "pattern": "src/**/*.ts", "output_mode": "content" }),
-            // `..` as regex syntax, not a path component: one component named
-            // `a..b`, which is not a parent reference.
-            json!({ "pattern": "a..b" }),
+            json!({ "file_path": f.clone(), "note": "**/*.rs" }),
+            json!({ "file_path": f.clone(), "note": "src/**/*.ts" }),
+            // `..` as regex/text syntax, not a path component: one component
+            // named `a..b`, which is not a parent reference.
+            json!({ "file_path": f.clone(), "note": "a..b" }),
         ] {
             assert!(
                 paths_contained(Some(&fine), &t.roots()),
-                "an ordinary relative arg must stay auto-approved: {fine}"
+                "an ordinary relative arg alongside a valid target key must \
+                 stay auto-approved: {fine}"
             );
         }
     }
 
-    /// The mirror of the above, so the empty-roots refusal can't be "fixed" by
-    /// something that also breaks the ordinary cwd-defaulting call: with a
-    /// RESOLVED session, naming no path is still fine.
+    /// The one targetless shape that remains fine even once the session
+    /// resolves: `tool_input` ABSENT from the outer payload entirely (as
+    /// opposed to present but naming no `TARGET_KEYS` entry, which round 2 of
+    /// this review now refuses — see
+    /// `missing_target_key_is_refused_and_stray_absolute_paths_still_are`).
+    /// So the empty-roots refusal (`empty_roots_auto_approve_nothing_at_all`)
+    /// can't be "fixed" by something that also breaks this ordinary,
+    /// malformed-but-harmless call once the session DOES resolve.
     #[test]
     fn targetless_call_is_fine_once_the_session_resolves() {
         let t = TempTree::new("targetless-ok");
-        assert!(paths_contained(
-            Some(&json!({ "pattern": "TODO" })),
-            &t.roots()
-        ));
         assert!(paths_contained(None, &t.roots()));
     }
 
