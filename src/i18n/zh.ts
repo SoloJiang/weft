@@ -439,7 +439,7 @@ export const zh = {
     engineRouteBlockedTransition: "{{from}} → {{to}}",
     engineRouteQuotaBasis: "额度：{{status}}",
     engineRouteBlockedHint: "请选择手动引擎或调整全局路由设置，然后重试。",
-    quotaFailoverFailedMarker: "自动 fail-over {{from}} → {{to}} 失败",
+    quotaFailoverFailedMarker: "自动 fail-over 到 {{to}} 失败——仍在 {{from}} 上",
   },
   diff: {
     tab: "改动",
