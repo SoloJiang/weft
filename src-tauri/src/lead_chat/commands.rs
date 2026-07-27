@@ -2278,6 +2278,54 @@ fn release_quota_failover_slot(key: QuotaFailoverKey) {
     cooldowns.remove(&key);
 }
 
+/// Gate 6 of the fail-over decision — the concurrency claim on the cooldown
+/// slot, resolved at the very last moment before the engine handoff (see the
+/// call site in [`maybe_failover_on_quota`], AFTER the per-engine switch gate
+/// is held and the manual-pin recheck has passed).
+///
+/// [`crate::engine_routing::FailoverDecision`] only models gates 1-5
+/// (enabled / structured-exceeded / fallback known / fallback not ALSO
+/// exceeded / cooldown not active) because it is resolved once, early,
+/// against a cheap pre-switch-gate peek ([`quota_failover_cooldown_active`]).
+/// That peek can go stale while the caller waits on the switch gate — a
+/// second, concurrent `maybe_failover_on_quota` invocation for the same key
+/// can claim the slot in the meantime — so this gate has to be its own,
+/// later, separately-resolved step, exactly like the manual-pin gate already
+/// gets both an early check (folded into `FailoverDecision`'s inputs) AND a
+/// late [`quota_failover_still_unpinned`] recheck.
+///
+/// This deliberately does NOT split "judge eligibility" from "perform the
+/// claim" into two independent calls (a peek-based pure predicate plus a
+/// separately-invoked mutating claim): two concurrent callers could both see
+/// a pre-claim peek as "available" and only find out they collided when a
+/// SECOND, unrelated claim call ran later — a real TOCTOU window, and a trap
+/// for a future caller who trusts the peek instead of the claim's own return
+/// value. Instead, [`claim_quota_failover_slot`] remains the single atomic
+/// compare-and-swap (lock, check elapsed-since-last-claim, insert `now` — all
+/// under one mutex acquisition) that decides for real; this function only
+/// folds its already-resolved, authoritative result into an
+/// exhaustively-matched verdict the call site must handle. There is no
+/// window in which two concurrent calls can both observe `Claimed` for the
+/// same key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotaFailoverClaimGate {
+    /// This call won the race: the slot is now ours for
+    /// [`QUOTA_FAILOVER_COOLDOWN_SECS`].
+    Claimed,
+    /// Another call already holds the slot for this key — skip this round
+    /// entirely rather than retry (see [`claim_quota_failover_slot`]'s doc).
+    Lost,
+}
+
+#[must_use]
+fn quota_failover_claim_gate(key: QuotaFailoverKey) -> QuotaFailoverClaimGate {
+    if claim_quota_failover_slot(key) {
+        QuotaFailoverClaimGate::Claimed
+    } else {
+        QuotaFailoverClaimGate::Lost
+    }
+}
+
 fn quota_failover_engine_key(thread_id: i32, session_id: Option<i32>) -> i64 {
     session_id.map(i64::from).unwrap_or_else(|| lead_key(thread_id))
 }
@@ -2393,7 +2441,9 @@ pub fn spawn_quota_failover_check(
 /// issue #97: auto-switch a thread/session away from `tool` using the shared
 /// engine-routing resolver. Thin wiring only — resolve the impure inputs
 /// (setting, installed tools, structured quota readings, cooldown peek),
-/// delegate the judgment call to the shared function, then dispatch. Reuses
+/// delegate the judgment call to the shared function (gates 1-5), then a
+/// second, later, exhaustively-matched gate (6: [`quota_failover_claim_gate`])
+/// governs dispatch. Reuses
 /// [`switch_lead_tool_inner`]/[`switch_worker_tool_inner`] VERBATIM — the
 /// exact six-step teardown/persist/reconstruct sequence #139 shipped and
 /// reviewed, never a hand-rolled partial tool/model update. Every failure is
@@ -2463,24 +2513,24 @@ async fn maybe_failover_on_quota(
     if !quota_failover_still_unpinned(db, thread_id, session_id).await {
         return;
     }
-    // Claim the cooldown slot before the short final engine handoff. A second
-    // turn-end callback then cannot race this one into a duplicate switch.
-    //
-    // This claim is a 6th gate `FailoverDecision` does not model — the
-    // decision above only ever sees `cooldown_ok` as an already-resolved
-    // input (the read-only peek near the top of this function). Deleting
-    // this call compiles cleanly and leaves every `quota_failover_tests`
-    // test green: none of them exercise `maybe_failover_on_quota` itself (it
-    // needs an `AppHandle`, unavailable in this crate's test harness — same
-    // limitation the `push_model_arg` tests' doc comment records). Without
-    // it, the cooldown map is never actually marked claimed on this path, so
-    // a second concurrent invocation for the same key would see
-    // `quota_failover_cooldown_active` still false and dispatch ANOTHER
-    // switch — silently defeating `QUOTA_FAILOVER_COOLDOWN_SECS`'s storm-
-    // breaker promise. `quota_failover_dispatch_claim_blocks_a_concurrent_decision`
-    // below proves the mechanism this depends on.
-    if !claim_quota_failover_slot(key) {
-        return;
+    // Gate 6 — claim the cooldown slot before the short final engine
+    // handoff, so a second turn-end callback cannot race this one into a
+    // duplicate switch. See `quota_failover_claim_gate`'s doc for why this
+    // is its own, later, exhaustively-matched step rather than folded into
+    // `FailoverDecision`'s gates 1-5. `quota_failover_claim_gate_blocks_a_
+    // concurrent_claim` below calls this EXACT function and proves its
+    // claim/reclaim behavior directly. What no test proves — the same,
+    // disclosed limitation every gate here shares — is that this call site
+    // itself still runs: `maybe_failover_on_quota` needs an `AppHandle`,
+    // unavailable in this crate's test harness (same limitation the
+    // `push_model_arg` tests' doc comment records). Deleting this `match`,
+    // or replacing `quota_failover_claim_gate` with a stub that always
+    // returns `Claimed`, would silently defeat
+    // `QUOTA_FAILOVER_COOLDOWN_SECS`'s storm-breaker promise without
+    // failing the build.
+    match quota_failover_claim_gate(key) {
+        QuotaFailoverClaimGate::Lost => return,
+        QuotaFailoverClaimGate::Claimed => {}
     }
     if !claim_quota_failover_commit(app, thread_id, session_id, tool).await {
         release_quota_failover_slot(key);
@@ -2706,15 +2756,16 @@ mod quota_failover_tests {
         crate::engine_quota::clear_for_test();
     }
 
-    /// Closest unit-testable proof of the mechanism the dispatch-time
-    /// `claim_quota_failover_slot` call in `maybe_failover_on_quota` depends
-    /// on (see the comment at that call site). A full regression test
-    /// through `maybe_failover_on_quota` itself needs an `AppHandle`, which
-    /// this crate's test harness does not provide — so this instead
-    /// reproduces the exact peek -> decide -> claim -> peek -> decide
-    /// sequence that function performs around the call, entirely through
-    /// pure/sync pieces: once the slot is claimed, a second, concurrent
-    /// caller's decision must flip from SwitchTo to Skip(CooldownActive).
+    /// Complements `quota_failover_claim_gate_blocks_a_concurrent_claim`
+    /// (which proves gate 6 in isolation) by proving how gate 6's real claim
+    /// feeds back into gate 5's PEEK: this reproduces the exact
+    /// peek -> decide -> claim -> peek -> decide sequence
+    /// `maybe_failover_on_quota` performs across its two decision points,
+    /// entirely through pure/sync pieces — once the slot is claimed, a
+    /// second, concurrent caller's EARLY decision must flip from SwitchTo to
+    /// Skip(CooldownActive) too, not just the late gate-6 claim itself. A
+    /// full regression test through `maybe_failover_on_quota` itself needs
+    /// an `AppHandle`, which this crate's test harness does not provide.
     #[test]
     fn quota_failover_dispatch_claim_blocks_a_concurrent_decision() {
         let key: QuotaFailoverKey = (900_010, None);
@@ -2760,6 +2811,36 @@ mod quota_failover_tests {
             ),
             "a second concurrent decision must be blocked by the claim, not switch again"
         );
+    }
+
+    /// Direct proof of gate 6 (`quota_failover_claim_gate`) itself — unlike
+    /// `quota_failover_dispatch_claim_blocks_a_concurrent_decision` above,
+    /// which reconstructs the surrounding peek/decide sequence by hand, this
+    /// calls the EXACT function `maybe_failover_on_quota` matches on at its
+    /// dispatch point. If a future change made that function's internals
+    /// vacuously return `Claimed` (bypassing the real
+    /// `claim_quota_failover_slot` CAS), this test is what would catch it:
+    /// a fresh key must win the claim; a second, concurrent call for the
+    /// SAME key, before the cooldown elapses, must lose the race rather
+    /// than claim again; a different key remains independent.
+    #[test]
+    fn quota_failover_claim_gate_blocks_a_concurrent_claim() {
+        let key: QuotaFailoverKey = (900_020, None);
+        assert_eq!(
+            quota_failover_claim_gate(key),
+            QuotaFailoverClaimGate::Claimed,
+            "first call for a fresh key must win the claim"
+        );
+        assert_eq!(
+            quota_failover_claim_gate(key),
+            QuotaFailoverClaimGate::Lost,
+            "a second concurrent call for the same key must lose the race, not re-claim"
+        );
+
+        // A different key (e.g. a worker session on the same thread) is
+        // independent — same invariant `claim_quota_failover_slot` proves.
+        let other: QuotaFailoverKey = (900_020, Some(1));
+        assert_eq!(quota_failover_claim_gate(other), QuotaFailoverClaimGate::Claimed);
     }
 
 }
