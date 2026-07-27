@@ -1,8 +1,9 @@
 //! All DB reads/writes go through here. Keeps SeaORM specifics out of commands.
 
 use super::entities::{
-    app_setting, code_checkpoint, direction, im_route, lead_message, plan, repo_profile,
-    repo_ref, session, skill_enable, skill_source, test_plan, thread, workspace, worktree,
+    app_setting, code_checkpoint, direction, im_route, lead_message, plan, pull_request,
+    repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread, workspace,
+    worktree,
 };
 use super::Db;
 use crate::slug::unique_slug;
@@ -3593,6 +3594,153 @@ pub async fn im_route_of_thread_ref(
         .await?)
 }
 
+// --- pull_request (issue #110 T1) ------------------------------------------
+//
+// Registration is agent-initiated (the `register_pr` bus tool, called right
+// after `gh pr create` / a future `glab mr create` succeeds); the background
+// monitor (`crate::host::monitor`) owns every write from then on. Both paths
+// funnel through the functions below so there is exactly one place that knows
+// the row shape.
+
+/// Find a tracked row by its natural host-side key. Registration upserts on
+/// this so re-registering the same PR/MR (e.g. after a restart, or a lead
+/// re-reporting it) updates context instead of duplicating the row.
+pub async fn find_pull_request(
+    db: &Db,
+    host_kind: &str,
+    host_owner: &str,
+    host_repo: &str,
+    number: i32,
+) -> Result<Option<pull_request::Model>> {
+    Ok(pull_request::Entity::find()
+        .filter(pull_request::Column::HostKind.eq(host_kind))
+        .filter(pull_request::Column::HostOwner.eq(host_owner))
+        .filter(pull_request::Column::HostRepo.eq(host_repo))
+        .filter(pull_request::Column::Number.eq(number))
+        .one(&db.0)
+        .await?)
+}
+
+pub async fn get_pull_request(db: &Db, id: i32) -> Result<Option<pull_request::Model>> {
+    Ok(pull_request::Entity::find_by_id(id).one(&db.0).await?)
+}
+
+/// Every row the monitor still needs to sweep — i.e. still `open`. A merged
+/// or closed row falls out of this query permanently: there is nothing left
+/// to poll once the change unit itself is resolved.
+pub async fn list_open_pull_requests(db: &Db) -> Result<Vec<pull_request::Model>> {
+    Ok(pull_request::Entity::find()
+        .filter(pull_request::Column::Lifecycle.eq("open"))
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn list_pull_requests_for_direction(
+    db: &Db,
+    direction_id: i32,
+) -> Result<Vec<pull_request::Model>> {
+    Ok(pull_request::Entity::find()
+        .filter(pull_request::Column::DirectionId.eq(direction_id))
+        .all(&db.0)
+        .await?)
+}
+
+/// Register a newly-opened PR/MR, or refresh an already-tracked one's context
+/// (thread/direction/repo can legitimately change across a re-registration —
+/// e.g. a direction's PR reopened under a new task after a rebase-and-reopen).
+#[allow(clippy::too_many_arguments)]
+pub async fn register_pull_request(
+    db: &Db,
+    thread_id: i32,
+    direction_id: i32,
+    repo_id: i32,
+    host_kind: &str,
+    host_base: &str,
+    host_owner: &str,
+    host_repo: &str,
+    number: i32,
+    url: &str,
+    title: &str,
+) -> Result<pull_request::Model> {
+    if let Some(existing) = find_pull_request(db, host_kind, host_owner, host_repo, number).await? {
+        let mut a: pull_request::ActiveModel = existing.into();
+        a.thread_id = Set(thread_id);
+        a.direction_id = Set(direction_id);
+        a.repo_id = Set(repo_id);
+        a.host_base = Set(host_base.to_string());
+        if !url.is_empty() {
+            a.url = Set(url.to_string());
+        }
+        if !title.is_empty() {
+            a.title = Set(title.to_string());
+        }
+        return Ok(a.update(&db.0).await?);
+    }
+    let a = pull_request::ActiveModel {
+        thread_id: Set(thread_id),
+        direction_id: Set(direction_id),
+        repo_id: Set(repo_id),
+        host_kind: Set(host_kind.to_string()),
+        host_base: Set(host_base.to_string()),
+        host_owner: Set(host_owner.to_string()),
+        host_repo: Set(host_repo.to_string()),
+        number: Set(number),
+        url: Set(url.to_string()),
+        title: Set(title.to_string()),
+        lifecycle: Set("open".to_string()),
+        created_at: Set(now()),
+        ..Default::default()
+    };
+    Ok(a.insert(&db.0).await?)
+}
+
+/// Apply a freshly, SUCCESSFULLY fetched snapshot: overwrite every observed
+/// field, clear any prior probe error, and stamp the check time. No-op if the
+/// row is gone (e.g. deleted concurrently). See
+/// `mark_pull_request_probe_error` for the failure counterpart, which
+/// deliberately leaves these observed fields untouched — a failed probe is a
+/// fact about the ATTEMPT, not new information about the PR/MR's real state.
+pub async fn apply_pull_request_snapshot(
+    db: &Db,
+    id: i32,
+    snapshot: &crate::host::PrSnapshot,
+    readiness: &crate::host::MergeReadiness,
+) -> Result<()> {
+    let Some(row) = pull_request::Entity::find_by_id(id).one(&db.0).await? else {
+        return Ok(());
+    };
+    let mut a: pull_request::ActiveModel = row.into();
+    a.head_sha = Set(snapshot.head_sha.clone());
+    a.base_ref = Set(snapshot.base_ref.clone());
+    if !snapshot.url.is_empty() {
+        a.url = Set(snapshot.url.clone());
+    }
+    if !snapshot.title.is_empty() {
+        a.title = Set(snapshot.title.clone());
+    }
+    a.lifecycle = Set(snapshot.lifecycle.as_str().to_string());
+    a.ci_status = Set(serde_json::to_string(&snapshot.ci).unwrap_or_default());
+    a.review_status = Set(serde_json::to_string(&snapshot.review).unwrap_or_default());
+    a.conflict_status = Set(serde_json::to_string(&snapshot.conflict).unwrap_or_default());
+    a.merge_readiness = Set(serde_json::to_string(readiness).unwrap_or_default());
+    a.last_checked_at = Set(now());
+    a.last_error = Set(String::new());
+    a.update(&db.0).await?;
+    Ok(())
+}
+
+/// Record a failed probe attempt without touching the last known snapshot.
+pub async fn mark_pull_request_probe_error(db: &Db, id: i32, message: &str) -> Result<()> {
+    let Some(row) = pull_request::Entity::find_by_id(id).one(&db.0).await? else {
+        return Ok(());
+    };
+    let mut a: pull_request::ActiveModel = row.into();
+    a.last_checked_at = Set(now());
+    a.last_error = Set(message.to_string());
+    a.update(&db.0).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7168,5 +7316,129 @@ mod tests {
         let ids: Vec<i32> = msgs.iter().map(|m| m.id).collect();
         // COALESCE(seq, id) ordering: A → a.id, C → c.id, B → c.id+1
         assert_eq!(ids, vec![a.id, c.id, b.id], "B must sort after C once its seq > C.id");
+    }
+
+    // ---- pull_request (issue #110 T1) ----
+
+    #[tokio::test]
+    async fn register_pull_request_creates_then_upserts_by_natural_key() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+
+        let first = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 42,
+            "https://github.com/acme/widgets/pull/42", "first title",
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.lifecycle, "open");
+        assert_eq!(first.title, "first title");
+
+        // Re-registering the SAME (host_kind, owner, repo, number) updates the
+        // existing row instead of creating a second one.
+        let second = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 42,
+            "https://github.com/acme/widgets/pull/42", "updated title",
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.id, first.id, "must upsert, not duplicate");
+        assert_eq!(second.title, "updated title");
+
+        let all = pull_request::Entity::find().all(&db.0).await.unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_open_pull_requests_excludes_merged_and_closed() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let open = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 1, "", "",
+        )
+        .await
+        .unwrap();
+        let merged = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 2, "", "",
+        )
+        .await
+        .unwrap();
+        let mut a: pull_request::ActiveModel = merged.clone().into();
+        a.lifecycle = Set("merged".to_string());
+        a.update(&db.0).await.unwrap();
+
+        let listed = list_open_pull_requests(&db).await.unwrap();
+        let ids: Vec<i32> = listed.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![open.id]);
+    }
+
+    #[tokio::test]
+    async fn apply_snapshot_overwrites_axes_and_clears_prior_error() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let pr = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 7, "", "",
+        )
+        .await
+        .unwrap();
+        mark_pull_request_probe_error(&db, pr.id, "boom: gh not authenticated")
+            .await
+            .unwrap();
+
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: "abc123".to_string(),
+            base_ref: "main".to_string(),
+            url: "https://github.com/acme/widgets/pull/7".to_string(),
+            title: "fix things".to_string(),
+            lifecycle: crate::host::PrLifecycle::Open,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        let readiness = crate::host::judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness)
+            .await
+            .unwrap();
+
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.head_sha, "abc123");
+        assert_eq!(reloaded.last_error, "", "a successful apply clears any prior probe error");
+        assert!(!reloaded.last_checked_at.is_empty());
+        assert!(reloaded.ci_status.contains("passing"));
+        assert!(reloaded.merge_readiness.contains("ready"));
+    }
+
+    #[tokio::test]
+    async fn probe_error_leaves_last_known_snapshot_untouched() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let pr = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 9, "", "",
+        )
+        .await
+        .unwrap();
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: "known-good-sha".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Open,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        let readiness = crate::host::judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness)
+            .await
+            .unwrap();
+
+        // A later probe failure (e.g. a transient network blip) must NOT erase
+        // the last known-good snapshot — only `last_checked_at`/`last_error` move.
+        mark_pull_request_probe_error(&db, pr.id, "network blip")
+            .await
+            .unwrap();
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.head_sha, "known-good-sha", "probe failure must not blank the last known snapshot");
+        assert_eq!(reloaded.last_error, "network blip");
     }
 }

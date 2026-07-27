@@ -35,6 +35,11 @@ mod engine_quota;
 pub(crate) mod engine_routing;
 mod gc;
 pub mod git;
+/// Issue #110 T1/T2: host abstraction (GitHub via `gh`, GitLab's shape
+/// reserved) + the background PR/MR monitor + the "truly mergeable"
+/// judgement. See `host::monitor` for the read-only boundary and
+/// `host::judge` for the judgement itself.
+pub mod host;
 /// Test-only: shared driver for the generated ask-hook scripts (see the module
 /// docs — one copy so claude's and codex's hook tests can't drift apart).
 #[cfg(test)]
@@ -210,6 +215,10 @@ pub fn run() {
             // since a coordination deadlock can develop while the app is
             // already running, not only across a restart (issue #95).
             lead_chat::revive::spawn_stall_watch(app.handle().clone());
+            // Issue #110 T1: the PR/MR state-machine sweep — same
+            // process-level-background shape as the stall watch above, not
+            // tied to any one chat session's lifetime.
+            host::monitor::spawn_pr_watch(app.handle().clone());
             power::spawn_sweep(app.handle().clone());
             process_quota::spawn_monitor(app.handle().clone());
             gc::spawn_periodic(app.handle().clone());

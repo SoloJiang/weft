@@ -1,7 +1,7 @@
 use crate::store::entities::{
     app_setting, backup_config, code_checkpoint, direction, im_route, lead_message, plan,
-    repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread, workspace,
-    worktree,
+    pull_request, repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread,
+    workspace, worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -56,6 +56,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0042ThreadLeadModel),
             Box::new(M0043SessionModel),
             Box::new(M0044EngineRoutingPin),
+            Box::new(M0045PullRequest),
         ]
     }
 }
@@ -1992,6 +1993,33 @@ impl MigrationTrait for M0044EngineRoutingPin {
                 )
                 .await?;
         }
+        Ok(())
+    }
+}
+
+/// Issue #110 T1: the tracked-PR/MR entity — a real DB row (repo, task,
+/// host-normalized state) so "what is this PR/MR waiting on" is a store fact
+/// the background monitor (`crate::host::monitor`) can read and update, not
+/// something that only lives in an agent's turn or a chat session's memory.
+pub struct M0045PullRequest;
+impl MigrationName for M0045PullRequest {
+    fn name(&self) -> &str {
+        "m0045_pull_request"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0045PullRequest {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut stmt = schema.create_table_from_entity(pull_request::Entity);
+        stmt.if_not_exists();
+        manager.create_table(stmt).await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("pull_request")).to_owned())
+            .await?;
         Ok(())
     }
 }

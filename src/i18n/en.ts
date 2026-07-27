@@ -346,7 +346,7 @@ export const en = {
     emptyBody:
       "When an agent hits a decision only you can make, it asks here. Answer once and the reply goes straight back to its inbox, so you never have to go hunting for the session.",
     answerPlaceholder: "Answer {{name}}…",
-    selfClearing: "No reply needed — clears itself when the task resumes.",
+    selfClearing: "No reply needed — clears itself automatically once it's resolved.",
     openDirection: "Open this task",
     wantsToWrite: "wants to modify",
     approveRun: "Approve & run",

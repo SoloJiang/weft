@@ -184,6 +184,7 @@ const AUTO_APPROVED_INTERNAL_TOOLS: &[(&str, &str)] = &[
     ("weft_bus", "thread_state_set"),
     ("weft_bus", "announce_interface_change"),
     ("weft_bus", "set_task_status"),
+    ("weft_bus", "register_pr"),
     // weft_planner — lead read-only planning; proposals are confirmed by the
     // human downstream in the direction-confirm flow.
     ("weft_planner", "get_task"),
@@ -405,11 +406,15 @@ async fn handle(
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            // set_task_status writes the DB (the task is `dir`); the rest are
-            // in-memory bus ops.
+            // set_task_status and register_pr write the DB (the task is
+            // `dir`); the rest are in-memory bus ops.
             if name == "set_task_status" {
                 let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
                 set_task_status_tool(&db, &dir, status).await
+            } else if name == "register_pr" {
+                let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                register_pr_tool(&db, thread, &dir, url, title).await
             } else {
                 call_tool(&reg, thread, &dir, name, &args)
             }
@@ -435,6 +440,51 @@ async fn set_task_status_tool(db: &Db, dir: &str, status: &str) -> Value {
             Err(e) => text_result(format!("error: {e}")),
         },
         Err(_) => text_result("this session has no task to update".into()),
+    }
+}
+
+/// Bus tool: track a just-opened PR/MR (issue #110 T1). `dir` is the
+/// direction id from the URL path (same identity-can't-be-spoofed guarantee
+/// `set_task_status_tool` relies on) — the task that owns this PR/MR. Only
+/// `url` is required: everything else (host kind, owner, repo, number) is
+/// PARSED from it (`host::parse_pr_url`) rather than trusted as separate
+/// free-text args that could drift from the URL the agent actually got back
+/// from `gh pr create` / a future `glab mr create`. The background monitor
+/// (`host::monitor::spawn_pr_watch`) picks up newly-registered rows on its
+/// own next sweep — this tool only ever writes the DB row, never calls a host
+/// API itself.
+async fn register_pr_tool(db: &Db, thread: i32, dir: &str, url: &str, title: &str) -> Value {
+    let Some(parts) = crate::host::parse_pr_url(url) else {
+        return text_result(format!(
+            "could not parse a PR/MR number and repo from '{url}' — expected a GitHub pull request URL (…/pull/N) or a GitLab merge request URL (…/-/merge_requests/N)"
+        ));
+    };
+    let direction_id = dir.parse::<i32>().unwrap_or(0);
+    let repo_id = match crate::store::repo::get_direction(db, direction_id).await {
+        Ok(Some(d)) => d.repo_id,
+        _ => 0,
+    };
+    match crate::store::repo::register_pull_request(
+        db,
+        thread,
+        direction_id,
+        repo_id,
+        parts.host_kind.as_str(),
+        &parts.host_base,
+        &parts.owner,
+        &parts.repo,
+        parts.number,
+        url,
+        title,
+    )
+    .await
+    {
+        Ok(pr) => text_result(format!(
+            "tracking {} #{} — weft will monitor its CI/review/conflict state in the background and post to Needs-you if it needs your attention",
+            parts.host_kind.native_noun(),
+            pr.number
+        )),
+        Err(e) => text_result(format!("error: {e}")),
     }
 }
 
@@ -1056,6 +1106,15 @@ fn tool_specs() -> Value {
             "description": "Move your task on the board as work really progresses: queued (not started), planning (working out this task's plan), working (actively building), review (done coding, awaiting the human's look), done (delivered/accepted). Reversible — set it back to working if the human asks for changes. Use this to keep the human's board honest instead of leaving it to guesswork.",
             "inputSchema": { "type": "object",
                 "properties": { "status": str_prop() }, "required": ["status"] }
+        },
+        {
+            "name": "register_pr",
+            "description": "Tell weft you just opened a pull/merge request for this task, so it tracks CI, review, and conflict state in the background and posts to Needs-you if something needs you — instead of that state only living in this conversation (which doesn't survive a restart). Call this right after `gh pr create` / `glab mr create` succeeds, with the URL it printed. Re-calling it for the same PR/MR (e.g. after a restart) just refreshes context, it does not duplicate tracking.",
+            "inputSchema": { "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The PR/MR web URL, e.g. https://github.com/owner/repo/pull/123 or https://gitlab.example.com/group/project/-/merge_requests/45 — host, owner/namespace, repo, and number are all parsed from this." },
+                    "title": str_prop()
+                }, "required": ["url"] }
         }
     ])
 }
@@ -1078,9 +1137,10 @@ pub async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_weft_internal_tool, session_servers_for_kind, summarize};
+    use super::{is_weft_internal_tool, register_pr_tool, session_servers_for_kind, summarize, tool_specs};
     use crate::ask::RiskLevel;
-    use serde_json::json;
+    use crate::store::Db;
+    use serde_json::{json, Value};
 
     /// Issue #89: a Claude/opencode multi-line command truncates `summary` to
     /// its first line for display, but `action_key` must carry the FULL command
@@ -1193,6 +1253,111 @@ mod tests {
         assert!(is_weft_internal_tool("mcp__weft_bus__set_task_status"));
         assert!(is_weft_internal_tool("mcp__weft_curator__get_repo_map"));
         assert!(is_weft_internal_tool("mcp__weft_global__list_workspaces"));
+    }
+
+    /// Issue #110: `register_pr` is a pure metadata/bookkeeping write (same
+    /// rationale as `set_task_status` — governed by weft's own Needs-you
+    /// surface downstream, no host-side effect), so it must be on the same
+    /// auto-approved footing.
+    #[test]
+    fn register_pr_is_auto_approved_like_set_task_status() {
+        assert!(is_weft_internal_tool("mcp__weft_bus__register_pr"));
+    }
+
+    /// The tool must actually be advertised to agents (`tools/list`), not just
+    /// silently auto-approved if called blind — otherwise no agent would ever
+    /// discover it exists.
+    #[test]
+    fn register_pr_is_advertised_in_tool_specs() {
+        let specs = tool_specs();
+        let names: Vec<&str> = specs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"register_pr"), "tool_specs: {names:?}");
+    }
+
+    fn tool_text(result: &Value) -> &str {
+        result["content"][0]["text"].as_str().unwrap_or("")
+    }
+
+    #[tokio::test]
+    async fn register_pr_tool_rejects_an_unparseable_url() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let result = register_pr_tool(&db, 1, "5", "not a valid pr url", "").await;
+        assert!(tool_text(&result).contains("could not parse"), "got: {}", tool_text(&result));
+    }
+
+    /// End-to-end through the exact path an agent's `register_pr` call takes:
+    /// URL parse → direction lookup (for `repo_id`) → DB upsert — confirming
+    /// the row lands attributed to the calling direction/thread, and that the
+    /// reply names the host's OWN vocabulary ("Pull request", not a neutral
+    /// "PR"/"change" — issue #110's UI-terminology requirement).
+    #[tokio::test]
+    async fn register_pr_tool_tracks_a_valid_github_pr_url() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let repo = crate::store::repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true)
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "codex")
+            .await
+            .unwrap();
+        let dir = crate::store::repo::create_direction(
+            &db, thread.id, "task", "codex", repo.id, "why", "impl-only", "",
+        )
+        .await
+        .unwrap();
+
+        let result = register_pr_tool(
+            &db,
+            thread.id,
+            &dir.id.to_string(),
+            "https://github.com/acme/widgets/pull/9",
+            "my title",
+        )
+        .await;
+        assert!(tool_text(&result).contains("Pull request #9"), "got: {}", tool_text(&result));
+
+        let tracked = crate::store::repo::find_pull_request(&db, "github", "acme", "widgets", 9)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tracked.direction_id, dir.id);
+        assert_eq!(tracked.thread_id, thread.id);
+        assert_eq!(tracked.repo_id, repo.id);
+        assert_eq!(tracked.title, "my title");
+        assert_eq!(tracked.lifecycle, "open");
+    }
+
+    /// `dir` "lead" (non-numeric) must still register the row rather than
+    /// erroring — see `register_pr_tool`'s doc: `direction_id`/`repo_id` fall
+    /// back to the "0 = unset" convention `direction.repo_id` already uses.
+    #[tokio::test]
+    async fn register_pr_tool_from_the_lead_falls_back_to_unset_direction() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "codex")
+            .await
+            .unwrap();
+
+        let result = register_pr_tool(
+            &db,
+            thread.id,
+            "lead",
+            "https://github.com/acme/widgets/pull/1",
+            "",
+        )
+        .await;
+        assert!(tool_text(&result).contains("Pull request #1"), "got: {}", tool_text(&result));
+        let tracked = crate::store::repo::find_pull_request(&db, "github", "acme", "widgets", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tracked.direction_id, 0);
+        assert_eq!(tracked.repo_id, 0);
     }
 
     #[test]
