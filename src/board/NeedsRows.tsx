@@ -2,10 +2,12 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import {
+  AlertTriangle,
   ArrowUpRight,
   Check,
   GitBranch,
   Layers,
+  RefreshCw,
   Send,
   X,
 } from "lucide-react";
@@ -18,6 +20,7 @@ import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { PermissionConfirmationCard } from "../components/ConfirmationCard";
 import { routeLabelKey, routeReasonKey, routeToolName } from "../lib/engineRoutingDisplay";
 import { needsRoutingControlOf } from "./needsRoutingControl";
+import { ASK_CARD_TONE, ASK_DOT_TONE, NOTICE_FOOTER_VIEW } from "./needsCardView";
 
 export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
   const { approveWriteTrigger, denyWriteTrigger, selectThread, defaultTool, installedTools } =
@@ -192,11 +195,51 @@ export function PermissionRow({ ask }: { ask: PermissionAsk }) {
   );
 }
 
+function NoticeFooter({
+  item,
+  retrying,
+  onRetry,
+}: {
+  item: NeedItem;
+  retrying: boolean;
+  onRetry: () => void;
+}) {
+  const { t } = useTranslation();
+  if (item.kind === "question") return null; // rendered as the answer form instead
+  const view = NOTICE_FOOTER_VIEW[item.kind];
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5 text-[12px]",
+        view.className,
+      )}
+    >
+      {view.icon === "alert" && <AlertTriangle size={13} className="shrink-0" />}
+      <p className="leading-relaxed">{t(view.textKey)}</p>
+      {item.kind === "notice_action_required" && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="ml-auto shrink-0"
+          disabled={retrying}
+          title={t("needs.retryTrackingTitle")}
+          onClick={onRetry}
+        >
+          <RefreshCw size={12} className={cn(retrying && "animate-spin")} />
+          {t("needs.retryTracking")}
+        </Button>
+      )}
+    </div>
+  );
+}
+
 export function AskRow({ item }: { item: NeedItem }) {
-  const { answerAsk, goToAsk } = useStore();
+  const { answerAsk, retryPrTracking, goToAsk } = useStore();
   const { t } = useTranslation();
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [retrying, setRetrying] = useState(false);
 
   async function submit() {
     if (!text.trim() || busy) return;
@@ -208,10 +251,20 @@ export function AskRow({ item }: { item: NeedItem }) {
     }
   }
 
+  async function retry() {
+    if (retrying) return;
+    setRetrying(true);
+    try {
+      await retryPrTracking(item);
+    } finally {
+      setRetrying(false);
+    }
+  }
+
   return (
-    <div className="overflow-hidden rounded-[var(--radius-lg)] border border-waiting/40 bg-waiting/10">
+    <div className={cn("overflow-hidden rounded-[var(--radius-lg)] border", ASK_CARD_TONE[item.kind])}>
       <div className="flex items-center gap-2 px-3.5 pt-3 text-[12px]">
-        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-waiting" />
+        <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", ASK_DOT_TONE[item.kind])} />
         {/* The worker reference itself is the primary jump target (not just the
             trailing icon below) — same handler, so hovering either affords the
             same one-click landing on its timeline. */}
@@ -245,7 +298,7 @@ export function AskRow({ item }: { item: NeedItem }) {
         {item.text}
       </p>
 
-      {item.answerable ? (
+      {item.kind === "question" ? (
         <form
           onSubmit={(event) => {
             event.preventDefault();
@@ -264,11 +317,7 @@ export function AskRow({ item }: { item: NeedItem }) {
           </Button>
         </form>
       ) : (
-        // Display-only NOTICE (self-clearing stall hint): no answer box — it
-        // retracts itself, and answering is refused backend-side.
-        <p className="border-t border-border bg-bg/40 px-3.5 py-2.5 text-[12px] text-ink-faint">
-          {t("needs.selfClearing")}
-        </p>
+        <NoticeFooter item={item} retrying={retrying} onRetry={() => void retry()} />
       )}
     </div>
   );

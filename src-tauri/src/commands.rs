@@ -1470,9 +1470,10 @@ pub struct NeedItem {
     pub direction_name: String,
     pub text: String,
     pub ts: u64,
-    /// `false` for a display-only NOTICE (the self-clearing stall hint): the UI
-    /// shows it without an answer box, and answering is refused backend-side.
-    pub answerable: bool,
+    /// See `bus::AskKind`. A `Question` shows an answer box; both NOTICE kinds
+    /// don't (answering is refused backend-side) — they differ in whether the
+    /// UI's generic "clears itself automatically" footer applies.
+    pub kind: crate::bus::AskKind,
 }
 
 /// Aggregate every open agent→human question across the workspace's threads.
@@ -1512,7 +1513,7 @@ pub async fn needs_you(
                 direction_name: dir_name,
                 text: a.text,
                 ts: a.ts,
-                answerable: a.answerable,
+                kind: a.kind,
             });
         }
     }
@@ -1858,6 +1859,50 @@ pub fn answer_ask(
     } else {
         Err("that question was already answered or no longer exists".into())
     }
+}
+
+/// Core of [`retry_pr_tracking`], taking `&Db` directly so it's unit-testable
+/// without a Tauri `State`/`AppHandle` (the `&Db`/store-seam pattern this
+/// codebase already uses for command logic that doesn't actually need the
+/// runtime). Re-registers every still-`open` PR/MR tracked under `direction_id`
+/// with ITS OWN already-stored fields — a plain upsert-by-natural-key
+/// (`repo::register_pull_request`), so it resets `probe_fail_count` to 0
+/// exactly the way a fresh agent `register_pr` call would (see that
+/// function's doc), without shelling out anywhere or needing the agent at
+/// all. Safe to call on a direction with no given-up row: a still-healthy row
+/// is simply reset to a zero streak, which the next probe overwrites anyway —
+/// so this is the desktop-side "retry" action for the ONE Needs-you notice
+/// that does not clear itself (`host::judge::give_up_text`), without having
+/// to first prove precisely which row triggered it.
+async fn retry_pr_tracking_core(db: &Db, direction_id: i32) -> anyhow::Result<u32> {
+    let rows = repo::list_pull_requests_for_direction(db, direction_id).await?;
+    let mut reset = 0u32;
+    for row in rows.into_iter().filter(|r| r.lifecycle == "open") {
+        repo::register_pull_request(
+            db,
+            row.thread_id,
+            row.direction_id,
+            row.repo_id,
+            &row.host_kind,
+            &row.host_base,
+            &row.host_owner,
+            &row.host_repo,
+            row.number,
+            &row.url,
+            &row.title,
+        )
+        .await?;
+        reset += 1;
+    }
+    Ok(reset)
+}
+
+/// The Needs-you "retry tracking" button's backend: see
+/// [`retry_pr_tracking_core`]. Returns how many rows were reset (0 is not an
+/// error — the notice may already have been superseded by a later sweep).
+#[tauri::command]
+pub async fn retry_pr_tracking(db: State<'_, Db>, direction_id: i32) -> R<u32> {
+    retry_pr_tracking_core(&db, direction_id).await.map_err(e)
 }
 
 /// All pending permission Asks across the workspace (the Ask Bridge → Needs-you),
@@ -3667,5 +3712,94 @@ mod tests {
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    // --- retry_pr_tracking (Needs-you "retry" button for the give-up notice) --
+
+    async fn pr_retry_fixture(
+        db: &Db,
+    ) -> (entities::thread::Model, entities::direction::Model, entities::repo_ref::Model) {
+        let ws = repo::create_workspace(db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(db, ws.id, "widgets", "/tmp/widgets", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            db, thread.id, "ship it", "codex", repo_ref.id, "why", "impl-only", "",
+        )
+        .await
+        .unwrap();
+        (thread, direction, repo_ref)
+    }
+
+    #[tokio::test]
+    async fn retry_pr_tracking_resets_a_given_up_rows_probe_failure_streak() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let (thread, dir, repo_ref) = pr_retry_fixture(&db).await;
+        let pr = repo::register_pull_request(
+            &db, thread.id, dir.id, repo_ref.id, "github", "github.com", "acme", "widgets", 4,
+            "https://github.com/acme/widgets/pull/4", "fix things",
+        )
+        .await
+        .unwrap();
+        // Drive it past a small give-up threshold, mirroring
+        // `host::monitor::MAX_CONSECUTIVE_PROBE_FAILURES` — the exact state
+        // that backs the "action required" Needs-you notice this button
+        // targets: `list_open_pull_requests` would now exclude this row.
+        repo::mark_pull_request_probe_error(&db, pr.id, "still broken").await.unwrap();
+        repo::mark_pull_request_probe_error(&db, pr.id, "still broken").await.unwrap();
+        let before = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert!(before.probe_fail_count >= 2);
+        assert!(
+            repo::list_open_pull_requests(&db, 2).await.unwrap().is_empty(),
+            "precondition: the row must actually have fallen out of the sweep"
+        );
+
+        let reset_count = retry_pr_tracking_core(&db, dir.id).await.unwrap();
+        assert_eq!(reset_count, 1);
+
+        let after = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(after.probe_fail_count, 0, "retry must reset the streak, same as a fresh register_pr");
+        assert_eq!(
+            repo::list_open_pull_requests(&db, 2).await.unwrap().len(),
+            1,
+            "the row must rejoin the sweep after a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_pr_tracking_ignores_merged_rows_and_a_direction_with_nothing_tracked() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let (thread, dir, repo_ref) = pr_retry_fixture(&db).await;
+
+        // A direction with no tracked PR/MR at all: a harmless no-op, not an
+        // error — the button must not fail just because the notice it targets
+        // was already superseded by a later sweep.
+        assert_eq!(retry_pr_tracking_core(&db, dir.id).await.unwrap(), 0);
+
+        // A merged row must be left alone — resetting a closed chapter's
+        // streak would be pointless (it will never be swept again either way)
+        // and `register_pull_request` would otherwise silently resurrect
+        // stale `open`-shaped bookkeeping for it.
+        let pr = repo::register_pull_request(
+            &db, thread.id, dir.id, repo_ref.id, "github", "github.com", "acme", "widgets", 5, "", "",
+        )
+        .await
+        .unwrap();
+        use sea_orm::{ActiveModelTrait, Set};
+        let mut a: entities::pull_request::ActiveModel = pr.clone().into();
+        a.lifecycle = Set("merged".to_string());
+        a.probe_fail_count = Set(3);
+        a.update(&db.0).await.unwrap();
+
+        assert_eq!(
+            retry_pr_tracking_core(&db, dir.id).await.unwrap(),
+            0,
+            "a merged row must not be touched"
+        );
+        let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.probe_fail_count, 3, "left exactly as it was");
     }
 }

@@ -65,6 +65,49 @@ pub struct Msg {
     pub kind: String, // "message" | "interface" | "ask"
 }
 
+/// What an `Ask` represents and how the Needs-you card should render it — ONE
+/// discriminant instead of the `answerable: bool` this replaces, now that a
+/// display-only NOTICE (`answerable == false`, in the old shape) itself splits
+/// in two: most notices (the stall hint, the stopped-worker hint, an ordinary
+/// PR/MR readiness or probe-error update) are retracted automatically by a
+/// background process once the condition they describe changes, but the ONE
+/// PR/MR "gave up tracking" notice (`host::judge::give_up_text`) is NOT — the
+/// row backing it drops out of the monitor's sweep entirely (see
+/// `host::monitor`'s `MAX_CONSECUTIVE_PROBE_FAILURES` doc), so nothing will
+/// ever re-check and clear it without an explicit external re-trigger
+/// (`register_pr`). Rendering the same generic "clears itself automatically"
+/// footer under THAT notice directly contradicts its own body text — exactly
+/// the bug this discriminant exists to let the frontend avoid (see
+/// `NeedsRows.tsx`'s `AskRow`). Three states driving the same rendering
+/// decision belong in one enum, not a second bool bolted onto `answerable`
+/// (CLAUDE.md's discriminated-state rule).
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    /// A real question awaiting a human answer — the only kind `answer_ask`
+    /// accepts and the only kind the UI renders an answer box for.
+    Question,
+    /// A display-only NOTICE a background process retracts on its own once
+    /// the condition it describes changes (the stall hint, the stopped-worker
+    /// hint, an ordinary PR/MR update). Renders the "clears itself
+    /// automatically" footer.
+    Notice,
+    /// A display-only NOTICE that will NOT be retracted by any background
+    /// process — only an explicit external action (named in the notice's own
+    /// text) makes tracking resume, at which point a fresh notice (or none)
+    /// eventually replaces this one. Must NOT render the "clears itself
+    /// automatically" footer, which would contradict this notice's own text.
+    NoticeActionRequired,
+}
+
+impl AskKind {
+    /// Whether `answer_ask` may accept a reply for this kind — true only for
+    /// [`AskKind::Question`]; both notice kinds are display-only.
+    pub fn is_answerable(self) -> bool {
+        matches!(self, AskKind::Question)
+    }
+}
+
 /// A question an agent direction has put to the human, awaiting an answer.
 /// This is the clean, non-TUI signal behind the "Needs-you" surface.
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -74,10 +117,9 @@ pub struct Ask {
     pub text: String,
     pub ts: u64,
     pub answered: bool,
-    /// `false` for a display-only NOTICE (e.g. the self-clearing stall hint):
-    /// it surfaces in Needs-you/IM but carries no answer — `answer_ask` refuses
-    /// it, so a reply can never inject a stray bus message. See `notify_human`.
-    pub answerable: bool,
+    /// See [`AskKind`]. Determines both `answer_ask`'s eligibility check and
+    /// the Needs-you card's rendering.
+    pub kind: AskKind,
 }
 
 #[derive(Default)]
@@ -271,18 +313,33 @@ impl BusRegistry {
     /// Also lands in the timeline (kind = "ask") and wakes the human sentinel
     /// so the UI knows attention is needed without polling.
     pub fn ask_human(&self, thread: i32, from: &str, text: &str) -> u64 {
-        self.push_ask(thread, from, text, true)
+        self.push_ask(thread, from, text, AskKind::Question)
     }
 
-    /// Post a display-only NOTICE to the human — same Needs-you/IM surfacing and
-    /// wake as `ask_human`, but `answerable = false`, so `answer_ask` refuses it
-    /// and a reply can't inject a stray bus message. For self-clearing hints
-    /// (the stall notice) that a later cancel retracts; there is no answer to give.
+    /// Post a display-only, SELF-CLEARING NOTICE to the human — same
+    /// Needs-you/IM surfacing and wake as `ask_human`, but `answer_ask`
+    /// refuses it (a reply can't inject a stray bus message) and the UI shows
+    /// no answer box. For hints (the stall/stopped-worker notices, an
+    /// ordinary PR/MR update) that a background process retracts once the
+    /// condition it describes changes — there is no answer to give, and
+    /// nothing further for the human to do to make it go away. See
+    /// `notify_human_action_required` for the one notice kind this does NOT
+    /// cover.
     pub fn notify_human(&self, thread: i32, from: &str, text: &str) -> u64 {
-        self.push_ask(thread, from, text, false)
+        self.push_ask(thread, from, text, AskKind::Notice)
     }
 
-    fn push_ask(&self, thread: i32, from: &str, text: &str, answerable: bool) -> u64 {
+    /// Post a display-only NOTICE like `notify_human`, but one that will NOT
+    /// be retracted by any background process — only an explicit external
+    /// re-trigger (named in `text` itself) makes tracking resume. Currently
+    /// only `host::monitor`'s PR/MR give-up notice (`host::judge::
+    /// give_up_text`) uses this; every other notice in the codebase keeps
+    /// calling `notify_human` and is unaffected.
+    pub fn notify_human_action_required(&self, thread: i32, from: &str, text: &str) -> u64 {
+        self.push_ask(thread, from, text, AskKind::NoticeActionRequired)
+    }
+
+    fn push_ask(&self, thread: i32, from: &str, text: &str, kind: AskKind) -> u64 {
         let id = self.next_ask_id.fetch_add(1, Ordering::Relaxed) + 1;
         let ts = now();
         let ask = Ask {
@@ -291,7 +348,7 @@ impl BusRegistry {
             text: text.to_string(),
             ts,
             answered: false,
-            answerable,
+            kind,
         };
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -322,19 +379,20 @@ impl BusRegistry {
             .collect()
     }
 
-    /// Count of open asks the human must actually act on — excludes a
-    /// display-only NOTICE (`answerable == false`, e.g. the self-clearing stall
-    /// hint), which surfaces in Needs-you but has no answer to give. Single
-    /// source so every "needs you" count (the workspace switcher, badges)
-    /// agrees on what's pending: a stall notice must not inflate a number that
-    /// promises "N things need your action" (issue #105).
+    /// Count of open asks the human must actually act on — excludes EITHER
+    /// display-only NOTICE kind (`AskKind::Notice` / `AskKind::
+    /// NoticeActionRequired`, e.g. the self-clearing stall hint), which
+    /// surfaces in Needs-you but has no answer to give. Single source so
+    /// every "needs you" count (the workspace switcher, badges) agrees on
+    /// what's pending: a notice must not inflate a number that promises "N
+    /// things need your action" (issue #105).
     pub fn open_answerable_ask_count(&self, thread: i32) -> usize {
-        self.open_asks(thread).iter().filter(|a| a.answerable).count()
+        self.open_asks(thread).iter().filter(|a| a.kind.is_answerable()).count()
     }
 
     /// Answer an open ask: mark it answered and deliver `text` to the asking
     /// direction's inbox (as if from the human). Returns false if not found —
-    /// including a display-only NOTICE (`answerable == false`), which has no
+    /// including a display-only NOTICE (either `AskKind`), which has no
     /// answer to give, so a stray reply never reaches the asker's inbox.
     pub fn answer_ask(&self, thread: i32, ask_id: u64, text: &str) -> bool {
         let target = {
@@ -343,7 +401,7 @@ impl BusRegistry {
             let hit = match bus
                 .asks
                 .iter_mut()
-                .find(|a| a.id == ask_id && !a.answered && a.answerable)
+                .find(|a| a.id == ask_id && !a.answered && a.kind.is_answerable())
             {
                 Some(a) => {
                     a.answered = true;
@@ -584,7 +642,8 @@ mod tests {
         let id = r.notify_human(1, "10", "⏳ task stalled");
         let open = r.open_asks(1);
         assert_eq!(open.len(), 1);
-        assert!(!open[0].answerable);
+        assert_eq!(open[0].kind, AskKind::Notice, "an ordinary notify_human posts a self-clearing Notice");
+        assert!(!open[0].kind.is_answerable());
         // Answering is refused — no delivery, and the notice remains open.
         assert!(!r.answer_ask(1, id, "hurry up"));
         assert!(r.inbox(1, "10").is_empty());
@@ -592,6 +651,22 @@ mod tests {
         // An explicit retract (what the watchdog does on recover/idle) clears it.
         assert!(r.cancel_open_asks_by_id(1, id));
         assert!(r.open_asks(1).is_empty());
+    }
+
+    #[test]
+    fn notify_human_action_required_is_a_distinct_non_answerable_kind() {
+        // The give-up PR/MR notice: still a non-answerable NOTICE (surfaces,
+        // refuses a reply, counts against neither open_answerable_ask_count),
+        // but tagged with the OTHER notice kind so the frontend can tell it
+        // apart from a self-clearing one and skip the contradictory footer.
+        let r = BusRegistry::new();
+        let id = r.notify_human_action_required(1, "10", "🛑 gave up tracking");
+        let open = r.open_asks(1);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, AskKind::NoticeActionRequired);
+        assert!(!open[0].kind.is_answerable());
+        assert_eq!(r.open_answerable_ask_count(1), 0, "an action-required notice still isn't a pending question");
+        assert!(!r.answer_ask(1, id, "ignored"), "answering is refused, same as an ordinary notice");
     }
 
     #[test]

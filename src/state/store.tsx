@@ -101,14 +101,17 @@ export function isInFlight(state: TurnState): boolean {
   return state === "busy" || state === "stalled";
 }
 
-/** A NeedItem the human must actually act on — excludes a display-only NOTICE
- *  (the self-clearing stall hint, `answerable: false`): it surfaces in the
- *  Needs-you queue as an FYI row but has no answer to give and clears itself
- *  automatically once the task recovers. Single source of truth for every
- *  "needs you" badge/count/urgent-flag so a stall notice can't inflate a number
- *  that promises "N things need your action" (issue #105). */
+/** A NeedItem the human must actually act on — excludes EITHER display-only
+ *  NOTICE kind (`item.kind !== "question"`: the self-clearing stall hint, the
+ *  stopped-worker hint, or the non-self-clearing PR/MR give-up notice). Every
+ *  notice surfaces in the Needs-you queue as an FYI row but has no answer to
+ *  give. Single source of truth for every "needs you" badge/count/urgent-flag
+ *  so a notice can't inflate a number that promises "N things need your
+ *  action" (issue #105) — even the one notice kind that, unlike the others,
+ *  won't clear itself; see `NeedsRows.tsx`'s `AskRow` for how that one is
+ *  instead made visually unmissable. */
 export function isPendingNeed(item: NeedItem): boolean {
-  return item.answerable;
+  return item.kind === "question";
 }
 
 /** Workspace-wide "needs you" count: real agent questions (excludes
@@ -337,6 +340,11 @@ interface Store {
   refreshNeeds: () => Promise<void>;
   answerAsk: (item: NeedItem, text: string) => Promise<void>;
   goToAsk: (item: NeedItem) => Promise<void>;
+  /** "Retry" for the ONE Needs-you notice kind that doesn't clear itself (a
+   *  given-up PR/MR): resets its tracked probe-failure streak so the
+   *  background monitor resumes sweeping it. Resolves once the reset lands;
+   *  the card itself clears on the monitor's next sweep tick, not instantly. */
+  retryPrTracking: (item: NeedItem) => Promise<void>;
   /** Single-source jump for any worker reference carrying a bus-style
    *  (thread, dir) pair — board cards, needs-you rows, anywhere a worker's
    *  name is shown. `dir` is the direction id as a string (backend convention,
@@ -2574,6 +2582,27 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [refreshNeeds],
   );
 
+  const retryPrTracking = useCallback(async (item: NeedItem) => {
+    // No optimistic removal: the backend monitor only retracts/replaces this
+    // notice on its NEXT sweep tick (up to `WEFT_PR_SWEEP_SECS`, default 60s)
+    // once it re-checks the row — not synchronously with this call — so the
+    // card staying put for a moment is correct, not a bug. A toast confirms
+    // the click actually did something in the meantime.
+    try {
+      const resetCount = await api.retryPrTracking(item.direction_id);
+      // One condition drives both the copy and the tone, decided once rather
+      // than re-checked per property (CLAUDE.md's single-discriminant rule).
+      const view =
+        resetCount > 0
+          ? { key: "needs.retryTrackingStarted", tone: "success" as const }
+          : { key: "needs.retryTrackingNothingToRetry", tone: "warning" as const };
+      toast(i18n.t(view.key), view.tone);
+    } catch (err) {
+      console.error(err);
+      toast(i18n.t("needs.retryTrackingFailed"), "danger");
+    }
+  }, []);
+
   const approveWriteTrigger = useCallback(
     async (item: WriteTrigger, tool?: string) => {
       // Flush any in-flight base-branch save first. If it REJECTED (re-propose moved
@@ -3051,6 +3080,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     openNeeds,
     refreshNeeds,
     answerAsk,
+    retryPrTracking,
     goToAsk,
     goToDirectionRef,
     answerPermission,

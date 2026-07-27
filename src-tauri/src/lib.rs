@@ -305,6 +305,7 @@ pub fn run() {
             commands::approve_write_trigger,
             commands::deny_write_trigger,
             commands::answer_ask,
+            commands::retry_pr_tracking,
             lead_chat::commands::lead_send,
             lead_chat::commands::lead_interrupt,
             lead_chat::commands::lead_ensure,

@@ -293,6 +293,12 @@ export const api = {
     invoke<NeedItem[]>("needs_you", { workspaceId }),
   answerAsk: (threadId: number, askId: number, text: string) =>
     invoke<void>("answer_ask", { threadId, askId, text }),
+  // The Needs-you "retry" action for the one notice that doesn't clear itself
+  // (a PR/MR the monitor gave up on): resets that direction's tracked PR/MR
+  // probe-failure streak(s), same effect as the agent re-calling `register_pr`.
+  // Resolves to how many rows were reset (0 = nothing to retry, not an error).
+  retryPrTracking: (directionId: number) =>
+    invoke<number>("retry_pr_tracking", { directionId }),
 
   // Write triggers: lead-proposed repo writes awaiting human approve/deny.
   writeTriggers: (workspaceId: number) =>
