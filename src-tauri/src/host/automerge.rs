@@ -9,41 +9,59 @@
 //! specific merge, so the default posture is "tell me it's ready", not
 //! "merge it for me" (see `auto_merge_enabled`'s doc).
 //!
-//! Flow, once per sweep tick:
-//!   1. [`spawn_pr_automerge_watch`] — its own timer loop, independent of
-//!      `host::monitor::spawn_pr_watch`'s (separate `WEFT_PR_AUTOMERGE_SWEEP_
-//!      SECS` cadence). Re-reads the SAME `pull_request` rows `host::monitor`
-//!      already keeps fresh, via the EXISTING `repo::list_open_pull_requests`
-//!      — no new store functions, no store/ edits at all.
-//!   2. Each row's stored state is parsed and run through the pure gate
-//!      `gate::decide_auto_merge`. Only a `Merge` verdict proceeds.
-//!   3. [`run_gh_merge`] — `gh pr merge --squash --match-head-commit <sha>`.
-//!      The ONE new `Command::new` in this entire feature.
+//! Flow, once per candidate row per sweep tick (`maybe_merge_one`):
+//!   1. Cheap PRE-FILTER (`gate::decide_auto_merge`) against the STORED,
+//!      possibly-stale DB row. Only decides whether the row is worth a live
+//!      re-check at all.
+//!   2. A defensive existence check: the row's owning `thread` must still be
+//!      there (an issue/repo/workspace delete cascades `pull_request` rows —
+//!      see `repo::delete_thread_cascade` et al — but this catches any row
+//!      that predates that cascade in an already-affected install, or a
+//!      narrow delete-vs-sweep race, without needing a data migration).
+//!   3. A per-row, per-commit BACKOFF: after `MAX_MERGE_ATTEMPTS_PER_HEAD`
+//!      consecutive FAILED merge attempts against the same `head_sha`, stop
+//!      retrying until a new commit lands.
+//!   4. A FRESH `PrHost::fetch_status` read + `judge::merge_readiness`
+//!      recompute — persisted immediately via the EXISTING `repo::apply_
+//!      pull_request_snapshot`.
+//!   5. The FINAL authorization: `gate::decide_auto_merge` AGAIN, fed ONLY
+//!      the fresh data from step 4 (`age`/`probe_fail_count` forced to `0`;
+//!      `enabled` itself re-read fresh too, never reused from step 1 or from
+//!      an earlier row in the same sweep pass). Only a `Merge` verdict here
+//!      proceeds — step 1's verdict never directly authorizes anything.
+//!   6. [`run_gh_merge`] — `gh pr merge --squash --match-head-commit <sha>`,
+//!      off the async runtime (`spawn_blocking`). The ONE new `Command::new`
+//!      in this entire feature, using the head_sha from step 4's fresh read.
 //!      `--match-head-commit` makes GitHub itself refuse the merge if the
-//!      head has moved since the judgement this attempt is based on,
-//!      closing the "merged code nobody reviewed" gap server-side, with no
-//!      extra network round trip on our side to race against.
-//!   4. Regardless of outcome, ONE fresh `PrHost::fetch_status` read (this
-//!      file's only read — the same call `host::monitor` itself makes) is
-//!      taken and persisted via the EXISTING `repo::apply_pull_request_
-//!      snapshot` / `repo::mark_pull_request_probe_error` — so the row (and
-//!      the NEXT sweep, by either loop) always reflects ground truth — and a
-//!      durable, honest timeline marker is left either way (see
-//!      [`insert_automerge_marker`]'s doc for why it is kind `"text"`, not a
-//!      new `ChatTimeline` marker kind).
+//!      head has moved AGAIN since step 4, closing the last sliver of gap
+//!      between "we just confirmed this" and "the API call executes".
+//!   7. Regardless of outcome, ONE more fresh `PrHost::fetch_status` read is
+//!      taken and persisted, and a durable, structured, i18n-rendered
+//!      timeline marker is inserted either way (see
+//!      [`insert_automerge_marker`]'s doc).
 //!
-//! Race safety without an in-memory lock: within one sweep tick, rows are
-//! processed strictly sequentially (`for pr in open { maybe_merge_one(...).
-//! await }`), and [`spawn_pr_automerge_watch`]'s loop only sleeps — starting
-//! the NEXT tick — after the WHOLE pass returns. So a second attempt at the
-//! same row can never overlap the first attempt's confirmation write. The one
-//! residual gap is a process crash between step 3 succeeding and step 4's
-//! write landing: the stored row would still read `Ready` next boot, so a
-//! retry is attempted — but by then the fresh read in step 4 (now step 3 of
-//! the retry) observes the PR as `Merged` on GitHub and `run_gh_merge` itself
-//! fails cleanly (GitHub refuses to re-merge a merged PR) rather than
-//! double-merging anything. Bounded, self-healing, never destructive.
+//! Review round 1 on this PR found the original version skipped steps 2/3/5
+//! entirely and only ever re-read fresh state AFTER attempting the merge
+//! (step 7 existed, steps 4-5 did not) — meaning the mutating call in step 6
+//! could fire off a DB snapshot up to `MAX_READY_AGE_SECS` stale, including
+//! at process boot before `host::monitor`'s own first sweep had a chance to
+//! refresh anything. Steps 4-5 close that: the merge is now NEVER attempted
+//! without a fresh, live confirmation taken immediately beforehand.
+//!
+//! Double-merge safety across a crash: if the process dies between step 6
+//! succeeding and step 7's write landing, the STORED row still reads
+//! open+Ready on restart — but step 4's fresh read on the RETRY observes the
+//! PR as already `Merged` on GitHub, and step 5's gate then refuses with
+//! `NotOpen` BEFORE step 6 is ever reached again. This holds regardless of
+//! what `gh pr merge` itself does when asked to merge an already-merged PR
+//! (review round 1 Codex P2 found a prior version of this doc incorrectly
+//! assumed `gh` errors in that case — reading `cli/cli`'s own merge command
+//! shows it can exit 0 as a silent no-op instead — but that behavior is
+//! irrelevant here specifically BECAUSE step 4-5's own fresh check already
+//! prevents the retry from ever calling `run_gh_merge` a second time; this
+//! file does not rely on `gh`'s own idempotency for that guarantee).
 
+use std::collections::HashMap;
 use std::process::Command;
 
 use tauri::{AppHandle, Emitter, Manager};
@@ -68,15 +86,28 @@ pub const K_AUTO_MERGE_ENABLED: &str = "pr_auto_merge_enabled";
 /// `0` disables the loop entirely.
 const PR_AUTOMERGE_SWEEP_DEFAULT_SECS: u64 = 60;
 
-/// How stale a row's last SUCCESSFUL probe may be before this sweep refuses
-/// to act on its stored `Ready` verdict, even with zero recorded probe
-/// failures (`probe_fail_count == 0`) — the OTHER way a row's `Ready` column
-/// can outlive its truth: not a failing probe (see `gate::AutoMergeSkipReason
-/// ::ProbeFailing`), but a STALLED one (the sweep loop itself wedged, or the
-/// whole process was suspended for hours and just resumed). Ten sweep
-/// intervals at `host::monitor`'s own default cadence — generous enough to
-/// ride out ordinary scheduling jitter, far short of "hours-old".
+/// How stale a row's last SUCCESSFUL probe may be before the PRE-FILTER
+/// refuses to even attempt a fresh check on its stored `Ready` verdict, even
+/// with zero recorded probe failures (`probe_fail_count == 0`) — the OTHER
+/// way a row's `Ready` column can outlive its truth: not a failing probe
+/// (see `gate::AutoMergeSkipReason::ProbeFailing`), but a STALLED one (the
+/// sweep loop itself wedged, or the whole process was suspended for hours
+/// and just resumed). Ten sweep intervals at `host::monitor`'s own default
+/// cadence — generous enough to ride out ordinary scheduling jitter, far
+/// short of "hours-old". The FINAL authorization (step 5 in this module's
+/// doc) never uses this — it always passes `age_secs: 0` against data that
+/// was just read live.
 const MAX_READY_AGE_SECS: i64 = 600;
+
+/// After this many CONSECUTIVE FAILED `gh pr merge` attempts against the
+/// SAME `head_sha`, stop retrying that exact request until a new commit
+/// lands. Without this, a persistently-failing merge (missing merge
+/// permission, a repo that rejects squash merges, ...) would retry — and
+/// post a fresh failure marker — every sweep tick forever (review round 1
+/// P2). Small and in-memory (see `spawn_pr_automerge_watch`'s
+/// `merge_failures` map): a process restart or a fresh push both
+/// legitimately deserve a clean slate.
+const MAX_MERGE_ATTEMPTS_PER_HEAD: u32 = 3;
 
 /// Start the runtime PR/MR auto-merge sweep. Call once at app setup,
 /// alongside `host::monitor::spawn_pr_watch` (see `lib.rs`) — NOT instead of
@@ -91,10 +122,16 @@ pub fn spawn_pr_automerge_watch(app: AppHandle) {
         if sweep_secs == 0 {
             return; // disabled
         }
-        run_automerge_sweep(&app).await;
+        // Owned by this task for the process's whole life, threaded through
+        // every sweep — the per-(row, head_sha) merge-failure backoff state.
+        // Mirrors `host::monitor::spawn_pr_watch`'s own `notices` map
+        // ownership shape exactly, for exactly the same reason (a single
+        // task owns the state; no global/static needed).
+        let mut merge_failures: HashMap<i32, (String, u32)> = HashMap::new();
+        run_automerge_sweep(&app, &mut merge_failures).await;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(sweep_secs)).await;
-            run_automerge_sweep(&app).await;
+            run_automerge_sweep(&app, &mut merge_failures).await;
         }
     });
 }
@@ -102,8 +139,12 @@ pub fn spawn_pr_automerge_watch(app: AppHandle) {
 /// One sweep pass. Short-circuits before listing any rows when the feature
 /// is off (the default for almost every install) rather than doing real
 /// per-row work just to gate on `enabled` — same shape as `host::monitor::
-/// run_pr_sweep`'s own `try_state` guards.
-async fn run_automerge_sweep(app: &AppHandle) {
+/// run_pr_sweep`'s own `try_state` guards. This EARLY check is an efficiency
+/// short-circuit only: `maybe_merge_one` re-reads `enabled` fresh, per row,
+/// immediately before its own final authorization (step 5 in this module's
+/// doc) — so a mid-pass toggle-off still takes effect within the same pass,
+/// it just does not save the listing query itself.
+async fn run_automerge_sweep(app: &AppHandle, merge_failures: &mut HashMap<i32, (String, u32)>) {
     let Some(db) = app.try_state::<Db>() else {
         return;
     };
@@ -128,51 +169,166 @@ async fn run_automerge_sweep(app: &AppHandle) {
         }
     };
     for pr in open {
-        maybe_merge_one(app, &db, pr).await;
+        maybe_merge_one(app, &db, pr, merge_failures).await;
     }
 }
 
-/// Gate one row, and if it clears the bar, execute + confirm + record the
-/// merge attempt. No-op (silently) for every `Skip` verdict — a blocked or
-/// indeterminate row already has `host::monitor`'s own Needs-you notice
-/// telling the human why, when that is warranted; this feature only speaks
-/// up when it actually ACTS (see `insert_automerge_marker`'s doc).
-async fn maybe_merge_one(app: &AppHandle, db: &Db, pr: pull_request::Model) {
+/// Gate one row twice (pre-filter, then final authorization against fresh
+/// state), and if it clears both, execute + confirm + record the merge
+/// attempt. No-op (silently) for every `Skip` verdict at any stage — a
+/// blocked or indeterminate row already has `host::monitor`'s own Needs-you
+/// notice telling the human why, when that is warranted; this feature only
+/// speaks up when it actually ACTS (see `insert_automerge_marker`'s doc).
+/// See this module's own doc for the full numbered flow.
+async fn maybe_merge_one(
+    app: &AppHandle,
+    db: &Db,
+    pr: pull_request::Model,
+    merge_failures: &mut HashMap<i32, (String, u32)>,
+) {
     let Some(host_kind) = HostKind::parse(&pr.host_kind) else {
         return; // unrecognized host_kind on the row — nothing sane to do
     };
-    let now = repo::now_unix();
-    let lifecycle = gate::parse_lifecycle(&pr.lifecycle);
-    let readiness = gate::parse_readiness(&pr.merge_readiness);
-    let age = gate::age_secs(&pr.last_checked_at, &now);
 
-    let decision = gate::decide_auto_merge(
-        true, // this sweep already confirmed `enabled` via `auto_merge_enabled`'s
-        // fail-closed read before listing rows; passed through explicitly
-        // (rather than hard-coding the gate to skip the check) so
-        // `gate::decide_auto_merge` stays a complete, independently
-        // testable decision — see that function's own doc.
+    // Step 1: cheap DB-level pre-filter using STORED (possibly stale) state.
+    let now = repo::now_unix();
+    let stored_lifecycle = gate::parse_lifecycle(&pr.lifecycle);
+    let stored_ci = gate::parse_ci(&pr.ci_status);
+    let stored_readiness = gate::parse_readiness(&pr.merge_readiness);
+    let age = gate::age_secs(&pr.last_checked_at, &now);
+    let pre_decision = gate::decide_auto_merge(
+        true, // `run_automerge_sweep` already confirmed `enabled` before listing
+        // rows; passed through explicitly (not hard-coded inside the gate)
+        // so `gate::decide_auto_merge` stays a complete, independently
+        // testable decision — see that function's own doc. The FINAL
+        // authorization below re-reads this fresh regardless.
         host_kind,
-        lifecycle,
-        &readiness,
+        stored_lifecycle,
+        &stored_ci,
+        &stored_readiness,
         pr.probe_fail_count,
         age,
         MAX_READY_AGE_SECS,
     );
-    if decision != AutoMergeDecision::Merge {
+    if pre_decision != AutoMergeDecision::Merge {
         return;
     }
 
-    let merge_result =
-        run_gh_merge(&pr.host_owner, &pr.host_repo, pr.number, &pr.head_sha);
+    // Step 2: defensive existence check — see this module's doc. A deleted
+    // issue/repo/workspace cascades `pull_request` rows away (`repo::
+    // delete_thread_cascade` et al), so this should be unreachable in normal
+    // operation; kept as free insurance against a row that predates that
+    // fix, or a narrow delete-vs-sweep timing race.
+    match repo::get_thread(db, pr.thread_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return, // orphaned — nothing to merge into, nowhere to post a marker
+        Err(e) => {
+            eprintln!(
+                "[weft][automerge] pr #{}: could not confirm the owning thread still exists: {e}",
+                pr.id
+            );
+            return;
+        }
+    }
 
-    // Regardless of outcome: one fresh, honest read, persisted the same way
-    // `host::monitor` persists every probe — never leave the row (or the
-    // human) trusting a pre-attempt snapshot once we know more.
-    let target =
-        PrTarget { owner: pr.host_owner.clone(), repo: pr.host_repo.clone(), number: pr.number };
-    let confirmed = tokio::task::spawn_blocking(move || {
+    // Step 3: per-(row, head_sha) backoff after repeated failed attempts.
+    if let Some((last_sha, count)) = merge_failures.get(&pr.id) {
+        if last_sha == &pr.head_sha && *count >= MAX_MERGE_ATTEMPTS_PER_HEAD {
+            return;
+        }
+    }
+
+    // Step 4: fresh, live read — the ONLY thing this feature ever trusts to
+    // actually authorize a merge attempt (step 5). Mirrors `host::monitor`'s
+    // own `check_one` exactly (same `spawn_blocking` discipline).
+    let target = PrTarget {
+        owner: pr.host_owner.clone(),
+        repo: pr.host_repo.clone(),
+        number: pr.number,
+    };
+    let fresh = tokio::task::spawn_blocking(move || {
         super::resolve_host(host_kind).and_then(|h| h.fetch_status(&target))
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        Err(HostError::Other {
+            message: format!("internal: automerge pre-merge fresh read join error: {join_err}"),
+        })
+    });
+
+    let snapshot = match fresh {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = repo::mark_pull_request_probe_error(db, pr.id, &e.message()).await;
+            return; // couldn't confirm live state — never merge on a guess
+        }
+    };
+    let fresh_readiness = judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+    if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, &snapshot, &fresh_readiness).await {
+        eprintln!(
+            "[weft][automerge] pr #{}: could not save pre-merge confirmation snapshot: {e}",
+            pr.id
+        );
+    }
+
+    // Step 5: FINAL authorization against the FRESH state only. `enabled` is
+    // re-read here too (never reused from `run_automerge_sweep`'s own
+    // earlier, pass-level check) — closes the "user disables the switch
+    // mid-pass, later rows in the same pass still merge" gap (review round 1
+    // P1 / Codex P1).
+    let enabled_now = auto_merge_enabled(db).await;
+    let final_decision = gate::decide_auto_merge(
+        enabled_now,
+        host_kind,
+        Some(snapshot.lifecycle),
+        &snapshot.ci,
+        &fresh_readiness,
+        0,
+        0,
+        MAX_READY_AGE_SECS,
+    );
+    if final_decision != AutoMergeDecision::Merge {
+        return; // downgraded since the pre-filter — silent, like any other skip
+    }
+
+    // Step 6: the ONE mutating call, off the async runtime, using the FRESH
+    // head_sha (never the stale row's) and the row's recorded host_base (GHE
+    // support — review round 1 Codex P1: a prior version always targeted
+    // `gh`'s own default host regardless of what was recorded at
+    // registration).
+    let host_base = pr.host_base.clone();
+    let owner = pr.host_owner.clone();
+    let repo_name = pr.host_repo.clone();
+    let number = pr.number;
+    let head_sha = snapshot.head_sha.clone();
+    let merge_result = tokio::task::spawn_blocking(move || {
+        run_gh_merge(&host_base, &owner, &repo_name, number, &head_sha)
+    })
+    .await
+    .unwrap_or_else(|join_err| Err(format!("internal: merge task join error: {join_err}")));
+
+    // Track consecutive failures per (row, head_sha) for step 3's backoff.
+    let attempts_exhausted = match &merge_result {
+        Ok(()) => {
+            merge_failures.remove(&pr.id);
+            false
+        }
+        Err(_) => {
+            let entry = merge_failures
+                .entry(pr.id)
+                .or_insert_with(|| (snapshot.head_sha.clone(), 0));
+            if entry.0 != snapshot.head_sha {
+                *entry = (snapshot.head_sha.clone(), 0);
+            }
+            entry.1 += 1;
+            entry.1 >= MAX_MERGE_ATTEMPTS_PER_HEAD
+        }
+    };
+
+    // Step 7: regardless of outcome, one more fresh read + persist + marker.
+    let target2 = PrTarget { owner: pr.host_owner.clone(), repo: pr.host_repo.clone(), number: pr.number };
+    let confirmed = tokio::task::spawn_blocking(move || {
+        super::resolve_host(host_kind).and_then(|h| h.fetch_status(&target2))
     })
     .await
     .unwrap_or_else(|join_err| {
@@ -181,19 +337,16 @@ async fn maybe_merge_one(app: &AppHandle, db: &Db, pr: pull_request::Model) {
         })
     });
 
-    let current_state_text = match &confirmed {
-        Ok(snapshot) => {
-            let confirmed_readiness =
-                judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
-            if let Err(e) =
-                repo::apply_pull_request_snapshot(db, pr.id, snapshot, &confirmed_readiness).await
-            {
+    let (state, state_error) = match &confirmed {
+        Ok(s) => {
+            let r = judge::merge_readiness(&s.ci, &s.review, &s.conflict);
+            if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, s, &r).await {
                 eprintln!(
                     "[weft][automerge] pr #{}: could not save confirmation snapshot: {e}",
                     pr.id
                 );
             }
-            lifecycle_state_text(snapshot.lifecycle).to_string()
+            (lifecycle_state_tag(s.lifecycle), None)
         }
         Err(err) => {
             if let Err(store_err) = repo::mark_pull_request_probe_error(db, pr.id, &err.message()).await
@@ -203,50 +356,53 @@ async fn maybe_merge_one(app: &AppHandle, db: &Db, pr: pull_request::Model) {
                     pr.id
                 );
             }
-            format!("暂时无法确认当前状态({})", err.message())
+            ("unknown", Some(err.message()))
         }
     };
 
-    let marker_text = match &merge_result {
-        Ok(()) => format!(
-            "✅ 自动合并完成:{} #{} 已 squash 合并到 {}。当前状态:{}。",
-            host_kind.native_abbrev(),
-            pr.number,
-            pr.base_ref,
-            current_state_text
-        ),
-        Err(reason) => format!(
-            "❌ 自动合并失败:{} #{} — {}。当前状态:{}。",
-            host_kind.native_abbrev(),
-            pr.number,
-            reason,
-            current_state_text
-        ),
-    };
-    insert_automerge_marker(app, db, pr.thread_id, &marker_text).await;
+    insert_automerge_marker(
+        app,
+        db,
+        pr.thread_id,
+        &MergeAttemptOutcome {
+            merged: merge_result.is_ok(),
+            abbrev: host_kind.native_abbrev(),
+            number: pr.number,
+            base_ref: pr.base_ref.clone(),
+            reason: merge_result.err(),
+            state,
+            state_error,
+            attempts_exhausted,
+            attempts_max: MAX_MERGE_ATTEMPTS_PER_HEAD,
+        },
+    )
+    .await;
 }
 
-/// Exhaustive, human-facing (Chinese; dev-English tokens kept — same
-/// backend-composed-notice convention `judge::ci_reason`/`review_reason`/
-/// `conflict_reason` already document and use) description of a FRESH
-/// lifecycle read, for the "当前状态" clause of both the success and failure
-/// markers. `Merged` is listed even in the success branch's own text because
-/// a merge attempt this file made is not the only way a PR becomes merged —
-/// see this module's doc on the crash-then-retry case, where a SECOND
-/// attempt's failure marker must be able to say "already merged" instead of
-/// reading as a fresh, alarming failure.
-fn lifecycle_state_text(lifecycle: PrLifecycle) -> &'static str {
+/// Exhaustive, discriminated tag for a FRESH lifecycle read, for the
+/// structured `"state"` field of the auto-merge timeline marker (see
+/// [`insert_automerge_marker`]'s doc on why this stays structured facts, not
+/// pre-composed prose). `Merged` is the EXPECTED state for a success outcome
+/// (confirming the merge this file just made actually landed); it is also
+/// reachable on a FAILURE outcome — e.g. someone else merges the same PR in
+/// the narrow window between step 4's read and step 6's attempt — in which
+/// case the marker still honestly shows "failed, but here's what's true
+/// right now" rather than conflating the two.
+fn lifecycle_state_tag(lifecycle: PrLifecycle) -> &'static str {
     match lifecycle {
-        PrLifecycle::Open => "仍是 open,未合并",
-        PrLifecycle::Merged => "已是 merged 状态",
-        PrLifecycle::Closed => "已被关闭,未合并",
+        PrLifecycle::Open => "open",
+        PrLifecycle::Merged => "merged",
+        PrLifecycle::Closed => "closed",
     }
 }
 
 /// The ONE mutating call in this entire feature — `gh pr merge`. Nothing in
 /// `host::monitor` / `host::github` / `host::judge` / `host::gate` ever calls
-/// this, and this file only calls it from `maybe_merge_one`, gated by
-/// `gate::decide_auto_merge` returning `Merge`.
+/// this, and this file only calls it (via `spawn_blocking` — review round 1
+/// Codex P2: a synchronous `Command::output()` call directly on the async
+/// runtime would occupy a Tokio worker for the whole `gh` round trip) from
+/// `maybe_merge_one`, gated by TWO `gate::decide_auto_merge` calls, the
+/// second against data read immediately before this call.
 ///
 /// `--match-head-commit` makes GitHub itself refuse the merge if `head_sha`
 /// has moved since the judgement this attempt is based on — server-side
@@ -255,15 +411,23 @@ fn lifecycle_state_text(lifecycle: PrLifecycle) -> &'static str {
 /// on its own. `--squash` matches this repo's own established merge
 /// convention (CLAUDE.md: "user habit squash merge"; also the only strategy
 /// this repo's own PR workflow uses).
-fn run_gh_merge(owner: &str, repo: &str, number: i32, head_sha: &str) -> Result<(), String> {
+///
+/// `host_base` (the hostname recorded at registration — see `host/mod.rs`'s
+/// module doc on why GitHub Enterprise needs this recorded per row) is
+/// threaded into `--repo` as `HOST/OWNER/REPO` when non-empty, so this call
+/// targets the SAME host the row was registered against rather than
+/// whatever `gh`'s own configured default happens to be (review round 1
+/// Codex P1).
+fn run_gh_merge(host_base: &str, owner: &str, repo: &str, number: i32, head_sha: &str) -> Result<(), String> {
     // Same defense-in-depth guard `github::GitHubHost::fetch_status` applies
     // independently of `parse_pr_url`'s own validation, for the exact same
-    // reason: `--repo` here is built the same way (a single joined
-    // `owner/repo` argument), so it inherits the exact same confirmed SSRF
-    // risk (see `parse_pr_url`'s doc) and gets the exact same guard.
-    if owner.contains('/') || repo.contains('/') {
+    // reason: `--repo` here is built the same way (a joined argument), so it
+    // inherits the exact same confirmed SSRF risk (see `parse_pr_url`'s doc)
+    // and gets the exact same guard — extended to `host_base` too, since
+    // that is now ALSO folded into the same argument.
+    if host_base.contains('/') || owner.contains('/') || repo.contains('/') {
         return Err(format!(
-            "refusing to merge a repo slug with an embedded '/' (owner={owner:?}, repo={repo:?}) — this would be reinterpreted as a host override"
+            "refusing to merge a repo slug with an embedded '/' (host_base={host_base:?}, owner={owner:?}, repo={repo:?}) — this would be reinterpreted as a host override"
         ));
     }
     // A `Ready` verdict can only ever be produced from a SUCCESSFUL snapshot
@@ -275,7 +439,7 @@ fn run_gh_merge(owner: &str, repo: &str, number: i32, head_sha: &str) -> Result<
     }
     let repo_slug = format!("{owner}/{repo}");
     let out = Command::new("gh")
-        .args(build_merge_args(number, &repo_slug, head_sha))
+        .args(build_merge_args(host_base, &repo_slug, number, head_sha))
         // Checks run user tooling that a GUI launch's minimal PATH can't
         // resolve (Homebrew/local installs of `gh`) — same reasoning as
         // `github::GitHubHost::fetch_status` / `check::run_check`.
@@ -296,46 +460,92 @@ fn run_gh_merge(owner: &str, repo: &str, number: i32, head_sha: &str) -> Result<
 }
 
 /// The exact `gh pr merge` argument vector, pulled out as its own pure
-/// function so the presence of `--match-head-commit` — this feature's
-/// server-side head-consistency enforcement, the mechanism `gate`'s own doc
-/// points to instead of a second client-side sha comparison — is
-/// independently, directly unit-tested below without ever spawning a
-/// process. `run_gh_merge` is the only caller; nothing here talks to `gh`.
-fn build_merge_args(number: i32, repo_slug: &str, head_sha: &str) -> Vec<String> {
+/// function so both the presence of `--match-head-commit` (this feature's
+/// server-side head-consistency enforcement — the mechanism `gate`'s own doc
+/// points to instead of a second client-side sha comparison) AND the
+/// host-targeting `--repo` value are independently, directly unit-tested
+/// below without ever spawning a process. `run_gh_merge` is the only caller;
+/// nothing here talks to `gh`.
+fn build_merge_args(host_base: &str, repo_slug: &str, number: i32, head_sha: &str) -> Vec<String> {
+    // `gh`'s `-R/--repo` grammar is `[HOST/]OWNER/REPO` — an explicit host
+    // segment selects that host instead of `gh`'s own configured default.
+    // Empty `host_base` (a row from before this field existed) falls back to
+    // the plain two-segment form, preserving `gh`'s own default-host
+    // behavior exactly as before this fix.
+    let repo_arg = if host_base.is_empty() {
+        repo_slug.to_string()
+    } else {
+        format!("{host_base}/{repo_slug}")
+    };
     vec![
         "pr".to_string(),
         "merge".to_string(),
         number.to_string(),
         "--repo".to_string(),
-        repo_slug.to_string(),
+        repo_arg,
         "--squash".to_string(),
         "--match-head-commit".to_string(),
         head_sha.to_string(),
     ]
 }
 
+/// Every fact needed to render one auto-merge attempt's timeline marker —
+/// see [`insert_automerge_marker`]'s doc for why this stays PLAIN FACTS
+/// rather than a pre-composed sentence.
+struct MergeAttemptOutcome {
+    merged: bool,
+    abbrev: &'static str,
+    number: i32,
+    base_ref: String,
+    /// Raw `gh` failure text (or an internal error) — only `Some` when
+    /// `merged` is `false`. Never localized: it is the host's/OS's own
+    /// diagnostic passthrough, the same treatment `HostError::message`'s
+    /// callers already give probe-failure text elsewhere in this module tree
+    /// (e.g. `judge::probe_error_text`).
+    reason: Option<String>,
+    /// `"open" | "merged" | "closed" | "unknown"` — see `lifecycle_state_tag`.
+    state: &'static str,
+    /// Raw diagnostic for `state == "unknown"` (the post-attempt confirmation
+    /// read itself failed) — same never-localized treatment as `reason`.
+    state_error: Option<String>,
+    attempts_exhausted: bool,
+    attempts_max: u32,
+}
+
 /// A durable, visible timeline record of an auto-merge attempt — the same
 /// "system-owned, always part of the record" treatment `lead_chat::commands`
-/// already gives an engine switch / a failed quota fail-over. Deliberately
-/// `kind: "text"` (a plain system chat bubble), NOT a new dedicated
-/// `ChatTimeline` marker kind: this feature's territory explicitly excludes
-/// `ChatTimeline.tsx` (a fail-over-marker-copy change is in flight there
-/// concurrently — see this PR's own notes), and `kind: "text"` already
-/// renders any `{"text": ...}` content as a normal message bubble with zero
-/// frontend changes, for either `role`. The message text itself is
-/// backend-composed Chinese (dev-English tokens kept) rather than routed
-/// through `src/i18n` — the same established exception `judge::notice_text`/
-/// `give_up_text` already document and use for backend-composed notices: the
-/// backend has no channel to learn the user's UI language at all today, and
-/// this is exactly that same class of dynamically-composed system text, not
-/// static interactive UI copy (the opt-in TOGGLE's own label/hint/confirm
-/// text, which IS static UI copy, goes through `src/i18n/en.ts` + `zh.ts` as
-/// usual).
-async fn insert_automerge_marker(app: &AppHandle, db: &Db, thread_id: i32, text: &str) {
+/// already gives an engine switch / a failed quota fail-over. `kind:
+/// "pr_auto_merge"`, with STRUCTURED content (never a pre-composed sentence)
+/// — review round 1 Codex P1: an earlier version composed the marker text as
+/// fixed Chinese in this file, which left English-UI users an untranslated
+/// message; every user-facing string here now lives in `src/i18n/en.ts` +
+/// `zh.ts` (`ChatTimeline.tsx`'s `AutoMergeMarker` composes the sentence via
+/// `t()` from these plain facts) like the rest of this codebase's UI copy.
+async fn insert_automerge_marker(app: &AppHandle, db: &Db, thread_id: i32, outcome: &MergeAttemptOutcome) {
     let turn_id = repo::next_turn_id(db, thread_id).await.unwrap_or(1);
-    let content = serde_json::json!({ "text": text }).to_string();
-    match repo::insert_lead_message(db, thread_id, None, turn_id, "system", "text", &content, "complete")
-        .await
+    let content = serde_json::json!({
+        "merged": outcome.merged,
+        "abbrev": outcome.abbrev,
+        "number": outcome.number,
+        "base_ref": outcome.base_ref,
+        "reason": outcome.reason,
+        "state": outcome.state,
+        "state_error": outcome.state_error,
+        "attempts_exhausted": outcome.attempts_exhausted,
+        "attempts_max": outcome.attempts_max,
+    })
+    .to_string();
+    match repo::insert_lead_message(
+        db,
+        thread_id,
+        None,
+        turn_id,
+        "system",
+        "pr_auto_merge",
+        &content,
+        "complete",
+    )
+    .await
     {
         Ok(m) => {
             let _ = app.emit(
@@ -343,7 +553,9 @@ async fn insert_automerge_marker(app: &AppHandle, db: &Db, thread_id: i32, text:
                 crate::lead_chat::engine::Push::Message { thread_id, message: m },
             );
         }
-        Err(e) => eprintln!("[weft][automerge] marker insert failed: {e}"),
+        Err(e) => eprintln!(
+            "[weft][automerge] marker insert failed (thread_id={thread_id}): {e}"
+        ),
     }
 }
 
@@ -390,30 +602,35 @@ mod tests {
         // the guard's own message text rather than just success/failure: a
         // real `gh pr merge` failure (auth, not found, ...) could otherwise
         // make a deleted guard look identical to a passing test.
-        match run_gh_merge("evil.example.org/ownerx", "repox", 5, "abc123") {
+        match run_gh_merge("", "evil.example.org/ownerx", "repox", 5, "abc123") {
             Err(message) => assert!(message.contains("host override"), "got: {message}"),
             Ok(()) => panic!("expected the embedded-slash guard to fire"),
         }
-        match run_gh_merge("owner", "a/b", 5, "abc123") {
+        match run_gh_merge("", "owner", "a/b", 5, "abc123") {
             Err(message) => assert!(message.contains("host override"), "got: {message}"),
             Ok(()) => panic!("expected the embedded-slash guard to fire"),
+        }
+        match run_gh_merge("evil.example.org/extra", "owner", "repo", 5, "abc123") {
+            Err(message) => assert!(message.contains("host override"), "got: {message}"),
+            Ok(()) => panic!("expected the embedded-slash guard to fire for a smuggled host_base"),
         }
     }
 
     #[test]
     fn run_gh_merge_refuses_an_empty_head_sha_before_shelling_out() {
-        match run_gh_merge("owner", "repo", 5, "") {
+        match run_gh_merge("", "owner", "repo", 5, "") {
             Err(message) => assert!(message.contains("head_sha"), "got: {message}"),
             Ok(()) => panic!("expected the empty-head_sha guard to fire"),
         }
     }
 
-    // --- build_merge_args: the head-consistency enforcement must actually
-    // reach the `gh` invocation, not just exist in a doc comment -----------
+    // --- build_merge_args: the head-consistency AND host-targeting
+    // enforcement must actually reach the `gh` invocation, not just exist in
+    // a doc comment --------------------------------------------------------
 
     #[test]
     fn build_merge_args_always_squashes_and_pins_match_head_commit_to_the_exact_sha() {
-        let args = build_merge_args(42, "acme/widgets", "deadbeef");
+        let args = build_merge_args("", "acme/widgets", 42, "deadbeef");
         assert_eq!(
             args,
             vec!["pr", "merge", "42", "--repo", "acme/widgets", "--squash", "--match-head-commit", "deadbeef"]
@@ -430,18 +647,39 @@ mod tests {
         );
     }
 
-    // --- lifecycle_state_text: exhaustive, always distinguishable ---------
+    #[test]
+    fn build_merge_args_folds_a_non_empty_host_base_into_the_repo_argument() {
+        // Review round 1 Codex P1: a GitHub Enterprise row's recorded host
+        // must actually reach the invocation, not silently fall back to
+        // `gh`'s own default host.
+        let args = build_merge_args("github.acme-corp.com", "acme/widgets", 42, "deadbeef");
+        let idx = args.iter().position(|a| a == "--repo").unwrap();
+        assert_eq!(args[idx + 1], "github.acme-corp.com/acme/widgets");
+    }
 
     #[test]
-    fn lifecycle_state_text_is_distinct_for_every_variant() {
-        let open = lifecycle_state_text(PrLifecycle::Open);
-        let merged = lifecycle_state_text(PrLifecycle::Merged);
-        let closed = lifecycle_state_text(PrLifecycle::Closed);
+    fn build_merge_args_empty_host_base_preserves_the_plain_two_segment_form() {
+        // A row from before `host_base` was recorded (or a plain github.com
+        // one, if this crate ever stops populating it for that case) must
+        // not regress into passing a bare empty host segment.
+        let args = build_merge_args("", "acme/widgets", 42, "deadbeef");
+        let idx = args.iter().position(|a| a == "--repo").unwrap();
+        assert_eq!(args[idx + 1], "acme/widgets");
+    }
+
+    // --- lifecycle_state_tag: exhaustive, always distinguishable ----------
+
+    #[test]
+    fn lifecycle_state_tag_is_distinct_for_every_variant() {
+        let open = lifecycle_state_tag(PrLifecycle::Open);
+        let merged = lifecycle_state_tag(PrLifecycle::Merged);
+        let closed = lifecycle_state_tag(PrLifecycle::Closed);
         assert_ne!(open, merged);
         assert_ne!(open, closed);
         assert_ne!(merged, closed);
-        assert!(merged.contains("merged"));
-        assert!(open.contains("open"));
+        assert_eq!(open, "open");
+        assert_eq!(merged, "merged");
+        assert_eq!(closed, "closed");
     }
 
     // --- is_enabled --------------------------------------------------------

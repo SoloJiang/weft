@@ -29,10 +29,11 @@
 //! an internal domain with no recognizable name) entirely: the caller who
 //! just ran `gh pr create` / `glab mr create` already KNOWS which one it used.
 //!
-//! READ/WRITE BOUNDARY (issue #110 T3 added the write side): [`PrHost`] has
-//! exactly one method, `fetch_status`, and no mutating counterpart —
-//! `monitor` and `github`'s `PrHost` impl are READ-ONLY by construction, not
-//! just by convention, and that stayed true through T3. The one mutating
+//! READ/WRITE BOUNDARY (issue #110 T3 added the write side): [`PrHost`]'s two
+//! methods, `kind` and `fetch_status`, are BOTH read-only — there is no
+//! mutating counterpart on the trait — so `monitor` and `github`'s `PrHost`
+//! impl are READ-ONLY by construction, not just by convention, and that
+//! stayed true through T3. The one mutating
 //! action this module tree performs (`gh pr merge`) lives ENTIRELY in
 //! [`automerge`], has its own independent spawned loop
 //! (`automerge::spawn_pr_automerge_watch`), and is never reachable from

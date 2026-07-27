@@ -2037,6 +2037,15 @@ pub async fn delete_repo_cascade(
         .filter(repo_profile::Column::RepoId.eq(repo_id))
         .exec(&db.0)
         .await?;
+    // issue #110 T3 review: a tracked PR/MR row (`register_pr`) has no FK to
+    // cascade it away, and until this fix nothing deleted it when its repo
+    // went away — the auto-merge sweep would keep tracking (and could keep
+    // merging) a PR whose repo the user just deleted. See
+    // `delete_thread_cascade`'s matching fix for the full reasoning.
+    pull_request::Entity::delete_many()
+        .filter(pull_request::Column::RepoId.eq(repo_id))
+        .exec(&db.0)
+        .await?;
     repo_ref::Entity::delete_by_id(repo_id).exec(&db.0).await?;
     // Best-effort: invalidate the now-stale workspace map doc (see top of fn).
     if let Some(ws) = workspace_id {
@@ -2109,6 +2118,12 @@ pub async fn delete_workspace_cascade(
             .await?;
         test_plan::Entity::delete_many()
             .filter(test_plan::Column::ThreadId.eq(*thread_id))
+            .exec(&db.0)
+            .await?;
+        // issue #110 T3 review: see `delete_thread_cascade`'s matching fix —
+        // a tracked PR/MR row has no FK to cascade it away on its own.
+        pull_request::Entity::delete_many()
+            .filter(pull_request::Column::ThreadId.eq(*thread_id))
             .exec(&db.0)
             .await?;
     }
@@ -2235,6 +2250,17 @@ pub async fn delete_thread_cascade(
         .await?;
     test_plan::Entity::delete_many()
         .filter(test_plan::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
+    // issue #110 T3 review: a tracked PR/MR row (`register_pr` /
+    // `crate::host::monitor`/`crate::host::automerge`) has no FK relation to
+    // this thread, so without this it would silently outlive the issue that
+    // owned it — `host::automerge`'s sweep would keep tracking, and could
+    // still auto-merge, a PR belonging to an issue the user just deleted.
+    // Same transaction as the rest of this cascade for the same atomicity
+    // reason this function's own doc gives.
+    pull_request::Entity::delete_many()
+        .filter(pull_request::Column::ThreadId.eq(thread_id))
         .exec(&txn)
         .await?;
     txn.commit().await?;
@@ -4068,6 +4094,32 @@ mod tests {
         );
     }
 
+    /// issue #110 T3 review: same fix as `delete_thread_cascade_removes_
+    /// tracked_pull_requests`, for a repo (rather than a whole issue) delete.
+    #[tokio::test]
+    async fn delete_repo_cascade_removes_tracked_pull_requests() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "T", "feature", "claude").await.unwrap();
+        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        let dir = create_direction(&db, t.id, "d", "claude", a.id, "reason", "plan+impl", "")
+            .await
+            .unwrap();
+        let pr = register_pull_request(
+            &db, t.id, dir.id, a.id, "github", "github.com", "acme", "widgets", 6,
+            "https://github.com/acme/widgets/pull/6", "fix bug",
+        )
+        .await
+        .unwrap();
+
+        delete_repo_cascade(&db, a.id).await.unwrap();
+
+        assert!(
+            get_pull_request(&db, pr.id).await.unwrap().is_none(),
+            "a deleted repo's tracked PR/MR rows must not outlive it"
+        );
+    }
+
     /// R15-1: delete_repo_cascade must carry created_branch in its 4-tuple so
     #[tokio::test]
     async fn update_plan_proposal_cas_rejects_a_stale_write() {
@@ -5186,6 +5238,35 @@ mod tests {
         assert_eq!(list_worktrees(&db, None).await.unwrap().len(), 0);
     }
 
+    /// issue #110 T3 review: a tracked PR/MR row has no FK to the thread that
+    /// owns it, so without this fix it would silently outlive a deleted
+    /// issue — `host::automerge`'s sweep would keep tracking (and could
+    /// still auto-merge) a PR belonging to an issue the user just deleted.
+    #[tokio::test]
+    async fn delete_thread_cascade_removes_tracked_pull_requests() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "T", "feature", "claude").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true).await.unwrap();
+        let dir = create_direction(&db, t.id, "d", "claude", repo.id, "reason", "plan+impl", "")
+            .await
+            .unwrap();
+        let pr = register_pull_request(
+            &db, t.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 5,
+            "https://github.com/acme/widgets/pull/5", "fix bug",
+        )
+        .await
+        .unwrap();
+        assert!(get_pull_request(&db, pr.id).await.unwrap().is_some());
+
+        delete_thread_cascade(&db, t.id).await.unwrap();
+
+        assert!(
+            get_pull_request(&db, pr.id).await.unwrap().is_none(),
+            "a deleted issue's tracked PR/MR rows must not outlive it"
+        );
+    }
+
     #[tokio::test]
     async fn create_workspace_rejects_empty_name() {
         let db = mem().await;
@@ -5480,6 +5561,36 @@ mod tests {
             .map(|row| row.scope)
             .collect();
         assert_eq!(scopes, vec![format!("ws:{}", keep_ws.id)]);
+    }
+
+    /// issue #110 T3 review: same fix as `delete_thread_cascade_removes_
+    /// tracked_pull_requests`, for a whole-workspace delete.
+    #[tokio::test]
+    async fn delete_workspace_cascade_removes_tracked_pull_requests() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "delete me").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        let dir = create_direction(&db, thread.id, "d", "claude", repo.id, "reason", "plan+impl", "")
+            .await
+            .unwrap();
+        let pr = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 7,
+            "https://github.com/acme/widgets/pull/7", "fix bug",
+        )
+        .await
+        .unwrap();
+
+        delete_workspace_cascade(&db, ws.id).await.unwrap();
+
+        assert!(
+            get_pull_request(&db, pr.id).await.unwrap().is_none(),
+            "a deleted workspace's tracked PR/MR rows must not outlive it"
+        );
     }
 
     #[tokio::test]

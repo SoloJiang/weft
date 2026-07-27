@@ -650,6 +650,14 @@ function TimelineRow({
     return <EngineRouteBlockedMarker content={c} />;
   }
 
+  // issue #110 T3: a completed (success or failure) auto-merge attempt —
+  // same durable, system-owned marker treatment as the others above.
+  // Structured content only (never pre-composed prose — review round 1
+  // Codex P1), so this renders correctly in either UI language.
+  if (m.kind === "pr_auto_merge") {
+    return <AutoMergeMarker content={c} />;
+  }
+
   if (m.kind === "tool") {
     const content = parse(m.content);
     const name = typeof content.name === "string" ? content.name : "tool";
@@ -1176,6 +1184,61 @@ function QuotaFailoverFailedMarker({ content }: { content: Record<string, unknow
             className="inline-flex shrink-0 cursor-help text-danger/80"
           >
             <CircleAlert size={12} />
+          </span>
+        )}
+      </span>
+      <span className="h-px min-w-4 flex-1 bg-border" />
+    </div>
+  );
+}
+
+const AUTO_MERGE_STATE_KEYS: Record<string, string> = {
+  open: "session.autoMergeStateOpen",
+  merged: "session.autoMergeStateMerged",
+  closed: "session.autoMergeStateClosed",
+};
+
+/** issue #110 T3: durable record of one auto-merge attempt, success or
+ *  failure — same quiet centered-divider treatment as the markers above,
+ *  danger tone only when the attempt actually failed (a successful merge
+ *  reads neutral, matching `EngineSwitchMarker`'s own tone for a completed,
+ *  non-alarming automatic action). Raw, non-localizable diagnostics
+ *  (`reason` / `state_error` — the host's/OS's own passthrough text) render
+ *  as a hover tooltip, the same pattern `QuotaFailoverFailedMarker` already
+ *  established for its own `error` field, rather than inline untranslated
+ *  prose. */
+function AutoMergeMarker({ content }: { content: Record<string, unknown> }) {
+  const { t } = useTranslation();
+  const merged = content.merged === true;
+  const abbrev = typeof content.abbrev === "string" ? content.abbrev : "PR";
+  const number = typeof content.number === "number" ? content.number : 0;
+  const baseRef = typeof content.base_ref === "string" ? content.base_ref : "";
+  const reason = typeof content.reason === "string" ? content.reason : "";
+  const state = typeof content.state === "string" ? content.state : "unknown";
+  const stateError = typeof content.state_error === "string" ? content.state_error : "";
+  const attemptsExhausted = content.attempts_exhausted === true;
+  const attemptsMax = typeof content.attempts_max === "number" ? content.attempts_max : 0;
+  const stateKey = AUTO_MERGE_STATE_KEYS[state] ?? "session.autoMergeStateUnknown";
+  const tone = merged ? "text-ink-faint" : "text-danger";
+  const diagnostic = merged ? "" : reason || (state === "unknown" ? stateError : "");
+  return (
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className={cn("flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px]", tone)}>
+        <span>
+          {merged
+            ? t("session.autoMergeSucceeded", { abbrev, number, base: baseRef })
+            : t("session.autoMergeFailed", { abbrev, number })}
+        </span>
+        <span className="truncate">· {t(stateKey)}</span>
+        {diagnostic && (
+          <span title={truncateForTooltip(diagnostic, 240)} className="inline-flex shrink-0 cursor-help text-danger/80">
+            <CircleAlert size={12} />
+          </span>
+        )}
+        {attemptsExhausted && (
+          <span className="rounded-full border border-danger/30 bg-danger/10 px-1.5 py-0.5 text-[10px] font-medium text-danger">
+            {t("session.autoMergeAttemptsExhausted", { count: attemptsMax })}
           </span>
         )}
       </span>

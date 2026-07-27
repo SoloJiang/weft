@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft,
   Bot,
@@ -738,7 +739,17 @@ function AutomationSettings() {
   }
 
   async function toggleAutoMerge(on: boolean) {
-    if (on && !window.confirm(t("settings.autoMergeConfirm"))) return;
+    // issue #110 T3 review P1: `window.confirm` has no default implementation
+    // in Tauri's macOS WKWebView (its WKUIDelegate never wires up
+    // runJavaScriptConfirmPanelWithMessage) — the call hangs forever with no
+    // error, freezing this dialog on the flagship platform, for exactly the
+    // one confirmation gating an irreversible action. `@tauri-apps/plugin-
+    // dialog`'s `confirm` uses the native dialog plugin instead, which is
+    // already a dependency and already used elsewhere in this file for
+    // file pickers — verified live in the running app (see PR body).
+    if (on && !(await confirmDialog(t("settings.autoMergeConfirm"), { title: "Weft", kind: "warning" }))) {
+      return;
+    }
     const prev = autoMerge;
     setAutoMergeState(on);
     try {

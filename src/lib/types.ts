@@ -327,7 +327,13 @@ export interface LeadMessage {
     /** Marker for a server-owned initial route decision. */
     | "engine_route"
     /** Persistent blocked state when no automatic candidate is eligible. */
-    | "engine_route_blocked";
+    | "engine_route_blocked"
+    /** Marker row for one auto-merge attempt (issue #110 T3), success or
+     *  failure; content is {"merged","abbrev","number","base_ref","reason",
+     *  "state","state_error","attempts_exhausted","attempts_max"} — plain
+     *  facts only, never pre-composed prose, so `ChatTimeline.tsx`'s
+     *  `AutoMergeMarker` can render it in either UI language. */
+    | "pr_auto_merge";
   /** kind-shaped JSON string, e.g. {"text": "..."} for kind=text */
   content: string;
   status: "streaming" | "complete" | "interrupted" | "error" | "queued";
