@@ -169,17 +169,45 @@ async fn apply_probe_result(
             }
         }
         Err(e) => {
-            if let Err(store_err) = repo::mark_pull_request_probe_error(db, pr.id, &e.message()).await {
-                eprintln!("[weft][host] pr #{}: could not save probe error: {store_err}", pr.id);
-            }
-            Some(match kind {
-                Some(k) => judge::probe_error_text(k, pr.number, e),
-                None => format!("🔌 无法查询 PR/MR #{} 的状态:{}。", pr.number, e.message()),
-            })
+            let fail_count = match repo::mark_pull_request_probe_error(db, pr.id, &e.message()).await {
+                Ok(count) => count,
+                Err(store_err) => {
+                    eprintln!("[weft][host] pr #{}: could not save probe error: {store_err}", pr.id);
+                    None
+                }
+            };
+            Some(error_notice_text(kind, pr.number, e, fail_count))
         }
     };
 
     reconcile_notice(bus, app, notices, pr, desired_text);
+}
+
+/// Which notice text a FAILED probe should produce, given the NEW
+/// consecutive-failure count this attempt just wrote (`None` if the row
+/// vanished mid-write — no row to report a streak for). Pure and unit-tested
+/// in isolation from `mark_pull_request_probe_error`'s DB write: the
+/// boundary condition (`fail_count >= MAX_CONSECUTIVE_PROBE_FAILURES`) is
+/// precisely the ONE sweep `list_open_pull_requests` is about to start
+/// excluding this row from — so it is the ONLY sweep allowed to say "gave
+/// up" (`judge::give_up_text`) instead of "still checking, will retry"
+/// (`judge::probe_error_text`). Getting this boundary wrong either direction
+/// is a real regression: off-by-one-early falsely claims tracking stopped
+/// while it's still retrying; off-by-one-late repeats the ordinary text on
+/// the exact sweep where tracking silently stops for good (P1-A: the bug
+/// this function exists to prevent from recurring).
+fn error_notice_text(
+    kind: Option<HostKind>,
+    pr_number: i32,
+    error: &super::HostError,
+    fail_count: Option<i32>,
+) -> String {
+    let gave_up_now = fail_count.is_some_and(|c| c >= MAX_CONSECUTIVE_PROBE_FAILURES);
+    match kind {
+        Some(k) if gave_up_now => judge::give_up_text(k, pr_number, error),
+        Some(k) => judge::probe_error_text(k, pr_number, error),
+        None => format!("🔌 无法查询 PR/MR #{pr_number} 的状态:{}。", error.message()),
+    }
 }
 
 /// Apply whatever [`judge::plan_notice_action`] says about the Needs-you
@@ -297,7 +325,47 @@ fn snapshot_changed(old: &pull_request::Model, snapshot: &PrSnapshot, readiness:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{CiStatus, ConflictStatus, PrLifecycle, ReviewStatus};
+    use crate::host::{CiStatus, ConflictStatus, HostError, PrLifecycle, ReviewStatus};
+
+    // --- P1-A: the give-up boundary must never strand a row silently -----
+
+    #[test]
+    fn under_the_threshold_still_reports_an_ordinary_probe_error() {
+        let err = HostError::NotFound;
+        let text = error_notice_text(Some(HostKind::GitHub), 1, &err, Some(MAX_CONSECUTIVE_PROBE_FAILURES - 1));
+        assert_eq!(text, judge::probe_error_text(HostKind::GitHub, 1, &err));
+    }
+
+    #[test]
+    fn exactly_at_the_threshold_reports_gave_up_not_an_ordinary_error() {
+        // This is the EXACT sweep `list_open_pull_requests` starts excluding
+        // the row from — the one and only chance to tell the human tracking
+        // just stopped, instead of silently going quiet.
+        let err = HostError::NotFound;
+        let text = error_notice_text(Some(HostKind::GitHub), 1, &err, Some(MAX_CONSECUTIVE_PROBE_FAILURES));
+        assert_eq!(text, judge::give_up_text(HostKind::GitHub, 1, &err));
+    }
+
+    #[test]
+    fn past_the_threshold_also_reports_gave_up() {
+        // Reachable if the threshold constant is ever lowered while a row
+        // already has a higher stored count — must not fall through to the
+        // ordinary-error text just because it's not an EXACT match.
+        let err = HostError::NotFound;
+        let text =
+            error_notice_text(Some(HostKind::GitHub), 1, &err, Some(MAX_CONSECUTIVE_PROBE_FAILURES + 5));
+        assert_eq!(text, judge::give_up_text(HostKind::GitHub, 1, &err));
+    }
+
+    #[test]
+    fn a_missing_row_never_claims_gave_up() {
+        // `fail_count: None` means the DB write couldn't even find the row —
+        // that's a DIFFERENT fact from "we tracked it and gave up", and must
+        // not be misreported as the latter.
+        let err = HostError::NotFound;
+        let text = error_notice_text(Some(HostKind::GitHub), 1, &err, None);
+        assert_eq!(text, judge::probe_error_text(HostKind::GitHub, 1, &err));
+    }
 
     fn base_row() -> pull_request::Model {
         pull_request::Model {

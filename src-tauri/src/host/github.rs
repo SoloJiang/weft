@@ -347,13 +347,38 @@ mod tests {
         // never reach `Command::new("gh")` with an owner/repo that could be
         // reinterpreted as a host override. No process/network call happens
         // in this test — the guard fires before `Command::new` either way.
+        //
+        // IMPORTANT: this asserts the guard's OWN message content, not just
+        // the `HostError::Other` VARIANT. An earlier version of this test
+        // asserted only the variant, which is a false-green safety net:
+        // `classify_gh_error`'s catch-all ALSO produces `HostError::Other`
+        // for an unrecognized real `gh` failure, so with the guard deleted
+        // this test stayed green anyway — the UNGUARDED call proceeds to a
+        // REAL `gh pr view --repo "evil.example.org/ownerx/repox"`, which an
+        // independent review confirmed genuinely reaches the network (an
+        // HTTPS POST to `https://evil.example.org/api/graphql`), and still
+        // fails with the SAME `HostError::Other` variant — just a different
+        // message. Checking the message is what actually distinguishes "the
+        // guard fired" from "gh failed some other way", and it's checkable
+        // without ever spawning a process (the guard returns before
+        // `Command::new` runs).
         let host = GitHubHost;
         let bad_owner =
             PrTarget { owner: "evil.example.org/ownerx".to_string(), repo: "repox".to_string(), number: 5 };
-        assert!(matches!(host.fetch_status(&bad_owner), Err(HostError::Other { .. })));
+        match host.fetch_status(&bad_owner) {
+            Err(HostError::Other { message }) => {
+                assert!(message.contains("host override"), "got: {message}");
+            }
+            other => panic!("expected the embedded-slash guard's own error, got {other:?}"),
+        }
 
         let bad_repo = PrTarget { owner: "owner".to_string(), repo: "a/b".to_string(), number: 5 };
-        assert!(matches!(host.fetch_status(&bad_repo), Err(HostError::Other { .. })));
+        match host.fetch_status(&bad_repo) {
+            Err(HostError::Other { message }) => {
+                assert!(message.contains("host override"), "got: {message}");
+            }
+            other => panic!("expected the embedded-slash guard's own error, got {other:?}"),
+        }
     }
 
     #[test]

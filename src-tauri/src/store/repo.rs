@@ -3682,6 +3682,19 @@ pub async fn register_pull_request(
         if !title.is_empty() {
             a.title = Set(title.to_string());
         }
+        // A re-registration is this row's ONLY escape hatch once
+        // `probe_fail_count` has crossed the monitor's give-up threshold
+        // (`list_open_pull_requests` stops sweeping it — see that function's
+        // doc — and the sweep itself is the only OTHER path that ever resets
+        // this counter, via `apply_pull_request_snapshot` on a success it can
+        // now never reach). Without this reset, `register_pr`'s own
+        // documented contract ("re-calling it just refreshes context") would
+        // be false for exactly the row that most needs refreshing — a real
+        // dead end an adversarial review caught: a GitHub PR that's still
+        // alive but hit a transient failure streak (auth expired, an outage
+        // longer than the threshold) would fall out of monitoring FOREVER
+        // with no recovery path at all.
+        a.probe_fail_count = Set(0);
         return Ok(a.update(&db.0).await?);
     }
     let a = pull_request::ActiveModel {
@@ -3741,9 +3754,15 @@ pub async fn apply_pull_request_snapshot(
 /// Record a failed probe attempt without touching the last known snapshot,
 /// and bump the consecutive-failure streak (`list_open_pull_requests` stops
 /// sweeping the row once this reaches the caller's give-up threshold).
-pub async fn mark_pull_request_probe_error(db: &Db, id: i32, message: &str) -> Result<()> {
+/// Returns the NEW streak count (`None` if the row is gone) so the caller can
+/// tell whether THIS attempt is the one that just crossed the threshold — the
+/// monitor uses that to give the row's Needs-you notice honestly different
+/// wording ("stopped checking, here's how to resume") instead of repeating
+/// the same transient-failure text forever after tracking has actually
+/// stopped.
+pub async fn mark_pull_request_probe_error(db: &Db, id: i32, message: &str) -> Result<Option<i32>> {
     let Some(row) = pull_request::Entity::find_by_id(id).one(&db.0).await? else {
-        return Ok(());
+        return Ok(None);
     };
     let next_fail_count = row.probe_fail_count.saturating_add(1);
     let mut a: pull_request::ActiveModel = row.into();
@@ -3751,7 +3770,7 @@ pub async fn mark_pull_request_probe_error(db: &Db, id: i32, message: &str) -> R
     a.last_error = Set(message.to_string());
     a.probe_fail_count = Set(next_fail_count);
     a.update(&db.0).await?;
-    Ok(())
+    Ok(Some(next_fail_count))
 }
 
 #[cfg(test)]
@@ -7430,6 +7449,45 @@ mod tests {
         apply_pull_request_snapshot(&db, broken.id, &snapshot, &readiness).await.unwrap();
         let listed = list_open_pull_requests(&db, 2).await.unwrap();
         assert_eq!(listed.len(), 2, "a success must reset the failure streak and rejoin the sweep");
+    }
+
+    /// P1-A (issue #110 adversarial review, round 3): a success is not the
+    /// ONLY way `probe_fail_count` can reset — a row already past the give-up
+    /// threshold can NEVER see another success (it has fallen out of the
+    /// sweep for good), so `register_pull_request`'s re-registration path is
+    /// its one remaining escape hatch. Without this, that tool's own
+    /// documented contract ("re-calling it just refreshes context") would be
+    /// false for exactly the row that most needs it.
+    #[tokio::test]
+    async fn re_registering_an_existing_pr_resets_the_probe_failure_streak() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let pr = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 4, "", "",
+        )
+        .await
+        .unwrap();
+
+        // Push it past a small give-up threshold — simulating the dead end:
+        // no success is coming (that's the whole point of "gave up"), so the
+        // ONLY thing that can still touch this row is a fresh registration.
+        mark_pull_request_probe_error(&db, pr.id, "still broken").await.unwrap();
+        mark_pull_request_probe_error(&db, pr.id, "still broken").await.unwrap();
+        let listed = list_open_pull_requests(&db, 2).await.unwrap();
+        assert!(listed.is_empty(), "must have fallen out of the sweep at the threshold");
+
+        // Re-registering the SAME PR (natural key unchanged) must reset the
+        // streak and bring it back into the sweep — the row was never
+        // actually resolved, but the human/agent asked weft to try again.
+        register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 4, "", "",
+        )
+        .await
+        .unwrap();
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.probe_fail_count, 0, "re-registration must reset the streak");
+        let listed = list_open_pull_requests(&db, 2).await.unwrap();
+        assert_eq!(listed.len(), 1, "the row must rejoin the sweep after re-registration");
     }
 
     #[tokio::test]

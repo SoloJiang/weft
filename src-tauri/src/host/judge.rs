@@ -176,6 +176,28 @@ pub fn probe_error_text(kind: HostKind, number: i32, error: &HostError) -> Strin
     )
 }
 
+/// The Needs-you notice text for the ONE sweep where a row crosses the
+/// monitor's give-up threshold (`host::monitor::MAX_CONSECUTIVE_PROBE_
+/// FAILURES`) — after this, `list_open_pull_requests` stops sweeping the
+/// row, so this exact text is what stays posted indefinitely. Deliberately
+/// distinct from [`probe_error_text`] (an ordinary, still-being-retried
+/// failure): without this, a human has no way to tell "still checking, will
+/// retry" from "gave up ~10 minutes ago and will never check again" apart —
+/// both would otherwise read as byte-identical text. Names the ONLY way this
+/// row's tracking resumes (a fresh `register_pr` call resets the streak —
+/// see `repo::register_pull_request`'s update branch) and says plainly that
+/// THIS notice will not clear itself, contradicting the generic "clears
+/// itself automatically" Needs-you hint that would otherwise be sitting
+/// right below it, honestly, since it does not hold for this state.
+pub fn give_up_text(kind: HostKind, number: i32, error: &HostError) -> String {
+    format!(
+        "🛑 已停止跟踪 {} #{number} 的状态:连续多次查询失败,最近一次原因:{}。这条提示不会自动消失——如果这个 {} 其实还活着,请让 agent 重新调用一次 register_pr 恢复跟踪。",
+        kind.native_abbrev(),
+        error.message(),
+        kind.native_noun()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +389,31 @@ mod tests {
         assert_eq!(plan_notice_action(Some("x"), None), NoticeAction::Retract);
         assert_eq!(plan_notice_action(Some("x"), Some("x")), NoticeAction::NoOp);
         assert_eq!(plan_notice_action(Some("x"), Some("y")), NoticeAction::Replace);
+    }
+
+    #[test]
+    fn give_up_text_differs_from_an_ordinary_probe_error() {
+        // The P1-A honesty requirement: byte-identical text between "still
+        // retrying" and "gave up, will never retry again" would leave a
+        // human with no way to tell the two apart.
+        let error = HostError::NotAuthenticated { program: "gh".to_string() };
+        let ordinary = probe_error_text(HostKind::GitHub, 9, &error);
+        let gave_up = give_up_text(HostKind::GitHub, 9, &error);
+        assert_ne!(ordinary, gave_up);
+    }
+
+    #[test]
+    fn give_up_text_names_the_recovery_path() {
+        let error = HostError::NotFound;
+        let text = give_up_text(HostKind::GitHub, 3, &error);
+        assert!(text.contains("register_pr"), "must say HOW to recover, got: {text}");
+    }
+
+    #[test]
+    fn give_up_text_uses_host_native_terminology() {
+        let error = HostError::NotFound;
+        assert!(give_up_text(HostKind::GitHub, 1, &error).contains("PR #1"));
+        assert!(give_up_text(HostKind::GitLab, 1, &error).contains("MR #1"));
     }
 
     #[test]
