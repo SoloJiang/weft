@@ -2303,10 +2303,10 @@ fn release_quota_failover_slot(key: QuotaFailoverKey) {
 /// value. Instead, [`claim_quota_failover_slot`] remains the single atomic
 /// compare-and-swap (lock, check elapsed-since-last-claim, insert `now` — all
 /// under one mutex acquisition) that decides for real; this function only
-/// folds its already-resolved, authoritative result into an
-/// exhaustively-matched verdict the call site must handle. There is no
+/// wraps its already-resolved, authoritative result in a type. There is no
 /// window in which two concurrent calls can both observe `Claimed` for the
-/// same key.
+/// same key. [`quota_failover_dispatch_decision`] is what turns this value
+/// into the final, exhaustively-matched verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuotaFailoverClaimGate {
     /// This call won the race: the slot is now ours for
@@ -2323,6 +2323,46 @@ fn quota_failover_claim_gate(key: QuotaFailoverKey) -> QuotaFailoverClaimGate {
         QuotaFailoverClaimGate::Claimed
     } else {
         QuotaFailoverClaimGate::Lost
+    }
+}
+
+/// The final, exhaustively-matched verdict once gate 6 (`claim`) is known,
+/// for the `SwitchTo` case gates 1-5 already resolved earlier in
+/// [`maybe_failover_on_quota`]. A genuinely pure function of its
+/// arguments — `claim` MUST be supplied by the caller; this never reads the
+/// cooldown map itself. That is what makes it different from a bare
+/// `match` on [`QuotaFailoverClaimGate`] inlined at the call site (the
+/// shape this replaced), and it buys two protections at once:
+///
+/// - Stubbing this function's handling of `claim` (e.g. ignoring it and
+///   always returning `Switch`) is caught directly by
+///   `quota_failover_dispatch_decision_respects_a_lost_claim` below — the
+///   same way `engine_routing::resolve_failover`'s own tests would catch a
+///   stubbed gate 1-5 branch.
+/// - Deleting the caller's `quota_failover_claim_gate(key)` call — the ONLY
+///   place that performs the real [`claim_quota_failover_slot`] CAS — is
+///   now a COMPILE ERROR, not just an untested runtime change: removing
+///   that one line from `maybe_failover_on_quota` leaves the call below
+///   referencing an undefined `claim`, so `cargo build` refuses to link, no
+///   test run required.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QuotaFailoverOutcome {
+    /// All six gates passed — hand off to `tool`.
+    Switch { tool: String },
+    /// Gate 6 lost the race to a concurrent call for the same key.
+    ClaimLost,
+}
+
+#[must_use]
+fn quota_failover_dispatch_decision(
+    fallback_tool: &str,
+    claim: QuotaFailoverClaimGate,
+) -> QuotaFailoverOutcome {
+    match claim {
+        QuotaFailoverClaimGate::Lost => QuotaFailoverOutcome::ClaimLost,
+        QuotaFailoverClaimGate::Claimed => QuotaFailoverOutcome::Switch {
+            tool: fallback_tool.to_string(),
+        },
     }
 }
 
@@ -2442,8 +2482,8 @@ pub fn spawn_quota_failover_check(
 /// engine-routing resolver. Thin wiring only — resolve the impure inputs
 /// (setting, installed tools, structured quota readings, cooldown peek),
 /// delegate the judgment call to the shared function (gates 1-5), then a
-/// second, later, exhaustively-matched gate (6: [`quota_failover_claim_gate`])
-/// governs dispatch. Reuses
+/// second, later, pure function ([`quota_failover_dispatch_decision`],
+/// gate 6) governs dispatch once the concurrency claim is known. Reuses
 /// [`switch_lead_tool_inner`]/[`switch_worker_tool_inner`] VERBATIM — the
 /// exact six-step teardown/persist/reconstruct sequence #139 shipped and
 /// reviewed, never a hand-rolled partial tool/model update. Every failure is
@@ -2515,23 +2555,19 @@ async fn maybe_failover_on_quota(
     }
     // Gate 6 — claim the cooldown slot before the short final engine
     // handoff, so a second turn-end callback cannot race this one into a
-    // duplicate switch. See `quota_failover_claim_gate`'s doc for why this
-    // is its own, later, exhaustively-matched step rather than folded into
-    // `FailoverDecision`'s gates 1-5. `quota_failover_claim_gate_blocks_a_
-    // concurrent_claim` below calls this EXACT function and proves its
-    // claim/reclaim behavior directly. What no test proves — the same,
-    // disclosed limitation every gate here shares — is that this call site
-    // itself still runs: `maybe_failover_on_quota` needs an `AppHandle`,
-    // unavailable in this crate's test harness (same limitation the
-    // `push_model_arg` tests' doc comment records). Deleting this `match`,
-    // or replacing `quota_failover_claim_gate` with a stub that always
-    // returns `Claimed`, would silently defeat
-    // `QUOTA_FAILOVER_COOLDOWN_SECS`'s storm-breaker promise without
-    // failing the build.
-    match quota_failover_claim_gate(key) {
-        QuotaFailoverClaimGate::Lost => return,
-        QuotaFailoverClaimGate::Claimed => {}
-    }
+    // duplicate switch. `quota_failover_claim_gate` performs the one real,
+    // atomic CAS; `quota_failover_dispatch_decision` is a PURE function
+    // that REQUIRES `claim` as an input — see its doc for why that (not a
+    // bare `match` inlined here) makes deleting the claim call below a
+    // compile error, not a silent, untested behavior change. `fallback`
+    // (a `&str` since the SwitchTo match above) is shadowed here by the
+    // owned `String` gate 6 hands back once it's confirmed we still hold
+    // the slot.
+    let claim = quota_failover_claim_gate(key);
+    let fallback = match quota_failover_dispatch_decision(fallback, claim) {
+        QuotaFailoverOutcome::ClaimLost => return,
+        QuotaFailoverOutcome::Switch { tool } => tool,
+    };
     if !claim_quota_failover_commit(app, thread_id, session_id, tool).await {
         release_quota_failover_slot(key);
         return;
@@ -2576,7 +2612,7 @@ async fn maybe_failover_on_quota(
             return;
         }
         eprintln!("[weft][quota] auto fail-over {tool} -> {fallback} failed: {err}");
-        insert_quota_failover_failed_marker(app, db, thread_id, session_id, tool, fallback, &err)
+        insert_quota_failover_failed_marker(app, db, thread_id, session_id, tool, &fallback, &err)
             .await;
     }
 }
@@ -2813,12 +2849,13 @@ mod quota_failover_tests {
         );
     }
 
-    /// Direct proof of gate 6 (`quota_failover_claim_gate`) itself — unlike
-    /// `quota_failover_dispatch_claim_blocks_a_concurrent_decision` above,
-    /// which reconstructs the surrounding peek/decide sequence by hand, this
-    /// calls the EXACT function `maybe_failover_on_quota` matches on at its
-    /// dispatch point. If a future change made that function's internals
-    /// vacuously return `Claimed` (bypassing the real
+    /// Direct proof of gate 6's atomic CAS wrapper (`quota_failover_claim_gate`)
+    /// itself — unlike `quota_failover_dispatch_claim_blocks_a_concurrent_decision`
+    /// above, which reconstructs the surrounding peek/decide sequence by
+    /// hand, this calls the EXACT function `maybe_failover_on_quota` calls
+    /// to produce the `claim` it then feeds into
+    /// `quota_failover_dispatch_decision`. If a future change made this
+    /// function's internals vacuously return `Claimed` (bypassing the real
     /// `claim_quota_failover_slot` CAS), this test is what would catch it:
     /// a fresh key must win the claim; a second, concurrent call for the
     /// SAME key, before the cooldown elapses, must lose the race rather
@@ -2841,6 +2878,26 @@ mod quota_failover_tests {
         // independent — same invariant `claim_quota_failover_slot` proves.
         let other: QuotaFailoverKey = (900_020, Some(1));
         assert_eq!(quota_failover_claim_gate(other), QuotaFailoverClaimGate::Claimed);
+    }
+
+    /// Direct proof of gate 6's PURE verdict function
+    /// (`quota_failover_dispatch_decision`) itself, exactly the way each of
+    /// gates 1-5 gets its own direct test of `resolve_failover`. This is
+    /// the test a "stub gate 6 to always proceed" mutation must fail: if
+    /// `quota_failover_dispatch_decision` ignored `claim` and always
+    /// returned `Switch`, the `Lost` assertion below would catch it.
+    #[test]
+    fn quota_failover_dispatch_decision_respects_a_lost_claim() {
+        assert_eq!(
+            quota_failover_dispatch_decision("codex", QuotaFailoverClaimGate::Claimed),
+            QuotaFailoverOutcome::Switch { tool: "codex".to_string() },
+            "a won claim must dispatch to the resolved fallback tool"
+        );
+        assert_eq!(
+            quota_failover_dispatch_decision("codex", QuotaFailoverClaimGate::Lost),
+            QuotaFailoverOutcome::ClaimLost,
+            "a lost claim must never dispatch, regardless of which tool gates 1-5 picked"
+        );
     }
 
 }
