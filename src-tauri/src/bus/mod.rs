@@ -1,3 +1,4 @@
+pub mod builtin_allow;
 pub mod global;
 pub mod inject;
 pub mod server;
