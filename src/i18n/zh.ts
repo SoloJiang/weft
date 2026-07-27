@@ -768,7 +768,7 @@ export const zh = {
     autoMergeDisclosure:
       "只对 Weft 已经在跟踪（通过 register_pr）、且宿主支持合并的 PR/MR 生效（目前仅 GitHub）。状态过期或探测正在失败的行会被跳过，不会用旧快照去合并。这不会独立检查未解决的 review 讨论线程，也不会检查某个仓库专属的机器人批准约定（例如某个 review 机器人的 👍）——只看 GitHub 自己的聚合 review decision。如果你的仓库依赖这些，请开启 GitHub 自己的分支保护（「Require conversation resolution before merging」、必需的 reviewer），这样条件不满足时合并会在服务端被直接拒绝。",
     autoMergeConfirm:
-      "要开启自动合并吗？Weft 会自动 squash 合并每一个已经达到、或之后达到本仓库「truly mergeable」标准的被跟踪 PR/MR——不会再逐条问你，可能一开启就立刻合并好几个。这个动作一旦发生就无法撤销。",
+      "要开启自动合并吗？Weft 会自动 squash 合并每一个已经达到、或之后达到本仓库「truly mergeable」标准的被跟踪 PR/MR——不会再逐条问你，可能一开启就立刻合并好几个。它只看 GitHub 自己的 review decision：不会检查未解决的 review 线程，也不看 review 机器人是否批准。这个动作一旦发生就无法撤销。",
     engineRoutingGroup: "引擎路由",
     automaticRoutingTitle: "允许 Weft 自动选择引擎",
     automaticRoutingHint:

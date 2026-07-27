@@ -1207,6 +1207,22 @@ const AUTO_MERGE_STATE_KEYS: Record<string, string> = {
  *  as a hover tooltip, the same pattern `QuotaFailoverFailedMarker` already
  *  established for its own `error` field, rather than inline untranslated
  *  prose. */
+/** The raw diagnostic to hover-reveal, if any. A merged marker never carries
+ *  one; otherwise the host's own `reason` wins, and `state_error` only stands
+ *  in when the lifecycle itself came back unrecognized. Kept as a function
+ *  rather than a chained `?:` so each case reads on its own line. */
+function autoMergeDiagnostic(m: {
+  merged: boolean;
+  reason: string;
+  state: string;
+  stateError: string;
+}): string {
+  if (m.merged) return "";
+  if (m.reason) return m.reason;
+  if (m.state === "unknown") return m.stateError;
+  return "";
+}
+
 function AutoMergeMarker({ content }: { content: Record<string, unknown> }) {
   const { t } = useTranslation();
   const merged = content.merged === true;
@@ -1220,7 +1236,7 @@ function AutoMergeMarker({ content }: { content: Record<string, unknown> }) {
   const attemptsMax = typeof content.attempts_max === "number" ? content.attempts_max : 0;
   const stateKey = AUTO_MERGE_STATE_KEYS[state] ?? "session.autoMergeStateUnknown";
   const tone = merged ? "text-ink-faint" : "text-danger";
-  const diagnostic = merged ? "" : reason || (state === "unknown" ? stateError : "");
+  const diagnostic = autoMergeDiagnostic({ merged, reason, state, stateError });
   return (
     <div className="flex items-center gap-2 px-2 py-1.5">
       <span className="h-px min-w-4 flex-1 bg-border" />

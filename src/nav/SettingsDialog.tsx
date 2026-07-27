@@ -745,8 +745,9 @@ function AutomationSettings() {
     // error, freezing this dialog on the flagship platform, for exactly the
     // one confirmation gating an irreversible action. `@tauri-apps/plugin-
     // dialog`'s `confirm` uses the native dialog plugin instead, which is
-    // already a dependency and already used elsewhere in this file for
-    // file pickers — verified live in the running app (see PR body).
+    // already a dependency and already used for file pickers by the settings
+    // panes this dialog renders (`Backup.tsx`) — verified live in the running
+    // app (see PR body).
     if (on && !(await confirmDialog(t("settings.autoMergeConfirm"), { title: "Weft", kind: "warning" }))) {
       return;
     }

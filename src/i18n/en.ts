@@ -794,7 +794,7 @@ export const en = {
     autoMergeDisclosure:
       "Only applies to PR/MR rows Weft is already tracking (via register_pr) on a host with merge support (currently GitHub). A stale or currently-failing status check skips the row instead of merging on an old snapshot. This does NOT independently check unresolved review discussion threads or a repo-specific bot-approval convention (e.g. a review bot's 👍) — only GitHub's own aggregate review decision. If your repo relies on those, turn on GitHub's own branch protection (\"Require conversation resolution before merging\", a required reviewer) so an unmet condition refuses the merge server-side.",
     autoMergeConfirm:
-      "Enable auto-merge? Weft will squash-merge every tracked PR/MR that already meets — or next reaches — this repo's truly-mergeable bar, on its own, without asking you each time, possibly several at once right away. This cannot be undone once it happens.",
+      "Enable auto-merge? Weft will squash-merge every tracked PR/MR that already meets — or next reaches — this repo's truly-mergeable bar, on its own, without asking you each time, possibly several at once right away. It goes by GitHub's own review decision only: it does not check for unresolved review threads or a review bot's approval. This cannot be undone once it happens.",
     engineRoutingGroup: "Engine routing",
     automaticRoutingTitle: "Let Weft choose engines automatically",
     automaticRoutingHint:
