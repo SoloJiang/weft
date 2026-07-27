@@ -631,12 +631,40 @@ pub async fn cancel_reanalyze_workspace_deps(workspace_id: i32) -> R<()> {
 /// so the frontend can open its lead-chat surface for dependency calibration.
 #[tauri::command]
 pub async fn open_curator_chat(db: State<'_, Db>, workspace_id: i32) -> R<i32> {
-    // Stamp the curator thread with the user's configured default tool so the
-    // calibration chat is usable for codex/opencode users (not hard-coded claude).
-    let tool = crate::tools::default_tool(&db).await;
-    repo::ensure_curator_thread(&db, workspace_id, &tool)
+    if let Some(existing) = repo::curator_thread_for_workspace(&db, workspace_id)
         .await
-        .map_err(e)
+        .map_err(e)?
+    {
+        return Ok(existing);
+    }
+    // The curator is one more Weft-owned surface: it shares the global policy,
+    // with a deep hint because repository calibration benefits from deeper
+    // reasoning. OpenCode remains a legacy/manual fallback only.
+    let legacy_tool = crate::tools::default_tool(&db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        &db,
+        None,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Deep,
+    )
+    .await;
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
+    let thread_id = repo::ensure_curator_thread(&db, workspace_id, &tool)
+        .await
+        .map_err(e)?;
+    crate::engine_routing::record_decision(
+        &db,
+        thread_id,
+        None,
+        None,
+        "curator_start",
+        &route,
+    )
+    .await;
+    Ok(thread_id)
 }
 
 /// Return the analyst-synthesized markdown repo-map for a workspace, or `None`
@@ -756,10 +784,31 @@ pub async fn create_thread(
     title: String,
     kind: String,
 ) -> R<entities::thread::Model> {
-    let tool = crate::tools::default_tool(&db).await;
-    repo::create_thread(&db, workspace_id, &title, &kind, &tool)
+    let legacy_tool = crate::tools::default_tool(&db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        &db,
+        None,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Normal,
+    )
+    .await;
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
+    let thread = repo::create_thread(&db, workspace_id, &title, &kind, &tool)
         .await
-        .map_err(e)
+        .map_err(e)?;
+    crate::engine_routing::record_decision(
+        &db,
+        thread.id,
+        None,
+        None,
+        "new_thread",
+        &route,
+    )
+    .await;
+    Ok(thread)
 }
 
 #[tauri::command]
@@ -852,10 +901,13 @@ pub async fn list_directions(
 /// workspace repos (ARCHITECTURE §4.10, §5.1). None if nothing proposed yet.
 #[tauri::command]
 pub async fn get_proposal(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     thread_id: i32,
 ) -> R<Option<crate::planner::ResolvedProposal>> {
-    crate::planner::get_resolved(&db, thread_id)
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
+    crate::planner::get_resolved_with_live_sessions(&db, thread_id, &is_session_live)
         .await
         .map_err(e)
 }
@@ -865,9 +917,9 @@ pub async fn get_proposal(
 pub async fn save_proposal(
     db: State<'_, Db>,
     thread_id: i32,
-    proposal: crate::planner::Proposal,
+    proposal: serde_json::Value,
 ) -> R<()> {
-    crate::planner::save_proposal(&db, thread_id, &proposal)
+    crate::planner::save_proposal_value(&db, thread_id, &proposal)
         .await
         .map_err(e)
 }
@@ -926,7 +978,34 @@ async fn confirm_proposal_and_propagate_read_only(
     asks: &crate::ask::AskRegistry,
     thread_id: i32,
 ) -> anyhow::Result<Vec<i32>> {
-    let ids = crate::planner::confirm(db, thread_id).await?;
+    confirm_proposal_and_propagate_read_only_with_manual_tool(db, asks, thread_id, None).await
+}
+
+async fn confirm_proposal_and_propagate_read_only_with_manual_tool(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+    manual_tool: Option<&str>,
+) -> anyhow::Result<Vec<i32>> {
+    let ids = crate::planner::confirm_with_manual_tool(db, thread_id, manual_tool).await?;
+    asks.grant_read_only_issue(thread_id);
+    Ok(ids)
+}
+
+async fn confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sessions(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+    manual_tool: Option<&str>,
+    is_session_live: &(dyn Fn(i32) -> bool + Send + Sync),
+) -> anyhow::Result<Vec<i32>> {
+    let ids = crate::planner::confirm_with_manual_tool_and_live_sessions(
+        db,
+        thread_id,
+        manual_tool,
+        is_session_live,
+    )
+    .await?;
     asks.grant_read_only_issue(thread_id);
     Ok(ids)
 }
@@ -935,11 +1014,21 @@ async fn confirm_proposal_and_propagate_read_only(
 /// See `confirm_proposal_and_propagate_read_only` for the read-only propagation.
 #[tauri::command]
 pub async fn confirm_proposal(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     asks: tauri::State<'_, crate::ask::AskRegistry>,
     thread_id: i32,
+    manual_tool: Option<String>,
 ) -> R<Vec<i32>> {
-    confirm_proposal_and_propagate_read_only(&db, &asks, thread_id)
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
+    confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sessions(
+        &db,
+        &asks,
+        thread_id,
+        manual_tool.as_deref(),
+        &is_session_live,
+    )
         .await
         .map_err(e)
 }
@@ -995,6 +1084,31 @@ pub async fn verify_direction(db: State<'_, Db>, direction_id: i32) -> R<Vec<Rep
 // review skill INSIDE the worker's own conversation (frontend sends the slash
 // command), and the repo's PR harness stays the authority (§7: 别重造 review/CI).
 
+async fn create_direction_for_explicit_tool(
+    db: &Db,
+    thread_id: i32,
+    name: &str,
+    tool: &str,
+    repo_id: i32,
+    reason: &str,
+    mandate: &str,
+    base_branch: &str,
+) -> anyhow::Result<entities::direction::Model> {
+    let dir = repo::create_direction_with_engine_pin(
+        db,
+        thread_id,
+        name,
+        tool,
+        repo_id,
+        reason,
+        mandate,
+        base_branch,
+        true,
+    )
+    .await?;
+    Ok(dir)
+}
+
 #[tauri::command]
 pub async fn create_direction(
     db: State<'_, Db>,
@@ -1006,7 +1120,7 @@ pub async fn create_direction(
     mandate: Option<String>,
     base_branch: Option<String>,
 ) -> R<entities::direction::Model> {
-    let dir = repo::create_direction(
+    let dir = create_direction_for_explicit_tool(
         &db,
         thread_id,
         &name,
@@ -1435,6 +1549,34 @@ pub async fn set_default_tool(db: State<'_, Db>, tool: String) -> R<()> {
         .map_err(e)
 }
 
+/// Whether the one global automatic engine-routing policy is enabled. Unset is
+/// deliberately false so existing default-tool/manual behavior is unchanged
+/// for upgraded databases.
+#[tauri::command]
+pub async fn get_automatic_engine_routing_enabled(db: State<'_, Db>) -> R<bool> {
+    Ok(matches!(
+        repo::get_setting(&db, crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED)
+            .await
+            .map_err(e)?
+            .as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    ))
+}
+
+#[tauri::command]
+pub async fn set_automatic_engine_routing_enabled(
+    db: State<'_, Db>,
+    enabled: bool,
+) -> R<()> {
+    repo::set_setting(
+        &db,
+        crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(e)
+}
+
 /// issue #97: whether Weft should auto-switch a thread/session to its
 /// fallback engine when the current one reports its usage limit as exceeded
 /// (`crate::lead_chat::commands::maybe_failover_on_quota`). Opt-in, default
@@ -1442,7 +1584,7 @@ pub async fn set_default_tool(db: State<'_, Db>, tool: String) -> R<()> {
 #[tauri::command]
 pub async fn get_quota_failover_enabled(db: State<'_, Db>) -> R<bool> {
     Ok(matches!(
-        repo::get_setting(&db, crate::lead_chat::commands::K_QUOTA_FAILOVER_ENABLED)
+        repo::get_setting(&db, crate::engine_routing::K_QUOTA_FAILOVER_ENABLED)
             .await
             .map_err(e)?
             .as_deref(),
@@ -1454,7 +1596,7 @@ pub async fn get_quota_failover_enabled(db: State<'_, Db>) -> R<bool> {
 pub async fn set_quota_failover_enabled(db: State<'_, Db>, enabled: bool) -> R<()> {
     repo::set_setting(
         &db,
-        crate::lead_chat::commands::K_QUOTA_FAILOVER_ENABLED,
+        crate::engine_routing::K_QUOTA_FAILOVER_ENABLED,
         if enabled { "1" } else { "0" },
     )
     .await
@@ -1565,12 +1707,20 @@ pub struct WriteTrigger {
     pub repo_name: String,
     pub reason: String,
     pub base_branch: String,
+    pub hint: crate::engine_routing::RoutingHint,
+    pub route: Option<crate::engine_routing::RouteDecision>,
 }
 
 /// Every pending write declaration across the workspace's threads — the
 /// data behind the Needs-you "approve a write" cards.
 #[tauri::command]
-pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<WriteTrigger>> {
+pub async fn write_triggers(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    workspace_id: i32,
+) -> R<Vec<WriteTrigger>> {
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
     let threads: Vec<_> = repo::list_threads(&db, workspace_id)
         .await
         .map_err(e)?
@@ -1579,7 +1729,13 @@ pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<Write
         .collect();
     let mut out = Vec::new();
     for t in threads {
-        for p in crate::planner::pending_writes(&db, t.id).await.map_err(e)? {
+        for p in crate::planner::pending_writes_with_live_sessions(
+            &db,
+            t.id,
+            &is_session_live,
+        )
+        .await
+        .map_err(e)? {
             out.push(WriteTrigger {
                 thread_id: t.id,
                 thread_title: t.title.clone(),
@@ -1588,6 +1744,8 @@ pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<Write
                 repo_name: p.repo_name,
                 reason: p.reason,
                 base_branch: p.base_branch,
+                hint: p.hint,
+                route: p.route,
             });
         }
     }
@@ -1621,15 +1779,26 @@ async fn approve_write_trigger_and_propagate_read_only(
 /// `approve_write_trigger_and_propagate_read_only` for the read-only propagation.
 #[tauri::command]
 pub async fn approve_write_trigger(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     asks: tauri::State<'_, crate::ask::AskRegistry>,
     thread_id: i32,
     index: usize,
-    tool: String,
+    tool: Option<String>,
 ) -> R<i32> {
-    approve_write_trigger_and_propagate_read_only(&db, &asks, thread_id, index, &tool)
-        .await
-        .map_err(e)
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
+    let id = crate::planner::approve_direction_with_pin_and_live_sessions(
+        &db,
+        thread_id,
+        index,
+        tool.as_deref(),
+        &is_session_live,
+    )
+    .await
+    .map_err(e)?;
+    asks.grant_read_only_issue(thread_id);
+    Ok(id)
 }
 
 /// Deny a write declaration: mark denied + relay to the lead's bus inbox.
@@ -2577,6 +2746,34 @@ mod tests {
         sh(&p, &["git", "add", "-A"]);
         sh(&p, &["git", "commit", "-q", "-m", "init"]);
         p
+    }
+
+    #[tokio::test]
+    async fn direct_direction_creation_pins_the_explicit_tool() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, workspace.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+
+        let direction = create_direction_for_explicit_tool(
+            &db,
+            thread.id,
+            "manual task",
+            "opencode",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(direction.tool, "opencode");
+        assert!(direction.engine_pinned);
     }
 
     /// R47-2: `register_repo` must capture `base_ref_is_default` HONESTLY.

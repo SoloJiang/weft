@@ -127,6 +127,17 @@ pub enum Push {
         recovered: bool,
         queue: Vec<QueuedItem>,
     },
+    /// Authoritative engine identity after either a human switch or an
+    /// automatic quota failover. Timeline markers explain the change, while
+    /// this event keeps cached thread/direction/session badges in sync.
+    EngineSwitched {
+        thread_id: i32,
+        session_id: Option<i32>,
+        direction_id: Option<i32>,
+        tool: String,
+        model: Option<String>,
+        command: Option<String>,
+    },
     Init {
         thread_id: i32,
         session_id: Option<i32>,
@@ -213,6 +224,10 @@ pub struct Outgoing {
 #[derive(Default)]
 pub struct TurnState {
     pub busy: bool,
+    /// Set only by a structured provider signal observed while this exact turn
+    /// is active. A generic error plus an old account snapshot is never enough
+    /// to move work to another provider.
+    pub quota_exceeded: bool,
     pub queue: VecDeque<Outgoing>,
     /// A bus wake landed while this engine was busy. Rather than queue one "read
     /// your inbox" turn per wake, we remember the wake's FIFO position — the
@@ -232,6 +247,7 @@ impl TurnState {
             return false;
         }
         self.busy = true;
+        self.quota_exceeded = false;
         true
     }
 
@@ -248,6 +264,7 @@ impl TurnState {
             false
         } else {
             self.busy = true;
+            self.quota_exceeded = false;
             true
         }
     }
@@ -257,7 +274,7 @@ impl TurnState {
     /// reached, synthesize one invisible inbox-read turn; then the rest; finally
     /// go idle.
     pub fn on_turn_end(&mut self) -> Option<Outgoing> {
-        match self.bus_read_pos {
+        let next = match self.bus_read_pos {
             // The wake sits at the front: read the inbox now (stays busy).
             Some(0) => {
                 self.bus_read_pos = None;
@@ -285,7 +302,9 @@ impl TurnState {
                     None
                 }
             },
-        }
+        };
+        self.quota_exceeded = false;
+        next
     }
 
     /// 删除某条仍排队的消息；true=删掉了。
@@ -362,6 +381,36 @@ impl TurnState {
         self.queue = next;
         true
     }
+}
+
+/// L3 failover is permitted only at an idle failed-turn boundary. When a queued
+/// user message or coalesced inbox read already owns the next turn, leave this
+/// engine alone rather than race a healthy follow-up turn with a switch.
+fn should_attempt_quota_failover(
+    status: &str,
+    structured_exceeded: bool,
+    still_busy: bool,
+) -> bool {
+    status == "error" && structured_exceeded && !still_busy
+}
+
+fn structured_codex_exhaustion_snapshot(
+    tool: &str,
+    previous: Option<&crate::engine_quota::QuotaSnapshot>,
+) -> Option<crate::engine_quota::QuotaSnapshot> {
+    if tool != "codex" {
+        return None;
+    }
+    Some(crate::engine_quota::QuotaSnapshot {
+        tool: "codex".to_string(),
+        status: crate::engine_quota::QuotaStatus::Exceeded,
+        // The structured exhaustion event says only that the limit was hit.
+        // Keep the richer account snapshot's reset/window metadata visible.
+        used_percent: previous.and_then(|snapshot| snapshot.used_percent),
+        resets_at: previous.and_then(|snapshot| snapshot.resets_at),
+        window_label: previous.and_then(|snapshot| snapshot.window_label.clone()),
+        observed_at: crate::engine_quota::now_unix(),
+    })
 }
 
 /// Per-turn dialects (codex `exec --json`, opencode `run --format json`) spawn
@@ -1628,6 +1677,11 @@ pub struct EngineInner {
     /// window where a concurrent send's turn would be silently interrupted
     /// and its rows deleted by the rewind's stop/truncate steps.
     pub rewinding: bool,
+    /// Set only for the tiny final handoff of an opt-in quota fail-over. A
+    /// send that wins before this flag is set keeps the existing engine; once
+    /// set, new sends fail visibly rather than starting a healthy turn that
+    /// the imminent switch would interrupt.
+    pub quota_failover_committing: bool,
     /// The worktree this worker runs in (None for the lead console): lets
     /// send's admission honor a worktree-level restore reservation without a
     /// DB lookup. Sibling sessions of one worktree share the same id.
@@ -1901,6 +1955,46 @@ impl LeadChatState {
     pub fn get_or_insert(&self, key: i64, eng: EngineRef) -> EngineRef {
         self.0.entry(key).or_insert(eng).value().clone()
     }
+
+    /// A cached worker is live only while it owns an active turn. An idle
+    /// resident process or a failed initial open carries no conversation and
+    /// may still follow the current initial-route policy.
+    pub fn worker_is_running(&self, session_id: i32) -> bool {
+        let Some(engine) = self.get(session_id as i64) else {
+            return false;
+        };
+        let Ok(inner) = engine.try_lock() else {
+            // A worker whose state is being changed is conservatively live: a
+            // route update must never race an in-flight turn transition.
+            return true;
+        };
+        !inner.stopped && inner.turn.busy
+    }
+
+    /// Remove an engine only when the caller still owns the exact cached Arc.
+    /// An initial-open failure must not tear down a newer engine that won a
+    /// concurrent reconstruction race.
+    pub fn remove_if_same(&self, key: i64, expected: &EngineRef) -> Option<EngineRef> {
+        self.0
+            .remove_if(&key, |_, current| Arc::ptr_eq(current, expected))
+            .map(|(_, engine)| engine)
+    }
+}
+
+/// Serialize a worker's first-route ownership across planner pinning and engine
+/// registration. A direction owns one worktree route, so `direction_id` is the
+/// right key even before a session row has been created.
+pub(crate) fn initial_worker_route_gate(
+    direction_id: i32,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static GATES: std::sync::OnceLock<
+        DashMap<i32, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    > = std::sync::OnceLock::new();
+    let gates = GATES.get_or_init(DashMap::new);
+    gates
+        .entry(direction_id)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 fn build_args(inner: &EngineInner) -> Vec<String> {
@@ -1967,7 +2061,7 @@ fn merge_init_slash_commands(
 async fn ensure_running_locked(
     app: &AppHandle,
     inner: &mut EngineInner,
-) -> anyhow::Result<Option<(tokio::process::ChildStdout, u64)>> {
+) -> anyhow::Result<Option<(tokio::process::ChildStdout, u64, String)>> {
     if inner.stopped {
         return Ok(None);
     }
@@ -2036,7 +2130,7 @@ async fn ensure_running_locked(
     inner.clock = TurnClock::default();
     inner.current = None;
     inner.interrupting = false;
-    Ok(Some((stdout, inner.generation)))
+    Ok(Some((stdout, inner.generation, program)))
 }
 
 /// Spawn the process if it isn't alive (fresh or `--resume`), wiring the reader.
@@ -2045,8 +2139,8 @@ pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow
     let mut inner = eng.lock().await;
     let reader = ensure_running_locked(app, &mut inner).await?;
     drop(inner);
-    if let Some((stdout, generation)) = reader {
-        spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
+    if let Some((stdout, generation, quota_command)) = reader {
+        spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation, quota_command);
     }
     Ok(())
 }
@@ -2322,8 +2416,14 @@ pub async fn send(
     // A rewind holds its reservation from the busy check to the final
     // truncate; sends error out for that window rather than racing the
     // rewind's stop/truncate steps.
-    if eng.lock().await.rewinding {
-        return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+    {
+        let inner = eng.lock().await;
+        if inner.rewinding {
+            return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+        }
+        if inner.quota_failover_committing {
+            return Err(anyhow::anyhow!("engine_switch_in_progress"));
+        }
     }
     // Skill-refresh: a flag set on idle means newly-injected skills are waiting.
     // Silently bounce the resident process so the relaunch (resume) reads them.
@@ -2423,6 +2523,9 @@ pub async fn send(
         // rows deleted by the rewind's stop/truncate steps.
         if inner.rewinding {
             return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+        }
+        if inner.quota_failover_committing {
+            return Err(anyhow::anyhow!("engine_switch_in_progress"));
         }
         // A code restore holds a reservation on the whole WORKTREE: sibling
         // sessions of the same worktree must not start editing it mid-restore.
@@ -2917,14 +3020,21 @@ async fn spawn_codex_turn(
             let _ = client.resume_thread(&thread).await;
         }
         let rx = client.subscribe(&thread).await;
-        let (a, d, e, c, th) = (
+        let quota_command = match client.spawned_command().await {
+            Some(command) => command,
+            None => program.clone(),
+        };
+        let (a, d, e, c, th, quota_command) = (
             app.clone(),
             db.clone(),
             eng.clone(),
             client.clone(),
             thread.clone(),
+            quota_command,
         );
-        tauri::async_runtime::spawn(async move { codex_consumer(a, d, e, c, th, rx).await });
+        tauri::async_runtime::spawn(async move {
+            codex_consumer(a, d, e, c, th, quota_command, rx).await;
+        });
     }
     // stop_quiet may have run during the connect / start_thread / subscribe awaits
     // above, when there was no `codex_client` for it to shut down. If the stop won
@@ -3054,6 +3164,7 @@ async fn codex_consumer(
     eng: EngineRef,
     client: crate::codex_app_server::Client,
     thread: String,
+    quota_command: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::codex_app_server::ThreadMsg>,
 ) {
     use super::proto::ChatEvent;
@@ -3065,6 +3176,23 @@ async fn codex_consumer(
         Arc::new(crossbeam_skiplist::SkipMap::new());
     while let Some(msg) = rx.recv().await {
         match msg {
+            ThreadMsg::QuotaExceeded => {
+                let tool = {
+                    let mut inner = eng.lock().await;
+                    if inner.turn.busy {
+                        inner.turn.quota_exceeded = true;
+                        Some(inner.tool.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(tool) = tool {
+                    let previous = crate::engine_quota::current(&tool);
+                    if let Some(snapshot) = structured_codex_exhaustion_snapshot(&tool, previous.as_ref()) {
+                        crate::engine_quota::report_for_command(snapshot, &quota_command);
+                    }
+                }
+            }
             ThreadMsg::Event(ChatEvent::TextDelta { text, item, agent_thread }) => {
                 let mut inner = eng.lock().await;
                 note_turn_activity(&app, &db, &eng, &mut inner);
@@ -3312,6 +3440,7 @@ async fn codex_consumer(
                 let mut inner = eng.lock().await;
                 let thread_id = inner.thread_id;
                 let session_id = inner.session_id;
+                let structured_exceeded = inner.turn.quota_exceeded;
                 if let Some(ct) = context_tokens {
                     inner.last_context_tokens = Some(ct);
                     let _ = app.emit(
@@ -3417,13 +3546,14 @@ async fn codex_consumer(
                 // candidate for an auto fail-over — decoupled (own task, see
                 // `spawn_quota_failover_check`) so it can safely re-lock `eng`
                 // without deadlocking THIS task.
-                if status == "error" {
+                if should_attempt_quota_failover(status, structured_exceeded, still_busy) {
                     crate::lead_chat::commands::spawn_quota_failover_check(
                         app.clone(),
                         db.clone(),
                         thread_id,
                         session_id,
                         tool_for_quota_check,
+                        structured_exceeded,
                     );
                 }
                 // This turn is over: drop its active-turn id so a subsequent
@@ -3854,7 +3984,7 @@ async fn spawn_turn(
     inner.current = None;
     let generation = inner.generation;
     drop(inner);
-    spawn_reader(app, db, eng, stdout, generation);
+    spawn_reader(app, db, eng, stdout, generation, program);
     Ok(())
 }
 
@@ -4069,8 +4199,15 @@ async fn send_hidden_inner(
         // Spawn the resident process under THIS lock, never releasing it before
         // the slot is reserved below. The reader task blocks on this lock and
         // proceeds once we drop it on return.
-        if let Some((stdout, generation)) = ensure_running_locked(app, &mut inner).await? {
-            spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
+        if let Some((stdout, generation, quota_command)) = ensure_running_locked(app, &mut inner).await? {
+            spawn_reader(
+                app.clone(),
+                db.clone(),
+                eng.clone(),
+                stdout,
+                generation,
+                quota_command,
+            );
         }
     }
     let out = Outgoing {
@@ -4874,6 +5011,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         turn_user_row: None,
         last_assistant_uuid: None,
         rewinding: false,
+        quota_failover_committing: false,
         worktree_id: None,
     }
 }
@@ -6178,6 +6316,7 @@ fn spawn_reader(
     eng: EngineRef,
     stdout: tokio::process::ChildStdout,
     generation: u64,
+    quota_command: String,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -6222,7 +6361,12 @@ fn spawn_reader(
             if let Some(snapshot) = crate::adapters::adapter_for(&inner.tool)
                 .and_then(|a| a.quota_signal(&line))
             {
-                crate::engine_quota::report(snapshot);
+                if inner.turn.busy
+                    && snapshot.status == crate::engine_quota::QuotaStatus::Exceeded
+                {
+                    inner.turn.quota_exceeded = true;
+                }
+                crate::engine_quota::report_for_command(snapshot, &quota_command);
             }
             let event = crate::adapters::adapter_for(&inner.tool)
                 .map(|a| a.parse_line(&line))
@@ -6458,6 +6602,7 @@ fn spawn_reader(
                     is_error,
                     context_tokens,
                 } => {
+                    let structured_exceeded = inner.turn.quota_exceeded;
                     if let Some(ct) = context_tokens {
                         inner.last_context_tokens = Some(ct);
                         let _ = app.emit(
@@ -6634,13 +6779,14 @@ fn spawn_reader(
                     // `codex_consumer`'s TurnEnd arm — decoupled (own task) so
                     // it can safely re-lock `eng` without deadlocking THIS task,
                     // which is still holding `inner` right here.
-                    if status == "error" {
+                    if should_attempt_quota_failover(status, structured_exceeded, still_busy) {
                         crate::lead_chat::commands::spawn_quota_failover_check(
                             app.clone(),
                             db.clone(),
                             thread_id,
                             inner.session_id,
                             inner.tool.clone(),
+                            structured_exceeded,
                         );
                     }
                 }
@@ -6903,6 +7049,19 @@ fn emit_lead_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worker_liveness_requires_an_active_turn() {
+        let state = LeadChatState::default();
+        let engine: EngineRef = Arc::new(tokio::sync::Mutex::new(test_inner("claude")));
+        state.get_or_insert(42, engine.clone());
+
+        assert!(!state.worker_is_running(42));
+        engine.lock().await.turn.busy = true;
+        assert!(state.worker_is_running(42));
+        engine.lock().await.turn.busy = false;
+        assert!(!state.worker_is_running(42));
+    }
 
     // ---- issue #99: sub-agent branch attribution (branch_of / text_row_content) ----
 
@@ -7177,6 +7336,50 @@ mod tests {
         assert!(t.busy); // popped → still busy
         assert!(t.on_turn_end().is_none()); // empty queue → idle
         assert!(!t.busy);
+    }
+
+    #[test]
+    fn quota_evidence_is_scoped_to_one_turn() {
+        let mut turn = TurnState::default();
+        assert!(turn.try_begin_send());
+        turn.quota_exceeded = true;
+        assert!(turn.on_turn_end().is_none());
+        assert!(!turn.quota_exceeded);
+
+        assert!(turn.try_begin_send());
+        assert!(!turn.quota_exceeded);
+    }
+
+    #[test]
+    fn structured_codex_exhaustion_snapshot_is_global_but_codex_only() {
+        let previous = crate::engine_quota::QuotaSnapshot {
+            tool: "codex".to_string(),
+            status: crate::engine_quota::QuotaStatus::Warning,
+            used_percent: Some(93),
+            resets_at: Some(crate::engine_quota::now_unix() + 3600),
+            window_label: Some("primary".to_string()),
+            observed_at: crate::engine_quota::now_unix(),
+        };
+        let snapshot = structured_codex_exhaustion_snapshot("codex", Some(&previous)).unwrap();
+        assert_eq!(snapshot.tool, "codex");
+        assert_eq!(snapshot.status, crate::engine_quota::QuotaStatus::Exceeded);
+        assert_eq!(snapshot.used_percent, Some(93));
+        assert_eq!(snapshot.resets_at, previous.resets_at);
+        assert_eq!(snapshot.window_label.as_deref(), Some("primary"));
+        let empty = structured_codex_exhaustion_snapshot("codex", None).unwrap();
+        assert_eq!(empty.used_percent, None);
+        assert_eq!(empty.resets_at, None);
+        assert_eq!(empty.window_label, None);
+        assert!(structured_codex_exhaustion_snapshot("claude", None).is_none());
+        assert!(structured_codex_exhaustion_snapshot("opencode", None).is_none());
+    }
+
+    #[test]
+    fn quota_failover_requires_an_idle_failed_turn_boundary() {
+        assert!(should_attempt_quota_failover("error", true, false));
+        assert!(!should_attempt_quota_failover("error", true, true));
+        assert!(!should_attempt_quota_failover("complete", true, false));
+        assert!(!should_attempt_quota_failover("error", false, false));
     }
 
     #[test]
@@ -8675,6 +8878,7 @@ mod tests {
             turn_user_row: None,
             last_assistant_uuid: None,
             rewinding: false,
+            quota_failover_committing: false,
             worktree_id: None,
         };
         let fresh = build_args(&inner);
@@ -8796,6 +9000,26 @@ mod tests {
         })
         .unwrap();
         assert!(ordinary.get("seq").is_none());
+    }
+
+    #[test]
+    fn engine_switched_push_carries_authoritative_route_identity() {
+        let push = serde_json::to_value(Push::EngineSwitched {
+            thread_id: 7,
+            session_id: Some(9),
+            direction_id: Some(11),
+            tool: "claude".to_string(),
+            model: None,
+            command: Some("cc-claude".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(push["type"], "engine_switched");
+        assert_eq!(push["thread_id"], 7);
+        assert_eq!(push["session_id"], 9);
+        assert_eq!(push["direction_id"], 11);
+        assert_eq!(push["tool"], "claude");
+        assert_eq!(push["command"], "cc-claude");
     }
 
     #[test]

@@ -34,6 +34,7 @@ import type { useRepoActions } from "./useRepoActions";
 import type { ChatHistoryStatus } from "../state/chatHistory";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { switchKindOf } from "./engineSwitch";
+import { routeReasonKey } from "../lib/engineRoutingDisplay";
 
 type RunAction = ReturnType<typeof useRepoActions>["run"];
 
@@ -641,6 +642,14 @@ function TimelineRow({
     return <QuotaFailoverFailedMarker content={c} />;
   }
 
+  if (m.kind === "engine_route") {
+    return <EngineRouteMarker content={c} />;
+  }
+
+  if (m.kind === "engine_route_blocked") {
+    return <EngineRouteBlockedMarker content={c} />;
+  }
+
   if (m.kind === "tool") {
     const content = parse(m.content);
     const name = typeof content.name === "string" ? content.name : "tool";
@@ -999,10 +1008,11 @@ function EngineSwitchMarker({ content }: { content: Record<string, unknown> }) {
   // tagged with this reason so it reads unmistakably as automatic — a claimed
   // engine switch must always be visibly honest about WHO triggered it.
   const isQuotaFailover = content.reason === "quota_exceeded";
+  const quotaBasis = typeof content.quota_basis === "string" ? content.quota_basis : "";
   return (
-    <div className="flex items-center gap-3 px-2 py-1.5">
-      <span className="h-px flex-1 bg-border" />
-      <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-ink-faint">
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px] text-ink-faint">
         {!sameTool && oldTool && (
           <>
             <ToolIcon tool={oldTool} size={12} />
@@ -1021,8 +1031,100 @@ function EngineSwitchMarker({ content }: { content: Record<string, unknown> }) {
             {t("session.engineSwitchedQuotaReason")}
           </span>
         )}
+        {isQuotaFailover && quotaBasis && (
+          <span className="rounded-full border border-waiting/30 bg-waiting/10 px-1.5 py-0.5 text-[10px] text-waiting">
+            {t("session.engineRouteQuotaBasis", { status: quotaStatusLabel(t, quotaBasis) })}
+          </span>
+        )}
       </span>
-      <span className="h-px flex-1 bg-border" />
+      <span className="h-px min-w-4 flex-1 bg-border" />
+    </div>
+  );
+}
+
+function quotaStatusLabel(t: (key: string) => string, status: string): string {
+  const keys: Record<string, string> = {
+    ok: "settings.resourcesEngineQuotaOk",
+    warning: "settings.resourcesEngineQuotaWarning",
+    exceeded: "settings.resourcesEngineQuotaExceeded",
+    structured_exceeded: "settings.resourcesEngineQuotaExceeded",
+  };
+  const key = keys[status];
+  return key ? t(key) : status;
+}
+
+/** Durable record of the server-owned initial engine route decision. This is
+ * intentionally compact: users see the selected engine and one stable reason,
+ * while the decision remains auditable after the session is reopened. */
+function EngineRouteMarker({ content }: { content: Record<string, unknown> }) {
+  const { t } = useTranslation();
+  const tool = typeof content.tool === "string" ? content.tool : "";
+  const source = typeof content.source === "string" ? content.source : "automatic";
+  const reason = typeof content.reason === "string" ? content.reason : "automatic_candidate_unavailable";
+  const quotaStatus = typeof content.quota_status === "string" ? content.quota_status : "";
+  const labelKeys: Record<string, string> = {
+    automatic: "session.engineRouteMarker",
+    manual: "session.engineRouteManualMarker",
+    legacy: "session.engineRouteMarker",
+  };
+  const labelKey = labelKeys[source] ?? "session.engineRouteMarker";
+  const label = source === "legacy" ? t("scope.engineLegacy", { tool: toolFullName(tool) }) : t(labelKey, { tool: toolFullName(tool) });
+  return (
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px] text-ink-faint">
+        <ToolIcon tool={tool} size={12} />
+        <span>{label}</span>
+        <span className="truncate" title={t(routeReasonKey(reason))}>
+          · {t(routeReasonKey(reason))}
+        </span>
+        {quotaStatus && (
+          <span className="rounded-full border border-border px-1.5 py-0.5 text-[10px]">
+            {t("session.engineRouteQuotaBasis", { status: quotaStatusLabel(t, quotaStatus) })}
+          </span>
+        )}
+      </span>
+      <span className="h-px min-w-4 flex-1 bg-border" />
+    </div>
+  );
+}
+
+/** Durable, actionable record for a blocked route. It is separate from the
+ * selected-route marker so an exhausted pool cannot look like a successful
+ * launch after a reload. */
+function EngineRouteBlockedMarker({ content }: { content: Record<string, unknown> }) {
+  const { t } = useTranslation();
+  const tool = typeof content.tool === "string" ? content.tool : "";
+  const fallback = typeof content.fallback === "string" ? content.fallback : "";
+  const reason = typeof content.reason === "string" ? content.reason : "automatic_candidate_unavailable";
+  const quotaStatus = typeof content.quota_status === "string" ? content.quota_status : "";
+  return (
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px] text-danger">
+        {tool && <ToolIcon tool={tool} size={12} />}
+        {tool && fallback && <ArrowRight size={10} />}
+        {fallback && <ToolIcon tool={fallback} size={12} />}
+        {tool && fallback && (
+          <span>
+            {t("session.engineRouteBlockedTransition", {
+              from: toolFullName(tool),
+              to: toolFullName(fallback),
+            })}
+          </span>
+        )}
+        <span>{t("session.engineRouteBlockedMarker")}</span>
+        <span className="truncate" title={t(routeReasonKey(reason))}>
+          · {t(routeReasonKey(reason))}
+        </span>
+        {quotaStatus && (
+          <span className="rounded-full border border-danger/30 px-1.5 py-0.5 text-[10px]">
+            {t("session.engineRouteQuotaBasis", { status: quotaStatusLabel(t, quotaStatus) })}
+          </span>
+        )}
+        <span className="truncate">· {t("session.engineRouteBlockedHint")}</span>
+      </span>
+      <span className="h-px min-w-4 flex-1 bg-border" />
     </div>
   );
 }
@@ -1034,10 +1136,11 @@ function QuotaFailoverFailedMarker({ content }: { content: Record<string, unknow
   const { t } = useTranslation();
   const tool = typeof content.tool === "string" ? content.tool : "";
   const fallback = typeof content.fallback === "string" ? content.fallback : "";
+  const quotaBasis = typeof content.quota_basis === "string" ? content.quota_basis : "";
   return (
-    <div className="flex items-center gap-3 px-2 py-1.5">
-      <span className="h-px flex-1 bg-border" />
-      <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-danger">
+    <div className="flex items-center gap-2 px-2 py-1.5">
+      <span className="h-px min-w-4 flex-1 bg-border" />
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-center gap-1.5 text-center text-[11px] text-danger">
         <ToolIcon tool={tool} size={12} />
         <ArrowRight size={10} />
         <ToolIcon tool={fallback} size={12} />
@@ -1047,8 +1150,13 @@ function QuotaFailoverFailedMarker({ content }: { content: Record<string, unknow
             to: toolFullName(fallback),
           })}
         </span>
+        {quotaBasis && (
+          <span className="rounded-full border border-danger/30 px-1.5 py-0.5 text-[10px]">
+            {t("session.engineRouteQuotaBasis", { status: quotaStatusLabel(t, quotaBasis) })}
+          </span>
+        )}
       </span>
-      <span className="h-px flex-1 bg-border" />
+      <span className="h-px min-w-4 flex-1 bg-border" />
     </div>
   );
 }

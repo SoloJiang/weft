@@ -24,6 +24,7 @@ import {
   shouldApplyProcessQuotaStatus,
   type ProcessQuotaNotice,
 } from "../lib/processQuota";
+import { routeReasonKey } from "../lib/engineRoutingDisplay";
 import { STORAGE_KEYS } from "../lib/storageKeys";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
@@ -146,6 +147,15 @@ function rawErrorMessage(error: unknown): string {
   return "";
 }
 
+function routeBlockedErrorMessage(raw: string): string | null {
+  const prefix = "engine_route_blocked:";
+  if (!raw.startsWith(prefix)) return null;
+  const reason = raw.slice(prefix.length);
+  return i18n.t("lead.engineRouteBlocked", {
+    reason: i18n.t(routeReasonKey(reason)),
+  });
+}
+
 /** A send that never created a message row (queue-full race, worktree/session
  *  mid-rewind, "turn ended while persisting", a missing agent binary before any
  *  row lands, …) has no row to carry a delivery receipt — the composer
@@ -153,11 +163,29 @@ function rawErrorMessage(error: unknown): string {
  *  as a silent drop (issue #94). Surface the reason explicitly instead. */
 function notifySendFailed(error: unknown) {
   const raw = rawErrorMessage(error);
-  const msg =
-    raw === "queue_full"
-      ? i18n.t("lead.queueFull")
-      : i18n.t("lead.sendFailedGeneric", { reason: raw || i18n.t("lead.sendFailedUnknown") });
+  let msg: string;
+  if (raw === "queue_full") {
+    msg = i18n.t("lead.queueFull");
+  } else if (raw.includes("engine_switch_in_progress")) {
+    msg = i18n.t("session.switchInProgress");
+  } else {
+    const routeBlocked = routeBlockedErrorMessage(raw);
+    if (routeBlocked) {
+      msg = routeBlocked;
+    } else {
+      msg = i18n.t("lead.sendFailedGeneric", { reason: raw || i18n.t("lead.sendFailedUnknown") });
+    }
+  }
   toast(msg, "danger");
+}
+
+/** Background worker starts have no composer to restore a draft or report a
+ * rejected promise. Process-quota pauses already have a persistent UI state;
+ * every other failure must become visible instead of being dropped by a `void`
+ * dispatch/revive caller. */
+function notifyBackgroundWorkerDispatchFailed(error: unknown) {
+  if (isProcessQuotaDegradedError(error)) return;
+  notifySendFailed(error);
 }
 
 interface Store {
@@ -385,7 +413,7 @@ interface Store {
   proposal: ResolvedProposal | null;
   refreshProposal: (threadId: number) => Promise<void>;
   saveProposal: (proposal: Proposal) => Promise<void>;
-  confirmProposal: () => Promise<void>;
+  confirmProposal: (manualTool?: string) => Promise<void>;
   setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string) => Promise<void>;
   /** Approve a plan_card: post `plan_decision` to the lead, then persist the settled
    *  state. Shared by the chat plan_card's own Approve button and the merged
@@ -1498,10 +1526,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         try {
           await spawnWorker(directionId, w.repo_id, false);
         } catch (error) {
-          // The persistent quota bar already explains the pause. Background
-          // auto-dispatch must not leak a rejected promise while degraded.
-          if (isProcessQuotaDegradedError(error)) continue;
-          throw error;
+          notifyBackgroundWorkerDispatchFailed(error);
+          return;
         }
       }
     },
@@ -1522,7 +1548,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // Skip reclaimed worktrees (exists=false): a resume would drive a worker
       // into a missing cwd.
       for (const w of wts.filter((w) => w.exists)) {
-        await driveDirection(directionId, w.repo_id, false);
+        try {
+          await driveDirection(directionId, w.repo_id, false);
+        } catch (error) {
+          notifyBackgroundWorkerDispatchFailed(error);
+          return;
+        }
       }
     },
     [driveDirection],
@@ -1588,11 +1619,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // see EngineSwitchDialog's doc for the three-layer semantics). The backend
   // already made the switch honest in its own record (a durable engine_switch
   // timeline marker, delivered like any other Push::Message); this action's
-  // job is patching the TWO bits of local state the event stream doesn't
-  // reach: `threads` (leadTool/leadModel — read by LeadTab/ChatComposer's
-  // badge) and `leadMeta` (the OLD tool's model/MCP/skills readings, which
-  // would otherwise linger under the NEW tool's badge until the next
-  // turn-triggered probe happens to overwrite them).
+  // job is eagerly patching the local state used by LeadTab/ChatComposer.
+  // `engine_switched` repeats the same patch for automatic quota failover,
+  // whose switch has no frontend invocation to update these caches.
   const switchLeadTool = useCallback(async (threadId: number, tool: string, model: string | null) => {
     const outcome = await api.switchLeadTool(threadId, tool, model, currentLang());
     setThreads((cur) =>
@@ -1613,8 +1642,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // `directionId` is the caller's (WorkerConversation already has it in scope)
   // — the backend also updates `direction.tool` (so a later reopen doesn't
   // revert the switch, see switch_worker_tool's doc), and the board reads
-  // that through `directionsByThread`, so it is patched the same way
-  // `renameDirection` patches a name change.
+  // that through `directionsByThread`, so it is patched eagerly here. The
+  // matching `engine_switched` event covers automatic quota failover and also
+  // refreshes any cached SessionInfo command.
   const switchWorkerTool = useCallback(
     async (threadId: number, directionId: number, sessionId: number, tool: string, model: string | null) => {
       const outcome = await api.switchWorkerTool(sessionId, tool, model);
@@ -1714,6 +1744,53 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               if (pr.status !== "proposed") setReviewingProposal(false);
             })
             .catch(() => {});
+        }
+      } else if (p.type === "engine_switched") {
+        if (p.session_id == null) {
+          setThreads((cur) =>
+            cur.map((thread) =>
+              thread.id === p.thread_id
+                ? { ...thread, lead_tool: p.tool, lead_model: p.model }
+                : thread,
+            ),
+          );
+          setLeadMeta((meta) => {
+            if (!(p.thread_id in meta)) return meta;
+            const next = { ...meta };
+            delete next[p.thread_id];
+            return next;
+          });
+        } else {
+          const sessionId = p.session_id;
+          if (p.direction_id != null) {
+            setDirections((directions) => ({
+              ...directions,
+              [p.thread_id]: (directions[p.thread_id] ?? []).map((direction) =>
+                direction.id === p.direction_id ? { ...direction, tool: p.tool } : direction,
+              ),
+            }));
+          }
+          setSessions((sessions) => {
+            const current = sessions[sessionId];
+            if (!current) return sessions;
+            return {
+              ...sessions,
+              [sessionId]: {
+                ...current,
+                info: {
+                  ...current.info,
+                  tool: p.tool,
+                  command: p.command ?? current.info.command,
+                },
+              },
+            };
+          });
+          setWorkerMeta((meta) => {
+            if (!(sessionId in meta)) return meta;
+            const next = { ...meta };
+            delete next[sessionId];
+            return next;
+          });
         }
       } else if (p.type === "finalize") {
         setLeadMessages((m) => ({
@@ -2359,7 +2436,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // confirm/approve abort while the thread still has ANY unrecovered lane failure.
   const baseSaveFailed = useRef<Map<number, Set<string>>>(new Map());
 
-  const confirmProposal = useCallback(async () => {
+  const confirmProposal = useCallback(async (manualTool?: string) => {
     if (activeThreadId == null) return;
     // Flush any in-flight base-branch save before materializing. If it REJECTED
     // (e.g. a re-propose moved the lane, or a DB error), the backend still holds the
@@ -2388,10 +2465,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // branch above: toast, refresh to the real state, and return so a retry acts on it).
     let ids: number[];
     try {
-      ids = await api.confirmProposal(activeThreadId);
+      ids = await api.confirmProposal(activeThreadId, manualTool);
     } catch (err) {
       console.error(err);
-      toast(i18n.t("scope.confirmFailed"), "danger");
+      const routeBlocked = routeBlockedErrorMessage(rawErrorMessage(err));
+      if (routeBlocked) {
+        toast(routeBlocked, "danger");
+      } else {
+        toast(i18n.t("scope.confirmFailed"), "danger");
+      }
       await refreshProposal(activeThreadId);
       return;
     }
@@ -2523,13 +2605,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
       );
       try {
-        const dirId = await api.approveWriteTrigger(item.thread_id, item.index, tool ?? defaultTool);
+        const dirId = await api.approveWriteTrigger(item.thread_id, item.index, tool);
         void dispatchDirection(dirId);
       } finally {
         await refreshNeeds();
       }
     },
-    [dispatchDirection, refreshNeeds, defaultTool, activeThreadId, refreshProposal],
+    [dispatchDirection, refreshNeeds, activeThreadId, refreshProposal],
   );
 
   const denyWriteTrigger = useCallback(

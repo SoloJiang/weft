@@ -216,23 +216,31 @@ fn refresh_tool_path() -> String {
     merged
 }
 
-/// Does `program` resolve on the augmented PATH — the SAME way a bare
-/// `Command::new(program)` spawn will? Re-probes once on a miss (like
-/// [`resolve_tool_path`]) but does NOT consult the Codex app-bundle fallback,
-/// which a bare PATH spawn can't reach.
-pub fn resolves_on_path(program: &str) -> bool {
-    // Absolute executable paths are valid overrides/pins (see tool_command) and
-    // don't live on PATH: the file's existence IS the resolution check — without
-    // this, the send pre-flight reports agent_not_found for a configured
-    // absolute CLI that Command::new would spawn just fine.
+/// Resolve the executable that a bare `Command::new(program)` can reach using
+/// the PATH Weft passes to agent processes. This deliberately does NOT consult
+/// the Codex app-bundle fallback: that fallback is useful for diagnostics and
+/// version display, but a bare spawn cannot reach it. Absolute command
+/// overrides are checked directly, including the Unix executable bit.
+pub fn resolve_spawnable_tool_path(program: &str) -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(program);
     if p.is_absolute() {
-        return p.is_file();
+        return spawnable_absolute_path_candidates(program, cfg!(windows))
+            .into_iter()
+            .find(|candidate| path_is_spawnable(candidate));
     }
-    if which_on_path(program, &tool_path()).is_some() {
-        return true;
-    }
-    which_on_path(program, &refresh_tool_path()).is_some()
+    spawnable_path_on_path(program, &tool_path())
+        .or_else(|| spawnable_path_on_path(program, &refresh_tool_path()))
+}
+
+/// Whether a bare `Command::new(program)` can resolve an executable using the
+/// PATH Weft passes to agent processes.
+pub fn is_spawnable(program: &str) -> bool {
+    resolve_spawnable_tool_path(program).is_some()
+}
+
+/// Existing callers use this name for the same bare-command preflight.
+pub fn resolves_on_path(program: &str) -> bool {
+    is_spawnable(program)
 }
 
 /// Prewarm the augmented PATH at startup so the first agent spawn doesn't pay the
@@ -360,13 +368,13 @@ pub(crate) fn pick_default_tool(user: Option<&str>, installed: impl Fn(&str) -> 
         .to_string()
 }
 
-/// Resolve the effective default tool against the real PATH (and the Codex
-/// app-bundle fallback), honoring the user's explicit choice when present. A
-/// tool counts as installed when its configured command (alias) resolves, so an
-/// aliased CLI is eligible as the default.
+/// Resolve the effective default tool against the real executable PATH,
+/// honoring the user's explicit choice when present. A tool counts as eligible
+/// only when its configured command (alias) is spawnable, so an aliased CLI is
+/// eligible while a diagnostics-only app-bundle fallback is not.
 pub fn resolve_default_tool(user: Option<&str>) -> String {
     pick_default_tool(user, |t| {
-        resolve_tool_path(&crate::tool_command::command_for(t)).is_some()
+        is_spawnable(&crate::tool_command::command_for(t))
     })
 }
 
@@ -397,14 +405,95 @@ pub fn resolve_tool_path(tool: &str) -> Option<std::path::PathBuf> {
     which_on_path(tool, &refresh_tool_path())
 }
 
+/// Candidate names used by diagnostic PATH lookup. On non-Windows callers pass
+/// `None`, keeping the exact command name only; Windows diagnostics intentionally
+/// include PATHEXT script entries even though automatic routing does not.
+fn executable_name_candidates(tool: &str, windows_pathext: Option<&str>) -> Vec<String> {
+    let mut names = vec![tool.to_string()];
+    let Some(windows_pathext) = windows_pathext else {
+        return names;
+    };
+    if std::path::Path::new(tool).extension().is_some() {
+        return names;
+    }
+    for extension in windows_pathext.split(';').map(str::trim).filter(|ext| !ext.is_empty()) {
+        let extension = if extension.starts_with('.') {
+            extension.to_string()
+        } else {
+            format!(".{extension}")
+        };
+        names.push(format!("{tool}{extension}"));
+    }
+    names
+}
+
+fn windows_pathext() -> Option<String> {
+    if cfg!(windows) {
+        return Some(
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string()),
+        );
+    }
+    None
+}
+
 fn which_on_path(tool: &str, path: &str) -> Option<std::path::PathBuf> {
+    let names = executable_name_candidates(tool, windows_pathext().as_deref());
     for dir in std::env::split_paths(path) {
-        let cand = dir.join(tool);
-        if cand.is_file() {
-            return Some(cand);
+        for name in &names {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
         }
     }
     None
+}
+
+fn spawnable_path_on_path(tool: &str, path: &str) -> Option<std::path::PathBuf> {
+    let names = spawnable_executable_name_candidates(tool, cfg!(windows));
+    for directory in std::env::split_paths(path) {
+        for name in &names {
+            let candidate = directory.join(name);
+            if path_is_spawnable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Candidate names that the worker's bare process spawn can resolve.
+/// Windows process creation appends ".exe" for an extensionless name; it does
+/// not search arbitrary PATHEXT entries. Explicit ".cmd"/".bat" commands stay
+/// valid because Rust's Windows command implementation invokes cmd.exe for
+/// those explicit paths.
+fn spawnable_executable_name_candidates(tool: &str, windows: bool) -> Vec<String> {
+    if windows && std::path::Path::new(tool).extension().is_none() {
+        return vec![format!("{tool}.exe")];
+    }
+    vec![tool.to_string()]
+}
+
+fn spawnable_absolute_path_candidates(program: &str, windows: bool) -> Vec<std::path::PathBuf> {
+    let path = std::path::Path::new(program);
+    if windows && path.extension().is_none() {
+        return vec![path.with_extension("exe"), path.to_path_buf()];
+    }
+    vec![path.to_path_buf()]
+}
+
+#[cfg(unix)]
+fn path_is_spawnable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn path_is_spawnable(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 #[cfg(test)]
@@ -436,6 +525,49 @@ mod tests {
         assert_eq!(merge_path("/a", ""), "/a");
         assert_eq!(merge_path("", "/a::/a"), "/a");
         assert_eq!(merge_path("/a:/b", "/b:/a"), "/a:/b");
+    }
+
+    #[test]
+    fn windows_executable_candidates_honor_pathext_for_bare_commands() {
+        assert_eq!(
+            executable_name_candidates("codex", Some(".COM;.EXE;.BAT;.CMD")),
+            vec!["codex", "codex.COM", "codex.EXE", "codex.BAT", "codex.CMD"]
+        );
+        assert_eq!(
+            executable_name_candidates("codex.exe", Some(".COM;.EXE;.BAT;.CMD")),
+            vec!["codex.exe"]
+        );
+    }
+
+    #[test]
+    fn windows_spawnable_candidates_do_not_expand_pathext_scripts() {
+        assert_eq!(
+            spawnable_executable_name_candidates("codex", true),
+            vec!["codex.exe"]
+        );
+        assert_eq!(
+            spawnable_executable_name_candidates("codex.cmd", true),
+            vec!["codex.cmd"]
+        );
+        assert_eq!(
+            spawnable_executable_name_candidates("codex.bat", true),
+            vec!["codex.bat"]
+        );
+    }
+
+    #[test]
+    fn windows_spawnable_absolute_candidates_prefer_native_executable() {
+        assert_eq!(
+            spawnable_absolute_path_candidates("/tools/codex", true),
+            vec![
+                std::path::PathBuf::from("/tools/codex.exe"),
+                std::path::PathBuf::from("/tools/codex"),
+            ]
+        );
+        assert_eq!(
+            spawnable_absolute_path_candidates("/tools/codex.cmd", true),
+            vec![std::path::PathBuf::from("/tools/codex.cmd")]
+        );
     }
 
     #[test]
@@ -539,5 +671,50 @@ mod tests {
         let path = format!("/usr/bin:{}", bin.display());
         assert_eq!(which_on_path("codex", &path), Some(bin.join("codex")));
         assert!(which_on_path("absent", &path).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawnable_absolute_path_requires_execute_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let executable = tmp.path().join("codex");
+        std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        assert!(!is_spawnable(executable.to_str().unwrap()));
+
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        assert!(is_spawnable(executable.to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawnable_path_search_skips_a_non_executable_earlier_match() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let blocked = first.path().join("codex");
+        let runnable = second.path().join("codex");
+        std::fs::write(&blocked, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&runnable, b"#!/bin/sh\n").unwrap();
+
+        let mut blocked_permissions = std::fs::metadata(&blocked).unwrap().permissions();
+        blocked_permissions.set_mode(0o644);
+        std::fs::set_permissions(&blocked, blocked_permissions).unwrap();
+        let mut runnable_permissions = std::fs::metadata(&runnable).unwrap().permissions();
+        runnable_permissions.set_mode(0o755);
+        std::fs::set_permissions(&runnable, runnable_permissions).unwrap();
+
+        let path = std::env::join_paths([first.path(), second.path()])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(spawnable_path_on_path("codex", &path), Some(runnable));
     }
 }

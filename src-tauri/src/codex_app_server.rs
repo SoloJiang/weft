@@ -365,6 +365,27 @@ pub fn turn_error_text(params: &Value) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
+/// True only for a machine-readable quota cause attached to this completed
+/// turn. Do not inspect the display message: generic transport, auth, or tool
+/// errors may contain similar words but must never trigger a provider switch.
+pub fn turn_reports_quota_exceeded(params: &Value) -> bool {
+    let error = &params["turn"]["error"];
+    let mut codes = [
+        error["code"].as_str(),
+        error["type"].as_str(),
+        error["kind"].as_str(),
+        error["details"]["code"].as_str(),
+    ]
+    .into_iter()
+    .flatten();
+    codes.any(|code| {
+        matches!(
+            code.trim().to_ascii_lowercase().as_str(),
+            "rate_limit_exceeded" | "rate_limit_reached" | "quota_exceeded" | "usage_limit_exceeded"
+        )
+    })
+}
+
 /// A codex app-server `RateLimitSnapshot` (the `rateLimits` field of an
 /// `account/rateLimits/updated` notification, or of an `account/rateLimits/read`
 /// response) → an [`crate::engine_quota::QuotaSnapshot`] for "codex" (issue #97).
@@ -564,6 +585,10 @@ fn cap_out(s: &str) -> String {
 pub enum ThreadMsg {
     /// A streaming event for the session's timeline.
     Event(ChatEvent),
+    /// A structured quota-exceeded cause attached to the active turn. It is
+    /// delivered before that turn's `TurnEnd`, allowing the engine to make a
+    /// failover decision at the safe boundary only.
+    QuotaExceeded,
     /// A liveness ping (e.g. command output-delta while a long command runs) that
     /// carries no timeline change — the consumer uses it only to refresh the
     /// runaway-guard's last-activity clock so a busy command isn't idle-killed.
@@ -583,6 +608,9 @@ pub enum ThreadMsg {
 }
 
 struct Inner {
+    /// Exact binary that spawned this app-server process. It stays immutable for
+    /// the connection's lifetime even if the global command override changes.
+    command: String,
     /// Channel to the dedicated stdin writer task. Holds no `ChildStdin` directly,
     /// so async writes never need the state lock.
     // Each entry is (bytes, optional flush-ack): the writer task acks AFTER
@@ -654,6 +682,11 @@ impl Client {
     /// Whether the connection is still alive (read_loop clears the inner on EOF).
     pub async fn is_alive(&self) -> bool {
         self.0.lock().await.is_some()
+    }
+
+    /// The immutable binary that owns this connection's account/quota events.
+    pub async fn spawned_command(&self) -> Option<String> {
+        self.0.lock().await.as_ref().map(|inner| inner.command.clone())
     }
 
     /// Same underlying connection? Lets a consumer tell a genuine disconnect (still
@@ -794,6 +827,7 @@ impl Client {
         });
 
         *g = Some(Inner {
+            command: program.to_string(),
             write_tx,
             next_id: 1,
             pending: HashMap::new(),
@@ -805,7 +839,10 @@ impl Client {
         drop(g);
 
         let me = self.clone();
-        tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
+        let read_quota_command = program.to_string();
+        tauri::async_runtime::spawn(async move {
+            me.read_loop(stdout, read_quota_command).await;
+        });
 
         // Handshake: initialize (await), then the `initialized` notification. If it
         // wedges/errors (auth/network/version), tear the half-open client down so a
@@ -832,7 +869,12 @@ impl Client {
         // AFTER a turn already ran on this connection — decoupled task so a
         // slow/unsupported endpoint can never delay the connection itself.
         let quota_probe = self.clone();
-        tauri::async_runtime::spawn(async move { quota_probe.refresh_quota_snapshot().await });
+        let probe_quota_command = program.to_string();
+        tauri::async_runtime::spawn(async move {
+            quota_probe
+                .refresh_quota_snapshot(&probe_quota_command)
+                .await;
+        });
         Ok(())
     }
 
@@ -842,17 +884,17 @@ impl Client {
     /// connection or a turn — the notification path (`read_loop`'s
     /// `account/rateLimits/updated` branch) still populates the hub reactively
     /// either way.
-    async fn refresh_quota_snapshot(&self) {
+    async fn refresh_quota_snapshot(&self, command: &str) {
         if let Ok(result) = self.request("account/rateLimits/read", Value::Null).await {
             if let Some(snapshot) = codex_quota_snapshot(&result["rateLimits"]) {
-                crate::engine_quota::report(snapshot);
+                crate::engine_quota::report_for_command(snapshot, command);
             }
         }
     }
 
     /// Demux the server's stdout for the connection's lifetime: correlate replies
     /// by id, route notifications + approval requests to the owning thread.
-    async fn read_loop(&self, stdout: tokio::process::ChildStdout) {
+    async fn read_loop(&self, stdout: tokio::process::ChildStdout, quota_command: String) {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             match classify(&line) {
@@ -865,6 +907,10 @@ impl Client {
                         // turn/completed — surface it as text before the TurnEnd so
                         // the row shows the real cause, not error_before_output.
                         if method == "turn/completed" {
+                            if turn_reports_quota_exceeded(&params) {
+                                self.route_resolved(tid.as_deref(), ThreadMsg::QuotaExceeded)
+                                    .await;
+                            }
                             if let Some(text) = turn_error_text(&params) {
                                 self.route_resolved(
                                     tid.as_deref(),
@@ -903,7 +949,7 @@ impl Client {
                         // no chat row to render) — land straight in the quota hub
                         // instead of going through ChatEvent/route_resolved.
                         if let Some(snapshot) = codex_quota_snapshot(&params["rateLimits"]) {
-                            crate::engine_quota::report(snapshot);
+                            crate::engine_quota::report_for_command(snapshot, &quota_command);
                         }
                     }
                 }
@@ -1169,6 +1215,7 @@ impl Client {
         let reg = configured.register(&child);
         let (write_tx, _write_rx) = mpsc::unbounded_channel();
         Client(Arc::new(Mutex::new(Some(Inner {
+            command: "codex".to_string(),
             write_tx,
             next_id: 1,
             pending: HashMap::new(),
@@ -1577,6 +1624,19 @@ mod tests {
     }
 
     #[test]
+    fn turn_quota_detection_requires_a_structured_code() {
+        assert!(turn_reports_quota_exceeded(&json!({
+            "turn": {"error": {"code": "rate_limit_reached"}}
+        })));
+        assert!(turn_reports_quota_exceeded(&json!({
+            "turn": {"error": {"details": {"code": "quota_exceeded"}}}
+        })));
+        assert!(!turn_reports_quota_exceeded(&json!({
+            "turn": {"error": {"message": "rate limit exceeded"}}
+        })));
+    }
+
+    #[test]
     fn codex_quota_snapshot_reads_the_more_severe_window() {
         use crate::engine_quota::QuotaStatus;
         // Real-shaped `RateLimitSnapshot` (openai/codex app-server-protocol v2):
@@ -1628,11 +1688,12 @@ mod tests {
     fn codex_quota_snapshot_single_window_only() {
         use crate::engine_quota::QuotaStatus;
         // Only primary present (a freshly-created account has no secondary yet).
+        // A full percentage is advisory until the provider sends a reached type.
         let snapshot = codex_quota_snapshot(&json!({
             "primary": {"usedPercent": 100, "resetsAt": 1_700_100_000},
         }))
         .expect("usable snapshot");
-        assert_eq!(snapshot.status, QuotaStatus::Exceeded);
+        assert_eq!(snapshot.status, QuotaStatus::Warning);
         assert_eq!(snapshot.window_label.as_deref(), Some("primary"));
     }
 

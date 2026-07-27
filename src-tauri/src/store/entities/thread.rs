@@ -16,6 +16,11 @@ pub struct Model {
     /// Set when the user excludes existing sessions from a newly-configured
     /// command override, freezing this lead to its prior command.
     pub lead_command: Option<String>,
+    /// Explicit engine/model selections are pins. Migration defaults legacy
+    /// rows to true so enabling a new automatic policy never takes over an
+    /// existing lead; newly-created threads explicitly start unpinned.
+    #[sea_orm(default_value = true)]
+    pub engine_pinned: bool,
     /// Optional per-thread model override (issue #98), passed as `--model
     /// <value>` to the lead's CLI (claude/codex; a free-text value, not
     /// validated against a model list — the CLI is the authority). NULL =

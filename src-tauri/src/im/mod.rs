@@ -1664,8 +1664,21 @@ async fn ensure_im_concierge_thread(
     } else {
         format!("飞书群聊 · {chat_id}")
     };
-    let tool = crate::tools::default_tool(db).await;
+    let legacy_tool = crate::tools::default_tool(db).await;
+    let route = crate::engine_routing::resolve_for_db(
+        db,
+        None,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Normal,
+    )
+    .await;
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
     let thread = crate::store::repo::create_thread(db, ws_id, &title, "concierge", &tool).await?;
+    crate::engine_routing::record_decision(db, thread.id, None, None, "concierge_start", &route)
+        .await;
     crate::store::repo::bind_im_route(db, thread.id, "feishu_concierge", chat_id, im_thread_ref)
         .await?;
     Ok(thread.id)

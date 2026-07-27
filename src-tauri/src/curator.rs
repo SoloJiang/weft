@@ -1500,9 +1500,16 @@ pub async fn reanalyze_workspace(
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
         return true;
     }
-    analyze_workspace(db, workspace_id, true, Some(cancel))
-        .await
-        .unwrap_or(false)
+    match analyze_workspace(db, workspace_id, true, Some(cancel)).await {
+        Ok(cancelled) => cancelled,
+        Err(err) => {
+            // A routing failure is persisted by the relation stage as a visible,
+            // retryable repo analysis failure. Keep cancellation distinct: callers
+            // use this boolean only for the cooperative Stop result.
+            eprintln!("[weft] forced curator analysis failed: {err}");
+            false
+        }
+    }
 }
 
 /// Drop a repo's run-state entirely, whatever its phase — called when the repo is
@@ -1534,6 +1541,43 @@ async fn classified_for(db: &Db, repo_id: i32, analyzed_commit: &str) -> bool {
         .flatten()
         .map(|p| profile::normalize_tier(&p.role).is_some() && p.profiled_commit == analyzed_commit)
         .unwrap_or(false)
+}
+
+/// Load the existing workspace curator thread and expose its manual engine pin
+/// to the shared router. The configured/default `lead_tool` is only a legacy
+/// fallback when `engine_pinned` is false; passing it as a manual tool would
+/// incorrectly disable the global automatic policy for newly-created curators.
+async fn curator_route_context(
+    db: &Db,
+    workspace_id: i32,
+) -> Result<Option<(i32, Option<String>)>> {
+    let Some(thread_id) = repo::curator_thread_for_workspace(db, workspace_id).await? else {
+        return Ok(None);
+    };
+    let Some(thread) = repo::get_thread(db, thread_id).await? else {
+        return Ok(None);
+    };
+    let manual_tool = thread.engine_pinned.then(|| thread.lead_tool);
+    Ok(Some((thread.id, manual_tool)))
+}
+
+/// Relation analysis is part of the curator analysis lifecycle. There is no
+/// separate workspace-level failure field in the existing API, so reuse the
+/// established per-repo failed/retryable state for every repo that was part of
+/// the failed relation pass. This makes `unanalyzed_repo_names` report the
+/// failure to both the toolbar and curator chat without conflating it with
+/// cancellation or silently claiming success.
+async fn mark_relation_analysis_failed(
+    db: &Db,
+    workspace_id: i32,
+    profiled: &[(repo_ref::Model, repo_profile::Model)],
+    message: &str,
+) {
+    for (repo, _) in profiled {
+        let _ = repo::set_analysis_state(db, repo.id, "failed", Some(message)).await;
+        emit_repo_analysis(workspace_id, repo.id, "failed", None, Some(message));
+    }
+    emit_graph_updated(workspace_id);
 }
 
 #[cfg(test)]
@@ -1772,6 +1816,7 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
         emit_repo_analysis(repo.workspace_id, repo.id, "failed", None, Some(GONE));
         return Ok(());
     }
+    let curator_route = curator_route_context(db, repo.workspace_id).await?;
     // Dedupe: a manual reprofile racing the background pass must not double-spawn
     // the agent for the same repo.
     if !run_begin(repo.id) {
@@ -1785,7 +1830,51 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     // `repo-graph-updated` otherwise fires only when the (minutes-long) run ends —
     // without this, a reprofiled-but-unselected card sits stale for the whole run.
     emit_graph_updated(ws);
-    let tool = crate::tools::default_tool(db).await;
+    let legacy_tool = crate::tools::default_tool(db).await;
+    let manual_tool = curator_route
+        .as_ref()
+        .and_then(|(_, tool)| tool.as_deref());
+    let route = crate::engine_routing::resolve_for_db(
+        db,
+        manual_tool,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Deep,
+    )
+    .await;
+    if route.blocked {
+        if let Some((curator_thread, _)) = curator_route.as_ref() {
+            crate::engine_routing::record_decision(
+                db,
+                *curator_thread,
+                None,
+                None,
+                "curator_analysis",
+                &route,
+            )
+            .await;
+        }
+        let message = format!("engine-routing-blocked:{}", route.reason_code());
+        run_finish_err(rid, message.clone());
+        let _ = repo::set_analysis_state(db, rid, "failed", Some(&message)).await;
+        emit_repo_analysis(ws, rid, "failed", None, Some(&message));
+        emit_graph_updated(ws);
+        return Err(anyhow::anyhow!(message));
+    }
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
+    if let Some((curator_thread, _)) = curator_route.as_ref() {
+        crate::engine_routing::record_decision(
+            db,
+            *curator_thread,
+            None,
+            None,
+            "curator_analysis",
+            &route,
+        )
+        .await;
+    }
     let prompt = build_repo_class_prompt(&repo.name, cwd);
     // Capture HEAD BEFORE the (minutes-long) run so the stored `profiled_commit`
     // reflects the tree the agent actually classified. If the checkout advances
@@ -2186,7 +2275,49 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     let cwd = common_ancestor(&paths)
         .filter(|anc| !is_too_broad(anc))
         .unwrap_or_else(|| Path::new(&profiled[0].0.local_git_path).to_path_buf());
-    let tool = crate::tools::default_tool(db).await;
+    let legacy_tool = crate::tools::default_tool(db).await;
+    let curator_route = curator_route_context(db, workspace_id).await?;
+    let manual_tool = curator_route
+        .as_ref()
+        .and_then(|(_, tool)| tool.as_deref());
+    let route = crate::engine_routing::resolve_for_db(
+        db,
+        manual_tool,
+        &legacy_tool,
+        crate::engine_routing::RoutingHint::Deep,
+    )
+    .await;
+    if route.blocked {
+        let message = format!("engine-routing-blocked:{}", route.reason_code());
+        mark_relation_analysis_failed(db, workspace_id, &profiled, &message).await;
+        if let Some((curator_thread, _)) = curator_route.as_ref() {
+            crate::engine_routing::record_decision(
+                db,
+                *curator_thread,
+                None,
+                None,
+                "curator_relations",
+                &route,
+            )
+            .await;
+        }
+        anyhow::bail!(message);
+    }
+    let tool = route
+        .selected()
+        .map(|selected| selected.as_str().to_string())
+        .unwrap_or(legacy_tool);
+    if let Some((curator_thread, _)) = curator_route.as_ref() {
+        crate::engine_routing::record_decision(
+            db,
+            *curator_thread,
+            None,
+            None,
+            "curator_relations",
+            &route,
+        )
+        .await;
+    }
     // The relations pass is workspace-level, not tied to one repo's detail panel,
     // so its stream is discarded — it shares the runner only for the transport fix.
     let mut fresh_markdown: Option<String> = None;
@@ -2494,6 +2625,125 @@ mod tests {
         assert!(super::should_analyze(false, false, true), "auto: classifies a non-failed repo that needs it");
         assert!(!super::should_analyze(false, false, false), "auto: skips an up-to-date repo");
         assert!(super::should_analyze(false, true, false), "forced: re-reads even an up-to-date repo");
+    }
+
+    #[tokio::test]
+    async fn curator_route_uses_manual_pin_but_not_legacy_tool() {
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = repo::ensure_curator_thread(&db, ws.id, "opencode")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED, "true")
+            .await
+            .unwrap();
+        let current_exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        crate::tool_command::set_overrides(std::collections::HashMap::from([
+            ("codex".to_string(), "weft_missing_codex_route_test".to_string()),
+            ("claude".to_string(), "weft_missing_claude_route_test".to_string()),
+            ("opencode".to_string(), current_exe),
+        ]));
+
+        let automatic_context = super::curator_route_context(&db, ws.id).await.unwrap().unwrap();
+        assert!(automatic_context.1.is_none(), "default curator tool is not a pin");
+        let automatic = crate::engine_routing::resolve_for_db(
+            &db,
+            automatic_context.1.as_deref(),
+            "opencode",
+            crate::engine_routing::RoutingHint::Deep,
+        )
+        .await;
+        assert!(automatic.blocked, "automatic curator route must honor the blocked pool");
+
+        repo::set_thread_engine_pinned(&db, thread, true).await.unwrap();
+        let manual_context = super::curator_route_context(&db, ws.id).await.unwrap().unwrap();
+        assert_eq!(manual_context.1.as_deref(), Some("opencode"));
+        let manual = crate::engine_routing::resolve_for_db(
+            &db,
+            manual_context.1.as_deref(),
+            "codex",
+            crate::engine_routing::RoutingHint::Deep,
+        )
+        .await;
+        assert_eq!(manual.selected().map(|tool| tool.as_str()), Some("opencode"));
+        assert_eq!(manual.source, crate::engine_routing::RoutingSource::Manual);
+
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+    }
+
+    #[tokio::test]
+    async fn reanalyze_relation_route_block_is_visible_and_retryable() {
+        let _run_state_guard = super::test_run_state_guard();
+        let _override_lock = crate::tool_command::override_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::ensure_curator_thread(&db, ws.id, "codex").await.unwrap();
+        repo::set_setting(&db, crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED, "true")
+            .await
+            .unwrap();
+        let tag = format!("weft-curator-relation-blocked-{}", std::process::id());
+        let root = std::env::temp_dir().join(tag);
+        let path_a = root.join("a");
+        let path_b = root.join("b");
+        std::fs::create_dir_all(&path_a).unwrap();
+        std::fs::create_dir_all(&path_b).unwrap();
+        let a = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "a",
+            path_a.to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let b = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "b",
+            path_b.to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        for r in [&a, &b] {
+            repo::upsert_repo_profile(&db, r.id, "backend", "[]", "profiled", "[]", "agent", "")
+                .await
+                .unwrap();
+        }
+        crate::tool_command::set_overrides(std::collections::HashMap::from([
+            ("codex".to_string(), "weft_missing_codex_relation_test".to_string()),
+            ("claude".to_string(), "weft_missing_claude_relation_test".to_string()),
+        ]));
+
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let cancelled = super::reanalyze_workspace(&db, ws.id, &cancel).await;
+        assert!(!cancelled, "routing failure must not be reported as cancellation");
+        let names = super::unanalyzed_repo_names(&db, ws.id).await;
+        assert!(names.contains(&"a".to_string()));
+        assert!(names.contains(&"b".to_string()));
+        for id in [a.id, b.id] {
+            let profile = repo::get_repo_profile(&db, id).await.unwrap().unwrap();
+            assert_eq!(profile.analysis_state, "failed");
+            assert!(
+                profile
+                    .analysis_error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with("engine-routing-blocked:")),
+                "relation routing failure must remain a stable blocked error"
+            );
+        }
+
+        crate::tool_command::set_overrides(std::collections::HashMap::new());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

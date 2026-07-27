@@ -102,6 +102,10 @@ const NESTABLE_KIND: Record<LeadMessage["kind"], boolean> = {
   // Same treatment — a failed auto fail-over attempt (issue #97) is also a
   // system-owned marker, never a per-agent row.
   quota_failover_failed: false,
+  // Routing decisions and blocked routing outcomes are durable system-owned
+  // markers, not conversation rows that belong inside a collab branch.
+  engine_route: false,
+  engine_route_blocked: false,
 };
 
 function parseContentObject(row: LeadMessage): Record<string, unknown> {

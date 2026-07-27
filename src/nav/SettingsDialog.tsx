@@ -34,6 +34,7 @@ import { toolFullName } from "../components/ToolIcon";
 import { currentLang, setLang, type Lang } from "../i18n";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
+import { spawnableToolsOf } from "../lib/toolStatus.ts";
 import {
   ensureNotifyPermission,
   notifyPermission,
@@ -216,7 +217,7 @@ function GeneralSettings() {
   } = useStore();
   const [lang, setLangState] = useState<Lang>(currentLang());
 
-  const installed = installedTools.filter((tl) => tl.installed);
+  const spawnable = spawnableToolsOf(installedTools);
 
   // Per-tool command overrides ("aliases", e.g. claude → cc-claude). `draft`
   // holds in-progress edits; `saved` is what the backend persisted, so a Save
@@ -338,14 +339,14 @@ function GeneralSettings() {
     <div className="flex flex-col gap-10">
       <SettingsGroup title={t("settings.defaults")}>
         <SettingRow label={t("settings.defaultTool")} hint={t("settings.defaultToolHint")}>
-          {installed.length === 0 ? (
+          {spawnable.length === 0 ? (
             <span className="text-[12px] text-waiting">{t("settings.noTools")}</span>
           ) : (
             <div className="flex flex-col items-end gap-1">
               <Segmented
                 value={defaultTool}
                 onChange={setDefaultTool}
-                options={installed.map((tl) => ({ value: tl.tool, label: toolFullName(tl.tool) }))}
+                options={spawnable.map((tl) => ({ value: tl.tool, label: toolFullName(tl.tool) }))}
               />
               {configuredTool && configuredTool !== defaultTool && (
                 <span className="text-[11px] text-waiting">
@@ -675,6 +676,8 @@ function AutomationSettings() {
   // narrow, rarely-touched preference with no other consumer.
   const [quotaFailover, setQuotaFailoverState] = useState(false);
   const [quotaFailoverLoaded, setQuotaFailoverLoaded] = useState(false);
+  const [automaticRouting, setAutomaticRoutingState] = useState(false);
+  const [automaticRoutingLoaded, setAutomaticRoutingLoaded] = useState(false);
 
   useEffect(() => {
     void api.imGetSettings().then((s) => {
@@ -684,6 +687,10 @@ function AutomationSettings() {
     void api.getQuotaFailoverEnabled().then((enabled) => {
       setQuotaFailoverState(enabled);
       setQuotaFailoverLoaded(true);
+    });
+    void api.getAutomaticEngineRoutingEnabled().then((enabled) => {
+      setAutomaticRoutingState(enabled);
+      setAutomaticRoutingLoaded(true);
     });
   }, []);
 
@@ -699,12 +706,24 @@ function AutomationSettings() {
   }
 
   async function toggleQuotaFailover(on: boolean) {
+    if (on && !window.confirm(t("settings.quotaFailoverConfirm"))) return;
     const prev = quotaFailover;
     setQuotaFailoverState(on);
     try {
       await api.setQuotaFailoverEnabled(on);
     } catch (err) {
       setQuotaFailoverState(prev);
+      throw err;
+    }
+  }
+
+  async function toggleAutomaticRouting(on: boolean) {
+    const prev = automaticRouting;
+    setAutomaticRoutingState(on);
+    try {
+      await api.setAutomaticEngineRoutingEnabled(on);
+    } catch (err) {
+      setAutomaticRoutingState(prev);
       throw err;
     }
   }
@@ -736,6 +755,25 @@ function AutomationSettings() {
           )}
         </SettingRow>
       </SettingsGroup>
+      <SettingsGroup title={t("settings.engineRoutingGroup")}>
+        <SettingRow
+          label={t("settings.automaticRoutingTitle")}
+          hint={t("settings.automaticRoutingHint")}
+        >
+          {automaticRoutingLoaded ? (
+            <Toggle
+              on={automaticRouting}
+              onChange={(v) => void toggleAutomaticRouting(v)}
+              label={t("settings.automaticRoutingTitle")}
+            />
+          ) : (
+            <div
+              aria-hidden
+              className="h-[22px] w-[38px] shrink-0 rounded-full bg-border-strong/40"
+            />
+          )}
+        </SettingRow>
+      </SettingsGroup>
       <SettingsGroup title={t("settings.quotaFailoverGroup")}>
         <SettingRow label={t("settings.quotaFailoverTitle")} hint={t("settings.quotaFailoverHint")}>
           {quotaFailoverLoaded ? (
@@ -751,6 +789,9 @@ function AutomationSettings() {
             />
           )}
         </SettingRow>
+        <p className="px-3 pb-3 text-[11px] leading-relaxed text-ink-faint">
+          {t("settings.quotaFailoverDisclosure")}
+        </p>
       </SettingsGroup>
       <SettingsGroup title={t("settings.reviewGroup")}>
         <SettingRow label={t("settings.reviewSkill")} hint={t("settings.reviewSkillHint")}>

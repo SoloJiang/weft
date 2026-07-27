@@ -47,6 +47,17 @@ export interface EngineQuotaSnapshot {
   observedAt: number;
 }
 
+/** One server-owned route decision/preview. `reason` is a stable code mapped
+ * to bilingual copy by the frontend; it is never free-form agent text. */
+export interface EngineRouteDecision {
+  tool: string | null;
+  source: "manual" | "automatic" | "legacy" | "blocked";
+  reason: string;
+  hint: "normal" | "deep";
+  quota: EngineQuotaLevel | null;
+  blocked: boolean;
+}
+
 /** Read-only local-runtime dashboard snapshot (issue #112). Combines the three
  *  process-tree safety-net axes — no sampling happens here, this only aggregates
  *  what `process_quota` / `proc_registry` / `session_gate` already track. */
@@ -117,6 +128,7 @@ export interface SwitchOutcome {
   new_tool: string;
   old_model: string | null;
   new_model: string | null;
+  quota_basis?: string | null;
 }
 
 export interface FileDiff {
@@ -311,7 +323,11 @@ export interface LeadMessage {
     /** Marker row for a FAILED auto fail-over attempt (issue #97); content is
      *  {"tool","fallback","error"} — the attempted switch never completed, so
      *  `tool` is unchanged (unlike "engine_switch", there is no old/new pair). */
-    | "quota_failover_failed";
+    | "quota_failover_failed"
+    /** Marker for a server-owned initial route decision. */
+    | "engine_route"
+    /** Persistent blocked state when no automatic candidate is eligible. */
+    | "engine_route_blocked";
   /** kind-shaped JSON string, e.g. {"text": "..."} for kind=text */
   content: string;
   status: "streaming" | "complete" | "interrupted" | "error" | "queued";
@@ -366,6 +382,17 @@ export type LeadChatPush =
        *  running-tool label on recovery but still clears it on a real/promoted turn. */
       recovered?: boolean;
       queue: QueuedItem[];
+    }
+  | {
+      /** Durable tool identity changed; emitted for manual switches and quota failover. */
+      type: "engine_switched";
+      thread_id: number;
+      session_id: number | null;
+      direction_id: number | null;
+      tool: string;
+      model: string | null;
+      /** Present for workers, whose SessionInfo exposes the effective resume command. */
+      command: string | null;
     }
   | {
       type: "init";
@@ -610,6 +637,8 @@ export interface ProposedDirection {
   mandate?: string;
   base_branch?: string;
   decision?: string;
+  /** Optional normalized planner hint; the server defaults old/malformed rows to normal. */
+  hint?: "normal" | "deep";
 }
 export interface Proposal {
   rationale: string;
@@ -631,6 +660,8 @@ export interface ResolvedDirection {
   /** the chosen base branch; "" = the repo's default branch. */
   base_branch: string;
   decision: string;
+  hint: "normal" | "deep";
+  route?: EngineRouteDecision | null;
 }
 export interface ResolvedProposal {
   thread_id: number;
@@ -660,6 +691,7 @@ export interface ToolDiagnostic {
 export interface ToolStatus {
   tool: string;
   installed: boolean;
+  spawnable: boolean;
   version: string | null;
   path: string | null;
   meets_min: boolean;
@@ -781,6 +813,8 @@ export interface WriteTrigger {
   reason: string;
   /** the lead's chosen base branch for this write; "" = the repo's default branch. */
   base_branch: string;
+  hint: "normal" | "deep";
+  route?: EngineRouteDecision | null;
 }
 
 /** An open agent→human question, aggregated workspace-wide for "Needs you". */
