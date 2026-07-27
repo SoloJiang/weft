@@ -92,6 +92,14 @@ const ASK_WAIT: Duration = Duration::from_secs(3600);
 /// the card's own tool label honest instead of mislabeling an unknown caller
 /// as "Claude Code" (`ToolIcon`/`toolFullName` on the frontend already
 /// degrade gracefully for an unrecognized string).
+///
+/// That guarantee used to rest on convention alone: every existing test
+/// checked specific tool names, never the actual `SAFE_BUILTINS` table, so a
+/// future row added there with THIS string as its engine would silently defeat
+/// the sentinel and no test would notice. `unknown_engine_sentinel_matches_
+/// no_safe_builtins_row_structurally` below closes that gap by iterating
+/// `builtin_allow::SAFE_BUILTINS` (made `pub(super)` for exactly this) instead
+/// of enumerating tool names.
 const UNKNOWN_ENGINE: &str = "unknown";
 
 /// The Ask Bridge endpoint. A tool's permission hook POSTs its PreToolUse-style
@@ -1601,6 +1609,25 @@ mod tests {
         assert_eq!(
             crate::bus::builtin_allow::safe_scope(UNKNOWN_ENGINE, "update_plan"),
             None
+        );
+    }
+
+    /// Structural companion to `unknown_engine_sentinel_matches_no_safe_
+    /// builtins_row` above: that test enumerates 4 concrete tool names as of
+    /// this writing, so it CANNOT catch a future `SAFE_BUILTINS` row keyed on
+    /// `UNKNOWN_ENGINE` with some OTHER tool name — the enumeration would just
+    /// stay green next to a newly-unsafe table. This iterates the actual table
+    /// instead, so the invariant holds for every row, present or future, not
+    /// just the ones a human thought to name here.
+    #[test]
+    fn unknown_engine_sentinel_matches_no_safe_builtins_row_structurally() {
+        assert!(
+            crate::bus::builtin_allow::SAFE_BUILTINS
+                .iter()
+                .all(|(engine, _, _)| *engine != UNKNOWN_ENGINE),
+            "a SAFE_BUILTINS row keyed on UNKNOWN_ENGINE would let a request with a \
+             missing or unrecognized ?tool= silently inherit that row's auto-approval \
+             instead of surfacing the Needs-you card — see UNKNOWN_ENGINE's doc"
         );
     }
 
