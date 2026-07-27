@@ -457,7 +457,7 @@ export const en = {
     engineRouteBlockedTransition: "{{from}} → {{to}}",
     engineRouteQuotaBasis: "quota: {{status}}",
     engineRouteBlockedHint: "Choose a manual engine or change the global routing setting, then retry.",
-    quotaFailoverFailedMarker: "Auto fail-over {{from}} → {{to}} failed",
+    quotaFailoverFailedMarker: "Auto fail-over to {{to}} failed — still on {{from}}",
   },
   diff: {
     tab: "Diff",

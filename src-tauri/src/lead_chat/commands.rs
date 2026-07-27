@@ -2465,6 +2465,20 @@ async fn maybe_failover_on_quota(
     }
     // Claim the cooldown slot before the short final engine handoff. A second
     // turn-end callback then cannot race this one into a duplicate switch.
+    //
+    // This claim is a 6th gate `FailoverDecision` does not model — the
+    // decision above only ever sees `cooldown_ok` as an already-resolved
+    // input (the read-only peek near the top of this function). Deleting
+    // this call compiles cleanly and leaves every `quota_failover_tests`
+    // test green: none of them exercise `maybe_failover_on_quota` itself (it
+    // needs an `AppHandle`, unavailable in this crate's test harness — same
+    // limitation the `push_model_arg` tests' doc comment records). Without
+    // it, the cooldown map is never actually marked claimed on this path, so
+    // a second concurrent invocation for the same key would see
+    // `quota_failover_cooldown_active` still false and dispatch ANOTHER
+    // switch — silently defeating `QUOTA_FAILOVER_COOLDOWN_SECS`'s storm-
+    // breaker promise. `quota_failover_dispatch_claim_blocks_a_concurrent_decision`
+    // below proves the mechanism this depends on.
     if !claim_quota_failover_slot(key) {
         return;
     }
@@ -2638,6 +2652,113 @@ mod quota_failover_tests {
         assert!(
             !quota_failover_still_unpinned(&db, thread.id, None).await,
             "the post-gate recheck must stop the automatic handoff after a same-tool manual switch"
+        );
+    }
+
+    /// The inline `matches!(.., Some("1") | Some("true"))` an earlier review
+    /// pointed at (parsing [`K_QUOTA_FAILOVER_ENABLED`] right here in
+    /// `maybe_failover_on_quota`) has since been extracted into
+    /// `engine_routing::is_enabled` by the unrelated #111 routing refactor —
+    /// a private fn in a module this change's scope does not touch. This
+    /// pins down the same real source of truth ("did the user opt in?") end
+    /// to end instead: the exact setting key, through the exact public entry
+    /// point `maybe_failover_on_quota` calls, so a regression in that parser
+    /// (or in the setting-key wiring) still fails a test living next to the
+    /// feature it gates.
+    #[tokio::test]
+    async fn quota_failover_enabled_setting_gates_the_real_db_backed_decision() {
+        // engine_quota is a process-global hub other tests also mutate.
+        let _hub_lock = crate::engine_quota::hub_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::engine_quota::clear_for_test();
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        // Unset = disabled — opt-in feature, see K_QUOTA_FAILOVER_ENABLED's doc.
+        assert_eq!(
+            crate::engine_routing::quota_failover_for_db(&db, "claude", false, true, true).await,
+            crate::engine_routing::FailoverDecision::Skip(
+                crate::engine_routing::FailoverSkipReason::Disabled
+            ),
+            "unset setting must not silently enable an auto-switch"
+        );
+
+        repo::set_setting(&db, K_QUOTA_FAILOVER_ENABLED, "0").await.unwrap();
+        assert_eq!(
+            crate::engine_routing::quota_failover_for_db(&db, "claude", false, true, true).await,
+            crate::engine_routing::FailoverDecision::Skip(
+                crate::engine_routing::FailoverSkipReason::Disabled
+            ),
+            "\"0\" must not be read as truthy"
+        );
+
+        repo::set_setting(&db, K_QUOTA_FAILOVER_ENABLED, "1").await.unwrap();
+        assert_eq!(
+            crate::engine_routing::quota_failover_for_db(&db, "claude", false, true, true).await,
+            crate::engine_routing::FailoverDecision::SwitchTo {
+                tool: crate::engine_routing::EngineId::Codex,
+                quota: None,
+            },
+            "\"1\" is documented as truthy and must clear the enabled gate"
+        );
+
+        crate::engine_quota::clear_for_test();
+    }
+
+    /// Closest unit-testable proof of the mechanism the dispatch-time
+    /// `claim_quota_failover_slot` call in `maybe_failover_on_quota` depends
+    /// on (see the comment at that call site). A full regression test
+    /// through `maybe_failover_on_quota` itself needs an `AppHandle`, which
+    /// this crate's test harness does not provide — so this instead
+    /// reproduces the exact peek -> decide -> claim -> peek -> decide
+    /// sequence that function performs around the call, entirely through
+    /// pure/sync pieces: once the slot is claimed, a second, concurrent
+    /// caller's decision must flip from SwitchTo to Skip(CooldownActive).
+    #[test]
+    fn quota_failover_dispatch_claim_blocks_a_concurrent_decision() {
+        let key: QuotaFailoverKey = (900_010, None);
+        let fallback = crate::engine_routing::RouteCandidate {
+            tool: crate::engine_routing::EngineId::Claude,
+            installed: true,
+            quota: None,
+        };
+
+        let cooldown_ok = !quota_failover_cooldown_active(key);
+        assert_eq!(
+            crate::engine_routing::resolve_failover(
+                crate::engine_routing::EngineId::Codex,
+                true,
+                false,
+                true,
+                Some(&fallback),
+                cooldown_ok,
+            ),
+            crate::engine_routing::FailoverDecision::SwitchTo {
+                tool: crate::engine_routing::EngineId::Claude,
+                quota: None,
+            },
+            "first pass, nothing claimed yet, must resolve to a switch"
+        );
+
+        // The dispatch-time claim maybe_failover_on_quota performs right
+        // before the actual engine handoff.
+        assert!(claim_quota_failover_slot(key));
+
+        let cooldown_ok_2 = !quota_failover_cooldown_active(key);
+        assert_eq!(
+            crate::engine_routing::resolve_failover(
+                crate::engine_routing::EngineId::Codex,
+                true,
+                false,
+                true,
+                Some(&fallback),
+                cooldown_ok_2,
+            ),
+            crate::engine_routing::FailoverDecision::Skip(
+                crate::engine_routing::FailoverSkipReason::CooldownActive
+            ),
+            "a second concurrent decision must be blocked by the claim, not switch again"
         );
     }
 

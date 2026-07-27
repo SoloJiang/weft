@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, Check, CheckCheck, Copy, Sparkles, Undo2, type LucideIcon } from "lucide-react";
+import { ArrowRight, Check, CheckCheck, CircleAlert, Copy, Sparkles, Undo2, type LucideIcon } from "lucide-react";
 import type { LeadMessage, PermissionAsk, QueuedItem, ResolvedProposal } from "../lib/types";
 import { receiptStateOf, type ReceiptState } from "../state/leadSnapshot";
 import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
@@ -1129,14 +1129,31 @@ function EngineRouteBlockedMarker({ content }: { content: Record<string, unknown
   );
 }
 
+/** Native `title` tooltips render verbatim with no CSS truncation available —
+ *  cap it so a multi-KB CLI stack trace doesn't produce an unusable OS
+ *  tooltip (issue #97 review P2 follow-up). */
+function truncateForTooltip(text: string, max: number): string {
+  const trimmed = text.trim();
+  return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
+}
+
 /** issue #97 review P2: a failed auto fail-over attempt — same quiet centered
- *  divider as `EngineSwitchMarker`, but a danger tone (nothing actually
- *  changed) and no before/after tool pair to show. */
+ *  divider as `EngineSwitchMarker`, but a danger tone since nothing actually
+ *  changed.
+ *
+ *  Independent re-review follow-up: the old copy ("Auto fail-over X → Y
+ *  failed") left the user to infer two of the three things they actually
+ *  need — this now spells out "still on {{from}}" outright, reuses
+ *  `EngineSwitchMarker`'s own `engineSwitchedQuotaReason` badge (unconditional
+ *  here, unlike the success marker's `reason === "quota_exceeded"` check —
+ *  every marker of this kind exists BECAUSE quota was exceeded), and puts the
+ *  backend's real `content.error` — previously shown nowhere, not even a
+ *  tooltip — one hover away via a native `title`. */
 function QuotaFailoverFailedMarker({ content }: { content: Record<string, unknown> }) {
   const { t } = useTranslation();
   const tool = typeof content.tool === "string" ? content.tool : "";
   const fallback = typeof content.fallback === "string" ? content.fallback : "";
-  const quotaBasis = typeof content.quota_basis === "string" ? content.quota_basis : "";
+  const error = typeof content.error === "string" ? content.error : "";
   return (
     <div className="flex items-center gap-2 px-2 py-1.5">
       <span className="h-px min-w-4 flex-1 bg-border" />
@@ -1150,9 +1167,15 @@ function QuotaFailoverFailedMarker({ content }: { content: Record<string, unknow
             to: toolFullName(fallback),
           })}
         </span>
-        {quotaBasis && (
-          <span className="rounded-full border border-danger/30 px-1.5 py-0.5 text-[10px]">
-            {t("session.engineRouteQuotaBasis", { status: quotaStatusLabel(t, quotaBasis) })}
+        <span className="rounded-full border border-danger/30 bg-danger/10 px-1.5 py-0.5 text-[10px] font-medium text-danger">
+          {t("session.engineSwitchedQuotaReason")}
+        </span>
+        {error && (
+          <span
+            title={truncateForTooltip(error, 240)}
+            className="inline-flex shrink-0 cursor-help text-danger/80"
+          >
+            <CircleAlert size={12} />
           </span>
         )}
       </span>
