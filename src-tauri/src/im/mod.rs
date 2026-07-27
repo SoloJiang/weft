@@ -1236,7 +1236,7 @@ async fn consume_human_event(
             // record it in CardIndex: a later Answered/Cancelled then finds
             // nothing to patch (take_human → None), which is exactly right for
             // a notice that never carries an answer.
-            if !ask.answerable {
+            if !ask.kind.is_answerable() {
                 let notice = format!("{title} · {from}\n{}", ask.text);
                 if let Err(e) = ch.send_text(&owner, &notice).await {
                     eprintln!("[weft][im] send stall notice: {e}");
@@ -2099,7 +2099,11 @@ mod tests {
             text: "x".to_string(),
             ts: 0,
             answered: false,
-            answerable,
+            kind: if answerable {
+                crate::bus::state::AskKind::Question
+            } else {
+                crate::bus::state::AskKind::Notice
+            },
         };
         // An answerable question IS forwarded as an IM answer card.
         consume_human_event(

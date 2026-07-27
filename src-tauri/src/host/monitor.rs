@@ -47,6 +47,25 @@ const PR_SWEEP_DEFAULT_SECS: u64 = 60;
 /// stopped checking" rather than a silent infinite retry loop.
 const MAX_CONSECUTIVE_PROBE_FAILURES: i32 = 10;
 
+/// Which bus method should post a notice this module computed — mirrors the
+/// two NOTICE variants of `bus::AskKind` (this module never posts a
+/// `Question`, so it gets its own narrower, exhaustively-matched local type
+/// instead of reusing the 3-way one and having to handle an impossible arm).
+/// [`error_notice_text`] is the ONE place that decides this for a failed
+/// probe; keeping the choice as data (not a direct `notify_human*` call
+/// buried in that function) lets [`apply_notice_action`] be the single place
+/// that actually calls the bus, for both the `Ok` (readiness) and `Err`
+/// (probe error) paths alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoticeKind {
+    /// A background sweep will retract this notice on its own once the
+    /// condition it describes changes.
+    SelfClearing,
+    /// Nothing will retract this notice automatically — see
+    /// `judge::give_up_text`.
+    ActionRequired,
+}
+
 /// Start the runtime PR/MR sweep. Call once at app setup, alongside
 /// `revive::spawn_stall_watch` (see `lib.rs`).
 pub fn spawn_pr_watch(app: AppHandle) {
@@ -153,7 +172,7 @@ async fn apply_probe_result(
     kind: Option<HostKind>,
     result: Result<PrSnapshot, super::HostError>,
 ) {
-    let desired_text = match &result {
+    let desired: Option<(NoticeKind, String)> = match &result {
         Ok(snapshot) => {
             let readiness = judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
             let changed = snapshot_changed(pr, snapshot, &readiness);
@@ -166,6 +185,7 @@ async fn apply_probe_result(
                 None // merged/closed — the readiness question is moot now
             } else {
                 kind.and_then(|k| judge::notice_text(k, pr.number, &readiness))
+                    .map(|text| (NoticeKind::SelfClearing, text))
             }
         }
         Err(e) => {
@@ -180,33 +200,38 @@ async fn apply_probe_result(
         }
     };
 
-    reconcile_notice(bus, app, notices, pr, desired_text);
+    reconcile_notice(bus, app, notices, pr, desired);
 }
 
-/// Which notice text a FAILED probe should produce, given the NEW
-/// consecutive-failure count this attempt just wrote (`None` if the row
-/// vanished mid-write — no row to report a streak for). Pure and unit-tested
-/// in isolation from `mark_pull_request_probe_error`'s DB write: the
-/// boundary condition (`fail_count >= MAX_CONSECUTIVE_PROBE_FAILURES`) is
+/// Which notice text (and [`NoticeKind`]) a FAILED probe should produce,
+/// given the NEW consecutive-failure count this attempt just wrote (`None` if
+/// the row vanished mid-write — no row to report a streak for). Pure and
+/// unit-tested in isolation from `mark_pull_request_probe_error`'s DB write:
+/// the boundary condition (`fail_count >= MAX_CONSECUTIVE_PROBE_FAILURES`) is
 /// precisely the ONE sweep `list_open_pull_requests` is about to start
 /// excluding this row from — so it is the ONLY sweep allowed to say "gave
-/// up" (`judge::give_up_text`) instead of "still checking, will retry"
-/// (`judge::probe_error_text`). Getting this boundary wrong either direction
-/// is a real regression: off-by-one-early falsely claims tracking stopped
-/// while it's still retrying; off-by-one-late repeats the ordinary text on
-/// the exact sweep where tracking silently stops for good (P1-A: the bug
-/// this function exists to prevent from recurring).
+/// up" (`judge::give_up_text`, `NoticeKind::ActionRequired` — the row will
+/// NOT be revisited again on its own) instead of "still checking, will
+/// retry" (`judge::probe_error_text`, `NoticeKind::SelfClearing`). Getting
+/// this boundary wrong either direction is a real regression:
+/// off-by-one-early falsely claims tracking stopped while it's still
+/// retrying; off-by-one-late repeats the ordinary text (and the WRONG,
+/// self-clearing kind) on the exact sweep where tracking silently stops for
+/// good (P1-A: the bug this function exists to prevent from recurring).
 fn error_notice_text(
     kind: Option<HostKind>,
     pr_number: i32,
     error: &super::HostError,
     fail_count: Option<i32>,
-) -> String {
+) -> (NoticeKind, String) {
     let gave_up_now = fail_count.is_some_and(|c| c >= MAX_CONSECUTIVE_PROBE_FAILURES);
     match kind {
-        Some(k) if gave_up_now => judge::give_up_text(k, pr_number, error),
-        Some(k) => judge::probe_error_text(k, pr_number, error),
-        None => format!("🔌 无法查询 PR/MR #{pr_number} 的状态:{}。", error.message()),
+        Some(k) if gave_up_now => (NoticeKind::ActionRequired, judge::give_up_text(k, pr_number, error)),
+        Some(k) => (NoticeKind::SelfClearing, judge::probe_error_text(k, pr_number, error)),
+        None => (
+            NoticeKind::SelfClearing,
+            format!("🔌 无法查询 PR/MR #{pr_number} 的状态:{}。", error.message()),
+        ),
     }
 }
 
@@ -224,9 +249,9 @@ fn reconcile_notice(
     app: &AppHandle,
     notices: &mut HashMap<i32, (i32, u64, String)>,
     pr: &pull_request::Model,
-    desired_text: Option<String>,
+    desired: Option<(NoticeKind, String)>,
 ) {
-    for thread_id in apply_notice_action(bus, notices, pr, desired_text) {
+    for thread_id in apply_notice_action(bus, notices, pr, desired) {
         let _ = app.emit("needs-you://changed", thread_id);
     }
 }
@@ -249,21 +274,30 @@ fn reconcile_notice(
 /// canceling under the wrong thread silently no-ops (returns `false`) and
 /// strands the notice under its original thread forever, un-retractable and
 /// with no manual dismiss (see `NeedsRows.tsx`'s `AskRow`, which has an
-/// answer box only when `answerable`, never a close button for a NOTICE).
+/// answer box only for a Question, never a close button for a NOTICE).
+///
+/// Also the ONE place that calls into the bus to actually POST a notice — so
+/// it is the single spot that picks `notify_human` vs `notify_human_action_
+/// required` from the incoming [`NoticeKind`] (via `post_notice`), for both
+/// the `Post` and `Replace` arms alike. `desired`'s text (`.1`) is still what
+/// `plan_notice_action` compares against the previously-posted text to decide
+/// NoOp/Post/Replace/Retract — the KIND never affects that decision, only
+/// which method posts the result.
 fn apply_notice_action(
     bus: &crate::bus::BusRegistry,
     notices: &mut HashMap<i32, (i32, u64, String)>,
     pr: &pull_request::Model,
-    desired_text: Option<String>,
+    desired: Option<(NoticeKind, String)>,
 ) -> Vec<i32> {
     let existing = notices.get(&pr.id).map(|(_, _, text)| text.as_str());
-    let action = judge::plan_notice_action(existing, desired_text.as_deref());
+    let desired_text = desired.as_ref().map(|(_, text)| text.as_str());
+    let action = judge::plan_notice_action(existing, desired_text);
     let mut changed_threads = Vec::new();
     match action {
         judge::NoticeAction::NoOp => {}
         judge::NoticeAction::Post => {
-            if let Some(text) = desired_text {
-                let id = bus.notify_human(pr.thread_id, &pr.direction_id.to_string(), &text);
+            if let Some((kind, text)) = desired {
+                let id = post_notice(bus, kind, pr.thread_id, &pr.direction_id.to_string(), &text);
                 notices.insert(pr.id, (pr.thread_id, id, text));
                 changed_threads.push(pr.thread_id);
             }
@@ -273,8 +307,8 @@ fn apply_notice_action(
                 bus.cancel_open_asks_by_id(old_thread_id, old_id);
                 changed_threads.push(old_thread_id);
             }
-            if let Some(text) = desired_text {
-                let id = bus.notify_human(pr.thread_id, &pr.direction_id.to_string(), &text);
+            if let Some((kind, text)) = desired {
+                let id = post_notice(bus, kind, pr.thread_id, &pr.direction_id.to_string(), &text);
                 notices.insert(pr.id, (pr.thread_id, id, text));
                 changed_threads.push(pr.thread_id);
             }
@@ -290,6 +324,17 @@ fn apply_notice_action(
     changed_threads.sort_unstable();
     changed_threads.dedup();
     changed_threads
+}
+
+/// Post one notice via the bus method matching its [`NoticeKind`] — the only
+/// place this module chooses between `notify_human` and `notify_human_
+/// action_required`, so `Post` and `Replace` in [`apply_notice_action`] can't
+/// drift apart on that choice.
+fn post_notice(bus: &crate::bus::BusRegistry, kind: NoticeKind, thread: i32, from: &str, text: &str) -> u64 {
+    match kind {
+        NoticeKind::SelfClearing => bus.notify_human(thread, from, text),
+        NoticeKind::ActionRequired => bus.notify_human_action_required(thread, from, text),
+    }
 }
 
 fn emit_pr_changed(app: &AppHandle, pr: &pull_request::Model) {
@@ -332,8 +377,10 @@ mod tests {
     #[test]
     fn under_the_threshold_still_reports_an_ordinary_probe_error() {
         let err = HostError::NotFound;
-        let text = error_notice_text(Some(HostKind::GitHub), 1, &err, Some(MAX_CONSECUTIVE_PROBE_FAILURES - 1));
+        let (kind, text) =
+            error_notice_text(Some(HostKind::GitHub), 1, &err, Some(MAX_CONSECUTIVE_PROBE_FAILURES - 1));
         assert_eq!(text, judge::probe_error_text(HostKind::GitHub, 1, &err));
+        assert_eq!(kind, NoticeKind::SelfClearing, "still retrying — must stay self-clearing");
     }
 
     #[test]
@@ -342,8 +389,14 @@ mod tests {
         // the row from — the one and only chance to tell the human tracking
         // just stopped, instead of silently going quiet.
         let err = HostError::NotFound;
-        let text = error_notice_text(Some(HostKind::GitHub), 1, &err, Some(MAX_CONSECUTIVE_PROBE_FAILURES));
+        let (kind, text) =
+            error_notice_text(Some(HostKind::GitHub), 1, &err, Some(MAX_CONSECUTIVE_PROBE_FAILURES));
         assert_eq!(text, judge::give_up_text(HostKind::GitHub, 1, &err));
+        assert_eq!(
+            kind,
+            NoticeKind::ActionRequired,
+            "the give-up sweep must be tagged action-required, not self-clearing"
+        );
     }
 
     #[test]
@@ -352,9 +405,10 @@ mod tests {
         // already has a higher stored count — must not fall through to the
         // ordinary-error text just because it's not an EXACT match.
         let err = HostError::NotFound;
-        let text =
+        let (kind, text) =
             error_notice_text(Some(HostKind::GitHub), 1, &err, Some(MAX_CONSECUTIVE_PROBE_FAILURES + 5));
         assert_eq!(text, judge::give_up_text(HostKind::GitHub, 1, &err));
+        assert_eq!(kind, NoticeKind::ActionRequired);
     }
 
     #[test]
@@ -363,8 +417,9 @@ mod tests {
         // that's a DIFFERENT fact from "we tracked it and gave up", and must
         // not be misreported as the latter.
         let err = HostError::NotFound;
-        let text = error_notice_text(Some(HostKind::GitHub), 1, &err, None);
+        let (kind, text) = error_notice_text(Some(HostKind::GitHub), 1, &err, None);
         assert_eq!(text, judge::probe_error_text(HostKind::GitHub, 1, &err));
+        assert_eq!(kind, NoticeKind::SelfClearing);
     }
 
     fn base_row() -> pull_request::Model {
@@ -468,7 +523,12 @@ mod tests {
         // there.
         let mut pr = base_row();
         pr.thread_id = 1;
-        let touched = apply_notice_action(&bus, &mut notices, &pr, Some("first blocked text".to_string()));
+        let touched = apply_notice_action(
+            &bus,
+            &mut notices,
+            &pr,
+            Some((NoticeKind::SelfClearing, "first blocked text".to_string())),
+        );
         assert_eq!(touched, vec![1]);
         assert_eq!(bus.open_asks(1).len(), 1, "the notice must land in thread 1's queue");
 
@@ -477,8 +537,12 @@ mod tests {
         // that — the row now belongs to thread 2 — AND the readiness text
         // changes too (still not-Ready, so this is a Replace, not a NoOp).
         pr.thread_id = 2;
-        let touched =
-            apply_notice_action(&bus, &mut notices, &pr, Some("second blocked text".to_string()));
+        let touched = apply_notice_action(
+            &bus,
+            &mut notices,
+            &pr,
+            Some((NoticeKind::SelfClearing, "second blocked text".to_string())),
+        );
 
         assert!(
             bus.open_asks(1).is_empty(),
@@ -496,10 +560,10 @@ mod tests {
 
         let mut pr = base_row();
         pr.thread_id = 1;
-        apply_notice_action(&bus, &mut notices, &pr, Some("blocked".to_string()));
+        apply_notice_action(&bus, &mut notices, &pr, Some((NoticeKind::SelfClearing, "blocked".to_string())));
         assert_eq!(bus.open_asks(1).len(), 1);
 
-        // Reassigned to thread 2, AND the PR became Ready (desired_text =
+        // Reassigned to thread 2, AND the PR became Ready (desired =
         // None) in the same sweep — a pure Retract, no Replace involved.
         pr.thread_id = 2;
         let touched = apply_notice_action(&bus, &mut notices, &pr, None);
@@ -517,9 +581,53 @@ mod tests {
         let mut notices: HashMap<i32, (i32, u64, String)> = HashMap::new();
         let pr = base_row(); // thread_id stays 1 throughout
 
-        apply_notice_action(&bus, &mut notices, &pr, Some("first".to_string()));
-        let touched = apply_notice_action(&bus, &mut notices, &pr, Some("second".to_string()));
+        apply_notice_action(&bus, &mut notices, &pr, Some((NoticeKind::SelfClearing, "first".to_string())));
+        let touched = apply_notice_action(
+            &bus,
+            &mut notices,
+            &pr,
+            Some((NoticeKind::SelfClearing, "second".to_string())),
+        );
         assert_eq!(touched, vec![1]);
         assert_eq!(bus.open_asks(1).len(), 1, "old notice retracted, new one posted — still exactly one open");
+    }
+
+    // --- the NoticeKind → bus method wiring itself -------------------------
+
+    #[test]
+    fn post_notice_picks_the_bus_method_matching_its_kind() {
+        // Direct unit coverage of `post_notice` (and therefore the choice
+        // `apply_notice_action`'s Post/Replace arms make): SelfClearing must
+        // land as `AskKind::Notice`, ActionRequired as `AskKind::
+        // NoticeActionRequired` — never crossed.
+        let bus = crate::bus::BusRegistry::new();
+        post_notice(&bus, NoticeKind::SelfClearing, 1, "10", "self-clearing text");
+        post_notice(&bus, NoticeKind::ActionRequired, 1, "10", "action-required text");
+        let open = bus.open_asks(1);
+        assert_eq!(open.len(), 2);
+        let self_clearing = open.iter().find(|a| a.text == "self-clearing text").unwrap();
+        let action_required = open.iter().find(|a| a.text == "action-required text").unwrap();
+        assert_eq!(self_clearing.kind, crate::bus::AskKind::Notice);
+        assert_eq!(action_required.kind, crate::bus::AskKind::NoticeActionRequired);
+    }
+
+    #[test]
+    fn apply_notice_action_posts_an_action_required_notice_with_the_matching_ask_kind() {
+        // End-to-end through the real decision path (not just `post_notice`
+        // directly): a give-up-shaped `desired` must actually reach the bus
+        // as `AskKind::NoticeActionRequired`, so the frontend discriminator
+        // this whole PR adds is fed correctly from the one sweep that needs it.
+        let bus = crate::bus::BusRegistry::new();
+        let mut notices: HashMap<i32, (i32, u64, String)> = HashMap::new();
+        let pr = base_row();
+        apply_notice_action(
+            &bus,
+            &mut notices,
+            &pr,
+            Some((NoticeKind::ActionRequired, "gave up".to_string())),
+        );
+        let open = bus.open_asks(pr.thread_id);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, crate::bus::AskKind::NoticeActionRequired);
     }
 }

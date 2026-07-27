@@ -186,15 +186,23 @@ pub fn probe_error_text(kind: HostKind, number: i32, error: &HostError) -> Strin
 /// both would otherwise read as byte-identical text. Names the ONLY way this
 /// row's tracking resumes (a fresh `register_pr` call resets the streak —
 /// see `repo::register_pull_request`'s update branch) and says plainly that
-/// THIS notice will not clear itself, contradicting the generic "clears
-/// itself automatically" Needs-you hint that would otherwise be sitting
-/// right below it, honestly, since it does not hold for this state.
+/// THIS notice will not clear itself. The generic "clears itself
+/// automatically" Needs-you footer that would otherwise sit right below it is
+/// no longer a frontend-side contradiction: this is the one notice `host::
+/// monitor` posts via `BusRegistry::notify_human_action_required` rather than
+/// `notify_human`, which the frontend renders with a DIFFERENT footer (see
+/// `NeedsRows.tsx` / `bus::AskKind::NoticeActionRequired`) — but the text
+/// still says so plainly on its own, since the notice must stand on its own
+/// even if a future surface (IM, a notification) never renders that footer at
+/// all. Both mentions of the host below use the SAME short form
+/// (`native_abbrev`, "PR"/"MR") — this file's other notices never mix it with
+/// `native_noun`'s long form ("Pull request"/"Merge request") mid-sentence,
+/// and this one previously did (P3, PR #150 review).
 pub fn give_up_text(kind: HostKind, number: i32, error: &HostError) -> String {
+    let abbrev = kind.native_abbrev();
     format!(
-        "🛑 已停止跟踪 {} #{number} 的状态:连续多次查询失败,最近一次原因:{}。这条提示不会自动消失——如果这个 {} 其实还活着,请让 agent 重新调用一次 register_pr 恢复跟踪。",
-        kind.native_abbrev(),
-        error.message(),
-        kind.native_noun()
+        "🛑 已停止跟踪 {abbrev} #{number} 的状态:连续多次查询失败,最近一次原因:{}。这条提示不会自动消失——如果这个 {abbrev} 其实还活着,请让 agent 重新调用一次 register_pr 恢复跟踪。",
+        error.message()
     )
 }
 
@@ -414,6 +422,29 @@ mod tests {
         let error = HostError::NotFound;
         assert!(give_up_text(HostKind::GitHub, 1, &error).contains("PR #1"));
         assert!(give_up_text(HostKind::GitLab, 1, &error).contains("MR #1"));
+    }
+
+    #[test]
+    fn give_up_text_never_mixes_the_abbreviation_with_the_long_form_noun() {
+        // P3 (PR #150 review): the two host mentions in this ONE sentence must
+        // both use `native_abbrev` ("PR"/"MR") — a prior version referred to
+        // the SAME PR as "PR #1" and then, two clauses later, "这个 Pull
+        // request", which reads as two different things to a Chinese-reading
+        // human even though every other notice in this file stays on the
+        // abbreviation throughout.
+        let error = HostError::NotFound;
+        for (kind, abbrev, noun) in [
+            (HostKind::GitHub, "PR", "Pull request"),
+            (HostKind::GitLab, "MR", "Merge request"),
+        ] {
+            let text = give_up_text(kind, 1, &error);
+            assert!(!text.contains(noun), "must not mix in the long-form noun, got: {text}");
+            assert_eq!(
+                text.matches(abbrev).count(),
+                2,
+                "both host mentions must use the abbreviation consistently, got: {text}"
+            );
+        }
     }
 
     #[test]
