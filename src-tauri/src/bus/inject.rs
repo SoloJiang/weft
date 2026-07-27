@@ -140,6 +140,13 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
     match tool {
         "claude" => {
             let settings = cwd.join(".weft-ask.settings.json");
+            // The matcher STAYS a wildcard on purpose. Narrowing it to exclude
+            // safe tools would look like the fix for the over-asking storm, but
+            // a matcher is a positive filter: a name it doesn't match is never
+            // seen by the hook at all, so it runs UNGATED. Every tool name the
+            // pattern-author didn't anticipate would then be ungated by
+            // default. The narrowing lives in `bus::builtin_allow` instead,
+            // where an unrecognized name falls through to the human.
             let json = serde_json::json!({
                 "hooks": { "PreToolUse": [
                     { "matcher": "*", "hooks": [

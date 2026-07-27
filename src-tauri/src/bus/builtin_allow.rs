@@ -1,0 +1,1022 @@
+//! The Ask Bridge's closed allowlist for an ENGINE'S OWN BUILT-IN tools —
+//! the sibling of `server::AUTO_APPROVED_INTERNAL_TOOLS` (which covers weft's
+//! own injected MCP tools).
+//!
+//! # Why this exists
+//!
+//! `inject::inject_ask_hook` installs a PreToolUse hook with a WILDCARD matcher
+//! (`"*"` for claude, `".*"` for codex), so EVERY tool call reaches
+//! `server::handle_ask` — including read-only builtins (`Read`, `Grep`,
+//! `Glob`). Each one blocks on a human click in Needs-you, and a routine
+//! file-reading turn issues dozens of them: dogfooding issue #96 froze a lead
+//! for 23 minutes on nothing but reads.
+//!
+//! # Why the fix is here and NOT in the matcher
+//!
+//! The obvious fix — narrow the hook's matcher so safe tools never fire it —
+//! fails in the DANGEROUS direction. A matcher is a positive filter: a tool
+//! name the pattern doesn't match is not "asked about later", it is NEVER SEEN,
+//! so it runs ungated. Expressing "everything except these safe ones" as a
+//! matcher regex therefore makes every tool name the pattern-author didn't
+//! anticipate — a newly shipped builtin, a renamed one, an MCP tool whose name
+//! happens to dodge the pattern — silently ungated. That is a denylist wearing
+//! a matcher's clothes, and its failure mode is exactly the one this change
+//! must not have.
+//!
+//! So the matcher STAYS a wildcard (the hook keeps seeing everything) and the
+//! narrowing happens HERE, on a closed allowlist: a name that isn't listed
+//! surfaces the Needs-you card exactly as it does today. Every failure — an
+//! unknown name, a drifted name, a path that can't be resolved, a DB error —
+//! lands on "ask the human", never on "allow".
+//!
+//! # The bar for an entry
+//!
+//! A PreToolUse `allow` decision BYPASSES the CLI's own permission check rather
+//! than deferring to it, so an entry here is weft OVERRIDING the engine, and
+//! the shape of the rule has to be one the engine itself would recognize.
+//! claude's tools reference ("Tools reference",
+//! `code.claude.com/docs/en/tools-reference`) draws the line precisely:
+//! `Read`/`Grep`/`Glob` don't prompt for paths INSIDE the working directory and
+//! its additional directories, and DO prompt outside them. `ReadOnlyPath`
+//! adopts that same rule — read-only tools, scoped to the session's own
+//! directories — with weft's DB supplying the directory set (`session_roots`).
+//! Parity is a CEILING, not a target: `Grep` and `Glob` are both on claude's
+//! don't-prompt list and deliberately NOT on this one — an allowlisted tool
+//! must name ONE literal path this module can resolve and judge, which rules
+//! out anything taking a pattern (see the omissions on `SAFE_BUILTINS`).
+//!
+//! That set is NOT always identical to the engine's own cwd, and the difference
+//! is deliberate: a lead's cwd is an almost-empty scratch dir
+//! (`<weft_home>/leads/<thread>`) while the repos it plans across live
+//! elsewhere, so claude alone would prompt for every one of those reads. weft
+//! knows what that lead's project actually is and says so, rather than weft
+//! being loose about it — the set stays closed, weft-owned, and built only from
+//! directories the user explicitly registered.
+//!
+//! Three independent conditions must ALL hold before a call is waved through
+//! (`server::handle_ask` applies them in that order); each one can only
+//! SUBTRACT auto-approvals:
+//!
+//! 1. the engine + tool name is in `SAFE_BUILTINS` (this file), and
+//! 2. `ask::classify_risk` independently rates the call `ReadOnly`, and
+//! 3. every path in its arguments is inside the session's own directories.
+//!
+//! # What each condition is actually worth
+//!
+//! Conditions 1 and 3 are the BOUNDARY. Both are structural: a closed set of
+//! names, and "does this resolve inside a directory weft itself created or the
+//! user registered". Neither depends on judging what a file contains.
+//!
+//! Condition 2 is BEST-EFFORT DEFENCE IN DEPTH, and this file is emphatic
+//! about that because review kept proving it. `classify_risk` documents itself
+//! as a UX heuristic for card triage, not a security boundary, and promoting a
+//! path-SPELLING judgment into a gate invites every trick that points a benign
+//! spelling at sensitive bytes. PR #146's review found four in a row: a
+//! `Grep` that never names what it reads, a symlink alias, a hard link, and a
+//! Windows separator that matched no marker. Each is fixed (see `contained`),
+//! and the honest conclusion is still that the NEXT one exists — the marker
+//! list was never exhaustive either (`~/.config/gh/hosts.yml` matches nothing
+//! in it).
+//!
+//! So: condition 2 is used ONLY as a veto — a non-`ReadOnly` verdict forces
+//! the card, never the reverse — and nothing here relies on it being complete.
+//! Its job is to stop the obvious foot-gun of auto-reading a repo's own `.env`
+//! or `.npmrc`, which containment alone would allow. What keeps the change
+//! safe when it fails is condition 3: whatever the veto misses is still, at
+//! worst, a file inside the session's own worktree or one of the workspace
+//! repos the user registered — the same material the engine's own default
+//! permission mode reads without prompting.
+
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+/// How much of a safe builtin's INPUT still has to be checked before its call
+/// can skip the human.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SafeScope {
+    /// The tool has no target to point anywhere: its capability is fixed and
+    /// confined to the agent's own bookkeeping, so no argument can turn it into
+    /// something else. Approved on the name alone.
+    NoTarget,
+    /// The tool reads whatever its arguments point at, so the ARGUMENTS decide
+    /// whether the call is safe. Approved only when `classify_risk` rates it
+    /// `ReadOnly` AND every path it names is inside the session's own
+    /// directories (`paths_contained`).
+    ReadOnlyPath,
+}
+
+/// The EXACT `(engine, tool_name, scope)` triples the Ask Bridge auto-approves
+/// without a human click. Closed allowlist: anything absent surfaces the card.
+///
+/// Matching is EXACT and CASE-SENSITIVE, and keyed by engine on purpose:
+///
+/// - Engine-keyed because a bare tool name is not globally unique. opencode
+///   flattens MCP tool names to `<server>_<tool>` with a SINGLE underscore, so
+///   an opencode MCP server named `update` exposing a tool named `plan` reports
+///   the name `update_plan` — indistinguishable from codex's builtin of that
+///   name. Keying by engine makes that collision unreachable instead of
+///   relying on the name to be unambiguous. (This is the same hazard
+///   `server::split_internal_tool` documents for the MCP allowlist.)
+/// - Case-sensitive because opencode's builtins are the lowercase spellings of
+///   claude's (`read`, `grep`, `glob`); an ASCII-insensitive compare would
+///   silently extend claude's entries to an engine whose tool vocabulary and
+///   argument shapes were never audited here.
+///
+/// Notable DELIBERATE omissions:
+///
+/// - `Bash` / `apply_patch` / `Edit` / `Write` / `NotebookEdit` / `WebFetch` /
+///   `WebSearch` — write, execute, or leave the machine. Arbitrary shell is
+///   arbitrary regardless of how read-only the command text looks; weft has a
+///   read-only-command classifier (`ask::READ_ONLY_COMMAND_WORDS`) but it is a
+///   display heuristic, and promoting it into a gate that skips the human is a
+///   separate, deliberate product decision — not something to slip in here.
+/// - `Glob` — REMOVED after review (Codex, PR #146), for the reason that
+///   generalizes: a glob PATTERN is a small language, and its expansion — not
+///   its spelling — decides what gets read. Two independent escapes were found
+///   in it. A leading `../` (fixed by component inspection), and then
+///   `{..,src}/*`, where brace expansion is TEXTUAL and happens before
+///   matching, so `{..,src}` reads as one ordinary component while expanding
+///   to `../*`; `{/etc,src}/*` synthesizes an absolute alternative the same
+///   way. Gating that safely means modelling brace expansion, extglob, and
+///   whatever the next release adds, across engines — and every gap in that
+///   model fails OPEN.
+///
+///   Hence the line this list now draws: NO PATTERN LANGUAGES. `Read` and
+///   `NotebookRead` name one literal path that this module can resolve and
+///   check; `Glob` and `Grep` take expressions whose meaning is decided
+///   elsewhere. The practical cost is small — `Glob` did not appear at all in
+///   the weft-launched transcripts sampled for this change, while `Read`
+///   dominated them.
+/// - `Grep` — REMOVED after review (Codex, PR #146). It was listed alongside
+///   `Read` as "same exposure, same scoping", and that was wrong in a way that
+///   breaks condition 2: a content search never names the files it reads, so
+///   `classify_risk` has nothing to inspect. `Grep {"pattern": ".+", "path":
+///   "/worktree"}` is rated `ReadOnly`, passes containment, and returns lines
+///   out of a tracked `credentials.json` — a file that `Read` could not have
+///   touched without surfacing a card. Restricting it to the name-only
+///   `output_mode`s doesn't save it either: repeated `pattern` probes
+///   (`SECRET_KEY=a`, `SECRET_KEY=b`, …) turn match/no-match into a
+///   content ORACLE, one auto-approved bit at a time. `Glob` has no such
+///   problem — it matches on names and cannot test contents. An entry whose
+///   safety argument needs this many caveats does not belong on a conservative
+///   allowlist.
+/// - `Skill` — claude's own tools reference marks it permission-REQUIRED.
+/// - `Agent` / `Task` — spawns a subagent. Its children each hit this bridge on
+///   their own, but weft's session accounting doesn't model subagents, so the
+///   spawn itself stays visible.
+/// - `ExitPlanMode`, `LSP`, `ReadMcpResourceTool` — either permission-required
+///   upstream or a capability whose full surface isn't pinned down here.
+///   Unverified means gated.
+/// - Every opencode builtin — its vocabulary is not verified in this repo, and
+///   guessing at names is precisely the unsafe direction. opencode sessions
+///   keep asking for everything, as today.
+///
+/// Sources for the claude names: claude's tools reference (the "Permission
+/// required" column) cross-checked against the tool names appearing in real
+/// weft-launched claude transcripts. For codex: its hooks documentation, which
+/// states PreToolUse fires for `Bash`, `apply_patch`, MCP tools, and local
+/// function tools such as `update_plan` — codex has no read-only file builtin
+/// to list, because its reads go through the shell, which stays gated.
+const SAFE_BUILTINS: &[(&str, &str, SafeScope)] = &[
+    // ── claude ──────────────────────────────────────────────────────────────
+    // Reads a file's contents. Path-scoped: `Read` is exactly the tool that
+    // could otherwise walk out of the worktree into `~/.ssh`.
+    ("claude", "Read", SafeScope::ReadOnlyPath),
+    // `Glob` is NOT here — see the omissions above for why it was removed.
+    // `Grep` is NOT here — see the omissions above for why it was removed.
+    // Legacy notebook reader (superseded by `Read` in claude 2.x, still present
+    // in older CLIs weft may be pointed at). Read-only by construction.
+    ("claude", "NotebookRead", SafeScope::ReadOnlyPath),
+    // The agent's own in-session checklist. No filesystem, no network, no
+    // target: the input is the todo list itself.
+    ("claude", "TodoWrite", SafeScope::NoTarget),
+    // Loads deferred TOOL SCHEMAS into context. Returns declarations only, and
+    // any tool it surfaces still hits this bridge when actually called.
+    ("claude", "ToolSearch", SafeScope::NoTarget),
+    // ── codex ───────────────────────────────────────────────────────────────
+    // codex's analog of TodoWrite: the turn's plan steps. Same reasoning.
+    ("codex", "update_plan", SafeScope::NoTarget),
+];
+
+/// Argument keys that NAME A TARGET for the path-scoped builtins, across the
+/// engines' spelling conventions (claude `file_path`, opencode `filePath`,
+/// `path` for the `Glob` root, `notebook_path` for the legacy notebook
+/// reader). When one of these is present it MUST be a string, absolute, and
+/// contained — a relative or `~`-prefixed value is refused rather than guessed
+/// at, because resolving it would mean trusting a base directory the agent
+/// could be wrong about.
+const TARGET_KEYS: &[&str] = &[
+    "file_path",
+    "filePath",
+    "path",
+    "notebook_path",
+    "notebookPath",
+];
+
+/// The scope at which `(engine, tool_name)` may skip the human, or `None` when
+/// it may not — the single lookup `server::handle_ask` consults.
+pub fn safe_scope(engine: &str, tool_name: &str) -> Option<SafeScope> {
+    SAFE_BUILTINS
+        .iter()
+        .find(|(e, t, _)| *e == engine && *t == tool_name)
+        .map(|(_, _, scope)| *scope)
+}
+
+/// Whether `path` resolves INSIDE one of `roots`.
+///
+/// Both sides are canonicalized, so this is containment of REAL locations, not
+/// of the strings naming them: a symlink planted inside a worktree that points
+/// at `~/.ssh` resolves outside every root and is refused, and macOS's
+/// `/tmp` → `/private/tmp` aliasing doesn't produce a spurious miss. `roots`
+/// arrives pre-canonicalized from `server::session_roots` (canonicalizing it
+/// per call would re-stat every root on every ask).
+///
+/// `Path::starts_with` compares whole COMPONENTS, so `/repo-evil` is correctly
+/// not inside `/repo`.
+///
+/// A path that can't be canonicalized — most often one that doesn't exist yet —
+/// is NOT contained. Deliberate: containment can't be established for a
+/// location that isn't there, and the honest answer to "can't establish it" is
+/// the card. A read of a nonexistent file was going to fail in the engine
+/// anyway.
+///
+/// The RESOLVED path is also re-run through the credential check, and that is
+/// not belt-and-braces — it closes a seam between this module's two conditions.
+/// `handle_ask` computes `classify_risk` from the RAW argument while this
+/// function resolves it, so a symlink gives the two of them different paths to
+/// judge: `config.txt -> .env`, both inside the worktree, reads as `ReadOnly`
+/// on the name the request used and stays contained on the name it resolves
+/// to, and the secret comes back with no card. Judging the resolved target
+/// here means the veto applies to the file actually opened, not to the alias
+/// pointing at it. Caught in review by Codex on PR #146.
+fn contained(path: &str, roots: &[PathBuf]) -> bool {
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return false;
+    }
+    // BEFORE any filesystem call. `canonicalize` on a Windows UNC path
+    // (`\\host\share\x`) DIALS THE REMOTE SHARE, so deciding this after
+    // resolution would let a tool call weft is in the middle of GATING still
+    // perform agent-chosen network I/O from inside the hook — leaking Windows
+    // authentication to a host the agent picked, or hanging the whole ask on an
+    // unreachable one. Device/verbatim prefixes go the same way. A permission
+    // check must not become an outbound-request primitive. (Codex, PR #146.)
+    if has_non_disk_prefix(p) {
+        return false;
+    }
+    let Ok(real) = std::fs::canonicalize(p) else {
+        return false;
+    };
+    if !roots.iter().any(|r| real.starts_with(r)) {
+        return false;
+    }
+    if is_multi_linked(&real) {
+        return false;
+    }
+    resolved_target_is_read_only(&real)
+}
+
+/// A path anchored at something other than a plain disk volume — a UNC share,
+/// a device path, a verbatim UNC. Inert on unix, where the parser never
+/// produces a `Prefix` component at all.
+fn has_non_disk_prefix(p: &Path) -> bool {
+    p.components().any(|c| match c {
+        std::path::Component::Prefix(pre) => !matches!(
+            pre.kind(),
+            std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+        ),
+        _ => false,
+    })
+}
+
+/// A regular file reachable under MORE THAN ONE name.
+///
+/// `canonicalize` resolves symlinks but not hard links — a hard link is not an
+/// alias for another name, it is an equally real name for the same inode. So
+/// `wt/config.txt` hard-linked to an outside `.env` canonicalizes to itself,
+/// sits genuinely inside the root, and shows the veto nothing but
+/// `config.txt`. Neither containment nor a spelling check can see through
+/// that; the only signal available at this layer is that the target has more
+/// than one name, so a multi-linked file goes to the human. (Codex, PR #146.)
+///
+/// Files only — a directory legitimately has several links (`.`, `..`).
+/// Metadata failure gates, like every other unknown here. Windows hard links
+/// are NOT detected: `std::os::windows::fs::MetadataExt::number_of_links` is
+/// unstable, so this is a documented gap on a platform weft does not yet test.
+///
+/// KNOWN over-ask: package managers that hard-link from a content store
+/// (pnpm's `node_modules`, in this very repo) produce multi-linked files, so
+/// reading one asks. Accepted — the failure direction is a click.
+fn is_multi_linked(resolved: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return match std::fs::metadata(resolved) {
+            Ok(m) => m.is_file() && m.nlink() > 1,
+            Err(_) => true,
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = resolved;
+        false
+    }
+}
+
+/// The credential veto, applied to a path AFTER symlink resolution.
+///
+/// Reuses `classify_risk`'s `File` signal so the marker list stays single-
+/// sourced. `tool_name` is pinned to `"Read"` on purpose: the caller has
+/// already established that the TOOL is a read-only builtin, so what is being
+/// asked here is only "is this destination credential-shaped", and a fixed
+/// read verb keeps the verdict a function of the path alone.
+///
+/// Separators are normalized to `/` first, because several `CRED_NET_MARKERS`
+/// spell a path fragment (`.kube/config`, `.docker/config.json`, `.gnupg/`)
+/// and a Windows path rendered with backslashes would match none of them —
+/// `C:\wt\.kube\config` read as `ReadOnly` at every layer. (Codex, PR #146.)
+/// Safe on unix even though a backslash is a legal filename character there:
+/// this string is used ONLY for marker matching, never for filesystem access,
+/// and since no marker contains a backslash the rewrite can only make MORE
+/// things match — it moves the verdict toward gating, never away.
+///
+/// The same normalization would fix `ask::classify_file`'s Windows verdict for
+/// the CARD LABEL too, which is where this defect also shows. Left alone
+/// deliberately: that is shared display code two other in-flight PRs are
+/// editing, and the gate here does not depend on it.
+fn resolved_target_is_read_only(resolved: &Path) -> bool {
+    let normalized = resolved.to_string_lossy().replace('\\', "/");
+    crate::ask::classify_risk(crate::ask::RiskSignal::File {
+        tool_name: "Read",
+        path: &normalized,
+    }) == crate::ask::RiskLevel::ReadOnly
+}
+
+/// Every absolute-path-shaped string anywhere in `input` is inside `roots`, and
+/// every `TARGET_KEYS` entry present is a contained absolute path.
+///
+/// Two rules, because each covers what the other can't:
+///
+/// 1. A `TARGET_KEYS` key that IS present must be a string AND absolute AND
+///    contained. This is what refuses `{"file_path": 42}` and
+///    `{"file_path": "~/.ssh/id_rsa"}` — values rule 2 would skip because
+///    neither is an absolute path string. A target key that is ABSENT is fine:
+///    `Glob` then defaults to the engine's own cwd, which weft set to a
+///    root when it spawned the session — a fact that only holds once the
+///    session RESOLVED, hence the empty-`roots` refusal below.
+/// 2. Recursively, EVERY string value must stay inside the roots — absolute
+///    ones by containment, relative ones by carrying no `..` component (see
+///    `string_stays_in_root`). This is the rule that doesn't depend on knowing
+///    the tool's schema: an argument key that isn't in `TARGET_KEYS` — one
+///    added by a later CLI release, a nested option object, or a glob pattern
+///    that is a path in all but name — still can't reach out of the session's
+///    directories.
+///
+/// KNOWN, ACCEPTED over-refusals from rule 2, both of which cost a click and
+/// never an unwanted approval:
+///
+/// - A non-path string that merely STARTS with `/` — a `Grep` pattern like
+///   `^/api/v1`, a URL path fragment — reads as an out-of-root path. The
+///   alternative, deciding which leading-slash strings are "really" paths, is a
+///   guess in the direction this module refuses to guess in.
+/// - An ABSOLUTE glob pattern (`/wt/**/*.rs`) can't be canonicalized, so it
+///   isn't contained even when it points inside a root. The common shape
+///   claude actually emits — a relative `pattern` plus an absolute `path` — is
+///   unaffected.
+///
+/// An empty `roots` — a session weft could NOT resolve (stale direction,
+/// cross-thread route, deleted worktree; see `session_roots`) — refuses
+/// everything, before the arguments are even looked at.
+///
+/// That check has to come first rather than falling out of the path rules,
+/// because the targetless form has no path to fail on. `Grep {"pattern":
+/// "TODO"}` names nothing and searches the ENGINE'S CWD, and rule 1 waves it
+/// through on the strength of "the cwd is one of our roots" — which is exactly
+/// the fact an empty `roots` says we could not establish. Scanning the
+/// arguments would find nothing to reject and approve a read from an
+/// unverified directory, turning the fail-closed identity check in
+/// `session_roots` into a no-op for precisely the routes it exists to catch.
+/// (Caught in review by Codex on PR #146; this function's own test had
+/// asserted the permissive behavior as correct.)
+pub fn paths_contained(input: Option<&Value>, roots: &[PathBuf]) -> bool {
+    if roots.is_empty() {
+        return false;
+    }
+    let Some(v) = input else {
+        // No arguments at all: nothing points anywhere. A `Read`/`Glob` without
+        // arguments is malformed and the engine will reject it on its own.
+        return true;
+    };
+    if let Some(obj) = v.as_object() {
+        for key in TARGET_KEYS {
+            let Some(target) = obj.get(*key) else {
+                continue;
+            };
+            match target.as_str() {
+                Some(s) if contained(s, roots) => {}
+                _ => return false,
+            }
+        }
+    }
+    every_string_stays_in_root(v, roots)
+}
+
+/// Rule 2 of `paths_contained`, walked over the whole argument value.
+fn every_string_stays_in_root(v: &Value, roots: &[PathBuf]) -> bool {
+    match v {
+        Value::String(s) => string_stays_in_root(s, roots),
+        Value::Array(items) => items.iter().all(|i| every_string_stays_in_root(i, roots)),
+        Value::Object(map) => map.values().all(|i| every_string_stays_in_root(i, roots)),
+        _ => true,
+    }
+}
+
+/// One string argument can't reach outside `roots`.
+///
+/// The two halves are judged differently because they escape differently:
+///
+/// - ABSOLUTE: canonicalized and checked against the roots (`contained`). That
+///   collapses any `..` along the way, so `/wt/src/../lib.rs` is correctly
+///   judged by where it actually lands, not by how it's spelled.
+/// - RELATIVE: safe only because it resolves under the ENGINE'S CWD, which weft
+///   set to a root. Any component that escapes that anchoring is refused
+///   outright, since no amount of checking the rest of the string helps once
+///   the value no longer resolves under the cwd:
+///   - `ParentDir` (`..`) climbs above whatever the value is relative TO.
+///   - `RootDir` / `Prefix` are the WINDOWS forms of the same escape.
+///     `\Users\outside\*` has a root component but is NOT `is_absolute()`
+///     there (Windows wants a drive prefix too), so it would otherwise slip
+///     through this branch and search from the current drive's root;
+///     `C:foo` is drive-relative and just as unanchored. Both are inert on
+///     unix — a unix relative path can produce neither component — so this
+///     costs nothing on the platforms weft tests today and closes the hole on
+///     the one it doesn't. Caught in review by Codex on PR #146.
+///
+/// The relative half is what catches `Glob {"pattern": "../outside/*"}`: the
+/// pattern isn't absolute, so the containment check never looked at it, yet
+/// glob resolution walks straight up out of the root and `classify_risk` still
+/// (correctly) calls the call read-only. Caught in review by Codex on PR #146.
+///
+/// Checking COMPONENTS rather than substrings keeps a regex like `a..b` — one
+/// component, not a parent reference — out of it. A relative value that
+/// harmlessly doubles back inside the root (`src/../lib.rs`) is refused too:
+/// over-refusal, the accepted direction, and not a shape the engines emit.
+fn string_stays_in_root(s: &str, roots: &[PathBuf]) -> bool {
+    let p = Path::new(s);
+    if p.is_absolute() {
+        return contained(s, roots);
+    }
+    !p.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A temp dir that cleans itself up, so a failing assert can't leak a tree.
+    struct TempTree(PathBuf);
+    impl TempTree {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "weft-allow-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            TempTree(std::fs::canonicalize(&p).unwrap())
+        }
+        fn file(&self, rel: &str) -> String {
+            let p = self.0.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, b"x").unwrap();
+            p.to_string_lossy().to_string()
+        }
+        fn roots(&self) -> Vec<PathBuf> {
+            vec![self.0.clone()]
+        }
+    }
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn safe_scope_is_exact_and_engine_keyed() {
+        assert_eq!(
+            safe_scope("claude", "Read"),
+            Some(SafeScope::ReadOnlyPath),
+            "the storm this whole module exists for"
+        );
+        assert_eq!(safe_scope("claude", "TodoWrite"), Some(SafeScope::NoTarget));
+        assert_eq!(
+            safe_scope("codex", "update_plan"),
+            Some(SafeScope::NoTarget)
+        );
+        // claude's entries must NOT leak to another engine: opencode flattens
+        // MCP names as `<server>_<tool>`, so a server `update` + tool `plan`
+        // reports exactly `update_plan`.
+        assert_eq!(safe_scope("opencode", "update_plan"), None);
+        assert_eq!(safe_scope("codex", "Read"), None);
+        assert_eq!(safe_scope("opencode", "Read"), None);
+        // Case-sensitive: opencode's `read` is a DIFFERENT tool from claude's.
+        assert_eq!(safe_scope("claude", "read"), None);
+        assert_eq!(safe_scope("claude", "READ"), None);
+        assert_eq!(safe_scope("opencode", "read"), None);
+    }
+
+    #[test]
+    fn dangerous_builtins_are_never_allowlisted() {
+        // The half of each CLI's vocabulary that writes, executes, or leaves
+        // the machine. If any of these ever answers Some(..), the bridge has
+        // stopped gating the thing it exists to gate.
+        for name in [
+            // Both removed from the allowlist after review — they take PATTERN
+            // languages, whose expansion (not spelling) decides what is read.
+            "Grep",
+            "Glob",
+            "Bash",
+            "BashOutput",
+            "KillShell",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "Agent",
+            "Task",
+            "Skill",
+            "SlashCommand",
+            "ExitPlanMode",
+            "EnterWorktree",
+            "LSP",
+            "ReadMcpResourceTool",
+            "ListMcpResourcesTool",
+            "PowerShell",
+            "Artifact",
+            "apply_patch",
+            "exec_command",
+            "shell",
+            "write_stdin",
+            "spawn_agent",
+            "view_image",
+            "mcp__weft_bus__bus_post",
+            "mcp__anything__anything",
+        ] {
+            for engine in ["claude", "codex", "opencode"] {
+                assert_eq!(
+                    safe_scope(engine, name),
+                    None,
+                    "{engine}/{name} must still surface the card"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_inside_a_root_is_contained() {
+        let t = TempTree::new("inside");
+        let f = t.file("src/main.rs");
+        assert!(paths_contained(
+            Some(&json!({ "file_path": f })),
+            &t.roots()
+        ));
+    }
+
+    #[test]
+    fn read_outside_every_root_is_refused() {
+        let t = TempTree::new("outside");
+        let other = TempTree::new("outside-other");
+        let f = other.file("secrets.txt");
+        assert!(!paths_contained(
+            Some(&json!({ "file_path": f })),
+            &t.roots()
+        ));
+        // ...including the classic absolute targets.
+        assert!(!paths_contained(
+            Some(&json!({ "file_path": "/etc/hosts" })),
+            &t.roots()
+        ));
+    }
+
+    #[test]
+    fn sibling_root_prefix_is_not_containment() {
+        // `/x/repo-evil` must not count as inside `/x/repo` just because the
+        // string starts with it. Component-wise `starts_with` is what saves us.
+        let base = TempTree::new("prefix");
+        let root = base.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let evil = base.0.join("repo-evil");
+        std::fs::create_dir_all(&evil).unwrap();
+        std::fs::write(evil.join("f.txt"), b"x").unwrap();
+        assert!(!paths_contained(
+            Some(&json!({ "file_path": evil.join("f.txt").to_string_lossy() })),
+            &[root]
+        ));
+    }
+
+    #[test]
+    fn dotdot_traversal_out_of_a_root_is_refused() {
+        let base = TempTree::new("dotdot");
+        let root = base.0.join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = base.file("outside.txt");
+        let traversal = root.join("..").join("outside.txt");
+        assert!(std::fs::metadata(&traversal).is_ok(), "target exists");
+        assert!(
+            !paths_contained(
+                Some(&json!({ "file_path": traversal.to_string_lossy() })),
+                &[root]
+            ),
+            "canonicalization must collapse `..` before the prefix check, got {outside}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escaping_a_root_is_refused() {
+        // The containment property has to hold for REAL locations: a repo (or
+        // an agent, via an earlier approved write) can plant a symlink inside
+        // the worktree that points anywhere.
+        let base = TempTree::new("symlink");
+        let root = base.0.join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        let secret = base.file("id_rsa");
+        let link = root.join("innocent.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert!(
+            !paths_contained(
+                Some(&json!({ "file_path": link.to_string_lossy() })),
+                &[root.clone()]
+            ),
+            "a symlink out of the root must not be auto-approved"
+        );
+        // ...while a symlink that stays inside is still fine.
+        let inner = root.join("real.txt");
+        std::fs::write(&inner, b"x").unwrap();
+        let inner_link = root.join("alias.txt");
+        std::os::unix::fs::symlink(&inner, &inner_link).unwrap();
+        assert!(paths_contained(
+            Some(&json!({ "file_path": inner_link.to_string_lossy() })),
+            &[root]
+        ));
+    }
+
+    /// A symlink with an innocuous NAME pointing at a credential-shaped file
+    /// INSIDE the same root is refused — the seam between this module's two
+    /// conditions.
+    ///
+    /// `handle_ask` classifies the RAW argument while this module resolves it,
+    /// so `config.txt -> .env` gives them different paths to judge: `ReadOnly`
+    /// on the name the request used, contained on the name it resolves to. The
+    /// veto has to follow the resolution. Codex caught it on PR #146.
+    #[cfg(unix)]
+    #[test]
+    fn credential_target_behind_an_innocuous_symlink_is_refused() {
+        let base = TempTree::new("aliased-cred");
+        let root = base.0.join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        let secret = root.join(".env");
+        std::fs::write(&secret, b"TOKEN=1").unwrap();
+        let alias = root.join("config.txt");
+        std::os::unix::fs::symlink(&secret, &alias).unwrap();
+
+        // The raw name is innocuous AND the target is inside the root, so
+        // neither the risk verdict on the argument nor containment refuses it.
+        assert_eq!(
+            crate::ask::classify_risk(crate::ask::RiskSignal::File {
+                tool_name: "Read",
+                path: &alias.to_string_lossy(),
+            }),
+            crate::ask::RiskLevel::ReadOnly,
+            "premise: the alias itself looks harmless"
+        );
+        assert!(
+            !paths_contained(
+                Some(&json!({ "file_path": alias.to_string_lossy() })),
+                &[root]
+            ),
+            "the veto must follow the symlink to what is actually opened"
+        );
+    }
+
+    /// A HARD link inside the root, pointing at a credential file outside it.
+    ///
+    /// `canonicalize` resolves symlinks but not hard links — the alias is an
+    /// equally real name for the same inode, so it canonicalizes to ITSELF and
+    /// sits genuinely inside the root. Containment can't see it and the veto
+    /// sees only `config.txt`. Multiple names is the one signal left at this
+    /// layer. Codex caught it on PR #146.
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_credential_alias_is_refused() {
+        let base = TempTree::new("hardlink");
+        let root = base.0.join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        let secret = base.0.join("outside.env");
+        std::fs::write(&secret, b"TOKEN=1").unwrap();
+        let alias = root.join("config.txt");
+        // Same filesystem (same temp tree), so the link really is created.
+        std::fs::hard_link(&secret, &alias).unwrap();
+
+        // Premise: neither of the other two conditions objects. The alias
+        // canonicalizes to itself, INSIDE the root...
+        assert_eq!(
+            std::fs::canonicalize(&alias).unwrap(),
+            alias,
+            "premise: a hard link is not resolved away"
+        );
+        // ...and its name is innocuous.
+        assert_eq!(
+            crate::ask::classify_risk(crate::ask::RiskSignal::File {
+                tool_name: "Read",
+                path: &alias.to_string_lossy(),
+            }),
+            crate::ask::RiskLevel::ReadOnly,
+            "premise: the alias itself looks harmless"
+        );
+        assert!(
+            !paths_contained(
+                Some(&json!({ "file_path": alias.to_string_lossy() })),
+                &[root.clone()]
+            ),
+            "a multi-linked target must go to the human"
+        );
+
+        // Mirror: an ordinary single-linked file in the same root is fine, so
+        // the check can't be satisfied by refusing everything.
+        let plain = root.join("main.rs");
+        std::fs::write(&plain, b"x").unwrap();
+        assert!(paths_contained(
+            Some(&json!({ "file_path": plain.to_string_lossy() })),
+            &[root]
+        ));
+    }
+
+    /// The credential markers spell path fragments with `/`, so a
+    /// backslash-separated rendering matched none of them.
+    ///
+    /// Asserted through the normalization helper rather than a real Windows
+    /// path, so it runs on every platform: the point is that the string handed
+    /// to the classifier has `/` separators. Codex caught it on PR #146.
+    #[test]
+    fn backslash_separated_credential_paths_are_normalized() {
+        // Slash-spelled markers that a raw Windows rendering would miss.
+        for tail in [".kube\\config", ".docker\\config.json", ".gnupg\\key"] {
+            let win = PathBuf::from(format!("C:\\wt\\{tail}"));
+            assert!(
+                !resolved_target_is_read_only(&win),
+                "a backslash-spelled credential path must still trip the veto: {tail}"
+            );
+        }
+        // Mirror: an ordinary backslash-spelled path is still fine.
+        assert!(resolved_target_is_read_only(&PathBuf::from(
+            "C:\\wt\\src\\main.rs"
+        )));
+    }
+
+    /// A UNC / device path is refused BEFORE `canonicalize` is called on it, so
+    /// the permission hook never dials a host the agent chose. Asserted via the
+    /// prefix predicate, which is what runs ahead of the filesystem call.
+    #[test]
+    fn unc_and_device_paths_are_rejected_before_any_filesystem_call() {
+        for p in [
+            r"\\host\share\file",
+            r"\\?\UNC\host\share\file",
+            r"\\.\PhysicalDrive0",
+        ] {
+            let path = PathBuf::from(p);
+            #[cfg(windows)]
+            assert!(has_non_disk_prefix(&path), "{p} must be refused");
+            // On unix these are not absolute at all, so `contained` refuses
+            // them one step earlier — either way, no filesystem call.
+            #[cfg(not(windows))]
+            assert!(
+                has_non_disk_prefix(&path) || !path.is_absolute(),
+                "{p} must never reach canonicalize"
+            );
+        }
+        // An ordinary disk path is not caught by the prefix check.
+        assert!(!has_non_disk_prefix(&PathBuf::from(r"C:\wt\src\main.rs")));
+        assert!(!has_non_disk_prefix(&PathBuf::from("/wt/src/main.rs")));
+    }
+
+    #[test]
+    fn relative_and_tilde_targets_are_refused() {
+        let t = TempTree::new("relative");
+        t.file("src/main.rs");
+        // Relative: weft would have to guess the base directory to resolve it.
+        assert!(!paths_contained(
+            Some(&json!({ "file_path": "src/main.rs" })),
+            &t.roots()
+        ));
+        // `~` is not expanded by `Path`, so it is not absolute — rule 1 must
+        // still refuse it rather than letting rule 2 skip past it.
+        assert!(!paths_contained(
+            Some(&json!({ "file_path": "~/.ssh/id_rsa" })),
+            &t.roots()
+        ));
+    }
+
+    #[test]
+    fn non_string_target_is_refused() {
+        let t = TempTree::new("nonstring");
+        for bad in [json!(42), json!(null), json!(["/a", "/b"]), json!({})] {
+            assert!(
+                !paths_contained(Some(&json!({ "file_path": bad })), &t.roots()),
+                "a target key that isn't a string must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_target_key_is_fine_but_stray_absolute_paths_are_not() {
+        let t = TempTree::new("missing");
+        // Glob without `path` searches the session's own cwd — a root.
+        assert!(paths_contained(
+            Some(&json!({ "pattern": "TODO", "output_mode": "content" })),
+            &t.roots()
+        ));
+        // But an absolute path under ANY key — including one this module
+        // doesn't know — must still be contained (rule 2).
+        assert!(!paths_contained(
+            Some(&json!({ "pattern": "TODO", "some_future_key": "/etc/passwd" })),
+            &t.roots()
+        ));
+        // ...and nested inside arrays/objects, too.
+        assert!(!paths_contained(
+            Some(&json!({ "opts": { "extra_dirs": ["/etc"] } })),
+            &t.roots()
+        ));
+    }
+
+    #[test]
+    fn multiple_roots_each_admit_their_own_files() {
+        // A direction can own one worktree per repo; a file in ANY of them is
+        // inside the session.
+        let a = TempTree::new("multi-a");
+        let b = TempTree::new("multi-b");
+        let outside = TempTree::new("multi-c");
+        let roots = vec![a.0.clone(), b.0.clone()];
+        for f in [a.file("x.rs"), b.file("y.rs")] {
+            assert!(paths_contained(Some(&json!({ "file_path": f })), &roots));
+        }
+        assert!(!paths_contained(
+            Some(&json!({ "file_path": outside.file("z.rs") })),
+            &roots
+        ));
+    }
+
+    /// An unresolvable session (stale direction, cross-thread route, deleted
+    /// worktree) auto-approves NOTHING path-scoped — including the forms that
+    /// name no path at all.
+    ///
+    /// The targetless case is the one that matters and the one this test
+    /// originally got WRONG: it asserted that `Grep {"pattern":"x"}` was fine
+    /// with no roots, reasoning that a call naming nothing has nothing to
+    /// contain. But it does have a target — the engine's cwd — and "the cwd is
+    /// one of our roots" is exactly what an empty `roots` means we could not
+    /// establish. Scanning arguments finds nothing to reject, so the identity
+    /// check in `session_roots` silently became a no-op for the very routes it
+    /// guards. Codex caught it in review on PR #146.
+    #[test]
+    fn empty_roots_auto_approve_nothing_at_all() {
+        let t = TempTree::new("noroots");
+        let f = t.file("a.rs");
+        assert!(
+            !paths_contained(Some(&json!({ "file_path": f })), &[]),
+            "an unresolvable session must not auto-approve a path-scoped read"
+        );
+        for targetless in [
+            json!({ "pattern": "x" }),
+            json!({ "pattern": "x", "output_mode": "content" }),
+            json!({}),
+        ] {
+            assert!(
+                !paths_contained(Some(&targetless), &[]),
+                "a cwd-defaulting call must not be approved against an \
+                 unverified cwd: {targetless}"
+            );
+        }
+        assert!(!paths_contained(None, &[]));
+    }
+
+    /// A RELATIVE argument climbs out with `..` — the absolute-path rule never
+    /// looks at it, but glob/path resolution follows it right out of the root.
+    ///
+    /// `Glob {"pattern": "../outside/*"}` is the shape that matters: no
+    /// absolute string anywhere, an optional `path` that is itself perfectly
+    /// contained, and `classify_risk` correctly calling the whole thing
+    /// read-only — so every other guard says yes. Codex caught it on PR #146.
+    #[test]
+    fn parent_traversing_relative_args_are_refused() {
+        let t = TempTree::new("dotdot-rel");
+        let wt = t.0.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let roots = vec![wt.clone()];
+        for escaping in [
+            json!({ "pattern": "../outside/*" }),
+            // ...even alongside a `path` that IS contained: the pattern
+            // resolves relative to it and climbs out anyway.
+            json!({ "pattern": "../*", "path": wt.to_string_lossy() }),
+            json!({ "pattern": "**/../../etc/*" }),
+            json!({ "opts": { "globs": ["ok/*", "../escape/*"] } }),
+        ] {
+            assert!(
+                !paths_contained(Some(&escaping), &roots),
+                "a parent-traversing relative arg must not be auto-approved: {escaping}"
+            );
+        }
+    }
+
+    /// A relative value can also escape via the WINDOWS root forms, which
+    /// `is_absolute()` rejects there: `\Users\outside\*` has a `RootDir` but no
+    /// drive prefix, and `C:foo` has a prefix but no root. Both would search
+    /// from somewhere other than the cwd. Codex caught it on PR #146.
+    ///
+    /// Asserted on every platform: on unix these strings simply can't be
+    /// produced by a real relative path, so the check is inert there — but the
+    /// assertion still pins the INTENT, and the code is compiled for Windows.
+    /// `\Users\outside\*` is one opaque component on unix and so passes; the
+    /// forward-slash spelling is what unix actually parses as a root.
+    #[test]
+    fn windows_root_relative_args_are_refused() {
+        let t = TempTree::new("winroot");
+        // Parsed as RootDir on unix; on Windows this is the drive-relative
+        // form `is_absolute()` says false to. Refused on both.
+        assert!(!paths_contained(
+            Some(&json!({ "pattern": "/Users/outside/*" })),
+            &t.roots()
+        ));
+        #[cfg(windows)]
+        {
+            for escaping in [
+                json!({ "pattern": "\\Users\\outside\\*" }),
+                json!({ "pattern": "C:foo\\*" }),
+            ] {
+                assert!(
+                    !paths_contained(Some(&escaping), &t.roots()),
+                    "a Windows root-relative arg must not be auto-approved: {escaping}"
+                );
+            }
+        }
+    }
+
+    /// The mirror: ordinary relative arguments — the overwhelmingly common
+    /// case — must keep working, so the `..` refusal can't be "fixed" by
+    /// something that refuses every relative value.
+    #[test]
+    fn ordinary_relative_args_still_pass() {
+        let t = TempTree::new("rel-ok");
+        for fine in [
+            json!({ "pattern": "**/*.rs" }),
+            json!({ "pattern": "src/**/*.ts", "output_mode": "content" }),
+            // `..` as regex syntax, not a path component: one component named
+            // `a..b`, which is not a parent reference.
+            json!({ "pattern": "a..b" }),
+        ] {
+            assert!(
+                paths_contained(Some(&fine), &t.roots()),
+                "an ordinary relative arg must stay auto-approved: {fine}"
+            );
+        }
+    }
+
+    /// The mirror of the above, so the empty-roots refusal can't be "fixed" by
+    /// something that also breaks the ordinary cwd-defaulting call: with a
+    /// RESOLVED session, naming no path is still fine.
+    #[test]
+    fn targetless_call_is_fine_once_the_session_resolves() {
+        let t = TempTree::new("targetless-ok");
+        assert!(paths_contained(
+            Some(&json!({ "pattern": "TODO" })),
+            &t.roots()
+        ));
+        assert!(paths_contained(None, &t.roots()));
+    }
+
+    #[test]
+    fn nonexistent_path_is_refused() {
+        let t = TempTree::new("missing-file");
+        let ghost = t.0.join("never-written.rs");
+        assert!(
+            !paths_contained(
+                Some(&json!({ "file_path": ghost.to_string_lossy() })),
+                &t.roots()
+            ),
+            "containment can't be established for a path that isn't there"
+        );
+    }
+}
