@@ -459,6 +459,21 @@ async fn register_pr_tool(db: &Db, thread: i32, dir: &str, url: &str, title: &st
             "could not parse a PR/MR number and repo from '{url}' — expected a GitHub pull request URL (…/pull/N) or a GitLab merge request URL (…/-/merge_requests/N)"
         ));
     };
+    // Reject an unimplemented host BEFORE creating a row, not after: a row
+    // for a host with no working `PrHost` backend would sweep-fail forever
+    // (every ~60s) with no way to self-clear (the readiness question never
+    // resolves) and no manual dismiss (a non-answerable Needs-you NOTICE has
+    // no close button — see `NeedsRows.tsx`'s `AskRow`). For GitLab
+    // specifically — the exact host this issue's user explicitly needs
+    // supported — that would mean the FIRST time anyone tries it, they get a
+    // permanently-stuck card. Fail the registration itself, honestly, instead.
+    if crate::host::resolve_host(parts.host_kind).is_err() {
+        return text_result(format!(
+            "{} tracking isn't supported yet — weft's PR/MR automation currently only implements GitHub. This {} was NOT registered; please track it yourself for now.",
+            parts.host_kind.native_noun(),
+            parts.host_kind.native_noun()
+        ));
+    }
     let direction_id = dir.parse::<i32>().unwrap_or(0);
     let repo_id = match crate::store::repo::get_direction(db, direction_id).await {
         Ok(Some(d)) => d.repo_id,
@@ -1109,10 +1124,10 @@ fn tool_specs() -> Value {
         },
         {
             "name": "register_pr",
-            "description": "Tell weft you just opened a pull/merge request for this task, so it tracks CI, review, and conflict state in the background and posts to Needs-you if something needs you — instead of that state only living in this conversation (which doesn't survive a restart). Call this right after `gh pr create` / `glab mr create` succeeds, with the URL it printed. Re-calling it for the same PR/MR (e.g. after a restart) just refreshes context, it does not duplicate tracking.",
+            "description": "Tell weft you just opened a pull request for this task, so it tracks CI, review, and conflict state in the background and posts to Needs-you if something needs you — instead of that state only living in this conversation (which doesn't survive a restart). Call this right after `gh pr create` succeeds, with the URL it printed. Re-calling it for the same PR (e.g. after a restart) just refreshes context, it does not duplicate tracking. GitHub only for now — a GitLab merge request URL is recognized but currently REJECTED (not yet supported), so don't rely on this for GitLab repos.",
             "inputSchema": { "type": "object",
                 "properties": {
-                    "url": { "type": "string", "description": "The PR/MR web URL, e.g. https://github.com/owner/repo/pull/123 or https://gitlab.example.com/group/project/-/merge_requests/45 — host, owner/namespace, repo, and number are all parsed from this." },
+                    "url": { "type": "string", "description": "The PR web URL, e.g. https://github.com/owner/repo/pull/123 — host, owner, repo, and number are all parsed from this." },
                     "title": str_prop()
                 }, "required": ["url"] }
         }
@@ -1358,6 +1373,40 @@ mod tests {
             .unwrap();
         assert_eq!(tracked.direction_id, 0);
         assert_eq!(tracked.repo_id, 0);
+    }
+
+    /// P1 (issue #110 adversarial review): a GitLab MR URL parses cleanly
+    /// (`host::parse_pr_url` recognizes the shape) but `resolve_host(GitLab)`
+    /// has no working backend — registering it anyway would create a row
+    /// that fails every sweep FOREVER with no way to self-clear (readiness
+    /// never resolves) and no manual dismiss (a NOTICE has no close button).
+    /// Must be rejected at registration, honestly, with NOTHING written to
+    /// the DB — not silently accepted and left to fail later.
+    #[tokio::test]
+    async fn register_pr_tool_rejects_an_unsupported_gitlab_host_without_creating_a_row() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "codex")
+            .await
+            .unwrap();
+
+        let result = register_pr_tool(
+            &db,
+            thread.id,
+            "lead",
+            "https://gitlab.com/my-group/my-project/-/merge_requests/12",
+            "",
+        )
+        .await;
+        let text = tool_text(&result).to_lowercase();
+        assert!(text.contains("not registered"), "must clearly say it was not registered, got: {text}");
+        assert!(text.contains("support"), "must clearly explain WHY (unsupported host), got: {text}");
+
+        let tracked =
+            crate::store::repo::find_pull_request(&db, "gitlab", "my-group", "my-project", 12)
+                .await
+                .unwrap();
+        assert!(tracked.is_none(), "an unsupported host must never create a trackable (and un-clearable) row");
     }
 
     #[test]

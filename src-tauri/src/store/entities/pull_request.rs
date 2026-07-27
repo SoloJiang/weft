@@ -77,6 +77,15 @@ pub struct Model {
     /// axes as if they were fresh.
     #[sea_orm(default_value = "")]
     pub last_error: String,
+    /// Consecutive FAILED probe attempts since the last success; reset to 0
+    /// on any success. Once this reaches `host::monitor`'s give-up threshold,
+    /// `repo::list_open_pull_requests` stops returning the row — a
+    /// persistently-failing probe (a deleted PR, revoked `gh` auth) must not
+    /// hammer the host forever, and the LAST posted Needs-you notice stays in
+    /// place (not cleared — clearing would falsely claim "resolved") as an
+    /// honest "we stopped checking" signal rather than an infinite retry.
+    #[sea_orm(default_value = 0)]
+    pub probe_fail_count: i32,
     pub created_at: String,
 }
 

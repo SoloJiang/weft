@@ -3625,12 +3625,20 @@ pub async fn get_pull_request(db: &Db, id: i32) -> Result<Option<pull_request::M
     Ok(pull_request::Entity::find_by_id(id).one(&db.0).await?)
 }
 
-/// Every row the monitor still needs to sweep — i.e. still `open`. A merged
-/// or closed row falls out of this query permanently: there is nothing left
-/// to poll once the change unit itself is resolved.
-pub async fn list_open_pull_requests(db: &Db) -> Result<Vec<pull_request::Model>> {
+/// Every row the monitor still needs to sweep — i.e. still `open` AND not
+/// (yet) given up on. `max_probe_fail_count` is the caller's give-up
+/// threshold (see `host::monitor::MAX_CONSECUTIVE_PROBE_FAILURES`): a row
+/// whose `probe_fail_count` has reached it stops being returned here — a
+/// persistently-failing probe (deleted PR, revoked auth) must not be retried
+/// forever, but a merged/closed row (this function's OTHER exclusion) and a
+/// row still under the threshold are unaffected.
+pub async fn list_open_pull_requests(
+    db: &Db,
+    max_probe_fail_count: i32,
+) -> Result<Vec<pull_request::Model>> {
     Ok(pull_request::Entity::find()
         .filter(pull_request::Column::Lifecycle.eq("open"))
+        .filter(pull_request::Column::ProbeFailCount.lt(max_probe_fail_count))
         .all(&db.0)
         .await?)
 }
@@ -3725,18 +3733,23 @@ pub async fn apply_pull_request_snapshot(
     a.merge_readiness = Set(serde_json::to_string(readiness).unwrap_or_default());
     a.last_checked_at = Set(now());
     a.last_error = Set(String::new());
+    a.probe_fail_count = Set(0); // a success resets the consecutive-failure streak
     a.update(&db.0).await?;
     Ok(())
 }
 
-/// Record a failed probe attempt without touching the last known snapshot.
+/// Record a failed probe attempt without touching the last known snapshot,
+/// and bump the consecutive-failure streak (`list_open_pull_requests` stops
+/// sweeping the row once this reaches the caller's give-up threshold).
 pub async fn mark_pull_request_probe_error(db: &Db, id: i32, message: &str) -> Result<()> {
     let Some(row) = pull_request::Entity::find_by_id(id).one(&db.0).await? else {
         return Ok(());
     };
+    let next_fail_count = row.probe_fail_count.saturating_add(1);
     let mut a: pull_request::ActiveModel = row.into();
     a.last_checked_at = Set(now());
     a.last_error = Set(message.to_string());
+    a.probe_fail_count = Set(next_fail_count);
     a.update(&db.0).await?;
     Ok(())
 }
@@ -7367,9 +7380,56 @@ mod tests {
         a.lifecycle = Set("merged".to_string());
         a.update(&db.0).await.unwrap();
 
-        let listed = list_open_pull_requests(&db).await.unwrap();
+        let listed = list_open_pull_requests(&db, 10).await.unwrap();
         let ids: Vec<i32> = listed.iter().map(|p| p.id).collect();
         assert_eq!(ids, vec![open.id]);
+    }
+
+    /// P1 (issue #110 adversarial review): a row that has failed enough
+    /// CONSECUTIVE probes falls out of the sweep too — a persistently-broken
+    /// probe (deleted PR, revoked auth) must not be retried forever.
+    #[tokio::test]
+    async fn list_open_pull_requests_excludes_rows_past_the_probe_failure_threshold() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let healthy = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 1, "", "",
+        )
+        .await
+        .unwrap();
+        let broken = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 2, "", "",
+        )
+        .await
+        .unwrap();
+
+        // Under the threshold: still swept.
+        mark_pull_request_probe_error(&db, broken.id, "blip").await.unwrap();
+        let listed = list_open_pull_requests(&db, 2).await.unwrap();
+        assert_eq!(listed.len(), 2, "a single failure must not stop the sweep");
+
+        // At the threshold: no longer swept.
+        mark_pull_request_probe_error(&db, broken.id, "still broken").await.unwrap();
+        let listed = list_open_pull_requests(&db, 2).await.unwrap();
+        let ids: Vec<i32> = listed.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![healthy.id], "a row at the give-up threshold must fall out of the sweep");
+
+        // A later SUCCESS resets the streak — the row rejoins the sweep.
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: "abc".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Open,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        let readiness =
+            crate::host::judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+        apply_pull_request_snapshot(&db, broken.id, &snapshot, &readiness).await.unwrap();
+        let listed = list_open_pull_requests(&db, 2).await.unwrap();
+        assert_eq!(listed.len(), 2, "a success must reset the failure streak and rejoin the sweep");
     }
 
     #[tokio::test]

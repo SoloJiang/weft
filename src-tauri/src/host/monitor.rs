@@ -35,6 +35,18 @@ use crate::store::{repo, Db};
 /// Override with `WEFT_PR_SWEEP_SECS`.
 const PR_SWEEP_DEFAULT_SECS: u64 = 60;
 
+/// After this many CONSECUTIVE failed probes, a row stops being swept (see
+/// `repo::list_open_pull_requests`) — it is NOT retried forever. At the
+/// default 60s cadence this is ~10 minutes of persistent failure: long
+/// enough to ride out a transient blip (a network hiccup, a momentary `gh`
+/// rate limit), short enough not to hammer the host indefinitely for
+/// something that has clearly stopped being transient (a deleted PR, `gh`
+/// auth revoked and never restored). The row's last-posted Needs-you notice
+/// is left in place when this fires — not retracted (that would falsely
+/// claim "resolved") — an honest "here's the last thing we knew, we've
+/// stopped checking" rather than a silent infinite retry loop.
+const MAX_CONSECUTIVE_PROBE_FAILURES: i32 = 10;
+
 /// Start the runtime PR/MR sweep. Call once at app setup, alongside
 /// `revive::spawn_stall_watch` (see `lib.rs`).
 pub fn spawn_pr_watch(app: AppHandle) {
@@ -48,7 +60,19 @@ pub fn spawn_pr_watch(app: AppHandle) {
         // one notice latch, seeded by an IMMEDIATE first pass, so a notice
         // posted before the first timer tick is tracked from the start
         // instead of being re-posted (or left un-retractable) a tick later.
-        let mut notices: HashMap<i32, (u64, String)> = HashMap::new();
+        // Keyed by pr_id -> (thread_id it was posted under, ask_id, text) —
+        // the thread_id MUST be stored alongside the ask, not read live off
+        // the row at retraction time: `register_pull_request`'s own doc says
+        // thread/direction can legitimately change across a re-registration,
+        // and `cancel_open_asks_by_id` is scoped to a specific thread's bus,
+        // so retracting under the row's CURRENT (possibly reassigned)
+        // thread_id would silently miss the ask actually posted under the
+        // OLD one, leaving it stuck forever (no manual dismiss exists for a
+        // non-answerable notice — see `NeedsRows.tsx`'s `AskRow`). Mirrors
+        // `revive::spawn_stall_watch`'s `stopped_notices: HashMap<i32, (i32,
+        // u64)>` (dir_id -> (thread_id, ask_id)) exactly, for exactly the
+        // same reason.
+        let mut notices: HashMap<i32, (i32, u64, String)> = HashMap::new();
         run_pr_sweep(&app, &mut notices).await;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(sweep_secs)).await;
@@ -58,7 +82,7 @@ pub fn spawn_pr_watch(app: AppHandle) {
 }
 
 /// One sweep pass over every still-`open` tracked row.
-async fn run_pr_sweep(app: &AppHandle, notices: &mut HashMap<i32, (u64, String)>) {
+async fn run_pr_sweep(app: &AppHandle, notices: &mut HashMap<i32, (i32, u64, String)>) {
     let Some(db) = app.try_state::<Db>() else {
         return;
     };
@@ -68,7 +92,7 @@ async fn run_pr_sweep(app: &AppHandle, notices: &mut HashMap<i32, (u64, String)>
     };
     let bus = bus.inner().clone();
 
-    let open = match repo::list_open_pull_requests(&db).await {
+    let open = match repo::list_open_pull_requests(&db, MAX_CONSECUTIVE_PROBE_FAILURES).await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[weft][host] pr sweep: could not list tracked PR/MRs: {e}");
@@ -87,7 +111,7 @@ async fn check_one(
     app: &AppHandle,
     db: &Db,
     bus: &crate::bus::BusRegistry,
-    notices: &mut HashMap<i32, (u64, String)>,
+    notices: &mut HashMap<i32, (i32, u64, String)>,
     pr: pull_request::Model,
 ) {
     let Some(kind) = HostKind::parse(&pr.host_kind) else {
@@ -124,7 +148,7 @@ async fn apply_probe_result(
     app: &AppHandle,
     db: &Db,
     bus: &crate::bus::BusRegistry,
-    notices: &mut HashMap<i32, (u64, String)>,
+    notices: &mut HashMap<i32, (i32, u64, String)>,
     pr: &pull_request::Model,
     kind: Option<HostKind>,
     result: Result<PrSnapshot, super::HostError>,
@@ -159,47 +183,85 @@ async fn apply_probe_result(
 }
 
 /// Apply whatever [`judge::plan_notice_action`] says about the Needs-you
-/// notice for this PR/MR: post, replace, retract, or leave alone. `from` is
-/// the direction id (as a string) that owns this PR — same convention every
-/// other per-task notice in this codebase already uses (see
-/// `lead_chat::engine`'s stall/freeze notices), so it lands attributed to the
-/// right task in the Needs-you list with zero frontend changes.
+/// notice for this PR/MR against the real bus + notice tracker, THEN emit
+/// `needs-you://changed` for every thread that actually needs a refresh.
+/// Split into a pure core ([`apply_notice_action`], which owns the actual
+/// decision + `BusRegistry`/map mutation and is unit-tested directly against
+/// a real `BusRegistry::new()` — no `AppHandle`/Tauri runtime needed) plus
+/// this thin `AppHandle`-emitting shell, so the P1 regression test below
+/// (thread reassignment must still retract cleanly) doesn't need a Tauri
+/// runtime to run.
 fn reconcile_notice(
     bus: &crate::bus::BusRegistry,
     app: &AppHandle,
-    notices: &mut HashMap<i32, (u64, String)>,
+    notices: &mut HashMap<i32, (i32, u64, String)>,
     pr: &pull_request::Model,
     desired_text: Option<String>,
 ) {
-    let existing = notices.get(&pr.id).map(|(_, text)| text.as_str());
+    for thread_id in apply_notice_action(bus, notices, pr, desired_text) {
+        let _ = app.emit("needs-you://changed", thread_id);
+    }
+}
+
+/// The pure decision + mutation core of [`reconcile_notice`]: post, replace,
+/// retract, or leave alone. `from` is the direction id (as a string) that
+/// owns this PR — same convention every other per-task notice in this
+/// codebase already uses (see `lead_chat::engine`'s stall/freeze notices), so
+/// it lands attributed to the right task in the Needs-you list with zero
+/// frontend changes.
+///
+/// Returns every thread id that needs a `needs-you://changed` refresh (0, 1,
+/// or — on a `Replace` that crosses a thread reassignment — 2 DISTINCT
+/// threads: the old one loses a card, the new one gains one).
+///
+/// The critical property, and the P1 fix this function embodies: retraction
+/// ALWAYS targets the thread_id STORED alongside the tracked ask (`old_
+/// thread_id`), never `pr.thread_id` (the row's CURRENT, possibly-reassigned
+/// value) — `cancel_open_asks_by_id` is scoped to one thread's bus, so
+/// canceling under the wrong thread silently no-ops (returns `false`) and
+/// strands the notice under its original thread forever, un-retractable and
+/// with no manual dismiss (see `NeedsRows.tsx`'s `AskRow`, which has an
+/// answer box only when `answerable`, never a close button for a NOTICE).
+fn apply_notice_action(
+    bus: &crate::bus::BusRegistry,
+    notices: &mut HashMap<i32, (i32, u64, String)>,
+    pr: &pull_request::Model,
+    desired_text: Option<String>,
+) -> Vec<i32> {
+    let existing = notices.get(&pr.id).map(|(_, _, text)| text.as_str());
     let action = judge::plan_notice_action(existing, desired_text.as_deref());
+    let mut changed_threads = Vec::new();
     match action {
         judge::NoticeAction::NoOp => {}
         judge::NoticeAction::Post => {
             if let Some(text) = desired_text {
                 let id = bus.notify_human(pr.thread_id, &pr.direction_id.to_string(), &text);
-                notices.insert(pr.id, (id, text));
-                let _ = app.emit("needs-you://changed", pr.thread_id);
+                notices.insert(pr.id, (pr.thread_id, id, text));
+                changed_threads.push(pr.thread_id);
             }
         }
         judge::NoticeAction::Replace => {
-            if let Some((old_id, _)) = notices.remove(&pr.id) {
-                bus.cancel_open_asks_by_id(pr.thread_id, old_id);
+            if let Some((old_thread_id, old_id, _)) = notices.remove(&pr.id) {
+                bus.cancel_open_asks_by_id(old_thread_id, old_id);
+                changed_threads.push(old_thread_id);
             }
             if let Some(text) = desired_text {
                 let id = bus.notify_human(pr.thread_id, &pr.direction_id.to_string(), &text);
-                notices.insert(pr.id, (id, text));
+                notices.insert(pr.id, (pr.thread_id, id, text));
+                changed_threads.push(pr.thread_id);
             }
-            let _ = app.emit("needs-you://changed", pr.thread_id);
         }
         judge::NoticeAction::Retract => {
-            if let Some((old_id, _)) = notices.remove(&pr.id) {
-                if bus.cancel_open_asks_by_id(pr.thread_id, old_id) {
-                    let _ = app.emit("needs-you://changed", pr.thread_id);
+            if let Some((old_thread_id, old_id, _)) = notices.remove(&pr.id) {
+                if bus.cancel_open_asks_by_id(old_thread_id, old_id) {
+                    changed_threads.push(old_thread_id);
                 }
             }
         }
     }
+    changed_threads.sort_unstable();
+    changed_threads.dedup();
+    changed_threads
 }
 
 fn emit_pr_changed(app: &AppHandle, pr: &pull_request::Model) {
@@ -259,6 +321,7 @@ mod tests {
             merge_readiness: serde_json::to_string(&MergeReadiness::Ready).unwrap(),
             last_checked_at: "100".to_string(),
             last_error: String::new(),
+            probe_fail_count: 0,
             created_at: "1".to_string(),
         }
     }
@@ -324,5 +387,71 @@ mod tests {
         let snap = base_snapshot();
         let readiness = MergeReadiness::Blocked { reasons: vec!["something".to_string()] };
         assert!(snapshot_changed(&old, &snap, &readiness));
+    }
+
+    // --- P1: the notice tracker must survive a thread reassignment --------
+
+    #[test]
+    fn replace_retracts_the_notice_under_its_original_thread_even_after_reassignment() {
+        let bus = crate::bus::BusRegistry::new();
+        let mut notices: HashMap<i32, (i32, u64, String)> = HashMap::new();
+
+        // The PR starts tracked under thread 1; a Blocked notice is posted
+        // there.
+        let mut pr = base_row();
+        pr.thread_id = 1;
+        let touched = apply_notice_action(&bus, &mut notices, &pr, Some("first blocked text".to_string()));
+        assert_eq!(touched, vec![1]);
+        assert_eq!(bus.open_asks(1).len(), 1, "the notice must land in thread 1's queue");
+
+        // `register_pull_request`'s own doc: "thread/direction/repo can
+        // legitimately change across a re-registration". Simulate exactly
+        // that — the row now belongs to thread 2 — AND the readiness text
+        // changes too (still not-Ready, so this is a Replace, not a NoOp).
+        pr.thread_id = 2;
+        let touched =
+            apply_notice_action(&bus, &mut notices, &pr, Some("second blocked text".to_string()));
+
+        assert!(
+            bus.open_asks(1).is_empty(),
+            "the stale notice under thread 1 must be retracted, not stranded there forever"
+        );
+        assert_eq!(bus.open_asks(2).len(), 1, "the fresh notice must be posted under the NEW thread");
+        assert!(touched.contains(&1), "thread 1's Needs-you list lost a card and needs a refresh");
+        assert!(touched.contains(&2), "thread 2's Needs-you list gained a card and needs a refresh");
+    }
+
+    #[test]
+    fn retract_after_reassignment_also_targets_the_original_thread() {
+        let bus = crate::bus::BusRegistry::new();
+        let mut notices: HashMap<i32, (i32, u64, String)> = HashMap::new();
+
+        let mut pr = base_row();
+        pr.thread_id = 1;
+        apply_notice_action(&bus, &mut notices, &pr, Some("blocked".to_string()));
+        assert_eq!(bus.open_asks(1).len(), 1);
+
+        // Reassigned to thread 2, AND the PR became Ready (desired_text =
+        // None) in the same sweep — a pure Retract, no Replace involved.
+        pr.thread_id = 2;
+        let touched = apply_notice_action(&bus, &mut notices, &pr, None);
+
+        assert!(bus.open_asks(1).is_empty(), "must retract from thread 1, where the ask actually lives");
+        assert!(bus.open_asks(2).is_empty(), "nothing was ever posted under thread 2");
+        assert_eq!(touched, vec![1]);
+    }
+
+    #[test]
+    fn replace_under_the_same_thread_reports_it_only_once() {
+        // Sanity check on the dedup: a Replace that does NOT cross a thread
+        // reassignment must report that one thread exactly once, not twice.
+        let bus = crate::bus::BusRegistry::new();
+        let mut notices: HashMap<i32, (i32, u64, String)> = HashMap::new();
+        let pr = base_row(); // thread_id stays 1 throughout
+
+        apply_notice_action(&bus, &mut notices, &pr, Some("first".to_string()));
+        let touched = apply_notice_action(&bus, &mut notices, &pr, Some("second".to_string()));
+        assert_eq!(touched, vec![1]);
+        assert_eq!(bus.open_asks(1).len(), 1, "old notice retracted, new one posted — still exactly one open");
     }
 }

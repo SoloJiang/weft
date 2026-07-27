@@ -130,24 +130,48 @@ pub enum CiStatus {
     Failing,
 }
 
-/// Review signal. MVP scope note: normalized from GitHub's own aggregate
-/// `reviewDecision` (which already folds in required-reviewer/CODEOWNERS
-/// rules), NOT a per-thread `reviewThreads.isResolved` walk — that needs
-/// paginated GraphQL with a documented prior pagination bug in this very repo
-/// (dropping the newest/unresolved threads past 100), which is more machinery
-/// than an MVP host-agnostic signal needs. A repo-specific convention layered
-/// on top of this (e.g. a review-bot's 👍 reaction counting as "all clear") is
-/// exactly that — repo-specific — and stays the calling agent's job per its
-/// own CLAUDE.md, not this neutral state machine's.
+/// Review signal.
+///
+/// This is intentionally NOT a single GitHub-shaped aggregate enum, even
+/// though GitHub's own `reviewDecision` field legitimately IS one (it already
+/// folds in required-reviewer/CODEOWNERS rules for you). GitLab has no
+/// equivalent aggregate at all: approval state comes from the separate Merge
+/// Request Approvals API, and "are there unresolved discussion threads" comes
+/// from a THIRD, independent source (the Discussions API's per-note
+/// `resolved`) — collapsing those two into one bucket (as an earlier version
+/// of this type did, by literally renaming GitHub's `reviewDecision` values)
+/// would make it impossible to tell a human WHICH of the two is actually
+/// blocking, once a GitLab backend exists. `ChangesRequested` stays a
+/// GitHub-only concept (GitLab has no formal "changes requested" state) —
+/// a future GitLab backend simply never produces that variant, which is
+/// honest (it's a real GitHub-specific signal), not a conflation.
+///
+/// MVP scope note: GitHub's mapping (`github::review_of`) does not walk
+/// `reviewThreads.isResolved` — that needs paginated GraphQL with a
+/// documented prior pagination bug in this very repo (dropping the newest/
+/// unresolved threads past 100) — so it reports `unresolved_discussions:
+/// None` (honestly unknown), never `Some(false)` ("definitely none
+/// unresolved", which it never checked). A repo-specific convention layered
+/// on top of either host's raw signal (e.g. a review-bot's 👍 reaction
+/// counting as "all clear") stays the calling agent's job per its own
+/// CLAUDE.md, not this neutral state machine's.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ReviewStatus {
     Unknown { reason: String },
+    /// GitHub-only: a maintainer explicitly requested changes.
     ChangesRequested,
-    /// Not yet reviewed / no decision recorded (GitHub's `REVIEW_REQUIRED` or
-    /// an empty `reviewDecision` — confirmed live against this repo's own PRs
-    /// while building this: an open, otherwise-healthy PR reports `""`).
-    AwaitingReview,
+    /// Not (yet) approved. `unresolved_discussions` is the SEPARATE "are
+    /// there open discussion threads" signal, kept apart from approval so
+    /// neither backend has to force one into the other:
+    /// - `None` — this backend doesn't check thread-resolution at all
+    ///   (GitHub, this MVP: confirmed live against this repo's own PRs while
+    ///   building this — an open, otherwise-healthy PR reports
+    ///   `reviewDecision: ""`, i.e. not-yet-reviewed, which says nothing
+    ///   about discussion threads).
+    /// - `Some(_)` — a backend that actually knows (a future GitLab backend,
+    ///   from its Discussions API).
+    AwaitingApproval { unresolved_discussions: Option<bool> },
     Approved,
 }
 
@@ -258,21 +282,49 @@ pub struct PrUrlParts {
 /// subgroup — the LAST segment before `/-/merge_requests/` is the project,
 /// everything before it is the namespace). Returns `None` for anything else
 /// rather than guessing.
+///
+/// SECURITY: this is a trust boundary, not a convenience parser. The output
+/// feeds `gh --repo`/`glab --repo`, whose `[HOST/]OWNER/REPO` grammar treats
+/// an EXTRA leading path segment as a HOST OVERRIDE. A prior version used
+/// `str::split_once('/')` for GitHub's owner/repo, which only looks at the
+/// FIRST `/` — an attacker-supplied URL with one extra path segment before
+/// `/pull/` (`https://github.com/evil.example.org/ownerx/repox/pull/5`) then
+/// silently parsed as `owner="evil.example.org"`, `repo="ownerx/repox"`,
+/// which `github::GitHubHost::fetch_status` formatted into a 3-segment
+/// `--repo` value — reinterpreted by `gh` as "talk to host
+/// evil.example.org", a real SSRF confirmed against a live `gh` binary
+/// (`register_pr` is auto-approved with zero human confirmation, and the
+/// sweep would have repeated the request every `WEFT_PR_SWEEP_SECS`). Fixed
+/// by requiring EXACTLY the expected segment count (never silently absorbing
+/// an extra one into `repo`) AND a character allowlist per segment (blocks
+/// `@`/`:`/whitespace/control-character smuggling even within a single
+/// segment). `github::GitHubHost::fetch_status` also independently refuses to
+/// proceed if `owner`/`repo` contain `/`, so a `PrTarget` built some other
+/// way (bypassing this parser) can't reopen the same hole.
 pub fn parse_pr_url(url: &str) -> Option<PrUrlParts> {
     let url = url.trim();
     let after_scheme = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
     let (host, rest) = after_scheme.split_once('/')?;
-    if host.is_empty() {
+    if host.is_empty() || !is_plain_hostname(host) {
         return None;
     }
 
     if let Some(idx) = rest.find("/pull/") {
         let (path, tail) = rest.split_at(idx);
         let number = parse_leading_number(tail.trim_start_matches("/pull/"))?;
-        let (owner, repo) = path.split_once('/')?;
-        if owner.is_empty() || repo.is_empty() {
+        // GitHub owner/repo is EXACTLY two path segments — never more, never
+        // fewer. Rejecting a third segment outright (instead of folding it
+        // into `repo`, as a naive `split_once` does) is what closes the SSRF
+        // documented above.
+        let mut segs = path.split('/');
+        let owner = segs.next()?;
+        let repo = segs.next()?;
+        if segs.next().is_some() {
+            return None;
+        }
+        if !is_valid_path_segment(owner) || !is_valid_path_segment(repo) {
             return None;
         }
         return Some(PrUrlParts {
@@ -291,6 +343,20 @@ pub fn parse_pr_url(url: &str) -> Option<PrUrlParts> {
         if owner.is_empty() || repo.is_empty() {
             return None;
         }
+        // GitLab's namespace legitimately nests (`group/subgroup/...`), so
+        // the OVERALL `owner` string may contain `/` — but every individual
+        // segment (each namespace level, and the trailing project name) must
+        // still be a plain, single slug: no segment may itself smuggle a
+        // `/`-like structural character. (A path-position "is this really a
+        // host override" ambiguity is inherent to GitLab's arbitrary-depth
+        // namespaces and can't be fully resolved from the URL shape alone —
+        // there is no live `glab` invocation yet for this to reach, see
+        // `resolve_host`; whichever future backend adds one must not trust a
+        // URL-derived multi-segment owner as a `--repo`/`-R` argument without
+        // separately confirming which prefix, if any, is a host override.)
+        if !owner.split('/').all(is_valid_path_segment) || !is_valid_path_segment(repo) {
+            return None;
+        }
         return Some(PrUrlParts {
             host_kind: HostKind::GitLab,
             host_base: host.to_string(),
@@ -301,6 +367,26 @@ pub fn parse_pr_url(url: &str) -> Option<PrUrlParts> {
     }
 
     None
+}
+
+/// A single path segment (a GitHub owner/repo, or one GitLab namespace
+/// level/project) is "plain" if it contains only characters GitHub/GitLab
+/// themselves allow in that position — alphanumeric, `-`, `_`, `.`. Notably
+/// excludes `/` (would smuggle an extra segment), `@`/`:` (userinfo/port/
+/// scheme-like), whitespace, and control characters — anything a downstream
+/// `--repo`/`-R` flag parser could plausibly reinterpret structurally.
+fn is_valid_path_segment(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// A bare hostname (`github.com`, `github.acme-corp.com`, `git.internal:8443`)
+/// — alphanumeric, `-`, `.`, and `:` for an explicit port. Rejects anything
+/// that could itself carry a path/userinfo/scheme fragment; `host_base` is
+/// currently stored for display only (never fed to a `gh`/`glab` invocation),
+/// but validating it here means it stays that way even if a future backend
+/// starts using it for GHE/self-hosted targeting.
+fn is_plain_hostname(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':'))
 }
 
 /// The number at the start of a path tail, stopping at the next `/` (or
@@ -403,5 +489,98 @@ mod tests {
         assert!(parse_pr_url("ftp://github.com/acme/widgets/pull/1").is_none());
         // A number-less tail must not parse as PR 0 or panic.
         assert!(parse_pr_url("https://github.com/acme/widgets/pull/").is_none());
+    }
+
+    // --- adversarial: SSRF via a smuggled extra path segment -------------
+    //
+    // `github::GitHubHost::fetch_status` formats `owner`/`repo` into a single
+    // `--repo` argument for `gh`, whose `[HOST/]OWNER/REPO` grammar treats an
+    // extra leading segment as a HOST OVERRIDE. Every case below is a shape
+    // that, before the fix, slipped a THIRD segment past a naive
+    // `split_once('/')` and got silently absorbed into `repo` instead of
+    // being rejected.
+
+    #[test]
+    fn parse_pr_url_rejects_an_extra_leading_segment_before_owner_repo() {
+        // The exact repro from the adversarial review: a 3-segment path where
+        // the naive parser read segment 1 as `owner` (attacker-controlled)
+        // and segments 2+3 (still containing a `/`) as `repo`.
+        assert!(
+            parse_pr_url("https://github.com/evil.example.org/ownerx/repox/pull/5").is_none(),
+            "a 3-segment path before /pull/ must be rejected outright, not folded into repo"
+        );
+    }
+
+    #[test]
+    fn parse_pr_url_rejects_an_extra_segment_anywhere_before_pull() {
+        // Same shape, but the attacker-controlled segment is LAST instead of
+        // first — still must not silently become part of `repo`.
+        assert!(parse_pr_url("https://github.com/owner/repo/evil.example.org/pull/5").is_none());
+        // Four segments — not just the specific 3-segment repro.
+        assert!(parse_pr_url("https://github.com/a/b/c/d/pull/5").is_none());
+    }
+
+    #[test]
+    fn parse_pr_url_rejects_too_few_segments_before_pull() {
+        assert!(parse_pr_url("https://github.com/owner/pull/5").is_none());
+        assert!(parse_pr_url("https://github.com/pull/5").is_none());
+    }
+
+    #[test]
+    fn parse_pr_url_rejects_structural_characters_smuggled_within_a_single_segment() {
+        // Even a single, correctly-counted segment must not carry `@`/`:`/
+        // whitespace/control characters that a downstream CLI arg parser
+        // could reinterpret (userinfo, port, scheme, or a raw newline
+        // splitting the argument some other way).
+        assert!(parse_pr_url("https://github.com/owner:evil/repo/pull/5").is_none());
+        assert!(parse_pr_url("https://github.com/owner/re@po/pull/5").is_none());
+        assert!(parse_pr_url("https://github.com/own er/repo/pull/5").is_none());
+        assert!(parse_pr_url("https://github.com/owner/re\npo/pull/5").is_none());
+        assert!(parse_pr_url("https://github.com/owner/repo\\x/pull/5").is_none());
+    }
+
+    #[test]
+    fn parse_pr_url_rejects_userinfo_smuggled_into_the_host_position() {
+        // `user@host` in URL syntax — the "host" segment must not carry a
+        // userinfo prefix that could confuse a downstream consumer of
+        // `host_base` about which part is actually the hostname.
+        assert!(parse_pr_url("https://github.com@evil.example/owner/repo/pull/5").is_none());
+    }
+
+    #[test]
+    fn parse_pr_url_rejects_a_dot_segment_disguised_as_a_third_path_component() {
+        assert!(parse_pr_url("https://github.com/../owner/repo/pull/5").is_none());
+    }
+
+    #[test]
+    fn parse_pr_url_still_accepts_the_legitimate_two_segment_shape() {
+        // Regression guard alongside the rejections above: the fix must not
+        // have overcorrected into rejecting normal URLs (dots/hyphens/
+        // underscores are common in real owner/repo names).
+        let parts = parse_pr_url("https://github.com/my-org_1/my.repo_name/pull/42").unwrap();
+        assert_eq!(parts.owner, "my-org_1");
+        assert_eq!(parts.repo, "my.repo_name");
+    }
+
+    #[test]
+    fn parse_pr_url_gitlab_rejects_structural_characters_in_any_namespace_segment_or_project() {
+        // The nested-subgroup case must still validate EACH segment even
+        // though the overall owner string legitimately contains `/`.
+        assert!(
+            parse_pr_url("https://gitlab.com/group/evil:host/project/-/merge_requests/5")
+                .is_none()
+        );
+        assert!(
+            parse_pr_url("https://gitlab.com/group/sub/pro@ject/-/merge_requests/5").is_none()
+        );
+    }
+
+    #[test]
+    fn parse_pr_url_gitlab_still_accepts_legitimate_nested_subgroups_with_plain_segments() {
+        let parts =
+            parse_pr_url("https://gitlab.com/a-group/sub_group/my.project/-/merge_requests/7")
+                .unwrap();
+        assert_eq!(parts.owner, "a-group/sub_group");
+        assert_eq!(parts.repo, "my.project");
     }
 }

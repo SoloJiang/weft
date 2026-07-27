@@ -34,7 +34,10 @@ fn review_verdict(s: &ReviewStatus) -> AxisVerdict {
     match s {
         ReviewStatus::Unknown { .. } => AxisVerdict::Unknown,
         ReviewStatus::Approved => AxisVerdict::Clear,
-        ReviewStatus::ChangesRequested | ReviewStatus::AwaitingReview => AxisVerdict::Blocking,
+        // Not approved is blocking regardless of the (separate)
+        // unresolved-discussions sub-signal — approval itself is the bar;
+        // `unresolved_discussions` only adds detail to the REASON text below.
+        ReviewStatus::ChangesRequested | ReviewStatus::AwaitingApproval { .. } => AxisVerdict::Blocking,
     }
 }
 
@@ -64,7 +67,15 @@ fn review_reason(s: &ReviewStatus) -> Option<String> {
     match s {
         ReviewStatus::Unknown { reason } => Some(format!("review 状态未知({reason})")),
         ReviewStatus::ChangesRequested => Some("review 有待处理的修改意见".to_string()),
-        ReviewStatus::AwaitingReview => Some("还没有 review 批准".to_string()),
+        // `unresolved_discussions` is a SEPARATE signal from approval (see
+        // this type's doc on why GitLab needs them kept apart) — surfaced in
+        // the reason text only when a backend actually checked it (`Some`);
+        // `None` (this MVP's GitHub mapping never walks reviewThreads) says
+        // nothing about discussions one way or the other.
+        ReviewStatus::AwaitingApproval { unresolved_discussions: Some(true) } => {
+            Some("还没有 review 批准,且有未解决的讨论".to_string())
+        }
+        ReviewStatus::AwaitingApproval { .. } => Some("还没有 review 批准".to_string()),
         ReviewStatus::Approved => None,
     }
 }
@@ -218,14 +229,55 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_review_alone_blocks() {
+    fn awaiting_approval_alone_blocks() {
         // Not yet reviewed is NOT the same as approved — issue #110's bar is
         // "review clear/approved", not "nobody objected yet".
         let (ci, _, conflict) = ready();
         assert!(matches!(
-            merge_readiness(&ci, &ReviewStatus::AwaitingReview, &conflict),
+            merge_readiness(
+                &ci,
+                &ReviewStatus::AwaitingApproval { unresolved_discussions: None },
+                &conflict
+            ),
             MergeReadiness::Blocked { .. }
         ));
+    }
+
+    #[test]
+    fn awaiting_approval_blocks_regardless_of_the_unresolved_discussions_sub_signal() {
+        // The sub-signal is extra REASON detail, not a second axis — both
+        // `Some(true)`/`Some(false)`/`None` must still block on their own,
+        // since approval itself (not discussion-resolution) is the bar.
+        let (ci, _, conflict) = ready();
+        for unresolved_discussions in [None, Some(true), Some(false)] {
+            assert!(
+                matches!(
+                    merge_readiness(
+                        &ci,
+                        &ReviewStatus::AwaitingApproval { unresolved_discussions },
+                        &conflict
+                    ),
+                    MergeReadiness::Blocked { .. }
+                ),
+                "unresolved_discussions={unresolved_discussions:?} must still block"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_discussions_true_is_named_in_the_reason_when_a_backend_actually_checked() {
+        let (ci, _, conflict) = ready();
+        let readiness = merge_readiness(
+            &ci,
+            &ReviewStatus::AwaitingApproval { unresolved_discussions: Some(true) },
+            &conflict,
+        );
+        match readiness {
+            MergeReadiness::Blocked { reasons } => {
+                assert!(reasons[0].contains("未解决的讨论"), "got: {reasons:?}");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
     }
 
     #[test]

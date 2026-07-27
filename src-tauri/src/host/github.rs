@@ -27,6 +27,22 @@ impl PrHost for GitHubHost {
     }
 
     fn fetch_status(&self, target: &PrTarget) -> Result<PrSnapshot, HostError> {
+        // Defense in depth alongside `host::parse_pr_url`'s own validation:
+        // this format! joins owner/repo into a SINGLE `--repo` argument, and
+        // `gh`'s `[HOST/]OWNER/REPO` grammar treats an extra `/`-delimited
+        // segment as a HOST OVERRIDE (the confirmed SSRF — see
+        // `parse_pr_url`'s doc). `parse_pr_url` is the only current producer
+        // of a `PrTarget`, but refusing here too means this call can never be
+        // tricked into a host override even if some future caller builds a
+        // `PrTarget` another way.
+        if target.owner.contains('/') || target.repo.contains('/') {
+            return Err(HostError::Other {
+                message: format!(
+                    "refusing to query a repo slug with an embedded '/' (owner={:?}, repo={:?}) — this would be reinterpreted as a host override",
+                    target.owner, target.repo
+                ),
+            });
+        }
         let repo_slug = format!("{}/{}", target.owner, target.repo);
         let out = Command::new("gh")
             .args(["pr", "view", &target.number.to_string(), "--repo", &repo_slug, "--json", JSON_FIELDS])
@@ -174,8 +190,10 @@ fn review_of(decision: &str) -> ReviewStatus {
         "APPROVED" => ReviewStatus::Approved,
         "CHANGES_REQUESTED" => ReviewStatus::ChangesRequested,
         // "REVIEW_REQUIRED" or "" (no review recorded yet/configured) — either
-        // way, not a positive approval signal.
-        _ => ReviewStatus::AwaitingReview,
+        // way, not a positive approval signal. `unresolved_discussions: None`
+        // — this MVP doesn't walk `reviewThreads` (see `ReviewStatus`'s doc),
+        // so that sub-signal stays honestly unknown, never a false `Some(false)`.
+        _ => ReviewStatus::AwaitingApproval { unresolved_discussions: None },
     }
 }
 
@@ -208,7 +226,11 @@ mod tests {
         let s = parse_pr_json(MERGED_FIXTURE).unwrap();
         assert_eq!(s.lifecycle, PrLifecycle::Merged);
         assert_eq!(s.ci, CiStatus::Passing);
-        assert_eq!(s.review, ReviewStatus::AwaitingReview, "empty reviewDecision is NOT Approved");
+        assert_eq!(
+            s.review,
+            ReviewStatus::AwaitingApproval { unresolved_discussions: None },
+            "empty reviewDecision is NOT Approved"
+        );
         assert_eq!(
             s.conflict,
             ConflictStatus::Unknown {
@@ -265,8 +287,11 @@ mod tests {
     fn review_decision_variants_map_correctly() {
         assert_eq!(review_of("APPROVED"), ReviewStatus::Approved);
         assert_eq!(review_of("CHANGES_REQUESTED"), ReviewStatus::ChangesRequested);
-        assert_eq!(review_of("REVIEW_REQUIRED"), ReviewStatus::AwaitingReview);
-        assert_eq!(review_of(""), ReviewStatus::AwaitingReview);
+        assert_eq!(
+            review_of("REVIEW_REQUIRED"),
+            ReviewStatus::AwaitingApproval { unresolved_discussions: None }
+        );
+        assert_eq!(review_of(""), ReviewStatus::AwaitingApproval { unresolved_discussions: None });
     }
 
     #[test]
@@ -313,6 +338,22 @@ mod tests {
             classify_gh_error("some unexpected network error"),
             HostError::Other { message: "some unexpected network error".to_string() }
         );
+    }
+
+    #[test]
+    fn fetch_status_refuses_an_embedded_slash_before_shelling_out() {
+        // Defense in depth alongside `host::parse_pr_url`'s own rejection:
+        // even a `PrTarget` built some OTHER way (bypassing that parser) must
+        // never reach `Command::new("gh")` with an owner/repo that could be
+        // reinterpreted as a host override. No process/network call happens
+        // in this test — the guard fires before `Command::new` either way.
+        let host = GitHubHost;
+        let bad_owner =
+            PrTarget { owner: "evil.example.org/ownerx".to_string(), repo: "repox".to_string(), number: 5 };
+        assert!(matches!(host.fetch_status(&bad_owner), Err(HostError::Other { .. })));
+
+        let bad_repo = PrTarget { owner: "owner".to_string(), repo: "a/b".to_string(), number: 5 };
+        assert!(matches!(host.fetch_status(&bad_repo), Err(HostError::Other { .. })));
     }
 
     #[test]

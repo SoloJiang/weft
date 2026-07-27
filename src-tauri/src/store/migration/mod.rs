@@ -2013,7 +2013,25 @@ impl MigrationTrait for M0045PullRequest {
         let schema = Schema::new(manager.get_database_backend());
         let mut stmt = schema.create_table_from_entity(pull_request::Entity);
         stmt.if_not_exists();
-        manager.create_table(stmt).await
+        manager.create_table(stmt).await?;
+        // Belt-and-suspenders alongside `repo::register_pull_request`'s
+        // application-level find-then-upsert: guarantees the natural key
+        // (host_kind, host_owner, host_repo, number) can never duplicate at
+        // the DB level even under a race the app layer doesn't catch.
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_pull_request_natural_key")
+                    .table(Alias::new("pull_request"))
+                    .col(Alias::new("host_kind"))
+                    .col(Alias::new("host_owner"))
+                    .col(Alias::new("host_repo"))
+                    .col(Alias::new("number"))
+                    .unique()
+                    .to_owned(),
+            )
+            .await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
