@@ -73,6 +73,27 @@ pub fn router(bus: BusRegistry, db: Db, asks: AskRegistry) -> Router {
 // truly abandoned. Kept just under the hook/curl ceilings in inject.rs.
 const ASK_WAIT: Duration = Duration::from_secs(3600);
 
+/// The `?tool=` query parameter's fallback when a request omits it. Every
+/// hook consumer this repo controls hard-codes its own literal
+/// `tool=claude|codex|opencode` when it injects the `/ask` URL
+/// (`inject.rs::ask_url`), so a normal request never actually hits this
+/// default — but PR #146 promoted this same variable from a purely cosmetic
+/// card label into the LOOKUP KEY for `builtin_allow::safe_scope`'s
+/// auto-approval decision. Before that, defaulting to `"claude"` was
+/// harmless; after it, a missing/unrecognized `tool` would silently inherit
+/// whichever engine's row happens to sit at that string — today `claude`,
+/// the most PERMISSIVE of the three engines' allowlists — rather than
+/// degrading to "no scope, surface the card". `UNKNOWN_ENGINE` is guaranteed
+/// to match no `SAFE_BUILTINS` row (`safe_scope_is_exact_and_engine_keyed`
+/// and `dangerous_builtins_are_never_allowlisted` in `builtin_allow` check
+/// every real engine string; this is deliberately none of them), so a
+/// missing/forged `tool` param now always surfaces the Needs-you card
+/// instead of quietly borrowing the loosest engine's grants. It also makes
+/// the card's own tool label honest instead of mislabeling an unknown caller
+/// as "Claude Code" (`ToolIcon`/`toolFullName` on the frontend already
+/// degrade gracefully for an unrecognized string).
+const UNKNOWN_ENGINE: &str = "unknown";
+
 /// The Ask Bridge endpoint. A tool's permission hook POSTs its PreToolUse-style
 /// payload here and BLOCKS until the human answers in weft (→ allow/deny) or the
 /// wait elapses (→ an explicit deny, issue #96). Every weft-spawned engine runs
@@ -108,7 +129,7 @@ async fn handle_ask(
     State(db): State<Db>,
     Json(req): Json<Value>,
 ) -> Response {
-    let tool = q.get("tool").map(|s| s.as_str()).unwrap_or("claude");
+    let tool = q.get("tool").map(|s| s.as_str()).unwrap_or(UNKNOWN_ENGINE);
     let tool_name = req
         .get("tool_name")
         .and_then(|v| v.as_str())
@@ -1261,7 +1282,10 @@ pub async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_weft_internal_tool, register_pr_tool, session_servers_for_kind, summarize, tool_specs};
+    use super::{
+        is_weft_internal_tool, register_pr_tool, serve, session_servers_for_kind, summarize,
+        tool_specs, UNKNOWN_ENGINE,
+    };
     use crate::ask::RiskLevel;
     use crate::store::Db;
     use serde_json::{json, Value};
@@ -1555,5 +1579,93 @@ mod tests {
         // Malformed names never match.
         assert!(!is_weft_internal_tool("mcp__weft_bus"));
         assert!(!is_weft_internal_tool("weft_bus__x"));
+    }
+
+    /// Fast companion to `missing_tool_query_param_does_not_inherit_claudes_allowlist`
+    /// below: the sentinel itself must resolve to no scope for both engines
+    /// that actually have `SAFE_BUILTINS` rows.
+    #[test]
+    fn unknown_engine_sentinel_matches_no_safe_builtins_row() {
+        assert_eq!(
+            crate::bus::builtin_allow::safe_scope(UNKNOWN_ENGINE, "Read"),
+            None
+        );
+        assert_eq!(
+            crate::bus::builtin_allow::safe_scope(UNKNOWN_ENGINE, "NotebookRead"),
+            None
+        );
+        assert_eq!(
+            crate::bus::builtin_allow::safe_scope(UNKNOWN_ENGINE, "TodoWrite"),
+            None
+        );
+        assert_eq!(
+            crate::bus::builtin_allow::safe_scope(UNKNOWN_ENGINE, "update_plan"),
+            None
+        );
+    }
+
+    /// PR #146 promoted the `?tool=` query param from a cosmetic card label
+    /// into the LOOKUP KEY for `builtin_allow::safe_scope`'s auto-approval
+    /// decision, but its default stayed `"claude"` — the most PERMISSIVE of
+    /// the three engines' allowlists. A request with no `tool` param (or an
+    /// unrecognized one) must surface the Needs-you card for a `Read`-shaped
+    /// call exactly like an unknown engine, never silently inherit claude's
+    /// `ReadOnlyPath` entry for `Read`. End-to-end through the real HTTP
+    /// endpoint (not just `safe_scope` in isolation), so this also proves
+    /// `handle_ask`'s query parsing — not just the constant — takes the fix.
+    #[tokio::test]
+    async fn missing_tool_query_param_does_not_inherit_claudes_allowlist() {
+        use crate::ask::{Answer, AskRegistry};
+        use crate::bus::BusRegistry;
+
+        let dir = std::env::temp_dir().join(format!(
+            "weft-ask-unknown-tool-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.rs");
+        std::fs::write(&file, b"fn main() {}\n").unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        crate::store::repo::add_repo_ref(&db, ws.id, "r", &root.to_string_lossy(), "main", "", true)
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "codex")
+            .await
+            .unwrap();
+
+        let asks = AskRegistry::new();
+        let (base, _h) = serve(BusRegistry::new(), db, asks.clone()).await.unwrap();
+
+        // Deliberately NO `?tool=` query parameter on this URL.
+        let url = format!("{base}/ask/{}/{}", thread.id, crate::bus::LEAD);
+        let client = reqwest::Client::new();
+        let body = json!({
+            "tool_name": "Read",
+            "tool_input": { "file_path": file.to_string_lossy().to_string() }
+        });
+
+        let (resp, ()) = tokio::join!(
+            async { client.post(url.as_str()).json(&body).send().await.unwrap() },
+            crate::hook_test_support::answer_first_ask(&asks, Answer::Allow),
+        );
+        let out: Value = resp.json().await.unwrap();
+        assert_eq!(
+            out["hookSpecificOutput"]["permissionDecision"], "allow",
+            "the human's own Allow must still reach the engine: {out}"
+        );
+        assert_eq!(
+            out["hookSpecificOutput"]["permissionDecisionReason"], "Approved in weft",
+            "a missing `tool` query param must surface the Needs-you card and \
+             wait for a human decision, not silently auto-approve via claude's \
+             Read allowlist entry (reason would read \"read-only builtin \
+             (auto-approved)\" if it had): {out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
