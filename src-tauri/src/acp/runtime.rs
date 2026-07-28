@@ -224,7 +224,27 @@ static POOL: LazyLock<Pool> = LazyLock::new(|| Pool {
 
 /// Serializes first-time ACP child creation so two concurrent first turns cannot
 /// each spawn a child and race the pool insert.
-static CREATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+/// Pool-wide gate. Per-key work (create, retire) takes a READ guard and then
+/// its own key lock; only the pool-wide drain takes the WRITE guard.
+///
+/// Creation used to serialize on ONE process-wide mutex held across
+/// `ensure_connected`, whose handshake waits up to 60s — so a single slow or
+/// broken command pin stalled the first send of every OTHER `(backend,
+/// program)` key, defeating the isolation the pool key exists to provide.
+static POOL_GATE: LazyLock<tokio::sync::RwLock<()>> =
+    LazyLock::new(|| tokio::sync::RwLock::new(()));
+
+/// One creation lock per pool key, so `client()` and `reap_if_unused` stay
+/// atomic against each other for the SAME key without touching other keys.
+static KEY_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+async fn key_lock(key: &str) -> Arc<Mutex<()>> {
+    let mut g = KEY_LOCKS.lock().await;
+    g.entry(key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
 
 /// Get or create the client for (`backend_id`, `program`).
 /// Different program pins get isolated children — never recycle a live peer.
@@ -233,9 +253,13 @@ pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHan
         .ok_or_else(|| anyhow::anyhow!("no ACP backend registered for {backend_id}"))?;
     let id = backend.id();
     let key = pool_key(id, program);
-    // Hold CREATE_LOCK across lookup+ensure so maybe_reap_if_idle cannot remove
-    // a handle another caller just acquired (unsubscribe/reap race).
-    let _create = CREATE_LOCK.lock().await;
+    // Held across lookup+ensure so `reap_if_unused` cannot remove a handle
+    // another caller just acquired (unsubscribe/reap race). Per KEY: a slow
+    // handshake on one command pin must not block a different one. The read
+    // guard additionally excludes the pool-wide shutdown.
+    let _gate = POOL_GATE.read().await;
+    let create_lock = key_lock(&key).await;
+    let _create = create_lock.lock().await;
     let existing = {
         let g = POOL.clients.lock().await;
         g.get(&key).cloned()
@@ -251,7 +275,7 @@ pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHan
         connect_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     handle.ensure_connected(backend, program).await?;
-    // Checked under CREATE_LOCK, which `shutdown_all` also takes: if the exit
+    // Checked under the pool gate, which `shutdown_all` takes for write: if the exit
     // path already drained the pool, this child would never be reaped by
     // anyone. Reap it here rather than inserting into a pool that is done.
     if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
@@ -298,12 +322,13 @@ pub async fn shutdown(backend_id: &str) {
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub async fn shutdown_all() {
-    // Serialize with `client()`. It holds CREATE_LOCK from lookup through
-    // `ensure_connected` and inserts into the pool only afterwards, so draining
-    // without this lock can run entirely between the spawn and the insert —
-    // finding an empty pool while an untracked child is already alive, which
-    // the exit path then leaves running along with its tool descendants.
-    let _create = CREATE_LOCK.lock().await;
+    // Serialize with EVERY in-flight `client()`. Each holds the read guard from
+    // lookup through `ensure_connected` and inserts into the pool only
+    // afterwards, so draining without the write guard can run entirely between
+    // a spawn and its insert — finding an empty pool while an untracked child
+    // is already alive, which the exit path then leaves running along with its
+    // tool descendants.
+    let _gate = POOL_GATE.write().await;
     SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut g = POOL.clients.lock().await;
     let all: Vec<_> = g.drain().map(|(_, c)| c).collect();
@@ -883,14 +908,19 @@ impl ClientHandle {
     }
 
     async fn reap_if_unused(&self, pending_policy: PendingPolicy) {
-        // Same lock as client() acquisition — empty-check + pool remove are
-        // atomic w.r.t. a concurrent get-or-create for this key.
-        let _create = CREATE_LOCK.lock().await;
+        // Resolve the key BEFORE locking: the guard is per-key now, so there is
+        // nothing to take until we know which key this is.
         let prog = self.program.lock().await.clone();
         let Some(program) = prog else {
             return;
         };
         let key = pool_key(self.backend_id, &program);
+        // Same guards as `client()` — empty-check + pool remove stay atomic
+        // against a concurrent get-or-create for this key, and the read guard
+        // keeps this out of the pool-wide drain's way.
+        let _gate = POOL_GATE.read().await;
+        let create_lock = key_lock(&key).await;
+        let _create = create_lock.lock().await;
         let empty = {
             if let Some(inner) = self.inner.lock().await.as_ref() {
                 may_retire(
@@ -917,8 +947,9 @@ impl ClientHandle {
                 _ => None,
             }
         };
-        // Drop CREATE_LOCK before await reap (shutdown takes other locks).
+        // Release before awaiting the reap (shutdown takes other locks).
         drop(_create);
+        drop(_gate);
         if let Some(c) = removed {
             c.shutdown_and_reap().await;
         }
@@ -1287,6 +1318,29 @@ mod tests {
         }
         // Once a route has existed, the ordinary rules resume.
         assert!(may_retire(state(0, 0, 0, 0), PendingPolicy::Protects));
+    }
+
+    /// Different pool keys must not serialize against each other. The whole
+    /// point of keying by `(backend, program)` is that a slow or broken command
+    /// pin is isolated; a process-wide creation mutex held across a handshake
+    /// (up to 60s) put every other key behind it.
+    #[tokio::test]
+    async fn creation_locks_are_per_key_not_process_wide() {
+        let a = super::key_lock("omp\0slow-binary").await;
+        let b = super::key_lock("omp\0healthy-binary").await;
+
+        let held = a.lock().await;
+        // A different key must be free while the first is held mid-handshake.
+        assert!(
+            b.try_lock().is_ok(),
+            "a different pool key must not wait on this one"
+        );
+        // The SAME key still serializes — that is what keeps create/retire atomic.
+        assert!(
+            super::key_lock("omp\0slow-binary").await.try_lock().is_err(),
+            "the same key must still serialize"
+        );
+        drop(held);
     }
 
     #[test]

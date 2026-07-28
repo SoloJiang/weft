@@ -5,48 +5,84 @@
 //! backend per command invocation rather than being persisted. Those paths post
 //! a TOKEN, and each consumer renders it with the locale it actually has.
 //!
-//! The webview owns the primary copy in `src/i18n/*.ts` (keyed through
-//! `src/lib/noticeTokens.ts`) because it knows the operator's language. This
-//! table exists for the consumers that cannot reach those catalogs — today the
-//! IM bridge, which sends on its own fixed locale — so a remote human gets a
-//! sentence instead of a raw `acp.force_reset_notice`.
+//! The webview renders tokens through its own catalogs. This module exists for
+//! consumers that cannot reach them — today the IM bridge, which sends on its
+//! own fixed locale.
+//!
+//! Both read the SAME file. `src/i18n/notices.json` is the single source, baked
+//! in here at compile time and imported by `src/i18n/{en,zh}.ts`; an earlier
+//! version restated the sentences in Rust, which meant a catalog edit silently
+//! gave remote and in-app users different text.
 
-/// The copy for `token`, or `None` when the text is ordinary agent prose that
-/// should pass through untouched.
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+/// `token -> lang -> copy`, compiled in from the shared catalog source.
+///
+/// A malformed file yields an EMPTY table rather than a panic (production paths
+/// must not panic), which would surface as raw tokens. `notices_json_parses`
+/// below fails the build's test run in that case, so it cannot ship silently.
+static NOTICES: LazyLock<HashMap<String, HashMap<String, String>>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../../../src/i18n/notices.json")).unwrap_or_default()
+});
+
+/// The copy for `token` in `lang`, or `None` when the text is ordinary agent
+/// prose that should pass through untouched.
+///
+/// Falls back to English for a locale the catalog does not carry — a sentence
+/// in the wrong language still beats a raw `acp.force_reset_notice`.
 pub fn resolve(token: &str, lang: &str) -> Option<&'static str> {
-    let zh = match token {
-        crate::lead_chat::engine::ACP_FORCE_RESET_NOTICE => {
-            "⏹️ 停止后 agent 未响应取消请求，已强制中断并重置为全新会话继续。历史对话仍保留在时间线里，但新会话不带原生上下文；如果后续回复像「忘记」了之前的内容，请重新提示一下关键信息。"
-        }
-        _ => return None,
-    };
-    if lang == "zh" {
-        return Some(zh);
-    }
-    let en = match token {
-        crate::lead_chat::engine::ACP_FORCE_RESET_NOTICE => {
-            "⏹️ The agent did not answer the cancellation after Stop, so the turn was force-interrupted and continues on a brand-new session. The conversation stays in the timeline, but the new session carries no native context — if later replies seem to have \"forgotten\" earlier details, re-state the key points."
-        }
-        _ => return None,
-    };
-    Some(en)
+    let by_lang = NOTICES.get(token)?;
+    by_lang
+        .get(lang)
+        .or_else(|| by_lang.get("en"))
+        .map(String::as_str)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The table is `include_str!`-ed, so a malformed or moved file degrades to
+    /// empty at runtime. This is the check that keeps that from shipping.
     #[test]
-    fn known_tokens_resolve_in_both_languages() {
+    fn notices_json_parses_and_carries_both_languages() {
+        assert!(
+            !NOTICES.is_empty(),
+            "notices.json failed to parse — every token would render raw"
+        );
+        for (token, by_lang) in NOTICES.iter() {
+            for lang in ["en", "zh"] {
+                let copy = by_lang
+                    .get(lang)
+                    .unwrap_or_else(|| panic!("{token} is missing {lang}"));
+                assert!(!copy.trim().is_empty(), "{token}/{lang} is blank");
+                assert!(
+                    !copy.contains(token),
+                    "{token}/{lang} contains the raw token"
+                );
+            }
+        }
+    }
+
+    /// The one token the force-reset path posts must be renderable, or a remote
+    /// human receives `acp.force_reset_notice` verbatim.
+    #[test]
+    fn the_force_reset_token_resolves_in_both_languages() {
         for lang in ["zh", "en"] {
             let text = resolve(crate::lead_chat::engine::ACP_FORCE_RESET_NOTICE, lang)
                 .expect("force-reset notice must have copy");
             assert!(!text.is_empty());
-            assert!(
-                !text.contains("acp.force_reset_notice"),
-                "{lang}: the token must not leak into the copy"
-            );
         }
+    }
+
+    /// An unknown locale still gets a sentence rather than the token.
+    #[test]
+    fn an_unknown_locale_falls_back_to_english() {
+        let text = resolve(crate::lead_chat::engine::ACP_FORCE_RESET_NOTICE, "fr")
+            .expect("fallback copy");
+        let en = resolve(crate::lead_chat::engine::ACP_FORCE_RESET_NOTICE, "en").expect("en copy");
+        assert_eq!(text, en);
     }
 
     /// Ordinary agent prose is not a token and must pass through untouched.

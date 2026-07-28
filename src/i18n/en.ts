@@ -1,3 +1,4 @@
+import notices from "./notices.json" with { type: "json" };
 export const en = {
   common: {
     cancel: "Cancel",
@@ -328,8 +329,10 @@ export const en = {
   },
   needs: {
     acpPermissionRequired: "Permission required",
-    acpForceResetNotice:
-      "⏹️ The agent did not answer the cancellation after Stop, so the turn was force-interrupted and continues on a brand-new session. The conversation stays in the timeline, but the new session carries no native context — if later replies seem to have \"forgotten\" earlier details, re-state the key points.",
+    // Sourced from `notices.json`, NOT restated here: the IM bridge renders the
+    // same token from Rust, and two copies of the sentence drift the moment one
+    // side is edited.
+    acpForceResetNotice: notices["acp.force_reset_notice"].en,
     title: "Needs you",
     subtitle: "approvals and questions only you can answer",
     wantsPermission: "wants permission",
