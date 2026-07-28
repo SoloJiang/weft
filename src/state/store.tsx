@@ -1964,7 +1964,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
       try {
         const cmds = await api.discoverSlash(threadId, null);
-        setLeadSlash((s) => ({ ...s, [threadId]: cmds }));
+        // Same reasoning as the worker path below: an empty list cannot be
+        // told apart from a failed discovery, so it must not clear a palette
+        // that is already populated.
+        if (cmds.length > 0) setLeadSlash((s) => ({ ...s, [threadId]: cmds }));
       } catch (e) {
         /* slash discovery is best-effort */
         console.error(e);
@@ -2054,6 +2057,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     void api
       .discoverSlash(null, sessionId)
       .then((cmds) => {
+        // Enforce the best-effort contract stated above instead of only
+        // documenting it. `discoverSlash` returns an empty list for an
+        // authoritative empty palette AND for startup / HTTP / parse failures
+        // — opencode's live `GET /command` can fail transiently — and the two
+        // are indistinguishable from here. Overwriting on empty therefore wiped
+        // a working palette after any hiccup. Keeping a stale-but-valid list
+        // costs at most a few extra entries; clearing it costs the feature.
+        if (cmds.length === 0) return;
         setWorkerSlash((s) => ({ ...s, [sessionId]: cmds }));
       })
       .catch(() => {});

@@ -111,11 +111,23 @@ struct RouteState {
     opening: usize,
     expecting: u32,
     pending: usize,
+    /// Whether a route was EVER installed on this connection.
+    ever_had_session: bool,
 }
 
 /// Whether a pooled client in this state may be retired. Split out from the
 /// locking so the policy itself is directly testable.
+///
+/// `ever_had_session` separates "done with its routes" from "has not opened one
+/// yet". A freshly reconnected client sits in the second state between
+/// `initialize` and the caller's `session/new|resume`: every counter reads zero
+/// and its `pending` map drains the moment the handshake resolves, so without
+/// this it looked idle and was retired out from under the caller, whose next
+/// `session/*` then failed with `ACP not connected`.
 fn may_retire(state: RouteState, policy: PendingPolicy) -> bool {
+    if !state.ever_had_session {
+        return false;
+    }
     let unused = state.sessions == 0 && state.opening == 0 && state.expecting == 0;
     let replies_settled = match policy {
         PendingPolicy::Protects => state.pending == 0,
@@ -140,6 +152,15 @@ struct Inner {
     /// Sessions currently between session/new|resume and subscribe — only these
     /// may buffer pre-subscribe updates. Explicit unsubscribe drops the key.
     opening_sessions: std::collections::HashSet<String>,
+    /// Whether any session route has EVER existed on this connection.
+    ///
+    /// Distinguishes "finished with its routes" from "has not opened one yet".
+    /// A freshly (re)connected client sits in the second state between
+    /// `initialize` and the caller's `session/new|resume`: its `pending` map
+    /// drains when the handshake resolves, and treating that as "idle" retired
+    /// the client the caller was about to use, which then failed with
+    /// `ACP not connected`.
+    ever_had_session: bool,
     /// In-flight session/new|resume|load count — buffer updates while > 0.
     /// Counter (not bool) so concurrent opens don't clear early.
     expecting_session: u32,
@@ -352,6 +373,7 @@ impl ClientHandle {
             permission_gen: 0,
             pending_updates: std::collections::HashMap::new(),
             opening_sessions: std::collections::HashSet::new(),
+            ever_had_session: false,
             expecting_session: 0,
             connection_gen,
             _child: child,
@@ -445,11 +467,17 @@ impl ClientHandle {
                 if let Some(sid) = val.get("sessionId").and_then(|s| s.as_str()) {
                     if !sid.is_empty() {
                         inner.opening_sessions.insert(sid.to_string());
+                        inner.ever_had_session = true;
                     }
                 }
             }
             let waiter = inner.pending.remove(&id);
-            let drained = inner.pending.is_empty();
+            // A connection that has not opened a route yet is BETWEEN connect
+            // and `session/new|resume`, not done with its work. Its `pending`
+            // map drains the moment `initialize` resolves, and retiring there
+            // shut down the very client the caller was about to use — the next
+            // `session/*` then failed with `ACP not connected`.
+            let drained = inner.pending.is_empty() && inner.ever_had_session;
             if let Some(tx) = waiter {
                 let _ = tx.send(res);
             }
@@ -775,6 +803,7 @@ impl ClientHandle {
             .pending_updates
             .remove(session_id)
             .unwrap_or_default();
+        inner.ever_had_session = true;
         inner.sessions.insert(
             session_id.to_string(),
             SessionRoute {
@@ -850,6 +879,7 @@ impl ClientHandle {
                         opening: inner.opening_sessions.len(),
                         expecting: inner.expecting_session,
                         pending: inner.pending.len(),
+                        ever_had_session: inner.ever_had_session,
                     },
                     pending_policy,
                 )
@@ -877,6 +907,7 @@ impl ClientHandle {
     async fn mark_opening(&self, session_id: &str) {
         if let Some(inner) = self.inner.lock().await.as_mut() {
             inner.opening_sessions.insert(session_id.to_string());
+            inner.ever_had_session = true;
         }
     }
 
@@ -884,6 +915,7 @@ impl ClientHandle {
         if let Some(inner) = self.inner.lock().await.as_mut() {
             if on {
                 inner.expecting_session = inner.expecting_session.saturating_add(1);
+                inner.ever_had_session = true;
             } else {
                 inner.expecting_session = inner.expecting_session.saturating_sub(1);
             }
@@ -1152,6 +1184,7 @@ mod tests {
             opening,
             expecting,
             pending,
+            ever_had_session: true,
         }
     }
 
@@ -1194,6 +1227,29 @@ mod tests {
                 "{policy:?}: fully unused clients are retired"
             );
         }
+    }
+
+    /// A reconnected client between `initialize` and `session/new` reads as
+    /// fully idle — zero routes, and `pending` empties when the handshake
+    /// resolves. Retiring it there shut down the client the caller was about
+    /// to use; the next `session/*` answered `ACP not connected`.
+    #[test]
+    fn a_connection_that_never_opened_a_route_is_never_retired() {
+        for policy in [PendingPolicy::Protects, PendingPolicy::Abandoned] {
+            let fresh = RouteState {
+                sessions: 0,
+                opening: 0,
+                expecting: 0,
+                pending: 0,
+                ever_had_session: false,
+            };
+            assert!(
+                !may_retire(fresh, policy),
+                "{policy:?}: a client mid-handshake is not idle, it is not started"
+            );
+        }
+        // Once a route has existed, the ordinary rules resume.
+        assert!(may_retire(state(0, 0, 0, 0), PendingPolicy::Protects));
     }
 
     #[test]

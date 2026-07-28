@@ -680,7 +680,12 @@ pub fn fork_omp_at(
         // Only headers — equivalent to before-first-message.
         return Ok(None);
     }
-    let new_id = uuid_v4_simple();
+    // Random, not clock-derived: two rewinds on the same tick produced the SAME
+    // id, and both write `weft-rewind_<id>.jsonl` with a truncating `fs::write`,
+    // so one fork silently overwrote the other and two sessions resumed the same
+    // (or a corrupted) history. `new_uuid_v4` is the same RFC 4122 v4 helper the
+    // claude rewind already uses.
+    let new_id = new_uuid_v4();
     let mut out = String::new();
     for line in kept {
         let Ok(mut v) = serde_json::from_str::<Value>(line) else {
@@ -712,9 +717,22 @@ pub fn fork_omp_at(
 fn find_omp_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
     let root = home.join(".omp/agent/sessions");
-    if !root.is_dir() {
+    // The ROOT itself must not be a symlink. `is_dir()` follows one, and the
+    // bucket/entry checks below only reject a symlink at the FINAL component —
+    // so a redirected root put the whole scan outside the intended tree, and
+    // rewind then writes its fork beside that external file.
+    let root_ok = std::fs::symlink_metadata(&root)
+        .map(|m| m.is_dir() && !m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !root_ok {
         return Ok(None);
     }
+    // Containment of REAL locations, checked once at the end. Rejecting a
+    // symlink component-by-component can only cover the components this code
+    // happens to look at; canonicalizing the winner and requiring it under the
+    // canonical root covers every intermediate component and any `..` escape.
+    // Same rule `bus::builtin_allow` uses for ask-bridge path containment.
+    let canon_root = std::fs::canonicalize(&root)?;
     // Prefer encoded-cwd bucket; fall back to any match.
     let encoded = omp_encode_cwd(cwd);
     let mut candidates = Vec::new();
@@ -756,6 +774,7 @@ fn find_omp_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>
             candidates.push(e);
         }
     }
+    candidates.retain(|p| is_inside_canonical(p, &canon_root));
     // Newest mtime wins if several.
     candidates.sort_by_key(|p| {
         std::fs::metadata(p)
@@ -765,6 +784,30 @@ fn find_omp_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>
             .unwrap_or(0)
     });
     Ok(candidates.pop())
+}
+
+/// Whether `candidate`'s REAL location is under `canon_root` (already
+/// canonical).
+///
+/// This is the actual boundary. The component-by-component symlink rejections
+/// above and in [`walkdir_jsonl`] are shape matching — they can only cover the
+/// components that particular code happens to look at — whereas resolving the
+/// winner and requiring containment holds for every intermediate component and
+/// for `..` escapes at once.
+///
+/// It is unreachable through today's callers precisely BECAUSE those scans also
+/// refuse symlinks, so no integration test can drive it without first weakening
+/// them; the predicate is tested directly instead. It stays as the structural
+/// guarantee those local checks are only approximating. Note it does NOT catch
+/// hard links — `canonicalize` does not resolve them — so it is containment of
+/// paths, not of inodes.
+///
+/// A path that cannot be canonicalized is NOT contained: when containment can't
+/// be established, the honest answer is "not a candidate".
+fn is_inside_canonical(candidate: &Path, canon_root: &Path) -> bool {
+    std::fs::canonicalize(candidate)
+        .map(|real| real.starts_with(canon_root))
+        .unwrap_or(false)
 }
 
 fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
@@ -847,22 +890,6 @@ fn omp_encode_cwd(cwd: &Path) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
-}
-
-fn uuid_v4_simple() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!(
-        "{:08x}-{:04x}-4{:03x}-a{:03x}-{:012x}",
-        (nanos & 0xffff_ffff) as u32,
-        ((nanos >> 32) & 0xffff) as u16,
-        ((nanos >> 48) & 0x0fff) as u16,
-        ((nanos >> 60) & 0x0fff) as u16,
-        (nanos.reverse_bits() & 0xffff_ffff_ffff) as u64
-    )
 }
 
 #[cfg(test)]
@@ -1469,9 +1496,146 @@ mod tests {
         assert!(hits.len() <= 32, "hits capped");
     }
 
+    /// CLAUDE.md requires symlink-containment coverage for recursive
+    /// filesystem work. `is_dir()` FOLLOWS a symlink, and the per-bucket and
+    /// per-entry checks only reject one at the final component — so a
+    /// redirected root put the whole scan outside `~/.omp/agent/sessions`, and
+    /// a rewind would then write its fork beside that external file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_session_root_is_refused() {
+        use std::fs;
+        let _serialized = home_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path();
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+
+        // The real session tree lives OUTSIDE the home we will point at.
+        let outside = dir.path().join("elsewhere");
+        let bucket = outside.join(omp_encode_cwd(&cwd));
+        fs::create_dir_all(&bucket).unwrap();
+        fs::write(bucket.join("zzz_sess-outside.jsonl"), b"{}\n").unwrap();
+
+        // ~/.omp/agent/sessions -> the outside tree.
+        fs::create_dir_all(home.join(".omp/agent")).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join(".omp/agent/sessions")).unwrap();
+
+        let old = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let found = find_omp_session_file(&cwd, "sess-outside");
+        match old {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert!(
+            matches!(found, Ok(None)),
+            "a symlinked session root must select nothing, got {found:?}"
+        );
+    }
+
+    /// The containment check is on REAL locations, so an entry reachable only
+    /// through a symlinked BUCKET (an intermediate component, which the
+    /// per-entry check never looks at) is refused too.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_reached_through_a_symlinked_bucket_is_refused() {
+        use std::fs;
+        let _serialized = home_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path();
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let outside = dir.path().join("outside-bucket");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("zzz_sess-linked.jsonl"), b"{}\n").unwrap();
+
+        let sessions = home.join(".omp/agent/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        std::os::unix::fs::symlink(&outside, sessions.join(omp_encode_cwd(&cwd))).unwrap();
+
+        let old = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let found = find_omp_session_file(&cwd, "sess-linked");
+        match old {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert!(
+            matches!(found, Ok(None)),
+            "a symlinked bucket must not yield a candidate, got {found:?}"
+        );
+    }
+
+    /// The boundary predicate itself. Unreachable via `find_omp_session_file`
+    /// today (its scans refuse symlinks first), so it is exercised directly —
+    /// a guard with no test is indistinguishable from one that always returns
+    /// the same answer.
+    #[cfg(unix)]
+    #[test]
+    fn containment_is_of_real_locations_not_path_strings() {
+        use std::fs;
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("escaped.jsonl"), b"{}\n").unwrap();
+        fs::write(root.join("real.jsonl"), b"{}\n").unwrap();
+        let canon_root = fs::canonicalize(&root).unwrap();
+
+        assert!(is_inside_canonical(&root.join("real.jsonl"), &canon_root));
+
+        // Reachable through a path that LOOKS inside, but resolves outside.
+        std::os::unix::fs::symlink(outside.join("escaped.jsonl"), root.join("looks-inside.jsonl"))
+            .unwrap();
+        assert!(
+            !is_inside_canonical(&root.join("looks-inside.jsonl"), &canon_root),
+            "a symlink pointing out of the tree is not contained"
+        );
+
+        // `..` traversal that stringly-starts-with the root.
+        assert!(!is_inside_canonical(
+            &root.join("../outside/escaped.jsonl"),
+            &canon_root
+        ));
+
+        // Cannot be canonicalized → not contained.
+        assert!(!is_inside_canonical(&root.join("missing.jsonl"), &canon_root));
+    }
+
+    /// The guards must not reject the ordinary case.
+    #[test]
+    fn an_ordinary_session_file_is_still_found() {
+        use std::fs;
+        let _serialized = home_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path();
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let bucket = home.join(".omp/agent/sessions").join(omp_encode_cwd(&cwd));
+        fs::create_dir_all(&bucket).unwrap();
+        fs::write(bucket.join("zzz_sess-ok.jsonl"), b"{}\n").unwrap();
+
+        let old = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let found = find_omp_session_file(&cwd, "sess-ok");
+        match old {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let path = found.expect("lookup ok").expect("a candidate");
+        assert!(path.ends_with("zzz_sess-ok.jsonl"), "got {path:?}");
+    }
+
     #[test]
     fn preferred_bucket_caps_large_dir() {
         use std::fs;
+        let _serialized = home_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tmp");
         let home = dir.path();
         let sessions = home.join(".omp/agent/sessions");
@@ -1496,6 +1660,15 @@ mod tests {
 
     /// The system prepend the first ACP user turn carries in these fixtures.
     const SYS: &str = "SYSTEM PREAMBLE";
+
+    /// Serializes the tests that override `HOME`. `find_omp_session_file`
+    /// resolves it through `dirs::home_dir()` and cargo runs tests on threads,
+    /// so without this two HOME-swapping tests interleave and each sees the
+    /// other's root — a flake that only shows up under load.
+    fn home_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
 
     fn omp_user_line(blocks: serde_json::Value) -> String {
         serde_json::json!({

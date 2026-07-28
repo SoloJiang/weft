@@ -328,6 +328,8 @@ export const en = {
   },
   needs: {
     acpPermissionRequired: "Permission required",
+    acpForceResetNotice:
+      "⏹️ The agent did not answer the cancellation after Stop, so the turn was force-interrupted and continues on a brand-new session. The conversation stays in the timeline, but the new session carries no native context — if later replies seem to have \"forgotten\" earlier details, re-state the key points.",
     title: "Needs you",
     subtitle: "approvals and questions only you can answer",
     wantsPermission: "wants permission",

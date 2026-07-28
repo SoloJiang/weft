@@ -733,6 +733,46 @@ fn queue_hidden_delivery(app: &AppHandle, inner: &mut EngineInner, out: Outgoing
 /// `status` distinguishes WHY the turn died: "error" for a genuine failure,
 /// "interrupted" when a stop/interrupt canceled it (a guard-canceled spawn must
 /// not be reported as an agent failure).
+/// Drain the consumer for `session_id`, then finalize every row this turn left
+/// open, as `status`.
+///
+/// The queued-prompt error path skipped both. `reset_failed_hidden_turn` clears
+/// `inner.current` outright, so a follow-up prompt that had already streamed
+/// text before its JSON-RPC request failed left that row `streaming` in the DB
+/// with nothing to ever close it — and updates still sitting in the consumer
+/// could arrive after the turn was reset and attach to an idle session. The
+/// first-prompt path gets this via `acp_drain_then_end`; this is the same
+/// sequence, in the same order, for the failure branch.
+async fn acp_drain_and_finalize_open_rows(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    client: &crate::acp::runtime::ClientHandle,
+    session_id: &str,
+    status: &str,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if client
+        .send_session_event(
+            session_id,
+            crate::acp::runtime::SessionEvent::DrainBarrier(tx),
+        )
+        .await
+    {
+        // Bounded, same as the success path: a gone consumer must not hang this.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+    }
+    let mut inner = eng.lock().await;
+    let thread_id = inner.thread_id;
+    let orphans: Vec<(i32, serde_json::Value)> =
+        inner.tool_rows.drain().map(|(_, v)| v).collect();
+    finalize_orphan_tool_rows(app, db, thread_id, orphans, status).await;
+    finalize_open_texts(app, db, &mut inner, status).await;
+    if inner.current.is_some() {
+        finalize_current_text(app, db, &mut inner, status).await;
+    }
+}
+
 async fn rollback_failed_turn(
     app: &AppHandle,
     db: &Db,
@@ -3396,6 +3436,13 @@ async fn spawn_acp_turn(
     if need_sub {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         client.subscribe(&session_id, tx).await?;
+        // Capture the generation HERE, not inside the spawned task. Read after
+        // the spawn, the consumer records whatever epoch is current when it
+        // first takes the lock — so a Stop, rewind, or engine switch landing in
+        // that gap makes it adopt the NEW epoch and treat already-buffered
+        // events from the abandoned session as live, appending or finalizing
+        // stale text onto a session that was stopped or switched.
+        let route_epoch = eng.lock().await.reset_epoch;
         let (a, d, e, c, s) = (
             app.clone(),
             db.clone(),
@@ -3403,7 +3450,9 @@ async fn spawn_acp_turn(
             client.clone(),
             session_id.clone(),
         );
-        tauri::async_runtime::spawn(async move { acp_consumer(a, d, e, c, s, rx).await });
+        tauri::async_runtime::spawn(
+            async move { acp_consumer(a, d, e, c, s, rx, route_epoch).await },
+        );
     }
 
     let stop_won = {
@@ -3649,6 +3698,11 @@ async fn acp_emit_turn_end(
                 Err(err) => {
                     eprintln!("[weft][acp] flush prompt failed: {err}");
                     let status = drain_failure_status(&eng, dequeue_epoch).await;
+                    // Close what this prompt already streamed BEFORE resetting
+                    // the turn — the reset drops `inner.current` without
+                    // finalizing it, and un-drained consumer updates would
+                    // otherwise land on an already-idle session.
+                    acp_drain_and_finalize_open_rows(&app, &db, &eng, &client, &sid, status).await;
                     rollback_failed_turn(&app, &db, &eng, turn_id, status).await;
                     finalize_dequeued_row(&app, &db, thread_id, &msg, status).await;
                     break;
@@ -3884,14 +3938,16 @@ async fn acp_consumer(
     client: crate::acp::runtime::ClientHandle,
     _session_id: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::acp::runtime::SessionEvent>,
+    // The engine generation this route was subscribed under — captured by the
+    // caller BEFORE this task was spawned, so it names the session that created
+    // the route rather than whatever won a race afterwards.
+    start_epoch: u64,
 ) {
     use crate::acp::runtime::SessionEvent;
     use super::proto::ChatEvent;
     // Accumulated thought text for the busy-line chip, bounded to the display
     // window. Cleared at every prompt boundary — see the DrainBarrier arm.
     let mut thought_buf = ThoughtTail::default();
-    // Drop late events after stop/unsubscribe/teardown (reset_epoch advances).
-    let start_epoch = eng.lock().await.reset_epoch;
     while let Some(msg) = rx.recv().await {
         match msg {
             // Barrier: prompt-task waits until prior events are drained.
@@ -5283,7 +5339,7 @@ async fn force_acp_turn_reset(
     // The native context is gone, exactly as after a freeze recovery — say so,
     // with the same persistent notice, worded for the cause the user saw.
     if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
-        bus.ask_human(thread_id, &ask_dir, &acp_force_reset_text());
+        bus.ask_human(thread_id, &ask_dir, ACP_FORCE_RESET_NOTICE);
     }
 }
 
@@ -5292,24 +5348,16 @@ async fn force_acp_turn_reset(
 /// window — same consequence (the native session is abandoned), so the same
 /// persistent notice rather than a self-clearing hint.
 ///
-/// BILINGUAL in one string rather than locale-selected, the same shape
-/// `bus::inject::HOOK_DECIDE_OR_DENY` uses and for the same reason: the
-/// frontend `src/i18n/*.ts` catalogs are TS modules bundled into the webview
-/// and unreachable from here, and `lang` is not persisted backend-side — it is
-/// passed per command invocation (see `lang_directive`'s callers). This notice
-/// is raised from a detached watchdog task 8s after the Stop, which has no such
-/// invocation to read it from. Emitting only Chinese would leave an
-/// English-language operator with an unreadable Needs-you card.
-fn acp_force_reset_text() -> String {
-    "⏹️ The agent did not answer the cancellation after Stop, so the turn was \
-     force-interrupted and continues on a brand-new session. The conversation \
-     stays in the timeline, but the new session carries no native context — if \
-     later replies seem to have \"forgotten\" earlier details, re-state the key \
-     points. / 停止后 agent 未响应取消请求，已强制中断并重置为全新会话继续。\
-     历史对话仍保留在时间线里，但新会话不带原生上下文；如果后续回复像「忘记」了\
-     之前的内容，请重新提示一下关键信息。"
-        .to_string()
-}
+/// A STABLE MACHINE TOKEN, not prose. This path has no locale to read — it runs
+/// on a detached watchdog task 8s after the Stop, and `lang` is passed per
+/// command invocation (see `lang_directive`'s callers) rather than persisted —
+/// so the copy belongs in the catalogs the webview already owns. `summary_from
+/// _params` established exactly this shape for `acp.permission_required`;
+/// `ConfirmationCard` maps the token to `t(...)`. An earlier round of this PR
+/// shipped the text bilingually inline instead; that left the string
+/// untranslatable and inconsistent with the rest of the UI, which is the wrong
+/// trade when a token costs one line on each side.
+pub(crate) const ACP_FORCE_RESET_NOTICE: &str = "acp.force_reset_notice";
 
 pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
@@ -8515,6 +8563,15 @@ fn emit_lead_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The notice is a machine token, and the FRONTEND owns its copy
+    /// (`NeedsRows.tsx`'s `NOTICE_TOKENS` → `needs.acpForceResetNotice`).
+    /// Changing this string without changing it there renders the raw token as
+    /// the notice body, so pin the exact value on this side too.
+    #[test]
+    fn the_force_reset_notice_is_the_token_the_frontend_maps() {
+        assert_eq!(ACP_FORCE_RESET_NOTICE, "acp.force_reset_notice");
+    }
 
     /// The hole this closes, end to end: a read naming an ordinary file FIRST
     /// and a credential second was tiered `ReadOnly` off the first path alone,
