@@ -703,6 +703,21 @@ fn emit_turn_state(
     );
 }
 
+/// Whether a HIDDEN turn (a bus wake, a plumbing delivery) may start now.
+///
+/// The visible path asks `send_reservation_valid`; hidden delivery never passes
+/// through it, so the teardown reservation has to be checked here too. Without
+/// this, a teardown holding `tearing_down` — which has already cleared
+/// `turn.busy` and `interrupting` and bumped the epoch — is invisible to a bus
+/// wake, which then starts a fresh native session mid-cleanup and has its
+/// native id cleared and an idle state emitted over it by the older reset.
+///
+/// Split out rather than inlined at both call sites so the two entry points
+/// cannot drift, and so the rule is testable without an `AppHandle`.
+fn hidden_turn_admissible(inner: &EngineInner) -> bool {
+    !inner.stopped && !inner.tearing_down
+}
+
 async fn begin_hidden_turn(app: &AppHandle, db: &Db, inner: &mut EngineInner) -> i32 {
     let turn_id = mark_hidden_turn_started(inner);
     crate::power::on_turn_began(app);
@@ -3296,7 +3311,13 @@ async fn spawn_acp_turn(
 ) -> anyhow::Result<()> {
     let (native, cwd, sid, thread_id_i, system_prompt, tool, command, ask_dir) = {
         let i = eng.lock().await;
-        if i.stopped || i.interrupting || expected_epoch.is_some_and(|e| e != i.reset_epoch) {
+        // `tearing_down` included as defence in depth: the hidden path already
+        // refuses, but this is the one gate every ACP turn passes through.
+        if i.stopped
+            || i.interrupting
+            || i.tearing_down
+            || expected_epoch.is_some_and(|e| e != i.reset_epoch)
+        {
             return Err(anyhow::anyhow!("engine stopped; not starting an ACP turn"));
         }
         (
@@ -5603,6 +5624,17 @@ async fn send_hidden_inner(
         return Err(err);
     }
     let mut inner = eng.lock().await;
+    // Same reservation the visible path honours via `send_reservation_valid`,
+    // which hidden delivery does not go through. A bus wake skipped here is not
+    // lost — the coordinator re-delivers it on the next sweep — whereas one
+    // admitted mid-teardown has its turn reset out from under it.
+    if !hidden_turn_admissible(&inner) {
+        drop(inner);
+        if bus_read {
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!("engine is tearing down"));
+    }
     if ensure {
         // Spawn the resident process under THIS lock, never releasing it before
         // the slot is reserved below. The reader task blocks on this lock and
@@ -8693,6 +8725,26 @@ fn emit_lead_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hidden delivery bypasses `send_reservation_valid` entirely, so the
+    /// teardown reservation has to be enforced on its own path — otherwise a
+    /// bus wake starts a native session during cleanup and the older reset
+    /// clears its id and emits idle over it.
+    #[test]
+    fn a_hidden_turn_is_refused_while_a_teardown_is_reserved() {
+        let mut inner = test_inner("omp");
+        assert!(hidden_turn_admissible(&inner), "baseline: idle engine accepts");
+
+        inner.tearing_down = true;
+        assert!(!hidden_turn_admissible(&inner), "a reserved teardown refuses");
+
+        inner.tearing_down = false;
+        inner.stopped = true;
+        assert!(!hidden_turn_admissible(&inner), "a stopped engine refuses");
+
+        inner.stopped = false;
+        assert!(hidden_turn_admissible(&inner), "and accepts again afterwards");
+    }
 
     /// A stale claim owns nothing, so it must leave every field it inspected
     /// exactly as it found them — including the reservation and the native id.
