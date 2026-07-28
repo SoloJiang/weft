@@ -57,6 +57,10 @@ pub enum SessionEvent {
         /// its structure is still here. `intent_key` is the always-grant
         /// cache token and is far too lossy to re-derive this from.
         intent: super::permission::PermissionIntent,
+        /// Canonical full action identity for the persisted Always grant.
+        /// Carries the structured `locations` that `detail` (stringified
+        /// `rawInput`) can omit entirely — see `permission::grant_identity`.
+        grant_id: String,
         options: Vec<Value>,
     },
 }
@@ -500,6 +504,7 @@ impl ClientHandle {
         let (summary, detail) = summary_from_params(&params);
         let intent = intent_key_from_params(&params);
         let what = super::permission::intent_from_params(&params);
+        let grant = super::permission::grant_identity(&params);
         let req_key = Self::permission_id_key(&id);
 
         let (auto, gen) = {
@@ -546,6 +551,7 @@ impl ClientHandle {
                             detail: detail.clone(),
                             intent_key: intent.clone(),
                             intent: what.clone(),
+                            grant_id: grant.clone(),
                             options: options.clone(),
                         })
                         .is_ok()

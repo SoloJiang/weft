@@ -961,10 +961,7 @@ async fn run_streaming_agent<F: FnMut(AnalysisEvent)>(
     prompt: &str,
     on_event: &mut F,
 ) -> Result<String> {
-    // Curator is exec/app-server only. ACP tools (omp) have no argv dialect —
-    // fall back to the next installed non-ACP CLI so repo analysis still runs
-    // when the user default is omp.
-    let tool = curator_exec_tool(tool);
+    let tool = curator_exec_tool(tool)?;
     if tool == "codex" && crate::adapters::codex_prefers_appserver() {
         match run_codex_appserver(cwd, prompt, on_event).await {
             Ok(text) => return Ok(text),
@@ -976,27 +973,26 @@ async fn run_streaming_agent<F: FnMut(AnalysisEvent)>(
     run_exec(tool, cwd, prompt, on_event).await
 }
 
-/// Pick a tool the curator runner can actually drive. ACP-only defaults (omp)
-/// resolve to the next installed non-ACP CLI by TOOL_PRIORITY; if none, keep
-/// the original so the call surfaces a clear error.
-fn curator_exec_tool(preferred: &str) -> &str {
-    if !crate::lead_chat::engine::is_acp_tool(preferred) {
-        return preferred;
+/// Pick a tool the curator runner can actually drive.
+///
+/// The curator drives agents through exec / app-server argv, and an ACP engine
+/// (omp) has no argv dialect. This used to substitute the next installed
+/// non-ACP CLI so analysis "still ran" — but the caller has already committed
+/// the routing decision via `record_decision`, so that would send the
+/// repository to a provider the user did not choose while the audit trail
+/// names the one they did. It refuses instead.
+///
+/// Unreachable today, and deliberately so rather than merely absent:
+/// `EngineId` has no ACP variant, so a hand-pinned `omp` blocks the route as
+/// `invalid_manual_tool` and `route.selected()` can never yield an ACP tool.
+/// `curator_refuses_an_acp_engine_rather_than_substituting_one` pins BOTH
+/// halves, so the day an ACP engine becomes routable this fails closed and the
+/// test says what to build instead.
+fn curator_exec_tool(preferred: &str) -> Result<&str> {
+    if crate::lead_chat::engine::is_acp_tool(preferred) {
+        anyhow::bail!("curator_unsupported_engine:{preferred}");
     }
-    for t in crate::detect::TOOL_PRIORITY {
-        if crate::lead_chat::engine::is_acp_tool(t) {
-            continue;
-        }
-        // Honor Settings command overrides / absolute pins (same as run_exec).
-        let cmd = crate::tool_command::command_for(t);
-        if crate::detect::resolve_tool_path(&cmd).is_some() {
-            eprintln!(
-                "[weft][curator] default tool {preferred} is ACP-only; using {t} for analysis"
-            );
-            return t;
-        }
-    }
-    preferred
+    Ok(preferred)
 }
 
 /// codex app-server transport: spawn a per-run app-server in `cwd` with read-only
@@ -2634,6 +2630,34 @@ mod tests {
     use super::*;
     use crate::profile::AgentRelation;
     use crate::store::{repo, Db};
+
+    /// The curator commits its routing decision (`record_decision`) BEFORE the
+    /// runner starts, so substituting a different engine inside the runner
+    /// would send the repository to a provider the user did not choose while
+    /// the audit trail names the one they did. Two independent things prevent
+    /// that, and both are asserted here because either one alone is a silent
+    /// dependency: routing cannot yield an ACP engine, and the runner refuses
+    /// one if it ever sees it.
+    #[test]
+    fn curator_refuses_an_acp_engine_rather_than_substituting_one() {
+        assert!(
+            curator_exec_tool("omp").is_err(),
+            "an ACP engine must fail loudly, not become a different provider"
+        );
+        assert_eq!(curator_exec_tool("codex").ok(), Some("codex"));
+        assert_eq!(curator_exec_tool("claude").ok(), Some("claude"));
+
+        // Why the refusal is unreachable today — and the tripwire for the day
+        // it is not. If an ACP engine becomes routable, `route.selected()` can
+        // hand one to the runner and this test fails, pointing at the real
+        // work: give the curator an ACP path, not a substitution.
+        for id in crate::acp::registered_ids() {
+            assert!(
+                crate::engine_routing::EngineId::parse(id).is_none(),
+                "{id} became routable; the curator now needs a real ACP runner"
+            );
+        }
+    }
 
     async fn mem() -> Db {
         Db::connect("sqlite::memory:").await.unwrap()

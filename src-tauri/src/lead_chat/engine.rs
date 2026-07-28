@@ -3823,7 +3823,8 @@ async fn acp_consumer(
 ) {
     use crate::acp::runtime::SessionEvent;
     use super::proto::ChatEvent;
-    // Accumulated thought text for the busy-line chip (cleared on answer tokens).
+    // Accumulated thought text for the busy-line chip, bounded to the display
+    // window. Cleared at every prompt boundary — see the DrainBarrier arm.
     let mut thought_buf = ThoughtTail::default();
     // Drop late events after stop/unsubscribe/teardown (reset_epoch advances).
     let start_epoch = eng.lock().await.reset_epoch;
@@ -3831,6 +3832,18 @@ async fn acp_consumer(
         match msg {
             // Barrier: prompt-task waits until prior events are drained.
             SessionEvent::DrainBarrier(tx) => {
+                // This barrier IS the end of a prompt, and it is the only end
+                // every prompt reaches. Clearing only on answer text or a tool
+                // call leaks reasoning across turns whenever a prompt produced
+                // thought chunks and nothing else — a clean cancellation, an
+                // error, a refusal — because this consumer outlives the prompt.
+                // The next turn's first chunk would then render appended to the
+                // previous turn's reasoning as if it were current activity.
+                //
+                // Placed BEFORE the stop/epoch guard below on purpose: a turn
+                // torn down mid-reasoning is exactly a turn whose tail must not
+                // survive, and that guard would otherwise skip this arm.
+                thought_buf.clear();
                 let _ = tx.send(());
             }
             _ if {
@@ -4041,6 +4054,7 @@ async fn acp_consumer(
                 detail,
                 intent_key,
                 intent,
+                grant_id,
                 options,
             } => {
                 let (thread_id, tool, dir, reject_now) = {
@@ -4059,8 +4073,13 @@ async fn acp_consumer(
                     continue;
                 }
                 // Precise Always key (issue #89): ACP family + session intent +
-                // raw detail so two different commands never share a grant.
-                let action_key = crate::ask::action_key(&["Acp", &intent_key, &detail]);
+                // the canonical action identity, so two different actions never
+                // share a grant. NOT `detail`: that is the stringified
+                // `rawInput`, which is identical (often empty) for two edits
+                // whose only difference lives in `toolCall.locations` — the
+                // very field the risk classifier reads first. `grant_id`
+                // folds every named location in; see `permission::grant_identity`.
+                let action_key = crate::ask::action_key(&["Acp", &intent_key, &grant_id]);
                 // Clone the registry BEFORE any await — State guards are !Send.
                 let asks = app
                     .try_state::<crate::ask::AskRegistry>()
@@ -5154,15 +5173,30 @@ async fn force_acp_turn_reset(
             return;
         }
         let client = inner.acp_client.take();
-        let sid = inner.native_id.clone();
+        // TAKE, not clone. Retiring the pooled client only helps when this
+        // engine was its last route; a client kept alive by ANOTHER session
+        // survives, and holding on to this session id would make the next send
+        // resume the very session whose prompt is still running — racing it or
+        // being rejected as busy. Dropping the id is what abandons the wedged
+        // session safely in both cases; the next send opens a fresh one.
+        let sid = inner.native_id.take();
+        let ask_dir = inner.ask_dir.clone();
         let Some(drain) = reset_frozen_appserver_turn(&mut inner, turn_id) else {
             inner.acp_client = client;
+            inner.native_id = sid;
             return;
         };
         inner.reset_epoch = inner.reset_epoch.saturating_add(1);
-        (inner.thread_id, inner.session_id, client, sid, drain)
+        (
+            inner.thread_id,
+            inner.session_id,
+            client,
+            sid,
+            drain,
+            ask_dir,
+        )
     };
-    let (thread_id, session_id, client, sid, drain) = snapshot;
+    let (thread_id, session_id, client, sid, drain, ask_dir) = snapshot;
     if let (Some(c), Some(sid)) = (client.as_ref(), sid.as_deref()) {
         let _ = c.cancel(sid).await;
         c.unsubscribe(sid).await;
@@ -5172,8 +5206,30 @@ async fn force_acp_turn_reset(
         // child and prompts the agent still running the abandoned turn.
         c.retire_after_ignored_cancel().await;
     }
+    // Mirror the in-memory clear above into the DB, or a restart would restore
+    // the abandoned session id and resume onto it.
+    if let Some(db) = app.try_state::<Db>() {
+        if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
+            eprintln!(
+                "[weft] acp force reset: failed to clear native id for thread {thread_id}: {err}"
+            );
+        }
+    }
     force_acp_finalize_drain(app, thread_id, session_id, turn_id, drain).await;
     emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
+    // The native context is gone, exactly as after a freeze recovery — say so,
+    // with the same persistent notice, worded for the cause the user saw.
+    if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
+        bus.ask_human(thread_id, &ask_dir, &acp_force_reset_text());
+    }
+}
+
+/// The ACP sibling of [`freeze_recovery_text`]. The user pressed Stop, the
+/// agent ignored `session/cancel`, and the turn was cut loose after the grace
+/// window — same consequence (the native session is abandoned), so the same
+/// persistent notice rather than a self-clearing hint.
+fn acp_force_reset_text() -> String {
+    "⏹️ 停止后 agent 未响应取消请求，已强制中断并重置为全新会话继续。历史对话仍保留在时间线里，但新会话不带原生上下文；如果后续回复像「忘记」了之前的内容，请重新提示一下关键信息。".to_string()
 }
 
 pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
@@ -6989,6 +7045,7 @@ async fn rewind_reserved(
             cwd: inner.cwd.clone(),
             native_id: inner.native_id.clone(),
             ask_dir: inner.ask_dir.clone(),
+            system_prompt: inner.system_prompt.clone(),
             codex_client: inner.codex_client.clone(),
             acp_client: inner.acp_client.clone(),
         }
@@ -7142,7 +7199,13 @@ async fn rewind_reserved(
                     if ordinal == 0 {
                         return Err(anyhow::anyhow!("该会话历史缺少回退锚点（旧会话）"));
                     }
-                    super::rewind::fork_omp_at(&snap.cwd, old, &match_text, ordinal)?
+                    super::rewind::fork_omp_at(
+                        &snap.cwd,
+                        old,
+                        &match_text,
+                        ordinal,
+                        &snap.system_prompt,
+                    )?
                 }
             },
             _ => return Err(anyhow::anyhow!("该工具暂不支持回退")),
@@ -7568,6 +7631,10 @@ struct RewindSnap {
     cwd: std::path::PathBuf,
     native_id: Option<String>,
     ask_dir: String,
+    /// The prepend the FIRST ACP user turn carries (`{system}\n\n{user}`).
+    /// Needed to strip it exactly during a rewind match — guessing the split
+    /// by blank line mis-handles multi-paragraph prompts.
+    system_prompt: String,
     codex_client: Option<crate::codex_app_server::Client>,
     #[allow(dead_code)]
     acp_client: Option<crate::acp::runtime::ClientHandle>,

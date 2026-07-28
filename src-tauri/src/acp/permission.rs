@@ -168,6 +168,43 @@ pub fn intent_from_params(params: &Value) -> PermissionIntent {
     }
 }
 
+/// The canonical, EXACT action identity for an Always grant (issue #89).
+///
+/// The stringified `rawInput` alone is NOT it. ACP lets a request carry its
+/// target only in `toolCall.locations` — which is exactly where
+/// [`intent_from_params`] looks first — and two edits to different files then
+/// stringify to an identical, sometimes empty, `rawInput`. An Always grant
+/// keyed on that would let approving one file silently auto-approve another.
+///
+/// EVERY named location joins the key, not just the first that `tool_path`
+/// takes for display and risk tiering: otherwise a two-file request could be
+/// replayed under the same grant with its second file swapped out.
+///
+/// Never shown to a human — `summary`/`detail` are the display strings.
+///
+/// Each location is LENGTH-PREFIXED rather than joined by a separator: a path
+/// may contain any byte except `/` and NUL, so any delimiter could in
+/// principle be forged to make two different location sets serialize
+/// identically. Lengths make the encoding unambiguous outright.
+pub fn grant_identity(params: &Value) -> String {
+    let tc = params.get("toolCall").unwrap_or(&Value::Null);
+    let raw = tc
+        .get("rawInput")
+        .map(|r| r.to_string())
+        .unwrap_or_default();
+    let mut out = format!("{}:{raw}", raw.len());
+    for path in tc
+        .get("locations")
+        .and_then(|l| l.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.get("path").and_then(|p| p.as_str()))
+    {
+        out.push_str(&format!("{}:{path}", path.len()));
+    }
+    out
+}
+
 /// Intent key from a full permission request params object.
 pub fn intent_key_from_params(params: &Value) -> String {
     let tc = params.get("toolCall").unwrap_or(&Value::Null);
@@ -371,6 +408,48 @@ mod tests {
                 kind: "tool".into()
             }
         );
+    }
+
+    /// An Always grant is persisted and replayed, so its key must be the FULL
+    /// action. `detail` (the stringified `rawInput`) is not: ACP lets a request
+    /// name its target only in `locations` — the field `intent_from_params`
+    /// reads first — and two edits to different files then share an identical,
+    /// here empty, `rawInput`. Keyed on that, approving one file would silently
+    /// auto-approve the other.
+    #[test]
+    fn grant_identity_separates_requests_that_differ_only_in_locations() {
+        let a = json!({"toolCall":{"kind":"edit","locations":[{"path":"src/a.rs"}]}});
+        let b = json!({"toolCall":{"kind":"edit","locations":[{"path":"src/b.rs"}]}});
+
+        // The old key material is identical for both — the bug in one line.
+        assert_eq!(summary_from_params(&a).1, summary_from_params(&b).1);
+        assert_ne!(grant_identity(&a), grant_identity(&b));
+        // An identical request still shares its grant; that is what Always is.
+        assert_eq!(grant_identity(&a), grant_identity(&a));
+    }
+
+    /// Every location joins the key, not just the first one `tool_path` uses:
+    /// a two-file request must not be replayable with one file swapped.
+    #[test]
+    fn grant_identity_covers_every_location_not_just_the_first() {
+        let a = json!({"toolCall":{"locations":[{"path":"keep"},{"path":"b"}]}});
+        let b = json!({"toolCall":{"locations":[{"path":"keep"},{"path":"c"}]}});
+        assert_ne!(grant_identity(&a), grant_identity(&b));
+    }
+
+    /// Length prefixes, not delimiters: a path can contain any byte but `/` and
+    /// NUL, so a separator-joined encoding could be forged into a collision.
+    #[test]
+    fn grant_identity_boundaries_cannot_be_forged_from_path_bytes() {
+        for probe in ["a\u{1f}b", "a\u{1e}b", "a:b", "2:ab"] {
+            let one = json!({"toolCall":{"locations":[{"path":probe}]}});
+            let two = json!({"toolCall":{"locations":[{"path":"a"},{"path":"b"}]}});
+            assert_ne!(
+                grant_identity(&one),
+                grant_identity(&two),
+                "path {probe:?} must not collide with a two-location request"
+            );
+        }
     }
 
     /// Whatever kind an agent declares, a command line runs a shell.

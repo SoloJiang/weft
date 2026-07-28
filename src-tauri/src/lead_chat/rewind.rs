@@ -541,29 +541,44 @@ fn strip_outer_quotes(s: &str) -> &str {
 
 /// Whether an omp jsonl user-message body matches the rewind target.
 ///
-/// Exact whitespace-normalized equality always matches. The first user message
-/// may also match when Weft prepended `{system}\n\n{user}` on session start —
-/// but only that first turn, so a later ordinary prompt containing a blank
-/// paragraph cannot steal the ordinal.
-fn omp_user_body_matches(body: &str, want_norm: &str, is_first_user: bool) -> bool {
-    let got = normalize_ws(body);
-    if got == want_norm {
+/// Exact whitespace-normalized equality always matches. The FIRST user message
+/// may also match after stripping the `{system}\n\n{user}` prepend Weft adds on
+/// session start — `system` is passed in, not guessed.
+///
+/// It used to be guessed, as "everything before the LAST blank line". A
+/// multi-paragraph first prompt breaks that in both directions: `SYS\n\nHello\n\
+/// \nWorld` isolates only `World`, so a later message whose text is `World`
+/// falsely matches the first turn and steals its ordinal (rewind then cuts the
+/// whole session away), while the real target `Hello\n\nWorld` fails to match
+/// its own first occurrence. An attachment appendix — which `dispatched_text`
+/// appends as its own blank-line block — puts every attachment-bearing first
+/// prompt in that same shape.
+///
+/// A mismatched `system` (the prompt changed since the session opened) simply
+/// declines the relaxed match; the caller then reports no anchor rather than
+/// cutting at the wrong message.
+fn omp_user_body_matches(
+    body: &str,
+    want_norm: &str,
+    first_user_prepend: Option<&str>,
+) -> bool {
+    if normalize_ws(body) == want_norm {
         return true;
     }
-    if !is_first_user {
+    // Only the first user turn carries the prepend.
+    let Some(system) = first_user_prepend else {
+        return false;
+    };
+    if system.is_empty() {
         return false;
     }
-    // System prepend may contain multiple blank-line paragraphs. Accept when
-    // the normalized body ends with the user text and contains the separator,
-    // with a non-empty prefix (anything before the final user segment).
-    if !body.contains("\n\n") {
+    let Some(rest) = body
+        .strip_prefix(system)
+        .and_then(|rest| rest.strip_prefix("\n\n"))
+    else {
         return false;
-    }
-    // Strip trailing user segment: find last \n\n and compare rest.
-    if let Some((prefix, rest)) = body.rsplit_once("\n\n") {
-        return !prefix.is_empty() && normalize_ws(rest) == want_norm;
-    }
-    false
+    };
+    normalize_ws(rest) == want_norm
 }
 
 /// Line index of the `ordinal`-th user prompt whose text blocks match `text`,
@@ -572,7 +587,12 @@ fn omp_user_body_matches(body: &str, want_norm: &str, is_first_user: bool) -> bo
 /// Split from [`fork_omp_at`]'s file IO so the matching rule — including the
 /// empty-text (image-only) prompt that [`ordinal_of_prompt`] can now address —
 /// is testable end to end without a session file on disk.
-fn omp_cut_index(lines: &[&str], text: &str, ordinal: usize) -> Option<usize> {
+fn omp_cut_index(
+    lines: &[&str],
+    text: &str,
+    ordinal: usize,
+    system_prompt: &str,
+) -> Option<usize> {
     let want = normalize_ws(text);
     let mut user_hits = 0usize;
     let mut seen_users = 0usize;
@@ -606,9 +626,9 @@ fn omp_cut_index(lines: &[&str], text: &str, ordinal: usize) -> Option<usize> {
             .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
             .collect::<Vec<_>>()
             .join("\n");
-        let is_first_user = seen_users == 0;
+        let first_user_prepend = (seen_users == 0).then_some(system_prompt);
         seen_users += 1;
-        if !omp_user_body_matches(&body, &want, is_first_user) {
+        if !omp_user_body_matches(&body, &want, first_user_prepend) {
             continue;
         }
         user_hits += 1;
@@ -626,7 +646,13 @@ fn omp_cut_index(lines: &[&str], text: &str, ordinal: usize) -> Option<usize> {
 /// before the Nth matching user message, mint a new session id, and return it
 /// so the engine can `session/load` next turn. Spike-verified: hand-cut files
 /// load and only see the kept prefix (omp 17.1.1).
-pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> Result<Option<String>> {
+pub fn fork_omp_at(
+    cwd: &Path,
+    session_id: &str,
+    text: &str,
+    ordinal: usize,
+    system_prompt: &str,
+) -> Result<Option<String>> {
     if ordinal == 0 {
         return Err(anyhow!("ordinal is 1-based"));
     }
@@ -636,7 +662,7 @@ pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> 
     let raw = std::fs::read_to_string(&src)
         .with_context(|| format!("read omp session {}", src.display()))?;
     let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
-    let Some(cut) = omp_cut_index(&lines, text, ordinal) else {
+    let Some(cut) = omp_cut_index(&lines, text, ordinal, system_prompt) else {
         return Err(anyhow!("omp_user_not_found"));
     };
     if cut == 0 {
@@ -1287,48 +1313,74 @@ mod tests {
         // Unrelated first user row must consume the "first" slot so a later
         // `notes\n\nrun tests` cannot match as system-prepend.
         let want = normalize_ws("run tests");
-        let first = "hello world";
-        let later = "notes\n\nrun tests";
-        assert!(!omp_user_body_matches(first, &want, true));
-        // After first row visited, later blank-paragraph is not first.
-        assert!(!omp_user_body_matches(later, &want, false));
+        assert!(!omp_user_body_matches("hello world", &want, Some("sys")));
+        // After the first row is visited, a blank-paragraph body is not first.
+        assert!(!omp_user_body_matches("notes\n\nrun tests", &want, None));
         // Exact later still matches.
-        assert!(omp_user_body_matches("run tests", &want, false));
+        assert!(omp_user_body_matches("run tests", &want, None));
     }
 
     #[test]
     fn omp_multi_paragraph_system_prepend_matches() {
         let want = normalize_ws("run tests");
-        let body = "You are the lead.\n\nOperate with judgment.\n\nThird para.\n\nrun tests";
-        assert!(omp_user_body_matches(body, &want, true));
-        assert!(!omp_user_body_matches(body, &want, false));
+        let system = "You are the lead.\n\nOperate with judgment.\n\nThird para.";
+        let body = format!("{system}\n\nrun tests");
+        assert!(omp_user_body_matches(&body, &want, Some(system)));
+        assert!(!omp_user_body_matches(&body, &want, None));
+    }
+
+    /// The prepend is STRIPPED, never guessed. Splitting on the last blank line
+    /// broke both ways once a prompt had more than one paragraph.
+    #[test]
+    fn a_multi_paragraph_first_prompt_matches_whole_and_not_by_tail() {
+        let system = "You are the lead.";
+        let body = format!("{system}\n\nHello\n\nWorld");
+
+        // The real target is the WHOLE user message.
+        assert!(omp_user_body_matches(
+            &body,
+            &normalize_ws("Hello\n\nWorld"),
+            Some(system)
+        ));
+        // A later message equal to the first prompt's final paragraph must not
+        // steal the first turn's ordinal — that cut the whole session away.
+        assert!(!omp_user_body_matches(
+            &body,
+            &normalize_ws("World"),
+            Some(system)
+        ));
+    }
+
+    /// A system prompt that changed since the session opened declines the
+    /// relaxed match, so the caller reports "no anchor" instead of cutting at
+    /// the wrong message.
+    #[test]
+    fn a_stale_system_prompt_declines_rather_than_mismatching() {
+        let want = normalize_ws("run tests");
+        let body = "You are helpful.\n\nrun tests";
+        assert!(!omp_user_body_matches(body, &want, Some("Different prompt.")));
+        assert!(!omp_user_body_matches(body, &want, Some("")));
+        assert!(omp_user_body_matches(body, &want, Some("You are helpful.")));
     }
 
     #[test]
     fn omp_user_body_matches_system_prepend_only_on_first() {
         let want = normalize_ws("run tests");
-        // First user: system prepend OK
         assert!(omp_user_body_matches(
             "You are helpful.\n\nrun tests",
             &want,
-            true
+            Some("You are helpful.")
         ));
-        // First user: exact OK
-        assert!(omp_user_body_matches("run tests", &want, true));
-        // Later user with blank paragraph must NOT match as prepend
-        assert!(!omp_user_body_matches(
-            "notes\n\nrun tests",
-            &want,
-            false
-        ));
-        // Later user exact still matches
-        assert!(omp_user_body_matches("run tests", &want, false));
+        assert!(omp_user_body_matches("run tests", &want, Some("sys")));
+        // Later user with a blank paragraph must NOT match as a prepend.
+        assert!(!omp_user_body_matches("notes\n\nrun tests", &want, None));
+        assert!(omp_user_body_matches("run tests", &want, None));
         // Leading blank lines collapse under normalize_ws → exact match path.
-        assert!(omp_user_body_matches("\n\nrun tests", &want, true));
-        // Non-empty prefix that is NOT a system prompt but shares a blank
-        // paragraph: only allowed on the first user turn.
-        assert!(omp_user_body_matches("sys\n\nrun tests", &want, true));
-        assert!(!omp_user_body_matches("sys\n\nrun tests", &want, false));
+        assert!(omp_user_body_matches("\n\nrun tests", &want, Some("sys")));
+        // A non-empty prefix that is NOT the system prompt no longer matches
+        // just because it shares a blank-line separator.
+        assert!(!omp_user_body_matches("sys\n\nrun tests", &want, Some("other")));
+        assert!(omp_user_body_matches("sys\n\nrun tests", &want, Some("sys")));
     }
 
     #[test]
@@ -1442,6 +1494,9 @@ mod tests {
         assert!(found.is_ok());
     }
 
+    /// The system prepend the first ACP user turn carries in these fixtures.
+    const SYS: &str = "SYSTEM PREAMBLE";
+
     fn omp_user_line(blocks: serde_json::Value) -> String {
         serde_json::json!({
             "type": "message",
@@ -1477,7 +1532,7 @@ mod tests {
         let lines: Vec<&str> = vec![&tool_result];
 
         assert_eq!(
-            omp_cut_index(&lines, "", 1),
+            omp_cut_index(&lines, "", 1, SYS),
             None,
             "a tool_result row is not an empty user prompt"
         );
@@ -1510,7 +1565,7 @@ mod tests {
         assert_eq!(ordinal, 1, "ACP can: it is the first empty-bodied prompt");
 
         assert_eq!(
-            omp_cut_index(&lines, "", ordinal),
+            omp_cut_index(&lines, "", ordinal, SYS),
             Some(3),
             "cut before the image-only prompt itself"
         );
@@ -1529,9 +1584,9 @@ mod tests {
         let dispatched = vec!["hello".to_string(), String::new(), String::new()];
         assert_eq!(ordinal_of_prompt(&dispatched, ""), 2, "counts up to the target");
 
-        assert_eq!(omp_cut_index(&lines, "", 1), Some(1));
-        assert_eq!(omp_cut_index(&lines, "", 2), Some(3));
-        assert_eq!(omp_cut_index(&lines, "", 3), None, "only two exist");
+        assert_eq!(omp_cut_index(&lines, "", 1, SYS), Some(1));
+        assert_eq!(omp_cut_index(&lines, "", 2, SYS), Some(3));
+        assert_eq!(omp_cut_index(&lines, "", 3, SYS), None, "only two exist");
     }
 
     /// The first prompt carries the system prepend, whose relaxed match must
@@ -1539,15 +1594,17 @@ mod tests {
     #[test]
     fn a_system_prepended_first_prompt_never_matches_an_empty_target() {
         let first = omp_user_line(serde_json::json!([
-            {"type":"text","text":"SYSTEM PREAMBLE\n\nhello"}
+            {"type":"text","text":format!("{SYS}\n\nhello")}
         ]));
         let image_only = image_only_line();
         let lines: Vec<&str> = vec![&first, &image_only];
 
         assert_eq!(
-            omp_cut_index(&lines, "", 1),
+            omp_cut_index(&lines, "", 1, SYS),
             Some(1),
             "the empty target is the image-only prompt, not the prepended first turn"
         );
+        // And the prepended turn IS reachable by its own text.
+        assert_eq!(omp_cut_index(&lines, "hello", 1, SYS), Some(0));
     }
 }
