@@ -3715,6 +3715,26 @@ async fn acp_drain_then_end(
     acp_emit_turn_end(app, db, eng, is_error, cancelled, usage, prompt_epoch).await;
 }
 
+/// Whether a DEQUEUED prompt may still be dispatched.
+///
+/// The epoch alone is not enough. `interrupt()` sets `interrupting` WITHOUT
+/// bumping the epoch — deliberately, so a queued message survives interrupting
+/// the current turn — and it sends `session/cancel` against whatever prompt is
+/// live. A Stop landing after `on_turn_end` promoted a queued item but before
+/// it is dispatched therefore cancels NOTHING (the old prompt has ended, the
+/// new one has not started), leaves the epoch untouched, and the dispatch went
+/// ahead: the user pressed Stop and a fresh turn ran anyway, executing tools
+/// until it finished on its own or the 8s forced reset fired.
+///
+/// `stopped` and `tearing_down` are included for the same reason they gate
+/// every other admission point — this is one of them.
+fn queued_dispatch_admissible(inner: &EngineInner, dequeue_epoch: u64) -> bool {
+    !inner.stopped
+        && !inner.interrupting
+        && !inner.tearing_down
+        && inner.reset_epoch == dequeue_epoch
+}
+
 async fn acp_emit_turn_end(
     app: AppHandle,
     db: Db,
@@ -3732,7 +3752,11 @@ async fn acp_emit_turn_end(
         None;
     loop {
         if let Some((client, sid, msg, dequeue_epoch, turn_id)) = follow_up.take() {
-            if eng.lock().await.reset_epoch != dequeue_epoch {
+            let admissible = {
+                let g = eng.lock().await;
+                queued_dispatch_admissible(&g, dequeue_epoch)
+            };
+            if !admissible {
                 rollback_failed_turn(&app, &db, &eng, turn_id, "interrupted").await;
                 finalize_dequeued_row(&app, &db, eng.lock().await.thread_id, &msg, "interrupted")
                     .await;
@@ -8725,6 +8749,39 @@ fn emit_lead_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stop must actually stop. `interrupt()` sets `interrupting` without
+    /// bumping the epoch, so a Stop landing between `on_turn_end` promoting a
+    /// queued item and its dispatch cancels nothing and leaves the epoch
+    /// matching — and the queued prompt ran anyway, executing tools, after the
+    /// user had pressed Stop.
+    #[test]
+    fn a_queued_prompt_is_not_dispatched_after_stop() {
+        let mut inner = test_inner("omp");
+        let epoch = inner.reset_epoch;
+        assert!(
+            queued_dispatch_admissible(&inner, epoch),
+            "baseline: an idle engine dispatches its queue"
+        );
+
+        inner.interrupting = true;
+        assert!(
+            !queued_dispatch_admissible(&inner, epoch),
+            "Stop must block the dispatch even though it leaves the epoch alone"
+        );
+
+        inner.interrupting = false;
+        inner.stopped = true;
+        assert!(!queued_dispatch_admissible(&inner, epoch));
+
+        inner.stopped = false;
+        inner.tearing_down = true;
+        assert!(!queued_dispatch_admissible(&inner, epoch));
+
+        inner.tearing_down = false;
+        assert!(!queued_dispatch_admissible(&inner, epoch + 1), "a reset still invalidates");
+        assert!(queued_dispatch_admissible(&inner, epoch), "and recovers otherwise");
+    }
 
     /// Hidden delivery bypasses `send_reservation_valid` entirely, so the
     /// teardown reservation has to be enforced on its own path — otherwise a
