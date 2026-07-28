@@ -1,41 +1,57 @@
 import { useEffect, useRef, useState } from "react";
-import {
-  isPermissionGranted,
-  requestPermission,
-  sendNotification,
-} from "@tauri-apps/plugin-notification";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
-import { api } from "./api";
 import { useStore } from "../state/store";
-import type { NeedItem, PermissionAsk, ThreadOverview, WriteTrigger } from "./types";
+import { api } from "./api";
+import {
+  badgeCountFrom,
+  diffForNotifications,
+  isAppInForeground,
+  isInQuietHours,
+  notifyCopyKeys,
+  planNotifyOpen,
+  snapshotOf,
+  type NotifyRoute,
+  type NotifySnapshot,
+} from "./notificationsCore";
+
+export * from "./notificationsCore";
 
 /** Three-state OS permission. macOS prompts exactly once — after a refusal,
  *  requestPermission returns "denied" without a dialog and the only remedy is
  *  the OS settings pane, so callers must tell "denied" apart from "prompt". */
 export type NotifyPermission = "granted" | "denied" | "prompt";
 
+function asNotifyPermission(raw: string): NotifyPermission {
+  if (raw === "granted" || raw === "denied" || raw === "prompt") return raw;
+  return "denied";
+}
+
 export async function notifyPermission(): Promise<NotifyPermission> {
   try {
-    if (await isPermissionGranted()) return "granted";
-    const perm = (window as { Notification?: { permission?: string } }).Notification
+    const p = asNotifyPermission(await api.osNotifyPermission());
+    if (p === "granted") return "granted";
+    // user-notify collapses Denied + NotDetermined to false. Prefer the Web
+    // Notification permission bit when present so Settings can show the
+    // "open System Settings" recovery instead of re-prompting forever.
+    const web = (window as { Notification?: { permission?: string } }).Notification
       ?.permission;
-    return perm === "denied" ? "denied" : "prompt";
+    if (web === "denied") return "denied";
+    if (web === "granted") return "granted";
+    return "prompt";
   } catch {
-    return "denied"; // pure-vite dev: plugin unavailable
+    return "denied"; // pure-vite dev: command unavailable
   }
 }
 
-/** Resolve to a settled state, asking the OS only from "prompt" (a dismissed
- *  dialog stays "prompt" so the user can be asked again later). */
+/** Resolve to a settled state, asking the OS only from "prompt". */
 export async function ensureNotifyPermission(): Promise<NotifyPermission> {
   const p = await notifyPermission();
   if (p !== "prompt") return p;
   try {
-    const r = await requestPermission();
-    if (r === "granted") return "granted";
-    if (r === "denied") return "denied";
-    return "prompt";
+    return asNotifyPermission(await api.osNotifyRequestPermission());
   } catch {
     return "denied";
   }
@@ -45,11 +61,12 @@ export async function ensureNotifyPermission(): Promise<NotifyPermission> {
  *  Linux has no portable one — returns false and the caller's copy stands. */
 export async function openSystemNotificationSettings(): Promise<boolean> {
   const ua = navigator.userAgent;
-  const url = ua.includes("Mac")
-    ? "x-apple.systempreferences:com.apple.preference.notifications"
-    : ua.includes("Windows")
-      ? "ms-settings:notifications"
-      : null;
+  let url: string | null = null;
+  if (ua.includes("Mac")) {
+    url = "x-apple.systempreferences:com.apple.preference.notifications";
+  } else if (ua.includes("Windows")) {
+    url = "ms-settings:notifications";
+  }
   if (!url) return false;
   try {
     await openUrl(url);
@@ -59,85 +76,135 @@ export async function openSystemNotificationSettings(): Promise<boolean> {
   }
 }
 
-/**
- * OS notifications for the two things worth pulling the human back (spec
- * 2026-06-11): a new Needs-you item, and a sub-task reaching review. Desktop
- * notifications carry no click callback (Tauri v2 platform limit), so the body
- * carries the context and the in-app badges take over once focused.
- */
-
-/** Notify-relevant state reduced to stable identity keys → context line. */
-export interface NotifySnapshot {
-  needs: Map<string, string>;
-  review: Map<string, string>;
+async function setDockBadge(count: number): Promise<void> {
+  try {
+    const win = getCurrentWindow();
+    await win.setBadgeCount(count > 0 ? count : undefined);
+  } catch {
+    /* pure-vite / unsupported platform */
+  }
 }
 
-export function snapshotOf(
-  needs: NeedItem[],
-  asks: PermissionAsk[],
-  triggers: WriteTrigger[],
-  overview: ThreadOverview[],
-): NotifySnapshot {
-  const n = new Map<string, string>();
-  for (const it of needs) {
-    n.set(`need:${it.ask_id}`, `${it.thread_title} · ${it.direction_name}`);
+async function requestAttention(): Promise<void> {
+  try {
+    const win = getCurrentWindow();
+    await win.requestUserAttention(UserAttentionType.Informational);
+  } catch {
+    /* pure-vite / unsupported */
   }
-  for (const a of asks) {
-    n.set(`ask:${a.id}`, `${a.thread_title} · ${a.dir_name}`);
-  }
-  for (const w of triggers) {
-    n.set(`wt:${w.thread_id}:${w.index}`, `${w.thread_title} · ${w.name}`);
-  }
-  const r = new Map<string, string>();
-  for (const o of overview) {
-    o.statuses.forEach((s, i) => {
-      if (s === "review") r.set(`rev:${o.direction_ids[i]}`, o.title);
-    });
-  }
-  return { needs: n, review: r };
 }
 
-export interface NotifyEvent {
-  kind: "needs" | "review";
-  count: number;
-  /** Context of the first new item, used as the body when count === 1. */
-  sample: string;
+async function focusMainWindow(): Promise<void> {
+  try {
+    const win = getCurrentWindow();
+    await win.unminimize();
+    await win.show();
+    await win.setFocus();
+  } catch {
+    /* pure-vite */
+  }
 }
 
-/** New keys in `next` that weren't in `prev` — the things worth a ping. */
-export function diffForNotifications(
-  prev: NotifySnapshot,
-  next: NotifySnapshot,
-): NotifyEvent[] {
-  const out: NotifyEvent[] = [];
-  for (const kind of ["needs", "review"] as const) {
-    const fresh = [...next[kind]].filter(([k]) => !prev[kind].has(k));
-    if (fresh.length > 0) {
-      out.push({ kind, count: fresh.length, sample: fresh[0][1] });
+export interface OsNotifyOpenEvent {
+  kind: string;
+  threadId?: number | null;
+  directionId?: number | null;
+  askId?: number | null;
+  workspaceId?: number | null;
+}
+
+/** Apply a notification click to the in-app navigation surface. */
+export async function handleNotifyOpen(
+  payload: OsNotifyOpenEvent,
+  deps: {
+    selectWorkspace: (id: number) => Promise<void> | void;
+    goToDirectionRef: (thread: number, dir: string) => Promise<void>;
+    openNeeds: () => void;
+    openSettings: (page?: "resources" | "general" | "appearance" | "automation" | "skills" | "im" | "backup") => void;
+    activeWorkspaceId: number | null;
+  },
+): Promise<void> {
+  await focusMainWindow();
+  const intents = planNotifyOpen(payload);
+  for (const intent of intents) {
+    if (intent.type === "workspace") {
+      if (intent.workspaceId !== deps.activeWorkspaceId) {
+        await deps.selectWorkspace(intent.workspaceId);
+      }
+      continue;
+    }
+    if (intent.type === "resources") {
+      deps.openSettings("resources");
+      continue;
+    }
+    if (intent.type === "direction") {
+      await deps.goToDirectionRef(intent.threadId, intent.direction);
+      continue;
+    }
+    if (intent.type === "needs") {
+      deps.openNeeds();
     }
   }
-  return out;
 }
 
-const OVERVIEW_POLL_MS = 10_000;
+async function sendOsNotification(
+  title: string,
+  body: string,
+  route: NotifyRoute,
+): Promise<void> {
+  await api.osNotifySend({
+    title,
+    body,
+    kind: route.kind,
+    threadId: route.threadId ?? null,
+    directionId: route.directionId ?? null,
+    askId: route.askId ?? null,
+    workspaceId: route.workspaceId ?? null,
+  });
+}
 
 /**
- * Mounted once in App. Reuses the store's Needs-you aggregation (4s poll +
- * push); polls workspace_overview itself for review transitions (the board
- * only fetches it on mount, and the per-issue direction poll covers only the
- * open issue). First load and workspace switches rebuild the baseline silently.
+ * Mounted once in App. Reuses the store's Needs-you aggregation, overview,
+ * live session/lead turn state, and process-quota snapshot. First load and
+ * workspace switches rebuild the baseline silently.
+ *
+ * Delivery uses the community `user-notify` bridge (not the official Tauri
+ * notification plugin) so desktop clicks can deep-link via `notify://open`.
  */
 export function useSystemNotifications() {
-  const { needs, asks, writeTriggers, notifyEnabled, activeWorkspaceId } = useStore();
+  const {
+    needs,
+    asks,
+    writeTriggers,
+    overview,
+    sessions,
+    leadTurn,
+    processQuota,
+    threads,
+    notifyEnabled,
+    notifyCategories,
+    quietHours,
+    activeWorkspaceId,
+    selectWorkspace,
+    goToDirectionRef,
+    openNeeds,
+    openSettings,
+  } = useStore();
   const { t } = useTranslation();
-  const [overview, setOverview] = useState<ThreadOverview[]>([]);
   const prev = useRef<NotifySnapshot | null>(null);
   const baselineWs = useRef<number | null>(null);
   const granted = useRef<boolean | null>(null);
+  const [windowFocused, setWindowFocused] = useState<boolean | null>(null);
+  const lastBadge = useRef<number | null>(null);
 
-  // OS permission, settled once per enable. Only a never-asked "prompt" state
-  // raises the system dialog; a past refusal stays silent (Settings shows the
-  // denied hint with the System-Settings jump).
+  const threadsById = useRef<Record<number, { title: string }>>({});
+  useEffect(() => {
+    const m: Record<number, { title: string }> = {};
+    for (const th of threads) m[th.id] = { title: th.title };
+    threadsById.current = m;
+  }, [threads]);
+
+  // OS permission, settled once per enable.
   useEffect(() => {
     if (!notifyEnabled) return;
     void ensureNotifyPermission().then((p) => {
@@ -145,51 +212,127 @@ export function useSystemNotifications() {
     });
   }, [notifyEnabled]);
 
-  // Review-transition source: our own modest overview poll.
+  // Track OS-level window focus.
   useEffect(() => {
-    if (!notifyEnabled || activeWorkspaceId == null) {
-      setOverview([]);
-      return;
-    }
-    let alive = true;
-    const tick = async () => {
+    let unFocus: (() => void) | undefined;
+    let cancelled = false;
+    void (async () => {
       try {
-        const o = await api.workspaceOverview(activeWorkspaceId);
-        if (alive) setOverview(o);
+        const win = getCurrentWindow();
+        const focused = await win.isFocused();
+        if (!cancelled) setWindowFocused(focused);
+        unFocus = await win.onFocusChanged(({ payload }) => {
+          setWindowFocused(payload);
+        });
       } catch {
-        /* backend unavailable */
+        if (!cancelled) setWindowFocused(null);
       }
-    };
-    void tick();
-    const h = setInterval(tick, OVERVIEW_POLL_MS);
+    })();
     return () => {
-      alive = false;
-      clearInterval(h);
+      cancelled = true;
+      unFocus?.();
     };
-  }, [notifyEnabled, activeWorkspaceId]);
+  }, []);
+
+  // Click / action deep-link from the native bridge.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void (async () => {
+      try {
+        unlisten = await listen<OsNotifyOpenEvent>("notify://open", (event) => {
+          void handleNotifyOpen(event.payload, {
+            selectWorkspace,
+            goToDirectionRef,
+            openNeeds,
+            openSettings,
+            activeWorkspaceId,
+          });
+        });
+      } catch {
+        /* pure-vite */
+      }
+      if (cancelled) unlisten?.();
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [
+    selectWorkspace,
+    goToDirectionRef,
+    openNeeds,
+    openSettings,
+    activeWorkspaceId,
+  ]);
+
+  // Dock / taskbar badge tracks actionable Needs-you count.
+  useEffect(() => {
+    const count = badgeCountFrom(needs, asks, writeTriggers);
+    if (lastBadge.current === count) return;
+    lastBadge.current = count;
+    void setDockBadge(count);
+  }, [needs, asks, writeTriggers]);
 
   useEffect(() => {
-    const next = snapshotOf(needs, asks, writeTriggers, overview);
+    const next = snapshotOf(
+      needs,
+      asks,
+      writeTriggers,
+      overview,
+      sessions,
+      leadTurn,
+      processQuota,
+      threadsById.current,
+      activeWorkspaceId,
+    );
     const base = baselineWs.current === activeWorkspaceId ? prev.current : null;
     prev.current = next;
     baselineWs.current = activeWorkspaceId;
     if (!base) return; // first load / workspace switch: baseline only
     if (!notifyEnabled || granted.current !== true) return;
-    if (document.hasFocus()) return; // already looking at the app
-    for (const ev of diffForNotifications(base, next)) {
-      try {
-        sendNotification({
-          title: ev.kind === "needs" ? t("notify.needsTitle") : t("notify.reviewTitle"),
-          body:
-            ev.count === 1
-              ? ev.sample
-              : t(ev.kind === "needs" ? "notify.needsBody" : "notify.reviewBody", {
-                  count: ev.count,
-                }),
-        });
-      } catch {
-        /* never let a failed ping disturb the app */
-      }
+    if (
+      isAppInForeground({
+        windowFocused,
+        documentFocused: document.hasFocus(),
+      })
+    ) {
+      return;
     }
-  }, [needs, asks, writeTriggers, overview, notifyEnabled, activeWorkspaceId, t]);
+    if (isInQuietHours(quietHours)) return;
+
+    const events = diffForNotifications(base, next, notifyCategories);
+    if (events.length === 0) return;
+
+    void (async () => {
+      let sent = false;
+      for (const ev of events) {
+        const keys = notifyCopyKeys(ev.kind);
+        const title = t(keys.title);
+        const body =
+          ev.count === 1 ? ev.sample : t(keys.body, { count: ev.count });
+        try {
+          await sendOsNotification(title, body, ev.route);
+          sent = true;
+        } catch {
+          /* never let a failed ping disturb the app */
+        }
+      }
+      if (sent) void requestAttention();
+    })();
+  }, [
+    needs,
+    asks,
+    writeTriggers,
+    overview,
+    sessions,
+    leadTurn,
+    processQuota,
+    notifyEnabled,
+    notifyCategories,
+    quietHours,
+    activeWorkspaceId,
+    windowFocused,
+    t,
+  ]);
 }

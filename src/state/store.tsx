@@ -26,6 +26,15 @@ import {
 } from "../lib/processQuota";
 import { routeReasonKey } from "../lib/engineRoutingDisplay";
 import { STORAGE_KEYS } from "../lib/storageKeys";
+import {
+  parseNotifyCategories,
+  parseQuietHours,
+  serializeNotifyCategories,
+  serializeQuietHours,
+  type NotifyCategory,
+  type NotifyCategoryFlags,
+  type QuietHours,
+} from "../lib/notificationsCore";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
@@ -526,9 +535,15 @@ interface Store {
   /** Auto-run the review skill when a task flows into the review column. */
   autoReview: boolean;
   setAutoReview: (on: boolean) => void;
-  /** OS notifications for new Needs-you items / review-ready sub-tasks. */
+  /** OS notifications master switch (categories below only apply when on). */
   notifyEnabled: boolean;
   setNotifyEnabled: (on: boolean) => void;
+  /** Per-category mute flags under the master switch. */
+  notifyCategories: NotifyCategoryFlags;
+  setNotifyCategory: (kind: NotifyCategory, on: boolean) => void;
+  /** Local quiet-hours window; suppresses OS pings while active. */
+  quietHours: QuietHours;
+  setQuietHours: (qh: QuietHours) => void;
   /** Prevent system idle sleep while any session is running. */
   keepAwake: boolean;
   setKeepAwake: (on: boolean) => void;
@@ -758,14 +773,31 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(STORAGE_KEYS.autoReview, on ? "1" : "0");
     setAutoReviewState(on);
   }, []);
-  // System notifications: new Needs-you items / review-ready sub-tasks raise an
-  // OS notification while the window is unfocused. Default ON.
+  // System notifications: master switch + per-category mutes + quiet hours.
+  // Default master ON; categories all ON; quiet hours OFF.
   const [notifyEnabled, setNotifyEnabledState] = useState(
     () => localStorage.getItem(STORAGE_KEYS.notify) !== "0",
   );
   const setNotifyEnabled = useCallback((on: boolean) => {
     localStorage.setItem(STORAGE_KEYS.notify, on ? "1" : "0");
     setNotifyEnabledState(on);
+  }, []);
+  const [notifyCategories, setNotifyCategoriesState] = useState<NotifyCategoryFlags>(
+    () => parseNotifyCategories(localStorage.getItem(STORAGE_KEYS.notifyCategories)),
+  );
+  const setNotifyCategory = useCallback((kind: NotifyCategory, on: boolean) => {
+    setNotifyCategoriesState((prev) => {
+      const next = { ...prev, [kind]: on };
+      localStorage.setItem(STORAGE_KEYS.notifyCategories, serializeNotifyCategories(next));
+      return next;
+    });
+  }, []);
+  const [quietHours, setQuietHoursState] = useState<QuietHours>(
+    () => parseQuietHours(localStorage.getItem(STORAGE_KEYS.notifyQuietHours)),
+  );
+  const setQuietHours = useCallback((qh: QuietHours) => {
+    localStorage.setItem(STORAGE_KEYS.notifyQuietHours, serializeQuietHours(qh));
+    setQuietHoursState(qh);
   }, []);
   // Keep-awake: hold a "prevent idle sleep" OS assertion while any session is
   // busy (the display may still turn off). Default ON; synced to the backend
@@ -2866,26 +2898,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [activeThreadId]);
 
   // Needs-you: poll workspace-wide, plus a push refresh when the coordinator
-  // signals a new ask (needs-you://changed). Poll is the safety net; the event
-  // makes new questions appear near-instantly.
+  // signals a new ask (}, [activeWorkspaceId, refreshNeeds]);
+
+  // Board overview poll: review transitions (and any status drift) stay fresh
+  // even when the kanban is unmounted. 10s matches the previous notify hook.
   useEffect(() => {
-    if (activeWorkspaceId == null) {
-      setNeeds([]);
-      return;
-    }
+    if (activeWorkspaceId == null) return;
     let alive = true;
     const tick = () => {
-      if (alive) void refreshNeeds();
+      if (alive) void refreshOverview();
     };
     tick();
-    const h = setInterval(tick, 4000);
-    const unChanged = listen("needs-you://changed", tick);
+    const h = setInterval(tick, 10_000);
     return () => {
       alive = false;
       clearInterval(h);
-      void unChanged.then((f) => f());
     };
-  }, [activeWorkspaceId, refreshNeeds]);
+  }, [activeWorkspaceId, refreshOverview]);
+
 
   // Live-refresh the repo map when the curator calibrates an edge (or the auto
   // pass finishes) for the active workspace.
@@ -3176,6 +3206,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setAutoReview,
     notifyEnabled,
     setNotifyEnabled,
+    notifyCategories,
+    setNotifyCategory,
+    quietHours,
+    setQuietHours,
     keepAwake,
     setKeepAwake,
     focusSession,

@@ -59,6 +59,7 @@ mod power;
 /// 派生并发上限都挂靠此接口(单一口径 `is_ours`,计数==孤儿判定)。
 pub mod proc_registry;
 mod process_quota;
+mod os_notify;
 pub mod profile;
 /// issue #112 本地资源仪表盘:只读聚合 proc_registry / process_quota /
 /// session_gate 已有的采样,不新增采样、不碰任何安全网写路径。
@@ -235,6 +236,9 @@ pub fn run() {
             host::automerge::spawn_pr_automerge_watch(app.handle().clone());
             power::spawn_sweep(app.handle().clone());
             process_quota::spawn_monitor(app.handle().clone());
+            if let Err(err) = os_notify::init(app.handle()) {
+                eprintln!("[weft] os_notify init: {err}");
+            }
             gc::spawn_periodic(app.handle().clone());
             skills::spawn_periodic(app.handle().clone());
             im::spawn(app.handle().clone());
@@ -311,6 +315,9 @@ pub fn run() {
             commands::set_guardrails,
             process_quota::process_quota_status,
             resource_dashboard::resource_dashboard_snapshot,
+            os_notify::os_notify_permission,
+            os_notify::os_notify_request_permission,
+            os_notify::os_notify_send,
             commands::session_for,
             commands::session_meta,
             commands::effective_config,

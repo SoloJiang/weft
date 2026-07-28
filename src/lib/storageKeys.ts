@@ -12,6 +12,8 @@ export const STORAGE_KEYS = {
   reviewSkill: "weft-review-skill",
   autoReview: "weft-auto-review",
   notify: "weft-notify",
+  notifyCategories: "weft-notify-categories",
+  notifyQuietHours: "weft-notify-quiet-hours",
   keepAwake: "weft-keep-awake",
   dangerousMode: "weft-dangerous",
   idleCapMins: "weft-idle-cap-mins",

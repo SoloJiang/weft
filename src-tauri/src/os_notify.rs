@@ -1,0 +1,225 @@
+//! Desktop OS notifications via the community `user-notify` crate.
+//!
+//! Official `@tauri-apps/plugin-notification` cannot deliver a reliable click
+//! callback on desktop (plugins-workspace#2150). `user-notify` talks to the
+//! platform APIs directly and returns `NotificationResponse` with `user_info`,
+//! which we bridge to the frontend as `notify://open` for deep-linking.
+
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
+use user_notify::{
+    get_notification_manager, NotificationBuilder, NotificationManager, NotificationResponse,
+    NotificationResponseAction,
+};
+
+/// Stable app id — matches `tauri.conf.json` `identifier`.
+const APP_ID: &str = "com.weft.app";
+
+/// Event the frontend listens for after the user clicks a notification.
+pub const OPEN_EVENT: &str = "notify://open";
+
+static MANAGER: OnceLock<Arc<dyn NotificationManager>> = OnceLock::new();
+
+fn manager() -> Result<&'static Arc<dyn NotificationManager>, String> {
+    MANAGER
+        .get()
+        .ok_or_else(|| "os_notify not initialized".to_string())
+}
+
+/// Payload the frontend stores in `user_info` and gets back on click.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifyOpenPayload {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<i32>,
+}
+
+/// Frontend → backend send request.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifySendRequest {
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub thread_id: Option<i32>,
+    #[serde(default)]
+    pub direction_id: Option<i32>,
+    #[serde(default)]
+    pub ask_id: Option<i32>,
+    #[serde(default)]
+    pub workspace_id: Option<i32>,
+}
+
+fn payload_from_user_info(info: &HashMap<String, String>) -> NotifyOpenPayload {
+    NotifyOpenPayload {
+        kind: info.get("kind").cloned().unwrap_or_default(),
+        thread_id: info.get("threadId").and_then(|s| s.parse().ok()),
+        direction_id: info.get("directionId").and_then(|s| s.parse().ok()),
+        ask_id: info.get("askId").and_then(|s| s.parse().ok()),
+        workspace_id: info.get("workspaceId").and_then(|s| s.parse().ok()),
+    }
+}
+
+fn user_info_from_req(req: &NotifySendRequest) -> HashMap<String, String> {
+    let mut info = HashMap::new();
+    if !req.kind.is_empty() {
+        info.insert("kind".to_string(), req.kind.clone());
+    }
+    if let Some(v) = req.thread_id {
+        info.insert("threadId".to_string(), v.to_string());
+    }
+    if let Some(v) = req.direction_id {
+        info.insert("directionId".to_string(), v.to_string());
+    }
+    if let Some(v) = req.ask_id {
+        info.insert("askId".to_string(), v.to_string());
+    }
+    if let Some(v) = req.workspace_id {
+        info.insert("workspaceId".to_string(), v.to_string());
+    }
+    info
+}
+
+fn focus_main_window<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+fn handle_response<R: Runtime>(app: AppHandle<R>, response: NotificationResponse) {
+    // Only deep-link on an actual click (Default) or a custom action button.
+    // Dismiss must stay silent.
+    let open = match &response.action {
+        NotificationResponseAction::Default => true,
+        NotificationResponseAction::Other(_) => true,
+        NotificationResponseAction::Dismiss => false,
+    };
+    if !open {
+        return;
+    }
+    focus_main_window(&app);
+    let payload = payload_from_user_info(&response.user_info);
+    if let Err(err) = app.emit(OPEN_EVENT, payload) {
+        eprintln!("[weft] os_notify emit {OPEN_EVENT}: {err}");
+    }
+}
+
+/// Register the platform notification manager once during Tauri setup.
+/// Safe to call only from the main thread (macOS permission APIs require it).
+pub fn init<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    if MANAGER.get().is_some() {
+        return Ok(());
+    }
+    let mgr = get_notification_manager(APP_ID.to_string(), None);
+    let app_handle = app.clone();
+    mgr.register(
+        Box::new(move |response| {
+            handle_response(app_handle.clone(), response);
+        }),
+        Vec::new(),
+    )
+    .map_err(|e| format!("os_notify register: {e}"))?;
+
+    if MANAGER.set(mgr).is_err() {
+        // Another setup path won the race — fine, keep the first.
+        return Ok(());
+    }
+    Ok(())
+}
+
+/// `"granted" | "denied" | "prompt"` — mirrors the frontend `NotifyPermission`.
+#[tauri::command]
+pub async fn os_notify_permission() -> Result<String, String> {
+    let mgr = manager()?.clone();
+    // Mock manager (unsigned macOS dev) always reports granted; real macOS
+    // distinguishes NotDetermined as false without a dedicated "prompt" API, so
+    // we map false → "prompt" and let requestPermission settle it.
+    match mgr.get_notification_permission_state().await {
+        Ok(true) => Ok("granted".to_string()),
+        Ok(false) => Ok("prompt".to_string()),
+        Err(e) => Err(format!("os_notify permission: {e}")),
+    }
+}
+
+#[tauri::command]
+pub async fn os_notify_request_permission() -> Result<String, String> {
+    let mgr = manager()?.clone();
+    match mgr.first_time_ask_for_notification_permission().await {
+        Ok(true) => Ok("granted".to_string()),
+        Ok(false) => Ok("denied".to_string()),
+        Err(e) => Err(format!("os_notify request permission: {e}")),
+    }
+}
+
+#[tauri::command]
+pub async fn os_notify_send(req: NotifySendRequest) -> Result<(), String> {
+    let mgr = manager()?.clone();
+    let info = user_info_from_req(&req);
+    let mut builder = NotificationBuilder::new()
+        .title(&req.title)
+        .body(&req.body);
+    if !info.is_empty() {
+        builder = builder.set_user_info(info);
+    }
+    // Group by kind so the OS can collapse related pings.
+    if !req.kind.is_empty() {
+        builder = builder.set_thread_id(&format!("weft.{}", req.kind));
+    }
+    mgr.send_notification(builder)
+        .await
+        .map_err(|e| format!("os_notify send: {e}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_info_roundtrip_preserves_route_fields() {
+        let req = NotifySendRequest {
+            title: "t".into(),
+            body: "b".into(),
+            kind: "needs".into(),
+            thread_id: Some(7),
+            direction_id: Some(12),
+            ask_id: Some(99),
+            workspace_id: Some(3),
+        };
+        let info = user_info_from_req(&req);
+        let payload = payload_from_user_info(&info);
+        assert_eq!(payload.kind, "needs");
+        assert_eq!(payload.thread_id, Some(7));
+        assert_eq!(payload.direction_id, Some(12));
+        assert_eq!(payload.ask_id, Some(99));
+        assert_eq!(payload.workspace_id, Some(3));
+    }
+
+    #[test]
+    fn empty_request_yields_empty_info() {
+        let req = NotifySendRequest {
+            title: "t".into(),
+            body: "b".into(),
+            kind: String::new(),
+            thread_id: None,
+            direction_id: None,
+            ask_id: None,
+            workspace_id: None,
+        };
+        assert!(user_info_from_req(&req).is_empty());
+    }
+}

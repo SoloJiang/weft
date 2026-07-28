@@ -38,8 +38,12 @@ import { cn } from "../lib/cn";
 import { spawnableToolsOf } from "../lib/toolStatus.ts";
 import {
   ensureNotifyPermission,
+  formatQuietTime,
+  NOTIFY_CATEGORIES,
   notifyPermission,
   openSystemNotificationSettings,
+  parseQuietTime,
+  type NotifyCategory,
   type NotifyPermission,
 } from "../lib/notifications";
 import { useStore, type SettingsPage } from "../state/store";
@@ -215,6 +219,10 @@ function GeneralSettings() {
     refreshDefaultTool,
     notifyEnabled,
     setNotifyEnabled,
+    notifyCategories,
+    setNotifyCategory,
+    quietHours,
+    setQuietHours,
   } = useStore();
   const [lang, setLangState] = useState<Lang>(currentLang());
 
@@ -379,7 +387,7 @@ function GeneralSettings() {
           </div>
         </SettingRow>
         <SettingRow label={t("settings.notifications")} hint={t("settings.notificationsHint")}>
-          <div className="flex flex-col items-end gap-1">
+          <div className="flex flex-col items-end gap-2">
             <Toggle
               on={notifyEnabled}
               onChange={onNotifyToggle}
@@ -393,6 +401,63 @@ function GeneralSettings() {
               >
                 {t("settings.notifyDenied")}
               </button>
+            )}
+            {notifyEnabled && (
+              <div className="flex w-full max-w-[280px] flex-col gap-1.5 rounded-[var(--radius-md)] border border-border bg-bg/50 px-2.5 py-2">
+                {NOTIFY_CATEGORIES.map((kind) => (
+                  <label
+                    key={kind}
+                    className="flex items-center justify-between gap-3 text-[12px] text-ink-muted"
+                  >
+                    <span>{t(`settings.notifyCat_${kind}`)}</span>
+                    <Toggle
+                      on={notifyCategories[kind]}
+                      onChange={(on) => setNotifyCategory(kind as NotifyCategory, on)}
+                      label={t(`settings.notifyCat_${kind}`)}
+                    />
+                  </label>
+                ))}
+                <div className="mt-1 border-t border-border pt-1.5">
+                  <label className="flex items-center justify-between gap-3 text-[12px] text-ink-muted">
+                    <span>{t("settings.notifyQuietHours")}</span>
+                    <Toggle
+                      on={quietHours.enabled}
+                      onChange={(on) => setQuietHours({ ...quietHours, enabled: on })}
+                      label={t("settings.notifyQuietHours")}
+                    />
+                  </label>
+                  {quietHours.enabled && (
+                    <div className="mt-1.5 flex items-center justify-end gap-1.5 text-[12px] text-ink-muted">
+                      <input
+                        type="time"
+                        value={formatQuietTime(quietHours.startMin)}
+                        onChange={(e) => {
+                          const v = parseQuietTime(e.currentTarget.value);
+                          if (v == null) return;
+                          setQuietHours({ ...quietHours, startMin: v });
+                        }}
+                        className="rounded-[var(--radius-sm)] border border-border bg-bg px-1.5 py-0.5 text-[12px] text-ink"
+                        aria-label={t("settings.notifyQuietStart")}
+                      />
+                      <span className="text-ink-faint">–</span>
+                      <input
+                        type="time"
+                        value={formatQuietTime(quietHours.endMin)}
+                        onChange={(e) => {
+                          const v = parseQuietTime(e.currentTarget.value);
+                          if (v == null) return;
+                          setQuietHours({ ...quietHours, endMin: v });
+                        }}
+                        className="rounded-[var(--radius-sm)] border border-border bg-bg px-1.5 py-0.5 text-[12px] text-ink"
+                        aria-label={t("settings.notifyQuietEnd")}
+                      />
+                    </div>
+                  )}
+                  <p className="mt-1 text-right text-[11px] leading-snug text-ink-faint">
+                    {t("settings.notifyQuietHoursHint")}
+                  </p>
+                </div>
+              </div>
             )}
           </div>
         </SettingRow>

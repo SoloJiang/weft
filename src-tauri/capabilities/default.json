@@ -15,6 +15,9 @@
     },
     "dialog:default",
     "notification:default",
+    "core:window:allow-set-badge-count",
+    "core:window:allow-request-user-attention",
+    "core:window:allow-is-focused",
     "updater:default",
     "mcp-bridge:default",
     "process:default"
