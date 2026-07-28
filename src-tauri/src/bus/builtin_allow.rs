@@ -177,7 +177,14 @@ pub enum SafeScope {
 /// states PreToolUse fires for `Bash`, `apply_patch`, MCP tools, and local
 /// function tools such as `update_plan` — codex has no read-only file builtin
 /// to list, because its reads go through the shell, which stays gated.
-const SAFE_BUILTINS: &[(&str, &str, SafeScope)] = &[
+///
+/// `pub(super)` (visible throughout `bus::*`, not just this module) so the
+/// sibling `bus::server` module's tests can iterate this table directly —
+/// see `server::UNKNOWN_ENGINE`'s doc for the invariant that enables checking
+/// structurally rather than by convention: no row here may ever be keyed on
+/// that sentinel, or a request whose `?tool=` is missing/unrecognized would
+/// silently inherit it.
+pub(super) const SAFE_BUILTINS: &[(&str, &str, SafeScope)] = &[
     // ── claude ──────────────────────────────────────────────────────────────
     // Reads a file's contents. Path-scoped: `Read` is exactly the tool that
     // could otherwise walk out of the worktree into `~/.ssh`.
@@ -280,29 +287,51 @@ fn contained(path: &str, roots: &[PathBuf]) -> bool {
 /// a device path, a verbatim UNC. Inert on unix, where the parser never
 /// produces a `Prefix` component at all.
 ///
-/// KNOWN, DOCUMENTED CI GAP (review round 2): this function's own test
+/// KNOWN, DOCUMENTED CI GAP (review round 2, reconfirmed and WIDENED on a
+/// follow-up pass): this function's own test
 /// (`unc_and_device_paths_are_rejected_before_any_filesystem_call`) asserts
 /// `has_non_disk_prefix(&path) || !path.is_absolute()` on non-Windows, and a
 /// UNC-style STRING is never `is_absolute()` on unix in the first place — the
 /// right side of that `||` is unconditionally `true` there, so the assertion
-/// holds no matter what this function returns. A mutation that deletes this
-/// function's body entirely (always `false`) still passes that test on every
-/// platform this repo's CI actually runs (Windows is currently disabled in
-/// `.github/workflows/ci.yml`), because `PathBuf::from` on unix can never
-/// parse a `\\host\share\x`-style string into a `Component::Prefix` at all —
-/// there is no public std API to fabricate one outside of the platform's own
-/// path parser either, so this specific traversal-and-dispatch wiring has NO
-/// test that can exercise it with a real `Path` value except on an actual
-/// Windows target. `is_non_disk_prefix_kind` below pulls the one piece that
-/// CAN be asserted cross-platform — the disk/non-disk KIND decision, which
-/// `std::path::Prefix` (unlike `Component::Prefix`/`PrefixComponent`) is a
-/// plain public enum anyone can construct directly, parser or no parser — out
-/// into its own function precisely so a mutation to THAT decision has
-/// somewhere to be caught even where the surrounding traversal can't be
-/// exercised. The remaining gap (does `.components()` really route a real
-/// Windows path's prefix through it) stays open until Windows CI comes back;
-/// documented here rather than pretended away, the same way `is_multi_linked`
-/// documents its own "Windows hard links aren't detected" gap.
+/// holds no matter what this function returns. That was the round-2 finding.
+/// The follow-up pass mutated the WHOLE function body to a bare `false`
+/// (rather than just the one guard round 2 checked) and re-ran every test in
+/// this module: all 23 stayed green, `non_disk_prefix_kinds_are_rejected_on_
+/// every_platform` included — because that test exercises `is_non_disk_
+/// prefix_kind` directly and never calls `has_non_disk_prefix` at all. So the
+/// gap is the ENTIRE function, not one guard inside it: on every platform this
+/// repo's CI runs today (Windows is disabled in `.github/workflows/ci.yml`),
+/// NOTHING in this module would notice if this function's body were deleted.
+///
+/// This is not fixable by further splitting the function (the obvious next
+/// move, and the one tried here first). The blocker isn't how the traversal
+/// is factored, it's that its INPUT can't be constructed off-platform:
+/// `std::path::Component::Prefix` wraps a `PrefixComponent`, and
+/// `PrefixComponent`'s two fields are private with no public constructor
+/// anywhere in std (confirmed by reading `library/std/src/path.rs` — `kind()`
+/// and `as_os_str()` are the only public members). Only the platform's own
+/// path parser can produce one, and on a non-Windows target that parser code
+/// path is structurally unreachable — `PathBuf::from` never parses a
+/// `\\host\share\x`-style string into a `Prefix` component there. Extracting
+/// the `.components()` loop into a function taking `&[Component]` (or an
+/// iterator of them) would not help: the test calling it would still need a
+/// real `Component::Prefix` value to pass in, and there is no way to build one
+/// without the parser this gap is already about. Reimplementing Windows
+/// prefix parsing ourselves just to get a constructible stand-in would trade
+/// a documented, honest test gap for an actually-untested reimplementation of
+/// platform-specific parsing logic — a worse position, not a better one.
+///
+/// `is_non_disk_prefix_kind` below pulls the one piece that CAN be asserted
+/// cross-platform — the disk/non-disk KIND decision, which `std::path::Prefix`
+/// (unlike `Component::Prefix`/`PrefixComponent`) is a plain public enum
+/// anyone can construct directly, parser or no parser — out into its own
+/// function precisely so a mutation to THAT decision has somewhere to be
+/// caught even where the surrounding traversal can't be exercised. The
+/// remaining gap (does `.components()` really route a real Windows path's
+/// prefix through it, and does this function's dispatch on the `Prefix` arm
+/// stay wired up) stays open until Windows CI comes back — documented here
+/// rather than pretended away, the same way `is_multi_linked` documents its
+/// own "Windows hard links aren't detected" gap.
 fn has_non_disk_prefix(p: &Path) -> bool {
     p.components().any(|c| match c {
         std::path::Component::Prefix(pre) => is_non_disk_prefix_kind(pre.kind()),

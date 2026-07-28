@@ -1903,7 +1903,27 @@ pub fn answer_ask(
 /// so this is the desktop-side "retry" action for the ONE Needs-you notice
 /// that does not clear itself (`host::judge::give_up_text`), without having
 /// to first prove precisely which row triggered it.
-async fn retry_pr_tracking_core(db: &Db, direction_id: i32) -> anyhow::Result<u32> {
+///
+/// ALSO clears `host::automerge`'s own, entirely separate per-(row, head_sha)
+/// merge-ATTEMPT backoff (`host::automerge::MergeBackoffState`) for every row
+/// this function touches. Before this, Retry only ever reached `probe_
+/// fail_count` (`host::monitor`'s "could not even CHECK this PR/MR" counter)
+/// — a row whose CHECKS were succeeding fine but whose `gh pr merge`
+/// attempts kept failing (branch protection, a repo that rejects squash
+/// merges, ...) had exhausted a counter this button never touched, so
+/// clicking it looked like it worked (the notice cleared, `probe_fail_count`
+/// really did reset) while the actual stuck condition silently remained.
+/// `MergeBackoffState::clear` has no rate limit of its own; see that
+/// method's doc for why an unlimited Retry is the deliberate choice here,
+/// not an oversight — briefly: every attempt Retry unlocks still has to
+/// clear the FULL live gate again (`gate::decide_auto_merge` against a FRESH
+/// read), so Retry can only let an already-ready-looking target keep trying,
+/// never bypass the actual authorization.
+async fn retry_pr_tracking_core(
+    db: &Db,
+    direction_id: i32,
+    merge_backoff: &crate::host::automerge::MergeBackoffState,
+) -> anyhow::Result<u32> {
     let rows = repo::list_pull_requests_for_direction(db, direction_id).await?;
     let mut reset = 0u32;
     for row in rows.into_iter().filter(|r| r.lifecycle == "open") {
@@ -1921,6 +1941,7 @@ async fn retry_pr_tracking_core(db: &Db, direction_id: i32) -> anyhow::Result<u3
             &row.title,
         )
         .await?;
+        merge_backoff.clear(row.id);
         reset += 1;
     }
     Ok(reset)
@@ -1930,8 +1951,12 @@ async fn retry_pr_tracking_core(db: &Db, direction_id: i32) -> anyhow::Result<u3
 /// [`retry_pr_tracking_core`]. Returns how many rows were reset (0 is not an
 /// error — the notice may already have been superseded by a later sweep).
 #[tauri::command]
-pub async fn retry_pr_tracking(db: State<'_, Db>, direction_id: i32) -> R<u32> {
-    retry_pr_tracking_core(&db, direction_id).await.map_err(e)
+pub async fn retry_pr_tracking(
+    db: State<'_, Db>,
+    merge_backoff: State<'_, crate::host::automerge::MergeBackoffState>,
+    direction_id: i32,
+) -> R<u32> {
+    retry_pr_tracking_core(&db, direction_id, &merge_backoff).await.map_err(e)
 }
 
 /// All pending permission Asks across the workspace (the Ask Bridge → Needs-you),
@@ -3790,6 +3815,7 @@ mod tests {
     async fn retry_pr_tracking_resets_a_given_up_rows_probe_failure_streak() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let (thread, dir, repo_ref) = pr_retry_fixture(&db).await;
+        let merge_backoff = crate::host::automerge::MergeBackoffState::default();
         let pr = repo::register_pull_request(
             &db, thread.id, dir.id, repo_ref.id, "github", "github.com", "acme", "widgets", 4,
             "https://github.com/acme/widgets/pull/4", "fix things",
@@ -3809,7 +3835,7 @@ mod tests {
             "precondition: the row must actually have fallen out of the sweep"
         );
 
-        let reset_count = retry_pr_tracking_core(&db, dir.id).await.unwrap();
+        let reset_count = retry_pr_tracking_core(&db, dir.id, &merge_backoff).await.unwrap();
         assert_eq!(reset_count, 1);
 
         let after = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
@@ -3825,11 +3851,12 @@ mod tests {
     async fn retry_pr_tracking_ignores_merged_rows_and_a_direction_with_nothing_tracked() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let (thread, dir, repo_ref) = pr_retry_fixture(&db).await;
+        let merge_backoff = crate::host::automerge::MergeBackoffState::default();
 
         // A direction with no tracked PR/MR at all: a harmless no-op, not an
         // error — the button must not fail just because the notice it targets
         // was already superseded by a later sweep.
-        assert_eq!(retry_pr_tracking_core(&db, dir.id).await.unwrap(), 0);
+        assert_eq!(retry_pr_tracking_core(&db, dir.id, &merge_backoff).await.unwrap(), 0);
 
         // A merged row must be left alone — resetting a closed chapter's
         // streak would be pointless (it will never be swept again either way)
@@ -3845,13 +3872,62 @@ mod tests {
         a.lifecycle = Set("merged".to_string());
         a.probe_fail_count = Set(3);
         a.update(&db.0).await.unwrap();
+        // Seed an EXHAUSTED merge-attempt backoff entry too, mirroring a row
+        // that finally merged after exactly using up its attempts — a merged
+        // row must not have EITHER of its counters touched by Retry.
+        for _ in 0..3 {
+            merge_backoff.record_failure(pr.id, &pr.head_sha);
+        }
 
         assert_eq!(
-            retry_pr_tracking_core(&db, dir.id).await.unwrap(),
+            retry_pr_tracking_core(&db, dir.id, &merge_backoff).await.unwrap(),
             0,
             "a merged row must not be touched"
         );
         let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
         assert_eq!(reloaded.probe_fail_count, 3, "left exactly as it was");
+        assert!(
+            merge_backoff.is_exhausted(pr.id, &pr.head_sha),
+            "a merged row's merge-attempt backoff must be left exactly as it was too, not silently cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_pr_tracking_also_clears_an_exhausted_merge_attempt_backoff() {
+        // Task B's exact repro: `host::monitor`'s `probe_fail_count` never
+        // moved (every CHECK succeeded) — the row is stuck purely because
+        // `host::automerge`'s OWN, separate merge-attempt backoff
+        // (`MergeBackoffState`) exhausted. Before this fix, `register_
+        // pull_request` alone (the old body of `retry_pr_tracking_core`)
+        // never reached that table at all, so a human clicking Retry saw
+        // the button "succeed" while the row stayed silently stuck.
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let (thread, dir, repo_ref) = pr_retry_fixture(&db).await;
+        let merge_backoff = crate::host::automerge::MergeBackoffState::default();
+        let pr = repo::register_pull_request(
+            &db, thread.id, dir.id, repo_ref.id, "github", "github.com", "acme", "widgets", 6,
+            "https://github.com/acme/widgets/pull/6", "flaky merge",
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            merge_backoff.record_failure(pr.id, &pr.head_sha);
+        }
+        assert!(
+            merge_backoff.is_exhausted(pr.id, &pr.head_sha),
+            "precondition: the row's merge-attempt backoff must actually be exhausted"
+        );
+        assert_eq!(
+            repo::get_pull_request(&db, pr.id).await.unwrap().unwrap().probe_fail_count,
+            0,
+            "precondition: host::monitor's OWN counter never moved — this is purely an automerge-side backoff"
+        );
+
+        retry_pr_tracking_core(&db, dir.id, &merge_backoff).await.unwrap();
+
+        assert!(
+            !merge_backoff.is_exhausted(pr.id, &pr.head_sha),
+            "Retry must also clear host::automerge's OWN merge-attempt backoff, not just host::monitor's probe_fail_count"
+        );
     }
 }

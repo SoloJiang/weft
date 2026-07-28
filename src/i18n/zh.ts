@@ -354,7 +354,7 @@ export const zh = {
     detailTruncated: "……已截断 {{n}} 个字符",
     actionRequired: "需要你处理 —— 不会自动消失。",
     retryTracking: "重试",
-    retryTrackingTitle: "重置失败计数，让 Weft 重新尝试跟踪这个 PR/MR",
+    retryTrackingTitle: "重置失败计数，以及暂停中的自动合并重试，让 Weft 重新尝试",
     retryTrackingStarted: "已请求重试，Weft 会尽快重新检查。",
     retryTrackingNothingToRetry: "没有可重试的项 —— 可能已经自行解决了。",
     retryTrackingFailed: "重试失败，请稍后再试。",
@@ -458,7 +458,7 @@ export const zh = {
     autoMergeStateMerged: "已确认 merged",
     autoMergeStateClosed: "已关闭，未合并",
     autoMergeStateUnknown: "暂时无法确认当前状态",
-    autoMergeAttemptsExhausted: "已连续失败 {{count}} 次，在这个 commit 更新前不会再自动重试",
+    autoMergeAttemptsExhausted: "已连续失败 {{count}} 次，已停止自动重试——push 一个新 commit 即可重新尝试",
   },
   diff: {
     tab: "改动",
