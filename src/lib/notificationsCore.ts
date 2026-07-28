@@ -264,9 +264,9 @@ export function snapshotOf(
   for (const s of Object.values(sessions)) {
     if (s.status !== "stalled") continue;
     const meta = threadsById[s.threadId];
-    const title = meta?.title ?? `thread ${s.threadId}`;
+    const title = meta?.title ?? `#${s.threadId}`;
     stalled.set(`stall:worker:${s.info.session_id}`, {
-      sample: `${title} · dir ${s.directionId}`,
+      sample: `${title} · #${s.directionId}`,
       route: {
         kind: "stalled",
         threadId: s.threadId,
@@ -281,7 +281,7 @@ export function snapshotOf(
     if (turn.state !== "stalled") continue;
     const tid = Number(tidStr);
     const meta = threadsById[tid];
-    const title = meta?.title ?? `thread ${tid}`;
+    const title = meta?.title ?? `#${tid}`;
     stalled.set(`stall:lead:${tid}`, {
       sample: title,
       route: {

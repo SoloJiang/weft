@@ -166,12 +166,12 @@ fn handle_response<R: Runtime>(app: AppHandle<R>, response: NotificationResponse
     }
     focus_main_window(&app);
     let payload = payload_from_user_info(&response.user_info);
-    // Always retain the latest pending open so a cold-start click is not lost
-    // if the frontend listener is not mounted yet.
+    // Retain as pending first so a cold-start click survives if no frontend
+    // listener is mounted yet. Live handlers must ack/clear after handling.
     if let Ok(mut guard) = pending_open().lock() {
         *guard = Some(payload.clone());
     }
-    if let Err(err) = app.emit(OPEN_EVENT, payload) {
+    if let Err(err) = app.emit(OPEN_EVENT, payload.clone()) {
         eprintln!("[weft] os_notify emit {OPEN_EVENT}: {err}");
     }
 }
@@ -202,21 +202,23 @@ pub fn init<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 /// `"granted" | "denied" | "prompt"` — mirrors the frontend `NotifyPermission`.
 #[tauri::command]
 pub async fn os_notify_permission() -> Result<String, String> {
-    if let Ok(guard) = perm_settled().lock() {
-        if let Some(settled) = guard.as_ref() {
-            return Ok(settled.clone());
-        }
-    }
     let mgr = manager()?.clone();
-    // Mock manager (unsigned macOS dev) always reports granted; real macOS
-    // distinguishes NotDetermined as false without a dedicated "prompt" API, so
-    // we map false → "prompt" until a request settles to denied/granted.
+    // Always re-query the OS so Settings recovery / revocation is visible without
+    // restarting Weft. Cached settlement only disambiguates native `false`
+    // (NotDetermined vs previously denied).
     match mgr.get_notification_permission_state().await {
         Ok(true) => {
             remember_settled_permission("granted");
             Ok("granted".to_string())
         }
-        Ok(false) => Ok("prompt".to_string()),
+        Ok(false) => {
+            if let Ok(guard) = perm_settled().lock() {
+                if guard.as_deref() == Some("denied") {
+                    return Ok("denied".to_string());
+                }
+            }
+            Ok("prompt".to_string())
+        }
         Err(e) => Err(format!("os_notify permission: {e}")),
     }
 }
@@ -261,6 +263,14 @@ pub async fn os_notify_send(req: NotifySendRequest) -> Result<(), String> {
 #[tauri::command]
 pub fn os_notify_take_pending_open() -> Option<NotifyOpenPayload> {
     pending_open().lock().ok().and_then(|mut g| g.take())
+}
+
+/// Clear a retained pending open after the frontend has handled a live event.
+#[tauri::command]
+pub fn os_notify_ack_open() {
+    if let Ok(mut guard) = pending_open().lock() {
+        *guard = None;
+    }
 }
 
 #[cfg(test)]

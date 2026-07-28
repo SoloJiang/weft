@@ -153,7 +153,7 @@ test("snapshotOf captures stalled workers and leads", () => {
     null,
     { 2: { title: "Issue B" } },
   );
-  assert.equal(snap.stalled.get("stall:worker:99")?.sample, "Issue B · dir 5");
+  assert.equal(snap.stalled.get("stall:worker:99")?.sample, "Issue B · #5");
   assert.equal(snap.stalled.get("stall:worker:99")?.route.directionId, 5);
   assert.equal(snap.stalled.get("stall:worker:99")?.route.repoId, 8);
   assert.equal(snap.stalled.get("stall:worker:99")?.route.sessionId, 99);

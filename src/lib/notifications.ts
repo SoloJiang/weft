@@ -6,7 +6,6 @@ import { useTranslation } from "react-i18next";
 import { useStore } from "../state/store";
 import { api } from "./api";
 import {
-  badgeCountFrom,
   diffForNotifications,
   isAppInForeground,
   isInQuietHours,
@@ -117,6 +116,59 @@ export interface OsNotifyOpenEvent {
 }
 
 /** Apply a notification click to the in-app navigation surface. */
+const PENDING_NAV_KEY = "weft-notify-pending-nav";
+
+function stashPendingNav(payload: OsNotifyOpenEvent): void {
+  try {
+    sessionStorage.setItem(PENDING_NAV_KEY, JSON.stringify(payload));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+export function takePendingNav(): OsNotifyOpenEvent | null {
+  try {
+    const raw = sessionStorage.getItem(PENDING_NAV_KEY);
+    if (!raw) return null;
+    sessionStorage.removeItem(PENDING_NAV_KEY);
+    return JSON.parse(raw) as OsNotifyOpenEvent;
+  } catch {
+    return null;
+  }
+}
+
+export async function applyNotifyIntents(
+  payload: OsNotifyOpenEvent,
+  deps: {
+    goToDirectionRef: (
+      thread: number,
+      dir: string,
+      opts?: { repoId?: number; sessionId?: number },
+    ) => Promise<void>;
+    openNeeds: () => void;
+    openSettings: (page?: "resources" | "general" | "appearance" | "automation" | "skills" | "im" | "backup") => void;
+  },
+): Promise<void> {
+  const intents = planNotifyOpen(payload).filter((i) => i.type !== "workspace");
+  for (const intent of intents) {
+    if (intent.type === "resources") {
+      deps.openSettings("resources");
+      continue;
+    }
+    if (intent.type === "direction") {
+      await deps.goToDirectionRef(intent.threadId, intent.direction, {
+        repoId: intent.repoId,
+        sessionId: intent.sessionId,
+      });
+      continue;
+    }
+    if (intent.type === "needs") {
+      deps.openNeeds();
+    }
+  }
+}
+
+/** Apply a notification click to the in-app navigation surface. */
 export async function handleNotifyOpen(
   payload: OsNotifyOpenEvent,
   deps: {
@@ -133,28 +185,20 @@ export async function handleNotifyOpen(
 ): Promise<void> {
   await focusMainWindow();
   const intents = planNotifyOpen(payload);
-  for (const intent of intents) {
-    if (intent.type === "workspace") {
-      if (intent.workspaceId !== deps.activeWorkspaceId) {
-        await deps.selectWorkspace(intent.workspaceId);
-      }
-      continue;
-    }
-    if (intent.type === "resources") {
-      deps.openSettings("resources");
-      continue;
-    }
-    if (intent.type === "direction") {
-      await deps.goToDirectionRef(intent.threadId, intent.direction, {
-        repoId: intent.repoId,
-        sessionId: intent.sessionId,
-      });
-      continue;
-    }
-    if (intent.type === "needs") {
-      deps.openNeeds();
-    }
+  const workspaceIntent = intents.find((i) => i.type === "workspace");
+  if (
+    workspaceIntent &&
+    workspaceIntent.type === "workspace" &&
+    workspaceIntent.workspaceId !== deps.activeWorkspaceId
+  ) {
+    // Defer the rest until the store finishes the workspace switch effect.
+    // A second selectWorkspace(activeWorkspaceId) otherwise races and clears
+    // the deep-link destination.
+    stashPendingNav(payload);
+    await deps.selectWorkspace(workspaceIntent.workspaceId);
+    return;
   }
+  await applyNotifyIntents(payload, deps);
 }
 
 async function sendOsNotification(
@@ -198,6 +242,7 @@ export function useSystemNotifications() {
     notifyCategories,
     quietHours,
     activeWorkspaceId,
+    needsByWorkspace,
     selectWorkspace,
     goToDirectionRef,
     openNeeds,
@@ -264,11 +309,20 @@ export function useSystemNotifications() {
     void (async () => {
       try {
         unlisten = await listen<OsNotifyOpenEvent>("notify://open", (event) => {
-          void handleNotifyOpen(event.payload, deps);
+          void (async () => {
+            await handleNotifyOpen(event.payload, deps);
+            // Live delivery was handled — drop any retained pending copy so a
+            // later effect re-run does not replay the same click.
+            try {
+              await api.osNotifyAckOpen();
+            } catch {
+              /* pure-vite */
+            }
+          })();
         });
         const pending = await api.osNotifyTakePendingOpen();
         if (!cancelled && pending) {
-          void handleNotifyOpen(pending, deps);
+          await handleNotifyOpen(pending, deps);
         }
       } catch {
         /* pure-vite */
@@ -287,13 +341,42 @@ export function useSystemNotifications() {
     activeWorkspaceId,
   ]);
 
-  // Dock / taskbar badge tracks actionable Needs-you count.
+  // Finish a deep link that had to switch workspaces first.
   useEffect(() => {
-    const count = badgeCountFrom(needs, asks, writeTriggers);
+    const pending = takePendingNav();
+    if (!pending) return;
+    if (
+      pending.workspaceId != null &&
+      pending.workspaceId !== activeWorkspaceId
+    ) {
+      // Not settled yet — put it back.
+      try {
+        sessionStorage.setItem(
+          "weft-notify-pending-nav",
+          JSON.stringify(pending),
+        );
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    void applyNotifyIntents(pending, {
+      goToDirectionRef,
+      openNeeds,
+      openSettings,
+    });
+  }, [activeWorkspaceId, goToDirectionRef, openNeeds, openSettings]);
+
+  // Dock / taskbar badge tracks actionable Needs-you across all workspaces.
+  useEffect(() => {
+    const fromWs = Object.values(needsByWorkspace).reduce((a, b) => a + b, 0);
+    // Permission asks are global; they are not in needsByWorkspace. Add them
+    // once on top of the per-workspace totals.
+    const count = fromWs + asks.length;
     if (lastBadge.current === count) return;
     lastBadge.current = count;
     void setDockBadge(count);
-  }, [needs, asks, writeTriggers]);
+  }, [needsByWorkspace, asks]);
 
   useEffect(() => {
     const next = snapshotOf(
