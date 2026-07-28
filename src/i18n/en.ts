@@ -594,6 +594,8 @@ export const en = {
     analysisRunning: "Analyzing…",
     analysisFailed: "Analysis failed",
     analysisErrorCheckoutMissing: "Checkout not found on disk",
+    analysisErrorUnsupportedEngine:
+      "Repository analysis can't run on {{tool}} — pick another engine for the curator.",
     retryAnalysis: "Retry",
     viewOverview: "Overview",
     viewExpanded: "Expanded",

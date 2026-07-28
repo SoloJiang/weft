@@ -109,6 +109,15 @@ function analysisErrorText(
   error: string | null | undefined,
 ): string {
   if (error === "checkout-missing") return t("repomap.analysisErrorCheckoutMissing");
+  // The curator drives agents over exec/app-server argv and refuses an ACP
+  // engine outright rather than silently substituting a different provider
+  // (see `curator::curator_exec_tool`). Say which engine, and what to do.
+  const unsupportedEnginePrefix = "curator_unsupported_engine:";
+  if (error?.startsWith(unsupportedEnginePrefix)) {
+    return t("repomap.analysisErrorUnsupportedEngine", {
+      tool: error.slice(unsupportedEnginePrefix.length),
+    });
+  }
   const routeBlockedPrefix = "engine-routing-blocked:";
   if (error?.startsWith(routeBlockedPrefix)) {
     const reason = error.slice(routeBlockedPrefix.length);

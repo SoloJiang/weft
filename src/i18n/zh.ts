@@ -571,6 +571,7 @@ export const zh = {
     analysisRunning: "分析中…",
     analysisFailed: "分析失败",
     analysisErrorCheckoutMissing: "本地检出未找到",
+    analysisErrorUnsupportedEngine: "仓库分析暂不支持 {{tool}}，请为 curator 选择其他引擎。",
     retryAnalysis: "重试",
     viewOverview: "概览",
     viewExpanded: "展开",
