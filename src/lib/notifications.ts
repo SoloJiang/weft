@@ -243,6 +243,7 @@ export function useSystemNotifications() {
     activeWorkspaceId,
     needsByWorkspace,
     threadWorkspaceById,
+    workspaceLoadSeq,
     selectWorkspace,
     goToDirectionRef,
     openNeeds,
@@ -371,7 +372,10 @@ export function useSystemNotifications() {
     };
   }, []);
 
-  // Finish a deep link that had to switch workspaces first.
+  // Finish a deep link that had to switch workspaces first. Wait until
+  // selectWorkspace has finished loading (workspaceLoadSeq) so a concurrent
+  // selection reset cannot clear the destination right after we navigate.
+  const pendingAppliedSeq = useRef<number | null>(null);
   useEffect(() => {
     const pending = takePendingNav();
     if (!pending) return;
@@ -390,12 +394,37 @@ export function useSystemNotifications() {
       }
       return;
     }
+    if (pendingAppliedSeq.current === workspaceLoadSeq) {
+      // Already applied for this load; put back only if still relevant.
+      return;
+    }
+    // If a workspace switch just started, wait for its load seq bump.
+    // workspaceLoadSeq is 0 before any selection completes; still allow apply
+    // once activeWorkspaceId already matches the target after a completed load.
+    if (pending.workspaceId != null && workspaceLoadSeq === 0) {
+      try {
+        sessionStorage.setItem(
+          "weft-notify-pending-nav",
+          JSON.stringify(pending),
+        );
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    pendingAppliedSeq.current = workspaceLoadSeq;
     void applyNotifyIntents(pending, {
       goToDirectionRef,
       openNeeds,
       openSettings,
     });
-  }, [activeWorkspaceId, goToDirectionRef, openNeeds, openSettings]);
+  }, [
+    activeWorkspaceId,
+    workspaceLoadSeq,
+    goToDirectionRef,
+    openNeeds,
+    openSettings,
+  ]);
 
   // Dock / taskbar badge tracks actionable Needs-you across all workspaces.
   // needsByWorkspace already includes questions + asks + writeTriggers per ws.

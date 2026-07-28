@@ -209,6 +209,8 @@ interface Store {
   threads: Thread[];
   /** Cumulative thread_id → workspace_id map across visited workspaces. */
   threadWorkspaceById: Record<number, number>;
+  /** Bumps after each selectWorkspace finishes loading repos/threads. */
+  workspaceLoadSeq: number;
   directionsByThread: Record<number, Direction[]>;
   worktreesByDirection: Record<number, Worktree[]>;
 
@@ -597,6 +599,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [repos, setRepos] = useState<RepoRef[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadWorkspaceById, setThreadWorkspaceById] = useState<Record<number, number>>({});
+  const [workspaceLoadSeq, setWorkspaceLoadSeq] = useState(0);
   const rememberThreads = useCallback((list: Thread[]) => {
     setThreads(list);
     setThreadWorkspaceById((prev) => {
@@ -971,6 +974,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setHomeTab("board");
     setProposal(null);
     setOverview([]);
+    setWorkspaceLoadSeq((n) => n + 1);
   }, [rememberThreads]);
 
   const loadThreadChildren = useCallback(async (threadId: number) => {
