@@ -388,7 +388,11 @@ async fn evaluate_row(
             return RowVerdict::Skip; // couldn't confirm live state — never merge on a guess
         }
     };
-    let fresh_readiness = judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+    // Re-resolved here rather than trusting the swept row: this is the
+    // pre-merge confirmation, and an upstream can have moved since the sweep.
+    let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
+    let fresh_readiness =
+        judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict, &upstream);
     if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, &snapshot, &fresh_readiness).await {
         eprintln!(
             "[weft][automerge] pr #{}: could not save pre-merge confirmation snapshot: {e}",
@@ -482,7 +486,8 @@ async fn maybe_merge_one(
 
     let (state, state_error) = match &confirmed {
         Ok(s) => {
-            let r = judge::merge_readiness(&s.ci, &s.review, &s.conflict);
+            let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
+            let r = judge::merge_readiness(&s.ci, &s.review, &s.conflict, &upstream);
             if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, s, &r).await {
                 eprintln!(
                     "[weft][automerge] pr #{}: could not save confirmation snapshot: {e}",

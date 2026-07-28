@@ -5925,6 +5925,7 @@ mod tests {
             base_branch: "HEAD".to_string(),
             target_branch: "".to_string(),
             branch: "feat/a".to_string(),
+            depends_on_direction_id: 0,
             created_at: "0".to_string(),
         };
 
@@ -5967,6 +5968,7 @@ mod tests {
             base_branch: base.to_string(),
             target_branch: "".to_string(),
             branch: "feat/a".to_string(),
+            depends_on_direction_id: 0,
             created_at: "0".to_string(),
         };
         // Non-empty bases are normalized purely by string prefix-stripping — no repo
@@ -6029,6 +6031,7 @@ mod tests {
             base_branch: base.to_string(),
             target_branch: target.to_string(),
             branch: "feat/a".to_string(),
+            depends_on_direction_id: 0,
             created_at: "0".to_string(),
         };
 

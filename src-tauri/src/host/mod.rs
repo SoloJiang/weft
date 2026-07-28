@@ -201,6 +201,28 @@ pub enum ConflictStatus {
     Conflicting,
 }
 
+/// Whether the task this PR belongs to is waiting on ANOTHER task's PR.
+///
+/// Ordering exists because a consumer repo pinned to a producer (a submodule
+/// SHA, a version bump) cannot be green until the producer's change is on its
+/// default branch. Merging the consumer first does not merely reorder work —
+/// it lands a commit referencing something nobody else can resolve.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum UpstreamStatus {
+    /// No ordering edge recorded — the overwhelmingly common case, and the
+    /// only one that existed before cross-repo change sets.
+    None,
+    /// Every upstream task's PR is merged; this one is free to go.
+    Merged,
+    /// An upstream is still outstanding. `what` names it for the human.
+    Pending { what: String },
+    /// An upstream edge exists but its state could not be established (the
+    /// task row is gone, its PR was never registered). Deliberately NOT
+    /// treated as "no upstream": the honest answer to "can we tell?" is no.
+    Unknown { reason: String },
+}
+
 /// The `truly mergeable` bar (this repo's CLAUDE.md "GitHub Remote Review
 /// Workflow" section), turned into code instead of prose: CI green × review
 /// clear/approved × no conflict. See `judge::merge_readiness` for the

@@ -174,7 +174,14 @@ async fn apply_probe_result(
 ) {
     let desired: Option<(NoticeKind, String)> = match &result {
         Ok(snapshot) => {
-            let readiness = judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+            // Ordering is resolved per sweep, not cached on the row: the
+            // upstream's lifecycle changes on ITS own schedule, and a stale
+            // copy here would either hold a mergeable PR back or release one
+            // early. `direction_id == 0` (a legacy row) resolves to Unknown,
+            // which is the honest answer for a PR whose task we cannot find.
+            let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
+            let readiness =
+                judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict, &upstream);
             let changed = snapshot_changed(pr, snapshot, &readiness);
             if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, snapshot, &readiness).await {
                 eprintln!("[weft][host] pr #{}: could not save snapshot: {e}", pr.id);

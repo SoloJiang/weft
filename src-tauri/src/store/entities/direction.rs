@@ -22,6 +22,11 @@ pub struct Model {
     /// in Needs-you and kept for audit.
     #[sea_orm(default_value = "")]
     pub reason: String,
+    /// Another task that must be MERGED before this one is considered
+    /// mergeable — the cross-repo ordering edge (producer → consumer).
+    /// `0` = no upstream, same convention as `repo_id`.
+    #[sea_orm(default_value = 0)]
+    pub depends_on_direction_id: i32,
     /// Explicit engine selections are pins. Legacy rows stay pinned; a new
     /// route-derived direction is explicitly created unpinned.
     #[sea_orm(default_value = true)]

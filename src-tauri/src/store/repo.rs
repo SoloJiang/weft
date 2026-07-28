@@ -13,6 +13,7 @@ use sea_orm::{
     TryIntoModel,
 };
 use std::collections::HashMap;
+use crate::host;
 
 /// A manual route selected for a reused direction before its first native
 /// conversation. `session_id` is present only when an interrupted initial
@@ -1561,6 +1562,31 @@ pub async fn get_direction(db: &Db, direction_id: i32) -> Result<Option<directio
     Ok(direction::Entity::find_by_id(direction_id)
         .one(&db.0)
         .await?)
+}
+
+/// Record (or clear, with `0`) the task this one must merge after.
+///
+/// Deliberately refuses a SELF edge: a task waiting on itself can never
+/// resolve, and `upstream_merge_state` would report it as permanently
+/// `Pending` — a task no human could ever merge, with a reason that reads like
+/// a bug. Longer cycles are not detected here; a single upstream per task
+/// cannot express one, and the day this becomes a real graph it needs a real
+/// cycle check (see `M0046DirectionUpstream`).
+pub async fn set_direction_upstream(
+    db: &Db,
+    direction_id: i32,
+    upstream_id: i32,
+) -> Result<()> {
+    if upstream_id == direction_id {
+        anyhow::bail!("a task cannot depend on itself");
+    }
+    let Some(row) = direction::Entity::find_by_id(direction_id).one(&db.0).await? else {
+        return Ok(());
+    };
+    let mut a: direction::ActiveModel = row.into();
+    a.depends_on_direction_id = Set(upstream_id);
+    a.update(&db.0).await?;
+    Ok(())
 }
 
 pub async fn set_direction_engine_pinned(
@@ -3658,6 +3684,71 @@ pub async fn get_pull_request(db: &Db, id: i32) -> Result<Option<pull_request::M
 /// persistently-failing probe (deleted PR, revoked auth) must not be retried
 /// forever, but a merged/closed row (this function's OTHER exclusion) and a
 /// row still under the threshold are unaffected.
+/// Resolve the ordering axis for the task that owns `direction_id`: is the
+/// task it depends on merged yet?
+///
+/// Every failure to establish an answer returns `Unknown`, never `None`.
+/// `None` means "this task has no upstream", which would let the PR merge; a
+/// missing task row or an unreadable DB means we cannot tell, and
+/// `judge::merge_readiness` turns that into `Indeterminate` rather than a
+/// verdict. Conflating the two would merge a consumer ahead of its producer on
+/// the strength of a failed query.
+///
+/// An upstream with NO registered PR is `Pending`, not `Unknown`: the task
+/// demonstrably has not merged anything yet. That is a fact, not an absence of
+/// information.
+pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamStatus {
+    let dir = match get_direction(db, direction_id).await {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            return host::UpstreamStatus::Unknown {
+                reason: "找不到这个任务".into(),
+            }
+        }
+        Err(e) => {
+            return host::UpstreamStatus::Unknown {
+                reason: format!("读取任务失败: {e}"),
+            }
+        }
+    };
+    if dir.depends_on_direction_id == 0 {
+        return host::UpstreamStatus::None;
+    }
+    let upstream = match get_direction(db, dir.depends_on_direction_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return host::UpstreamStatus::Unknown {
+                reason: format!("上游任务 #{} 不存在", dir.depends_on_direction_id),
+            }
+        }
+        Err(e) => {
+            return host::UpstreamStatus::Unknown {
+                reason: format!("读取上游任务失败: {e}"),
+            }
+        }
+    };
+    let prs = match pull_request::Entity::find()
+        .filter(pull_request::Column::DirectionId.eq(upstream.id))
+        .all(&db.0)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            return host::UpstreamStatus::Unknown {
+                reason: format!("读取上游 PR 失败: {e}"),
+            }
+        }
+    };
+    // Merged only when the upstream has at least one PR and EVERY one of them
+    // has landed: a task that opened two PRs is not done because one merged.
+    if !prs.is_empty() && prs.iter().all(|p| p.lifecycle == "merged") {
+        return host::UpstreamStatus::Merged;
+    }
+    host::UpstreamStatus::Pending {
+        what: upstream.name.clone(),
+    }
+}
+
 pub async fn list_open_pull_requests(
     db: &Db,
     max_probe_fail_count: i32,
@@ -7418,6 +7509,169 @@ mod tests {
         );
     }
 
+    /// Fixture: a workspace + thread + two tasks, the second depending on the
+    /// first, mirroring a producer→consumer change set.
+    async fn ordered_pair(db: &Db) -> (i32, i32) {
+        let ws = create_workspace(db, "ws_order").await.unwrap();
+        let r = add_repo_ref(db, ws.id, "api", "/tmp/ordered-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(db, ws.id, "t", "feature", "claude").await.unwrap();
+        let producer = create_direction(db, t.id, "producer", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        let consumer = create_direction(db, t.id, "consumer", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        set_direction_upstream(db, consumer.id, producer.id).await.unwrap();
+        (producer.id, consumer.id)
+    }
+
+    async fn register_open_pr(db: &Db, direction_id: i32, number: i32) -> pull_request::Model {
+        register_pull_request(
+            db, 1, direction_id, 0, "github", "github.com", "o", "r", number, "", "",
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A task with no edge is `None` — the state that lets a PR merge. Every
+    /// other answer in this function has to EARN that.
+    #[tokio::test]
+    async fn a_task_with_no_upstream_reports_none() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws_solo").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", "/tmp/solo-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let d = create_direction(&db, t.id, "solo", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            upstream_merge_state(&db, d.id).await,
+            crate::host::UpstreamStatus::None
+        );
+    }
+
+    /// An upstream that has not opened a PR is PENDING, not Unknown: it
+    /// demonstrably has not merged anything. That is a fact, not missing
+    /// information, and the difference decides whether the consumer is
+    /// `Blocked` (correct) or `Indeterminate`.
+    #[tokio::test]
+    async fn an_upstream_with_no_pr_is_pending_not_unknown() {
+        let db = mem().await;
+        let (_producer, consumer) = ordered_pair(&db).await;
+
+        match upstream_merge_state(&db, consumer).await {
+            crate::host::UpstreamStatus::Pending { what } => assert_eq!(what, "producer"),
+            other => panic!("expected pending, got {other:?}"),
+        }
+    }
+
+    /// The ordering itself: open upstream PR → blocked; merged → free.
+    #[tokio::test]
+    async fn an_upstream_pr_releases_the_consumer_only_once_merged() {
+        let db = mem().await;
+        let (producer, consumer) = ordered_pair(&db).await;
+        let pr = register_open_pr(&db, producer, 1).await;
+
+        assert!(
+            matches!(
+                upstream_merge_state(&db, consumer).await,
+                crate::host::UpstreamStatus::Pending { .. }
+            ),
+            "an OPEN upstream PR must hold the consumer"
+        );
+
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: "abc".into(),
+            base_ref: "main".into(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Merged,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            upstream_merge_state(&db, consumer).await,
+            crate::host::UpstreamStatus::Merged
+        );
+    }
+
+    /// TWO upstream PRs, one merged: still pending. A task is not done because
+    /// one of its PRs landed.
+    #[tokio::test]
+    async fn one_merged_pr_does_not_release_an_upstream_with_two() {
+        let db = mem().await;
+        let (producer, consumer) = ordered_pair(&db).await;
+        let first = register_open_pr(&db, producer, 1).await;
+        let _second = register_open_pr(&db, producer, 2).await;
+
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: "abc".into(),
+            base_ref: "main".into(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Merged,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        apply_pull_request_snapshot(&db, first.id, &snapshot, &crate::host::MergeReadiness::Ready)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                upstream_merge_state(&db, consumer).await,
+                crate::host::UpstreamStatus::Pending { .. }
+            ),
+            "every upstream PR must land before the consumer is free"
+        );
+    }
+
+    /// A dangling edge must NOT read as "no upstream". `None` would release the
+    /// merge on the strength of a row we could not find.
+    #[tokio::test]
+    async fn a_dangling_upstream_edge_is_unknown_never_none() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws_dangle").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", "/tmp/dangle-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let d = create_direction(&db, t.id, "consumer", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        set_direction_upstream(&db, d.id, 4242).await.unwrap();
+
+        match upstream_merge_state(&db, d.id).await {
+            crate::host::UpstreamStatus::Unknown { reason } => {
+                assert!(reason.contains("4242"), "reason names the missing id: {reason}");
+            }
+            other => panic!("a dangling edge must be Unknown, got {other:?}"),
+        }
+    }
+
+    /// A PR row whose task is gone (legacy `direction_id == 0`) is Unknown too
+    /// — the monitor resolves ordering by direction, and "no such task" is not
+    /// evidence of "no dependency".
+    #[tokio::test]
+    async fn an_unknown_task_is_unknown_not_none() {
+        let db = mem().await;
+        match upstream_merge_state(&db, 0).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!("expected unknown, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn next_turn_id_increments_from_last_row() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
@@ -7556,7 +7810,12 @@ mod tests {
             conflict: crate::host::ConflictStatus::Clean,
         };
         let readiness =
-            crate::host::judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+            crate::host::judge::merge_readiness(
+                &snapshot.ci,
+                &snapshot.review,
+                &snapshot.conflict,
+                &host::UpstreamStatus::None,
+            );
         apply_pull_request_snapshot(&db, broken.id, &snapshot, &readiness).await.unwrap();
         let listed = list_open_pull_requests(&db, 2).await.unwrap();
         assert_eq!(listed.len(), 2, "a success must reset the failure streak and rejoin the sweep");
@@ -7624,7 +7883,12 @@ mod tests {
             review: crate::host::ReviewStatus::Approved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        let readiness = crate::host::judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+        let readiness = crate::host::judge::merge_readiness(
+                &snapshot.ci,
+                &snapshot.review,
+                &snapshot.conflict,
+                &host::UpstreamStatus::None,
+            );
         apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness)
             .await
             .unwrap();
@@ -7656,7 +7920,12 @@ mod tests {
             review: crate::host::ReviewStatus::Approved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        let readiness = crate::host::judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+        let readiness = crate::host::judge::merge_readiness(
+                &snapshot.ci,
+                &snapshot.review,
+                &snapshot.conflict,
+                &host::UpstreamStatus::None,
+            );
         apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness)
             .await
             .unwrap();

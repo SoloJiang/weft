@@ -57,6 +57,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0043SessionModel),
             Box::new(M0044EngineRoutingPin),
             Box::new(M0045PullRequest),
+            Box::new(M0046DirectionUpstream),
         ]
     }
 }
@@ -2001,6 +2002,61 @@ impl MigrationTrait for M0044EngineRoutingPin {
 /// host-normalized state) so "what is this PR/MR waiting on" is a store fact
 /// the background monitor (`crate::host::monitor`) can read and update, not
 /// something that only lives in an agent's turn or a chat session's memory.
+/// One task may declare ANOTHER task as its upstream, so a cross-repo change
+/// set can be merged in dependency order: the producer's PR lands before the
+/// consumer's is considered mergeable at all.
+///
+/// A single column, not a join table, and deliberately so. It expresses one
+/// upstream per task, which is what a producer→consumer pair needs, and this
+/// is the minimum that answers whether ordered cross-repo delivery is worth
+/// building out. A real topological sequencer wants many-to-many and will need
+/// its own table — see the module docs on `host::judge::UpstreamStatus`.
+///
+/// `0` means "no upstream", matching the `direction.repo_id` convention rather
+/// than introducing a nullable column with different emptiness semantics.
+/// Existing rows migrate to 0: an upgrade must never invent a dependency that
+/// would block a task the user can merge today.
+pub struct M0046DirectionUpstream;
+impl MigrationName for M0046DirectionUpstream {
+    fn name(&self) -> &str {
+        "m0046_direction_upstream"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0046DirectionUpstream {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let result = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("depends_on_direction_id"))
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) if err.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .drop_column(Alias::new("depends_on_direction_id"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 pub struct M0045PullRequest;
 impl MigrationName for M0045PullRequest {
     fn name(&self) -> &str {
