@@ -139,12 +139,17 @@ fn user_info_from_req(req: &NotifySendRequest) -> HashMap<String, String> {
     info
 }
 
-fn focus_main_window<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.unminimize();
-        let _ = win.show();
-        let _ = win.set_focus();
-    }
+fn focus_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let win = app
+        .get_webview_window("main")
+        .ok_or_else(|| "os_notify: main window missing".to_string())?;
+    win.unminimize()
+        .map_err(|e| format!("os_notify unminimize: {e}"))?;
+    win.show()
+        .map_err(|e| format!("os_notify show: {e}"))?;
+    win.set_focus()
+        .map_err(|e| format!("os_notify set_focus: {e}"))?;
+    Ok(())
 }
 
 fn remember_settled_permission(value: &str) {
@@ -164,12 +169,21 @@ fn handle_response<R: Runtime>(app: AppHandle<R>, response: NotificationResponse
     if !open {
         return;
     }
-    focus_main_window(&app);
+    if let Err(err) = focus_main_window(&app) {
+        // Keep navigating the webview even if focus fails, but never swallow
+        // the failure silently — otherwise a click can look like a no-op.
+        eprintln!("[weft] {err}");
+    }
     let payload = payload_from_user_info(&response.user_info);
     // Retain as pending first so a cold-start click survives if no frontend
     // listener is mounted yet. Live handlers must ack/clear after handling.
-    if let Ok(mut guard) = pending_open().lock() {
-        *guard = Some(payload.clone());
+    match pending_open().lock() {
+        Ok(mut guard) => {
+            *guard = Some(payload.clone());
+        }
+        Err(err) => {
+            eprintln!("[weft] os_notify pending lock poisoned: {err}");
+        }
     }
     if let Err(err) = app.emit(OPEN_EVENT, payload.clone()) {
         eprintln!("[weft] os_notify emit {OPEN_EVENT}: {err}");
