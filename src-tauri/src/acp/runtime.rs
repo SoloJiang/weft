@@ -257,6 +257,20 @@ pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHan
     };
     if let Some(c) = existing {
         c.ensure_connected(backend, program).await?;
+        // The shutdown check belongs on THIS path too. `shutdown_all` can drain
+        // this very handle and clear its `inner` between the lookup above and
+        // `ensure_connected`, which then spawns a REPLACEMENT child — and this
+        // early return would hand it back without re-inserting, leaving a child
+        // nothing tracks and the exit path already past. Re-checked under the
+        // pool lock, the same mutual exclusion the fresh-handle path uses.
+        let mut pool = POOL.clients.lock().await;
+        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            drop(pool);
+            c.shutdown_and_reap().await;
+            anyhow::bail!("ACP pool is shutting down");
+        }
+        // Re-insert if the drain removed us: the handle is live again.
+        pool.entry(key).or_insert_with(|| c.clone());
         return Ok(c);
     }
     let handle = ClientHandle {

@@ -5383,6 +5383,14 @@ async fn force_acp_turn_reset(
             return;
         };
         inner.reset_epoch = inner.reset_epoch.saturating_add(1);
+        // Held across the cancel/unsubscribe/retire, the DB native-id clear and
+        // the row finalization below — the THIRD teardown path needing this,
+        // after `stop_quiet` and freeze recovery, and for the identical reason:
+        // `reset_frozen_appserver_turn` clears `turn.busy` AND `interrupting`,
+        // so a send arriving during those awaits captures the already-bumped
+        // epoch, is admitted onto a fresh session, and then has its native id
+        // cleared and an idle state emitted over it by this older reset.
+        inner.tearing_down = true;
         (
             inner.thread_id,
             inner.session_id,
@@ -5412,6 +5420,10 @@ async fn force_acp_turn_reset(
         }
     }
     force_acp_finalize_drain(app, thread_id, session_id, turn_id, drain).await;
+    // Cleanup is complete; the engine can accept work again. Released before
+    // the idle push so the state the user sees and the state the engine will
+    // accept agree.
+    eng.lock().await.tearing_down = false;
     emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
     // The native context is gone — say so. A NOTICE, not a question: there is
     // nothing to answer, and `ask_human` would render an answer box whose reply
