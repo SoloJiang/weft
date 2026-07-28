@@ -364,14 +364,28 @@ export const api = {
   // Desktop OS notifications via user-notify (click deep-link capable).
   osNotifyPermission: () => invoke<string>("os_notify_permission"),
   osNotifyRequestPermission: () => invoke<string>("os_notify_request_permission"),
+  osNotifyTakePendingOpen: () =>
+    invoke<{
+      kind: string;
+      threadId?: number | null;
+      directionId?: number | null;
+      repoId?: number | null;
+      sessionId?: number | null;
+      askId?: number | null;
+      workspaceId?: number | null;
+      openNeeds?: boolean | null;
+    } | null>("os_notify_take_pending_open"),
   osNotifySend: (req: {
     title: string;
     body: string;
     kind: string;
     threadId?: number | null;
     directionId?: number | null;
+    repoId?: number | null;
+    sessionId?: number | null;
     askId?: number | null;
     workspaceId?: number | null;
+    openNeeds?: boolean | null;
   }) => invoke<void>("os_notify_send", { req }),
   // Local-runtime resource dashboard (issue #112): read-only aggregate of
   // process_quota / proc_registry / session_gate. Polled while the Settings →

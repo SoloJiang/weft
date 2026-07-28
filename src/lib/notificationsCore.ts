@@ -142,6 +142,7 @@ export interface NotifySessionRef {
   info: { session_id: number };
   status: SessionStatus;
   directionId: number;
+  repoId: number;
   threadId: number;
 }
 
@@ -150,8 +151,13 @@ export interface NotifyRoute {
   kind: NotifyCategory;
   threadId?: number;
   directionId?: number;
+  /** Prefer opening this exact worker session when set. */
+  repoId?: number;
+  sessionId?: number;
   askId?: number;
   workspaceId?: number;
+  /** Prefer the Needs-you surface (write triggers, action-required notices). */
+  openNeeds?: boolean;
 }
 
 /** One snapshot entry: human sample line + optional deep-link route. */
@@ -185,13 +191,16 @@ export function snapshotOf(
   sessions: Record<number, NotifySessionRef>,
   leadTurn: Record<number, { state: TurnState; queue: unknown[] }>,
   processQuota: ProcessQuotaStatus | null,
-  threadsById: Record<number, { title: string } | undefined> = {},
+  threadsById: Record<number, { title: string; workspaceId?: number } | undefined> = {},
   workspaceId: number | null = null,
 ): NotifySnapshot {
   const n = new Map<string, NotifyEntry>();
   for (const it of needs) {
-    // Notices are display-only (or self-clearing); only real questions ping Needs-you.
-    if (it.kind !== "question") continue;
+    // Self-clearing notices stay silent; questions and action-required notices ping.
+    if (it.kind === "notice") continue;
+    const openNeeds = it.kind === "notice_action_required";
+    const ws =
+      threadsById[it.thread_id]?.workspaceId ?? workspaceId ?? undefined;
     n.set(`need:${it.ask_id}`, {
       sample: `${it.thread_title} · ${it.direction_name}`,
       route: {
@@ -199,12 +208,14 @@ export function snapshotOf(
         threadId: it.thread_id,
         directionId: it.direction_id,
         askId: it.ask_id,
-        workspaceId: workspaceId ?? undefined,
+        workspaceId: ws,
+        openNeeds,
       },
     });
   }
   for (const a of asks) {
     const directionId = Number(a.dir);
+    const ws = threadsById[a.thread]?.workspaceId ?? workspaceId ?? undefined;
     n.set(`ask:${a.id}`, {
       sample: `${a.thread_title} · ${a.dir_name}`,
       route: {
@@ -212,17 +223,20 @@ export function snapshotOf(
         threadId: a.thread,
         directionId: Number.isFinite(directionId) ? directionId : undefined,
         askId: a.id,
-        workspaceId: workspaceId ?? undefined,
+        workspaceId: ws,
+        openNeeds: true,
       },
     });
   }
   for (const w of triggers) {
+    const ws = threadsById[w.thread_id]?.workspaceId ?? workspaceId ?? undefined;
     n.set(`wt:${w.thread_id}:${w.index}`, {
       sample: `${w.thread_title} · ${w.name}`,
       route: {
         kind: "needs",
         threadId: w.thread_id,
-        workspaceId: workspaceId ?? undefined,
+        workspaceId: ws,
+        openNeeds: true,
       },
     });
   }
@@ -232,13 +246,15 @@ export function snapshotOf(
     o.statuses.forEach((s, i) => {
       if (s !== "review") return;
       const directionId = o.direction_ids[i];
+      const ws =
+        threadsById[o.thread_id]?.workspaceId ?? workspaceId ?? undefined;
       r.set(`rev:${directionId}`, {
         sample: o.title,
         route: {
           kind: "review",
           threadId: o.thread_id,
           directionId,
-          workspaceId: workspaceId ?? undefined,
+          workspaceId: ws,
         },
       });
     });
@@ -247,27 +263,31 @@ export function snapshotOf(
   const stalled = new Map<string, NotifyEntry>();
   for (const s of Object.values(sessions)) {
     if (s.status !== "stalled") continue;
-    const title = threadsById[s.threadId]?.title ?? `thread ${s.threadId}`;
+    const meta = threadsById[s.threadId];
+    const title = meta?.title ?? `thread ${s.threadId}`;
     stalled.set(`stall:worker:${s.info.session_id}`, {
       sample: `${title} · dir ${s.directionId}`,
       route: {
         kind: "stalled",
         threadId: s.threadId,
         directionId: s.directionId,
-        workspaceId: workspaceId ?? undefined,
+        repoId: s.repoId,
+        sessionId: s.info.session_id,
+        workspaceId: meta?.workspaceId ?? workspaceId ?? undefined,
       },
     });
   }
   for (const [tidStr, turn] of Object.entries(leadTurn)) {
     if (turn.state !== "stalled") continue;
     const tid = Number(tidStr);
-    const title = threadsById[tid]?.title ?? `thread ${tid}`;
+    const meta = threadsById[tid];
+    const title = meta?.title ?? `thread ${tid}`;
     stalled.set(`stall:lead:${tid}`, {
       sample: title,
       route: {
         kind: "stalled",
         threadId: tid,
-        workspaceId: workspaceId ?? undefined,
+        workspaceId: meta?.workspaceId ?? workspaceId ?? undefined,
       },
     });
   }
@@ -352,7 +372,12 @@ export function badgeCountFrom(
   asks: PermissionAsk[],
   writeTriggers: WriteTrigger[],
 ): number {
-  return needs.filter((n) => n.kind === "question").length + asks.length + writeTriggers.length;
+  return (
+    needs.filter((n) => n.kind === "question" || n.kind === "notice_action_required")
+      .length +
+    asks.length +
+    writeTriggers.length
+  );
 }
 
 /**
@@ -376,7 +401,13 @@ export function isAppInForeground(
 /** Pure navigation intent for a notification click. UI layer applies it. */
 export type NotifyOpenIntent =
   | { type: "workspace"; workspaceId: number }
-  | { type: "direction"; threadId: number; direction: string }
+  | {
+      type: "direction";
+      threadId: number;
+      direction: string;
+      repoId?: number;
+      sessionId?: number;
+    }
   | { type: "needs" }
   | { type: "resources" };
 
@@ -384,7 +415,10 @@ export function planNotifyOpen(payload: {
   kind: string;
   threadId?: number | null;
   directionId?: number | null;
+  repoId?: number | null;
+  sessionId?: number | null;
   workspaceId?: number | null;
+  openNeeds?: boolean | null;
 }): NotifyOpenIntent[] {
   const out: NotifyOpenIntent[] = [];
   if (payload.workspaceId != null) {
@@ -394,10 +428,30 @@ export function planNotifyOpen(payload: {
     out.push({ type: "resources" });
     return out;
   }
+  // Write triggers / action-required notices: open the Needs-you surface so the
+  // human can act on the control the notification advertised.
+  if (payload.openNeeds) {
+    out.push({ type: "needs" });
+    return out;
+  }
   if (payload.threadId != null) {
     const direction =
       payload.directionId != null ? String(payload.directionId) : "lead";
-    out.push({ type: "direction", threadId: payload.threadId, direction });
+    if (payload.repoId != null || payload.sessionId != null) {
+      out.push({
+        type: "direction",
+        threadId: payload.threadId,
+        direction,
+        repoId: payload.repoId ?? undefined,
+        sessionId: payload.sessionId ?? undefined,
+      });
+    } else {
+      out.push({
+        type: "direction",
+        threadId: payload.threadId,
+        direction,
+      });
+    }
     return out;
   }
   if (payload.kind === "needs") {

@@ -361,7 +361,11 @@ interface Store {
    *  name is shown. `dir` is the direction id as a string (backend convention,
    *  see WorkerConversation's dir-parsing note) or a non-numeric sentinel
    *  ("lead") for a thread-level ask with no specific direction. */
-  goToDirectionRef: (thread: number, dir: string) => Promise<void>;
+  goToDirectionRef: (
+    thread: number,
+    dir: string,
+    opts?: { repoId?: number; sessionId?: number },
+  ) => Promise<void>;
   answerPermission: (
     askId: number,
     answer: "allow" | "deny" | "always" | "full",
@@ -2852,13 +2856,27 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // never spawned a worker). `dir` non-numeric (e.g. the "lead" sentinel) just
   // fails the live lookup and falls through to the thread — never throws.
   const goToDirectionRef = useCallback(
-    async (thread: number, dir: string) => {
+    async (
+      thread: number,
+      dir: string,
+      opts?: { repoId?: number; sessionId?: number },
+    ) => {
       setShowNeeds(false);
       setViewing(null);
       const directionId = Number(dir);
-      const live = Number.isFinite(directionId)
-        ? Object.values(sessions).find((s) => s.directionId === directionId)
-        : undefined;
+      const all = Object.values(sessions);
+      let live =
+        opts?.sessionId != null
+          ? all.find((s) => s.info.session_id === opts.sessionId)
+          : undefined;
+      if (!live && opts?.repoId != null && Number.isFinite(directionId)) {
+        live = all.find(
+          (s) => s.directionId === directionId && s.repoId === opts.repoId,
+        );
+      }
+      if (!live && Number.isFinite(directionId)) {
+        live = all.find((s) => s.directionId === directionId);
+      }
       if (live) {
         setActiveThreadId(thread);
         openWorker(live.directionId, live.repoId);
@@ -2898,7 +2916,26 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [activeThreadId]);
 
   // Needs-you: poll workspace-wide, plus a push refresh when the coordinator
-  // signals a new ask (}, [activeWorkspaceId, refreshNeeds]);
+  // signals a new ask (needs-you://changed). Poll is the safety net; the event
+  // makes new questions appear near-instantly.
+  useEffect(() => {
+    if (activeWorkspaceId == null) {
+      setNeeds([]);
+      return;
+    }
+    let alive = true;
+    const tick = () => {
+      if (alive) void refreshNeeds();
+    };
+    tick();
+    const h = setInterval(tick, 4000);
+    const unChanged = listen("needs-you://changed", tick);
+    return () => {
+      alive = false;
+      clearInterval(h);
+      void unChanged.then((f) => f());
+    };
+  }, [activeWorkspaceId, refreshNeeds]);
 
   // Board overview poll: review transitions (and any status drift) stay fresh
   // even when the kanban is unmounted. 10s matches the previous notify hook.

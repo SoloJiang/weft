@@ -109,8 +109,11 @@ export interface OsNotifyOpenEvent {
   kind: string;
   threadId?: number | null;
   directionId?: number | null;
+  repoId?: number | null;
+  sessionId?: number | null;
   askId?: number | null;
   workspaceId?: number | null;
+  openNeeds?: boolean | null;
 }
 
 /** Apply a notification click to the in-app navigation surface. */
@@ -118,7 +121,11 @@ export async function handleNotifyOpen(
   payload: OsNotifyOpenEvent,
   deps: {
     selectWorkspace: (id: number) => Promise<void> | void;
-    goToDirectionRef: (thread: number, dir: string) => Promise<void>;
+    goToDirectionRef: (
+      thread: number,
+      dir: string,
+      opts?: { repoId?: number; sessionId?: number },
+    ) => Promise<void>;
     openNeeds: () => void;
     openSettings: (page?: "resources" | "general" | "appearance" | "automation" | "skills" | "im" | "backup") => void;
     activeWorkspaceId: number | null;
@@ -138,7 +145,10 @@ export async function handleNotifyOpen(
       continue;
     }
     if (intent.type === "direction") {
-      await deps.goToDirectionRef(intent.threadId, intent.direction);
+      await deps.goToDirectionRef(intent.threadId, intent.direction, {
+        repoId: intent.repoId,
+        sessionId: intent.sessionId,
+      });
       continue;
     }
     if (intent.type === "needs") {
@@ -158,8 +168,11 @@ async function sendOsNotification(
     kind: route.kind,
     threadId: route.threadId ?? null,
     directionId: route.directionId ?? null,
+    repoId: route.repoId ?? null,
+    sessionId: route.sessionId ?? null,
     askId: route.askId ?? null,
     workspaceId: route.workspaceId ?? null,
+    openNeeds: route.openNeeds ?? null,
   });
 }
 
@@ -197,10 +210,12 @@ export function useSystemNotifications() {
   const [windowFocused, setWindowFocused] = useState<boolean | null>(null);
   const lastBadge = useRef<number | null>(null);
 
-  const threadsById = useRef<Record<number, { title: string }>>({});
+  const threadsById = useRef<Record<number, { title: string; workspaceId?: number }>>({});
   useEffect(() => {
-    const m: Record<number, { title: string }> = {};
-    for (const th of threads) m[th.id] = { title: th.title };
+    const m: Record<number, { title: string; workspaceId?: number }> = {};
+    for (const th of threads) {
+      m[th.id] = { title: th.title, workspaceId: th.workspace_id };
+    }
     threadsById.current = m;
   }, [threads]);
 
@@ -234,21 +249,27 @@ export function useSystemNotifications() {
     };
   }, []);
 
-  // Click / action deep-link from the native bridge.
+  // Click / action deep-link from the native bridge. Also drain a click that
+  // arrived before React mounted (cold-start from a persisted notification).
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
+    const deps = {
+      selectWorkspace,
+      goToDirectionRef,
+      openNeeds,
+      openSettings,
+      activeWorkspaceId,
+    };
     void (async () => {
       try {
         unlisten = await listen<OsNotifyOpenEvent>("notify://open", (event) => {
-          void handleNotifyOpen(event.payload, {
-            selectWorkspace,
-            goToDirectionRef,
-            openNeeds,
-            openSettings,
-            activeWorkspaceId,
-          });
+          void handleNotifyOpen(event.payload, deps);
         });
+        const pending = await api.osNotifyTakePendingOpen();
+        if (!cancelled && pending) {
+          void handleNotifyOpen(pending, deps);
+        }
       } catch {
         /* pure-vite */
       }

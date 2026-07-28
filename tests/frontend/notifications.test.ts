@@ -111,8 +111,8 @@ test("snapshotOf keys cover needs / asks / writeTriggers / review", () => {
   assert.equal(snap.review.has("rev:11"), false);
 });
 
-test("snapshotOf skips non-answerable needs (stall notices stay in stalled lane)", () => {
-  const snap = snapshotOf(
+test("snapshotOf skips self-clearing notices but keeps action-required notices", () => {
+  const silent = snapshotOf(
     [need({ ask_id: 1, kind: "notice" })],
     [],
     [],
@@ -121,7 +121,17 @@ test("snapshotOf skips non-answerable needs (stall notices stay in stalled lane)
     {},
     null,
   );
-  assert.equal(snap.needs.size, 0);
+  assert.equal(silent.needs.size, 0);
+  const action = snapshotOf(
+    [need({ ask_id: 2, kind: "notice_action_required" })],
+    [],
+    [],
+    [],
+    {},
+    {},
+    null,
+  );
+  assert.equal(action.needs.get("need:2")?.route.openNeeds, true);
 });
 
 test("snapshotOf captures stalled workers and leads", () => {
@@ -135,6 +145,7 @@ test("snapshotOf captures stalled workers and leads", () => {
         info: { session_id: 99 },
         status: "stalled",
         directionId: 5,
+        repoId: 8,
         threadId: 2,
       },
     },
@@ -144,6 +155,8 @@ test("snapshotOf captures stalled workers and leads", () => {
   );
   assert.equal(snap.stalled.get("stall:worker:99")?.sample, "Issue B · dir 5");
   assert.equal(snap.stalled.get("stall:worker:99")?.route.directionId, 5);
+  assert.equal(snap.stalled.get("stall:worker:99")?.route.repoId, 8);
+  assert.equal(snap.stalled.get("stall:worker:99")?.route.sessionId, 99);
   assert.equal(snap.stalled.get("stall:lead:2")?.sample, "Issue B");
   assert.equal(snap.stalled.has("stall:lead:3"), false);
 });
@@ -255,11 +268,15 @@ test("foreground gate prefers explicit window focus", () => {
 
 test("badgeCountFrom counts only actionable needs + asks + writeTriggers", () => {
   const n = badgeCountFrom(
-    [need({ ask_id: 1, kind: "question" }), need({ ask_id: 2, kind: "notice" })],
+    [
+      need({ ask_id: 1, kind: "question" }),
+      need({ ask_id: 2, kind: "notice" }),
+      need({ ask_id: 3, kind: "notice_action_required" }),
+    ],
     [ask(1)],
     [wt(0), wt(1)],
   );
-  assert.equal(n, 1 + 1 + 2);
+  assert.equal(n, 1 + 1 + 1 + 2);
 });
 
 test("notifyCopyKeys covers every category", () => {
@@ -297,4 +314,40 @@ test("planNotifyOpen routes quota to resources and lead-only stalled to lead", (
 
 test("planNotifyOpen falls back to needs list when only kind is present", () => {
   assert.deepEqual(planNotifyOpen({ kind: "needs" }), [{ type: "needs" }]);
+});
+
+test("planNotifyOpen routes write-trigger style openNeeds to Needs-you", () => {
+  assert.deepEqual(
+    planNotifyOpen({
+      kind: "needs",
+      threadId: 9,
+      openNeeds: true,
+      workspaceId: 2,
+    }),
+    [
+      { type: "workspace", workspaceId: 2 },
+      { type: "needs" },
+    ],
+  );
+});
+
+test("planNotifyOpen carries repo/session for stalled workers", () => {
+  assert.deepEqual(
+    planNotifyOpen({
+      kind: "stalled",
+      threadId: 4,
+      directionId: 5,
+      repoId: 8,
+      sessionId: 99,
+    }),
+    [
+      {
+        type: "direction",
+        threadId: 4,
+        direction: "5",
+        repoId: 8,
+        sessionId: 99,
+      },
+    ],
+  );
 });

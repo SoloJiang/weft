@@ -318,6 +318,7 @@ pub fn run() {
             os_notify::os_notify_permission,
             os_notify::os_notify_request_permission,
             os_notify::os_notify_send,
+            os_notify::os_notify_take_pending_open,
             commands::session_for,
             commands::session_meta,
             commands::effective_config,
