@@ -251,6 +251,13 @@ pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHan
         connect_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     handle.ensure_connected(backend, program).await?;
+    // Checked under CREATE_LOCK, which `shutdown_all` also takes: if the exit
+    // path already drained the pool, this child would never be reaped by
+    // anyone. Reap it here rather than inserting into a pool that is done.
+    if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        handle.shutdown_and_reap().await;
+        anyhow::bail!("ACP pool is shutting down");
+    }
     POOL.clients.lock().await.insert(key, handle.clone());
     Ok(handle)
 }
@@ -284,7 +291,20 @@ pub async fn shutdown(backend_id: &str) {
     }
 }
 
+/// Set once the exit path has drained the pool. `client()` checks it while
+/// holding `CREATE_LOCK`, so a child spawned by an in-flight creation is reaped
+/// by its own creator instead of being inserted into a pool nobody will drain
+/// again.
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub async fn shutdown_all() {
+    // Serialize with `client()`. It holds CREATE_LOCK from lookup through
+    // `ensure_connected` and inserts into the pool only afterwards, so draining
+    // without this lock can run entirely between the spawn and the insert —
+    // finding an empty pool while an untracked child is already alive, which
+    // the exit path then leaves running along with its tool descendants.
+    let _create = CREATE_LOCK.lock().await;
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut g = POOL.clients.lock().await;
     let all: Vec<_> = g.drain().map(|(_, c)| c).collect();
     drop(g);
@@ -912,13 +932,30 @@ impl ClientHandle {
     }
 
     async fn set_expecting_session(&self, on: bool) {
-        if let Some(inner) = self.inner.lock().await.as_mut() {
-            if on {
-                inner.expecting_session = inner.expecting_session.saturating_add(1);
-                inner.ever_had_session = true;
-            } else {
-                inner.expecting_session = inner.expecting_session.saturating_sub(1);
+        let cleared_last = {
+            match self.inner.lock().await.as_mut() {
+                Some(inner) if on => {
+                    inner.expecting_session = inner.expecting_session.saturating_add(1);
+                    inner.ever_had_session = true;
+                    false
+                }
+                Some(inner) => {
+                    inner.expecting_session = inner.expecting_session.saturating_sub(1);
+                    inner.expecting_session == 0
+                }
+                None => false,
             }
+        };
+        // A FAILED open leaves no route behind, and `resolve`'s own retry
+        // already declined while this expectation was standing — so nothing
+        // else would ever retire the client, and it sat in the static pool
+        // unreachable by any later stop/switch (the engine never published it
+        // into `acp_client`). One orphan per command pin whose open failed.
+        //
+        // A SUCCESSFUL open calls `mark_opening` before clearing its
+        // expectation, so the route checks inside decline and it is untouched.
+        if cleared_last {
+            self.maybe_reap_if_idle().await;
         }
     }
 

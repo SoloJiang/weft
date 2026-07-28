@@ -199,19 +199,23 @@ pub fn intent_from_params(params: &Value) -> PermissionIntent {
 /// identically. Lengths make the encoding unambiguous outright.
 pub fn grant_identity(params: &Value) -> String {
     let tc = params.get("toolCall").unwrap_or(&Value::Null);
-    let raw = tc
-        .get("rawInput")
-        .map(|r| r.to_string())
-        .unwrap_or_default();
-    let mut out = format!("{}:{raw}", raw.len());
-    for path in tc
-        .get("locations")
-        .and_then(|l| l.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|l| l.get("path").and_then(|p| p.as_str()))
-    {
-        out.push_str(&format!("{}:{path}", path.len()));
+    // Every field that can carry the action, not just the two that usually do.
+    // A sparse request may omit BOTH `rawInput` and `locations` and describe
+    // itself in `title`/`content` alone; keyed on the other two, two different
+    // `execute` requests collapsed to the same identity, and an Always granted
+    // to the first silently approved the second.
+    let mut out = String::new();
+    for part in [
+        tc.get("rawInput"),
+        tc.get("locations"),
+        tc.get("title"),
+        tc.get("content"),
+        tc.get("kind"),
+    ] {
+        // `to_string()` on a JSON value is stable for a given structure, and
+        // absent vs. present-but-null stay distinguishable (`""` vs `"null"`).
+        let encoded = part.map(|v| v.to_string()).unwrap_or_default();
+        out.push_str(&format!("{}:{encoded}", encoded.len()));
     }
     out
 }
@@ -498,6 +502,30 @@ mod tests {
         let a = json!({"toolCall":{"locations":[{"path":"keep"},{"path":"b"}]}});
         let b = json!({"toolCall":{"locations":[{"path":"keep"},{"path":"c"}]}});
         assert_ne!(grant_identity(&a), grant_identity(&b));
+    }
+
+    /// A sparse request — no `rawInput`, no `locations` — must still be
+    /// distinguishable. Keyed on only those two, every such request collapsed
+    /// to one identity, so an Always granted to the first `execute` silently
+    /// approved a different one.
+    #[test]
+    fn sparse_requests_do_not_collapse_to_one_identity() {
+        let a = json!({"toolCall": {"kind": "execute", "title": "deploy staging"}});
+        let b = json!({"toolCall": {"kind": "execute", "title": "deploy production"}});
+        assert_ne!(grant_identity(&a), grant_identity(&b));
+
+        // Content-only differences count too.
+        let c = json!({"toolCall": {"kind": "execute", "content": [{"text": "one"}]}});
+        let d = json!({"toolCall": {"kind": "execute", "content": [{"text": "two"}]}});
+        assert_ne!(grant_identity(&c), grant_identity(&d));
+
+        // Absent stays distinguishable from present-but-null.
+        let absent = json!({"toolCall": {"kind": "execute"}});
+        let null_title = json!({"toolCall": {"kind": "execute", "title": null}});
+        assert_ne!(grant_identity(&absent), grant_identity(&null_title));
+
+        // And identical requests still share their grant.
+        assert_eq!(grant_identity(&a), grant_identity(&a));
     }
 
     /// Length prefixes, not delimiters: a path can contain any byte but `/` and

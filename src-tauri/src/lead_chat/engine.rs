@@ -3823,6 +3823,26 @@ async fn acp_emit_turn_end(
     }
 }
 
+/// Worst-case tier across every path a file request named, or `pathless` when
+/// it named none.
+///
+/// The pathless verdict is per-verb rather than "ask `classify_file` with an
+/// empty path", because those two disagree in the direction that matters: a
+/// write with no target is still a write, but a READ with no target has
+/// established nothing at all and must not inherit `ReadOnly`.
+fn file_risk(
+    tool_name: &'static str,
+    paths: &[String],
+    pathless: crate::ask::RiskLevel,
+) -> crate::ask::RiskLevel {
+    if paths.is_empty() {
+        return pathless;
+    }
+    crate::ask::most_severe(paths.iter().map(|path| {
+        crate::ask::classify_risk(crate::ask::RiskSignal::File { tool_name, path })
+    }))
+}
+
 /// Reject an ACP permission request on the wire without a human verdict —
 /// used when teardown won the race and the card must not stand.
 async fn return_permission(
@@ -3852,23 +3872,24 @@ fn acp_permission_risk(
     detail: &str,
 ) -> crate::ask::RiskLevel {
     use crate::acp::permission::PermissionIntent;
-    let by_paths = |tool_name: &'static str, paths: &[String]| {
-        if paths.is_empty() {
-            return crate::ask::classify_risk(crate::ask::RiskSignal::File {
-                tool_name,
-                path: "",
-            });
-        }
-        crate::ask::most_severe(paths.iter().map(|path| {
-            crate::ask::classify_risk(crate::ask::RiskSignal::File { tool_name, path })
-        }))
-    };
     match intent {
         PermissionIntent::Command(cmd) => {
             crate::ask::classify_risk(crate::ask::RiskSignal::Command(cmd))
         }
-        PermissionIntent::Read { paths } => by_paths("Read", paths),
-        PermissionIntent::Write { paths } => by_paths("Edit", paths),
+        // A read that named nothing has established NOTHING. `classify_file`
+        // would answer `ReadOnly` from the verb alone, and a read-only session
+        // or issue grant releases `ReadOnly` without a card — so a sparse
+        // request whose target rides in `title`/`content` could read `.env` or
+        // an SSH key unseen. Same rule as `most_severe` of an empty set:
+        // "nothing to judge" is not evidence of safety.
+        PermissionIntent::Read { paths } => {
+            file_risk("Read", paths, crate::ask::RiskLevel::Unknown)
+        }
+        // A write that named nothing IS still a write: the verb alone
+        // establishes mutation, so the verb-derived tier is the honest floor.
+        PermissionIntent::Write { paths } => {
+            file_risk("Edit", paths, crate::ask::RiskLevel::Write)
+        }
         PermissionIntent::Network => crate::ask::classify_risk(crate::ask::RiskSignal::Network),
         PermissionIntent::Other { kind } => {
             crate::ask::classify_risk(crate::ask::RiskSignal::Other {
@@ -4268,18 +4289,29 @@ async fn acp_consumer(
                                 let mut g = eng.lock().await;
                                 g.acp_pending_asks.retain(|x| *x != id);
                             }
-                            // If stop/interrupt landed while we waited, reject
-                            // regardless of the human's answer.
-                            let g = eng.lock().await;
-                            if g.stopped || g.interrupting {
-                                crate::acp::Want::RejectOnce
-                            } else {
-                                decided
-                            }
+                            decided
                         }
                     }
                 } else {
                     crate::acp::Want::RejectOnce
+                };
+                // ONE final gate, on the path every branch leaves through, so
+                // "never allow after teardown" is an invariant of the reply
+                // rather than a check each branch has to remember.
+                //
+                // The waited-for-a-human branch used to carry its own copy and
+                // the AUTO-GRANT branch carried none: with an Always/Full hit
+                // there is no ask to cancel, so a Stop landing between the
+                // `reject_now` sample and the `auto_decision` verdict reached
+                // the wire as an allow — queued ahead of `session/cancel`,
+                // starting a tool after the user had stopped the turn.
+                let want = {
+                    let g = eng.lock().await;
+                    if g.stopped || g.interrupting || g.reset_epoch != start_epoch {
+                        crate::acp::Want::RejectOnce
+                    } else {
+                        want
+                    }
                 };
                 client.reply_permission(&request_id, &options, want).await;
             }
@@ -8601,15 +8633,24 @@ mod tests {
         );
     }
 
-    /// A file action that named no path keeps its verb's tier — it must not
-    /// fall through to `most_severe` of nothing, which is `Unknown`.
+    /// The two pathless cases differ, and the difference is the whole point.
+    /// A write with no named target is still a write. A READ with no named
+    /// target established nothing — `classify_file("Read", "")` says
+    /// `ReadOnly`, which a read-only grant releases with no card, so a sparse
+    /// request hiding its target in `title`/`content` could read a credential
+    /// unseen.
     #[test]
-    fn a_pathless_file_action_is_still_tiered_by_its_verb() {
+    fn a_pathless_read_is_unknown_while_a_pathless_write_stays_write() {
         use crate::acp::permission::PermissionIntent;
 
         assert_eq!(
             acp_permission_risk(&PermissionIntent::Write { paths: Vec::new() }, ""),
             crate::ask::RiskLevel::Write
+        );
+        assert_eq!(
+            acp_permission_risk(&PermissionIntent::Read { paths: Vec::new() }, ""),
+            crate::ask::RiskLevel::Unknown,
+            "an unauditable read must not be auto-released as read-only"
         );
     }
 
