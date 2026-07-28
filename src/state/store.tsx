@@ -3117,6 +3117,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     repos,
     threads,
     threadWorkspaceById,
+    workspaceLoadSeq,
     directionsByThread,
     worktreesByDirection,
     activeThreadId,
