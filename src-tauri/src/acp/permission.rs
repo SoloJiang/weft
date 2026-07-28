@@ -238,12 +238,34 @@ pub fn intent_key_from_params(params: &Value) -> String {
 }
 
 /// Human summary line for the Needs-you card.
+/// Readable text from a `toolCall.content` block list.
+///
+/// Deliberately NOT `map::extract_tool_output`: that one reads tool RESULTS,
+/// so it prefers `rawOutput` and drops a leading `$ cmd` echo. Here that echo
+/// is the single most useful line — it is what the human is being asked to
+/// approve.
+fn content_text(tc: &Value) -> String {
+    let Some(arr) = tc.get("content").and_then(|c| c.as_array()) else {
+        return String::new();
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for item in arr {
+        if let Some(t) = item.pointer("/content/text").and_then(|t| t.as_str()) {
+            parts.push(t);
+        } else if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+            parts.push(t);
+        }
+    }
+    parts.join("\n")
+}
+
 pub fn summary_from_params(params: &Value) -> (String, String) {
     let tc = params.get("toolCall").unwrap_or(&Value::Null);
-    let title = tc
-        .get("title")
-        .and_then(|t| t.as_str())
-        .unwrap_or("tool");
+    // Absent title becomes EMPTY, not the literal "tool": the empty branch
+    // below is what emits the machine token the catalogs localize, and a
+    // non-empty placeholder made that branch unreachable — so a request
+    // without a title showed an untranslated `tool` in every locale.
+    let title = tc.get("title").and_then(|t| t.as_str()).unwrap_or_default();
     // `rawInput` alone is not enough to authorize by. An ACP request may name
     // its targets ONLY in `toolCall.locations` — the shape the intent and
     // grant-identity code reads first — leaving `rawInput` empty. With a
@@ -254,11 +276,22 @@ pub fn summary_from_params(params: &Value) -> (String, String) {
         .get("rawInput")
         .map(|r| r.to_string())
         .unwrap_or_default();
-    let paths = tool_paths(tc);
-    let detail = match (raw.is_empty(), paths.is_empty()) {
-        (_, true) => raw,
-        (true, false) => paths.join("\n"),
-        (false, false) => format!("{raw}\n{}", paths.join("\n")),
+    let mut parts: Vec<String> = Vec::new();
+    if !raw.is_empty() {
+        parts.push(raw);
+    }
+    parts.extend(tool_paths(tc));
+    // `content` is a LAST RESORT, not an addition. For an ordinary request it
+    // would only restate `rawInput` in another form (`{"command":"ls"}` and
+    // `$ ls`), so it is used exactly when the action is described nowhere else
+    // — the sparse shape ACP permits and `grant_identity` already treats as
+    // action-bearing. Without it that card body is EMPTY and the human is
+    // asked to approve something unnamed, which leaves only blind-approve or
+    // refuse: both product failures.
+    let detail = if parts.is_empty() {
+        content_text(tc)
+    } else {
+        parts.join("\n")
     };
     // Stable machine token — frontend i18n maps `acp.permission_required`.
     let summary = if title.is_empty() {
@@ -547,6 +580,53 @@ mod tests {
         let a = json!({"toolCall":{"locations":[{"path":"keep"},{"path":"b"}]}});
         let b = json!({"toolCall":{"locations":[{"path":"keep"},{"path":"c"}]}});
         assert_ne!(grant_identity(&a), grant_identity(&b));
+    }
+
+    /// The product failure this closes: a card whose body is empty leaves the
+    /// human only "approve something unnamed" or "refuse", and a request may
+    /// legitimately describe its action only in `content` — which this module
+    /// already treats as action-bearing in `grant_identity`. The two halves of
+    /// the authorization decision must agree on what the action IS.
+    #[test]
+    fn a_content_only_request_still_says_what_it_will_do() {
+        let params = json!({
+            "toolCall": {
+                "kind": "execute",
+                "content": [
+                    {"type":"content","content":{"type":"text","text":"$ rm -rf build"}}
+                ]
+            }
+        });
+        let (summary, detail) = summary_from_params(&params);
+
+        assert!(
+            detail.contains("rm -rf build"),
+            "the card must name the action, got {detail:?}"
+        );
+        // No title either: the summary must be the token the catalogs localize,
+        // not a literal that every locale shows in English.
+        assert_eq!(summary, "acp.permission_required");
+    }
+
+    /// `content` is a fallback, not an addition — an ordinary request must not
+    /// gain a second line restating `rawInput` in another form.
+    #[test]
+    fn content_does_not_duplicate_an_ordinary_requests_detail() {
+        let params = json!({
+            "toolCall": {
+                "kind": "execute",
+                "title": "echo TOOL_OK",
+                "rawInput": { "command": "echo TOOL_OK" },
+                "content": [
+                    {"type":"content","content":{"type":"text","text":"$ echo TOOL_OK"}}
+                ]
+            }
+        });
+        let (summary, detail) = summary_from_params(&params);
+
+        assert_eq!(summary, "echo TOOL_OK");
+        assert!(!detail.contains("$ echo"), "content restated rawInput: {detail:?}");
+        assert!(detail.contains("echo TOOL_OK"));
     }
 
     /// A sparse request — no `rawInput`, no `locations` — must still be
