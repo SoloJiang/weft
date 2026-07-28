@@ -5368,10 +5368,14 @@ async fn force_acp_turn_reset(
     }
     force_acp_finalize_drain(app, thread_id, session_id, turn_id, drain).await;
     emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
-    // The native context is gone, exactly as after a freeze recovery — say so,
-    // with the same persistent notice, worded for the cause the user saw.
+    // The native context is gone — say so. A NOTICE, not a question: there is
+    // nothing to answer, and `ask_human` would render an answer box whose reply
+    // injects a stray bus message into the session that was just reset. And
+    // action-required rather than plain `notify_human`, because no background
+    // process retracts this one: the context stays gone until the human
+    // re-states what matters.
     if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
-        bus.ask_human(thread_id, &ask_dir, ACP_FORCE_RESET_NOTICE);
+        bus.notify_human_action_required(thread_id, &ask_dir, ACP_FORCE_RESET_NOTICE);
     }
 }
 

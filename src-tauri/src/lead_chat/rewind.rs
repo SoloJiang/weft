@@ -1762,6 +1762,35 @@ mod tests {
         assert_eq!(omp_cut_index(&lines, "", 3, SYS), None, "only two exist");
     }
 
+    /// A rewind of the first post-ENGINE-SWITCH message does not match, and
+    /// that is pinned deliberately.
+    ///
+    /// The dispatched text is `system + context_digest + user`, while the
+    /// persisted row holds only `user` — the digest is kept out of the DB on
+    /// purpose (PR #139: it can carry paths and pasted secrets). Stripping the
+    /// system prompt still leaves `digest + user`, so nothing matches.
+    ///
+    /// No match is the SAFE outcome: `fork_omp_at` runs before any stop or
+    /// truncate, so the rewind fails with the session fully intact. The tempting
+    /// "fix" — accepting any trailing segment after a blank line — is the
+    /// mis-cut this matcher was tightened to prevent one round earlier. A real
+    /// fix has to anchor the OMP-native history boundary (the jsonl starts at
+    /// the switch, while the DB ordinal counts the whole session), which is
+    /// cross-engine rewind semantics, not a matcher tweak.
+    #[test]
+    fn a_post_switch_first_prompt_does_not_match_rather_than_guessing() {
+        let dispatched = format!("{SYS}\n\nCONTEXT DIGEST: 12 prior turns…\n\nrun the tests");
+        let first = omp_user_line(serde_json::json!([{"type":"text","text":dispatched}]));
+        let lines: Vec<&str> = vec![&first];
+
+        assert_eq!(
+            omp_cut_index(&lines, "run the tests", 1, SYS),
+            None,
+            "refusing to guess the digest boundary is correct; a match here would \
+             mean accepting any trailing segment, which mis-cuts multi-paragraph prompts"
+        );
+    }
+
     /// The first prompt carries the system prepend, whose relaxed match must
     /// not swallow an empty target — that would cut the whole session away.
     #[test]

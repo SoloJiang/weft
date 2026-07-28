@@ -126,29 +126,35 @@ pub enum PermissionIntent {
 /// An empty result is not a downgrade: `classify_file` tiers on the tool verb,
 /// so a write that named no location is still a write.
 fn tool_paths(tc: &Value) -> Vec<String> {
-    let from_locations: Vec<String> = tc
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |out: &mut Vec<String>, p: &str| {
+        if !p.is_empty() && !out.iter().any(|seen| seen == p) {
+            out.push(p.to_string());
+        }
+    };
+    for p in tc
         .get("locations")
         .and_then(|l| l.as_array())
         .into_iter()
         .flatten()
         .filter_map(|l| l.get("path").and_then(|p| p.as_str()))
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect();
-    if !from_locations.is_empty() {
-        return from_locations;
+    {
+        push(&mut out, p);
     }
-    let Some(raw) = tc.get("rawInput") else {
-        return Vec::new();
-    };
-    for key in ["path", "file_path", "filePath", "abs_path", "absPath"] {
-        if let Some(p) = raw.get(key).and_then(|p| p.as_str()) {
-            if !p.is_empty() {
-                return vec![p.to_string()];
+    // BOTH sources, not "structured first, raw as fallback". Treating them as
+    // alternatives let a request put an ordinary file in `locations` and a
+    // credential in `rawInput.path`: only the ordinary one was classified, the
+    // request came out `ReadOnly`, and a read-only grant approved the
+    // credential read with no card. Every raw key is collected for the same
+    // reason — they can name different files.
+    if let Some(raw) = tc.get("rawInput") {
+        for key in ["path", "file_path", "filePath", "abs_path", "absPath"] {
+            if let Some(p) = raw.get(key).and_then(|p| p.as_str()) {
+                push(&mut out, p);
             }
         }
     }
-    Vec::new()
+    out
 }
 
 /// Classify a full permission request params object.
@@ -387,9 +393,9 @@ mod tests {
         assert_eq!(
             intent_from_params(&read),
             PermissionIntent::Read {
-                paths: vec!["src/from_locations.rs".into()]
+                paths: vec!["src/from_locations.rs".into(), "raw/input.rs".into()]
             },
-            "ACP's structured locations win over a raw-input guess"
+            "structured locations lead, but a raw-input path is still a target"
         );
 
         for kind in ["edit", "write", "delete", "move"] {
@@ -422,6 +428,45 @@ mod tests {
             intent_from_params(&params),
             PermissionIntent::Read {
                 paths: vec!["src/main.rs".into(), "/home/u/.ssh/id_rsa".into()]
+            }
+        );
+    }
+
+    /// `locations` and `rawInput` are not alternatives. Classifying only the
+    /// structured one let a request hide a credential in the other and inherit
+    /// the ordinary file's `ReadOnly` tier, which a read-only grant releases
+    /// without a card.
+    #[test]
+    fn paths_come_from_locations_and_raw_input_together() {
+        let params = json!({
+            "toolCall": {
+                "kind": "read",
+                "rawInput": { "path": "/home/u/.ssh/id_rsa" },
+                "locations": [{ "path": "src/main.rs" }]
+            }
+        });
+        assert_eq!(
+            intent_from_params(&params),
+            PermissionIntent::Read {
+                paths: vec!["src/main.rs".into(), "/home/u/.ssh/id_rsa".into()]
+            }
+        );
+    }
+
+    /// A path named in both places is one target, not two.
+    #[test]
+    fn a_path_named_twice_is_not_duplicated() {
+        let params = json!({
+            "toolCall": {
+                "kind": "read",
+                "rawInput": { "path": "src/main.rs", "file_path": "src/main.rs" },
+                "locations": [{ "path": "src/main.rs" }]
+            }
+        });
+        assert_eq!(
+            intent_from_params(&params),
+            PermissionIntent::Read {
+                paths: vec!["src/main.rs".into()]
             }
         );
     }
