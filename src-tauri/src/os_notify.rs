@@ -261,16 +261,21 @@ pub async fn os_notify_send(req: NotifySendRequest) -> Result<(), String> {
 
 /// Drain a click that arrived before the frontend listener was ready.
 #[tauri::command]
-pub fn os_notify_take_pending_open() -> Option<NotifyOpenPayload> {
-    pending_open().lock().ok().and_then(|mut g| g.take())
+pub fn os_notify_take_pending_open() -> Result<Option<NotifyOpenPayload>, String> {
+    let mut guard = pending_open()
+        .lock()
+        .map_err(|e| format!("os_notify pending lock poisoned: {e}"))?;
+    Ok(guard.take())
 }
 
 /// Clear a retained pending open after the frontend has handled a live event.
 #[tauri::command]
-pub fn os_notify_ack_open() {
-    if let Ok(mut guard) = pending_open().lock() {
-        *guard = None;
-    }
+pub fn os_notify_ack_open() -> Result<(), String> {
+    let mut guard = pending_open()
+        .lock()
+        .map_err(|e| format!("os_notify pending lock poisoned: {e}"))?;
+    *guard = None;
+    Ok(())
 }
 
 #[cfg(test)]

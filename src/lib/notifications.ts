@@ -31,10 +31,9 @@ function asNotifyPermission(raw: string): NotifyPermission {
 export async function notifyPermission(): Promise<NotifyPermission> {
   try {
     const p = asNotifyPermission(await api.osNotifyPermission());
-    if (p === "granted") return "granted";
-    // user-notify collapses Denied + NotDetermined to false. Prefer the Web
-    // Notification permission bit when present so Settings can show the
-    // "open System Settings" recovery instead of re-prompting forever.
+    // Backend is authoritative for denied/granted (user-notify). Only use the
+    // Web Notification bit as a secondary signal when backend is still prompt.
+    if (p === "granted" || p === "denied") return p;
     const web = (window as { Notification?: { permission?: string } }).Notification
       ?.permission;
     if (web === "denied") return "denied";
@@ -243,6 +242,7 @@ export function useSystemNotifications() {
     quietHours,
     activeWorkspaceId,
     needsByWorkspace,
+    threadWorkspaceById,
     selectWorkspace,
     goToDirectionRef,
     openNeeds,
@@ -257,12 +257,19 @@ export function useSystemNotifications() {
 
   const threadsById = useRef<Record<number, { title: string; workspaceId?: number }>>({});
   useEffect(() => {
-    const m: Record<number, { title: string; workspaceId?: number }> = {};
+    const m: Record<number, { title: string; workspaceId?: number }> = {
+      ...threadsById.current,
+    };
+    for (const [idStr, ws] of Object.entries(threadWorkspaceById)) {
+      const id = Number(idStr);
+      const prev = m[id];
+      m[id] = { title: prev?.title ?? `#${id}`, workspaceId: ws };
+    }
     for (const th of threads) {
       m[th.id] = { title: th.title, workspaceId: th.workspace_id };
     }
     threadsById.current = m;
-  }, [threads]);
+  }, [threads, threadWorkspaceById]);
 
   // OS permission, settled once per enable.
   useEffect(() => {
@@ -294,25 +301,40 @@ export function useSystemNotifications() {
     };
   }, []);
 
-  // Click / action deep-link from the native bridge. Also drain a click that
-  // arrived before React mounted (cold-start from a persisted notification).
+  // Live click / action deep-link from the native bridge. Keep this effect
+  // dependency-light so we do not re-drain pending opens on every navigation.
+  const navDepsRef = useRef({
+    selectWorkspace,
+    goToDirectionRef,
+    openNeeds,
+    openSettings,
+    activeWorkspaceId,
+  });
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    const deps = {
+    navDepsRef.current = {
       selectWorkspace,
       goToDirectionRef,
       openNeeds,
       openSettings,
       activeWorkspaceId,
     };
+  }, [
+    selectWorkspace,
+    goToDirectionRef,
+    openNeeds,
+    openSettings,
+    activeWorkspaceId,
+  ]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
     void (async () => {
       try {
         unlisten = await listen<OsNotifyOpenEvent>("notify://open", (event) => {
           void (async () => {
-            await handleNotifyOpen(event.payload, deps);
-            // Live delivery was handled — drop any retained pending copy so a
-            // later effect re-run does not replay the same click.
+            await handleNotifyOpen(event.payload, navDepsRef.current);
+            // Live delivery was handled — drop any retained pending copy.
             try {
               await api.osNotifyAckOpen();
             } catch {
@@ -320,10 +342,6 @@ export function useSystemNotifications() {
             }
           })();
         });
-        const pending = await api.osNotifyTakePendingOpen();
-        if (!cancelled && pending) {
-          await handleNotifyOpen(pending, deps);
-        }
       } catch {
         /* pure-vite */
       }
@@ -333,13 +351,25 @@ export function useSystemNotifications() {
       cancelled = true;
       unlisten?.();
     };
-  }, [
-    selectWorkspace,
-    goToDirectionRef,
-    openNeeds,
-    openSettings,
-    activeWorkspaceId,
-  ]);
+  }, []);
+
+  // Cold-start only: drain a pending open once after mount.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const pending = await api.osNotifyTakePendingOpen();
+        if (!cancelled && pending) {
+          await handleNotifyOpen(pending, navDepsRef.current);
+        }
+      } catch {
+        /* pure-vite */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Finish a deep link that had to switch workspaces first.
   useEffect(() => {
@@ -368,15 +398,13 @@ export function useSystemNotifications() {
   }, [activeWorkspaceId, goToDirectionRef, openNeeds, openSettings]);
 
   // Dock / taskbar badge tracks actionable Needs-you across all workspaces.
+  // needsByWorkspace already includes questions + asks + writeTriggers per ws.
   useEffect(() => {
-    const fromWs = Object.values(needsByWorkspace).reduce((a, b) => a + b, 0);
-    // Permission asks are global; they are not in needsByWorkspace. Add them
-    // once on top of the per-workspace totals.
-    const count = fromWs + asks.length;
+    const count = Object.values(needsByWorkspace).reduce((a, b) => a + b, 0);
     if (lastBadge.current === count) return;
     lastBadge.current = count;
     void setDockBadge(count);
-  }, [needsByWorkspace, asks]);
+  }, [needsByWorkspace]);
 
   useEffect(() => {
     const next = snapshotOf(

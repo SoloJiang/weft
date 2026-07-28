@@ -207,6 +207,8 @@ interface Store {
   activeWorkspaceId: number | null;
   repos: RepoRef[];
   threads: Thread[];
+  /** Cumulative thread_id → workspace_id map across visited workspaces. */
+  threadWorkspaceById: Record<number, number>;
   directionsByThread: Record<number, Direction[]>;
   worktreesByDirection: Record<number, Worktree[]>;
 
@@ -594,6 +596,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   activeWorkspaceIdRef.current = activeWorkspaceId;
   const [repos, setRepos] = useState<RepoRef[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
+  const [threadWorkspaceById, setThreadWorkspaceById] = useState<Record<number, number>>({});
+  const rememberThreads = useCallback((list: Thread[]) => {
+    rememberThreads(list);
+    setThreadWorkspaceById((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const th of list) {
+        if (next[th.id] !== th.workspace_id) {
+          next[th.id] = th.workspace_id;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, []);
   const [directionsByThread, setDirections] = useState<Record<number, Direction[]>>({});
   const [worktreesByDirection, setWorktrees] = useState<Record<number, Worktree[]>>({});
   const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
@@ -945,7 +962,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setSelectedRepoId(null);
     const [r, t] = await Promise.all([api.listRepos(id), api.listThreads(id)]);
     setRepos(r);
-    setThreads(t);
+    rememberThreads(t);
     setDirections({});
     setWorktrees({});
     setActiveThreadId(null);
@@ -954,7 +971,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setHomeTab("board");
     setProposal(null);
     setOverview([]);
-  }, []);
+  }, [rememberThreads]);
 
   const loadThreadChildren = useCallback(async (threadId: number) => {
     const dirs = await api.listDirections(threadId);
@@ -1262,7 +1279,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         api.listThreads(activeWorkspaceId),
         refreshOverview(),
       ]);
-      setThreads(threadList);
+      rememberThreads(threadList);
       return t;
     },
     [activeWorkspaceId, refreshOverview],
@@ -1272,7 +1289,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     async (threadId: number) => {
       await api.deleteThread(threadId);
       if (activeWorkspaceId != null)
-        setThreads(await api.listThreads(activeWorkspaceId));
+        rememberThreads(await api.listThreads(activeWorkspaceId));
       setDirections((m) => {
         const n = { ...m };
         delete n[threadId];
@@ -2375,7 +2392,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const id = await api.openCuratorChat(ws); // get-or-create; returns the id
       const list = await api.listThreads(ws);
       if (activeWorkspaceIdRef.current === ws) {
-        setThreads(list);
+        rememberThreads(list);
         setCuratorThreadId(id);
       }
       return id;
@@ -3095,6 +3112,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     activeWorkspaceId,
     repos,
     threads,
+    threadWorkspaceById,
     directionsByThread,
     worktreesByDirection,
     activeThreadId,
