@@ -598,7 +598,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadWorkspaceById, setThreadWorkspaceById] = useState<Record<number, number>>({});
   const rememberThreads = useCallback((list: Thread[]) => {
-    rememberThreads(list);
+    setThreads(list);
     setThreadWorkspaceById((prev) => {
       let changed = false;
       const next = { ...prev };
