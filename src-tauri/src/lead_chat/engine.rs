@@ -3319,6 +3319,14 @@ async fn spawn_acp_turn(
                         eprintln!(
                             "[weft][acp] resume failed ({resume_err}); load also failed ({load_err})"
                         );
+                        // Actually do what the comment above says. Returning
+                        // while the id survives in the engine AND the DB is
+                        // what made a deleted or unloadable session file
+                        // permanent: every later send re-entered this same
+                        // branch and answered `acp_session_open_failed`
+                        // forever. Cleared, the next send takes the `None`
+                        // arm and opens a fresh session.
+                        clear_acp_native_never_prompted(&app, &db, &eng, sid, thread_id_i).await;
                         return Err(anyhow::anyhow!("acp_session_open_failed"));
                     }
                 },
@@ -3761,6 +3769,62 @@ async fn acp_emit_turn_end(
     }
 }
 
+/// Reject an ACP permission request on the wire without a human verdict —
+/// used when teardown won the race and the card must not stand.
+async fn return_permission(
+    client: &crate::acp::runtime::ClientHandle,
+    request_id: &serde_json::Value,
+    options: &[serde_json::Value],
+) {
+    client
+        .reply_permission(request_id, options, crate::acp::Want::RejectOnce)
+        .await;
+}
+
+/// Risk tier for one ACP permission request (issue #101).
+///
+/// A file request is scored across EVERY path it names, worst tier wins. The
+/// first path used to decide alone, so a multi-file read whose leading entry
+/// was ordinary came out `ReadOnly` even when a later entry was a credential —
+/// and `auto_decision` releases `ReadOnly` asks under a read-only session or
+/// issue grant (issue #103), so that access would be approved without a human
+/// ever seeing the card.
+///
+/// A file request that named NO path is still classified by its verb: it goes
+/// through `classify_file` once with an empty path, rather than through
+/// `most_severe` of nothing, so a write stays a write.
+fn acp_permission_risk(
+    intent: &crate::acp::permission::PermissionIntent,
+    detail: &str,
+) -> crate::ask::RiskLevel {
+    use crate::acp::permission::PermissionIntent;
+    let by_paths = |tool_name: &'static str, paths: &[String]| {
+        if paths.is_empty() {
+            return crate::ask::classify_risk(crate::ask::RiskSignal::File {
+                tool_name,
+                path: "",
+            });
+        }
+        crate::ask::most_severe(paths.iter().map(|path| {
+            crate::ask::classify_risk(crate::ask::RiskSignal::File { tool_name, path })
+        }))
+    };
+    match intent {
+        PermissionIntent::Command(cmd) => {
+            crate::ask::classify_risk(crate::ask::RiskSignal::Command(cmd))
+        }
+        PermissionIntent::Read { paths } => by_paths("Read", paths),
+        PermissionIntent::Write { paths } => by_paths("Edit", paths),
+        PermissionIntent::Network => crate::ask::classify_risk(crate::ask::RiskSignal::Network),
+        PermissionIntent::Other { kind } => {
+            crate::ask::classify_risk(crate::ask::RiskSignal::Other {
+                tool_name: kind,
+                args_text: detail,
+            })
+        }
+    }
+}
+
 /// How much of the reasoning stream the busy-line chip shows.
 const THOUGHT_TAIL_CHARS: usize = 160;
 
@@ -4089,32 +4153,7 @@ async fn acp_consumer(
                 // Computed BEFORE `auto_decision` because the read-only batch
                 // grants (issue #103) key on the tier: deriving it only in the
                 // `None` arm would make every ACP ask miss those grants.
-                let risk = crate::ask::classify_risk(match &intent {
-                    crate::acp::permission::PermissionIntent::Command(cmd) => {
-                        crate::ask::RiskSignal::Command(cmd)
-                    }
-                    crate::acp::permission::PermissionIntent::Read { path } => {
-                        crate::ask::RiskSignal::File {
-                            tool_name: "Read",
-                            path,
-                        }
-                    }
-                    crate::acp::permission::PermissionIntent::Write { path } => {
-                        crate::ask::RiskSignal::File {
-                            tool_name: "Edit",
-                            path,
-                        }
-                    }
-                    crate::acp::permission::PermissionIntent::Network => {
-                        crate::ask::RiskSignal::Network
-                    }
-                    crate::acp::permission::PermissionIntent::Other { kind } => {
-                        crate::ask::RiskSignal::Other {
-                            tool_name: kind,
-                            args_text: &detail,
-                        }
-                    }
-                });
+                let risk = acp_permission_risk(&intent, &detail);
                 let want = if let Some(asks) = asks {
                     match asks.auto_decision(thread_id, &dir, risk, &action_key) {
                         Some(crate::ask::Decision::Allow) => crate::acp::Want::AllowOnce,
@@ -4129,8 +4168,32 @@ async fn acp_consumer(
                                 risk,
                                 &action_key,
                             );
-                            // Track so stop() can cancel the Needs-you card.
-                            eng.lock().await.acp_pending_asks.push(id);
+                            // Register in the SAME lock acquisition that
+                            // re-checks teardown, and give up the card if
+                            // teardown already won. With registration as a
+                            // separate acquisition, a Stop or engine switch
+                            // landing right after `asks.request` took an empty
+                            // `acp_pending_asks` and completed teardown while
+                            // the card was already on screen. The card then
+                            // outlived the turn, and answering it with Always
+                            // or Full persisted a standing grant — the
+                            // post-await check below only turns the WIRE reply
+                            // into a rejection, it cannot un-grant that.
+                            let registered = {
+                                let mut g = eng.lock().await;
+                                let lost = g.stopped
+                                    || g.interrupting
+                                    || g.reset_epoch != start_epoch;
+                                if !lost {
+                                    g.acp_pending_asks.push(id);
+                                }
+                                !lost
+                            };
+                            if !registered {
+                                asks.cancel(id);
+                                return_permission(&client, &request_id, &options).await;
+                                continue;
+                            }
                             let decided = match tokio::time::timeout(
                                 std::time::Duration::from_secs(3600),
                                 rx,
@@ -5228,8 +5291,24 @@ async fn force_acp_turn_reset(
 /// agent ignored `session/cancel`, and the turn was cut loose after the grace
 /// window — same consequence (the native session is abandoned), so the same
 /// persistent notice rather than a self-clearing hint.
+///
+/// BILINGUAL in one string rather than locale-selected, the same shape
+/// `bus::inject::HOOK_DECIDE_OR_DENY` uses and for the same reason: the
+/// frontend `src/i18n/*.ts` catalogs are TS modules bundled into the webview
+/// and unreachable from here, and `lang` is not persisted backend-side — it is
+/// passed per command invocation (see `lang_directive`'s callers). This notice
+/// is raised from a detached watchdog task 8s after the Stop, which has no such
+/// invocation to read it from. Emitting only Chinese would leave an
+/// English-language operator with an unreadable Needs-you card.
 fn acp_force_reset_text() -> String {
-    "⏹️ 停止后 agent 未响应取消请求，已强制中断并重置为全新会话继续。历史对话仍保留在时间线里，但新会话不带原生上下文；如果后续回复像「忘记」了之前的内容，请重新提示一下关键信息。".to_string()
+    "⏹️ The agent did not answer the cancellation after Stop, so the turn was \
+     force-interrupted and continues on a brand-new session. The conversation \
+     stays in the timeline, but the new session carries no native context — if \
+     later replies seem to have \"forgotten\" earlier details, re-state the key \
+     points. / 停止后 agent 未响应取消请求，已强制中断并重置为全新会话继续。\
+     历史对话仍保留在时间线里，但新会话不带原生上下文；如果后续回复像「忘记」了\
+     之前的内容，请重新提示一下关键信息。"
+        .to_string()
 }
 
 pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
@@ -8415,6 +8494,46 @@ fn emit_lead_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hole this closes, end to end: a read naming an ordinary file FIRST
+    /// and a credential second was tiered `ReadOnly` off the first path alone,
+    /// and `auto_decision` releases a `ReadOnly` ask under a read-only session
+    /// or issue grant (issue #103) — so the SSH key would have been read with
+    /// no card ever shown. The tier now comes from the worst target.
+    #[test]
+    fn a_multi_file_read_is_tiered_by_its_worst_target() {
+        use crate::acp::permission::PermissionIntent;
+
+        let ordinary = PermissionIntent::Read {
+            paths: vec!["src/main.rs".into()],
+        };
+        assert_eq!(
+            acp_permission_risk(&ordinary, ""),
+            crate::ask::RiskLevel::ReadOnly,
+            "an ordinary read is still releasable by a read-only grant"
+        );
+
+        let with_secret = PermissionIntent::Read {
+            paths: vec!["src/main.rs".into(), "/home/u/.ssh/id_rsa".into()],
+        };
+        assert_eq!(
+            acp_permission_risk(&with_secret, ""),
+            crate::ask::RiskLevel::NetworkOrCredential,
+            "a credential anywhere in the set must lift the whole request"
+        );
+    }
+
+    /// A file action that named no path keeps its verb's tier — it must not
+    /// fall through to `most_severe` of nothing, which is `Unknown`.
+    #[test]
+    fn a_pathless_file_action_is_still_tiered_by_its_verb() {
+        use crate::acp::permission::PermissionIntent;
+
+        assert_eq!(
+            acp_permission_risk(&PermissionIntent::Write { paths: Vec::new() }, ""),
+            crate::ask::RiskLevel::Write
+        );
+    }
 
     /// An image-only message is addressable in ACP and not in claude, and the
     /// rewind path has exactly one place that decides which rule applies.

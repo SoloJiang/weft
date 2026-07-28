@@ -2647,14 +2647,25 @@ mod tests {
         assert_eq!(curator_exec_tool("codex").ok(), Some("codex"));
         assert_eq!(curator_exec_tool("claude").ok(), Some("claude"));
 
-        // Why the refusal is unreachable today — and the tripwire for the day
-        // it is not. If an ACP engine becomes routable, `route.selected()` can
-        // hand one to the runner and this test fails, pointing at the real
-        // work: give the curator an ACP path, not a substitution.
-        for id in crate::acp::registered_ids() {
+        // This refusal is now a LIVE defence, not a latent one. omp became a
+        // routable identity so manual pins could select it (the pickers already
+        // offered it), which means `route.selected()` really can hand an ACP
+        // engine to a runner that cannot drive it. Any registered ACP backend
+        // that routing also accepts must therefore be refused here — failing
+        // visibly beats running the repository through a provider the user did
+        // not choose while `record_decision` names the one they did.
+        let routable_acp: Vec<&str> = crate::acp::registered_ids()
+            .into_iter()
+            .filter(|id| crate::engine_routing::EngineId::parse(id).is_some())
+            .collect();
+        assert!(
+            routable_acp.contains(&"omp"),
+            "omp should be routable; if that changed, this guard needs rethinking"
+        );
+        for id in routable_acp {
             assert!(
-                crate::engine_routing::EngineId::parse(id).is_none(),
-                "{id} became routable; the curator now needs a real ACP runner"
+                curator_exec_tool(id).is_err(),
+                "{id} is routable AND ACP, so the curator must refuse it"
             );
         }
     }

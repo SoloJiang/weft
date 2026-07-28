@@ -20,6 +20,10 @@ pub enum EngineId {
     Claude,
     Codex,
     Opencode,
+    /// The first ACP-transport engine. Routable so a manual pin can select it
+    /// — the pickers already offer it — but deliberately NOT one of the
+    /// automatic preferences below, which stay Codex/Claude.
+    Omp,
 }
 
 impl EngineId {
@@ -28,6 +32,7 @@ impl EngineId {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Opencode => "opencode",
+            Self::Omp => "omp",
         }
     }
 
@@ -36,6 +41,7 @@ impl EngineId {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "opencode" => Some(Self::Opencode),
+            "omp" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -411,7 +417,11 @@ pub fn resolve_failover(
     let expected = match current {
         EngineId::Claude => EngineId::Codex,
         EngineId::Codex => EngineId::Claude,
-        EngineId::Opencode => return FailoverDecision::Skip(FailoverSkipReason::NoFallback),
+        // No quota-failover partner: both are single-vendor identities, so
+        // there is no equivalent engine to hand the turn to.
+        EngineId::Opencode | EngineId::Omp => {
+            return FailoverDecision::Skip(FailoverSkipReason::NoFallback)
+        }
     };
     let Some(fallback) = fallback else {
         return FailoverDecision::Skip(FailoverSkipReason::NoFallback);
@@ -467,7 +477,12 @@ fn candidate_for(tool: EngineId, snapshots: &[QuotaSnapshot]) -> RouteCandidate 
 
 fn candidate_list() -> Vec<RouteCandidate> {
     let snapshots = snapshots_by_tool();
-    [EngineId::Codex, EngineId::Claude, EngineId::Opencode]
+    [
+        EngineId::Codex,
+        EngineId::Claude,
+        EngineId::Opencode,
+        EngineId::Omp,
+    ]
         .into_iter()
         .map(|tool| candidate_for(tool, &snapshots))
         .collect()
@@ -592,7 +607,7 @@ pub async fn try_quota_failover_for_db(
     let fallback_tool = match current {
         EngineId::Claude => Some(EngineId::Codex),
         EngineId::Codex => Some(EngineId::Claude),
-        EngineId::Opencode => None,
+        EngineId::Opencode | EngineId::Omp => None,
     };
     let fallback = fallback_tool.and_then(|tool| candidate(&candidates, tool));
     Ok(resolve_failover(

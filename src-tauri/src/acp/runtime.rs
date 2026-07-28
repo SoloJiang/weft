@@ -433,7 +433,11 @@ impl ClientHandle {
     }
 
     async fn resolve(&self, id: i64, res: Result<Value, String>) {
-        if let Some(inner) = self.inner.lock().await.as_mut() {
+        let settled_last = {
+            let mut g = self.inner.lock().await;
+            let Some(inner) = g.as_mut() else {
+                return;
+            };
             // Race: session/update can arrive before the open RPC future resumes
             // and calls mark_opening. If the response body already names a
             // sessionId, buffer for THAT sid immediately (not globally).
@@ -444,9 +448,23 @@ impl ClientHandle {
                     }
                 }
             }
-            if let Some(tx) = inner.pending.remove(&id) {
+            let waiter = inner.pending.remove(&id);
+            let drained = inner.pending.is_empty();
+            if let Some(tx) = waiter {
                 let _ = tx.send(res);
             }
+            drained
+        };
+        // Retirement is attempted on route teardown, but an in-flight reply
+        // protects the client at that moment (`PendingPolicy::Protects`). When
+        // the last session is stopped or switched mid-prompt, that teardown
+        // therefore declines — and nothing tried again once the reply landed,
+        // so the child survived routeless until process exit and every command
+        // pin change left one more orphan behind. This is that retry; the
+        // route checks inside still apply, so a client that is merely idle
+        // between turns is untouched.
+        if settled_last {
+            self.maybe_reap_if_idle().await;
         }
     }
 

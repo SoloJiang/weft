@@ -100,10 +100,13 @@ pub fn intent_key(tool_kind: &str, raw_input: &Value) -> String {
 pub enum PermissionIntent {
     /// A shell command line — the request carries `rawInput.command`.
     Command(String),
-    /// A filesystem read. `path` may be empty when the agent named no location.
-    Read { path: String },
-    /// A filesystem mutation: edit, write, delete, or move.
-    Write { path: String },
+    /// A filesystem read. EVERY named location, because the risk of the whole
+    /// request is the risk of its worst target — a read whose second path is
+    /// an SSH key is not a read-only request. Empty when none were named.
+    Read { paths: Vec<String> },
+    /// A filesystem mutation: edit, write, delete, or move. Same "every
+    /// location" rule as [`Self::Read`].
+    Write { paths: Vec<String> },
     /// Network access ACP itself declared as such (tool kind `fetch`) — the
     /// same "the engine already identified it" case `RiskSignal::Network`
     /// exists for, so it needs no further scanning.
@@ -112,32 +115,40 @@ pub enum PermissionIntent {
     Other { kind: String },
 }
 
-/// Best-effort path for a file-shaped request: ACP's own structured
-/// `locations` first, then the raw-input key names agents actually use.
-/// An absent path is not a downgrade — `classify_file` tiers on the tool
-/// verb, so a write with no location is still a write.
-fn tool_path(tc: &Value) -> String {
-    let from_locations = tc
+/// Every path a file-shaped request names: ACP's own structured `locations`
+/// first, then the raw-input key names agents actually use.
+///
+/// ALL of them, not just the first. The first path decided the risk tier once,
+/// which meant a multi-file read could be tiered `ReadOnly` off an ordinary
+/// leading path while a later entry touched a credential — and a read-only
+/// grant would then auto-approve it unseen.
+///
+/// An empty result is not a downgrade: `classify_file` tiers on the tool verb,
+/// so a write that named no location is still a write.
+fn tool_paths(tc: &Value) -> Vec<String> {
+    let from_locations: Vec<String> = tc
         .get("locations")
         .and_then(|l| l.as_array())
-        .and_then(|a| a.first())
-        .and_then(|l| l.get("path"))
-        .and_then(|p| p.as_str())
-        .unwrap_or_default();
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.get("path").and_then(|p| p.as_str()))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
     if !from_locations.is_empty() {
-        return from_locations.to_string();
+        return from_locations;
     }
     let Some(raw) = tc.get("rawInput") else {
-        return String::new();
+        return Vec::new();
     };
     for key in ["path", "file_path", "filePath", "abs_path", "absPath"] {
         if let Some(p) = raw.get(key).and_then(|p| p.as_str()) {
             if !p.is_empty() {
-                return p.to_string();
+                return vec![p.to_string()];
             }
         }
     }
-    String::new()
+    Vec::new()
 }
 
 /// Classify a full permission request params object.
@@ -156,10 +167,10 @@ pub fn intent_from_params(params: &Value) -> PermissionIntent {
     }
     match kind {
         "read" | "search" => PermissionIntent::Read {
-            path: tool_path(tc),
+            paths: tool_paths(tc),
         },
         "edit" | "write" | "delete" | "move" => PermissionIntent::Write {
-            path: tool_path(tc),
+            paths: tool_paths(tc),
         },
         "fetch" => PermissionIntent::Network,
         other => PermissionIntent::Other {
@@ -223,10 +234,22 @@ pub fn summary_from_params(params: &Value) -> (String, String) {
         .get("title")
         .and_then(|t| t.as_str())
         .unwrap_or("tool");
-    let detail = tc
+    // `rawInput` alone is not enough to authorize by. An ACP request may name
+    // its targets ONLY in `toolCall.locations` — the shape the intent and
+    // grant-identity code reads first — leaving `rawInput` empty. With a
+    // generic or empty title, the card would then ask a human to approve a
+    // file operation without naming a single path. Append whatever locations
+    // were named so the detail always says what will be touched.
+    let raw = tc
         .get("rawInput")
         .map(|r| r.to_string())
         .unwrap_or_default();
+    let paths = tool_paths(tc);
+    let detail = match (raw.is_empty(), paths.is_empty()) {
+        (_, true) => raw,
+        (true, false) => paths.join("\n"),
+        (false, false) => format!("{raw}\n{}", paths.join("\n")),
+    };
     // Stable machine token — frontend i18n maps `acp.permission_required`.
     let summary = if title.is_empty() {
         "acp.permission_required".into()
@@ -360,7 +383,7 @@ mod tests {
         assert_eq!(
             intent_from_params(&read),
             PermissionIntent::Read {
-                path: "src/from_locations.rs".into()
+                paths: vec!["src/from_locations.rs".into()]
             },
             "ACP's structured locations win over a raw-input guess"
         );
@@ -372,11 +395,46 @@ mod tests {
             assert_eq!(
                 intent_from_params(&params),
                 PermissionIntent::Write {
-                    path: "src/main.rs".into()
+                    paths: vec!["src/main.rs".into()]
                 },
                 "{kind} mutates the filesystem"
             );
         }
+    }
+
+    /// Every location is carried, in order. Taking only the first meant a
+    /// multi-file read could be tiered off an ordinary leading path while a
+    /// later entry was a credential — and a read-only grant auto-approves a
+    /// `ReadOnly` ask without ever showing the human the card.
+    #[test]
+    fn every_named_location_reaches_the_classifier() {
+        let params = json!({
+            "toolCall": {
+                "kind": "read",
+                "locations": [{"path":"src/main.rs"}, {"path":"/home/u/.ssh/id_rsa"}]
+            }
+        });
+        assert_eq!(
+            intent_from_params(&params),
+            PermissionIntent::Read {
+                paths: vec!["src/main.rs".into(), "/home/u/.ssh/id_rsa".into()]
+            }
+        );
+    }
+
+    /// The card must name what it is authorizing. With the target only in
+    /// `locations`, `rawInput` is empty and the detail said nothing at all.
+    #[test]
+    fn detail_names_locations_even_when_raw_input_is_empty() {
+        let params = json!({
+            "toolCall": {
+                "kind": "edit",
+                "locations": [{"path":"src/a.rs"}, {"path":"src/b.rs"}]
+            }
+        });
+        let (_, detail) = summary_from_params(&params);
+        assert!(detail.contains("src/a.rs"), "detail: {detail:?}");
+        assert!(detail.contains("src/b.rs"), "detail: {detail:?}");
     }
 
     /// A write with nowhere to point is still a write: `classify_file` tiers on
@@ -386,7 +444,7 @@ mod tests {
         let params = json!({ "toolCall": { "kind": "edit" } });
         assert_eq!(
             intent_from_params(&params),
-            PermissionIntent::Write { path: String::new() }
+            PermissionIntent::Write { paths: Vec::new() }
         );
     }
 
@@ -421,8 +479,13 @@ mod tests {
         let a = json!({"toolCall":{"kind":"edit","locations":[{"path":"src/a.rs"}]}});
         let b = json!({"toolCall":{"kind":"edit","locations":[{"path":"src/b.rs"}]}});
 
-        // The old key material is identical for both — the bug in one line.
-        assert_eq!(summary_from_params(&a).1, summary_from_params(&b).1);
+        // The bug in one line: `rawInput` — which WAS the whole key material —
+        // is identical for both. (`detail` now appends the locations too, so
+        // the card names them; the grant key must not depend on that.)
+        assert_eq!(
+            a.pointer("/toolCall/rawInput"),
+            b.pointer("/toolCall/rawInput")
+        );
         assert_ne!(grant_identity(&a), grant_identity(&b));
         // An identical request still shares its grant; that is what Always is.
         assert_eq!(grant_identity(&a), grant_identity(&a));

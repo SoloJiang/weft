@@ -1242,6 +1242,41 @@ pub fn classify_risk(signal: RiskSignal) -> RiskLevel {
     }
 }
 
+/// Severity order for folding several verdicts into one.
+///
+/// `Unknown` outranks `ReadOnly` deliberately: it means "not established as
+/// safe", the same reason `classify_risk` never guesses low. It sits below the
+/// tiers that were positively identified as dangerous, which are the ones a
+/// human most needs to see. This is NOT the enum's declaration order, so it
+/// lives here rather than as a derived `Ord`.
+fn severity(level: RiskLevel) -> u8 {
+    match level {
+        RiskLevel::ReadOnly => 0,
+        RiskLevel::Unknown => 1,
+        RiskLevel::Write => 2,
+        RiskLevel::NetworkOrCredential => 3,
+    }
+}
+
+/// The most severe of several verdicts — for one request naming several
+/// targets.
+///
+/// A multi-file read whose FIRST path is ordinary but whose second is `.env`
+/// or an SSH key must not inherit the first path's `ReadOnly` tier:
+/// [`AskRegistry::auto_decision`] releases `ReadOnly` asks under a read-only
+/// session or issue grant, so the credential access would be auto-approved
+/// without a human ever seeing it.
+///
+/// An EMPTY set yields `Unknown`, never `ReadOnly` — "nothing to judge" is not
+/// evidence of safety, and callers with a genuinely path-less action classify
+/// it explicitly instead of passing nothing.
+pub fn most_severe(levels: impl IntoIterator<Item = RiskLevel>) -> RiskLevel {
+    levels
+        .into_iter()
+        .max_by_key(|level| severity(*level))
+        .unwrap_or(RiskLevel::Unknown)
+}
+
 /// A pending permission request, awaiting the human's decision.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Ask {
@@ -2130,6 +2165,31 @@ impl AskRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fold's whole job: one dangerous target lifts the whole request, so
+    /// a read-only grant cannot release it. `Unknown` outranks `ReadOnly`
+    /// because it means "not established as safe", but stays below the tiers
+    /// that were positively identified — this is NOT the declaration order,
+    /// which is why `severity` exists rather than a derived `Ord`.
+    #[test]
+    fn most_severe_takes_the_worst_verdict_not_the_first() {
+        use RiskLevel::*;
+        assert_eq!(most_severe([ReadOnly, NetworkOrCredential]), NetworkOrCredential);
+        assert_eq!(most_severe([NetworkOrCredential, ReadOnly]), NetworkOrCredential);
+        assert_eq!(most_severe([ReadOnly, Write]), Write);
+        assert_eq!(most_severe([ReadOnly, Unknown]), Unknown);
+        assert_eq!(most_severe([Unknown, Write]), Write);
+        assert_eq!(most_severe([ReadOnly, ReadOnly]), ReadOnly);
+        assert_eq!(most_severe([ReadOnly]), ReadOnly);
+    }
+
+    /// "Nothing to judge" is not evidence of safety. Returning `ReadOnly` for
+    /// an empty set would let a read-only session grant auto-approve a request
+    /// whose targets we failed to extract at all.
+    #[test]
+    fn most_severe_of_nothing_is_unknown_never_read_only() {
+        assert_eq!(most_severe([]), RiskLevel::Unknown);
+    }
 
     #[test]
     fn answer_as_str_round_trips_with_parse() {
