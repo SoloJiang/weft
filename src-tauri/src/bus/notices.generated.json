@@ -1,0 +1,6 @@
+{
+  "acp.force_reset_notice": {
+    "en": "⏹️ The agent did not answer the cancellation after Stop, so the turn was force-interrupted and continues on a brand-new session. The conversation stays in the timeline, but the new session carries no native context — if later replies seem to have \"forgotten\" earlier details, re-state the key points.",
+    "zh": "⏹️ 停止后 agent 未响应取消请求，已强制中断并重置为全新会话继续。历史对话仍保留在时间线里，但新会话不带原生上下文；如果后续回复像「忘记」了之前的内容，请重新提示一下关键信息。"
+  }
+}

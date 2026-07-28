@@ -20,6 +20,10 @@ pub enum EngineId {
     Claude,
     Codex,
     Opencode,
+    /// The first ACP-transport engine. Routable so a manual pin can select it
+    /// — the pickers already offer it — but deliberately NOT one of the
+    /// automatic preferences below, which stay Codex/Claude.
+    Omp,
 }
 
 impl EngineId {
@@ -28,6 +32,7 @@ impl EngineId {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Opencode => "opencode",
+            Self::Omp => "omp",
         }
     }
 
@@ -36,6 +41,7 @@ impl EngineId {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "opencode" => Some(Self::Opencode),
+            "omp" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -333,10 +339,15 @@ pub fn resolve_with_manual_intent(
         return blocked(RouteReason::BothAutomaticCandidatesExceeded, request.hint);
     }
 
-    // OpenCode remains a manual/legacy engine, never an automatic fallback.
+    // OpenCode and OMP remain manual-only engines, never an automatic fallback.
     // A configured Codex/Claude legacy identity can still preserve the old
     // default behavior when the automatic pool has no usable reading.
-    if request.legacy_tool != EngineId::Opencode {
+    //
+    // OMP joined `candidate_list` so a MANUAL pin could resolve — the pickers
+    // already offered it — and being in that list made it reachable here too,
+    // which contradicts the closed Codex/Claude automatic pool. It would also
+    // route curator work to an engine the curator refuses outright.
+    if !matches!(request.legacy_tool, EngineId::Opencode | EngineId::Omp) {
         if let Some(legacy) = legacy {
             if legacy.installed && legacy.quota != Some(QuotaStatus::Exceeded) {
                 return selected(
@@ -411,7 +422,11 @@ pub fn resolve_failover(
     let expected = match current {
         EngineId::Claude => EngineId::Codex,
         EngineId::Codex => EngineId::Claude,
-        EngineId::Opencode => return FailoverDecision::Skip(FailoverSkipReason::NoFallback),
+        // No quota-failover partner: both are single-vendor identities, so
+        // there is no equivalent engine to hand the turn to.
+        EngineId::Opencode | EngineId::Omp => {
+            return FailoverDecision::Skip(FailoverSkipReason::NoFallback)
+        }
     };
     let Some(fallback) = fallback else {
         return FailoverDecision::Skip(FailoverSkipReason::NoFallback);
@@ -467,7 +482,12 @@ fn candidate_for(tool: EngineId, snapshots: &[QuotaSnapshot]) -> RouteCandidate 
 
 fn candidate_list() -> Vec<RouteCandidate> {
     let snapshots = snapshots_by_tool();
-    [EngineId::Codex, EngineId::Claude, EngineId::Opencode]
+    [
+        EngineId::Codex,
+        EngineId::Claude,
+        EngineId::Opencode,
+        EngineId::Omp,
+    ]
         .into_iter()
         .map(|tool| candidate_for(tool, &snapshots))
         .collect()
@@ -592,7 +612,7 @@ pub async fn try_quota_failover_for_db(
     let fallback_tool = match current {
         EngineId::Claude => Some(EngineId::Codex),
         EngineId::Codex => Some(EngineId::Claude),
-        EngineId::Opencode => None,
+        EngineId::Opencode | EngineId::Omp => None,
     };
     let fallback = fallback_tool.and_then(|tool| candidate(&candidates, tool));
     Ok(resolve_failover(
@@ -1530,6 +1550,42 @@ mod tests {
         ));
         assert_eq!(out.selected(), Some(EngineId::Claude));
         assert_eq!(out.reason, RouteReason::PreferredUnavailable);
+    }
+
+    /// OMP's contract: selectable by a MANUAL pin, never by automatic routing.
+    /// It sits in `candidate_list` only so a manual pin can find its
+    /// installation/quota reading, and the legacy-fallback arm must not turn
+    /// that presence into an automatic choice.
+    #[test]
+    fn omp_is_manual_only_and_never_an_automatic_fallback() {
+        // Automatic on, both automatic candidates missing, legacy = omp.
+        let out = resolve(&request(
+            true,
+            None,
+            EngineId::Omp,
+            RoutingHint::Normal,
+            vec![
+                candidate(EngineId::Codex, false, None),
+                candidate(EngineId::Claude, false, None),
+                candidate(EngineId::Omp, true, Some(QuotaStatus::Ok)),
+            ],
+        ));
+        assert!(out.blocked, "omp must not be picked as a legacy fallback");
+        assert_ne!(out.selected(), Some(EngineId::Omp));
+
+        // An explicit manual pin still resolves.
+        let manual = resolve(&request(
+            true,
+            Some(EngineId::Omp),
+            EngineId::Codex,
+            RoutingHint::Normal,
+            vec![
+                candidate(EngineId::Codex, true, Some(QuotaStatus::Ok)),
+                candidate(EngineId::Omp, true, Some(QuotaStatus::Ok)),
+            ],
+        ));
+        assert_eq!(manual.selected(), Some(EngineId::Omp));
+        assert_eq!(manual.reason, RouteReason::ManualPin);
     }
 
     #[test]

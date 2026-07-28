@@ -327,6 +327,12 @@ export const en = {
     blockedToast: "Process capacity is still constrained. Your message was kept; try again after recovery.",
   },
   needs: {
+    acpPermissionRequired: "Permission required",
+    // Authoritative copy. `scripts/gen-notice-copy.mjs` generates the
+    // backend-readable mirror the IM bridge renders from — edit here, run the
+    // script; `noticeCopy.test.ts` fails if the mirror drifts.
+    acpForceResetNotice:
+      "⏹️ The agent did not answer the cancellation after Stop, so the turn was force-interrupted and continues on a brand-new session. The conversation stays in the timeline, but the new session carries no native context — if later replies seem to have \"forgotten\" earlier details, re-state the key points.",
     title: "Needs you",
     subtitle: "approvals and questions only you can answer",
     wantsPermission: "wants permission",
@@ -390,6 +396,7 @@ export const en = {
     toolRunning: "Running",
     toolSyncing: "Syncing",
     toolOrganizing: "Organizing",
+    toolThinking: "Thinking",
     toolDelegating: "Delegating",
     toolCalling: "Calling",
     toolEdited: "Edited",
@@ -398,6 +405,7 @@ export const en = {
     toolRan: "Ran",
     toolSynced: "Synced",
     toolOrganized: "Organized",
+    toolThought: "Thought",
     toolDelegated: "Delegated",
     toolCalled: "Called",
     resumeMenu: "Resume…",
@@ -409,6 +417,11 @@ export const en = {
     rewindTitle: "Rewind the conversation?",
     rewindBody:
       "Messages after this one will be removed and the agent will forget them. This message's text goes back into the input box so you can edit and resend it.",
+    acpSessionOpenFailed: "Could not open the agent session. Check that the agent is installed and try again.",
+    ompSessionMissing: "Could not find this conversation on disk. The agent may have cleaned its session files — try sending a new message instead of rewinding.",
+    ompUserMissing: "Could not locate that message in the agent session file. Try rewinding a different message.",
+    ompScanTruncated:
+      "There are too many files in the agent session folder to search it fully, so this session could not be located. Clearing out old session files will let the search reach it.",
     rewindConfirm: "Rewind",
     rewindModeConversation: "Conversation only",
     rewindModeConversationDesc:
@@ -509,6 +522,7 @@ export const en = {
     title: "Session",
     used: "{{pct}}% used",
     pending: "Available after first message",
+    noMcp: "No user MCP servers in this session",
     noSkills: "No skills enabled",
     skillsInjected: "Injected",
     skillsInjectedHint: "Skills Weft enabled for this workspace",
@@ -587,6 +601,8 @@ export const en = {
     analysisRunning: "Analyzing…",
     analysisFailed: "Analysis failed",
     analysisErrorCheckoutMissing: "Checkout not found on disk",
+    analysisErrorUnsupportedEngine:
+      "Repository analysis can't run on {{tool}} — pick another engine for the curator.",
     retryAnalysis: "Retry",
     viewOverview: "Overview",
     viewExpanded: "Expanded",
@@ -753,7 +769,7 @@ export const en = {
     defaultTool: "Default coding tool",
     defaultToolHint:
       "Applies to new issues and new tasks only (a write-approval card can still override it per task). Doesn't retroactively change an issue's lead or a task's worker already running — switch those from their own Session panel.",
-    noTools: "No coding CLI detected — install codex, claude, or opencode.",
+    noTools: "No coding CLI detected — install codex, claude, opencode, or omp.",
     toolFallback: "{{configured}} is not installed — using {{tool}}.",
     agentCommands: "Agent commands",
     agentCommandsHint:

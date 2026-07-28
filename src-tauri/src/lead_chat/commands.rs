@@ -321,6 +321,7 @@ pub async fn lead_engine(
         pending_command_refresh: false,
         last_context_tokens: None,
         last_model: None,
+        last_reasoning: None,
         last_window: None,
         last_mcp_servers: vec![],
         last_tools: vec![],
@@ -330,10 +331,13 @@ pub async fn lead_engine(
         tool_rows: std::collections::HashMap::new(),
         stopped,
         codex_client: None,
+        acp_client: None,
+        acp_pending_asks: Vec::new(),
         turn_user_row: None,
         last_assistant_uuid: None,
         rewinding: false,
         quota_failover_committing: false,
+        tearing_down: false,
         worktree_id: None,
     };
     // Restore the last persisted meta snapshot so the Session panel is populated
@@ -441,6 +445,7 @@ pub struct LeadStateInfo {
     pub context_tokens: Option<u64>,
     pub window: Option<u64>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub mcp_servers: Vec<crate::lead_chat::proto::McpServer>,
     pub tools: Vec<String>,
 }
@@ -466,8 +471,8 @@ fn lead_state_label(alive: bool, busy: bool, stopped: bool) -> &'static str {
 /// resident child; a codex app-server lead has NO per-turn child when idle but
 /// stays alive while its client handle is present (a send reconnects if needed) —
 /// without this a remount's `loadLeadChat` mislabels the idle lead as "stopped".
-fn lead_alive(child_alive: bool, has_codex_client: bool) -> bool {
-    child_alive || has_codex_client
+fn lead_alive(child_alive: bool, has_connection_client: bool) -> bool {
+    child_alive || has_connection_client
 }
 
 #[cfg(test)]
@@ -702,6 +707,7 @@ mod tests {
             context_tokens: None,
             window: None,
             model: None,
+            reasoning_effort: None,
             mcp_servers: vec![],
             tools: vec![],
         };
@@ -755,6 +761,7 @@ pub async fn lead_state(
                 context_tokens: snap.context_tokens,
                 window: snap.window,
                 model: snap.model,
+                reasoning_effort: snap.reasoning_effort.clone(),
                 mcp_servers: snap.mcp_servers,
                 tools: snap.tools,
             })
@@ -767,7 +774,7 @@ pub async fn lead_state(
                 .map(|c| c.try_wait().ok().flatten().is_none())
                 .unwrap_or(false);
             // codex app-server leads are childless when idle but alive via the client.
-            let alive = lead_alive(child_alive, i.codex_client.is_some());
+            let alive = lead_alive(child_alive, i.codex_client.is_some() || i.acp_client.is_some());
             let command = crate::tool_command::effective(i.command.as_deref(), &i.tool);
             Ok(LeadStateInfo {
                 state: lead_state_label(alive, i.turn.busy, i.stopped).into(),
@@ -779,6 +786,7 @@ pub async fn lead_state(
                 context_tokens: i.last_context_tokens,
                 window: i.last_window,
                 model: i.last_model.clone(),
+                reasoning_effort: i.last_reasoning.clone(),
                 mcp_servers: i.last_mcp_servers.clone(),
                 tools: i.last_tools.clone(),
             })
@@ -807,13 +815,38 @@ pub async fn lead_session_meta(
     // Ticket BEFORE gathering: a slow probe overlapping a fresher one must not
     // roll usage back when it finally lands (see absorb_probe_meta).
     let ticket = engine::take_probe_ticket(&app, thread_id, None).await;
-    let snap = crate::session_meta::gather(
+    let mut snap = crate::session_meta::gather(
         &t.lead_tool,
         &cwd.to_string_lossy(),
         native.as_deref(),
         &command,
     )
     .await;
+    // ACP tools: MCP is what Weft injected on session/new — read engine cache.
+    // Also backfill model/reasoning from the live engine (session/new configOptions).
+    // Use LeadChatState::get (same as lead_state). NEVER write Some([]) when the
+    // engine is missing — absorb_probe_meta would treat that as freshest empty
+    // and wipe last_mcp_servers on a live engine race / ticket ordering quirk.
+    if crate::lead_chat::engine::is_acp_tool(&t.lead_tool) {
+        if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
+            let g = eng.lock().await;
+            // Some(list) even when only Weft-internal servers (frontend filters
+            // those) → mcpAuthoritative so the panel shows "none" not "pending".
+            snap.mcp_servers = Some(g.last_mcp_servers.clone());
+            if snap.model.is_none() {
+                snap.model = g.last_model.clone();
+            }
+            if snap.reasoning_effort.is_none() {
+                snap.reasoning_effort = g.last_reasoning.clone();
+            }
+            if snap.context_tokens.is_none() {
+                snap.context_tokens = g.last_context_tokens;
+            }
+            if snap.window.is_none() {
+                snap.window = g.last_window;
+            }
+        }
+    }
     // Probe results feed the engine cache + persisted snapshot: codex/opencode
     // model/window/MCP only exist here, never in engine events.
     engine::absorb_probe_meta(&app, &db, thread_id, None, ticket, &snap).await;
@@ -869,6 +902,17 @@ pub async fn discover_slash(
             "codex" => {
                 crate::codex_slash::discover_commands_for_cwd(std::path::Path::new(&sess.cwd)).await
             }
+            t if crate::acp::backend_for(t).is_some() => {
+                // ACP tools populate slash_commands via available_commands_update.
+                let eng = match state.get(sid as i64) {
+                    Some(eng) => eng,
+                    None => worker_engine(&app, &db, sid)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                };
+                let cmds = eng.lock().await.slash_commands.clone();
+                cmds
+            }
             _ => vec![],
         });
     }
@@ -908,6 +952,7 @@ pub async fn discover_slash(
                         cmds
                     }
                 }
+                t if crate::acp::backend_for(t).is_some() => live,
                 _ => live,
             };
             if !discovered.is_empty() {
@@ -1451,6 +1496,7 @@ pub(crate) async fn chat_open_worker_impl(
                 pending_command_refresh: false,
                 last_context_tokens: None,
                 last_model: None,
+                last_reasoning: None,
                 last_window: None,
                 last_mcp_servers: vec![],
                 last_tools: vec![],
@@ -1460,10 +1506,13 @@ pub(crate) async fn chat_open_worker_impl(
                 tool_rows: std::collections::HashMap::new(),
                 stopped: sess.status == "stopped",
                 codex_client: None,
+        acp_client: None,
+        acp_pending_asks: Vec::new(),
                 turn_user_row: None,
                 last_assistant_uuid: None,
                 rewinding: false,
                 quota_failover_committing: false,
+        tearing_down: false,
                 worktree_id: Some(wt.id),
             };
             // Restore the last persisted meta snapshot so the Session panel is
@@ -1584,6 +1633,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         pending_command_refresh: false,
         last_context_tokens: None,
         last_model: None,
+        last_reasoning: None,
         last_window: None,
         last_mcp_servers: vec![],
         last_tools: vec![],
@@ -1593,10 +1643,13 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         tool_rows: std::collections::HashMap::new(),
         stopped: sess.status == "stopped",
         codex_client: None,
+        acp_client: None,
+        acp_pending_asks: Vec::new(),
         turn_user_row: None,
         last_assistant_uuid: None,
         rewinding: false,
         quota_failover_committing: false,
+        tearing_down: false,
         // One cheap lookup at engine build so send's admission can honor a
         // worktree-level restore reservation without a per-send DB query.
         worktree_id: repo::worktree_for(db, sess.direction_id, sess.repo_id)
@@ -1720,10 +1773,15 @@ pub async fn lead_rewind(
         .map_err(|e| e.to_string())
 }
 
-/// The three coding-agent identities weft actually drives. `switch_lead_tool`/
+/// The coding-agent identities weft actually drives. `switch_lead_tool`/
 /// `switch_worker_tool` reject anything else up front — a typo'd tool name
 /// must fail loudly here, not deep inside a spawn as a raw "No such file".
-const KNOWN_TOOLS: &[&str] = &["claude", "codex", "opencode"];
+///
+/// Aliased from `crate::tools::TOOLS` rather than re-listed: this used to be
+/// its own hard-coded triple, so every engine added to the picker (omp, via
+/// the ACP backend registry) stayed un-switchable until someone remembered to
+/// edit this line too. See that constant for the full reasoning.
+const KNOWN_TOOLS: &[&str] = &crate::tools::TOOLS;
 
 /// Blank → None (a cleared/never-set override), trimmed otherwise. Mirrors how
 /// `set_tool_command` treats an empty alias as "no override" rather than

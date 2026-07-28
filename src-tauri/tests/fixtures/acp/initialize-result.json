@@ -1,0 +1,36 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "protocolVersion": 1,
+    "agentInfo": {
+      "name": "oh-my-pi",
+      "title": "Oh My Pi",
+      "version": "17.1.1"
+    },
+    "authMethods": [
+      {
+        "id": "agent",
+        "name": "Use existing local credentials",
+        "description": "Authenticate via the provider keys/OAuth state already configured under ~/.omp."
+      }
+    ],
+    "agentCapabilities": {
+      "loadSession": true,
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "promptCapabilities": {
+        "embeddedContext": true,
+        "image": true
+      },
+      "sessionCapabilities": {
+        "list": {},
+        "fork": {},
+        "resume": {},
+        "close": {}
+      }
+    }
+  }
+}

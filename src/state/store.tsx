@@ -169,6 +169,8 @@ function notifySendFailed(error: unknown) {
   let msg: string;
   if (raw === "queue_full") {
     msg = i18n.t("lead.queueFull");
+  } else if (raw.includes("acp_session_open_failed")) {
+    msg = i18n.t("session.acpSessionOpenFailed");
   } else if (raw.includes("engine_switch_in_progress")) {
     msg = i18n.t("session.switchInProgress");
   } else {
@@ -1829,7 +1831,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           [p.thread_id]: applyLeadConsumed(m[p.thread_id] ?? [], p.message_id, p.consumed_at),
         }));
       } else if (p.type === "activity") {
-        const act = { name: p.name, summary: p.summary };
+        // Empty name = explicit clear (thinking → first answer token).
+        const act = p.name ? { name: p.name, summary: p.summary } : null;
         if (p.session_id != null) {
           const sid = p.session_id;
           setWorkerActivity((a) => ({ ...a, [sid]: act }));
@@ -1961,9 +1964,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
       try {
         const cmds = await api.discoverSlash(threadId, null);
-        if (cmds.length > 0) {
-          setLeadSlash((s) => ({ ...s, [threadId]: cmds }));
-        }
+        // Same reasoning as the worker path below: an empty list cannot be
+        // told apart from a failed discovery, so it must not clear a palette
+        // that is already populated.
+        if (cmds.length > 0) setLeadSlash((s) => ({ ...s, [threadId]: cmds }));
       } catch (e) {
         /* slash discovery is best-effort */
         console.error(e);
@@ -2025,7 +2029,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // the only source of context/model/MCP until the next turn.
       setLeadMeta((m) => ({
         ...m,
-        [threadId]: fillMetaHoles(m[threadId], metaFromSnapshot(st)),
+        [threadId]: fillMetaHoles(
+          m[threadId],
+          metaFromSnapshot({
+            ...st,
+            // Live engine cache is an MCP reading. Stopped/missing engines that
+            // only hydrated model from disk must not wipe pending MCP rows.
+            mcp_known: st.state === "idle" || st.state === "busy",
+          }),
+        ),
       }));
     } catch (e) {
       /* engine state is cosmetic at load time */
@@ -2045,7 +2057,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     void api
       .discoverSlash(null, sessionId)
       .then((cmds) => {
-        if (cmds.length > 0) setWorkerSlash((s) => ({ ...s, [sessionId]: cmds }));
+        // Enforce the best-effort contract stated above instead of only
+        // documenting it. `discoverSlash` returns an empty list for an
+        // authoritative empty palette AND for startup / HTTP / parse failures
+        // — opencode's live `GET /command` can fail transiently — and the two
+        // are indistinguishable from here. Overwriting on empty therefore wiped
+        // a working palette after any hiccup. Keeping a stale-but-valid list
+        // costs at most a few extra entries; clearing it costs the feature.
+        if (cmds.length === 0) return;
+        setWorkerSlash((s) => ({ ...s, [sessionId]: cmds }));
       })
       .catch(() => {});
   }, []);

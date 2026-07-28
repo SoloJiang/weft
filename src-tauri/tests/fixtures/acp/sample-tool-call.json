@@ -1,0 +1,19 @@
+{
+  "sessionUpdate": "tool_call",
+  "toolCallId": "call-fb75add5-d66b-4754-8596-2092291de102-0|fc_8dd84108-a3e5-9b2a-910c-fb23fbfc059f_0",
+  "title": "$ echo TOOL_OK",
+  "kind": "execute",
+  "status": "pending",
+  "rawInput": {
+    "command": "echo TOOL_OK"
+  },
+  "content": [
+    {
+      "type": "content",
+      "content": {
+        "type": "text",
+        "text": "$ echo TOOL_OK"
+      }
+    }
+  ]
+}

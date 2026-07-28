@@ -20,6 +20,7 @@ import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { PermissionConfirmationCard } from "../components/ConfirmationCard";
 import { routeLabelKey, routeReasonKey, routeToolName } from "../lib/engineRoutingDisplay";
 import { needsRoutingControlOf } from "./needsRoutingControl";
+import { noticeTokenKey } from "../lib/noticeTokens";
 import { ASK_CARD_TONE, ASK_DOT_TONE, NOTICE_FOOTER_VIEW } from "./needsCardView";
 
 export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
@@ -195,6 +196,12 @@ export function PermissionRow({ ask }: { ask: PermissionAsk }) {
   );
 }
 
+function askBodyText(t: TFunction, text: string): string {
+  const key = noticeTokenKey(text);
+  if (key) return t(key);
+  return text;
+}
+
 function NoticeFooter({
   item,
   retrying,
@@ -295,7 +302,7 @@ export function AskRow({ item }: { item: NeedItem }) {
       </div>
 
       <p className="px-3.5 pb-3 pt-1.5 text-[14px] leading-relaxed text-ink">
-        {item.text}
+        {askBodyText(t, item.text)}
       </p>
 
       {item.kind === "question" ? (

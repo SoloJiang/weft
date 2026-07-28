@@ -148,6 +148,8 @@ pub enum Push {
         tools: Vec<String>,
         model: Option<String>,
         window: Option<u64>,
+        #[serde(default)]
+        mcp_known: bool,
     },
     /// The tool call currently executing — transient: rendered while it runs,
     /// replaced by the next one, cleared by the Turn event. Never persisted.
@@ -432,7 +434,10 @@ fn hidden_delivery(tool: &str, busy: bool, has_stdin: bool, stopped: bool) -> Hi
         HiddenDelivery::Noop
     } else if busy {
         HiddenDelivery::Queue
-    } else if per_turn(tool) {
+    } else if per_turn(tool) || is_acp_tool(tool) {
+        // Per-turn tools and ACP connection tools have no resident stdin when
+        // idle — both need a turn spawn (ACP → spawn_acp_turn; per-turn →
+        // spawn_turn / codex appserver redirect in send_hidden_inner).
         HiddenDelivery::SpawnTurn
     } else if has_stdin {
         HiddenDelivery::WriteResident
@@ -698,6 +703,21 @@ fn emit_turn_state(
     );
 }
 
+/// Whether a HIDDEN turn (a bus wake, a plumbing delivery) may start now.
+///
+/// The visible path asks `send_reservation_valid`; hidden delivery never passes
+/// through it, so the teardown reservation has to be checked here too. Without
+/// this, a teardown holding `tearing_down` — which has already cleared
+/// `turn.busy` and `interrupting` and bumped the epoch — is invisible to a bus
+/// wake, which then starts a fresh native session mid-cleanup and has its
+/// native id cleared and an idle state emitted over it by the older reset.
+///
+/// Split out rather than inlined at both call sites so the two entry points
+/// cannot drift, and so the rule is testable without an `AppHandle`.
+fn hidden_turn_admissible(inner: &EngineInner) -> bool {
+    !inner.stopped && !inner.tearing_down
+}
+
 async fn begin_hidden_turn(app: &AppHandle, db: &Db, inner: &mut EngineInner) -> i32 {
     let turn_id = mark_hidden_turn_started(inner);
     crate::power::on_turn_began(app);
@@ -728,6 +748,46 @@ fn queue_hidden_delivery(app: &AppHandle, inner: &mut EngineInner, out: Outgoing
 /// `status` distinguishes WHY the turn died: "error" for a genuine failure,
 /// "interrupted" when a stop/interrupt canceled it (a guard-canceled spawn must
 /// not be reported as an agent failure).
+/// Drain the consumer for `session_id`, then finalize every row this turn left
+/// open, as `status`.
+///
+/// The queued-prompt error path skipped both. `reset_failed_hidden_turn` clears
+/// `inner.current` outright, so a follow-up prompt that had already streamed
+/// text before its JSON-RPC request failed left that row `streaming` in the DB
+/// with nothing to ever close it — and updates still sitting in the consumer
+/// could arrive after the turn was reset and attach to an idle session. The
+/// first-prompt path gets this via `acp_drain_then_end`; this is the same
+/// sequence, in the same order, for the failure branch.
+async fn acp_drain_and_finalize_open_rows(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    client: &crate::acp::runtime::ClientHandle,
+    session_id: &str,
+    status: &str,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if client
+        .send_session_event(
+            session_id,
+            crate::acp::runtime::SessionEvent::DrainBarrier(tx),
+        )
+        .await
+    {
+        // Bounded, same as the success path: a gone consumer must not hang this.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+    }
+    let mut inner = eng.lock().await;
+    let thread_id = inner.thread_id;
+    let orphans: Vec<(i32, serde_json::Value)> =
+        inner.tool_rows.drain().map(|(_, v)| v).collect();
+    finalize_orphan_tool_rows(app, db, thread_id, orphans, status).await;
+    finalize_open_texts(app, db, &mut inner, status).await;
+    if inner.current.is_some() {
+        finalize_current_text(app, db, &mut inner, status).await;
+    }
+}
+
 async fn rollback_failed_turn(
     app: &AppHandle,
     db: &Db,
@@ -1640,6 +1700,8 @@ pub struct EngineInner {
     /// 解析出 mcp/model/window,turn 结束更新 context_tokens)。
     pub last_context_tokens: Option<u64>,
     pub last_model: Option<String>,
+    /// Reasoning effort / thinking level from ACP configOptions or updates.
+    pub last_reasoning: Option<String>,
     pub last_window: Option<u64>,
     pub last_mcp_servers: Vec<super::proto::McpServer>,
     pub last_tools: Vec<String>,
@@ -1664,6 +1726,13 @@ pub struct EngineInner {
     /// Per-session `codex app-server` connection (app-server transport only),
     /// spawned lazily on the first turn with this session's `-c mcp_servers` args.
     pub codex_client: Option<crate::codex_app_server::Client>,
+    /// Per-session ACP runtime handle (omp and future ACP backends). The
+    /// underlying child is process-global per backend; this Option means "this
+    /// engine has subscribed at least one session on that client".
+    pub acp_client: Option<crate::acp::runtime::ClientHandle>,
+    /// In-flight AskRegistry ids for ACP `session/request_permission` cards.
+    /// Cancelled on hard stop so a late Always/Full cannot grant after takeover.
+    pub acp_pending_asks: Vec<u64>,
     /// Rewind anchor bookkeeping for the in-flight turn: the user row that
     /// opened it. Written with the turn's native anchor at a clean TurnEnd
     /// (claude: `last_assistant_uuid`; codex app-server: the turn id).
@@ -1682,6 +1751,9 @@ pub struct EngineInner {
     /// set, new sends fail visibly rather than starting a healthy turn that
     /// the imminent switch would interrupt.
     pub quota_failover_committing: bool,
+    /// Set only for the window in which [`stop_quiet`] has released the engine
+    /// lock to await ACP cancel/unsubscribe. See `send_reservation_valid`.
+    pub tearing_down: bool,
     /// The worktree this worker runs in (None for the lead console): lets
     /// send's admission honor a worktree-level restore reservation without a
     /// DB lookup. Sibling sessions of one worktree share the same id.
@@ -1699,6 +1771,8 @@ pub struct PersistedMeta {
     pub context_tokens: Option<u64>,
     pub window: Option<u64>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub mcp_servers: Vec<super::proto::McpServer>,
     #[serde(default)]
@@ -1795,6 +1869,7 @@ async fn persist_engine_meta(db: &Db, inner: &EngineInner) {
         context_tokens: inner.last_context_tokens,
         window: inner.last_window,
         model: inner.last_model.clone(),
+        reasoning_effort: inner.last_reasoning.clone(),
         mcp_servers: inner.last_mcp_servers.clone(),
         tools: inner.last_tools.clone(),
     };
@@ -1862,6 +1937,7 @@ pub async fn absorb_probe_meta(
             context_tokens: inner.last_context_tokens,
             window: inner.last_window,
             model: inner.last_model.clone(),
+            reasoning_effort: inner.last_reasoning.clone(),
             mcp_servers: inner.last_mcp_servers.clone(),
             tools: inner.last_tools.clone(),
         };
@@ -1869,6 +1945,9 @@ pub async fn absorb_probe_meta(
             inner.last_context_tokens = m.context_tokens;
             inner.last_window = m.window;
             inner.last_model = m.model.clone();
+            if m.reasoning_effort.is_some() {
+                inner.last_reasoning = m.reasoning_effort.clone();
+            }
             inner.last_mcp_servers = m.mcp_servers.clone();
             persist_engine_meta(db, &inner).await;
         }
@@ -1922,6 +2001,7 @@ pub fn apply_persisted_meta(inner: &mut EngineInner, json: &str) {
     inner.last_context_tokens = m.context_tokens;
     inner.last_window = m.window;
     inner.last_model = m.model;
+    inner.last_reasoning = m.reasoning_effort;
     inner.last_mcp_servers = m.mcp_servers;
     inner.last_tools = m.tools;
 }
@@ -2065,7 +2145,9 @@ async fn ensure_running_locked(
     if inner.stopped {
         return Ok(None);
     }
-    if per_turn(&inner.tool) {
+    if per_turn(&inner.tool) || is_acp_tool(&inner.tool) {
+        // Per-turn and ACP connection tools have no resident child to keep
+        // alive here — turns are driven by spawn_turn / spawn_acp_turn.
         return Ok(None);
     }
     if inner.tool != "claude" {
@@ -2341,6 +2423,13 @@ fn send_reservation_valid(inner: &EngineInner, ctx: &SendContext) -> bool {
     if inner.stopped {
         return false;
     }
+    // A teardown that has released the lock for ACP I/O is going to overwrite
+    // `turn` when it reacquires it. Admitting work into that window loses it
+    // silently — the epoch check below cannot catch this one, because a send
+    // arriving mid-teardown captures the ALREADY-bumped epoch and matches.
+    if inner.tearing_down {
+        return false;
+    }
     // A stop/reset since Phase 1 — even one immediately followed by a restart that
     // cleared `stopped` and set `busy` again — bumps reset_epoch (stop_quiet). That
     // invalidates this send so it can't be delivered onto a turn the user canceled.
@@ -2441,7 +2530,22 @@ pub async fn send(
         )
     };
     if skill_pending || cmd_now {
-        let (tid, _sid, _texts, orphans, _was_busy) = stop_quiet(eng).await;
+        let tool_for_shutdown = eng.lock().await.tool.clone();
+        let StopQuietOutcome {
+            thread_id: tid,
+            orphans,
+            acp_asks,
+            ..
+        } = stop_quiet(eng).await;
+        if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
+            for id in acp_asks {
+                asks.inner().cancel(id);
+            }
+        }
+        // Do NOT backend-wide reap the ACP pool — other sessions may still be
+        // mid-turn on another pin. stop_quiet already cancelled+unsubscribed
+        // THIS engine; next send uses client(backend, new_program).
+        let _ = (cmd_now, tool_for_shutdown);
         {
             let mut g = eng.lock().await;
             g.pending_skill_refresh = false;
@@ -2715,7 +2819,9 @@ pub async fn send(
     // snapshot (which only decided the row's optimistic status). The lock drops
     // before any turn-spawning awaits.
     let is_codex_appserver = ctx.tool == "codex" && codex_appserver_enabled();
-    let spawn_now = ctx.direct && per_turn(&ctx.tool) && !is_codex_appserver;
+    let is_acp = is_acp_tool(&ctx.tool);
+    let is_connection = is_codex_appserver || is_acp;
+    let spawn_now = ctx.direct && per_turn(&ctx.tool) && !is_connection;
     // Set when a queued send found the engine idle and claimed a fresh turn.
     let mut promoted: Option<i32> = None;
     {
@@ -2738,7 +2844,7 @@ pub async fn send(
                 "send could not be delivered: the turn ended or the engine stopped while it was persisting"
             ));
         }
-        if ctx.direct && !spawn_now && !is_codex_appserver {
+        if ctx.direct && !spawn_now && !is_connection {
             if let Err(e) = write_user(&mut inner, &out).await {
                 drop(inner);
                 rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, "error").await;
@@ -2780,7 +2886,7 @@ pub async fn send(
                 // Under the lock for the same ordering reason as Phase 1's direct
                 // write: a concurrent stop's "stopped" write must not be overtaken.
                 persist_activity(db, inner.session_id, inner.thread_id, "running").await;
-                if !per_turn(&ctx.tool) && !is_codex_appserver {
+                if !per_turn(&ctx.tool) && !is_connection {
                     // Resident tool: deliver through the live stdin under this
                     // lock, exactly like a direct resident send.
                     if let Err(e) = write_user(&mut inner, &out).await {
@@ -2855,6 +2961,20 @@ pub async fn send(
             rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, status).await;
             return Err(e);
         }
+    } else if ctx.direct && is_acp {
+        if let Err(e) = spawn_acp_turn(
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            out,
+            Some(ctx.reset_epoch),
+        )
+        .await
+        {
+            let status = spawn_failure_status(eng, &ctx).await;
+            rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, status).await;
+            return Err(e);
+        }
     } else if let Some(pturn) = promoted {
         // The promoted send owns a fresh turn now. Flip its row to delivered
         // (complete + delivery seq + finalize emit, same as a drained queue item),
@@ -2872,7 +2992,7 @@ pub async fn send(
             turn: pturn,
             ..ctx.clone()
         };
-        if per_turn(&ctx.tool) && !is_codex_appserver {
+        if per_turn(&ctx.tool) && !is_connection {
             if let Err(e) = spawn_turn(
                 app.clone(),
                 db.clone(),
@@ -2888,6 +3008,20 @@ pub async fn send(
             }
         } else if is_codex_appserver {
             if let Err(e) = spawn_codex_turn_or_exec(
+                app.clone(),
+                db.clone(),
+                eng.clone(),
+                dispatched,
+                Some(ctx.reset_epoch),
+            )
+            .await
+            {
+                let status = spawn_failure_status(eng, &promoted_ctx).await;
+                rollback_failed_visible_turn(app, db, eng, pturn, row_id, &content, status).await;
+                return Err(e);
+            }
+        } else if is_acp {
+            if let Err(e) = spawn_acp_turn(
                 app.clone(),
                 db.clone(),
                 eng.clone(),
@@ -3136,6 +3270,1145 @@ fn codex_first_turn_text(system_prompt: &str, message: &str, had_native: bool) -
     } else {
         message.to_string()
     }
+}
+
+
+pub(crate) fn is_acp_tool(tool: &str) -> bool {
+    crate::acp::backend_for(tool).is_some()
+}
+
+/// Drive a turn over the generic ACP runtime (omp today). Mirrors the
+/// connection-shaped codex app-server path: ensure session, subscribe a
+/// long-lived consumer once, then `session/prompt`.
+
+/// Clear a never-prompted first ACP native id (engine + DB) so the next send
+/// re-opens and still prepends the system prompt.
+async fn clear_acp_native_never_prompted(
+    _app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    session_id: Option<i32>,
+    thread_id: i32,
+) {
+    {
+        let mut g = eng.lock().await;
+        g.native_id = None;
+        g.acp_client = None;
+    }
+    if let Some(sid) = session_id {
+        let _ = repo::set_session_native_id_opt(db, sid, None).await;
+    } else {
+        let _ = repo::set_lead_native_id_opt(db, thread_id, None).await;
+    }
+}
+
+async fn spawn_acp_turn(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    out: Outgoing,
+    expected_epoch: Option<u64>,
+) -> anyhow::Result<()> {
+    let (native, cwd, sid, thread_id_i, system_prompt, tool, command, ask_dir) = {
+        let i = eng.lock().await;
+        // `tearing_down` included as defence in depth: the hidden path already
+        // refuses, but this is the one gate every ACP turn passes through.
+        if i.stopped
+            || i.interrupting
+            || i.tearing_down
+            || expected_epoch.is_some_and(|e| e != i.reset_epoch)
+        {
+            return Err(anyhow::anyhow!("engine stopped; not starting an ACP turn"));
+        }
+        (
+            i.native_id.clone(),
+            i.cwd.clone(),
+            i.session_id,
+            i.thread_id,
+            i.system_prompt.clone(),
+            i.tool.clone(),
+            i.command.clone(),
+            i.ask_dir.clone(),
+        )
+    };
+    let backend = crate::acp::backend_for(&tool)
+        .ok_or_else(|| anyhow::anyhow!("not an ACP tool: {tool}"))?;
+    let program = crate::tool_command::effective(command.as_deref(), &tool);
+    let client = crate::acp::runtime::client(backend.id(), &program).await?;
+
+    // MCP list: mirror lead_engine inject branches (thread.kind), not ask_dir alone
+    // — lead/concierge/curator all store ask_dir="lead".
+    let base = app
+        .try_state::<crate::BusBase>()
+        .map(|b| b.0.clone())
+        .unwrap_or_default();
+    let mcp = if base.is_empty() {
+        vec![]
+    } else if sid.is_none() {
+        // Lead-kind engine: choose MCP from thread kind.
+        let kind = repo::get_thread(&db, thread_id_i)
+            .await
+            .ok()
+            .flatten()
+            .map(|th| th.kind)
+            .unwrap_or_default();
+        match kind.as_str() {
+            // Concierge: weft_global only (never bus).
+            "concierge" => crate::bus::inject::acp_mcp_servers(
+                &base, thread_id_i, "lead", false, false, true, false,
+            ),
+            // Curator: curator MCP + bus under LEAD identity.
+            "curator" => crate::bus::inject::acp_mcp_servers(
+                &base, thread_id_i, crate::bus::LEAD, true, false, false, true,
+            ),
+            // Issue lead: planner + bus.
+            _ => crate::bus::inject::acp_mcp_servers(
+                &base, thread_id_i, crate::bus::LEAD, true, true, false, false,
+            ),
+        }
+    } else {
+        // Worker: bus only under direction id.
+        crate::bus::inject::acp_mcp_servers(
+            &base, thread_id_i, &ask_dir, true, false, false, false,
+        )
+    };
+
+    let had_native = native.is_some();
+    let prior_native = native.clone();
+    // Keep mcp specs for Session Info seeding (moved into open calls via clone).
+    let mcp_for_meta = mcp.clone();
+    let (session_id, open_model, open_thinking) = match native {
+        Some(id) => {
+            // Prefer resume; fall back to load (hand-cut rewind files).
+            // Do NOT keep a stale id when both fail — next send would target an
+            // unopened session forever.
+            match client.resume_session(&id, &cwd, mcp.clone()).await {
+                Ok(open) => (open.session_id, open.model, open.thinking),
+                Err(resume_err) => match client.load_session(&id, &cwd, mcp.clone()).await {
+                    Ok(sid) => (sid, None, None),
+                    Err(load_err) => {
+                        eprintln!(
+                            "[weft][acp] resume failed ({resume_err}); load also failed ({load_err})"
+                        );
+                        // Actually do what the comment above says. Returning
+                        // while the id survives in the engine AND the DB is
+                        // what made a deleted or unloadable session file
+                        // permanent: every later send re-entered this same
+                        // branch and answered `acp_session_open_failed`
+                        // forever. Cleared, the next send takes the `None`
+                        // arm and opens a fresh session.
+                        //
+                        // Tear the RUNTIME route down too, the same way every
+                        // other abandonment path does. Clearing only the ids
+                        // leaves the old `SessionRoute` and its consumer
+                        // registered: they keep delivering late text, tool and
+                        // permission events into this engine after the retry
+                        // opened a different session, and the surviving route
+                        // also pins the pooled client so it can never retire.
+                        let _ = client.cancel(&id).await;
+                        client.unsubscribe(&id).await;
+                        clear_acp_native_never_prompted(&app, &db, &eng, sid, thread_id_i).await;
+                        return Err(anyhow::anyhow!("acp_session_open_failed"));
+                    }
+                },
+            }
+        }
+        None => {
+            let open = match client.new_session(&cwd, mcp).await {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("[weft][acp] session/new failed: {e}");
+                    return Err(anyhow::anyhow!("acp_session_open_failed"));
+                }
+            };
+            (open.session_id, open.model, open.thinking)
+        }
+    };
+    {
+        let mut g = eng.lock().await;
+        if let Some(model) = open_model {
+            g.last_model = Some(model);
+        }
+        if let Some(thinking) = open_thinking {
+            g.last_reasoning = Some(thinking);
+        }
+        // Seed MCP list from what we injected so Session Info is not empty after
+        // the first turn (OMP has no separate mcp discovery event).
+        if !mcp_for_meta.is_empty() {
+            // Refresh names from this turn's inject set (idempotent).
+            g.last_mcp_servers = mcp_for_meta
+                .into_iter()
+                .map(|s| super::proto::McpServer {
+                    name: s.name,
+                    status: "connected".into(),
+                })
+                .collect();
+        }
+        // Always push Init after ACP open so Session Info hydrates MCP/model
+        // immediately (probe gather used to return empty defaults for omp).
+        let _ = app.emit(
+            EVENT,
+            Push::Init {
+                thread_id: g.thread_id,
+                session_id: g.session_id,
+                native_id: session_id.clone(),
+                slash_commands: g.slash_commands.clone(),
+                mcp_servers: g.last_mcp_servers.clone(),
+                tools: g.last_tools.clone(),
+                model: g.last_model.clone(),
+                window: g.last_window,
+                mcp_known: true,
+            },
+        );
+    }
+
+    // If resume/load minted a replacement id, drop the prior route so late
+    // notifications cannot mutate this engine under the old sessionId.
+    if let Some(prev) = prior_native.as_deref() {
+        if prev != session_id.as_str() {
+            let _ = client.cancel(prev).await;
+            client.unsubscribe(prev).await;
+        }
+    }
+
+    // Always resubscribe when the runtime lost the route (child restart /
+    // shutdown clears sessions) even if the engine still holds acp_client.
+    let need_sub = !client.is_subscribed(&session_id).await;
+    if need_sub {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        client.subscribe(&session_id, tx).await?;
+        // Capture the generation HERE, not inside the spawned task. Read after
+        // the spawn, the consumer records whatever epoch is current when it
+        // first takes the lock — so a Stop, rewind, or engine switch landing in
+        // that gap makes it adopt the NEW epoch and treat already-buffered
+        // events from the abandoned session as live, appending or finalizing
+        // stale text onto a session that was stopped or switched.
+        let route_epoch = eng.lock().await.reset_epoch;
+        let (a, d, e, c, s) = (
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            client.clone(),
+            session_id.clone(),
+        );
+        tauri::async_runtime::spawn(
+            async move { acp_consumer(a, d, e, c, s, rx, route_epoch).await },
+        );
+    }
+
+    let stop_won = {
+        let mut g = eng.lock().await;
+        // Ordinary composer Stop sets `interrupting` without bumping epoch until
+        // the delayed force reset — must not publish acp_client or arm prompt.
+        let won = g.stopped
+            || g.interrupting
+            || expected_epoch.is_some_and(|e| e != g.reset_epoch);
+        if !won {
+            g.acp_client = Some(client.clone());
+            if g.native_id.as_deref() != Some(session_id.as_str()) {
+                g.native_id = Some(session_id.clone());
+            }
+        }
+        won
+    };
+    if stop_won {
+        // Subscribe may already have installed a route before acp_client was
+        // published; stop_quiet couldn't see it. Tear the route down or the
+        // next send reuses a stale-epoch consumer that drops every update.
+        let _ = client.cancel(&session_id).await;
+        client.unsubscribe(&session_id).await;
+        // First open never got session/prompt — drop native id so the next
+        // send re-opens and still prepends the system prompt.
+        if prior_native.is_none() {
+            clear_acp_native_never_prompted(&app, &db, &eng, sid, thread_id_i).await;
+        }
+        return Err(anyhow::anyhow!("engine stopped during ACP connect"));
+    }
+
+    // Persist whenever open id differs from the id we started with — resume/
+    // load can mint a replacement even when had_native was true.
+    if prior_native.as_deref() != Some(session_id.as_str()) {
+        if let Some(sid) = sid {
+            let _ = repo::set_session_native_id(&db, sid, &session_id).await;
+        } else {
+            let _ = repo::set_lead_native_id(&db, thread_id_i, &session_id).await;
+        }
+    }
+
+    let text = if !had_native && !system_prompt.is_empty() {
+        format!("{system_prompt}\n\n{}", out.text)
+    } else {
+        out.text.clone()
+    };
+
+    // Non-blocking: codex-style. Launch prompt on a background task so send()
+    // returns while the consumer streams; finalize when prompt resolves.
+    // Final stop check immediately before arming the prompt task — a takeover
+    // between stop_won and here must not start session/prompt after cancel.
+    let prompt_epoch = {
+        let g = eng.lock().await;
+        if g.stopped
+            || g.interrupting
+            || expected_epoch.is_some_and(|e| e != g.reset_epoch)
+        {
+            drop(g);
+            let _ = client.cancel(&session_id).await;
+            client.unsubscribe(&session_id).await;
+            if prior_native.is_none() {
+                clear_acp_native_never_prompted(&app, &db, &eng, sid, thread_id_i).await;
+            }
+            return Err(anyhow::anyhow!("engine stopped before ACP prompt"));
+        }
+        g.reset_epoch
+    };
+    let first_open = prior_native.is_none();
+    let (a, d, e, c, s, txt, imgs, first_open, sid_opt, tid) = (
+        app.clone(),
+        db.clone(),
+        eng.clone(),
+        client.clone(),
+        session_id.clone(),
+        text,
+        out.images.clone(),
+        first_open,
+        sid,
+        thread_id_i,
+    );
+    tauri::async_runtime::spawn(async move {
+        // Re-validate under the lock once more right before the RPC — stop may
+        // have landed while this task was scheduled.
+        {
+            let g = e.lock().await;
+            if g.stopped || g.interrupting || g.reset_epoch != prompt_epoch {
+                drop(g);
+                let _ = c.cancel(&s).await;
+                c.unsubscribe(&s).await;
+                if first_open {
+                    clear_acp_native_never_prompted(&a, &d, &e, sid_opt, tid).await;
+                }
+                return;
+            }
+        }
+        // Soft thinking chip for the pre-token gap. Many models (incl. current
+        // omp/grok) do not stream agent_thought_chunk; without this the UI only
+        // shows a generic "working" pulse until the first answer token.
+        {
+            let (thread_id, session_id) = {
+                let g = e.lock().await;
+                (g.thread_id, g.session_id)
+            };
+            let _ = a.emit(
+                EVENT,
+                Push::Activity {
+                    thread_id,
+                    session_id,
+                    name: "thinking".into(),
+                    summary: String::new(),
+                },
+            );
+        }
+        match c.prompt(&s, &txt, &imgs).await {
+            Ok(outcome) => {
+                let (cancelled, stopped) = {
+                    let g = e.lock().await;
+                    (
+                        outcome.cancelled || g.interrupting || g.stopped,
+                        g.stopped || g.reset_epoch != prompt_epoch,
+                    )
+                };
+                if stopped {
+                    // Hard stop already owns terminal state — do not emit idle.
+                    return;
+                }
+                acp_drain_then_end(
+                    a.clone(),
+                    d.clone(),
+                    e.clone(),
+                    c.clone(),
+                    s.clone(),
+                    outcome.is_error,
+                    cancelled,
+                    outcome.usage.clone(),
+                    prompt_epoch,
+                )
+                .await;
+            }
+            Err(err) => {
+                eprintln!("[weft][acp] prompt failed: {err}");
+                let (interrupting, stopped) = {
+                    let g = e.lock().await;
+                    (
+                        g.interrupting,
+                        g.stopped || g.reset_epoch != prompt_epoch,
+                    )
+                };
+                if stopped {
+                    return;
+                }
+                // The prompt is gone; its permission cards must go with it.
+                cancel_open_acp_asks(&a, &e).await;
+                acp_drain_then_end(
+                    a.clone(),
+                    d.clone(),
+                    e.clone(),
+                    c.clone(),
+                    s.clone(),
+                    true,
+                    interrupting,
+                    None,
+                    prompt_epoch,
+                )
+                .await;
+            }
+        }
+    });
+    // Stop pressed while we were connecting? Best-effort cancel.
+    if eng.lock().await.interrupting {
+        let _ = client.cancel(&session_id).await;
+    }
+    Ok(())
+}
+
+/// Cancel every permission card this turn left open, and stop tracking them.
+///
+/// A TRANSPORT failure — the child died, the connection dropped — ends the
+/// prompt while the consumer is still blocked on the `AskRegistry` receiver, so
+/// nothing else ever retires the card. It stays actionable for the full hour
+/// timeout, and answering it with Always or Full persists a standing grant for
+/// a request whose native session no longer exists. Cancelling also releases
+/// the consumer, which then replies `RejectOnce` into a dead connection —
+/// harmless, and the honest wire answer.
+async fn cancel_open_acp_asks(app: &AppHandle, eng: &EngineRef) {
+    let asks = std::mem::take(&mut eng.lock().await.acp_pending_asks);
+    if asks.is_empty() {
+        return;
+    }
+    if let Some(reg) = app.try_state::<crate::ask::AskRegistry>() {
+        for id in asks {
+            reg.inner().cancel(id);
+        }
+    }
+}
+
+/// Wait until the session consumer has drained events enqueued before the
+/// prompt result, then finalize. Prevents turn-end from racing late text/tool
+/// rows still in the mpsc buffer.
+async fn acp_drain_then_end(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    client: crate::acp::runtime::ClientHandle,
+    session_id: String,
+    is_error: bool,
+    cancelled: bool,
+    usage: Option<crate::acp::runtime::UsageBits>,
+    prompt_epoch: u64,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let sent = client
+        .send_session_event(&session_id, crate::acp::runtime::SessionEvent::DrainBarrier(tx))
+        .await;
+    if sent {
+        // Bounded wait: if the consumer is gone, don't hang finalize forever.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+    }
+    acp_emit_turn_end(app, db, eng, is_error, cancelled, usage, prompt_epoch).await;
+}
+
+/// Whether a DEQUEUED prompt may still be dispatched.
+///
+/// The epoch alone is not enough. `interrupt()` sets `interrupting` WITHOUT
+/// bumping the epoch — deliberately, so a queued message survives interrupting
+/// the current turn — and it sends `session/cancel` against whatever prompt is
+/// live. A Stop landing after `on_turn_end` promoted a queued item but before
+/// it is dispatched therefore cancels NOTHING (the old prompt has ended, the
+/// new one has not started), leaves the epoch untouched, and the dispatch went
+/// ahead: the user pressed Stop and a fresh turn ran anyway, executing tools
+/// until it finished on its own or the 8s forced reset fired.
+///
+/// `stopped` and `tearing_down` are included for the same reason they gate
+/// every other admission point — this is one of them.
+fn queued_dispatch_admissible(inner: &EngineInner, dequeue_epoch: u64) -> bool {
+    !inner.stopped
+        && !inner.interrupting
+        && !inner.tearing_down
+        && inner.reset_epoch == dequeue_epoch
+}
+
+async fn acp_emit_turn_end(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    is_error: bool,
+    cancelled: bool,
+    usage: Option<crate::acp::runtime::UsageBits>,
+    prompt_epoch: u64,
+) {
+    let mut pending_usage = usage;
+    let mut pending_error = is_error;
+    let mut pending_cancel = cancelled;
+    // Optional follow-up prompt after finalize (queue drain) — loop, not recurse.
+    let mut follow_up: Option<(crate::acp::runtime::ClientHandle, String, Outgoing, u64, i32)> =
+        None;
+    loop {
+        if let Some((client, sid, msg, dequeue_epoch, turn_id)) = follow_up.take() {
+            let admissible = {
+                let g = eng.lock().await;
+                queued_dispatch_admissible(&g, dequeue_epoch)
+            };
+            if !admissible {
+                rollback_failed_turn(&app, &db, &eng, turn_id, "interrupted").await;
+                finalize_dequeued_row(&app, &db, eng.lock().await.thread_id, &msg, "interrupted")
+                    .await;
+                break;
+            }
+            let thread_id = eng.lock().await.thread_id;
+            let session_id = eng.lock().await.session_id;
+            mark_queued_delivered(&app, &db, thread_id, session_id, &msg).await;
+            match client.prompt(&sid, &msg.text, &msg.images).await {
+                Ok(outcome) => {
+                    pending_usage = outcome.usage.clone();
+                    pending_error = outcome.is_error;
+                    pending_cancel = outcome.cancelled || eng.lock().await.interrupting;
+                    // Drain consumer before finalizing this queued turn (same as
+                    // first-prompt path via acp_drain_then_end).
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    if client
+                        .send_session_event(
+                            &sid,
+                            crate::acp::runtime::SessionEvent::DrainBarrier(tx),
+                        )
+                        .await
+                    {
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[weft][acp] flush prompt failed: {err}");
+                    let status = drain_failure_status(&eng, dequeue_epoch).await;
+                    // Same for a queued prompt that died mid-flight.
+                    cancel_open_acp_asks(&app, &eng).await;
+                    // Close what this prompt already streamed BEFORE resetting
+                    // the turn — the reset drops `inner.current` without
+                    // finalizing it, and un-drained consumer updates would
+                    // otherwise land on an already-idle session.
+                    acp_drain_and_finalize_open_rows(&app, &db, &eng, &client, &sid, status).await;
+                    rollback_failed_turn(&app, &db, &eng, turn_id, status).await;
+                    finalize_dequeued_row(&app, &db, thread_id, &msg, status).await;
+                    break;
+                }
+            }
+        }
+
+        let mut inner = eng.lock().await;
+        // Hard stop / takeover already wrote STATUS_STOPPED and bumped
+        // reset_epoch. A late cancelled prompt must not overwrite that with idle.
+        if inner.stopped || inner.reset_epoch != prompt_epoch {
+            drop(inner);
+            break;
+        }
+        let thread_id = inner.thread_id;
+        let session_id = inner.session_id;
+        // Prompt-result usage is billing counters (totalTokens/inputTokens),
+        // not the live context window. Context comes only from usage_update
+        // notifications (SessionEvent::Usage → last_context_tokens). Do not
+        // overwrite that here — OMP's totalTokens is ~2× used.
+        let _ = pending_usage;
+        persist_engine_meta(&db, &inner).await;
+        let status = if inner.interrupting || pending_cancel {
+            "interrupted"
+        } else if pending_error {
+            "error"
+        } else {
+            "complete"
+        };
+        inner.interrupting = false;
+        let orphans: Vec<(i32, serde_json::Value)> =
+            inner.tool_rows.drain().map(|(_, v)| v).collect();
+        finalize_orphan_tool_rows(&app, &db, thread_id, orphans, status).await;
+        let had_item_rows = !inner.open_texts.is_empty();
+        finalize_open_texts(&app, &db, &mut inner, status).await;
+        if inner.current.is_some() {
+            finalize_current_text(&app, &db, &mut inner, status).await;
+        } else if !had_item_rows && !inner.turn_saw_text {
+            if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
+                &db,
+                thread_id,
+                inner.session_id,
+                inner.turn_id,
+                status,
+            )
+            .await
+            {
+                let _ = app.emit(
+                    EVENT,
+                    Push::Message {
+                        thread_id,
+                        message: m,
+                    },
+                );
+            }
+        }
+        let next = inner.turn.on_turn_end();
+        inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
+        inner.last_assistant_uuid = None;
+        inner.turn_saw_text = false;
+        inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
+        let next_turn_id = if next.is_some() {
+            inner.turn_id += 1;
+            Some(inner.turn_id)
+        } else {
+            None
+        };
+        let dequeue_epoch = inner.reset_epoch;
+        let still_busy = inner.turn.busy;
+        let client = inner.acp_client.clone();
+        let native = inner.native_id.clone();
+        persist_activity(
+            &db,
+            inner.session_id,
+            thread_id,
+            if still_busy { "running" } else { "idle" },
+        )
+        .await;
+        inner.clock.on_turn_end(still_busy);
+        let _ = app.emit(
+            EVENT,
+            Push::Turn {
+                thread_id,
+                session_id: inner.session_id,
+                state: if still_busy { "busy" } else { "idle" }.into(),
+                recovered: false,
+                queue: queue_items(&inner.turn),
+            },
+        );
+        drop(inner);
+
+        let flush_stop_won = {
+            let g = eng.lock().await;
+            g.stopped || g.reset_epoch != dequeue_epoch
+        };
+        if flush_stop_won {
+            if let Some(turn_id) = next_turn_id {
+                rollback_failed_turn(&app, &db, &eng, turn_id, "interrupted").await;
+            }
+            if let Some(n) = next.as_ref() {
+                finalize_dequeued_row(&app, &db, thread_id, n, "interrupted").await;
+            }
+            break;
+        }
+        match (next, next_turn_id, client, native) {
+            (Some(n), Some(turn_id), Some(client), Some(sid)) => {
+                if let Some(qid) = n.queue_id {
+                    snapshot_turn_checkpoint(&app, &db, session_id, turn_id, qid).await;
+                }
+                follow_up = Some((client, sid, n, dequeue_epoch, turn_id));
+                pending_usage = None;
+                pending_error = false;
+                pending_cancel = false;
+                continue;
+            }
+            _ => break,
+        }
+    }
+}
+
+/// Worst-case tier across every path a file request named, or `pathless` when
+/// it named none.
+///
+/// The pathless verdict is per-verb rather than "ask `classify_file` with an
+/// empty path", because those two disagree in the direction that matters: a
+/// write with no target is still a write, but a READ with no target has
+/// established nothing at all and must not inherit `ReadOnly`.
+fn file_risk(
+    tool_name: &'static str,
+    paths: &[String],
+    pathless: crate::ask::RiskLevel,
+) -> crate::ask::RiskLevel {
+    if paths.is_empty() {
+        return pathless;
+    }
+    crate::ask::most_severe(paths.iter().map(|path| {
+        crate::ask::classify_risk(crate::ask::RiskSignal::File { tool_name, path })
+    }))
+}
+
+/// Reject an ACP permission request on the wire without a human verdict —
+/// used when teardown won the race and the card must not stand.
+async fn return_permission(
+    client: &crate::acp::runtime::ClientHandle,
+    request_id: &serde_json::Value,
+    options: &[serde_json::Value],
+) {
+    client
+        .reply_permission(request_id, options, crate::acp::Want::RejectOnce)
+        .await;
+}
+
+/// Risk tier for one ACP permission request (issue #101).
+///
+/// A file request is scored across EVERY path it names, worst tier wins. The
+/// first path used to decide alone, so a multi-file read whose leading entry
+/// was ordinary came out `ReadOnly` even when a later entry was a credential —
+/// and `auto_decision` releases `ReadOnly` asks under a read-only session or
+/// issue grant (issue #103), so that access would be approved without a human
+/// ever seeing the card.
+///
+/// A file request that named NO path is still classified by its verb: it goes
+/// through `classify_file` once with an empty path, rather than through
+/// `most_severe` of nothing, so a write stays a write.
+fn acp_permission_risk(
+    intent: &crate::acp::permission::PermissionIntent,
+    detail: &str,
+) -> crate::ask::RiskLevel {
+    use crate::acp::permission::PermissionIntent;
+    match intent {
+        PermissionIntent::Command(cmd) => {
+            crate::ask::classify_risk(crate::ask::RiskSignal::Command(cmd))
+        }
+        // A read that named nothing has established NOTHING. `classify_file`
+        // would answer `ReadOnly` from the verb alone, and a read-only session
+        // or issue grant releases `ReadOnly` without a card — so a sparse
+        // request whose target rides in `title`/`content` could read `.env` or
+        // an SSH key unseen. Same rule as `most_severe` of an empty set:
+        // "nothing to judge" is not evidence of safety.
+        PermissionIntent::Read { paths } => {
+            file_risk("Read", paths, crate::ask::RiskLevel::Unknown)
+        }
+        // A write that named nothing IS still a write: the verb alone
+        // establishes mutation, so the verb-derived tier is the honest floor.
+        PermissionIntent::Write { paths } => {
+            file_risk("Edit", paths, crate::ask::RiskLevel::Write)
+        }
+        PermissionIntent::Network => crate::ask::classify_risk(crate::ask::RiskSignal::Network),
+        PermissionIntent::Other { kind } => {
+            crate::ask::classify_risk(crate::ask::RiskSignal::Other {
+                tool_name: kind,
+                args_text: detail,
+            })
+        }
+    }
+}
+
+/// How much of the reasoning stream the busy-line chip shows.
+const THOUGHT_TAIL_CHARS: usize = 160;
+
+/// A bounded tail of one turn's reasoning text, for the busy-line chip.
+///
+/// Kept bounded rather than accumulated: a turn's whole `agent_thought_chunk`
+/// stream can be arbitrarily long, and re-collecting it into a `Vec<char>` on
+/// every chunk just to slice off the last [`THOUGHT_TAIL_CHARS`] made the work
+/// quadratic in the reasoning length — on the same single task that forwards
+/// tool progress and answer tokens, so a long reasoning turn could starve its
+/// own liveness signal and read as stalled. Trimming on push keeps both the
+/// buffer and the per-chunk work proportional to the display window.
+#[derive(Default)]
+struct ThoughtTail {
+    buf: String,
+    /// Whether anything was dropped off the front — the chip's leading
+    /// ellipsis. Not recoverable from `buf` once it has been trimmed to size.
+    elided: bool,
+}
+
+impl ThoughtTail {
+    fn push(&mut self, text: &str) {
+        self.buf.push_str(text);
+        // Bounded by the window plus THIS chunk, never by the turn so far.
+        let len = self.buf.chars().count();
+        if len <= THOUGHT_TAIL_CHARS {
+            return;
+        }
+        let excess = len - THOUGHT_TAIL_CHARS;
+        let cut = self
+            .buf
+            .char_indices()
+            .nth(excess)
+            .map(|(i, _)| i)
+            .unwrap_or(self.buf.len());
+        self.buf.drain(..cut);
+        self.elided = true;
+    }
+
+    fn summary(&self) -> String {
+        if self.elided {
+            return format!("…{}", self.buf);
+        }
+        self.buf.clone()
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.elided = false;
+    }
+}
+
+async fn acp_consumer(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    client: crate::acp::runtime::ClientHandle,
+    _session_id: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::acp::runtime::SessionEvent>,
+    // The engine generation this route was subscribed under — captured by the
+    // caller BEFORE this task was spawned, so it names the session that created
+    // the route rather than whatever won a race afterwards.
+    start_epoch: u64,
+) {
+    use crate::acp::runtime::SessionEvent;
+    use super::proto::ChatEvent;
+    // Accumulated thought text for the busy-line chip, bounded to the display
+    // window. Cleared at every prompt boundary — see the DrainBarrier arm.
+    let mut thought_buf = ThoughtTail::default();
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            // Barrier: prompt-task waits until prior events are drained.
+            SessionEvent::DrainBarrier(tx) => {
+                // This barrier IS the end of a prompt, and it is the only end
+                // every prompt reaches. Clearing only on answer text or a tool
+                // call leaks reasoning across turns whenever a prompt produced
+                // thought chunks and nothing else — a clean cancellation, an
+                // error, a refusal — because this consumer outlives the prompt.
+                // The next turn's first chunk would then render appended to the
+                // previous turn's reasoning as if it were current activity.
+                //
+                // Placed BEFORE the stop/epoch guard below on purpose: a turn
+                // torn down mid-reasoning is exactly a turn whose tail must not
+                // survive, and that guard would otherwise skip this arm.
+                thought_buf.clear();
+                let _ = tx.send(());
+            }
+            _ if {
+                let g = eng.lock().await;
+                g.stopped || g.reset_epoch != start_epoch
+            } => {
+                // Drop late events after stop/unsubscribe/teardown.
+            }
+            SessionEvent::ToolProgress { summary } => {
+                let mut inner = eng.lock().await;
+                note_turn_activity(&app, &db, &eng, &mut inner);
+                let (thread_id, session_id) = (inner.thread_id, inner.session_id);
+                drop(inner);
+                let _ = app.emit(
+                    EVENT,
+                    Push::Activity {
+                        thread_id,
+                        session_id,
+                        name: "tool".into(),
+                        summary,
+                    },
+                );
+            }
+            SessionEvent::Thought { text } => {
+                {
+                    let mut inner = eng.lock().await;
+                    note_turn_activity(&app, &db, &eng, &mut inner);
+                }
+                thought_buf.push(&text);
+                // Live reasoning on the busy line so the turn doesn't look stuck
+                // before the first answer token. Show a tail window of the buffer.
+                let summary = thought_buf.summary();
+                let thread_id = eng.lock().await.thread_id;
+                let session_id = eng.lock().await.session_id;
+                let _ = app.emit(
+                    EVENT,
+                    Push::Activity {
+                        thread_id,
+                        session_id,
+                        name: "thinking".into(),
+                        summary,
+                    },
+                );
+            }
+
+            SessionEvent::Chat(ChatEvent::TextDelta { text, item: _, agent_thread: _ }) => {
+                // Answer tokens started — drop soft/real thinking chip always.
+                thought_buf.clear();
+                {
+                    let (thread_id, session_id) = {
+                        let i = eng.lock().await;
+                        (i.thread_id, i.session_id)
+                    };
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Activity {
+                            thread_id,
+                            session_id,
+                            name: String::new(),
+                            summary: String::new(),
+                        },
+                    );
+                }
+                let mut inner = eng.lock().await;
+                note_turn_activity(&app, &db, &eng, &mut inner);
+                let thread_id = inner.thread_id;
+                let (sid, turn) = (inner.session_id, inner.turn_id);
+                if inner.current.is_none() {
+                    let Ok(m) = repo::insert_lead_message(
+                        &db,
+                        thread_id,
+                        sid,
+                        turn,
+                        "assistant",
+                        "text",
+                        r#"{"text":""}"#,
+                        "streaming",
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    inner.current = Some((m.id, String::new(), std::time::Instant::now()));
+                    let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+                }
+                let origin_tag = inner.current_origin_tag.clone();
+                let Some(c) = inner.current.as_mut() else { continue };
+                c.1.push_str(&text);
+                let row = c.0;
+                if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
+                    c.2 = std::time::Instant::now();
+                    let content = serde_json::json!({ "text": c.1 }).to_string();
+                    let _ = repo::update_lead_message(&db, row, &content, "streaming").await;
+                    emit_lead_delta(&app, thread_id, row, &c.1, false, origin_tag);
+                }
+                let _ = app.emit(
+                    EVENT,
+                    Push::Delta {
+                        thread_id,
+                        message_id: row,
+                        text,
+                    },
+                );
+            }
+            SessionEvent::Chat(ChatEvent::Assistant { tools, .. }) => {
+                // Tool calls end thinking (including soft pre-token chip).
+                thought_buf.clear();
+                {
+                    let (thread_id, session_id) = {
+                        let i = eng.lock().await;
+                        (i.thread_id, i.session_id)
+                    };
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Activity {
+                            thread_id,
+                            session_id,
+                            name: String::new(),
+                            summary: String::new(),
+                        },
+                    );
+                }
+                let mut inner = eng.lock().await;
+                note_turn_activity(&app, &db, &eng, &mut inner);
+                // Close the open text row so post-tool text starts a new bubble.
+                if inner.current.is_some() {
+                    finalize_current_text(&app, &db, &mut inner, "complete").await;
+                }
+                persist_tool_calls(&app, &db, &mut inner, tools, None).await;
+            }
+            SessionEvent::Chat(ChatEvent::ToolResults { items }) => {
+                let mut inner = eng.lock().await;
+                merge_tool_results(&app, &db, &mut inner, items).await;
+            }
+            SessionEvent::Chat(ChatEvent::Commands { commands }) => {
+                let mut inner = eng.lock().await;
+                // Empty is authoritative (session cleared its slash palette).
+                inner.slash_commands = commands.clone();
+                let (thread_id, session_id) = (inner.thread_id, inner.session_id);
+                let _ = app.emit(
+                    EVENT,
+                    Push::Init {
+                        thread_id,
+                        session_id,
+                        native_id: inner.native_id.clone().unwrap_or_default(),
+                        slash_commands: commands,
+                        mcp_servers: inner.last_mcp_servers.clone(),
+                        tools: inner.last_tools.clone(),
+                        model: inner.last_model.clone(),
+                        window: inner.last_window,
+                        mcp_known: false,
+                    },
+                );
+            }
+            SessionEvent::Commands(commands) => {
+                let mut inner = eng.lock().await;
+                // Empty is authoritative (session cleared its slash palette).
+                inner.slash_commands = commands.clone();
+                let (thread_id, session_id) = (inner.thread_id, inner.session_id);
+                let _ = app.emit(
+                    EVENT,
+                    Push::Init {
+                        thread_id,
+                        session_id,
+                        native_id: inner.native_id.clone().unwrap_or_default(),
+                        slash_commands: commands,
+                        mcp_servers: inner.last_mcp_servers.clone(),
+                        tools: inner.last_tools.clone(),
+                        model: inner.last_model.clone(),
+                        window: inner.last_window,
+                        mcp_known: false,
+                    },
+                );
+            }
+            SessionEvent::Usage {
+                context_tokens,
+                window,
+            } => {
+                let mut inner = eng.lock().await;
+                inner.last_context_tokens = Some(context_tokens);
+                if window.is_some() {
+                    inner.last_window = window;
+                }
+                let (thread_id, session_id) = (inner.thread_id, inner.session_id);
+                let _ = app.emit(
+                    EVENT,
+                    Push::Usage {
+                        thread_id,
+                        session_id,
+                        context_tokens,
+                        window: inner.last_window,
+                        model: inner.last_model.clone(),
+                    },
+                );
+            }
+            SessionEvent::Meta { model, thinking } => {
+                let mut inner = eng.lock().await;
+                if model.is_some() {
+                    inner.last_model = model;
+                }
+                if thinking.is_some() {
+                    inner.last_reasoning = thinking;
+                }
+            }
+            SessionEvent::Permission {
+                request_id,
+                summary,
+                detail,
+                intent_key,
+                intent,
+                grant_id,
+                options,
+            } => {
+                let (thread_id, tool, dir, reject_now) = {
+                    let i = eng.lock().await;
+                    (
+                        i.thread_id,
+                        i.tool.clone(),
+                        i.ask_dir.clone(),
+                        i.stopped || i.interrupting,
+                    )
+                };
+                if reject_now {
+                    client
+                        .reply_permission(&request_id, &options, crate::acp::Want::RejectOnce)
+                        .await;
+                    continue;
+                }
+                // Precise Always key (issue #89): ACP family + session intent +
+                // the canonical action identity, so two different actions never
+                // share a grant. NOT `detail`: that is the stringified
+                // `rawInput`, which is identical (often empty) for two edits
+                // whose only difference lives in `toolCall.locations` — the
+                // very field the risk classifier reads first. `grant_id`
+                // folds every named location in; see `permission::grant_identity`.
+                let action_key = crate::ask::action_key(&["Acp", &intent_key, &grant_id]);
+                // Clone the registry BEFORE any await — State guards are !Send.
+                let asks = app
+                    .try_state::<crate::ask::AskRegistry>()
+                    .map(|s| s.inner().clone());
+                // Risk tier for the Needs-you card (issue #101), from the
+                // classified `toolCall` rather than the lossy always-grant key.
+                // Computed BEFORE `auto_decision` because the read-only batch
+                // grants (issue #103) key on the tier: deriving it only in the
+                // `None` arm would make every ACP ask miss those grants.
+                let risk = acp_permission_risk(&intent, &detail);
+                let want = if let Some(asks) = asks {
+                    match asks.auto_decision(thread_id, &dir, risk, &action_key) {
+                        Some(crate::ask::Decision::Allow) => crate::acp::Want::AllowOnce,
+                        Some(crate::ask::Decision::Deny) => crate::acp::Want::RejectOnce,
+                        None => {
+                            let (id, rx) = asks.request(
+                                thread_id,
+                                &dir,
+                                &tool,
+                                &summary,
+                                &detail,
+                                risk,
+                                &action_key,
+                            );
+                            // Register in the SAME lock acquisition that
+                            // re-checks teardown, and give up the card if
+                            // teardown already won. With registration as a
+                            // separate acquisition, a Stop or engine switch
+                            // landing right after `asks.request` took an empty
+                            // `acp_pending_asks` and completed teardown while
+                            // the card was already on screen. The card then
+                            // outlived the turn, and answering it with Always
+                            // or Full persisted a standing grant — the
+                            // post-await check below only turns the WIRE reply
+                            // into a rejection, it cannot un-grant that.
+                            let registered = {
+                                let mut g = eng.lock().await;
+                                let lost = g.stopped
+                                    || g.interrupting
+                                    || g.reset_epoch != start_epoch;
+                                if !lost {
+                                    g.acp_pending_asks.push(id);
+                                }
+                                !lost
+                            };
+                            if !registered {
+                                asks.cancel(id);
+                                return_permission(&client, &request_id, &options).await;
+                                continue;
+                            }
+                            let decided = match tokio::time::timeout(
+                                std::time::Duration::from_secs(3600),
+                                rx,
+                            )
+                            .await
+                            {
+                                Ok(Ok(crate::ask::Decision::Allow)) => crate::acp::Want::AllowOnce,
+                                Ok(Ok(crate::ask::Decision::Deny)) => crate::acp::Want::RejectOnce,
+                                _ => {
+                                    asks.cancel(id);
+                                    crate::acp::Want::RejectOnce
+                                }
+                            };
+                            // Drop tracking whether answered or cancelled.
+                            {
+                                let mut g = eng.lock().await;
+                                g.acp_pending_asks.retain(|x| *x != id);
+                            }
+                            decided
+                        }
+                    }
+                } else {
+                    crate::acp::Want::RejectOnce
+                };
+                // ONE final gate, on the path every branch leaves through, so
+                // "never allow after teardown" is an invariant of the reply
+                // rather than a check each branch has to remember.
+                //
+                // The waited-for-a-human branch used to carry its own copy and
+                // the AUTO-GRANT branch carried none: with an Always/Full hit
+                // there is no ask to cancel, so a Stop landing between the
+                // `reject_now` sample and the `auto_decision` verdict reached
+                // the wire as an allow — queued ahead of `session/cancel`,
+                // starting a tool after the user had stopped the turn.
+                let want = {
+                    let g = eng.lock().await;
+                    if g.stopped || g.interrupting || g.reset_epoch != start_epoch {
+                        crate::acp::Want::RejectOnce
+                    } else {
+                        want
+                    }
+                };
+                client.reply_permission(&request_id, &options, want).await;
+            }
+            SessionEvent::Chat(_) => {}
+        }
+    }
+    let _ = client; // keep handle for permission replies while loop runs
 }
 
 /// issue #97: whether a `text` delta arriving on codex_consumer's anonymous
@@ -4070,6 +5343,160 @@ const INTERRUPT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// Interrupt the current turn: protocol control_request first (verified live:
 /// control_response + result{terminal_reason:aborted_streaming}); kill after 3s
 /// as the hard fallback. Either way `--resume` recovers the session next send.
+
+async fn force_acp_finalize_drain(
+    app: &AppHandle,
+    thread_id: i32,
+    session_id: Option<i32>,
+    turn_id: i32,
+    drain: FrozenTurnDrain,
+) {
+    let Some(db) = app.try_state::<Db>() else {
+        return;
+    };
+    persist_activity(&db, session_id, thread_id, "idle").await;
+    let had_orphan_texts = !drain.orphan_texts.is_empty() || drain.turn_saw_text;
+    if let Ok(Some(row)) = persist_disconnected_turn_row(
+        &db,
+        thread_id,
+        session_id,
+        turn_id,
+        "interrupted",
+        !had_orphan_texts,
+        drain.current,
+    )
+    .await
+    {
+        match row {
+            DisconnectedTurnRow::Finalized { message_id } => {
+                emit_finalize(app, thread_id, message_id, "interrupted");
+            }
+            DisconnectedTurnRow::Inserted(message) => {
+                let _ = app.emit(EVENT, Push::Message { thread_id, message });
+            }
+        }
+    }
+    for (id, text, agent_thread) in drain.orphan_texts {
+        let _ = repo::update_lead_message(
+            &db,
+            id,
+            &text_row_content(&text, agent_thread.as_deref()),
+            "interrupted",
+        )
+        .await;
+        emit_finalize(app, thread_id, id, "interrupted");
+    }
+    finalize_orphan_tool_rows(app, &db, thread_id, drain.orphan_tools, "interrupted").await;
+    if !drain.drained_queue.is_empty() {
+        if let Ok(rows) =
+            repo::set_queued_status_by_ids(&db, &drain.drained_queue, "interrupted").await
+        {
+            for m in rows {
+                emit_finalize(app, thread_id, m.id, "interrupted");
+            }
+        }
+    }
+}
+
+/// Force-reset a wedged ACP turn after cancel is ignored.
+async fn force_acp_turn_reset(
+    app: &AppHandle,
+    eng: &EngineRef,
+    turn_id: i32,
+    epoch_at_arm: u64,
+) {
+    let snapshot = {
+        let mut inner = eng.lock().await;
+        if !inner.turn.busy || inner.turn_id != turn_id || inner.reset_epoch != epoch_at_arm {
+            return;
+        }
+        if !is_acp_tool(&inner.tool) {
+            return;
+        }
+        let client = inner.acp_client.take();
+        // TAKE, not clone. Retiring the pooled client only helps when this
+        // engine was its last route; a client kept alive by ANOTHER session
+        // survives, and holding on to this session id would make the next send
+        // resume the very session whose prompt is still running — racing it or
+        // being rejected as busy. Dropping the id is what abandons the wedged
+        // session safely in both cases; the next send opens a fresh one.
+        let sid = inner.native_id.take();
+        let ask_dir = inner.ask_dir.clone();
+        let Some(drain) = reset_frozen_appserver_turn(&mut inner, turn_id) else {
+            inner.acp_client = client;
+            inner.native_id = sid;
+            return;
+        };
+        inner.reset_epoch = inner.reset_epoch.saturating_add(1);
+        // Held across the cancel/unsubscribe/retire, the DB native-id clear and
+        // the row finalization below — the THIRD teardown path needing this,
+        // after `stop_quiet` and freeze recovery, and for the identical reason:
+        // `reset_frozen_appserver_turn` clears `turn.busy` AND `interrupting`,
+        // so a send arriving during those awaits captures the already-bumped
+        // epoch, is admitted onto a fresh session, and then has its native id
+        // cleared and an idle state emitted over it by this older reset.
+        inner.tearing_down = true;
+        (
+            inner.thread_id,
+            inner.session_id,
+            client,
+            sid,
+            drain,
+            ask_dir,
+        )
+    };
+    let (thread_id, session_id, client, sid, drain, ask_dir) = snapshot;
+    if let (Some(c), Some(sid)) = (client.as_ref(), sid.as_deref()) {
+        let _ = c.cancel(sid).await;
+        c.unsubscribe(sid).await;
+        // `unsubscribe` reaps only when nothing is outstanding — and the wedged
+        // prompt IS outstanding, which is the whole reason this fallback ran.
+        // Left pooled, the next send gets this same handle back with a live
+        // child and prompts the agent still running the abandoned turn.
+        c.retire_after_ignored_cancel().await;
+    }
+    // Mirror the in-memory clear above into the DB, or a restart would restore
+    // the abandoned session id and resume onto it.
+    if let Some(db) = app.try_state::<Db>() {
+        if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
+            eprintln!(
+                "[weft] acp force reset: failed to clear native id for thread {thread_id}: {err}"
+            );
+        }
+    }
+    force_acp_finalize_drain(app, thread_id, session_id, turn_id, drain).await;
+    // Cleanup is complete; the engine can accept work again. Released before
+    // the idle push so the state the user sees and the state the engine will
+    // accept agree.
+    eng.lock().await.tearing_down = false;
+    emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
+    // The native context is gone — say so. A NOTICE, not a question: there is
+    // nothing to answer, and `ask_human` would render an answer box whose reply
+    // injects a stray bus message into the session that was just reset. And
+    // action-required rather than plain `notify_human`, because no background
+    // process retracts this one: the context stays gone until the human
+    // re-states what matters.
+    if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
+        bus.notify_human_action_required(thread_id, &ask_dir, ACP_FORCE_RESET_NOTICE);
+    }
+}
+
+/// The ACP sibling of [`freeze_recovery_text`]. The user pressed Stop, the
+/// agent ignored `session/cancel`, and the turn was cut loose after the grace
+/// window — same consequence (the native session is abandoned), so the same
+/// persistent notice rather than a self-clearing hint.
+///
+/// A STABLE MACHINE TOKEN, not prose. This path has no locale to read — it runs
+/// on a detached watchdog task 8s after the Stop, and `lang` is passed per
+/// command invocation (see `lang_directive`'s callers) rather than persisted —
+/// so the copy belongs in the catalogs the webview already owns. `summary_from
+/// _params` established exactly this shape for `acp.permission_required`;
+/// `ConfirmationCard` maps the token to `t(...)`. An earlier round of this PR
+/// shipped the text bilingually inline instead; that left the string
+/// untranslatable and inconsistent with the rest of the UI, which is the wrong
+/// trade when a token costs one line on each side.
+pub(crate) const ACP_FORCE_RESET_NOTICE: &str = "acp.force_reset_notice";
+
 pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
     if !inner.turn.busy {
@@ -4098,6 +5525,32 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
                 let _ = c.kill().await;
             }
         }
+        return Ok(());
+    }
+    if is_acp_tool(&inner.tool) {
+        let sid = inner.native_id.clone();
+        let client = inner.acp_client.clone();
+        let turn_id = inner.turn_id;
+        let epoch = inner.reset_epoch;
+        // Drop open Needs-you cards so Always/Full cannot land after Stop.
+        let asks = std::mem::take(&mut inner.acp_pending_asks);
+        drop(inner);
+        if let Some(reg) = app.try_state::<crate::ask::AskRegistry>() {
+            for id in asks {
+                reg.inner().cancel(id);
+            }
+        }
+        if let (Some(sid), Some(client)) = (sid, client) {
+            let _ = client.cancel(&sid).await;
+        }
+        // OMP may ignore session/cancel while request_long sits up to 24h.
+        // Bound recovery: if still the same busy turn after grace, force idle.
+        let eng2 = eng.clone();
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            force_acp_turn_reset(&app2, &eng2, turn_id, epoch).await;
+        });
         return Ok(());
     }
     // Process-tool interrupt by transport (via the adapter): per-turn dialects
@@ -4195,6 +5648,17 @@ async fn send_hidden_inner(
         return Err(err);
     }
     let mut inner = eng.lock().await;
+    // Same reservation the visible path honours via `send_reservation_valid`,
+    // which hidden delivery does not go through. A bus wake skipped here is not
+    // lost — the coordinator re-delivers it on the next sweep — whereas one
+    // admitted mid-teardown has its turn reset out from under it.
+    if !hidden_turn_admissible(&inner) {
+        drop(inner);
+        if bus_read {
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!("engine is tearing down"));
+    }
     if ensure {
         // Spawn the resident process under THIS lock, never releasing it before
         // the slot is reserved below. The reader task blocks on this lock and
@@ -4254,8 +5718,9 @@ async fn send_hidden_inner(
         HiddenDelivery::SpawnTurn => {
             // codex on app-server must stay on app-server even for hidden turns
             // (bus wakes), else an exec turn and the app-server connection diverge
-            // on the same thread.
+            // on the same thread. ACP tools similarly stay on the ACP runtime.
             let codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
+            let acp = is_acp_tool(&inner.tool);
             let turn_id = begin_hidden_turn(app, db, &mut inner).await;
             // Captured under the lock: a stop-then-restart before the spawn task
             // runs clears `stopped` but bumps the epoch — a canceled hidden turn
@@ -4265,6 +5730,15 @@ async fn send_hidden_inner(
             drop(inner);
             let res = if codex_appserver {
                 spawn_codex_turn_or_exec(
+                    app.clone(),
+                    db.clone(),
+                    eng.clone(),
+                    out,
+                    Some(hidden_epoch),
+                )
+                .await
+            } else if acp {
+                spawn_acp_turn(
                     app.clone(),
                     db.clone(),
                     eng.clone(),
@@ -4666,7 +6140,24 @@ pub fn build_switch_digest(old_tool: &str, new_tool: &str, messages: &[lead_mess
 /// interruption that did not happen is the same class of lie as the "nothing
 /// changed" claims earlier rounds removed, pointing the other way.
 pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) -> bool {
-    let (thread_id, session_id, texts, orphans, was_busy) = stop_quiet(eng).await;
+    let StopQuietOutcome {
+        thread_id,
+        session_id,
+        texts,
+        orphans,
+        acp_asks,
+        was_busy,
+    } = stop_quiet(eng).await;
+    // Same reason `stop` does it: a switch replaces this engine outright, so an
+    // ACP permission card still on screen belongs to a turn that no longer
+    // exists. Answering it — especially with Always/Full — would persist a
+    // grant against a torn-down session and, on the ACP side, reply to a
+    // request whose client was already cancelled and unsubscribed.
+    if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
+        for id in acp_asks {
+            asks.inner().cancel(id);
+        }
+    }
     let had_open_rows = !texts.is_empty() || !orphans.is_empty();
     let mut drained_queue = 0usize;
     if let Some(db) = app.try_state::<Db>() {
@@ -4812,6 +6303,12 @@ enum FreezeClaim {
     /// function) — resetting it again here would race that cleanup, so this
     /// deliberately leaves it alone.
     Owned(Option<(crate::codex_app_server::Client, FrozenTurnDrain)>),
+    /// ACP freeze recovery: session handle taken + turn reset.
+    OwnedAcp {
+        client: Option<crate::acp::runtime::ClientHandle>,
+        session_id: Option<String>,
+        drain: FrozenTurnDrain,
+    },
 }
 
 /// Re-confirm turn ownership AND (app-server dialect) take the live client,
@@ -4853,19 +6350,33 @@ async fn take_frozen_turn(eng: &EngineRef, turn_id: i32) -> FreezeClaim {
     if inner.turn_id != turn_id || !inner.turn.busy {
         return FreezeClaim::Stale;
     }
+    if inner.acp_client.is_some() && inner.codex_client.is_none() {
+        let acp = inner.acp_client.take();
+        // TAKE, not clone — the same rule `force_acp_turn_reset` follows. The
+        // caller is about to abandon this native session; leaving the id in
+        // place lets a send admitted during cleanup resume the very session
+        // being torn down.
+        let sid = inner.native_id.take();
+        let Some(drain) = reset_frozen_appserver_turn(&mut inner, turn_id) else {
+            inner.acp_client = acp;
+            inner.native_id = sid;
+            return FreezeClaim::Stale;
+        };
+        inner.reset_epoch = inner.reset_epoch.saturating_add(1);
+        // Held until the caller finishes cancel/unsubscribe/finalize/marker/
+        // native-id clearing. The epoch bump alone does not cover this window:
+        // a send arriving DURING it captures the already-bumped value, passes
+        // every check, and can prompt the abandoned session — after which the
+        // recovery clears state underneath the newer turn. Same reservation
+        // `stop_quiet` takes for the same reason.
+        inner.tearing_down = true;
+        return FreezeClaim::OwnedAcp {
+            client: acp,
+            session_id: sid,
+            drain,
+        };
+    }
     let client = inner.codex_client.take();
-    // `reset_frozen_appserver_turn` re-checks the SAME turn_id+busy guard
-    // just checked above — redundant in practice (this function holds ONE
-    // continuous `&mut` borrow with no `.await` in between the two checks,
-    // so nothing could have changed `inner`) but deliberately NOT asserted
-    // away with `.expect()`/`.unwrap()` (this crate's production paths ban
-    // both — see CLAUDE.md): reusing the guarded function as-is and letting
-    // `and_then`/`map` degrade a theoretically-unreachable mismatch to
-    // "nothing taken" keeps this provably panic-free, not just
-    // panic-free-by-inspection. `and_then` also means a `None` client
-    // (every non-app-server dialect) short-circuits without ever calling
-    // the reset — see [`FreezeClaim::Owned`] for why that dialect must NOT
-    // have its state reset here.
     let taken = client
         .and_then(|c| reset_frozen_appserver_turn(&mut inner, turn_id).map(|drain| (c, drain)));
     FreezeClaim::Owned(taken)
@@ -5020,6 +6531,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         pending_command_refresh: false,
         last_context_tokens: None,
         last_model: None,
+        last_reasoning: None,
         last_window: None,
         last_mcp_servers: vec![],
         last_tools: vec![],
@@ -5029,10 +6541,13 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         tool_rows: std::collections::HashMap::new(),
         stopped: false,
         codex_client: None,
+        acp_client: None,
+        acp_pending_asks: Vec::new(),
         turn_user_row: None,
         last_assistant_uuid: None,
         rewinding: false,
         quota_failover_committing: false,
+        tearing_down: false,
         worktree_id: None,
     }
 }
@@ -5128,6 +6643,27 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
     // connection drop, no native-id clear, no marker, no notice.
     let taken = match take_frozen_turn(eng, turn_id).await {
         FreezeClaim::Stale => return false,
+        FreezeClaim::OwnedAcp {
+            client,
+            session_id: acp_sid,
+            drain,
+        } => {
+            if let (Some(c), Some(sid)) = (client.as_ref(), acp_sid.as_deref()) {
+                let _ = c.cancel(sid).await;
+                c.unsubscribe(sid).await;
+                // A FROZEN prompt is the case most likely to ignore this
+                // cancel, which is exactly when `unsubscribe`'s own reap
+                // declines: the outstanding `session/prompt` still sits in
+                // `pending` and the ordinary policy treats it as live work.
+                // Without this the next send gets the same pooled process back,
+                // still running the abandoned prompt. The route checks inside
+                // still apply, so a client shared with another session lives.
+                c.retire_after_ignored_cancel().await;
+            }
+            force_acp_finalize_drain(app, thread_id, session_id, turn_id, drain).await;
+            emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
+            None
+        }
         FreezeClaim::Owned(taken) => taken,
     };
     // Publish the grace marker BEFORE anything below exposes a recoverable
@@ -5262,6 +6798,11 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
         )
         .await;
     }
+    // Every ACP cleanup step above is done; the engine can accept work again.
+    // Released here rather than at any earlier return: this is the one point
+    // all recovery paths converge on, so the reservation cannot outlive the
+    // cleanup it was protecting.
+    eng.lock().await.tearing_down = false;
     if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
         bus.ask_human(thread_id, &dir, &freeze_recovery_text(freeze_secs));
     }
@@ -5513,24 +7054,73 @@ pub fn spawn_watchdog(app: AppHandle) {
     });
 }
 
+/// What a [`stop_quiet`] teardown tore down and left for its caller to finish.
+///
+/// Named fields rather than a tuple on purpose. This return grew twice in
+/// parallel — `was_busy` on main (PR #140) and `acp_asks` on this branch — and
+/// each growth silently invalidated every positional destructuring elsewhere.
+/// One such call site was missed while merging and only surfaced as a CI
+/// compile error on two platforms; with named fields a caller that ignores a
+/// new field keeps compiling and a caller that needs it says so by name.
+pub struct StopQuietOutcome {
+    pub thread_id: i32,
+    pub session_id: Option<i32>,
+    /// Open text rows to finalize: `(row id, accumulated text, agent thread tag)`.
+    pub texts: Vec<(i32, String, Option<String>)>,
+    /// Open tool rows to finalize: `(row id, args json)`.
+    pub orphans: Vec<(i32, serde_json::Value)>,
+    /// Open ACP permission requests to cancel in the `AskRegistry`, so an
+    /// Always/Full answer cannot land against a torn-down turn.
+    pub acp_asks: Vec<u64>,
+    /// Whether a turn was BUSY at the moment this reset it, captured inside the
+    /// same critical section (PR #140 review round 14). Read through a separate
+    /// `eng.lock()` beforehand it describes a different state from the one
+    /// actually reset — a send admitted in the gap gets interrupted while the
+    /// flag says `false`, a turn that finished cleanly reports `true` — and
+    /// `teardown_for_switch` turns that flag into a sentence shown to the user.
+    pub was_busy: bool,
+}
+
+/// What the ACP half of a teardown needs once the engine lock is released.
+struct AcpTeardown {
+    client: Option<crate::acp::runtime::ClientHandle>,
+    session_id: Option<String>,
+    asks: Vec<u64>,
+}
+
+/// Take the ACP handles for teardown AND invalidate the turn, as ONE step.
+///
+/// These belong together. Cancelling and unsubscribing an ACP session must
+/// happen without the engine lock (they take the runtime mutex), and `stopped`
+/// is not set until `stop_quiet` returns — so between releasing the lock and
+/// re-taking it the engine still looks like it belongs to the running turn. An
+/// in-flight prompt task that grabs the lock in that gap would still match its
+/// own `prompt_epoch`, pass `acp_emit_turn_end`'s ownership check, and dequeue
+/// and dispatch the NEXT queued prompt into an engine a terminal takeover is
+/// tearing down. Advancing `reset_epoch` before the lock is released makes
+/// every such task self-invalidate instead.
+///
+/// The bump also does its original job: invalidating any send that reserved
+/// against the turn just cleared — one whose Phase 1 ran before this stop but
+/// whose Phase 3 runs after, and a stop-then-restart that resets
+/// `stopped`/`busy` and would otherwise slip past those flags.
+/// `send_reservation_valid` compares the captured `reset_epoch`.
+fn take_acp_teardown_and_invalidate(inner: &mut EngineInner) -> AcpTeardown {
+    let client = inner.acp_client.take();
+    let session_id = inner.native_id.clone();
+    let asks = std::mem::take(&mut inner.acp_pending_asks);
+    inner.reset_epoch += 1;
+    AcpTeardown {
+        client,
+        session_id,
+        asks,
+    }
+}
+
 /// Kill the live child + reset turn state WITHOUT emitting a "stopped" event —
 /// the UI keeps its last (idle) state. Used by the skill-refresh restart so the
 /// bounce is invisible; `stop` wraps this and then emits "stopped".
-/// The trailing `bool` is whether a turn was BUSY at the moment this reset it,
-/// captured inside the same critical section (PR #140 review round 14). Read
-/// through a separate `eng.lock()` beforehand it describes a different state
-/// from the one actually reset — a send admitted in the gap gets interrupted
-/// while the flag says `false`, a turn that finished cleanly reports `true` —
-/// and `teardown_for_switch` turns that flag into a sentence shown to the user.
-pub async fn stop_quiet(
-    eng: &EngineRef,
-) -> (
-    i32,
-    Option<i32>,
-    Vec<(i32, String, Option<String>)>,
-    Vec<(i32, serde_json::Value)>,
-    bool,
-) {
+pub async fn stop_quiet(eng: &EngineRef) -> StopQuietOutcome {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
     let was_busy = inner.turn.busy;
@@ -5562,7 +7152,33 @@ pub async fn stop_quiet(
     if let Some(c) = inner.codex_client.take() {
         c.shutdown().await;
     }
+    // Cancel any in-flight ACP prompt and drop the session route so a late
+    // acp_emit_turn_end cannot overwrite stopped → idle after takeover.
+    let AcpTeardown {
+        client: acp,
+        session_id: acp_sid,
+        asks: acp_asks,
+    } = take_acp_teardown_and_invalidate(&mut inner);
+    // Closed the other direction of the same race. Bumping the epoch stops work
+    // that reserved BEFORE this teardown from landing after it; this stops work
+    // admitted DURING it. The ACP cancel/unsubscribe below need the lock
+    // released, and `stopped` is not set until `stop` returns, so a human send
+    // or bus wake in that window reserves against the NEW epoch, passes every
+    // check, and is then silently discarded when the reset below replaces
+    // `turn` with `TurnState::default()`.
+    inner.tearing_down = true;
+    // Drop the engine lock before awaiting ACP cancel/unsubscribe (they take
+    // the runtime mutex). Re-lock afterwards for the remaining field clears.
+    drop(inner);
+    if let Some(c) = acp {
+        if let Some(sid) = acp_sid {
+            let _ = c.cancel(&sid).await;
+            c.unsubscribe(&sid).await;
+        }
+    }
+    let mut inner = eng.lock().await;
     inner.child = None;
+    inner.child_reg = None;
     // Hand the session_gate slot back on the explicit stop, not on the next
     // spawn. "Stop" is a high-frequency button and a stopped session may never
     // send again — holding its slot until a respawn that never comes is a leak
@@ -5577,12 +7193,17 @@ pub async fn stop_quiet(
     // turn inherits a stale true and a pre-output failure there would wrongly
     // suppress its error_before_output row.
     inner.turn_saw_text = false;
-    // Invalidate any send that reserved against the turn we just cleared — even one
-    // whose Phase 1 ran before this stop but whose Phase 3 runs after, and even a
-    // stop-then-restart (which resets `stopped`/`busy` and would otherwise slip
-    // past those flags). send_reservation_valid compares the captured reset_epoch.
-    inner.reset_epoch += 1;
-    (target.0, target.1, texts, orphan_tools, was_busy)
+    // The window is over: state is fully reset, so the engine can accept work
+    // again (a skill bounce reuses this same engine right after).
+    inner.tearing_down = false;
+    StopQuietOutcome {
+        thread_id: target.0,
+        session_id: target.1,
+        texts,
+        orphans: orphan_tools,
+        acp_asks,
+        was_busy,
+    }
 }
 
 /// Stop the engine outright (e.g. before a terminal takeover or by the runaway
@@ -5592,10 +7213,23 @@ pub async fn stop_quiet(
 /// (which skips "stopped"). Distinct from "idle" so a cleanly-idle session can
 /// still be driven by a bus post.
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
-    let (thread_id, session_id, texts, orphans, _was_busy) = stop_quiet(eng).await;
+    let StopQuietOutcome {
+        thread_id,
+        session_id,
+        texts,
+        orphans,
+        acp_asks,
+        ..
+    } = stop_quiet(eng).await;
     let mut inner = eng.lock().await;
     inner.stopped = true;
     drop(inner);
+    // Drop open ACP permission cards so Always/Full cannot land after takeover.
+    if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
+        for id in acp_asks {
+            asks.inner().cancel(id);
+        }
+    }
     if let Some(db) = app.try_state::<Db>() {
         persist_activity(&db, session_id, thread_id, STATUS_STOPPED).await;
         // Stop is now visible to the engine, so finalizing here can't race a
@@ -5665,6 +7299,24 @@ pub struct RewindOutcome {
     pub code_restored: bool,
 }
 
+/// The 1-based cut ordinal for `target` under the addressing rule of `tool`'s
+/// dialect.
+///
+/// The dialects disagree about ONE case: a message with no text. ACP always
+/// writes a text block (`{"type":"text","text":""}` for an image-only prompt,
+/// since images ride as sibling blocks rather than the spilled-path appendix
+/// per-turn tools append), so an empty prompt is a real, matchable entry. In a
+/// claude transcript the same message has no text block at all and
+/// `rewind::user_text` skips the line, so an empty target is unaddressable and
+/// a zero — which surfaces as "this session has no rewind anchor" — is the
+/// honest answer rather than a cut at the wrong line.
+fn rewind_ordinal(tool: &str, texts: &[String], target: &str) -> usize {
+    if crate::acp::backend_for(tool).is_some() {
+        return super::rewind::ordinal_of_prompt(texts, target);
+    }
+    super::rewind::ordinal_of(texts, target)
+}
+
 /// Rewind a worker session's OR the lead console's conversation to just
 /// BEFORE `message_id`: fork the native session at the cut point (claude
 /// transcript surgery / codex `thread/fork` / opencode `session/fork`), drop
@@ -5727,7 +7379,9 @@ async fn rewind_reserved(
             cwd: inner.cwd.clone(),
             native_id: inner.native_id.clone(),
             ask_dir: inner.ask_dir.clone(),
+            system_prompt: inner.system_prompt.clone(),
             codex_client: inner.codex_client.clone(),
+            acp_client: inner.acp_client.clone(),
         }
     };
     // Lead engines (session_id None) can only rewind the conversation — they
@@ -5783,7 +7437,7 @@ async fn rewind_reserved(
         .filter(|m| super::rewind::native_delivered(&m.role, &m.status))
         .map(|m| super::rewind::dispatched_text(per_turn_tool, m.id, &m.content))
         .collect();
-    let ordinal = super::rewind::ordinal_of(&user_texts, &match_text);
+    let ordinal = rewind_ordinal(&snap.tool, &user_texts, &match_text);
 
     // Resolve the session's worktree ONCE: mandatory for the code half,
     // best-effort for a conversation-only rewind (it only drives the
@@ -5870,6 +7524,22 @@ async fn rewind_reserved(
                         super::rewind::fork_opencode_at(&program, &snap.cwd, old, &match_text, ordinal)
                             .await?,
                     )
+                }
+            },
+            t if crate::acp::backend_for(t).is_some() => match &old_native {
+                None => None,
+                Some(_) if prev_user.is_none() => None,
+                Some(old) => {
+                    if ordinal == 0 {
+                        return Err(anyhow::anyhow!("该会话历史缺少回退锚点（旧会话）"));
+                    }
+                    super::rewind::fork_omp_at(
+                        &snap.cwd,
+                        old,
+                        &match_text,
+                        ordinal,
+                        &snap.system_prompt,
+                    )?
                 }
             },
             _ => return Err(anyhow::anyhow!("该工具暂不支持回退")),
@@ -6295,7 +7965,13 @@ struct RewindSnap {
     cwd: std::path::PathBuf,
     native_id: Option<String>,
     ask_dir: String,
+    /// The prepend the FIRST ACP user turn carries (`{system}\n\n{user}`).
+    /// Needed to strip it exactly during a rewind match — guessing the split
+    /// by blank line mis-handles multi-paragraph prompts.
+    system_prompt: String,
     codex_client: Option<crate::codex_app_server::Client>,
+    #[allow(dead_code)]
+    acp_client: Option<crate::acp::runtime::ClientHandle>,
 }
 
 /// `thread/fork` at `last_turn_id`: ride the session's live app-server
@@ -6371,6 +8047,7 @@ fn spawn_reader(
                             tools: inner.last_tools.clone(),
                             model: inner.last_model.clone(),
                             window: inner.last_window,
+                            mcp_known: false,
                         },
                     );
                 }
@@ -6446,6 +8123,7 @@ fn spawn_reader(
                             tools,
                             model,
                             window,
+                            mcp_known: false,
                         },
                     );
                 }
@@ -6463,6 +8141,7 @@ fn spawn_reader(
                             tools: inner.last_tools.clone(),
                             model: inner.last_model.clone(),
                             window: inner.last_window,
+                            mcp_known: false,
                         },
                     );
                 }
@@ -7071,6 +8750,281 @@ fn emit_lead_delta(
 mod tests {
     use super::*;
 
+    /// Stop must actually stop. `interrupt()` sets `interrupting` without
+    /// bumping the epoch, so a Stop landing between `on_turn_end` promoting a
+    /// queued item and its dispatch cancels nothing and leaves the epoch
+    /// matching — and the queued prompt ran anyway, executing tools, after the
+    /// user had pressed Stop.
+    #[test]
+    fn a_queued_prompt_is_not_dispatched_after_stop() {
+        let mut inner = test_inner("omp");
+        let epoch = inner.reset_epoch;
+        assert!(
+            queued_dispatch_admissible(&inner, epoch),
+            "baseline: an idle engine dispatches its queue"
+        );
+
+        inner.interrupting = true;
+        assert!(
+            !queued_dispatch_admissible(&inner, epoch),
+            "Stop must block the dispatch even though it leaves the epoch alone"
+        );
+
+        inner.interrupting = false;
+        inner.stopped = true;
+        assert!(!queued_dispatch_admissible(&inner, epoch));
+
+        inner.stopped = false;
+        inner.tearing_down = true;
+        assert!(!queued_dispatch_admissible(&inner, epoch));
+
+        inner.tearing_down = false;
+        assert!(!queued_dispatch_admissible(&inner, epoch + 1), "a reset still invalidates");
+        assert!(queued_dispatch_admissible(&inner, epoch), "and recovers otherwise");
+    }
+
+    /// Hidden delivery bypasses `send_reservation_valid` entirely, so the
+    /// teardown reservation has to be enforced on its own path — otherwise a
+    /// bus wake starts a native session during cleanup and the older reset
+    /// clears its id and emits idle over it.
+    #[test]
+    fn a_hidden_turn_is_refused_while_a_teardown_is_reserved() {
+        let mut inner = test_inner("omp");
+        assert!(hidden_turn_admissible(&inner), "baseline: idle engine accepts");
+
+        inner.tearing_down = true;
+        assert!(!hidden_turn_admissible(&inner), "a reserved teardown refuses");
+
+        inner.tearing_down = false;
+        inner.stopped = true;
+        assert!(!hidden_turn_admissible(&inner), "a stopped engine refuses");
+
+        inner.stopped = false;
+        assert!(hidden_turn_admissible(&inner), "and accepts again afterwards");
+    }
+
+    /// A stale claim owns nothing, so it must leave every field it inspected
+    /// exactly as it found them — including the reservation and the native id.
+    ///
+    /// The ACP branch itself (which sets the reservation and takes the id) has
+    /// no unit test: it keys on a live `acp_client`, and constructing one means
+    /// spawning a real child. This covers the decline path, where getting it
+    /// wrong would strand the engine permanently unsendable.
+    #[tokio::test]
+    async fn a_stale_freeze_claim_reserves_nothing() {
+        let mut inner = test_inner("omp");
+        inner.turn_id = 7;
+        inner.turn.busy = false; // already ended → Stale
+        inner.native_id = Some("sess-frozen".into());
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+
+        assert!(matches!(take_frozen_turn(&eng, 7).await, FreezeClaim::Stale));
+
+        let g = eng.lock().await;
+        assert!(!g.tearing_down, "a declined claim must not reserve");
+        assert_eq!(
+            g.native_id.as_deref(),
+            Some("sess-frozen"),
+            "a declined claim must not take the native id"
+        );
+    }
+
+    /// The teardown window's gate. Bumping the epoch stops work reserved
+    /// BEFORE a teardown; this stops work admitted DURING one — a send arriving
+    /// mid-teardown captures the already-bumped epoch, so the epoch check
+    /// cannot see it, and its queued work would be dropped when the reset
+    /// replaces `turn` with the default.
+    #[test]
+    fn a_send_is_refused_while_a_teardown_holds_the_engine_open() {
+        let mut inner = test_inner("omp");
+        inner.turn_id = 5;
+        inner.turn.busy = true;
+        let ctx = SendContext {
+            thread_id: 1,
+            session_id: None,
+            turn: 5,
+            direct: true,
+            is_command: false,
+            tool: "omp".into(),
+            origin_tag: None,
+            reset_epoch: inner.reset_epoch,
+        };
+        assert!(
+            send_reservation_valid(&inner, &ctx),
+            "baseline: this send is otherwise admissible"
+        );
+
+        inner.tearing_down = true;
+        assert!(
+            !send_reservation_valid(&inner, &ctx),
+            "a teardown that released the lock for ACP I/O must not admit work"
+        );
+
+        inner.tearing_down = false;
+        assert!(
+            send_reservation_valid(&inner, &ctx),
+            "and the engine is usable again once the window closes"
+        );
+    }
+
+    /// The notice is a machine token, and the FRONTEND owns its copy
+    /// (`NeedsRows.tsx`'s `NOTICE_TOKENS` → `needs.acpForceResetNotice`).
+    /// Changing this string without changing it there renders the raw token as
+    /// the notice body, so pin the exact value on this side too.
+    #[test]
+    fn the_force_reset_notice_is_the_token_the_frontend_maps() {
+        assert_eq!(ACP_FORCE_RESET_NOTICE, "acp.force_reset_notice");
+    }
+
+    /// The hole this closes, end to end: a read naming an ordinary file FIRST
+    /// and a credential second was tiered `ReadOnly` off the first path alone,
+    /// and `auto_decision` releases a `ReadOnly` ask under a read-only session
+    /// or issue grant (issue #103) — so the SSH key would have been read with
+    /// no card ever shown. The tier now comes from the worst target.
+    #[test]
+    fn a_multi_file_read_is_tiered_by_its_worst_target() {
+        use crate::acp::permission::PermissionIntent;
+
+        let ordinary = PermissionIntent::Read {
+            paths: vec!["src/main.rs".into()],
+        };
+        assert_eq!(
+            acp_permission_risk(&ordinary, ""),
+            crate::ask::RiskLevel::ReadOnly,
+            "an ordinary read is still releasable by a read-only grant"
+        );
+
+        let with_secret = PermissionIntent::Read {
+            paths: vec!["src/main.rs".into(), "/home/u/.ssh/id_rsa".into()],
+        };
+        assert_eq!(
+            acp_permission_risk(&with_secret, ""),
+            crate::ask::RiskLevel::NetworkOrCredential,
+            "a credential anywhere in the set must lift the whole request"
+        );
+    }
+
+    /// The two pathless cases differ, and the difference is the whole point.
+    /// A write with no named target is still a write. A READ with no named
+    /// target established nothing — `classify_file("Read", "")` says
+    /// `ReadOnly`, which a read-only grant releases with no card, so a sparse
+    /// request hiding its target in `title`/`content` could read a credential
+    /// unseen.
+    #[test]
+    fn a_pathless_read_is_unknown_while_a_pathless_write_stays_write() {
+        use crate::acp::permission::PermissionIntent;
+
+        assert_eq!(
+            acp_permission_risk(&PermissionIntent::Write { paths: Vec::new() }, ""),
+            crate::ask::RiskLevel::Write
+        );
+        assert_eq!(
+            acp_permission_risk(&PermissionIntent::Read { paths: Vec::new() }, ""),
+            crate::ask::RiskLevel::Unknown,
+            "an unauditable read must not be auto-released as read-only"
+        );
+    }
+
+    /// An image-only message is addressable in ACP and not in claude, and the
+    /// rewind path has exactly one place that decides which rule applies.
+    #[test]
+    fn the_rewind_ordinal_rule_follows_the_dialect() {
+        let texts = vec!["hello".to_string(), String::new()];
+
+        assert_eq!(
+            rewind_ordinal("omp", &texts, ""),
+            1,
+            "ACP writes an empty text block, so the image-only prompt is addressable"
+        );
+        assert_eq!(
+            rewind_ordinal("claude", &texts, ""),
+            0,
+            "claude's transcript has no line to match, so refuse rather than mis-cut"
+        );
+
+        // Ordinary text targets are unaffected by the dialect.
+        for tool in ["omp", "claude", "opencode", "codex"] {
+            assert_eq!(rewind_ordinal(tool, &texts, "hello"), 1, "{tool}");
+        }
+    }
+
+    /// The whole point of the helper: a teardown that hands out the ACP client
+    /// has ALREADY invalidated the turn. Splitting these leaves a window in
+    /// which the engine lock is free, `stopped` is not yet set and the epoch
+    /// still matches, so an in-flight prompt task passes its ownership check
+    /// and dispatches the next queued prompt into an engine being torn down.
+    #[test]
+    fn acp_teardown_invalidates_the_turn_in_the_step_that_takes_the_client() {
+        let mut inner = test_inner("omp");
+        inner.native_id = Some("sess-1".into());
+        inner.acp_pending_asks = vec![7, 9];
+        let before = inner.reset_epoch;
+
+        let taken = take_acp_teardown_and_invalidate(&mut inner);
+
+        assert_eq!(
+            inner.reset_epoch,
+            before + 1,
+            "the epoch must already be advanced when the lock is released for the ACP awaits"
+        );
+        assert_eq!(taken.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(taken.asks, vec![7, 9]);
+        assert!(
+            inner.acp_pending_asks.is_empty(),
+            "asks move to the caller so they are cancelled exactly once"
+        );
+    }
+
+    /// The chip shows a tail, so the buffer holds a tail — a turn that reasons
+    /// for a megabyte must not park a megabyte on the consumer task.
+    #[test]
+    fn thought_tail_stays_bounded_across_a_long_reasoning_stream() {
+        let mut tail = ThoughtTail::default();
+        for _ in 0..1000 {
+            tail.push(&"x".repeat(500));
+        }
+
+        assert_eq!(
+            tail.buf.chars().count(),
+            THOUGHT_TAIL_CHARS,
+            "buffer must hold the display window, not the whole trace"
+        );
+        let summary = tail.summary();
+        assert!(summary.starts_with('…'), "elided tail keeps its ellipsis");
+        assert_eq!(summary.chars().count(), THOUGHT_TAIL_CHARS + 1);
+    }
+
+    /// Trimming happens on char boundaries: a tail cut mid-codepoint would
+    /// panic on `drain`, and the reasoning stream is routinely non-ASCII.
+    #[test]
+    fn thought_tail_trims_on_character_boundaries() {
+        let mut tail = ThoughtTail::default();
+        tail.push(&"思".repeat(THOUGHT_TAIL_CHARS + 40));
+
+        assert_eq!(tail.buf.chars().count(), THOUGHT_TAIL_CHARS);
+        assert!(tail.buf.chars().all(|c| c == '思'));
+    }
+
+    /// Short reasoning is shown whole — no ellipsis implying dropped text that
+    /// was never dropped — and a cleared tail starts clean again.
+    #[test]
+    fn thought_tail_under_the_window_is_verbatim_and_clears() {
+        let mut tail = ThoughtTail::default();
+        tail.push("planning the edit");
+        assert_eq!(tail.summary(), "planning the edit");
+
+        tail.push(&"y".repeat(THOUGHT_TAIL_CHARS));
+        assert!(tail.summary().starts_with('…'));
+
+        tail.clear();
+        tail.push("second turn");
+        assert_eq!(
+            tail.summary(),
+            "second turn",
+            "clear must drop the elision flag with the text"
+        );
+    }
+
     #[tokio::test]
     async fn worker_liveness_requires_an_active_turn() {
         let state = LeadChatState::default();
@@ -7218,6 +9172,7 @@ mod tests {
             context_tokens: Some(57_000),
             window: Some(200_000),
             model: Some("claude-sonnet-4-5".into()),
+            reasoning_effort: None,
             mcp_servers: vec![super::super::proto::McpServer {
                 name: "context7".into(),
                 status: "connected".into(),
@@ -7295,6 +9250,7 @@ mod tests {
             context_tokens: Some(57_000),
             window: Some(100_000),
             model: Some("kept".into()),
+            reasoning_effort: None,
             mcp_servers: vec![],
             tools: vec![],
         };
@@ -8668,6 +10624,11 @@ mod tests {
             hidden_delivery("opencode", false, false, false),
             HiddenDelivery::SpawnTurn
         );
+        // ACP connection tools also have no resident stdin when idle.
+        assert_eq!(
+            hidden_delivery("omp", false, false, false),
+            HiddenDelivery::SpawnTurn
+        );
     }
 
     #[test]
@@ -8684,12 +10645,20 @@ mod tests {
             hidden_delivery("codex", true, false, false),
             HiddenDelivery::Queue
         );
+        assert_eq!(
+            hidden_delivery("omp", true, false, false),
+            HiddenDelivery::Queue
+        );
     }
 
     #[test]
     fn hidden_delivery_rejects_stopped_per_turn_engines() {
         assert_eq!(
             hidden_delivery("codex", false, false, true),
+            HiddenDelivery::Noop
+        );
+        assert_eq!(
+            hidden_delivery("omp", false, false, true),
             HiddenDelivery::Noop
         );
     }
@@ -8913,6 +10882,7 @@ mod tests {
             pending_command_refresh: false,
             last_context_tokens: None,
             last_model: None,
+            last_reasoning: None,
             last_window: None,
             last_mcp_servers: vec![],
             last_tools: vec![],
@@ -8922,10 +10892,13 @@ mod tests {
             tool_rows: std::collections::HashMap::new(),
             stopped: false,
             codex_client: None,
+            acp_client: None,
+            acp_pending_asks: Vec::new(),
             turn_user_row: None,
             last_assistant_uuid: None,
             rewinding: false,
             quota_failover_committing: false,
+            tearing_down: false,
             worktree_id: None,
         };
         let fresh = build_args(&inner);

@@ -17,15 +17,18 @@ export function resumeCommand(
   nativeId: string,
   command?: string,
 ): string {
-  const bin = command?.trim() || tool;
+  const rawBin = command?.trim() || tool;
+  const bin = shq(rawBin);
   const at = `cd ${shq(cwd)} && `;
   switch (tool) {
     case "claude":
-      return `${at}${bin} --resume ${nativeId}`;
+      return `${at}${bin} --resume ${shq(nativeId)}`;
     case "codex":
-      return `${at}${bin} resume ${nativeId}`;
+      return `${at}${bin} resume ${shq(nativeId)}`;
     case "opencode":
-      return `${at}${bin} . --session ${nativeId}`;
+      return `${at}${bin} . --session ${shq(nativeId)}`;
+    case "omp":
+      return `${at}${bin} --resume ${shq(nativeId)}`;
     default:
       return at + bin;
   }

@@ -5,16 +5,14 @@ import type { McpServerInfo, SessionMeta } from "../lib/types";
 const norm = (s: string) =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 
-/** Weft 自己在 spawn 时注入的内部协调 MCP(见 `bus/inject.rs`):是 Weft 的管道,不是
- *  用户配置的 MCP。面板只展示用户的 MCP,所以三家统一过滤掉。claude 的 `system/init`
- *  会带上它们(codex/opencode 的探测本就不含),在此统一隐藏以保持一致。
- *  **精确名单,不是前缀匹配** —— 开放的 `^weft[-_]` 会误伤用户自己命名的 `weft_analytics`
- *  这类真实 server(claude 的 `mcp_servers[].name` 原样来自用户 `.mcp.json`)。 */
-const WEFT_INTERNAL_MCP = new Set(["weft_bus", "weft_planner", "weft_global"]);
+/** Weft 自己在 spawn 时注入的内部协调 MCP(见 `bus/inject.rs`)。精确名单,不是前缀
+ *  匹配。面板展示时 status 标为 `weft`,与用户配置的 server 区分。 */
+const WEFT_INTERNAL_MCP = new Set(["weft_bus", "weft_planner", "weft_global", "weft_curator"]);
 const isInternalMcp = (name: string) => WEFT_INTERNAL_MCP.has(name.toLowerCase());
 
 /** claude init:把扁平 tools 里 `mcp__<server>__<tool>` 按 server 归到对应条目。
- *  codex/opencode 不传 tools,这里只产出 server + 状态(tools 为空)。weft_* 内部 server 过滤掉。 */
+ *  codex/opencode 不传 tools,这里只产出 server + 状态(tools 为空)。
+ *  Weft 内部 server status 标为 `weft`(见 WEFT_INTERNAL_MCP)。 */
 export function groupMcpTools(
   servers: { name: string; status: string }[],
   tools: string[],
@@ -28,13 +26,17 @@ export function groupMcpTools(
     list.push(m[2]);
     byPrefix.set(key, list);
   }
-  return servers
-    .filter((s) => !isInternalMcp(s.name))
-    .map((s) => ({
-      name: s.name,
-      status: s.status,
-      tools: byPrefix.get(norm(s.name)) ?? [],
-    }));
+  // Show every server on the session, including Weft pipes (weft_bus /
+  // weft_planner / weft_global). Hiding them made ACP/omp look MCP-less even
+  // though those pipes are what the agent actually has. Tag Weft pipes so the
+  // row still reads as infrastructure.
+  return servers.map((s) => ({
+    name: s.name,
+    status: isInternalMcp(s.name) && (s.status === "connected" || !s.status)
+      ? "weft"
+      : s.status,
+    tools: byPrefix.get(norm(s.name)) ?? [],
+  }));
 }
 
 /** init push → SessionMeta(init 不带 usage,保留旧 contextTokens)。
@@ -49,10 +51,18 @@ export function metaFromInit(
     tools: string[];
     model: string | null;
     window: number | null;
+    /** Explicit MCP authority (ACP open seeds true even when list empty). */
+    mcp_known?: boolean;
   },
 ): SessionMeta {
   const grouped = groupMcpTools(p.mcp_servers, p.tools);
-  const authoritative = p.model != null;
+  // Authority discriminators (in order):
+  // 1. explicit mcp_known from engine (ACP open always knows what it injected)
+  // 2. claude system/init carries model — empty mcp_servers is real "none"
+  // 3. non-empty raw list is always a real reading
+  // Placeholder inits (model null, empty servers, no flag) keep previous rows.
+  const authoritative =
+    p.mcp_known === true || p.model != null || p.mcp_servers.length > 0;
   const keepPrevServers = !authoritative && grouped.length === 0;
   return {
     contextTokens: prev?.contextTokens,
@@ -117,12 +127,22 @@ export function metaFromSnapshot(snap: {
   model: string | null;
   mcp_servers: { name: string; status: string }[];
   tools: string[];
+  /** True only when the engine/live path actually produced this MCP list. */
+  mcp_known?: boolean;
 }): SessionMeta {
+  const mcpServers = groupMcpTools(snap.mcp_servers, snap.tools);
+  // Never fabricate authority from model/tokens. Non-empty list is a real
+  // reading; empty list is authoritative only when mcp_known is explicit.
+  let mcpAuthoritative: true | undefined;
+  if (snap.mcp_known === true || snap.mcp_servers.length > 0) {
+    mcpAuthoritative = true;
+  }
   return {
     contextTokens: snap.context_tokens ?? undefined,
     window: snap.window ?? undefined,
     model: snap.model ?? undefined,
-    mcpServers: groupMcpTools(snap.mcp_servers, snap.tools),
+    mcpServers,
+    mcpAuthoritative,
   };
 }
 
@@ -139,7 +159,9 @@ export function fillMetaHoles(prev: SessionMeta | undefined, snap: SessionMeta):
     window: prev.window ?? snap.window,
     model: prev.model ?? snap.model,
     mcpServers: fillServers ? snap.mcpServers : prev.mcpServers,
-    mcpAuthoritative: prev.mcpAuthoritative,
+    // Promote authority when the snapshot is a real engine reading (even if
+    // user-visible servers are empty after filtering Weft-internal pipes).
+    mcpAuthoritative: prev.mcpAuthoritative || snap.mcpAuthoritative,
     engineSkills: prev.engineSkills ?? snap.engineSkills,
     reasoningEffort: prev.reasoningEffort ?? snap.reasoningEffort,
   };

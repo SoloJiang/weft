@@ -31,6 +31,47 @@ fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
     format!("{base}/ask/{thread}/{dir}?tool={tool}")
 }
 
+/// HTTP MCP servers Weft should pass on ACP `session/new|resume` for this
+/// engine role. Workers get `weft_bus`; lead also gets planner when `dir` is
+/// the lead lane; concierge/global callers pass `include_global`.
+pub fn acp_mcp_servers(
+    base: &str,
+    thread: i32,
+    dir: &str,
+    include_bus: bool,
+    include_planner: bool,
+    include_global: bool,
+    include_curator: bool,
+) -> Vec<crate::acp::McpServerSpec> {
+    let mut out = Vec::new();
+    // Concierge is global-only (no per-thread bus) — same as inject_global path.
+    if include_bus {
+        out.push(crate::acp::McpServerSpec {
+            name: "weft_bus".into(),
+            url: mcp_url(base, thread, dir),
+        });
+    }
+    if include_planner {
+        out.push(crate::acp::McpServerSpec {
+            name: "weft_planner".into(),
+            url: planner_url(base, thread),
+        });
+    }
+    if include_curator {
+        out.push(crate::acp::McpServerSpec {
+            name: "weft_curator".into(),
+            url: curator_url(base, thread),
+        });
+    }
+    if include_global {
+        out.push(crate::acp::McpServerSpec {
+            name: "weft_global".into(),
+            url: global_url(base),
+        });
+    }
+    out
+}
+
 /// The shared, FAIL-CLOSED tail of both bash ask-hook scripts — claude's
 /// per-worktree `.weft-ask-hook.sh` (below) and codex's global helper
 /// (`codex.rs::ensure_codex_hook_in`, which splices it in at
@@ -99,8 +140,12 @@ exit 0"#;
 /// Install the Ask Bridge for a session. Claude gets a worktree-local
 /// PreToolUse settings file; Codex writes only a worktree route file consumed
 /// by Weft's stable global hook in `~/.codex/config.toml`; OpenCode bridges via
-/// its server `/event` plugin. Best-effort: empty args if files can't be written.
+/// its server `/event` plugin. ACP tools (omp) use `session/request_permission`
+/// instead — no worktree files. Best-effort: empty args if files can't be written.
 pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Injection {
+    if crate::acp::backend_for(tool).is_some() {
+        return Injection { args: vec![] };
+    }
     if tool == "opencode" {
         return inject_opencode_ask_plugin(base, thread, dir, cwd);
     }
@@ -238,6 +283,10 @@ pub fn inject_global(base: &str, tool: &str, cwd: &Path) -> Injection {
 /// overriding the sub-repo's own config. `stem` names the claude temp config
 /// file (`.weft-<stem>.mcp.json`).
 fn inject_mcp(server: &str, stem: &str, url: &str, tool: &str, cwd: &Path) -> Injection {
+    if crate::acp::backend_for(tool).is_some() {
+        // MCP is supplied on session/new|resume, not via launch flags/files.
+        return Injection { args: vec![] };
+    }
     match tool {
         "claude" => {
             // ephemeral --mcp-config file inside the cwd. It's an injected,

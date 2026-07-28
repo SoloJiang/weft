@@ -5,7 +5,6 @@ import type { SessionMeta, EnabledSkill, Direction } from "../lib/types";
 import type { ReadOnlyScope } from "../lib/grants";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 
-type NamedSkill = { name: string; description: string };
 
 /**
  * 常驻右栏「会话信息」:Engine、Sub-tasks、Skills、MCP。Context 的 token/%
@@ -14,11 +13,9 @@ type NamedSkill = { name: string; description: string };
  * 且这是切换入口(onSwitchEngine)自然的落点,与"哪个引擎在跑"这条最基础的
  * 信息放在一起。Sub-tasks/MCP 是 <Section> 静态头 + <OverflowList>(head+
  * show-more):头常驻只读,长列表用同一个 head + "Show N more" 控件折叠尾部。
- * Skills 是两个独立口径的 <SkillGroup>(各自的头 + OverflowList)——workspace
- * 静态注入 vs 引擎运行时探测,见该段内注释与 #108;运行时探测那组按 `tool`
- * 门控(opencode 无此探测能力,见 {@link skillDiscoverySupported} 与 #114
- * review)。纯展示 + 一个切换入口——数据由 store 的 leadMeta/workerMeta +
- * workspaceSkills + directionsByThread 喂,切换的实际执行/确认交给调用方。
+ * Skills 是单一扁平列表(workspace 启用 ∪ 引擎 cwd 发现,按名去重;opencode 无
+ * 引擎探测则仅 workspace)。纯展示——数据由 store 的 leadMeta/workerMeta +
+ * workspaceSkills + directionsByThread 喂。
  */
 export function SessionInfoPanel({
   meta,
@@ -35,9 +32,7 @@ export function SessionInfoPanel({
 }: {
   meta: SessionMeta | undefined;
   skills: EnabledSkill[];
-  /** lead_tool / ObserveRef.tool — gates the "Discovered" Skills group to
-   *  engines that can actually report it (see {@link skillDiscoverySupported}).
-   *  Omitted/undefined (tool identity not resolved yet) still renders. */
+  /** lead_tool / ObserveRef.tool — optional session tool identity. */
   tool?: string;
   /** 该 thread 已创建的子任务(lead 专用;worker 不传 → 不渲染该段)。 */
   subtasks?: Direction[];
@@ -79,6 +74,28 @@ export function SessionInfoPanel({
   );
 
   const servers = meta?.mcpServers ?? [];
+
+  // One flat chip list (no 注入/发现 subgroups).
+  // - codex/claude: workspace-enabled ∪ engine-discovered (name-deduped)
+  // - omp/opencode: workspace-enabled only — engine "discovery" is either
+  //   absent (opencode) or just a cwd re-scan of Weft-materialized builtins (omp)
+  const mergeEngineSkills = tool !== "opencode";
+  const unifiedSkills = useMemo(() => {
+    const byName = new Map<string, { name: string; description?: string }>();
+    for (const s of skills) {
+      byName.set(s.name, { name: s.name, description: s.description });
+    }
+    if (mergeEngineSkills) {
+      for (const s of meta?.engineSkills ?? []) {
+        if (!byName.has(s.name)) {
+          byName.set(s.name, { name: s.name, description: s.description });
+        }
+      }
+    }
+    return [...byName.values()];
+  }, [skills, meta?.engineSkills, mergeEngineSkills]);
+  const skillsPending =
+    mergeEngineSkills && skills.length === 0 && meta?.engineSkills == null;
 
   return (
     <aside className="flex h-full w-[270px] shrink-0 flex-col overflow-hidden border-l border-border bg-bg">
@@ -186,41 +203,30 @@ export function SessionInfoPanel({
           </Section>
         )}
 
-        {/* Skills — two independently-sourced readings, kept apart rather than
-            merged into one count (issue #108). `skills` is Weft's injected
-            catalog for this workspace (policy, static — from workspace_skills).
-            `meta.engineSkills` is what the engine actually found on disk in the
-            session cwd at the last probe (ground truth, often a superset — e.g.
-            pre-existing/plugin skills outside Weft's catalog). A dedup-merge of
-            the two used to back the section's single count, which visibly
-            jumped (e.g. 41→79) the moment the turn-triggered engine probe
-            resolved after the workspace fetch. Each group now owns its count. */}
-        <Section key="skills" title={t("sessionInfo.skills")}>
-          <div className="mt-1.5">
-            <SkillGroup
-              label={t("sessionInfo.skillsInjected")}
-              hint={t("sessionInfo.skillsInjectedHint")}
-              skills={skills}
-              emptyText={t("sessionInfo.noSkills")}
+        {/* Skills — one flat list for this session. Workspace-enabled skills
+            plus anything the engine probe found in the cwd (deduped by name).
+            No injected/discovered split: users just want "what skills are on". */}
+        <Section key="skills" title={t("sessionInfo.skills")} count={unifiedSkills.length}>
+          {unifiedSkills.length > 0 ? (
+            <OverflowList
+              items={unifiedSkills}
+              head={10}
+              layout="wrap"
+              renderItem={(s) => (
+                <span
+                  key={s.name}
+                  title={s.description}
+                  className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
+                >
+                  {s.name}
+                </span>
+              )}
             />
-            {/* opencode has no discovery probe at all (session_meta.rs's
-                gather_opencode never sets `skills`) — engineSkills would stay
-                `undefined` forever, so the group would be stuck reading
-                "pending" turn after turn instead of ever resolving. That's not
-                the same as "not probed yet"; hide the reading entirely rather
-                than show a promise that can't be kept (PR #114 review). */}
-            {skillDiscoverySupported(tool) && (
-              <div className="mt-3">
-                <SkillGroup
-                  label={t("sessionInfo.skillsDiscovered")}
-                  hint={t("sessionInfo.skillsDiscoveredHint")}
-                  skills={meta?.engineSkills}
-                  emptyText={t("sessionInfo.noEngineSkills")}
-                  pendingText={t("sessionInfo.pending")}
-                />
-              </div>
-            )}
-          </div>
+          ) : (
+            <div className="mt-1.5 text-[11px] text-ink-faint">
+              {skillsPending ? t("sessionInfo.pending") : t("sessionInfo.noSkills")}
+            </div>
+          )}
         </Section>
 
         {/* MCP — servers cap at 3, each row expands its tools. */}
@@ -235,7 +241,11 @@ export function SessionInfoPanel({
               )}
             />
           ) : (
-            <div className="mt-1.5 text-[11px] text-ink-faint">{t("sessionInfo.pending")}</div>
+            <div className="mt-1.5 text-[11px] text-ink-faint">
+              {meta?.mcpAuthoritative
+                ? t("sessionInfo.noMcp")
+                : t("sessionInfo.pending")}
+            </div>
           )}
         </Section>
       </div>
@@ -329,105 +339,7 @@ function OverflowList<T>({
   );
 }
 
-/** Whether this session's engine has ANY mechanism to report which skills it
- *  actually loaded — mirrors `session_meta::gather`'s dispatch in
- *  `src-tauri/src/session_meta.rs`: claude scans the session cwd's
- *  `.claude/skills`, codex has its own skill discovery; opencode has no
- *  equivalent probe, so `gather_opencode` never sets `skills` and
- *  `meta.engineSkills` would stay `undefined` for the life of the session —
- *  not "pending", just permanently unavailable. `tool` unresolved
- *  (`undefined`, e.g. the worker surface before its session lookup lands)
- *  still counts as supported: the session_meta effects that would populate
- *  `engineSkills` already gate on the tool being known first (see
- *  LeadTab/WorkerConversation), so there's no real window where this default
- *  would show a reading that never arrives. */
-function skillDiscoverySupported(tool: string | undefined): boolean {
-  return tool !== "opencode";
-}
 
-/** One Skills reading's tri-state: `undefined` means no authoritative result
- *  has landed yet (the initial value, or every probe so far has failed —
- *  `sessionMeta.ts`'s merges keep this as `undefined`/prev rather than ever
- *  synthesizing a `[]`), `[]` means a probe DID land and confirmed zero, and a
- *  non-empty array is the actual list. Modeled as one discriminated value
- *  (instead of re-deriving `isPending`/`isEmpty` booleans at each call site)
- *  so "no signal yet" can never be silently displayed as "confirmed zero". */
-type SkillReadingState = "pending" | "empty" | "list";
-
-function skillReadingState(skills: unknown[] | undefined): SkillReadingState {
-  if (skills == null) return "pending";
-  return skills.length === 0 ? "empty" : "list";
-}
-
-/** Skills section body for one reading: an eyebrow label + its own count, over
- *  chips (head 10, dense) or an empty/pending hint. Exhaustive over
- *  `SkillReadingState` via {@link SkillGroupBody} rather than a nested ternary. */
-function SkillGroup<T extends NamedSkill>({
-  label,
-  hint,
-  skills,
-  emptyText,
-  pendingText = emptyText,
-}: {
-  label: string;
-  hint: string;
-  skills: T[] | undefined;
-  /** Shown when the reading is authoritative and empty. */
-  emptyText: string;
-  /** Shown when the reading hasn't landed yet. Defaults to `emptyText` for
-   *  readings that have no pending state (e.g. the injected list, always a
-   *  concrete — if possibly not-yet-fetched-once — array). */
-  pendingText?: string;
-}) {
-  const state = skillReadingState(skills);
-  const list = skills ?? [];
-  return (
-    <div>
-      <div className="flex items-center" title={hint}>
-        <span className="text-[10.5px] font-medium uppercase tracking-wide text-ink-faint">
-          {label}
-        </span>
-        {state !== "pending" && (
-          <span className="ml-auto text-[10.5px] text-ink-faint">{list.length}</span>
-        )}
-      </div>
-      <SkillGroupBody state={state} list={list} pendingText={pendingText} emptyText={emptyText} />
-    </div>
-  );
-}
-
-function SkillGroupBody<T extends NamedSkill>({
-  state,
-  list,
-  pendingText,
-  emptyText,
-}: {
-  state: SkillReadingState;
-  list: T[];
-  pendingText: string;
-  emptyText: string;
-}) {
-  if (state === "list") {
-    return (
-      <OverflowList
-        items={list}
-        head={10}
-        layout="wrap"
-        renderItem={(s) => (
-          <span
-            key={s.name}
-            title={s.description}
-            className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
-          >
-            {s.name}
-          </span>
-        )}
-      />
-    );
-  }
-  const text: Record<Exclude<SkillReadingState, "list">, string> = { pending: pendingText, empty: emptyText };
-  return <div className="mt-1.5 text-[11px] text-ink-faint">{text[state]}</div>;
-}
 
 /** created_at → epoch for ordering. Store writes Unix seconds as a string;
  * tolerate an ISO value too. Unparseable → 0 (sinks to the bottom). */
@@ -455,6 +367,7 @@ function subtaskDot(status: string): string {
 /** MCP server connection status → dot color. */
 function mcpDot(status: string): string {
   if (status === "connected") return "bg-running";
+  if (status === "weft") return "bg-brand";
   if (status === "failed") return "bg-danger";
   return "bg-idle";
 }

@@ -3728,6 +3728,13 @@ mod tests {
                 "opencode".to_string(),
                 root.join("missing-opencode").to_string_lossy().into_owned(),
             ),
+            // omp is a routing candidate too; without an override the test
+            // fixture's `installed || command == tool` fallback would call it
+            // available and this "nothing is installed" setup would not hold.
+            (
+                "omp".to_string(),
+                root.join("missing-omp").to_string_lossy().into_owned(),
+            ),
         ]));
 
         let preview = get_resolved(&db, confirm_thread).await.unwrap().unwrap();
@@ -3860,6 +3867,13 @@ mod tests {
             (
                 "opencode".to_string(),
                 root.join("missing-opencode").to_string_lossy().into_owned(),
+            ),
+            // omp is a routing candidate too; without an override the test
+            // fixture's `installed || command == tool` fallback would call it
+            // available and this "nothing is installed" setup would not hold.
+            (
+                "omp".to_string(),
+                root.join("missing-omp").to_string_lossy().into_owned(),
             ),
         ]));
 
@@ -4011,6 +4025,13 @@ mod tests {
             (
                 "opencode".to_string(),
                 root.join("missing-opencode").to_string_lossy().into_owned(),
+            ),
+            // omp is a routing candidate too; without an override the test
+            // fixture's `installed || command == tool` fallback would call it
+            // available and this "nothing is installed" setup would not hold.
+            (
+                "omp".to_string(),
+                root.join("missing-omp").to_string_lossy().into_owned(),
             ),
         ]));
         let result = approve_direction_with_pin(&db, thread.id, 0, None).await;

@@ -317,6 +317,12 @@ export const zh = {
     blockedToast: "进程额度仍处于降级状态。消息已保留，请在恢复后重试。",
   },
   needs: {
+    acpPermissionRequired: "需要授权",
+    // Authoritative copy. `scripts/gen-notice-copy.mjs` generates the
+    // backend-readable mirror the IM bridge renders from — edit here, run the
+    // script; `noticeCopy.test.ts` fails if the mirror drifts.
+    acpForceResetNotice:
+      "⏹️ 停止后 agent 未响应取消请求，已强制中断并重置为全新会话继续。历史对话仍保留在时间线里，但新会话不带原生上下文；如果后续回复像「忘记」了之前的内容，请重新提示一下关键信息。",
     title: "待你处理",
     subtitle: "只有你能回答的审批与提问",
     wantsPermission: "请求权限",
@@ -379,6 +385,7 @@ export const zh = {
     toolRunning: "正在运行",
     toolSyncing: "正在同步",
     toolOrganizing: "正在整理",
+    toolThinking: "正在思考",
     toolDelegating: "正在委派",
     toolCalling: "正在调用",
     toolEdited: "已编辑",
@@ -387,6 +394,7 @@ export const zh = {
     toolRan: "已运行",
     toolSynced: "已同步",
     toolOrganized: "已整理",
+    toolThought: "已思考",
     toolDelegated: "已委派",
     toolCalled: "已调用",
     resumeMenu: "恢复…",
@@ -397,6 +405,10 @@ export const zh = {
     rewindTip: "回退到这条消息之前",
     rewindTitle: "回退对话？",
     rewindBody: "这条消息之后的对话将被移除，agent 将不再记得它们；这条消息的文本会回填到输入框，可编辑后重发。",
+    acpSessionOpenFailed: "无法打开 agent 会话。请确认 agent 已安装后重试。",
+    ompSessionMissing: "找不到本地会话文件（agent 可能已清理）。请直接发新消息，而不是回退。",
+    ompUserMissing: "在 agent 会话文件里找不到这条消息，请换一条再试。",
+    ompScanTruncated: "agent 会话目录里的文件太多，未能完整搜索，因此没能定位到这个会话。清理旧的会话文件后即可搜到。",
     rewindConfirm: "回退",
     rewindModeConversation: "仅回退对话",
     rewindModeConversationDesc:
@@ -490,6 +502,7 @@ export const zh = {
     title: "会话信息",
     used: "已用 {{pct}}%",
     pending: "首条消息后可见",
+    noMcp: "本会话没有用户配置的 MCP server",
     noSkills: "未启用 skill",
     skillsInjected: "注入",
     skillsInjectedHint: "Weft 为该工作区启用的 skill",
@@ -564,6 +577,7 @@ export const zh = {
     analysisRunning: "分析中…",
     analysisFailed: "分析失败",
     analysisErrorCheckoutMissing: "本地检出未找到",
+    analysisErrorUnsupportedEngine: "仓库分析暂不支持 {{tool}}，请为 curator 选择其他引擎。",
     retryAnalysis: "重试",
     viewOverview: "概览",
     viewExpanded: "展开",
@@ -729,7 +743,7 @@ export const zh = {
     defaultTool: "默认编程工具",
     defaultToolHint:
       "只影响新建的 issue 和新建的任务（批准写入时卡片上仍可逐条覆盖）。不会追溯改动已经在跑的 issue 的 lead 或任务的 worker——那些去各自的会话信息面板里切换。",
-    noTools: "未检测到编程 CLI，请先安装 codex / claude / opencode。",
+    noTools: "未检测到编程 CLI，请先安装 codex / claude / opencode / omp。",
     toolFallback: "{{configured}} 未安装，当前生效 {{tool}}。",
     agentCommands: "Agent 命令",
     agentCommandsHint:

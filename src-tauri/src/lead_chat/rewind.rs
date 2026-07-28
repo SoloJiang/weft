@@ -8,7 +8,7 @@
 //! holding every message strictly before the matched user message.
 //! Spike-verified against opencode 1.17.9.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -44,7 +44,7 @@ pub(crate) fn dispatched_text(per_turn_tool: bool, row_id: i32, content_json: &s
         return d.to_string();
     }
     let mut out = v["text"].as_str().unwrap_or_default().to_string();
-    let mut list = |key: &str| -> Vec<String> {
+    let list = |key: &str| -> Vec<String> {
         v[key]
             .as_array()
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
@@ -255,11 +255,32 @@ pub(crate) fn normalize_ws(s: &str) -> String {
 /// 1-based position of `target` among `texts` under [`normalize_ws`] identity.
 /// The engine computes a fallback cut ordinal from DB rows with this, so it
 /// matches the transcript-side normalized matching exactly. 0 = no match.
+///
+/// An EMPTY target is "no match" here because that is claude's rule, not a
+/// universal one: [`user_text`] skips a transcript user line carrying no text
+/// blocks, so an empty target is genuinely unaddressable in that dialect and
+/// counting it would only trade a clear "no anchor" error for a confusing
+/// "text not found" one. Dialects that DO record an empty prompt verbatim use
+/// [`ordinal_of_prompt`].
 pub(crate) fn ordinal_of(texts: &[String], target: &str) -> usize {
-    let want = normalize_ws(target);
-    if want.is_empty() {
+    if normalize_ws(target).is_empty() {
         return 0;
     }
+    ordinal_of_prompt(texts, target)
+}
+
+/// [`ordinal_of`] for dialects where an empty prompt is still an addressable
+/// message — ACP in particular.
+///
+/// `session/prompt` always sends a text block, `{"type":"text","text":""}`
+/// even for an image-only message (images ride as sibling image blocks rather
+/// than the spilled-path appendix per-turn tools get). So "" is a real entry
+/// in the transcript, and `fork_omp_at`'s matcher already treats it as one —
+/// but the engine's `ordinal == 0` guard rejected it upstream, so rewinding a
+/// non-first image-only message failed as "no rewind anchor" and the matcher
+/// never ran.
+pub(crate) fn ordinal_of_prompt(texts: &[String], target: &str) -> usize {
+    let want = normalize_ws(target);
     texts.iter().filter(|t| normalize_ws(t) == want).count()
 }
 
@@ -513,6 +534,387 @@ fn strip_outer_quotes(s: &str) -> &str {
     } else {
         s
     }
+}
+
+
+
+
+/// Whether an omp jsonl user-message body matches the rewind target.
+///
+/// Exact whitespace-normalized equality always matches. The FIRST user message
+/// may also match after stripping the `{system}\n\n{user}` prepend Weft adds on
+/// session start — `system` is passed in, not guessed.
+///
+/// It used to be guessed, as "everything before the LAST blank line". A
+/// multi-paragraph first prompt breaks that in both directions: `SYS\n\nHello\n\
+/// \nWorld` isolates only `World`, so a later message whose text is `World`
+/// falsely matches the first turn and steals its ordinal (rewind then cuts the
+/// whole session away), while the real target `Hello\n\nWorld` fails to match
+/// its own first occurrence. An attachment appendix — which `dispatched_text`
+/// appends as its own blank-line block — puts every attachment-bearing first
+/// prompt in that same shape.
+///
+/// A mismatched `system` (the prompt changed since the session opened) simply
+/// declines the relaxed match; the caller then reports no anchor rather than
+/// cutting at the wrong message.
+fn omp_user_body_matches(
+    body: &str,
+    want_norm: &str,
+    first_user_prepend: Option<&str>,
+) -> bool {
+    if normalize_ws(body) == want_norm {
+        return true;
+    }
+    // Only the first user turn carries the prepend.
+    let Some(system) = first_user_prepend else {
+        return false;
+    };
+    if system.is_empty() {
+        return false;
+    }
+    let Some(rest) = body
+        .strip_prefix(system)
+        .and_then(|rest| rest.strip_prefix("\n\n"))
+    else {
+        return false;
+    };
+    normalize_ws(rest) == want_norm
+}
+
+/// Line index of the `ordinal`-th user prompt whose text blocks match `text`,
+/// i.e. where a cut-before rewind should truncate. `None` = no such prompt.
+///
+/// Split from [`fork_omp_at`]'s file IO so the matching rule — including the
+/// empty-text (image-only) prompt that [`ordinal_of_prompt`] can now address —
+/// is testable end to end without a session file on disk.
+fn omp_cut_index(
+    lines: &[&str],
+    text: &str,
+    ordinal: usize,
+    system_prompt: &str,
+) -> Option<usize> {
+    let want = normalize_ws(text);
+    let mut user_hits = 0usize;
+    let mut seen_users = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+        let role = v
+            .pointer("/message/role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        if role != "user" {
+            continue;
+        }
+        let content = v.pointer("/message/content").and_then(|c| c.as_array());
+        // Tool-result rows are also role=user but have no direct text block.
+        // Attachment-only prompts DO have a text block (text may be empty).
+        let Some(arr) = content else { continue };
+        let has_text_block = arr.iter().any(|b| {
+            b.get("type").and_then(|t| t.as_str()) == Some("text")
+                || b.get("text").and_then(|t| t.as_str()).is_some()
+        });
+        if !has_text_block {
+            continue;
+        }
+        let body = arr
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let first_user_prepend = (seen_users == 0).then_some(system_prompt);
+        seen_users += 1;
+        if !omp_user_body_matches(&body, &want, first_user_prepend) {
+            continue;
+        }
+        user_hits += 1;
+        if user_hits == ordinal {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Cut-before rewind for omp ACP sessions.
+///
+/// ACP `session/fork` only does full-history copy. We rewrite the on-disk
+/// `~/.omp/agent/sessions/<encoded-cwd>/*_<id>.jsonl` to keep entries strictly
+/// before the Nth matching user message, mint a new session id, and return it
+/// so the engine can `session/load` next turn. Spike-verified: hand-cut files
+/// load and only see the kept prefix (omp 17.1.1).
+pub fn fork_omp_at(
+    cwd: &Path,
+    session_id: &str,
+    text: &str,
+    ordinal: usize,
+    system_prompt: &str,
+) -> Result<Option<String>> {
+    if ordinal == 0 {
+        return Err(anyhow!("ordinal is 1-based"));
+    }
+    let Some(src) = find_omp_session_file(cwd, session_id)? else {
+        return Err(anyhow!("omp_session_not_found"));
+    };
+    let raw = std::fs::read_to_string(&src)
+        .with_context(|| format!("read omp session {}", src.display()))?;
+    let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    let Some(cut) = omp_cut_index(&lines, text, ordinal, system_prompt) else {
+        return Err(anyhow!("omp_user_not_found"));
+    };
+    if cut == 0 {
+        // Nothing to keep before first line — fresh session.
+        return Ok(None);
+    }
+    let kept = &lines[..cut];
+    if kept.iter().all(|l| {
+        serde_json::from_str::<Value>(l)
+            .ok()
+            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s.to_string()))
+            .map(|t| t != "message")
+            .unwrap_or(true)
+    }) {
+        // Only headers — equivalent to before-first-message.
+        return Ok(None);
+    }
+    // Random, not clock-derived: two rewinds on the same tick produced the SAME
+    // id, and both write `weft-rewind_<id>.jsonl` with a truncating `fs::write`,
+    // so one fork silently overwrote the other and two sessions resumed the same
+    // (or a corrupted) history. `new_uuid_v4` is the same RFC 4122 v4 helper the
+    // claude rewind already uses.
+    let new_id = new_uuid_v4();
+    let mut out = String::new();
+    for line in kept {
+        let Ok(mut v) = serde_json::from_str::<Value>(line) else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) == Some("session") {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("id".into(), Value::String(new_id.clone()));
+                obj.remove("parentSession");
+            }
+        }
+        out.push_str(&v.to_string());
+        out.push('\n');
+    }
+    let parent = src.parent().unwrap_or(Path::new("."));
+    let dst = parent.join(format!("weft-rewind_{new_id}.jsonl"));
+    std::fs::write(&dst, out).with_context(|| format!("write omp fork {}", dst.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod omp fork {}", dst.display()))?;
+    }
+    Ok(Some(new_id))
+}
+
+fn find_omp_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
+    let root = home.join(".omp/agent/sessions");
+    // The ROOT itself must not be a symlink. `is_dir()` follows one, and the
+    // bucket/entry checks below only reject a symlink at the FINAL component —
+    // so a redirected root put the whole scan outside the intended tree, and
+    // rewind then writes its fork beside that external file.
+    let root_ok = std::fs::symlink_metadata(&root)
+        .map(|m| m.is_dir() && !m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !root_ok {
+        return Ok(None);
+    }
+    // Containment of REAL locations, checked once at the end. Rejecting a
+    // symlink component-by-component can only cover the components this code
+    // happens to look at; canonicalizing the winner and requiring it under the
+    // canonical root covers every intermediate component and any `..` escape.
+    // Same rule `bus::builtin_allow` uses for ask-bridge path containment.
+    let canon_root = std::fs::canonicalize(&root)?;
+    // Prefer encoded-cwd bucket; fall back to any match.
+    let encoded = omp_encode_cwd(cwd);
+    let mut candidates = Vec::new();
+    // Whether a scan stopped at its cap. "Nothing found" and "stopped looking"
+    // are different answers, and reporting the second as the first told the
+    // user their session was gone when it was merely past the cap.
+    let mut truncated = false;
+    let preferred = root.join(&encoded);
+    // Do not follow a symlink bucket (or entries): rewind must stay under
+    // ~/.omp/agent/sessions.
+    let preferred_ok = std::fs::symlink_metadata(&preferred)
+        .map(|m| m.is_dir() && !m.file_type().is_symlink())
+        .unwrap_or(false);
+    if preferred_ok {
+        const MAX_PREFERRED_SCAN: usize = 4_096;
+        const MAX_PREFERRED_HITS: usize = 32;
+        let mut scanned = 0usize;
+        for e in std::fs::read_dir(&preferred)? {
+            if scanned >= MAX_PREFERRED_SCAN {
+                truncated = true;
+                break;
+            }
+            let e = e?;
+            scanned += 1;
+            let p = e.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.contains(session_id) && name.ends_with(".jsonl") {
+                candidates.push(p);
+                if candidates.len() >= MAX_PREFERRED_HITS {
+                    break;
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        let (hits, walk_truncated) = walkdir_jsonl(&root, session_id)?;
+        truncated = truncated || walk_truncated;
+        candidates.extend(hits);
+    }
+    candidates.retain(|p| is_inside_canonical(p, &canon_root));
+    // Distinguish the two failure answers. `Ok(None)` means "scanned everything
+    // reachable, it is not there"; a truncated scan cannot claim that, and
+    // `fork_omp_at` would otherwise report `omp_session_not_found` for a
+    // session that exists just past the cap.
+    if candidates.is_empty() && truncated {
+        return Err(anyhow!("omp_session_scan_truncated"));
+    }
+    // Newest mtime wins if several.
+    candidates.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
+            .unwrap_or(0)
+    });
+    Ok(candidates.pop())
+}
+
+/// Whether `candidate`'s REAL location is under `canon_root` (already
+/// canonical).
+///
+/// This is the actual boundary. The component-by-component symlink rejections
+/// above and in [`walkdir_jsonl`] are shape matching — they can only cover the
+/// components that particular code happens to look at — whereas resolving the
+/// winner and requiring containment holds for every intermediate component and
+/// for `..` escapes at once.
+///
+/// It is unreachable through today's callers precisely BECAUSE those scans also
+/// refuse symlinks, so no integration test can drive it without first weakening
+/// them; the predicate is tested directly instead. It stays as the structural
+/// guarantee those local checks are only approximating. Note it does NOT catch
+/// hard links — `canonicalize` does not resolve them — so it is containment of
+/// paths, not of inodes.
+///
+/// A path that cannot be canonicalized is NOT contained: when containment can't
+/// be established, the honest answer is "not a candidate".
+fn is_inside_canonical(candidate: &Path, canon_root: &Path) -> bool {
+    std::fs::canonicalize(candidate)
+        .map(|real| real.starts_with(canon_root))
+        .unwrap_or(false)
+}
+
+/// Returns the hits plus whether any cap stopped the walk early — the caller
+/// must not report a truncated walk as "not found".
+fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<(Vec<PathBuf>, bool)> {
+    use std::collections::HashSet;
+    /// Hard caps so a huge/unexpected `~/.omp/agent/sessions` tree cannot pin
+    /// the async command thread or blow memory. Prefer the encoded-cwd bucket
+    /// (caller); this walk is only the fallback.
+    const MAX_DIRS: usize = 256;
+    const MAX_FILES_SCANNED: usize = 4_096;
+    const MAX_DEPTH: usize = 6;
+    const MAX_HITS: usize = 32;
+    const SKIP_DIR_NAMES: &[&str] = &[
+        "node_modules", "target", ".git", "dist", "build", "cache", ".cache",
+    ];
+    let mut out = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    let mut seen = HashSet::new();
+    let mut dirs_visited = 0usize;
+    let mut files_scanned = 0usize;
+    // A cap stopped the walk with directories still queued: the answer is
+    // "stopped looking", not "not there".
+    let mut truncated = false;
+    while let Some((dir, depth)) = stack.pop() {
+        if dirs_visited >= MAX_DIRS || files_scanned >= MAX_FILES_SCANNED {
+            truncated = true;
+            break;
+        }
+        if depth > MAX_DEPTH {
+            continue;
+        }
+        let Ok(canon) = dir.canonicalize() else {
+            continue;
+        };
+        if !seen.insert(canon) {
+            continue; // cycle / revisit
+        }
+        dirs_visited += 1;
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for e in rd.flatten() {
+            if files_scanned >= MAX_FILES_SCANNED {
+                truncated = true;
+                break;
+            }
+            // Hitting the HIT cap is not truncation of the search space — the
+            // session was found, several times over.
+            if out.len() >= MAX_HITS {
+                break;
+            }
+            let p = e.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue; // never follow symlink dirs/files into the walk
+            }
+            if meta.is_dir() {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if SKIP_DIR_NAMES.iter().any(|s| name.eq_ignore_ascii_case(s)) {
+                    continue;
+                }
+                // Cap enqueues, not only visits — a wide fan-out can otherwise
+                // grow `stack` without bound before dirs_visited hits MAX_DIRS.
+                if dirs_visited + stack.len() >= MAX_DIRS {
+                    truncated = true;
+                    continue;
+                }
+                stack.push((p, depth + 1));
+            } else {
+                files_scanned += 1;
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.contains(session_id) && name.ends_with(".jsonl") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    Ok((out, truncated))
+}
+
+/// omp session bucket: non-alnum path chars → `-` (observed
+/// `~/.omp/agent/sessions/-workspace-weft-...`).
+fn omp_encode_cwd(cwd: &Path) -> String {
+    let s = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 #[cfg(test)]
@@ -956,5 +1358,520 @@ mod tests {
             dispatched_text(true, 7, stamped),
             "look\n\nAttached images (read them as needed):\n- /tmp/weft-attachments/msg7-0.png\n"
         );
+    }
+
+    #[test]
+    fn omp_first_user_is_row_order_not_match_count() {
+        // Unrelated first user row must consume the "first" slot so a later
+        // `notes\n\nrun tests` cannot match as system-prepend.
+        let want = normalize_ws("run tests");
+        assert!(!omp_user_body_matches("hello world", &want, Some("sys")));
+        // After the first row is visited, a blank-paragraph body is not first.
+        assert!(!omp_user_body_matches("notes\n\nrun tests", &want, None));
+        // Exact later still matches.
+        assert!(omp_user_body_matches("run tests", &want, None));
+    }
+
+    #[test]
+    fn omp_multi_paragraph_system_prepend_matches() {
+        let want = normalize_ws("run tests");
+        let system = "You are the lead.\n\nOperate with judgment.\n\nThird para.";
+        let body = format!("{system}\n\nrun tests");
+        assert!(omp_user_body_matches(&body, &want, Some(system)));
+        assert!(!omp_user_body_matches(&body, &want, None));
+    }
+
+    /// The prepend is STRIPPED, never guessed. Splitting on the last blank line
+    /// broke both ways once a prompt had more than one paragraph.
+    #[test]
+    fn a_multi_paragraph_first_prompt_matches_whole_and_not_by_tail() {
+        let system = "You are the lead.";
+        let body = format!("{system}\n\nHello\n\nWorld");
+
+        // The real target is the WHOLE user message.
+        assert!(omp_user_body_matches(
+            &body,
+            &normalize_ws("Hello\n\nWorld"),
+            Some(system)
+        ));
+        // A later message equal to the first prompt's final paragraph must not
+        // steal the first turn's ordinal — that cut the whole session away.
+        assert!(!omp_user_body_matches(
+            &body,
+            &normalize_ws("World"),
+            Some(system)
+        ));
+    }
+
+    /// A system prompt that changed since the session opened declines the
+    /// relaxed match, so the caller reports "no anchor" instead of cutting at
+    /// the wrong message.
+    #[test]
+    fn a_stale_system_prompt_declines_rather_than_mismatching() {
+        let want = normalize_ws("run tests");
+        let body = "You are helpful.\n\nrun tests";
+        assert!(!omp_user_body_matches(body, &want, Some("Different prompt.")));
+        assert!(!omp_user_body_matches(body, &want, Some("")));
+        assert!(omp_user_body_matches(body, &want, Some("You are helpful.")));
+    }
+
+    #[test]
+    fn omp_user_body_matches_system_prepend_only_on_first() {
+        let want = normalize_ws("run tests");
+        assert!(omp_user_body_matches(
+            "You are helpful.\n\nrun tests",
+            &want,
+            Some("You are helpful.")
+        ));
+        assert!(omp_user_body_matches("run tests", &want, Some("sys")));
+        // Later user with a blank paragraph must NOT match as a prepend.
+        assert!(!omp_user_body_matches("notes\n\nrun tests", &want, None));
+        assert!(omp_user_body_matches("run tests", &want, None));
+        // Leading blank lines collapse under normalize_ws → exact match path.
+        assert!(omp_user_body_matches("\n\nrun tests", &want, Some("sys")));
+        // A non-empty prefix that is NOT the system prompt no longer matches
+        // just because it shares a blank-line separator.
+        assert!(!omp_user_body_matches("sys\n\nrun tests", &want, Some("other")));
+        assert!(omp_user_body_matches("sys\n\nrun tests", &want, Some("sys")));
+    }
+
+    #[test]
+    fn walkdir_jsonl_skips_symlinks_and_caps() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        // real hit
+        std::fs::write(root.join("sess-abc.jsonl"), "{}\n").unwrap();
+        // symlink file must be skipped
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(root.join("sess-abc.jsonl"), root.join("link-sess-abc.jsonl"));
+            // outside is a SIBLING of root, not a child — only reachable via symlink
+            let outside = dir.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("sess-abc-out.jsonl"), "{}\n").unwrap();
+            let _ = std::os::unix::fs::symlink(&outside, root.join("symdir"));
+        }
+        // artifact dir skipped
+        let nm = root.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(nm.join("sess-abc-nm.jsonl"), "{}\n").unwrap();
+        let (hits, _truncated) = walkdir_jsonl(&root, "sess-abc").expect("walk");
+        let names: Vec<_> = hits.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
+        assert!(names.iter().any(|n| n == "sess-abc.jsonl"), "real hit: {names:?}");
+        assert!(names.iter().all(|n| n != "link-sess-abc.jsonl"), "symlink file skipped: {names:?}");
+        assert!(names.iter().all(|n| !n.contains("out")), "symlink dir not followed: {names:?}");
+        assert!(names.iter().all(|n| n != "sess-abc-nm.jsonl"), "node_modules skipped: {names:?}");
+    }
+
+    #[test]
+    fn preferred_omp_bucket_rejects_symlink_dir() {
+        let dir = tempfile::tempdir().expect("tmp");
+        // Build a fake home-relative structure is hard; unit-test the metadata gate.
+        let bucket = dir.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("x-sid.jsonl"), "a\n").unwrap();
+        let meta = std::fs::symlink_metadata(&bucket).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("linkbucket");
+            let _ = std::os::unix::fs::symlink(&bucket, &link);
+            let lm = std::fs::symlink_metadata(&link).unwrap();
+            assert!(lm.file_type().is_symlink());
+            // Gate used by find_omp_session_file:
+            let ok = std::fs::symlink_metadata(&link)
+                .map(|m| m.is_dir() && !m.file_type().is_symlink())
+                .unwrap_or(false);
+            assert!(!ok, "symlink bucket must be rejected");
+        }
+    }
+
+    #[test]
+    fn walkdir_jsonl_respects_max_hits_cap() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path();
+        // Create more matching files than MAX_HITS (32).
+        for i in 0..80 {
+            std::fs::write(root.join(format!("sess-cap-{i}.jsonl")), b"{}\n").unwrap();
+        }
+        let (hits, truncated) = walkdir_jsonl(root, "sess-cap").expect("walk");
+        assert!(hits.len() <= 32, "capped at MAX_HITS, got {}", hits.len());
+        assert!(!hits.is_empty());
+        assert!(
+            !truncated,
+            "stopping at the HIT cap is not a truncated search — the session was found"
+        );
+    }
+
+    #[test]
+    fn walkdir_jsonl_caps_wide_directory_fanout() {
+        use std::fs;
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path();
+        // One level with many child dirs (few files) — must not grow stack unbounded.
+        for i in 0..2_000 {
+            let d = root.join(format!("d{i}"));
+            fs::create_dir(&d).expect("mkdir");
+            // one non-matching file per dir so we exercise file branch too
+            fs::write(d.join("x.txt"), b"x").expect("file");
+        }
+        // A single hit buried late should still be findable within caps, but
+        // the walk must terminate quickly and never enqueue > MAX_DIRS pending.
+        fs::write(root.join("sess-wide.jsonl"), b"{}\n").expect("hit");
+        let (hits, _truncated) = walkdir_jsonl(root, "sess-wide").expect("walk");
+        // Cap may stop before discovering the hit if fan-out exhausts MAX_DIRS;
+        // the invariant under test is termination + no panic/OOM, and hits ≤ MAX_HITS.
+        assert!(hits.len() <= 32, "hits capped");
+    }
+
+    /// CLAUDE.md requires symlink-containment coverage for recursive
+    /// filesystem work. `is_dir()` FOLLOWS a symlink, and the per-bucket and
+    /// per-entry checks only reject one at the final component — so a
+    /// redirected root put the whole scan outside `~/.omp/agent/sessions`, and
+    /// a rewind would then write its fork beside that external file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_session_root_is_refused() {
+        use std::fs;
+        let _serialized = home_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path();
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+
+        // The real session tree lives OUTSIDE the home we will point at.
+        let outside = dir.path().join("elsewhere");
+        let bucket = outside.join(omp_encode_cwd(&cwd));
+        fs::create_dir_all(&bucket).unwrap();
+        fs::write(bucket.join("zzz_sess-outside.jsonl"), b"{}\n").unwrap();
+
+        // ~/.omp/agent/sessions -> the outside tree.
+        fs::create_dir_all(home.join(".omp/agent")).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join(".omp/agent/sessions")).unwrap();
+
+        let old = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let found = find_omp_session_file(&cwd, "sess-outside");
+        match old {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert!(
+            matches!(found, Ok(None)),
+            "a symlinked session root must select nothing, got {found:?}"
+        );
+    }
+
+    /// The containment check is on REAL locations, so an entry reachable only
+    /// through a symlinked BUCKET (an intermediate component, which the
+    /// per-entry check never looks at) is refused too.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_reached_through_a_symlinked_bucket_is_refused() {
+        use std::fs;
+        let _serialized = home_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path();
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let outside = dir.path().join("outside-bucket");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("zzz_sess-linked.jsonl"), b"{}\n").unwrap();
+
+        let sessions = home.join(".omp/agent/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        std::os::unix::fs::symlink(&outside, sessions.join(omp_encode_cwd(&cwd))).unwrap();
+
+        let old = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let found = find_omp_session_file(&cwd, "sess-linked");
+        match old {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert!(
+            matches!(found, Ok(None)),
+            "a symlinked bucket must not yield a candidate, got {found:?}"
+        );
+    }
+
+    /// The boundary predicate itself. Unreachable via `find_omp_session_file`
+    /// today (its scans refuse symlinks first), so it is exercised directly —
+    /// a guard with no test is indistinguishable from one that always returns
+    /// the same answer.
+    #[cfg(unix)]
+    #[test]
+    fn containment_is_of_real_locations_not_path_strings() {
+        use std::fs;
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("escaped.jsonl"), b"{}\n").unwrap();
+        fs::write(root.join("real.jsonl"), b"{}\n").unwrap();
+        let canon_root = fs::canonicalize(&root).unwrap();
+
+        assert!(is_inside_canonical(&root.join("real.jsonl"), &canon_root));
+
+        // Reachable through a path that LOOKS inside, but resolves outside.
+        std::os::unix::fs::symlink(outside.join("escaped.jsonl"), root.join("looks-inside.jsonl"))
+            .unwrap();
+        assert!(
+            !is_inside_canonical(&root.join("looks-inside.jsonl"), &canon_root),
+            "a symlink pointing out of the tree is not contained"
+        );
+
+        // `..` traversal that stringly-starts-with the root.
+        assert!(!is_inside_canonical(
+            &root.join("../outside/escaped.jsonl"),
+            &canon_root
+        ));
+
+        // Cannot be canonicalized → not contained.
+        assert!(!is_inside_canonical(&root.join("missing.jsonl"), &canon_root));
+    }
+
+    /// "Stopped looking" must not be reported as "not there". The previous
+    /// large-directory test only asserted `is_ok()`, which accepts exactly that
+    /// false negative: a bucket past the scan cap made `fork_omp_at` answer
+    /// `omp_session_not_found` for a session that exists.
+    #[test]
+    fn a_truncated_scan_is_a_distinct_error_not_a_missing_session() {
+        use std::fs;
+        let _serialized = home_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path();
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let bucket = home.join(".omp/agent/sessions").join(omp_encode_cwd(&cwd));
+        fs::create_dir_all(&bucket).unwrap();
+        // Past MAX_PREFERRED_SCAN (4096) with NO matching file anywhere, so the
+        // fallback walk is capped too and the session is genuinely unreachable
+        // within the caps.
+        for i in 0..5_000 {
+            fs::write(bucket.join(format!("noise-{i}.txt")), b"x").unwrap();
+        }
+
+        let old = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let found = find_omp_session_file(&cwd, "sess-past-the-cap");
+        match old {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let err = found.expect_err("a truncated scan must not answer Ok(None)");
+        assert!(
+            err.to_string().contains("omp_session_scan_truncated"),
+            "got {err}"
+        );
+    }
+
+    /// The guards must not reject the ordinary case.
+    #[test]
+    fn an_ordinary_session_file_is_still_found() {
+        use std::fs;
+        let _serialized = home_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path();
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let bucket = home.join(".omp/agent/sessions").join(omp_encode_cwd(&cwd));
+        fs::create_dir_all(&bucket).unwrap();
+        fs::write(bucket.join("zzz_sess-ok.jsonl"), b"{}\n").unwrap();
+
+        let old = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let found = find_omp_session_file(&cwd, "sess-ok");
+        match old {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let path = found.expect("lookup ok").expect("a candidate");
+        assert!(path.ends_with("zzz_sess-ok.jsonl"), "got {path:?}");
+    }
+
+    #[test]
+    fn preferred_bucket_caps_large_dir() {
+        use std::fs;
+        let _serialized = home_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path();
+        let sessions = home.join(".omp/agent/sessions");
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let encoded = omp_encode_cwd(&cwd);
+        let bucket = sessions.join(&encoded);
+        fs::create_dir_all(&bucket).unwrap();
+        for i in 0..5_000 {
+            fs::write(bucket.join(format!("noise-{i}.txt")), b"x").unwrap();
+        }
+        fs::write(bucket.join("zzz_sess-cap-me.jsonl"), b"{}\n").unwrap();
+        let old = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let found = find_omp_session_file(&cwd, "sess-cap-me");
+        match old {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        assert!(found.is_ok());
+    }
+
+    /// The system prepend the first ACP user turn carries in these fixtures.
+    const SYS: &str = "SYSTEM PREAMBLE";
+
+    /// Serializes the tests that override `HOME`. `find_omp_session_file`
+    /// resolves it through `dirs::home_dir()` and cargo runs tests on threads,
+    /// so without this two HOME-swapping tests interleave and each sees the
+    /// other's root — a flake that only shows up under load.
+    fn home_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn omp_user_line(blocks: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "message",
+            "message": { "role": "user", "content": blocks }
+        })
+        .to_string()
+    }
+
+    fn omp_assistant_line(text: &str) -> String {
+        serde_json::json!({
+            "type": "message",
+            "message": { "role": "assistant", "content": [{"type":"text","text":text}] }
+        })
+        .to_string()
+    }
+
+    /// What omp actually records for an image-only message: `prompt()` always
+    /// emits a text block, so the text is EMPTY rather than absent.
+    fn image_only_line() -> String {
+        omp_user_line(serde_json::json!([
+            {"type":"text","text":""},
+            {"type":"image","mimeType":"image/png","data":"AAAA"}
+        ]))
+    }
+
+    /// Tool results are role=user too, but carry no text block — they must
+    /// never be mistaken for an (empty-bodied) user prompt.
+    #[test]
+    fn omp_cut_skips_tool_results_which_have_no_text_block() {
+        let tool_result = omp_user_line(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"t1","content":"ok"}
+        ]));
+        let lines: Vec<&str> = vec![&tool_result];
+
+        assert_eq!(
+            omp_cut_index(&lines, "", 1, SYS),
+            None,
+            "a tool_result row is not an empty user prompt"
+        );
+    }
+
+    /// The whole upstream path for a NON-FIRST image-only rewind: the DB-side
+    /// ordinal has to survive into the transcript cut. A matcher-level check
+    /// cannot catch this — `ordinal_of` zeroed the empty target and the engine
+    /// rejected the rewind as "no anchor" before the matcher ever ran.
+    #[test]
+    fn image_only_omp_prompt_rewinds_end_to_end() {
+        let first = omp_user_line(serde_json::json!([{"type":"text","text":"hello"}]));
+        let reply = omp_assistant_line("hi");
+        let tool_result = omp_user_line(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"t1","content":"ok"}
+        ]));
+        let image_only = image_only_line();
+        let after = omp_assistant_line("nice picture");
+        let lines: Vec<&str> = vec![&first, &reply, &tool_result, &image_only, &after];
+
+        // The engine reconstructs these dispatched texts from the DB rows; the
+        // image-only row's is empty because ACP keeps images out of the text.
+        let dispatched = vec!["hello".to_string(), String::new()];
+        assert_eq!(
+            ordinal_of(&dispatched, ""),
+            0,
+            "claude's transcript cannot address an empty prompt"
+        );
+        let ordinal = ordinal_of_prompt(&dispatched, "");
+        assert_eq!(ordinal, 1, "ACP can: it is the first empty-bodied prompt");
+
+        assert_eq!(
+            omp_cut_index(&lines, "", ordinal, SYS),
+            Some(3),
+            "cut before the image-only prompt itself"
+        );
+    }
+
+    /// Two image-only messages share the empty identity, so the ordinal is the
+    /// only thing telling them apart — it must select the right one.
+    #[test]
+    fn the_ordinal_picks_between_two_image_only_prompts() {
+        let first = omp_user_line(serde_json::json!([{"type":"text","text":"hello"}]));
+        let a = image_only_line();
+        let reply = omp_assistant_line("one");
+        let b = image_only_line();
+        let lines: Vec<&str> = vec![&first, &a, &reply, &b];
+
+        let dispatched = vec!["hello".to_string(), String::new(), String::new()];
+        assert_eq!(ordinal_of_prompt(&dispatched, ""), 2, "counts up to the target");
+
+        assert_eq!(omp_cut_index(&lines, "", 1, SYS), Some(1));
+        assert_eq!(omp_cut_index(&lines, "", 2, SYS), Some(3));
+        assert_eq!(omp_cut_index(&lines, "", 3, SYS), None, "only two exist");
+    }
+
+    /// A rewind of the first post-ENGINE-SWITCH message does not match, and
+    /// that is pinned deliberately.
+    ///
+    /// The dispatched text is `system + context_digest + user`, while the
+    /// persisted row holds only `user` — the digest is kept out of the DB on
+    /// purpose (PR #139: it can carry paths and pasted secrets). Stripping the
+    /// system prompt still leaves `digest + user`, so nothing matches.
+    ///
+    /// No match is the SAFE outcome: `fork_omp_at` runs before any stop or
+    /// truncate, so the rewind fails with the session fully intact. The tempting
+    /// "fix" — accepting any trailing segment after a blank line — is the
+    /// mis-cut this matcher was tightened to prevent one round earlier. A real
+    /// fix has to anchor the OMP-native history boundary (the jsonl starts at
+    /// the switch, while the DB ordinal counts the whole session), which is
+    /// cross-engine rewind semantics, not a matcher tweak.
+    #[test]
+    fn a_post_switch_first_prompt_does_not_match_rather_than_guessing() {
+        let dispatched = format!("{SYS}\n\nCONTEXT DIGEST: 12 prior turns…\n\nrun the tests");
+        let first = omp_user_line(serde_json::json!([{"type":"text","text":dispatched}]));
+        let lines: Vec<&str> = vec![&first];
+
+        assert_eq!(
+            omp_cut_index(&lines, "run the tests", 1, SYS),
+            None,
+            "refusing to guess the digest boundary is correct; a match here would \
+             mean accepting any trailing segment, which mis-cuts multi-paragraph prompts"
+        );
+    }
+
+    /// The first prompt carries the system prepend, whose relaxed match must
+    /// not swallow an empty target — that would cut the whole session away.
+    #[test]
+    fn a_system_prepended_first_prompt_never_matches_an_empty_target() {
+        let first = omp_user_line(serde_json::json!([
+            {"type":"text","text":format!("{SYS}\n\nhello")}
+        ]));
+        let image_only = image_only_line();
+        let lines: Vec<&str> = vec![&first, &image_only];
+
+        assert_eq!(
+            omp_cut_index(&lines, "", 1, SYS),
+            Some(1),
+            "the empty target is the image-only prompt, not the prepended first turn"
+        );
+        // And the prepended turn IS reachable by its own text.
+        assert_eq!(omp_cut_index(&lines, "hello", 1, SYS), Some(0));
     }
 }

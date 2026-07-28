@@ -1,0 +1,803 @@
+{
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "result": {
+      "stopReason": "end_turn",
+      "usage": {
+        "inputTokens": 227,
+        "outputTokens": 57,
+        "totalTokens": 51228,
+        "cachedReadTokens": 50944
+      }
+    }
+  },
+  "notes": [
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": "The"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " user"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " wants"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " me"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " to"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " use"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " bash"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " once"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " to"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " echo"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " TOOL"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": "_"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": "OK"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": ","
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " then"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " reply"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " DONE"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " only"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": "."
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": "\n\n"
+          },
+          "messageId": "b48bbaf9-bf26-4c8c-bb7b-da8411b12b78"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": 0,
+      "method": "session/request_permission",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "toolCall": {
+          "toolCallId": "call-fb75add5-d66b-4754-8596-2092291de102-0|fc_8dd84108-a3e5-9b2a-910c-fb23fbfc059f_0",
+          "title": "echo TOOL_OK",
+          "kind": "execute",
+          "status": "pending",
+          "rawInput": {
+            "command": "echo TOOL_OK"
+          },
+          "content": [
+            {
+              "type": "content",
+              "content": {
+                "type": "text",
+                "text": "$ echo TOOL_OK"
+              }
+            }
+          ],
+          "locations": []
+        },
+        "options": [
+          {
+            "optionId": "allow_once",
+            "name": "Allow once",
+            "kind": "allow_once"
+          },
+          {
+            "optionId": "allow_always",
+            "name": "Always allow",
+            "kind": "allow_always"
+          },
+          {
+            "optionId": "reject_once",
+            "name": "Reject",
+            "kind": "reject_once"
+          },
+          {
+            "optionId": "reject_always",
+            "name": "Always reject",
+            "kind": "reject_always"
+          }
+        ]
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "tool_call",
+          "toolCallId": "call-fb75add5-d66b-4754-8596-2092291de102-0|fc_8dd84108-a3e5-9b2a-910c-fb23fbfc059f_0",
+          "title": "$ echo TOOL_OK",
+          "kind": "execute",
+          "status": "pending",
+          "rawInput": {
+            "command": "echo TOOL_OK"
+          },
+          "content": [
+            {
+              "type": "content",
+              "content": {
+                "type": "text",
+                "text": "$ echo TOOL_OK"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "tool_call_update",
+          "toolCallId": "call-fb75add5-d66b-4754-8596-2092291de102-0|fc_8dd84108-a3e5-9b2a-910c-fb23fbfc059f_0",
+          "status": "in_progress",
+          "rawOutput": {
+            "content": [
+              {
+                "type": "text",
+                "text": "TOOL_OK\n"
+              }
+            ],
+            "details": {}
+          },
+          "content": [
+            {
+              "type": "content",
+              "content": {
+                "type": "text",
+                "text": "$ echo TOOL_OK"
+              }
+            },
+            {
+              "type": "content",
+              "content": {
+                "type": "text",
+                "text": "TOOL_OK\n"
+              }
+            },
+            {
+              "type": "content",
+              "content": {
+                "type": "text",
+                "text": "TOOL_OK"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "tool_call_update",
+          "toolCallId": "call-fb75add5-d66b-4754-8596-2092291de102-0|fc_8dd84108-a3e5-9b2a-910c-fb23fbfc059f_0",
+          "status": "completed",
+          "rawOutput": {
+            "content": [
+              {
+                "type": "text",
+                "text": "TOOL_OK\n\n\nWall time: 0.15 seconds"
+              }
+            ],
+            "details": {
+              "timeoutSeconds": 300,
+              "wallTimeMs": 151.16908300000068
+            }
+          },
+          "content": [
+            {
+              "type": "content",
+              "content": {
+                "type": "text",
+                "text": "$ echo TOOL_OK"
+              }
+            },
+            {
+              "type": "content",
+              "content": {
+                "type": "text",
+                "text": "TOOL_OK\n\n\nWall time: 0.15 seconds"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": "The"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " user"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " asked"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " me"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " to"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " reply"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " DONE"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " only"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " after"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " running"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " the"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " bash"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": " command"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": "."
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": {
+            "type": "text",
+            "text": "\n\n"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": {
+            "type": "text",
+            "text": "DONE"
+          },
+          "messageId": "43ed6e18-c02a-434f-833d-5fc94ae7cd63"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "usage_update",
+          "size": 500000,
+          "used": 25615
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "updatedAt": "2026-07-24T14:09:18.304Z"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": 5,
+      "result": {
+        "stopReason": "end_turn",
+        "usage": {
+          "inputTokens": 227,
+          "outputTokens": 57,
+          "totalTokens": 51228,
+          "cachedReadTokens": 50944
+        }
+      }
+    }
+  ],
+  "permissions": [
+    {
+      "jsonrpc": "2.0",
+      "id": 0,
+      "method": "session/request_permission",
+      "params": {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "toolCall": {
+          "toolCallId": "call-fb75add5-d66b-4754-8596-2092291de102-0|fc_8dd84108-a3e5-9b2a-910c-fb23fbfc059f_0",
+          "title": "echo TOOL_OK",
+          "kind": "execute",
+          "status": "pending",
+          "rawInput": {
+            "command": "echo TOOL_OK"
+          },
+          "content": [
+            {
+              "type": "content",
+              "content": {
+                "type": "text",
+                "text": "$ echo TOOL_OK"
+              }
+            }
+          ],
+          "locations": []
+        },
+        "options": [
+          {
+            "optionId": "allow_once",
+            "name": "Allow once",
+            "kind": "allow_once"
+          },
+          {
+            "optionId": "allow_always",
+            "name": "Always allow",
+            "kind": "allow_always"
+          },
+          {
+            "optionId": "reject_once",
+            "name": "Reject",
+            "kind": "reject_once"
+          },
+          {
+            "optionId": "reject_always",
+            "name": "Always reject",
+            "kind": "reject_always"
+          }
+        ]
+      }
+    }
+  ]
+}

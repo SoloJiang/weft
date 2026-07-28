@@ -85,8 +85,20 @@ export function RewindDialog({
       await onConfirm(mode);
       onOpenChange(false);
     } catch (e) {
-      setErr(String(e));
-      if (import.meta.env.DEV) console.error("chat rewind failed:", String(e));
+      const raw = String(e);
+      let mapped = raw;
+      if (raw.includes("omp_session_not_found")) {
+        mapped = t("session.ompSessionMissing");
+      } else if (raw.includes("omp_user_not_found")) {
+        mapped = t("session.ompUserMissing");
+      } else if (raw.includes("omp_session_scan_truncated")) {
+        // Distinct from "missing" on purpose: the session may well exist, the
+        // scan just stopped at its cap. Saying "not found" would send the user
+        // looking for a deleted session that is actually there.
+        mapped = t("session.ompScanTruncated");
+      }
+      setErr(mapped);
+      if (import.meta.env.DEV) console.error("chat rewind failed:", raw);
       setBusy(false);
     }
   }

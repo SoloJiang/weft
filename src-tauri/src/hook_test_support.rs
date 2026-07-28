@@ -48,7 +48,13 @@ pub(crate) async fn run_hook_script(
     // into `wait_with_output`, which consumes it.
     let pgid = child.id().map(|pid| pid as i32);
     let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(payload.as_bytes()).await.unwrap();
+    // A broken pipe here is the script BEHAVING CORRECTLY, not a test failure:
+    // several of these hooks exit before reading stdin (the non-loopback route
+    // returns without posting at all), so the write races a legitimate early
+    // exit. Unwrapping made that race a flaky `Broken pipe` panic on loaded CI
+    // runners while passing everywhere fast. What the tests assert is the
+    // script's stdout and exit code, both captured below.
+    let _ = stdin.write_all(payload.as_bytes()).await;
     drop(stdin); // EOF — curl's `--data-binary @-` reads until it
     match tokio::time::timeout(limit, child.wait_with_output()).await {
         Ok(out) => {

@@ -1237,7 +1237,12 @@ async fn consume_human_event(
             // nothing to patch (take_human → None), which is exactly right for
             // a notice that never carries an answer.
             if !ask.kind.is_answerable() {
-                let notice = format!("{title} · {from}\n{}", ask.text);
+                // Background tasks post a stable token rather than prose (they
+                // have no locale); render it here, or a remote human receives
+                // the raw `acp.force_reset_notice`.
+                let body = crate::bus::notice_text::resolve(&ask.text, IM_LANG)
+                    .unwrap_or(ask.text.as_str());
+                let notice = format!("{title} · {from}\n{body}");
                 if let Err(e) = ch.send_text(&owner, &notice).await {
                     eprintln!("[weft][im] send stall notice: {e}");
                 }
@@ -1246,7 +1251,13 @@ async fn consume_human_event(
             match ch
                 .send_card(
                     &owner,
-                    outbound::human_card(&title, &from, &ask.text, IM_LANG),
+                    outbound::human_card(
+                        &title,
+                        &from,
+                        crate::bus::notice_text::resolve(&ask.text, IM_LANG)
+                            .unwrap_or(ask.text.as_str()),
+                        IM_LANG,
+                    ),
                 )
                 .await
             {

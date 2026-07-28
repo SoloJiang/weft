@@ -1,0 +1,1404 @@
+//! Global multiplexed ACP client pool — one child process per backend id.
+//!
+//! Protocol-only: no CLI name strings except via [`super::backends::AcpBackend`].
+//! Codex app-server must NOT use this module (different wire dialect).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::{mpsc, oneshot, Mutex};
+
+use super::backends::{backend_for, AcpBackend, McpServerSpec};
+use super::jsonrpc::{
+    classify, encode_error_response, encode_notification, encode_request, encode_response, Incoming,
+};
+use super::map::{stop_reason_is_cancelled, stop_reason_is_error, update_to_out, UpdateOut};
+use super::permission::{
+    intent_key_from_params, pick_option_id, selected_outcome, summary_from_params, AlwaysCache, Want,
+};
+use crate::lead_chat::proto::{ChatEvent, SlashCmd};
+
+/// Events demuxed to a subscribed Weft session.
+#[derive(Debug)]
+pub enum SessionEvent {
+    Chat(ChatEvent),
+    Commands(Vec<SlashCmd>),
+    Usage {
+        context_tokens: u64,
+        window: Option<u64>,
+    },
+    Meta {
+        model: Option<String>,
+        thinking: Option<String>,
+    },
+    /// Streaming reasoning text (agent_thought_chunk) for the busy indicator.
+    Thought {
+        text: String,
+    },
+    ToolProgress {
+        summary: String,
+    },
+    /// Prompt-task → consumer ordering: consumer replies when this is dequeued.
+    DrainBarrier(tokio::sync::oneshot::Sender<()>),
+    /// Permission needed — engine/runtime resolves via Ask and replies on the wire.
+    /// Carries enough for the default handler; custom handlers may be installed later.
+    Permission {
+        request_id: Value,
+        summary: String,
+        detail: String,
+        intent_key: String,
+        /// What the request wants to do, classified from the `toolCall` while
+        /// its structure is still here. `intent_key` is the always-grant
+        /// cache token and is far too lossy to re-derive this from.
+        intent: super::permission::PermissionIntent,
+        /// Canonical full action identity for the persisted Always grant.
+        /// Carries the structured `locations` that `detail` (stringified
+        /// `rawInput`) can omit entirely — see `permission::grant_identity`.
+        grant_id: String,
+        options: Vec<Value>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageBits {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cached_read_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptOutcome {
+    pub stop_reason: String,
+    pub usage: Option<UsageBits>,
+    pub is_error: bool,
+    pub cancelled: bool,
+}
+
+type PendingMap = HashMap<i64, oneshot::Sender<Result<Value, String>>>;
+type SessionMap = HashMap<String, SessionRoute>;
+
+struct SessionRoute {
+    events: mpsc::UnboundedSender<SessionEvent>,
+    always: AlwaysCache,
+    /// Optional auto-reply for tests / dangerous mode short-circuit at route layer.
+    auto_want: Option<Want>,
+}
+
+/// Whether an outstanding JSON-RPC reply still protects a pooled client from
+/// being retired. "No routes, none opening, none expected" is required either
+/// way — this only decides what a non-empty `pending` means in that state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPolicy {
+    /// Ordinary route teardown: an outstanding reply means the peer is still
+    /// working on something, so keep the child alive for it.
+    Protects,
+    /// After the agent ignored `session/cancel`: the reply is never coming and
+    /// its route is already gone, so it must not pin the child.
+    Abandoned,
+}
+
+/// A pooled client's liveness counters at one instant.
+#[derive(Debug, Clone, Copy)]
+struct RouteState {
+    sessions: usize,
+    opening: usize,
+    expecting: u32,
+    pending: usize,
+    /// Whether a route was EVER installed on this connection.
+    ever_had_session: bool,
+}
+
+/// Whether a pooled client in this state may be retired. Split out from the
+/// locking so the policy itself is directly testable.
+///
+/// `ever_had_session` separates "done with its routes" from "has not opened one
+/// yet". A freshly reconnected client sits in the second state between
+/// `initialize` and the caller's `session/new|resume`: every counter reads zero
+/// and its `pending` map drains the moment the handshake resolves, so without
+/// this it looked idle and was retired out from under the caller, whose next
+/// `session/*` then failed with `ACP not connected`.
+fn may_retire(state: RouteState, policy: PendingPolicy) -> bool {
+    if !state.ever_had_session {
+        return false;
+    }
+    let unused = state.sessions == 0 && state.opening == 0 && state.expecting == 0;
+    let replies_settled = match policy {
+        PendingPolicy::Protects => state.pending == 0,
+        PendingPolicy::Abandoned => true,
+    };
+    unused && replies_settled
+}
+
+struct Inner {
+    write_tx: mpsc::UnboundedSender<(Vec<u8>, Option<oneshot::Sender<()>>)>,
+    next_id: i64,
+    pending: PendingMap,
+    sessions: SessionMap,
+    /// Permission request ids still awaiting a reply, mapped to a monotonic
+    /// generation. Safety-net timers capture the generation at arm time so a
+    /// stale 1h timer cannot reject a later request that reused omp's id:0.
+    pending_permission_ids: std::collections::HashMap<String, u64>,
+    permission_gen: u64,
+    /// session/update events that arrived before subscribe() installed a route
+    /// (OMP often emits available_commands_update right after session/new).
+    pending_updates: std::collections::HashMap<String, Vec<SessionEvent>>,
+    /// Sessions currently between session/new|resume and subscribe — only these
+    /// may buffer pre-subscribe updates. Explicit unsubscribe drops the key.
+    opening_sessions: std::collections::HashSet<String>,
+    /// Whether any session route has EVER existed on this connection.
+    ///
+    /// Distinguishes "finished with its routes" from "has not opened one yet".
+    /// A freshly (re)connected client sits in the second state between
+    /// `initialize` and the caller's `session/new|resume`: its `pending` map
+    /// drains when the handshake resolves, and treating that as "idle" retired
+    /// the client the caller was about to use, which then failed with
+    /// `ACP not connected`.
+    ever_had_session: bool,
+    /// In-flight session/new|resume|load count — buffer updates while > 0.
+    /// Counter (not bool) so concurrent opens don't clear early.
+    expecting_session: u32,
+    /// Generation of this child connection; read_loop only clears inner when
+    /// its generation still owns the slot (writer-fail reconnect race).
+    connection_gen: u64,
+    _child: tokio::process::Child,
+    _reg: crate::proc_registry::Registration,
+}
+/// Result of `session/new` / `session/resume`, including config metadata
+/// OMP returns under `configOptions` (model / thinking).
+#[derive(Debug, Clone)]
+pub struct SessionOpen {
+    pub session_id: String,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+}
+
+/// Read `currentValue` for a named entry in `result.configOptions`.
+fn config_option_current(result: &Value, id: &str) -> Option<String> {
+    let opts = result.get("configOptions")?.as_array()?;
+    for opt in opts {
+        let oid = opt.get("id").or_else(|| opt.get("configId")).and_then(|v| v.as_str());
+        if oid != Some(id) {
+            continue;
+        }
+        if let Some(v) = opt.get("currentValue").and_then(|v| v.as_str()) {
+            return Some(v.to_string());
+        }
+        if let Some(v) = opt.get("value").and_then(|v| v.as_str()) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+#[derive(Clone)]
+pub struct ClientHandle {
+    backend_id: &'static str,
+    inner: Arc<Mutex<Option<Inner>>>,
+    /// Effective program last successfully connected; used to detect pin changes.
+    program: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Held during spawn+initialize so concurrent ensure_connected waiters
+    /// don't race a half-ready child.
+    connect_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+fn pool_key(backend_id: &str, program: &str) -> String {
+    // Isolate clients by effective binary so two OMP sessions with different
+    // command pins never reap each other's active turns.
+    format!("{backend_id}\0{program}")
+}
+
+struct Pool {
+    clients: Mutex<HashMap<String, ClientHandle>>,
+}
+
+static POOL: LazyLock<Pool> = LazyLock::new(|| Pool {
+    clients: Mutex::new(HashMap::new()),
+});
+
+/// Serializes first-time ACP child creation so two concurrent first turns cannot
+/// each spawn a child and race the pool insert.
+/// One creation lock per pool key, so `client()` and `reap_if_unused` stay
+/// atomic against each other for the SAME key without touching other keys.
+///
+/// Per KEY, not process-wide: this is held across `ensure_connected`, whose
+/// handshake waits up to 60s, and a single slow or broken command pin must not
+/// stall the first send of every other `(backend, program)`.
+static KEY_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+async fn key_lock(key: &str) -> Arc<Mutex<()>> {
+    let mut g = KEY_LOCKS.lock().await;
+    g.entry(key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Get or create the client for (`backend_id`, `program`).
+/// Different program pins get isolated children — never recycle a live peer.
+pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHandle> {
+    let backend = backend_for(backend_id)
+        .ok_or_else(|| anyhow::anyhow!("no ACP backend registered for {backend_id}"))?;
+    let id = backend.id();
+    let key = pool_key(id, program);
+    // Held across lookup+ensure so `reap_if_unused` cannot remove a handle
+    // another caller just acquired (unsubscribe/reap race).
+    let create_lock = key_lock(&key).await;
+    let _create = create_lock.lock().await;
+    let existing = {
+        let g = POOL.clients.lock().await;
+        g.get(&key).cloned()
+    };
+    if let Some(c) = existing {
+        c.ensure_connected(backend, program).await?;
+        // The shutdown check belongs on THIS path too. `shutdown_all` can drain
+        // this very handle and clear its `inner` between the lookup above and
+        // `ensure_connected`, which then spawns a REPLACEMENT child — and this
+        // early return would hand it back without re-inserting, leaving a child
+        // nothing tracks and the exit path already past. Re-checked under the
+        // pool lock, the same mutual exclusion the fresh-handle path uses.
+        let mut pool = POOL.clients.lock().await;
+        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            drop(pool);
+            c.shutdown_and_reap().await;
+            anyhow::bail!("ACP pool is shutting down");
+        }
+        // Re-insert if the drain removed us: the handle is live again.
+        pool.entry(key).or_insert_with(|| c.clone());
+        return Ok(c);
+    }
+    let handle = ClientHandle {
+        backend_id: id,
+        inner: Arc::new(Mutex::new(None)),
+        program: Arc::new(tokio::sync::Mutex::new(None)),
+        connect_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    handle.ensure_connected(backend, program).await?;
+    // The check and the insert happen under the POOL LOCK, which `shutdown_all`
+    // also takes to set the flag and drain. That makes them mutually exclusive
+    // without either side waiting on the other's work: a creation that loses
+    // the race sees the flag and reaps its own child rather than inserting into
+    // a pool nobody will drain again, and the exit path never waits out a 60s
+    // handshake to find out.
+    {
+        let mut pool = POOL.clients.lock().await;
+        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            drop(pool);
+            handle.shutdown_and_reap().await;
+            anyhow::bail!("ACP pool is shutting down");
+        }
+        pool.insert(key, handle.clone());
+    }
+    Ok(handle)
+}
+
+/// Tear down one (`backend_id`, `program`) pooled client only.
+pub async fn shutdown_program(backend_id: &str, program: &str) {
+    let key = pool_key(backend_id, program);
+    let c = {
+        let mut g = POOL.clients.lock().await;
+        g.remove(&key)
+    };
+    if let Some(c) = c {
+        c.shutdown_and_reap().await;
+    }
+}
+
+/// Tear down every pooled connection for `backend_id` (any program pin).
+/// Prefer [`shutdown_program`] when only one pin should die.
+pub async fn shutdown(backend_id: &str) {
+    let victims: Vec<ClientHandle> = {
+        let mut g = POOL.clients.lock().await;
+        let keys: Vec<String> = g
+            .keys()
+            .filter(|k| k.split('\0').next() == Some(backend_id))
+            .cloned()
+            .collect();
+        keys.into_iter().filter_map(|k| g.remove(&k)).collect()
+    };
+    for c in victims {
+        c.shutdown_and_reap().await;
+    }
+}
+
+/// Set once the exit path has drained the pool. `client()` checks it while
+/// holding `CREATE_LOCK`, so a child spawned by an in-flight creation is reaped
+/// by its own creator instead of being inserted into a pool nobody will drain
+/// again.
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub async fn shutdown_all() {
+    // Flag and drain under ONE pool-lock acquisition. `client()` checks the flag
+    // and inserts under that same lock, so a creation racing this either
+    // inserts before the drain (and is drained) or sees the flag and reaps its
+    // own child — no untracked survivor either way.
+    //
+    // Deliberately NOT waiting for in-flight creations to finish: this runs
+    // synchronously on `ExitRequested`, and an unresponsive agent's handshake
+    // can take 60s, which would read as a hung desktop app. The flag makes
+    // waiting unnecessary.
+    let all: Vec<ClientHandle> = {
+        let mut g = POOL.clients.lock().await;
+        SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+        g.drain().map(|(_, c)| c).collect()
+    };
+    for c in all {
+        c.shutdown_and_reap().await;
+    }
+}
+
+impl ClientHandle {
+    pub fn backend_id(&self) -> &'static str {
+        self.backend_id
+    }
+
+    async fn ensure_connected(
+        &self,
+        backend: Arc<dyn AcpBackend>,
+        program: &str,
+    ) -> anyhow::Result<()> {
+        // Serialize reconnect/init so a second waiter can't send session/*
+        // before initialize finishes.
+        let _guard = self.connect_lock.lock().await;
+        if self.inner.lock().await.is_some() {
+            // Live child for this (backend, program) key — keep it.
+            return Ok(());
+        }
+        self.spawn(backend, program).await?;
+        *self.program.lock().await = Some(program.to_string());
+        Ok(())
+    }
+
+    async fn spawn(&self, backend: Arc<dyn AcpBackend>, program: &str) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().await;
+        if g.is_some() {
+            return Ok(());
+        }
+        let (prog, args) = backend.spawn_argv(program);
+        let mut command = Command::new(&prog);
+        command.args(&args);
+        command.env("PATH", crate::detect::tool_path());
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let owner = crate::proc_registry::Owner::global_app_server();
+        let configured = crate::proc_registry::configure(&mut command, owner);
+        let mut child = command
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("spawn {} ACP: {e}", backend.id()))?;
+        let reg = configured.register(&child);
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+
+        let (write_tx, mut write_rx) =
+            mpsc::unbounded_channel::<(Vec<u8>, Option<oneshot::Sender<()>>)>();
+        let me_w = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut stdin = stdin;
+            while let Some((bytes, ack)) = write_rx.recv().await {
+                if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
+                    me_w.fail_pending_and_reap("ACP stdin writer failed").await;
+                    break;
+                }
+                if let Some(a) = ack {
+                    let _ = a.send(());
+                }
+            }
+        });
+
+        let connection_gen = {
+            static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
+        *g = Some(Inner {
+            write_tx,
+            next_id: 1,
+            pending: HashMap::new(),
+            sessions: HashMap::new(),
+            pending_permission_ids: std::collections::HashMap::new(),
+            permission_gen: 0,
+            pending_updates: std::collections::HashMap::new(),
+            opening_sessions: std::collections::HashSet::new(),
+            ever_had_session: false,
+            expecting_session: 0,
+            connection_gen,
+            _child: child,
+            _reg: reg,
+        });
+        drop(g); // request() needs this mutex — never hold across initialize.
+
+        let me = self.clone();
+        tauri::async_runtime::spawn(async move { me.read_loop(stdout, connection_gen).await });
+
+        // initialize
+        let init_params = json!({
+            "protocolVersion": 1,
+            "clientInfo": {
+                "name": "weft",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "clientCapabilities": backend.client_capabilities(),
+        });
+        if let Err(e) = self.request("initialize", init_params).await {
+            self.shutdown_and_reap().await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    async fn fail_pending_and_reap(&self, message: &str) {
+        if let Some(mut inner) = self.inner.lock().await.take() {
+            for (_, tx) in inner.pending.drain() {
+                let _ = tx.send(Err(message.to_string()));
+            }
+            // Tree-aware: OMP may have shell/tool descendants in their own groups.
+            crate::proc_registry::reap(&mut inner._child, &inner._reg).await;
+        }
+    }
+
+    pub async fn shutdown_and_reap(&self) {
+        if let Some(mut inner) = self.inner.lock().await.take() {
+            crate::proc_registry::reap(&mut inner._child, &inner._reg).await;
+        }
+    }
+
+    async fn read_loop(&self, stdout: tokio::process::ChildStdout, connection_gen: u64) {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            match classify(&line) {
+                Incoming::Response { id, result } => self.resolve(id, Ok(result)).await,
+                Incoming::Error { id, message, .. } => self.resolve(id, Err(message)).await,
+                Incoming::Notification { method, params } => {
+                    if method == "session/update" {
+                        self.on_session_update(params).await;
+                    }
+                }
+                Incoming::ServerRequest { id, method, params } => {
+                    if method == "session/request_permission" {
+                        self.on_permission(id, params).await;
+                    } else {
+                        let _ = self
+                            .write_raw(encode_error_response(
+                                &id,
+                                -32601,
+                                &format!("method not supported: {method}"),
+                            ))
+                            .await;
+                    }
+                }
+                Incoming::Skip => {}
+            }
+        }
+        // Stdout closed: tree-reap if we still own the slot. A writer-fail may
+        // have already taken inner and spawned a newer generation.
+        let mut g = self.inner.lock().await;
+        if g.as_ref().is_some_and(|i| i.connection_gen == connection_gen) {
+            if let Some(mut inner) = g.take() {
+                drop(g);
+                crate::proc_registry::reap(&mut inner._child, &inner._reg).await;
+            }
+        }
+    }
+
+    async fn resolve(&self, id: i64, res: Result<Value, String>) {
+        let settled_last = {
+            let mut g = self.inner.lock().await;
+            let Some(inner) = g.as_mut() else {
+                return;
+            };
+            // Race: session/update can arrive before the open RPC future resumes
+            // and calls mark_opening. If the response body already names a
+            // sessionId, buffer for THAT sid immediately (not globally).
+            if let Ok(val) = &res {
+                if let Some(sid) = val.get("sessionId").and_then(|s| s.as_str()) {
+                    if !sid.is_empty() {
+                        inner.opening_sessions.insert(sid.to_string());
+                        inner.ever_had_session = true;
+                    }
+                }
+            }
+            let waiter = inner.pending.remove(&id);
+            // A connection that has not opened a route yet is BETWEEN connect
+            // and `session/new|resume`, not done with its work. Its `pending`
+            // map drains the moment `initialize` resolves, and retiring there
+            // shut down the very client the caller was about to use — the next
+            // `session/*` then failed with `ACP not connected`.
+            let drained = inner.pending.is_empty() && inner.ever_had_session;
+            if let Some(tx) = waiter {
+                let _ = tx.send(res);
+            }
+            drained
+        };
+        // Retirement is attempted on route teardown, but an in-flight reply
+        // protects the client at that moment (`PendingPolicy::Protects`). When
+        // the last session is stopped or switched mid-prompt, that teardown
+        // therefore declines — and nothing tried again once the reply landed,
+        // so the child survived routeless until process exit and every command
+        // pin change left one more orphan behind. This is that retry; the
+        // route checks inside still apply, so a client that is merely idle
+        // between turns is untouched.
+        if settled_last {
+            self.maybe_reap_if_idle().await;
+        }
+    }
+
+    async fn on_session_update(&self, params: Value) {
+        let sid = params
+            .get("sessionId")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        let update = params.get("update").cloned().unwrap_or(Value::Null);
+        let out = update_to_out(&update);
+        let ev = match out {
+            UpdateOut::Chat(c) => SessionEvent::Chat(c),
+            UpdateOut::Commands(c) => SessionEvent::Commands(c),
+            UpdateOut::Usage {
+                context_tokens,
+                window,
+            } => SessionEvent::Usage {
+                context_tokens,
+                window,
+            },
+            UpdateOut::Meta { model, thinking } => SessionEvent::Meta { model, thinking },
+            UpdateOut::Thought { text } => SessionEvent::Thought { text },
+            UpdateOut::ToolProgress { summary } => SessionEvent::ToolProgress { summary },
+            UpdateOut::Ignore => return,
+        };
+        if let Some(inner) = self.inner.lock().await.as_mut() {
+            if let Some(route) = inner.sessions.get(sid) {
+                let _ = route.events.send(ev);
+            } else if !sid.is_empty() && inner.opening_sessions.contains(sid) {
+                // Buffer only for the session currently between open and
+                // subscribe. Never use a process-global "expecting" flag — that
+                // would capture late updates from an unrelated unsubscribed sid
+                // while another session opens. Response handler marks opening
+                // as soon as sessionId is known (before caller resumes).
+                const MAX_BUFFERED: usize = 64;
+                let buf = inner.pending_updates.entry(sid.to_string()).or_default();
+                if buf.len() < MAX_BUFFERED {
+                    buf.push(ev);
+                }
+            }
+        }
+    }
+
+    async fn on_permission(&self, id: Value, params: Value) {
+        let sid = params
+            .get("sessionId")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let options = params
+            .get("options")
+            .and_then(|o| o.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let (summary, detail) = summary_from_params(&params);
+        let intent = intent_key_from_params(&params);
+        let what = super::permission::intent_from_params(&params);
+        let grant = super::permission::grant_identity(&params);
+        let req_key = Self::permission_id_key(&id);
+
+        let (auto, gen) = {
+            let mut g = self.inner.lock().await;
+            let Some(inner) = g.as_mut() else {
+                drop(g);
+                let _ = self
+                    .write_raw(encode_error_response(&id, -32000, "not connected"))
+                    .await;
+                return;
+            };
+            // pending map keys by JSON-RPC id (omp reuses 0) → generation
+            inner.permission_gen = inner.permission_gen.wrapping_add(1);
+            let gen = inner.permission_gen;
+            inner.pending_permission_ids.insert(req_key.clone(), gen);
+            let Some(route) = inner.sessions.get_mut(&sid) else {
+                drop(g);
+                self.reply_permission(&id, &options, Want::RejectOnce).await;
+                return;
+            };
+            // always-cache keys by intent, NOT request id
+            let auto = if let Some(w) = route.always.get(&intent) {
+                Some(w)
+            } else {
+                route.auto_want
+            };
+            (auto, gen)
+        };
+        if let Some(want) = auto {
+            self.reply_permission(&id, &options, want).await;
+            return;
+        }
+
+        let delivered = {
+            let g = self.inner.lock().await;
+            g.as_ref()
+                .and_then(|inner| inner.sessions.get(&sid))
+                .map(|route| {
+                    route
+                        .events
+                        .send(SessionEvent::Permission {
+                            request_id: id.clone(),
+                            summary: summary.clone(),
+                            detail: detail.clone(),
+                            intent_key: intent.clone(),
+                            intent: what.clone(),
+                            grant_id: grant.clone(),
+                            options: options.clone(),
+                        })
+                        .is_ok()
+                })
+                .unwrap_or(false)
+        };
+        if !delivered {
+            self.reply_permission(&id, &options, Want::RejectOnce).await;
+            return;
+        }
+        let me = self.clone();
+        let id_t = id.clone();
+        let opts_t = options.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            me.reply_permission_if_pending_gen(&id_t, &opts_t, Want::RejectOnce, gen)
+                .await;
+        });
+    }
+
+    fn permission_id_key(id: &Value) -> String {
+        id.to_string()
+    }
+
+    /// Answer a permission request (called by engine after Ask, or auto paths).
+    /// Idempotent while the id is pending: once removed, further calls no-op so
+    /// a reused JSON-RPC id (omp has used `0`) can be accepted on the next ask.
+    pub async fn reply_permission(&self, id: &Value, options: &[Value], want: Want) {
+        {
+            let mut g = self.inner.lock().await;
+            let Some(inner) = g.as_mut() else {
+                return;
+            };
+            let key = Self::permission_id_key(id);
+            if inner.pending_permission_ids.remove(&key).is_none() {
+                return; // already answered or unknown
+            }
+        }
+        let option_id = pick_option_id(options, want)
+            .or_else(|| pick_option_id(options, Want::RejectOnce))
+            .unwrap_or_else(|| want.kind_str_fallback().to_string());
+        let body = selected_outcome(&option_id);
+        let _ = self.write_raw(encode_response(id, body)).await;
+    }
+
+    async fn reply_permission_if_pending(&self, id: &Value, options: &[Value], want: Want) {
+        self.reply_permission(id, options, want).await;
+    }
+
+    /// Timeout path: only reject if the pending generation still matches.
+    async fn reply_permission_if_pending_gen(
+        &self,
+        id: &Value,
+        options: &[Value],
+        want: Want,
+        gen: u64,
+    ) {
+        {
+            let mut g = self.inner.lock().await;
+            let Some(inner) = g.as_mut() else {
+                return;
+            };
+            let key = Self::permission_id_key(id);
+            match inner.pending_permission_ids.get(&key) {
+                Some(g) if *g == gen => {}
+                _ => return, // answered, or a newer request reused this id
+            }
+        }
+        self.reply_permission(id, options, want).await;
+    }
+
+    /// Record always decision on a session after user picks Always.
+    pub async fn remember_always(&self, session_id: &str, intent_key: &str, want: Want) {
+        if let Some(inner) = self.inner.lock().await.as_mut() {
+            if let Some(route) = inner.sessions.get_mut(session_id) {
+                route.always.set(intent_key.to_string(), want);
+            }
+        }
+    }
+
+    /// For tests: auto-allow every permission on this session.
+    pub async fn set_auto_want(&self, session_id: &str, want: Option<Want>) {
+        if let Some(inner) = self.inner.lock().await.as_mut() {
+            if let Some(route) = inner.sessions.get_mut(session_id) {
+                route.auto_want = want;
+            }
+        }
+    }
+
+    async fn write_raw(&self, line: String) -> anyhow::Result<()> {
+        let g = self.inner.lock().await;
+        let inner = g
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ACP not connected"))?;
+        inner
+            .write_tx
+            .send((line.into_bytes(), None))
+            .map_err(|_| anyhow::anyhow!("ACP writer closed"))?;
+        Ok(())
+    }
+
+    /// Short-timeout request (handshake, session lifecycle). Not for prompt.
+    pub async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.request_timeout(method, params, Duration::from_secs(60))
+            .await
+    }
+
+    /// Long-lived request for `session/prompt` — cancel is the abort path.
+    pub async fn request_long(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        // 24h ceiling so a totally wedged agent still frees the oneshot eventually.
+        self.request_timeout(method, params, Duration::from_secs(86_400))
+            .await
+    }
+
+    async fn request_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        reply_budget: Duration,
+    ) -> anyhow::Result<Value> {
+        let (id, rx, flushed) = {
+            let mut g = self.inner.lock().await;
+            let inner = g
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("ACP not connected"))?;
+            let id = inner.next_id;
+            inner.next_id += 1;
+            let (tx, rx) = oneshot::channel();
+            inner.pending.insert(id, tx);
+            let (flush_tx, flush_rx) = oneshot::channel();
+            let line = encode_request(id, method, params);
+            inner
+                .write_tx
+                .send((line.into_bytes(), Some(flush_tx)))
+                .map_err(|_| anyhow::anyhow!("ACP writer closed"))?;
+            (id, rx, flush_rx)
+        };
+        match tokio::time::timeout(Duration::from_secs(60), flushed).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => anyhow::bail!("ACP {method}: writer closed before flush"),
+            Err(_) => {
+                self.fail_pending_and_reap("ACP stdin flush stalled").await;
+                anyhow::bail!("ACP {method}: stdin flush stalled");
+            }
+        }
+        match tokio::time::timeout(reply_budget, rx).await {
+            Ok(Ok(Ok(v))) => Ok(v),
+            Ok(Ok(Err(e))) => anyhow::bail!("ACP {method}: {e}"),
+            Ok(Err(_)) => anyhow::bail!("ACP {method}: reply dropped"),
+            Err(_) => {
+                if let Some(inner) = self.inner.lock().await.as_mut() {
+                    inner.pending.remove(&id);
+                }
+                anyhow::bail!("ACP {method}: timed out")
+            }
+        }
+    }
+
+    pub async fn notify(&self, method: &str, params: Option<Value>) -> anyhow::Result<()> {
+        let line = encode_notification(method, params);
+        self.write_raw(line).await
+    }
+
+    fn paint_mcp(backend_id: &str, mcp: Vec<McpServerSpec>) -> Vec<Value> {
+        match backend_for(backend_id) {
+            Some(b) => b.paint_mcp_servers(mcp),
+            None => mcp
+                .into_iter()
+                .map(|s| {
+                    json!({
+                        "type": "http",
+                        "name": s.name,
+                        "url": s.url,
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    pub async fn is_alive(&self) -> bool {
+        self.inner.lock().await.is_some()
+    }
+
+    pub async fn is_subscribed(&self, session_id: &str) -> bool {
+        self.inner
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|i| i.sessions.contains_key(session_id))
+    }
+
+    pub async fn subscribe(
+        &self,
+        session_id: &str,
+        tx: mpsc::UnboundedSender<SessionEvent>,
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().await;
+        let inner = g
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("ACP not connected"))?;
+        inner.opening_sessions.remove(session_id);
+        let buffered = inner
+            .pending_updates
+            .remove(session_id)
+            .unwrap_or_default();
+        inner.ever_had_session = true;
+        inner.sessions.insert(
+            session_id.to_string(),
+            SessionRoute {
+                events: tx,
+                always: AlwaysCache::new(),
+                auto_want: None,
+            },
+        );
+        if let Some(route) = inner.sessions.get(session_id) {
+            for ev in buffered {
+                let _ = route.events.send(ev);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn unsubscribe(&self, session_id: &str) {
+        let empty = {
+            if let Some(inner) = self.inner.lock().await.as_mut() {
+                inner.sessions.remove(session_id);
+                inner.opening_sessions.remove(session_id);
+                inner.pending_updates.remove(session_id);
+                inner.sessions.is_empty()
+                    && inner.opening_sessions.is_empty()
+                    && inner.expecting_session == 0
+            } else {
+                false
+            }
+        };
+        if empty {
+            self.maybe_reap_if_idle().await;
+        }
+    }
+
+    /// Drop this program-keyed pool entry when no routes remain so command-pin
+    /// changes do not accumulate orphan ACP children for the app lifetime.
+    async fn maybe_reap_if_idle(&self) {
+        self.reap_if_unused(PendingPolicy::Protects).await
+    }
+
+    /// Retire the client even though replies are still outstanding — the
+    /// force-reset path, taken only after the agent ignored `session/cancel`.
+    ///
+    /// That ignored cancel is exactly why the ordinary check cannot be used:
+    /// the wedged `session/prompt` stays in `pending` (its own ceiling is 24h),
+    /// so [`maybe_reap_if_idle`] refuses forever and the child stays pooled.
+    /// The next send then calls `client()`, gets this same handle back, finds a
+    /// live child via `ensure_connected`, and prompts the very agent that is
+    /// still running the abandoned turn — which either races it or is rejected
+    /// as busy. Retiring is safe here precisely because the route checks still
+    /// apply: with no sessions, none opening and none expected, whatever is
+    /// left in `pending` belongs to a route that has already been torn down.
+    /// Dropping `Inner` releases those senders, so their callers fail fast
+    /// instead of waiting out the ceiling.
+    pub async fn retire_after_ignored_cancel(&self) {
+        self.reap_if_unused(PendingPolicy::Abandoned).await
+    }
+
+    async fn reap_if_unused(&self, pending_policy: PendingPolicy) {
+        // Resolve the key BEFORE locking: the guard is per-key now, so there is
+        // nothing to take until we know which key this is.
+        let prog = self.program.lock().await.clone();
+        let Some(program) = prog else {
+            return;
+        };
+        let key = pool_key(self.backend_id, &program);
+        // Same key lock as `client()` — empty-check + pool remove stay atomic
+        // against a concurrent get-or-create for this key.
+        let create_lock = key_lock(&key).await;
+        let _create = create_lock.lock().await;
+        let empty = {
+            if let Some(inner) = self.inner.lock().await.as_ref() {
+                may_retire(
+                    RouteState {
+                        sessions: inner.sessions.len(),
+                        opening: inner.opening_sessions.len(),
+                        expecting: inner.expecting_session,
+                        pending: inner.pending.len(),
+                        ever_had_session: inner.ever_had_session,
+                    },
+                    pending_policy,
+                )
+            } else {
+                true
+            }
+        };
+        if !empty {
+            return;
+        }
+        let removed = {
+            let mut g = POOL.clients.lock().await;
+            match g.get(&key) {
+                Some(c) if std::sync::Arc::ptr_eq(&c.inner, &self.inner) => g.remove(&key),
+                _ => None,
+            }
+        };
+        // Release before awaiting the reap (shutdown takes other locks).
+        drop(_create);
+        if let Some(c) = removed {
+            c.shutdown_and_reap().await;
+        }
+    }
+
+    async fn mark_opening(&self, session_id: &str) {
+        if let Some(inner) = self.inner.lock().await.as_mut() {
+            inner.opening_sessions.insert(session_id.to_string());
+            inner.ever_had_session = true;
+        }
+    }
+
+    async fn set_expecting_session(&self, on: bool) {
+        let cleared_last = {
+            match self.inner.lock().await.as_mut() {
+                Some(inner) if on => {
+                    inner.expecting_session = inner.expecting_session.saturating_add(1);
+                    inner.ever_had_session = true;
+                    false
+                }
+                Some(inner) => {
+                    inner.expecting_session = inner.expecting_session.saturating_sub(1);
+                    inner.expecting_session == 0
+                }
+                None => false,
+            }
+        };
+        // A FAILED open leaves no route behind, and `resolve`'s own retry
+        // already declined while this expectation was standing — so nothing
+        // else would ever retire the client, and it sat in the static pool
+        // unreachable by any later stop/switch (the engine never published it
+        // into `acp_client`). One orphan per command pin whose open failed.
+        //
+        // A SUCCESSFUL open calls `mark_opening` before clearing its
+        // expectation, so the route checks inside decline and it is untouched.
+        if cleared_last {
+            self.maybe_reap_if_idle().await;
+        }
+    }
+
+    /// Enqueue a session-scoped event (used for DrainBarrier). Returns false if
+    /// the route is gone.
+    pub async fn send_session_event(&self, session_id: &str, ev: SessionEvent) -> bool {
+        let g = self.inner.lock().await;
+        g.as_ref()
+            .and_then(|inner| inner.sessions.get(session_id))
+            .map(|route| route.events.send(ev).is_ok())
+            .unwrap_or(false)
+    }
+
+    pub async fn new_session(
+        &self,
+        cwd: &Path,
+        mcp: Vec<McpServerSpec>,
+    ) -> anyhow::Result<SessionOpen> {
+        let mcp_v = Self::paint_mcp(self.backend_id, mcp);
+        self.set_expecting_session(true).await;
+        let result = self
+            .request(
+                "session/new",
+                json!({
+                    "cwd": path_str(cwd),
+                    "mcpServers": mcp_v,
+                }),
+            )
+            .await;
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_expecting_session(false).await;
+                return Err(e);
+            }
+        };
+        let session_id = match result
+            .get("sessionId")
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+        {
+            Some(id) => id,
+            None => {
+                self.set_expecting_session(false).await;
+                return Err(anyhow::anyhow!("session/new missing sessionId"));
+            }
+        };
+        self.mark_opening(&session_id).await;
+        self.set_expecting_session(false).await;
+        Ok(SessionOpen {
+            session_id,
+            model: config_option_current(&result, "model"),
+            thinking: config_option_current(&result, "thinking")
+                .or_else(|| config_option_current(&result, "reasoning")),
+        })
+    }
+
+    pub async fn resume_session(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        mcp: Vec<McpServerSpec>,
+    ) -> anyhow::Result<SessionOpen> {
+        let mcp_v = Self::paint_mcp(self.backend_id, mcp);
+        self.set_expecting_session(true).await;
+        // Pre-mark the known id so updates for this sid buffer immediately.
+        self.mark_opening(session_id).await;
+        let result = self
+            .request(
+                "session/resume",
+                json!({
+                    "sessionId": session_id,
+                    "cwd": path_str(cwd),
+                    "mcpServers": mcp_v,
+                }),
+            )
+            .await;
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_expecting_session(false).await;
+                return Err(e);
+            }
+        };
+        let sid = result
+            .get("sessionId")
+            .and_then(|s| s.as_str())
+            .unwrap_or(session_id)
+            .to_string();
+        if sid != session_id {
+            self.mark_opening(&sid).await;
+        }
+        self.set_expecting_session(false).await;
+        Ok(SessionOpen {
+            session_id: sid,
+            model: config_option_current(&result, "model"),
+            thinking: config_option_current(&result, "thinking")
+                .or_else(|| config_option_current(&result, "reasoning")),
+        })
+    }
+
+    pub async fn load_session(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        mcp: Vec<McpServerSpec>,
+    ) -> anyhow::Result<String> {
+        let mcp_v = Self::paint_mcp(self.backend_id, mcp);
+        // Known id up front — load responses may omit sessionId, and command/
+        // config updates can race before the RPC future resumes.
+        self.mark_opening(session_id).await;
+        self.set_expecting_session(true).await;
+        let result = self
+            .request(
+                "session/load",
+                json!({
+                    "sessionId": session_id,
+                    "cwd": path_str(cwd),
+                    "mcpServers": mcp_v,
+                }),
+            )
+            .await;
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_expecting_session(false).await;
+                // Leave opening_sessions: caller may retry/subscribe; explicit
+                // unsubscribe/clear_opening happens on failure paths that drop.
+                // Clear so a failed load does not buffer forever under this sid.
+                if let Some(inner) = self.inner.lock().await.as_mut() {
+                    inner.opening_sessions.remove(session_id);
+                    inner.pending_updates.remove(session_id);
+                }
+                return Err(e);
+            }
+        };
+        let sid = result
+            .get("sessionId")
+            .and_then(|s| s.as_str())
+            .unwrap_or(session_id)
+            .to_string();
+        if sid != session_id {
+            self.mark_opening(&sid).await;
+            if let Some(inner) = self.inner.lock().await.as_mut() {
+                inner.opening_sessions.remove(session_id);
+            }
+        }
+        self.set_expecting_session(false).await;
+        Ok(sid)
+    }
+
+    pub async fn fork_session(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        mcp: Vec<McpServerSpec>,
+    ) -> anyhow::Result<String> {
+        let mcp_v = Self::paint_mcp(self.backend_id, mcp);
+        let result = self
+            .request(
+                "session/fork",
+                json!({
+                    "sessionId": session_id,
+                    "cwd": path_str(cwd),
+                    "mcpServers": mcp_v,
+                }),
+            )
+            .await?;
+        result
+            .get("sessionId")
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("session/fork missing sessionId"))
+    }
+
+    pub async fn close_session(&self, session_id: &str) -> anyhow::Result<()> {
+        let _ = self
+            .request("session/close", json!({ "sessionId": session_id }))
+            .await;
+        self.unsubscribe(session_id).await;
+        Ok(())
+    }
+
+    pub async fn cancel(&self, session_id: &str) -> anyhow::Result<()> {
+        self.notify("session/cancel", Some(json!({ "sessionId": session_id })))
+            .await
+    }
+
+    pub async fn prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: &[(String, String)],
+    ) -> anyhow::Result<PromptOutcome> {
+        // ACP ContentBlock: text + image (base64). Keep text first so models that
+        // only read the leading block still see the user message.
+        let mut prompt_blocks = vec![json!({ "type": "text", "text": text })];
+        for (media_type, data) in images {
+            if data.is_empty() {
+                continue;
+            }
+            prompt_blocks.push(json!({
+                "type": "image",
+                "mimeType": media_type,
+                "data": data,
+            }));
+        }
+        let result = self
+            .request_long(
+                "session/prompt",
+                json!({
+                    "sessionId": session_id,
+                    "prompt": prompt_blocks,
+                }),
+            )
+            .await?;
+        let stop = result
+            .get("stopReason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("end_turn")
+            .to_string();
+        let usage = result.get("usage").map(|u| UsageBits {
+            input_tokens: u.get("inputTokens").and_then(|v| v.as_u64()),
+            output_tokens: u.get("outputTokens").and_then(|v| v.as_u64()),
+            total_tokens: u.get("totalTokens").and_then(|v| v.as_u64()),
+            cached_read_tokens: u.get("cachedReadTokens").and_then(|v| v.as_u64()),
+        });
+        Ok(PromptOutcome {
+            is_error: stop_reason_is_error(&stop),
+            cancelled: stop_reason_is_cancelled(&stop),
+            stop_reason: stop,
+            usage,
+        })
+    }
+}
+
+fn path_str(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+impl Want {
+    fn kind_str_fallback(self) -> &'static str {
+        match self {
+            Want::AllowOnce => "allow_once",
+            Want::AllowAlways => "allow_always",
+            Want::RejectOnce => "reject_once",
+            Want::RejectAlways => "reject_always",
+        }
+    }
+}
+
+// Silence unused PathBuf import if only Path is used via refs in signatures.
+#[allow(dead_code)]
+fn _pathbuf_ty(_: PathBuf) {}
+
+#[cfg(test)]
+mod tests {
+    use super::{may_retire, PendingPolicy, RouteState};
+
+    fn state(sessions: usize, opening: usize, expecting: u32, pending: usize) -> RouteState {
+        RouteState {
+            sessions,
+            opening,
+            expecting,
+            pending,
+            ever_had_session: true,
+        }
+    }
+
+    /// The force-reset case. An agent that ignored `session/cancel` leaves its
+    /// `session/prompt` in `pending` for up to 24h; while that pins the client,
+    /// the next send gets the same pooled handle and prompts the very agent
+    /// still running the abandoned turn.
+    #[test]
+    fn an_abandoned_reply_does_not_pin_a_client_whose_routes_are_gone() {
+        assert!(
+            !may_retire(state(0, 0, 0, 1), PendingPolicy::Protects),
+            "the ordinary path keeps the child while a reply may still arrive"
+        );
+        assert!(
+            may_retire(state(0, 0, 0, 1), PendingPolicy::Abandoned),
+            "after an ignored cancel the outstanding reply must not pin the child"
+        );
+    }
+
+    /// `Abandoned` relaxes ONLY the reply check. A client still serving a route
+    /// — or one mid-`session/new` — must survive either way, or a force reset
+    /// on one session would kill another session's live agent.
+    #[test]
+    fn live_routes_block_retirement_under_every_policy() {
+        for policy in [PendingPolicy::Protects, PendingPolicy::Abandoned] {
+            assert!(
+                !may_retire(state(1, 0, 0, 0), policy),
+                "{policy:?}: a live session still needs its child"
+            );
+            assert!(
+                !may_retire(state(0, 1, 0, 0), policy),
+                "{policy:?}: a session being opened still needs its child"
+            );
+            assert!(
+                !may_retire(state(0, 0, 1, 0), policy),
+                "{policy:?}: an expected session still needs its child"
+            );
+            assert!(
+                may_retire(state(0, 0, 0, 0), policy),
+                "{policy:?}: fully unused clients are retired"
+            );
+        }
+    }
+
+    /// A reconnected client between `initialize` and `session/new` reads as
+    /// fully idle — zero routes, and `pending` empties when the handshake
+    /// resolves. Retiring it there shut down the client the caller was about
+    /// to use; the next `session/*` answered `ACP not connected`.
+    #[test]
+    fn a_connection_that_never_opened_a_route_is_never_retired() {
+        for policy in [PendingPolicy::Protects, PendingPolicy::Abandoned] {
+            let fresh = RouteState {
+                sessions: 0,
+                opening: 0,
+                expecting: 0,
+                pending: 0,
+                ever_had_session: false,
+            };
+            assert!(
+                !may_retire(fresh, policy),
+                "{policy:?}: a client mid-handshake is not idle, it is not started"
+            );
+        }
+        // Once a route has existed, the ordinary rules resume.
+        assert!(may_retire(state(0, 0, 0, 0), PendingPolicy::Protects));
+    }
+
+    /// Different pool keys must not serialize against each other. The whole
+    /// point of keying by `(backend, program)` is that a slow or broken command
+    /// pin is isolated; a process-wide creation mutex held across a handshake
+    /// (up to 60s) put every other key behind it.
+    #[tokio::test]
+    async fn creation_locks_are_per_key_not_process_wide() {
+        let a = super::key_lock("omp\0slow-binary").await;
+        let b = super::key_lock("omp\0healthy-binary").await;
+
+        let held = a.lock().await;
+        // A different key must be free while the first is held mid-handshake.
+        assert!(
+            b.try_lock().is_ok(),
+            "a different pool key must not wait on this one"
+        );
+        // The SAME key still serializes — that is what keeps create/retire atomic.
+        assert!(
+            super::key_lock("omp\0slow-binary").await.try_lock().is_err(),
+            "the same key must still serialize"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn config_options_from_session_new_fixture() {
+        let result = serde_json::json!({
+            "sessionId": "s-1",
+            "configOptions": [
+                {"id": "model", "currentValue": "gpt-5"},
+                {"id": "thinking", "currentValue": "high"}
+            ]
+        });
+        assert_eq!(config_option_current(&result, "model").as_deref(), Some("gpt-5"));
+        assert_eq!(config_option_current(&result, "thinking").as_deref(), Some("high"));
+        assert_eq!(config_option_current(&result, "missing"), None);
+    }
+
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires omp on PATH"]
+    async fn omp_acp_pong_live() {
+        let c = client("omp", "omp").await.expect("client");
+        let cwd = std::env::temp_dir();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let open = c.new_session(&cwd, vec![]).await.expect("new");
+        let sid = open.session_id;
+        // OMP returns model via configOptions on session/new.
+        let _ = open.model;
+        c.subscribe(&sid, tx).await.unwrap();
+        c.set_auto_want(&sid, Some(Want::AllowOnce)).await;
+        let outcome = c
+            .prompt(&sid, "Reply with exactly: pong. Do not use tools.", &[])
+            .await
+            .expect("prompt");
+        assert_eq!(outcome.stop_reason, "end_turn");
+        // Drain some events
+        let mut saw_text = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let SessionEvent::Chat(ChatEvent::TextDelta { text, .. }) = ev {
+                if text.contains("pong") {
+                    saw_text = true;
+                }
+            }
+        }
+        let _ = saw_text;
+        let _ = c.cancel(&sid).await;
+        shutdown("omp").await;
+    }
+}

@@ -1,6 +1,6 @@
 // Mirrors the SeaORM models (serde serializes Rust field names as-is: snake_case).
 
-export type Tool = "claude" | "codex" | "opencode" | "none";
+export type Tool = "claude" | "codex" | "opencode" | "omp" | "none";
 export type ThreadKind = "feature" | "bugfix" | "refactor" | "spike";
 
 /** Process-pressure state reported by the backend governor. The frontend renders
@@ -410,6 +410,8 @@ export type LeadChatPush =
       tools: string[];
       model: string | null;
       window: number | null;
+      /** Engine intentionally produced this MCP list (incl. empty). */
+      mcp_known?: boolean;
     }
   | {
       /** 每个 turn 结束推一次当前上下文占用。 */

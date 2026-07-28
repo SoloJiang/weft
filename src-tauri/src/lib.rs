@@ -6,6 +6,7 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+mod acp;
 mod adapters;
 pub mod ask;
 mod auth_persist;
@@ -392,8 +393,25 @@ pub fn run() {
             commands_backup::backup_export_recovery_key,
             commands_backup::backup_restore,
         ])
-        .run(tauri::generate_context!())
-        .unwrap_or_else(|e| fatal("running tauri application", e));
+        .build(tauri::generate_context!())
+        .unwrap_or_else(|e| fatal("building tauri application", e))
+        .run(|_app, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                // ACP children are spawned into their own process group with no
+                // parent-death signal, and the pool that owns them is a
+                // process-static `LazyLock` — normal static teardown never drops
+                // its `Child` values, so the agent process and every tool it
+                // spawned would outlive the UI that was supervising them.
+                //
+                // Awaited rather than detached (unlike the backup flush on
+                // CloseRequested, which is only IO): this is the last moment the
+                // reap can still run, and a detached task dies with the process
+                // that was about to leak the children. `proc_registry::reap`
+                // SIGKILLs each process group in the descendant closure and then
+                // waits on an already-killed child, so this cannot hang.
+                tauri::async_runtime::block_on(acp::runtime::shutdown_all());
+            }
+        });
 }
 
 #[cfg(test)]

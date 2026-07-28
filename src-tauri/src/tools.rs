@@ -21,9 +21,16 @@ pub struct ToolStatus {
     pub diagnostics: Vec<crate::detect::ToolDiagnostic>,
 }
 
-// Display order for Settings (default-tool picker + diagnostics): mirrors the
-// default-tool priority (codex > claude > opencode).
-const TOOLS: [&str; 3] = ["codex", "claude", "opencode"];
+/// Every coding-agent identity weft drives, in Settings display order (which
+/// mirrors the default-tool priority: codex > claude > opencode > omp).
+///
+/// The SINGLE source for that set: `lead_chat::commands` validates
+/// engine-switch requests against this same list rather than its own copy.
+/// While they were separate constants, registering omp here made it appear in
+/// the picker and in `EngineSwitchDialog` while `switch_lead_tool` /
+/// `switch_worker_tool` still rejected it as `unknown tool "omp"` — offered
+/// everywhere, selectable nowhere.
+pub const TOOLS: [&str; 4] = ["codex", "claude", "opencode", "omp"];
 
 /// The executable used for the version probe, plus whether that exact path is
 /// reachable by a bare session spawn. Prefer the spawnable PATH match over a
@@ -147,6 +154,22 @@ pub async fn default_tool(db: &crate::store::Db) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Registering an ACP backend is what puts a tool in front of the user —
+    /// detect probes it, Settings lists it, `EngineSwitchDialog` offers it. If
+    /// it is missing from `TOOLS`, `switch_lead_tool`/`switch_worker_tool`
+    /// answer `unknown tool "…"` and the engine is unreachable by every path
+    /// that offered it. This asserts the registry can never get ahead of the
+    /// switch allowlist again, for the NEXT backend as much as for omp.
+    #[test]
+    fn every_registered_acp_backend_is_a_switchable_tool() {
+        for id in crate::acp::registered_ids() {
+            assert!(
+                TOOLS.contains(&id),
+                "ACP backend {id:?} is registered but not in TOOLS, so switching to it fails"
+            );
+        }
+    }
 
     #[test]
     fn probe_target_prefers_a_spawnable_path_over_diagnostic_only_match() {
