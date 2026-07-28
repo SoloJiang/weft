@@ -9,21 +9,24 @@
 //! consumers that cannot reach them — today the IM bridge, which sends on its
 //! own fixed locale.
 //!
-//! Both read the SAME file. `src/i18n/notices.json` is the single source, baked
-//! in here at compile time and imported by `src/i18n/{en,zh}.ts`; an earlier
-//! version restated the sentences in Rust, which meant a catalog edit silently
-//! gave remote and in-app users different text.
+//! The copy is AUTHORED in `src/i18n/{en,zh}.ts` like every other user-facing
+//! string (AGENTS.md), and `scripts/gen-notice-copy.mjs` mirrors the tokens
+//! listed there into `notices.generated.json`, which this module bakes in at
+//! compile time. Rust never authors the sentences — an earlier version did, and
+//! that meant a catalog edit silently gave remote and in-app users different
+//! text. `tests/frontend/noticeCopy.test.ts` fails if the mirror drifts from
+//! the catalogs, so the generated file cannot go stale unnoticed.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-/// `token -> lang -> copy`, compiled in from the shared catalog source.
+/// `token -> lang -> copy`, compiled in from the generated catalog mirror.
 ///
 /// A malformed file yields an EMPTY table rather than a panic (production paths
-/// must not panic), which would surface as raw tokens. `notices_json_parses`
-/// below fails the build's test run in that case, so it cannot ship silently.
+/// must not panic), which would surface as raw tokens. The test below fails the
+/// build's test run in that case, so it cannot ship silently.
 static NOTICES: LazyLock<HashMap<String, HashMap<String, String>>> = LazyLock::new(|| {
-    serde_json::from_str(include_str!("../../../src/i18n/notices.json")).unwrap_or_default()
+    serde_json::from_str(include_str!("notices.generated.json")).unwrap_or_default()
 });
 
 /// The copy for `token` in `lang`, or `None` when the text is ordinary agent
@@ -46,10 +49,10 @@ mod tests {
     /// The table is `include_str!`-ed, so a malformed or moved file degrades to
     /// empty at runtime. This is the check that keeps that from shipping.
     #[test]
-    fn notices_json_parses_and_carries_both_languages() {
+    fn generated_notice_copy_parses_and_carries_both_languages() {
         assert!(
             !NOTICES.is_empty(),
-            "notices.json failed to parse — every token would render raw"
+            "notices.generated.json failed to parse — every token would render raw"
         );
         for (token, by_lang) in NOTICES.iter() {
             for lang in ["en", "zh"] {

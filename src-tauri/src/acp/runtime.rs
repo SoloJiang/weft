@@ -224,18 +224,12 @@ static POOL: LazyLock<Pool> = LazyLock::new(|| Pool {
 
 /// Serializes first-time ACP child creation so two concurrent first turns cannot
 /// each spawn a child and race the pool insert.
-/// Pool-wide gate. Per-key work (create, retire) takes a READ guard and then
-/// its own key lock; only the pool-wide drain takes the WRITE guard.
-///
-/// Creation used to serialize on ONE process-wide mutex held across
-/// `ensure_connected`, whose handshake waits up to 60s — so a single slow or
-/// broken command pin stalled the first send of every OTHER `(backend,
-/// program)` key, defeating the isolation the pool key exists to provide.
-static POOL_GATE: LazyLock<tokio::sync::RwLock<()>> =
-    LazyLock::new(|| tokio::sync::RwLock::new(()));
-
 /// One creation lock per pool key, so `client()` and `reap_if_unused` stay
 /// atomic against each other for the SAME key without touching other keys.
+///
+/// Per KEY, not process-wide: this is held across `ensure_connected`, whose
+/// handshake waits up to 60s, and a single slow or broken command pin must not
+/// stall the first send of every other `(backend, program)`.
 static KEY_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -254,10 +248,7 @@ pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHan
     let id = backend.id();
     let key = pool_key(id, program);
     // Held across lookup+ensure so `reap_if_unused` cannot remove a handle
-    // another caller just acquired (unsubscribe/reap race). Per KEY: a slow
-    // handshake on one command pin must not block a different one. The read
-    // guard additionally excludes the pool-wide shutdown.
-    let _gate = POOL_GATE.read().await;
+    // another caller just acquired (unsubscribe/reap race).
     let create_lock = key_lock(&key).await;
     let _create = create_lock.lock().await;
     let existing = {
@@ -275,14 +266,21 @@ pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHan
         connect_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     handle.ensure_connected(backend, program).await?;
-    // Checked under the pool gate, which `shutdown_all` takes for write: if the exit
-    // path already drained the pool, this child would never be reaped by
-    // anyone. Reap it here rather than inserting into a pool that is done.
-    if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
-        handle.shutdown_and_reap().await;
-        anyhow::bail!("ACP pool is shutting down");
+    // The check and the insert happen under the POOL LOCK, which `shutdown_all`
+    // also takes to set the flag and drain. That makes them mutually exclusive
+    // without either side waiting on the other's work: a creation that loses
+    // the race sees the flag and reaps its own child rather than inserting into
+    // a pool nobody will drain again, and the exit path never waits out a 60s
+    // handshake to find out.
+    {
+        let mut pool = POOL.clients.lock().await;
+        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            drop(pool);
+            handle.shutdown_and_reap().await;
+            anyhow::bail!("ACP pool is shutting down");
+        }
+        pool.insert(key, handle.clone());
     }
-    POOL.clients.lock().await.insert(key, handle.clone());
     Ok(handle)
 }
 
@@ -322,17 +320,20 @@ pub async fn shutdown(backend_id: &str) {
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub async fn shutdown_all() {
-    // Serialize with EVERY in-flight `client()`. Each holds the read guard from
-    // lookup through `ensure_connected` and inserts into the pool only
-    // afterwards, so draining without the write guard can run entirely between
-    // a spawn and its insert — finding an empty pool while an untracked child
-    // is already alive, which the exit path then leaves running along with its
-    // tool descendants.
-    let _gate = POOL_GATE.write().await;
-    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
-    let mut g = POOL.clients.lock().await;
-    let all: Vec<_> = g.drain().map(|(_, c)| c).collect();
-    drop(g);
+    // Flag and drain under ONE pool-lock acquisition. `client()` checks the flag
+    // and inserts under that same lock, so a creation racing this either
+    // inserts before the drain (and is drained) or sees the flag and reaps its
+    // own child — no untracked survivor either way.
+    //
+    // Deliberately NOT waiting for in-flight creations to finish: this runs
+    // synchronously on `ExitRequested`, and an unresponsive agent's handshake
+    // can take 60s, which would read as a hung desktop app. The flag makes
+    // waiting unnecessary.
+    let all: Vec<ClientHandle> = {
+        let mut g = POOL.clients.lock().await;
+        SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+        g.drain().map(|(_, c)| c).collect()
+    };
     for c in all {
         c.shutdown_and_reap().await;
     }
@@ -915,10 +916,8 @@ impl ClientHandle {
             return;
         };
         let key = pool_key(self.backend_id, &program);
-        // Same guards as `client()` — empty-check + pool remove stay atomic
-        // against a concurrent get-or-create for this key, and the read guard
-        // keeps this out of the pool-wide drain's way.
-        let _gate = POOL_GATE.read().await;
+        // Same key lock as `client()` — empty-check + pool remove stay atomic
+        // against a concurrent get-or-create for this key.
         let create_lock = key_lock(&key).await;
         let _create = create_lock.lock().await;
         let empty = {
@@ -949,7 +948,6 @@ impl ClientHandle {
         };
         // Release before awaiting the reap (shutdown takes other locks).
         drop(_create);
-        drop(_gate);
         if let Some(c) = removed {
             c.shutdown_and_reap().await;
         }

@@ -6284,12 +6284,24 @@ async fn take_frozen_turn(eng: &EngineRef, turn_id: i32) -> FreezeClaim {
     }
     if inner.acp_client.is_some() && inner.codex_client.is_none() {
         let acp = inner.acp_client.take();
-        let sid = inner.native_id.clone();
+        // TAKE, not clone — the same rule `force_acp_turn_reset` follows. The
+        // caller is about to abandon this native session; leaving the id in
+        // place lets a send admitted during cleanup resume the very session
+        // being torn down.
+        let sid = inner.native_id.take();
         let Some(drain) = reset_frozen_appserver_turn(&mut inner, turn_id) else {
             inner.acp_client = acp;
+            inner.native_id = sid;
             return FreezeClaim::Stale;
         };
         inner.reset_epoch = inner.reset_epoch.saturating_add(1);
+        // Held until the caller finishes cancel/unsubscribe/finalize/marker/
+        // native-id clearing. The epoch bump alone does not cover this window:
+        // a send arriving DURING it captures the already-bumped value, passes
+        // every check, and can prompt the abandoned session — after which the
+        // recovery clears state underneath the newer turn. Same reservation
+        // `stop_quiet` takes for the same reason.
+        inner.tearing_down = true;
         return FreezeClaim::OwnedAcp {
             client: acp,
             session_id: sid,
@@ -6571,6 +6583,14 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
             if let (Some(c), Some(sid)) = (client.as_ref(), acp_sid.as_deref()) {
                 let _ = c.cancel(sid).await;
                 c.unsubscribe(sid).await;
+                // A FROZEN prompt is the case most likely to ignore this
+                // cancel, which is exactly when `unsubscribe`'s own reap
+                // declines: the outstanding `session/prompt` still sits in
+                // `pending` and the ordinary policy treats it as live work.
+                // Without this the next send gets the same pooled process back,
+                // still running the abandoned prompt. The route checks inside
+                // still apply, so a client shared with another session lives.
+                c.retire_after_ignored_cancel().await;
             }
             force_acp_finalize_drain(app, thread_id, session_id, turn_id, drain).await;
             emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
@@ -6710,6 +6730,11 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
         )
         .await;
     }
+    // Every ACP cleanup step above is done; the engine can accept work again.
+    // Released here rather than at any earlier return: this is the one point
+    // all recovery paths converge on, so the reservation cannot outlive the
+    // cleanup it was protecting.
+    eng.lock().await.tearing_down = false;
     if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
         bus.ask_human(thread_id, &dir, &freeze_recovery_text(freeze_secs));
     }
@@ -8656,6 +8681,32 @@ fn emit_lead_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stale claim owns nothing, so it must leave every field it inspected
+    /// exactly as it found them — including the reservation and the native id.
+    ///
+    /// The ACP branch itself (which sets the reservation and takes the id) has
+    /// no unit test: it keys on a live `acp_client`, and constructing one means
+    /// spawning a real child. This covers the decline path, where getting it
+    /// wrong would strand the engine permanently unsendable.
+    #[tokio::test]
+    async fn a_stale_freeze_claim_reserves_nothing() {
+        let mut inner = test_inner("omp");
+        inner.turn_id = 7;
+        inner.turn.busy = false; // already ended → Stale
+        inner.native_id = Some("sess-frozen".into());
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+
+        assert!(matches!(take_frozen_turn(&eng, 7).await, FreezeClaim::Stale));
+
+        let g = eng.lock().await;
+        assert!(!g.tearing_down, "a declined claim must not reserve");
+        assert_eq!(
+            g.native_id.as_deref(),
+            Some("sess-frozen"),
+            "a declined claim must not take the native id"
+        );
+    }
 
     /// The teardown window's gate. Bumping the epoch stops work reserved
     /// BEFORE a teardown; this stops work admitted DURING one — a send arriving

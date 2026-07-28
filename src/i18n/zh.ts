@@ -1,4 +1,3 @@
-import notices from "./notices.json" with { type: "json" };
 export const zh = {
   common: {
     cancel: "取消",
@@ -319,10 +318,11 @@ export const zh = {
   },
   needs: {
     acpPermissionRequired: "需要授权",
-    // Sourced from `notices.json`, NOT restated here: the IM bridge renders the
-    // same token from Rust, and two copies of the sentence drift the moment one
-    // side is edited.
-    acpForceResetNotice: notices["acp.force_reset_notice"].zh,
+    // Authoritative copy. `scripts/gen-notice-copy.mjs` generates the
+    // backend-readable mirror the IM bridge renders from — edit here, run the
+    // script; `noticeCopy.test.ts` fails if the mirror drifts.
+    acpForceResetNotice:
+      "⏹️ 停止后 agent 未响应取消请求，已强制中断并重置为全新会话继续。历史对话仍保留在时间线里，但新会话不带原生上下文；如果后续回复像「忘记」了之前的内容，请重新提示一下关键信息。",
     title: "待你处理",
     subtitle: "只有你能回答的审批与提问",
     wantsPermission: "请求权限",
@@ -408,6 +408,7 @@ export const zh = {
     acpSessionOpenFailed: "无法打开 agent 会话。请确认 agent 已安装后重试。",
     ompSessionMissing: "找不到本地会话文件（agent 可能已清理）。请直接发新消息，而不是回退。",
     ompUserMissing: "在 agent 会话文件里找不到这条消息，请换一条再试。",
+    ompScanTruncated: "agent 会话目录里的文件太多，未能完整搜索，因此没能定位到这个会话。清理旧的会话文件后即可搜到。",
     rewindConfirm: "回退",
     rewindModeConversation: "仅回退对话",
     rewindModeConversationDesc:

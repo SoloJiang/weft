@@ -40,15 +40,3 @@ test("prose passes through untouched", () => {
   assert.equal(noticeTokenKey("Should I bump the major version?"), null);
   assert.equal(noticeTokenKey(""), null);
 });
-
-/** Rust bakes this same file in at compile time (`bus::notice_text`). If the
- *  catalogs stopped sourcing from it, in-app and IM copy would drift — which is
- *  exactly the duplication this file replaced. */
-test("catalog copy comes from the shared notices file, not a second transcription", async () => {
-  const notices = (await import("../../src/i18n/notices.json", { with: { type: "json" } }))
-    .default as Record<string, Record<string, string>>;
-  const shared = notices["acp.force_reset_notice"];
-  assert.ok(shared, "the shared file must carry the force-reset token");
-  assert.equal(lookup(en, "needs.acpForceResetNotice"), shared.en);
-  assert.equal(lookup(zh, "needs.acpForceResetNotice"), shared.zh);
-});

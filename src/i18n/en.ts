@@ -1,4 +1,3 @@
-import notices from "./notices.json" with { type: "json" };
 export const en = {
   common: {
     cancel: "Cancel",
@@ -329,10 +328,11 @@ export const en = {
   },
   needs: {
     acpPermissionRequired: "Permission required",
-    // Sourced from `notices.json`, NOT restated here: the IM bridge renders the
-    // same token from Rust, and two copies of the sentence drift the moment one
-    // side is edited.
-    acpForceResetNotice: notices["acp.force_reset_notice"].en,
+    // Authoritative copy. `scripts/gen-notice-copy.mjs` generates the
+    // backend-readable mirror the IM bridge renders from — edit here, run the
+    // script; `noticeCopy.test.ts` fails if the mirror drifts.
+    acpForceResetNotice:
+      "⏹️ The agent did not answer the cancellation after Stop, so the turn was force-interrupted and continues on a brand-new session. The conversation stays in the timeline, but the new session carries no native context — if later replies seem to have \"forgotten\" earlier details, re-state the key points.",
     title: "Needs you",
     subtitle: "approvals and questions only you can answer",
     wantsPermission: "wants permission",
@@ -420,6 +420,8 @@ export const en = {
     acpSessionOpenFailed: "Could not open the agent session. Check that the agent is installed and try again.",
     ompSessionMissing: "Could not find this conversation on disk. The agent may have cleaned its session files — try sending a new message instead of rewinding.",
     ompUserMissing: "Could not locate that message in the agent session file. Try rewinding a different message.",
+    ompScanTruncated:
+      "There are too many files in the agent session folder to search it fully, so this session could not be located. Clearing out old session files will let the search reach it.",
     rewindConfirm: "Rewind",
     rewindModeConversation: "Conversation only",
     rewindModeConversationDesc:
