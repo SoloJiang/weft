@@ -736,6 +736,10 @@ fn find_omp_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>
     // Prefer encoded-cwd bucket; fall back to any match.
     let encoded = omp_encode_cwd(cwd);
     let mut candidates = Vec::new();
+    // Whether a scan stopped at its cap. "Nothing found" and "stopped looking"
+    // are different answers, and reporting the second as the first told the
+    // user their session was gone when it was merely past the cap.
+    let mut truncated = false;
     let preferred = root.join(&encoded);
     // Do not follow a symlink bucket (or entries): rewind must stay under
     // ~/.omp/agent/sessions.
@@ -748,6 +752,7 @@ fn find_omp_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>
         let mut scanned = 0usize;
         for e in std::fs::read_dir(&preferred)? {
             if scanned >= MAX_PREFERRED_SCAN {
+                truncated = true;
                 break;
             }
             let e = e?;
@@ -770,11 +775,18 @@ fn find_omp_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>
         }
     }
     if candidates.is_empty() {
-        for e in walkdir_jsonl(&root, session_id)? {
-            candidates.push(e);
-        }
+        let (hits, walk_truncated) = walkdir_jsonl(&root, session_id)?;
+        truncated = truncated || walk_truncated;
+        candidates.extend(hits);
     }
     candidates.retain(|p| is_inside_canonical(p, &canon_root));
+    // Distinguish the two failure answers. `Ok(None)` means "scanned everything
+    // reachable, it is not there"; a truncated scan cannot claim that, and
+    // `fork_omp_at` would otherwise report `omp_session_not_found` for a
+    // session that exists just past the cap.
+    if candidates.is_empty() && truncated {
+        return Err(anyhow!("omp_session_scan_truncated"));
+    }
     // Newest mtime wins if several.
     candidates.sort_by_key(|p| {
         std::fs::metadata(p)
@@ -810,7 +822,9 @@ fn is_inside_canonical(candidate: &Path, canon_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
+/// Returns the hits plus whether any cap stopped the walk early — the caller
+/// must not report a truncated walk as "not found".
+fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<(Vec<PathBuf>, bool)> {
     use std::collections::HashSet;
     /// Hard caps so a huge/unexpected `~/.omp/agent/sessions` tree cannot pin
     /// the async command thread or blow memory. Prefer the encoded-cwd bucket
@@ -827,8 +841,12 @@ fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
     let mut seen = HashSet::new();
     let mut dirs_visited = 0usize;
     let mut files_scanned = 0usize;
+    // A cap stopped the walk with directories still queued: the answer is
+    // "stopped looking", not "not there".
+    let mut truncated = false;
     while let Some((dir, depth)) = stack.pop() {
         if dirs_visited >= MAX_DIRS || files_scanned >= MAX_FILES_SCANNED {
+            truncated = true;
             break;
         }
         if depth > MAX_DEPTH {
@@ -846,7 +864,13 @@ fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
             Err(_) => continue,
         };
         for e in rd.flatten() {
-            if files_scanned >= MAX_FILES_SCANNED || out.len() >= MAX_HITS {
+            if files_scanned >= MAX_FILES_SCANNED {
+                truncated = true;
+                break;
+            }
+            // Hitting the HIT cap is not truncation of the search space — the
+            // session was found, several times over.
+            if out.len() >= MAX_HITS {
                 break;
             }
             let p = e.path();
@@ -864,6 +888,7 @@ fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
                 // Cap enqueues, not only visits — a wide fan-out can otherwise
                 // grow `stack` without bound before dirs_visited hits MAX_DIRS.
                 if dirs_visited + stack.len() >= MAX_DIRS {
+                    truncated = true;
                     continue;
                 }
                 stack.push((p, depth + 1));
@@ -876,7 +901,7 @@ fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
             }
         }
     }
-    Ok(out)
+    Ok((out, truncated))
 }
 
 /// omp session bucket: non-alnum path chars → `-` (observed
@@ -1431,7 +1456,7 @@ mod tests {
         let nm = root.join("node_modules");
         std::fs::create_dir_all(&nm).unwrap();
         std::fs::write(nm.join("sess-abc-nm.jsonl"), "{}\n").unwrap();
-        let hits = walkdir_jsonl(&root, "sess-abc").expect("walk");
+        let (hits, _truncated) = walkdir_jsonl(&root, "sess-abc").expect("walk");
         let names: Vec<_> = hits.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
         assert!(names.iter().any(|n| n == "sess-abc.jsonl"), "real hit: {names:?}");
         assert!(names.iter().all(|n| n != "link-sess-abc.jsonl"), "symlink file skipped: {names:?}");
@@ -1470,9 +1495,13 @@ mod tests {
         for i in 0..80 {
             std::fs::write(root.join(format!("sess-cap-{i}.jsonl")), b"{}\n").unwrap();
         }
-        let hits = walkdir_jsonl(root, "sess-cap").expect("walk");
+        let (hits, truncated) = walkdir_jsonl(root, "sess-cap").expect("walk");
         assert!(hits.len() <= 32, "capped at MAX_HITS, got {}", hits.len());
         assert!(!hits.is_empty());
+        assert!(
+            !truncated,
+            "stopping at the HIT cap is not a truncated search — the session was found"
+        );
     }
 
     #[test]
@@ -1490,7 +1519,7 @@ mod tests {
         // A single hit buried late should still be findable within caps, but
         // the walk must terminate quickly and never enqueue > MAX_DIRS pending.
         fs::write(root.join("sess-wide.jsonl"), b"{}\n").expect("hit");
-        let hits = walkdir_jsonl(root, "sess-wide").expect("walk");
+        let (hits, _truncated) = walkdir_jsonl(root, "sess-wide").expect("walk");
         // Cap may stop before discovering the hit if fan-out exhausts MAX_DIRS;
         // the invariant under test is termination + no panic/OOM, and hits ≤ MAX_HITS.
         assert!(hits.len() <= 32, "hits capped");
@@ -1605,6 +1634,42 @@ mod tests {
 
         // Cannot be canonicalized → not contained.
         assert!(!is_inside_canonical(&root.join("missing.jsonl"), &canon_root));
+    }
+
+    /// "Stopped looking" must not be reported as "not there". The previous
+    /// large-directory test only asserted `is_ok()`, which accepts exactly that
+    /// false negative: a bucket past the scan cap made `fork_omp_at` answer
+    /// `omp_session_not_found` for a session that exists.
+    #[test]
+    fn a_truncated_scan_is_a_distinct_error_not_a_missing_session() {
+        use std::fs;
+        let _serialized = home_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path();
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let bucket = home.join(".omp/agent/sessions").join(omp_encode_cwd(&cwd));
+        fs::create_dir_all(&bucket).unwrap();
+        // Past MAX_PREFERRED_SCAN (4096) with NO matching file anywhere, so the
+        // fallback walk is capped too and the session is genuinely unreachable
+        // within the caps.
+        for i in 0..5_000 {
+            fs::write(bucket.join(format!("noise-{i}.txt")), b"x").unwrap();
+        }
+
+        let old = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let found = find_omp_session_file(&cwd, "sess-past-the-cap");
+        match old {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let err = found.expect_err("a truncated scan must not answer Ok(None)");
+        assert!(
+            err.to_string().contains("omp_session_scan_truncated"),
+            "got {err}"
+        );
     }
 
     /// The guards must not reject the ordinary case.

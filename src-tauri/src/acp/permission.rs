@@ -127,7 +127,7 @@ pub enum PermissionIntent {
 /// so a write that named no location is still a write.
 fn tool_paths(tc: &Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let mut push = |out: &mut Vec<String>, p: &str| {
+    let push = |out: &mut Vec<String>, p: &str| {
         if !p.is_empty() && !out.iter().any(|seen| seen == p) {
             out.push(p.to_string());
         }

@@ -132,7 +132,11 @@ fn tool_name_from_raw(raw: Option<&Value>, kind: &str) -> String {
         return "bash".into();
     }
     if raw.get("path").is_some() || raw.get("file_path").is_some() {
-        if kind == "edit" || kind == "delete" || kind == "move" {
+        // `write` belongs with the other mutations. Collapsing it to `read`
+        // labelled a file write as a read in the timeline — wrong name, wrong
+        // icon — while the permission layer classified the same kind as a
+        // write, so the two surfaces disagreed about the same tool call.
+        if matches!(kind, "edit" | "write" | "delete" | "move") {
             return kind.to_string();
         }
         return "read".into();
@@ -299,6 +303,26 @@ pub fn stop_reason_is_cancelled(stop: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A file write must stay a write in the timeline. Collapsing `write` into
+    /// the `read` fallback gave it a read's name and icon while the permission
+    /// layer classified the same call as a mutation — two surfaces disagreeing
+    /// about one tool call.
+    #[test]
+    fn a_write_tool_call_is_not_labelled_read() {
+        let raw = serde_json::json!({ "path": "src/main.rs" });
+        for kind in ["edit", "write", "delete", "move"] {
+            assert_eq!(
+                super::tool_name_from_raw(Some(&raw), kind),
+                kind,
+                "{kind} is a mutation"
+            );
+        }
+        assert_eq!(super::tool_name_from_raw(Some(&raw), "read"), "read");
+        // A command still wins over any path-bearing input.
+        let cmd = serde_json::json!({ "command": "ls" });
+        assert_eq!(super::tool_name_from_raw(Some(&cmd), "write"), "bash");
+    }
+
     use super::*;
     use serde_json::json;
 

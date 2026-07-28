@@ -1736,6 +1736,9 @@ pub struct EngineInner {
     /// set, new sends fail visibly rather than starting a healthy turn that
     /// the imminent switch would interrupt.
     pub quota_failover_committing: bool,
+    /// Set only for the window in which [`stop_quiet`] has released the engine
+    /// lock to await ACP cancel/unsubscribe. See `send_reservation_valid`.
+    pub tearing_down: bool,
     /// The worktree this worker runs in (None for the lead console): lets
     /// send's admission honor a worktree-level restore reservation without a
     /// DB lookup. Sibling sessions of one worktree share the same id.
@@ -2403,6 +2406,13 @@ struct SendContext {
 /// change as long as the engine itself has not been stopped.
 fn send_reservation_valid(inner: &EngineInner, ctx: &SendContext) -> bool {
     if inner.stopped {
+        return false;
+    }
+    // A teardown that has released the lock for ACP I/O is going to overwrite
+    // `turn` when it reacquires it. Admitting work into that window loses it
+    // silently — the epoch check below cannot catch this one, because a send
+    // arriving mid-teardown captures the ALREADY-bumped epoch and matches.
+    if inner.tearing_down {
         return false;
     }
     // A stop/reset since Phase 1 — even one immediately followed by a restart that
@@ -3366,6 +3376,16 @@ async fn spawn_acp_turn(
                         // branch and answered `acp_session_open_failed`
                         // forever. Cleared, the next send takes the `None`
                         // arm and opens a fresh session.
+                        //
+                        // Tear the RUNTIME route down too, the same way every
+                        // other abandonment path does. Clearing only the ids
+                        // leaves the old `SessionRoute` and its consumer
+                        // registered: they keep delivering late text, tool and
+                        // permission events into this engine after the retry
+                        // opened a different session, and the surviving route
+                        // also pins the pooled client so it can never retire.
+                        let _ = client.cancel(&id).await;
+                        client.unsubscribe(&id).await;
                         clear_acp_native_never_prompted(&app, &db, &eng, sid, thread_id_i).await;
                         return Err(anyhow::anyhow!("acp_session_open_failed"));
                     }
@@ -3604,6 +3624,8 @@ async fn spawn_acp_turn(
                 if stopped {
                     return;
                 }
+                // The prompt is gone; its permission cards must go with it.
+                cancel_open_acp_asks(&a, &e).await;
                 acp_drain_then_end(
                     a.clone(),
                     d.clone(),
@@ -3624,6 +3646,27 @@ async fn spawn_acp_turn(
         let _ = client.cancel(&session_id).await;
     }
     Ok(())
+}
+
+/// Cancel every permission card this turn left open, and stop tracking them.
+///
+/// A TRANSPORT failure — the child died, the connection dropped — ends the
+/// prompt while the consumer is still blocked on the `AskRegistry` receiver, so
+/// nothing else ever retires the card. It stays actionable for the full hour
+/// timeout, and answering it with Always or Full persists a standing grant for
+/// a request whose native session no longer exists. Cancelling also releases
+/// the consumer, which then replies `RejectOnce` into a dead connection —
+/// harmless, and the honest wire answer.
+async fn cancel_open_acp_asks(app: &AppHandle, eng: &EngineRef) {
+    let asks = std::mem::take(&mut eng.lock().await.acp_pending_asks);
+    if asks.is_empty() {
+        return;
+    }
+    if let Some(reg) = app.try_state::<crate::ask::AskRegistry>() {
+        for id in asks {
+            reg.inner().cancel(id);
+        }
+    }
 }
 
 /// Wait until the session consumer has drained events enqueued before the
@@ -3698,6 +3741,8 @@ async fn acp_emit_turn_end(
                 Err(err) => {
                     eprintln!("[weft][acp] flush prompt failed: {err}");
                     let status = drain_failure_status(&eng, dequeue_epoch).await;
+                    // Same for a queued prompt that died mid-flight.
+                    cancel_open_acp_asks(&app, &eng).await;
                     // Close what this prompt already streamed BEFORE resetting
                     // the turn — the reset drops `inner.current` without
                     // finalizing it, and un-drained consumer updates would
@@ -6422,6 +6467,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         last_assistant_uuid: None,
         rewinding: false,
         quota_failover_committing: false,
+        tearing_down: false,
         worktree_id: None,
     }
 }
@@ -7020,6 +7066,14 @@ pub async fn stop_quiet(eng: &EngineRef) -> StopQuietOutcome {
         session_id: acp_sid,
         asks: acp_asks,
     } = take_acp_teardown_and_invalidate(&mut inner);
+    // Closed the other direction of the same race. Bumping the epoch stops work
+    // that reserved BEFORE this teardown from landing after it; this stops work
+    // admitted DURING it. The ACP cancel/unsubscribe below need the lock
+    // released, and `stopped` is not set until `stop` returns, so a human send
+    // or bus wake in that window reserves against the NEW epoch, passes every
+    // check, and is then silently discarded when the reset below replaces
+    // `turn` with `TurnState::default()`.
+    inner.tearing_down = true;
     // Drop the engine lock before awaiting ACP cancel/unsubscribe (they take
     // the runtime mutex). Re-lock afterwards for the remaining field clears.
     drop(inner);
@@ -7046,6 +7100,9 @@ pub async fn stop_quiet(eng: &EngineRef) -> StopQuietOutcome {
     // turn inherits a stale true and a pre-output failure there would wrongly
     // suppress its error_before_output row.
     inner.turn_saw_text = false;
+    // The window is over: state is fully reset, so the engine can accept work
+    // again (a skill bounce reuses this same engine right after).
+    inner.tearing_down = false;
     StopQuietOutcome {
         thread_id: target.0,
         session_id: target.1,
@@ -8599,6 +8656,44 @@ fn emit_lead_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The teardown window's gate. Bumping the epoch stops work reserved
+    /// BEFORE a teardown; this stops work admitted DURING one — a send arriving
+    /// mid-teardown captures the already-bumped epoch, so the epoch check
+    /// cannot see it, and its queued work would be dropped when the reset
+    /// replaces `turn` with the default.
+    #[test]
+    fn a_send_is_refused_while_a_teardown_holds_the_engine_open() {
+        let mut inner = test_inner("omp");
+        inner.turn_id = 5;
+        inner.turn.busy = true;
+        let ctx = SendContext {
+            thread_id: 1,
+            session_id: None,
+            turn: 5,
+            direct: true,
+            is_command: false,
+            tool: "omp".into(),
+            origin_tag: None,
+            reset_epoch: inner.reset_epoch,
+        };
+        assert!(
+            send_reservation_valid(&inner, &ctx),
+            "baseline: this send is otherwise admissible"
+        );
+
+        inner.tearing_down = true;
+        assert!(
+            !send_reservation_valid(&inner, &ctx),
+            "a teardown that released the lock for ACP I/O must not admit work"
+        );
+
+        inner.tearing_down = false;
+        assert!(
+            send_reservation_valid(&inner, &ctx),
+            "and the engine is usable again once the window closes"
+        );
+    }
 
     /// The notice is a machine token, and the FRONTEND owns its copy
     /// (`NeedsRows.tsx`'s `NOTICE_TOKENS` → `needs.acpForceResetNotice`).
@@ -10631,6 +10726,7 @@ mod tests {
             last_assistant_uuid: None,
             rewinding: false,
             quota_failover_committing: false,
+            tearing_down: false,
             worktree_id: None,
         };
         let fresh = build_args(&inner);

@@ -337,6 +337,7 @@ pub async fn lead_engine(
         last_assistant_uuid: None,
         rewinding: false,
         quota_failover_committing: false,
+        tearing_down: false,
         worktree_id: None,
     };
     // Restore the last persisted meta snapshot so the Session panel is populated
@@ -1511,6 +1512,7 @@ pub(crate) async fn chat_open_worker_impl(
                 last_assistant_uuid: None,
                 rewinding: false,
                 quota_failover_committing: false,
+        tearing_down: false,
                 worktree_id: Some(wt.id),
             };
             // Restore the last persisted meta snapshot so the Session panel is
@@ -1647,6 +1649,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         last_assistant_uuid: None,
         rewinding: false,
         quota_failover_committing: false,
+        tearing_down: false,
         // One cheap lookup at engine build so send's admission can honor a
         // worktree-level restore reservation without a per-send DB query.
         worktree_id: repo::worktree_for(db, sess.direction_id, sess.repo_id)
