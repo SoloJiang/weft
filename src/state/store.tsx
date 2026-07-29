@@ -2454,9 +2454,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setRepoDrawerOpen(true);
   }, []);
   const openCurator = useCallback(() => {
+    // Curator lives inside RepoMapView's side panel. Always land on the Repo Map
+    // first and clear issue/worker overlays; otherwise openCurator only flips
+    // drawer flags that no mounted surface can show.
+    setActiveThreadId(null);
+    setShowNeeds(false);
+    setViewing(null);
+    setHomeTab("repos");
     setRepoDrawerTabState("curator");
     setRepoDrawerOpen(true);
-  }, []);
+    void refreshRepoMap();
+  }, [refreshRepoMap]);
 
   // Every Analyze entry — the graph's button, the map's regenerate, or a typed
   // request — funnels to the ONE reanalyze tool: post a real user message to the
