@@ -305,7 +305,7 @@ export function snapshotOf(
       sample,
       route: {
         kind: "quota",
-        workspaceId: workspaceId ?? undefined,
+        // Quota / Resources is global — do not pin a workspace that may be stale by click time.
       },
     });
   }
@@ -421,12 +421,14 @@ export function planNotifyOpen(payload: {
   openNeeds?: boolean | null;
 }): NotifyOpenIntent[] {
   const out: NotifyOpenIntent[] = [];
-  if (payload.workspaceId != null) {
-    out.push({ type: "workspace", workspaceId: payload.workspaceId });
-  }
+  // Quota is process-global (Resources). Never switch workspaces for it, even if
+  // an older payload still carries a workspaceId.
   if (payload.kind === "quota") {
     out.push({ type: "resources" });
     return out;
+  }
+  if (payload.workspaceId != null) {
+    out.push({ type: "workspace", workspaceId: payload.workspaceId });
   }
   // Write triggers / action-required notices: open the Needs-you surface so the
   // human can act on the control the notification advertised.

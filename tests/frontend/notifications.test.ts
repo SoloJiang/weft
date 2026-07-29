@@ -162,9 +162,10 @@ test("snapshotOf captures stalled workers and leads", () => {
 });
 
 test("snapshotOf only surfaces degraded quota keyed by transitionSeq", () => {
-  const snap = snapshotOf([], [], [], [], {}, {}, quota("degraded", 4));
+  const snap = snapshotOf([], [], [], [], {}, {}, quota("degraded", 4), {}, 9);
   assert.equal(snap.quota.get("quota:degraded:4")?.sample, "900 / 1000");
   assert.equal(snap.quota.get("quota:degraded:4")?.route.kind, "quota");
+  assert.equal(snap.quota.get("quota:degraded:4")?.route.workspaceId, undefined);
   const warning = snapshotOf([], [], [], [], {}, {}, quota("warning", 5));
   assert.equal(warning.quota.size, 0);
 });
@@ -303,8 +304,11 @@ test("planNotifyOpen routes needs/review to direction and switches workspace", (
 });
 
 test("planNotifyOpen routes quota to resources and lead-only stalled to lead", () => {
+  // Quota is process-global: ignore any workspaceId so the current workspace stays.
+  assert.deepEqual(planNotifyOpen({ kind: "quota" }), [
+    { type: "resources" },
+  ]);
   assert.deepEqual(planNotifyOpen({ kind: "quota", workspaceId: 1 }), [
-    { type: "workspace", workspaceId: 1 },
     { type: "resources" },
   ]);
   assert.deepEqual(planNotifyOpen({ kind: "stalled", threadId: 4 }), [

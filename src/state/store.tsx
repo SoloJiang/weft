@@ -401,6 +401,10 @@ interface Store {
    *  `openSettings()` call (e.g. from the nav rail's gear icon). */
   settingsInitialPage: SettingsPage | null;
   clearSettingsInitialPage: () => void;
+  /** Live requested settings page while Settings is already open. Unlike
+   *  `settingsInitialPage`, this is not cleared on mount and is intended for
+   *  in-session deep links (e.g. quota notification → Resources). */
+  settingsRequestedPage: SettingsPage | null;
   /** Jump to the workspace home's Repos tab. */
   openRepoMap: () => void;
   refreshRepoMap: () => Promise<void>;
@@ -653,6 +657,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [repoAnalysisActive, setRepoAnalysisActive] = useState(false);
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
   const [settingsInitialPage, setSettingsInitialPage] = useState<SettingsPage | null>(null);
+  const [settingsRequestedPage, setSettingsRequestedPage] = useState<SettingsPage | null>(null);
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
   const [repoDrawerTab, setRepoDrawerTabState] = useState<"detail" | "curator">("detail");
@@ -1038,6 +1043,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const openSettings = useCallback(
     (page?: SettingsPage) => {
+      // Already on Settings: only navigate pages. Re-snapshotting would capture
+      // homeTab="settings" and make Back restore Settings instead of the app.
+      if (homeTab === "settings") {
+        if (page != null) {
+          setSettingsRequestedPage(page);
+        }
+        return;
+      }
       // Snapshot first — once we flip homeTab + clear thread/viewing the
       // info is gone and the back arrow can't restore it.
       prevHomeRef.current = {
@@ -1050,6 +1063,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setViewing(null);
       setShowNeeds(false);
       setSettingsInitialPage(page ?? null);
+      setSettingsRequestedPage(page ?? null);
       setHomeTab("settings");
     },
     [homeTab, activeThreadId, viewing, showNeeds],
@@ -1062,6 +1076,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const closeSettings = useCallback(() => {
     const prev = prevHomeRef.current;
     prevHomeRef.current = null;
+    setSettingsRequestedPage(null);
     if (!prev) {
       // First-launch / direct deep link into Settings — nothing to restore.
       setHomeTab("board");
@@ -3203,6 +3218,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     closeSettings,
     settingsInitialPage,
     clearSettingsInitialPage,
+    settingsRequestedPage,
     openRepoMap,
     refreshRepoMap,
     refreshReposAndMap,

@@ -427,7 +427,8 @@ export function useSystemNotifications() {
   ]);
 
   // Dock / taskbar badge tracks actionable Needs-you across all workspaces.
-  // needsByWorkspace already includes questions + asks + writeTriggers per ws.
+  // needsByWorkspace already includes questions + asks + writeTriggers +
+  // action-required notices per workspace (self-clearing notices stay out).
   useEffect(() => {
     const count = Object.values(needsByWorkspace).reduce((a, b) => a + b, 0);
     if (lastBadge.current === count) return;

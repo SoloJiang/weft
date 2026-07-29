@@ -2378,10 +2378,16 @@ pub async fn workspace_needs_counts(
         let tids: HashSet<i32> = threads.iter().map(|t| t.id).collect();
         let mut count: u32 = 0;
         for t in &threads {
-            // Excludes self-clearing NOTICEs (e.g. the stall hint) — they carry
-            // no action, so they must not inflate the "needs you" count that
-            // flags other workspaces (issue #105).
+            // Questions still come from open_answerable_ask_count (issue #105).
+            // Action-required notices are not answerable, but they leave a durable
+            // Retry control in Needs-you, so the dock badge and workspace switcher
+            // should count them. Self-clearing notices stay out.
             count += bus.open_answerable_ask_count(t.id) as u32;
+            count += bus
+                .open_asks(t.id)
+                .iter()
+                .filter(|a| a.kind == crate::bus::AskKind::NoticeActionRequired)
+                .count() as u32;
             count += crate::planner::pending_writes(&db, t.id)
                 .await
                 .map_err(e)?
