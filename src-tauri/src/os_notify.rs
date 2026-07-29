@@ -60,6 +60,8 @@ pub struct NotifyOpenPayload {
     pub workspace_id: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_needs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_curator: Option<bool>,
 }
 
 /// Frontend → backend send request.
@@ -84,6 +86,8 @@ pub struct NotifySendRequest {
     pub workspace_id: Option<i32>,
     #[serde(default)]
     pub open_needs: Option<bool>,
+    #[serde(default)]
+    pub open_curator: Option<bool>,
 }
 
 fn parse_bool(raw: &str) -> Option<bool> {
@@ -104,6 +108,7 @@ fn payload_from_user_info(info: &HashMap<String, String>) -> NotifyOpenPayload {
         ask_id: info.get("askId").and_then(|s| s.parse().ok()),
         workspace_id: info.get("workspaceId").and_then(|s| s.parse().ok()),
         open_needs: info.get("openNeeds").and_then(|s| parse_bool(s)),
+        open_curator: info.get("openCurator").and_then(|s| parse_bool(s)),
     }
 }
 
