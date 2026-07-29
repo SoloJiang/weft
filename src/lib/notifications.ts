@@ -112,27 +112,53 @@ export interface OsNotifyOpenEvent {
   askId?: number | null;
   workspaceId?: number | null;
   openNeeds?: boolean | null;
+  openCurator?: boolean | null;
 }
 
 /** Apply a notification click to the in-app navigation surface. */
 const PENDING_NAV_KEY = "weft-notify-pending-nav";
 
-function stashPendingNav(payload: OsNotifyOpenEvent): void {
+type PendingNav = OsNotifyOpenEvent & {
+  /**
+   * Absolute workspaceLoadSeq that must be reached before applying intents.
+   * Negative values encode "currentSeq + abs(value)" and are resolved on first
+   * settle attempt so we wait for both the direct selectWorkspace load and the
+   * store's [activeWorkspaceId] re-load.
+   */
+  expectedLoadSeq?: number;
+};
+
+function stashPendingNav(
+  payload: OsNotifyOpenEvent,
+  opts?: { expectedSeqDelta?: number },
+): void {
   try {
-    sessionStorage.setItem(PENDING_NAV_KEY, JSON.stringify(payload));
+    const pending: PendingNav = { ...payload };
+    if (opts?.expectedSeqDelta != null) {
+      pending.expectedLoadSeq = -Math.abs(opts.expectedSeqDelta);
+    }
+    sessionStorage.setItem(PENDING_NAV_KEY, JSON.stringify(pending));
   } catch {
     /* ignore quota / private mode */
   }
 }
 
-export function takePendingNav(): OsNotifyOpenEvent | null {
+export function takePendingNav(): PendingNav | null {
   try {
     const raw = sessionStorage.getItem(PENDING_NAV_KEY);
     if (!raw) return null;
     sessionStorage.removeItem(PENDING_NAV_KEY);
-    return JSON.parse(raw) as OsNotifyOpenEvent;
+    return JSON.parse(raw) as PendingNav;
   } catch {
     return null;
+  }
+}
+
+function putPendingNav(pending: PendingNav): void {
+  try {
+    sessionStorage.setItem(PENDING_NAV_KEY, JSON.stringify(pending));
+  } catch {
+    /* ignore */
   }
 }
 
@@ -146,12 +172,17 @@ export async function applyNotifyIntents(
     ) => Promise<void>;
     openNeeds: () => void;
     openSettings: (page?: "resources" | "general" | "appearance" | "automation" | "skills" | "im" | "backup") => void;
+    openCurator: () => void;
   },
 ): Promise<void> {
   const intents = planNotifyOpen(payload).filter((i) => i.type !== "workspace");
   for (const intent of intents) {
     if (intent.type === "resources") {
       deps.openSettings("resources");
+      continue;
+    }
+    if (intent.type === "curator") {
+      deps.openCurator();
       continue;
     }
     if (intent.type === "direction") {
@@ -179,6 +210,7 @@ export async function handleNotifyOpen(
     ) => Promise<void>;
     openNeeds: () => void;
     openSettings: (page?: "resources" | "general" | "appearance" | "automation" | "skills" | "im" | "backup") => void;
+    openCurator: () => void;
     activeWorkspaceId: number | null;
   },
 ): Promise<void> {
@@ -192,8 +224,9 @@ export async function handleNotifyOpen(
   ) {
     // Defer the rest until the store finishes the workspace switch effect.
     // A second selectWorkspace(activeWorkspaceId) otherwise races and clears
-    // the deep-link destination.
-    stashPendingNav(payload);
+    // the deep-link destination. Wait for +2 load-seq bumps (direct call +
+    // the [activeWorkspaceId] effect) before applying intents.
+    stashPendingNav(payload, { expectedSeqDelta: 2 });
     await deps.selectWorkspace(workspaceIntent.workspaceId);
     return;
   }
@@ -216,6 +249,7 @@ async function sendOsNotification(
     askId: route.askId ?? null,
     workspaceId: route.workspaceId ?? null,
     openNeeds: route.openNeeds ?? null,
+    openCurator: route.openCurator ?? null,
   });
 }
 
@@ -248,6 +282,7 @@ export function useSystemNotifications() {
     goToDirectionRef,
     openNeeds,
     openSettings,
+    openCurator,
   } = useStore();
   const { t } = useTranslation();
   const prev = useRef<NotifySnapshot | null>(null);
@@ -256,18 +291,31 @@ export function useSystemNotifications() {
   const [windowFocused, setWindowFocused] = useState<boolean | null>(null);
   const lastBadge = useRef<number | null>(null);
 
-  const threadsById = useRef<Record<number, { title: string; workspaceId?: number }>>({});
+  const threadsById = useRef<
+    Record<number, { title: string; workspaceId?: number; kind?: string }>
+  >({});
   useEffect(() => {
-    const m: Record<number, { title: string; workspaceId?: number }> = {
+    const m: Record<
+      number,
+      { title: string; workspaceId?: number; kind?: string }
+    > = {
       ...threadsById.current,
     };
     for (const [idStr, ws] of Object.entries(threadWorkspaceById)) {
       const id = Number(idStr);
-      const prev = m[id];
-      m[id] = { title: prev?.title ?? `#${id}`, workspaceId: ws };
+      const prevMeta = m[id];
+      m[id] = {
+        title: prevMeta?.title ?? `#${id}`,
+        workspaceId: ws,
+        kind: prevMeta?.kind,
+      };
     }
     for (const th of threads) {
-      m[th.id] = { title: th.title, workspaceId: th.workspace_id };
+      m[th.id] = {
+        title: th.title,
+        workspaceId: th.workspace_id,
+        kind: th.kind,
+      };
     }
     threadsById.current = m;
   }, [threads, threadWorkspaceById]);
@@ -309,6 +357,7 @@ export function useSystemNotifications() {
     goToDirectionRef,
     openNeeds,
     openSettings,
+    openCurator,
     activeWorkspaceId,
   });
   useEffect(() => {
@@ -317,6 +366,7 @@ export function useSystemNotifications() {
       goToDirectionRef,
       openNeeds,
       openSettings,
+      openCurator,
       activeWorkspaceId,
     };
   }, [
@@ -324,6 +374,7 @@ export function useSystemNotifications() {
     goToDirectionRef,
     openNeeds,
     openSettings,
+    openCurator,
     activeWorkspaceId,
   ]);
 
@@ -354,15 +405,24 @@ export function useSystemNotifications() {
     };
   }, []);
 
-  // Cold-start only: drain a pending open once after mount.
+  // Cold-start only: drain a pending open once after mount. If StrictMode
+  // cancels the first invocation after take(), put the payload back so the
+  // remount can still consume it.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
         const pending = await api.osNotifyTakePendingOpen();
-        if (!cancelled && pending) {
-          await handleNotifyOpen(pending, navDepsRef.current);
+        if (!pending) return;
+        if (cancelled) {
+          try {
+            await api.osNotifyRestorePendingOpen(pending);
+          } catch {
+            /* pure-vite / older backend */
+          }
+          return;
         }
+        await handleNotifyOpen(pending, navDepsRef.current);
       } catch {
         /* pure-vite */
       }
@@ -376,6 +436,7 @@ export function useSystemNotifications() {
   // selectWorkspace has finished loading (workspaceLoadSeq) so a concurrent
   // selection reset cannot clear the destination right after we navigate.
   const pendingAppliedSeq = useRef<number | null>(null);
+  const pendingBaselineSeq = useRef<number | null>(null);
   useEffect(() => {
     const pending = takePendingNav();
     if (!pending) return;
@@ -384,39 +445,41 @@ export function useSystemNotifications() {
       pending.workspaceId !== activeWorkspaceId
     ) {
       // Not settled yet — put it back.
-      try {
-        sessionStorage.setItem(
-          "weft-notify-pending-nav",
-          JSON.stringify(pending),
-        );
-      } catch {
-        /* ignore */
+      putPendingNav(pending);
+      return;
+    }
+    // Resolve relative expectedLoadSeq markers against the seq observed when
+    // the pending route first becomes eligible for the target workspace.
+    if (pending.expectedLoadSeq != null && pending.expectedLoadSeq < 0) {
+      if (pendingBaselineSeq.current == null) {
+        pendingBaselineSeq.current = workspaceLoadSeq;
       }
+      pending.expectedLoadSeq =
+        pendingBaselineSeq.current + Math.abs(pending.expectedLoadSeq);
+    }
+    if (
+      pending.expectedLoadSeq != null &&
+      workspaceLoadSeq < pending.expectedLoadSeq
+    ) {
+      putPendingNav(pending);
       return;
     }
     if (pendingAppliedSeq.current === workspaceLoadSeq) {
-      // Already applied for this load; put back only if still relevant.
+      // Already applied for this load.
       return;
     }
     // If a workspace switch just started, wait for its load seq bump.
-    // workspaceLoadSeq is 0 before any selection completes; still allow apply
-    // once activeWorkspaceId already matches the target after a completed load.
     if (pending.workspaceId != null && workspaceLoadSeq === 0) {
-      try {
-        sessionStorage.setItem(
-          "weft-notify-pending-nav",
-          JSON.stringify(pending),
-        );
-      } catch {
-        /* ignore */
-      }
+      putPendingNav(pending);
       return;
     }
     pendingAppliedSeq.current = workspaceLoadSeq;
+    pendingBaselineSeq.current = null;
     void applyNotifyIntents(pending, {
       goToDirectionRef,
       openNeeds,
       openSettings,
+      openCurator,
     });
   }, [
     activeWorkspaceId,
@@ -424,6 +487,7 @@ export function useSystemNotifications() {
     goToDirectionRef,
     openNeeds,
     openSettings,
+    openCurator,
   ]);
 
   // Dock / taskbar badge tracks actionable Needs-you across all workspaces.

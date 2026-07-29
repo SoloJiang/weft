@@ -147,18 +147,58 @@ test("snapshotOf captures stalled workers and leads", () => {
         directionId: 5,
         repoId: 8,
         threadId: 2,
+        workspaceId: 4,
       },
     },
     { 2: { state: "stalled", queue: [] }, 3: { state: "busy", queue: [] } },
     null,
-    { 2: { title: "Issue B" } },
+    { 2: { title: "Issue B", workspaceId: 4 } },
   );
   assert.equal(snap.stalled.get("stall:worker:99")?.sample, "Issue B · #5");
   assert.equal(snap.stalled.get("stall:worker:99")?.route.directionId, 5);
   assert.equal(snap.stalled.get("stall:worker:99")?.route.repoId, 8);
   assert.equal(snap.stalled.get("stall:worker:99")?.route.sessionId, 99);
+  assert.equal(snap.stalled.get("stall:worker:99")?.route.workspaceId, 4);
   assert.equal(snap.stalled.get("stall:lead:2")?.sample, "Issue B");
+  assert.equal(snap.stalled.get("stall:lead:2")?.route.workspaceId, 4);
   assert.equal(snap.stalled.has("stall:lead:3"), false);
+});
+
+test("snapshotOf skips stalled items without owning workspace and routes curator leads", () => {
+  const missing = snapshotOf(
+    [],
+    [],
+    [],
+    [],
+    {
+      1: {
+        info: { session_id: 1 },
+        status: "stalled",
+        directionId: 5,
+        repoId: 8,
+        threadId: 9,
+      },
+    },
+    { 10: { state: "stalled", queue: [] } },
+    null,
+    {},
+    1,
+  );
+  assert.equal(missing.stalled.size, 0);
+
+  const curator = snapshotOf(
+    [],
+    [],
+    [],
+    [],
+    {},
+    { 22: { state: "stalled", queue: [] } },
+    null,
+    { 22: { title: "Curator", workspaceId: 3, kind: "curator" } },
+  );
+  assert.equal(curator.stalled.get("stall:curator:22")?.route.openCurator, true);
+  assert.equal(curator.stalled.get("stall:curator:22")?.route.workspaceId, 3);
+  assert.equal(curator.stalled.has("stall:lead:22"), false);
 });
 
 test("snapshotOf only surfaces degraded quota keyed by transitionSeq", () => {
@@ -352,6 +392,21 @@ test("planNotifyOpen carries repo/session for stalled workers", () => {
         repoId: 8,
         sessionId: 99,
       },
+    ],
+  );
+});
+
+test("planNotifyOpen routes curator stalls to curator surface", () => {
+  assert.deepEqual(
+    planNotifyOpen({
+      kind: "stalled",
+      workspaceId: 3,
+      threadId: 22,
+      openCurator: true,
+    }),
+    [
+      { type: "workspace", workspaceId: 3 },
+      { type: "curator" },
     ],
   );
 });

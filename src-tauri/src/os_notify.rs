@@ -136,6 +136,12 @@ fn user_info_from_req(req: &NotifySendRequest) -> HashMap<String, String> {
             if v { "1".to_string() } else { "0".to_string() },
         );
     }
+    if let Some(v) = req.open_curator {
+        info.insert(
+            "openCurator".to_string(),
+            if v { "1".to_string() } else { "0".to_string() },
+        );
+    }
     info
 }
 
@@ -292,6 +298,17 @@ pub fn os_notify_ack_open() -> Result<(), String> {
     Ok(())
 }
 
+/// Put a previously taken pending open back — used when StrictMode cancels the
+/// first cold-start drain before the frontend can apply it.
+#[tauri::command]
+pub fn os_notify_restore_pending_open(payload: NotifyOpenPayload) -> Result<(), String> {
+    let mut guard = pending_open()
+        .lock()
+        .map_err(|e| format!("os_notify pending lock poisoned: {e}"))?;
+    *guard = Some(payload);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +326,7 @@ mod tests {
             ask_id: Some(99),
             workspace_id: Some(3),
             open_needs: Some(true),
+            open_curator: Some(true),
         };
         let info = user_info_from_req(&req);
         let payload = payload_from_user_info(&info);
@@ -320,6 +338,7 @@ mod tests {
         assert_eq!(payload.ask_id, Some(99));
         assert_eq!(payload.workspace_id, Some(3));
         assert_eq!(payload.open_needs, Some(true));
+        assert_eq!(payload.open_curator, Some(true));
     }
 
     #[test]
@@ -335,6 +354,7 @@ mod tests {
             ask_id: None,
             workspace_id: None,
             open_needs: None,
+            open_curator: None,
         };
         assert!(user_info_from_req(&req).is_empty());
     }

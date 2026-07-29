@@ -102,7 +102,7 @@ export function SettingsScreen() {
   }, []);
   useEffect(() => {
     if (settingsRequestedPage == null) return;
-    setActive(settingsRequestedPage);
+    setActive(settingsRequestedPage.page);
   }, [settingsRequestedPage]);
   const [query, setQuery] = useState("");
 

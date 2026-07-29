@@ -403,8 +403,9 @@ interface Store {
   clearSettingsInitialPage: () => void;
   /** Live requested settings page while Settings is already open. Unlike
    *  `settingsInitialPage`, this is not cleared on mount and is intended for
-   *  in-session deep links (e.g. quota notification → Resources). */
-  settingsRequestedPage: SettingsPage | null;
+   *  in-session deep links (e.g. quota notification → Resources). `seq`
+   *  changes even when the page repeats so SettingsScreen can re-apply. */
+  settingsRequestedPage: { page: SettingsPage; seq: number } | null;
   /** Jump to the workspace home's Repos tab. */
   openRepoMap: () => void;
   refreshRepoMap: () => Promise<void>;
@@ -657,7 +658,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [repoAnalysisActive, setRepoAnalysisActive] = useState(false);
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
   const [settingsInitialPage, setSettingsInitialPage] = useState<SettingsPage | null>(null);
-  const [settingsRequestedPage, setSettingsRequestedPage] = useState<SettingsPage | null>(null);
+  const [settingsRequestedPage, setSettingsRequestedPage] = useState<
+    { page: SettingsPage; seq: number } | null
+  >(null);
+  const settingsRequestSeqRef = useRef(0);
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
   const [repoDrawerTab, setRepoDrawerTabState] = useState<"detail" | "curator">("detail");
@@ -1043,11 +1047,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const openSettings = useCallback(
     (page?: SettingsPage) => {
+      const requestPage = (target: SettingsPage) => {
+        settingsRequestSeqRef.current += 1;
+        setSettingsRequestedPage({
+          page: target,
+          seq: settingsRequestSeqRef.current,
+        });
+      };
       // Already on Settings: only navigate pages. Re-snapshotting would capture
       // homeTab="settings" and make Back restore Settings instead of the app.
       if (homeTab === "settings") {
         if (page != null) {
-          setSettingsRequestedPage(page);
+          requestPage(page);
         }
         return;
       }
@@ -1063,7 +1074,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setViewing(null);
       setShowNeeds(false);
       setSettingsInitialPage(page ?? null);
-      setSettingsRequestedPage(page ?? null);
+      if (page != null) {
+        requestPage(page);
+      } else {
+        setSettingsRequestedPage(null);
+      }
       setHomeTab("settings");
     },
     [homeTab, activeThreadId, viewing, showNeeds],

@@ -375,7 +375,19 @@ export const api = {
       askId?: number | null;
       workspaceId?: number | null;
       openNeeds?: boolean | null;
+      openCurator?: boolean | null;
     } | null>("os_notify_take_pending_open"),
+  osNotifyRestorePendingOpen: (payload: {
+    kind: string;
+    threadId?: number | null;
+    directionId?: number | null;
+    repoId?: number | null;
+    sessionId?: number | null;
+    askId?: number | null;
+    workspaceId?: number | null;
+    openNeeds?: boolean | null;
+    openCurator?: boolean | null;
+  }) => invoke<void>("os_notify_restore_pending_open", { payload }),
   osNotifySend: (req: {
     title: string;
     body: string;
@@ -387,6 +399,7 @@ export const api = {
     askId?: number | null;
     workspaceId?: number | null;
     openNeeds?: boolean | null;
+    openCurator?: boolean | null;
   }) => invoke<void>("os_notify_send", { req }),
   // Local-runtime resource dashboard (issue #112): read-only aggregate of
   // process_quota / proc_registry / session_gate. Polled while the Settings →

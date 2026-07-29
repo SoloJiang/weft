@@ -144,6 +144,8 @@ export interface NotifySessionRef {
   directionId: number;
   repoId: number;
   threadId: number;
+  /** Owning workspace when known (adopted live sessions may predate a visit). */
+  workspaceId?: number;
 }
 
 /** Deep-link fields carried through the OS notification `user_info`. */
@@ -158,6 +160,8 @@ export interface NotifyRoute {
   workspaceId?: number;
   /** Prefer the Needs-you surface (write triggers, action-required notices). */
   openNeeds?: boolean;
+  /** Prefer the Repo Map curator surface instead of board lead chat. */
+  openCurator?: boolean;
 }
 
 /** One snapshot entry: human sample line + optional deep-link route. */
@@ -191,7 +195,10 @@ export function snapshotOf(
   sessions: Record<number, NotifySessionRef>,
   leadTurn: Record<number, { state: TurnState; queue: unknown[] }>,
   processQuota: ProcessQuotaStatus | null,
-  threadsById: Record<number, { title: string; workspaceId?: number } | undefined> = {},
+  threadsById: Record<
+    number,
+    { title: string; workspaceId?: number; kind?: string } | undefined
+  > = {},
   workspaceId: number | null = null,
 ): NotifySnapshot {
   const n = new Map<string, NotifyEntry>();
@@ -264,6 +271,11 @@ export function snapshotOf(
   for (const s of Object.values(sessions)) {
     if (s.status !== "stalled") continue;
     const meta = threadsById[s.threadId];
+    // Global live sessions may predate a visit to their workspace; prefer the
+    // session's own workspace, then thread metadata. Never fall back to the
+    // currently selected workspace for global stalled workers.
+    const ws = s.workspaceId ?? meta?.workspaceId;
+    if (ws == null) continue;
     const title = meta?.title ?? `#${s.threadId}`;
     stalled.set(`stall:worker:${s.info.session_id}`, {
       sample: `${title} · #${s.directionId}`,
@@ -273,7 +285,7 @@ export function snapshotOf(
         directionId: s.directionId,
         repoId: s.repoId,
         sessionId: s.info.session_id,
-        workspaceId: meta?.workspaceId ?? workspaceId ?? undefined,
+        workspaceId: ws,
       },
     });
   }
@@ -281,13 +293,30 @@ export function snapshotOf(
     if (turn.state !== "stalled") continue;
     const tid = Number(tidStr);
     const meta = threadsById[tid];
+    // Hidden curator leads belong in the Repo Map panel, not board lead chat.
+    if (meta?.kind === "curator") {
+      const ws = meta.workspaceId;
+      if (ws == null) continue;
+      stalled.set(`stall:curator:${tid}`, {
+        sample: meta.title ?? `#${tid}`,
+        route: {
+          kind: "stalled",
+          threadId: tid,
+          workspaceId: ws,
+          openCurator: true,
+        },
+      });
+      continue;
+    }
+    const ws = meta?.workspaceId;
+    if (ws == null) continue;
     const title = meta?.title ?? `#${tid}`;
     stalled.set(`stall:lead:${tid}`, {
       sample: title,
       route: {
         kind: "stalled",
         threadId: tid,
-        workspaceId: meta?.workspaceId ?? workspaceId ?? undefined,
+        workspaceId: ws,
       },
     });
   }
@@ -409,7 +438,8 @@ export type NotifyOpenIntent =
       sessionId?: number;
     }
   | { type: "needs" }
-  | { type: "resources" };
+  | { type: "resources" }
+  | { type: "curator" };
 
 export function planNotifyOpen(payload: {
   kind: string;
@@ -419,6 +449,7 @@ export function planNotifyOpen(payload: {
   sessionId?: number | null;
   workspaceId?: number | null;
   openNeeds?: boolean | null;
+  openCurator?: boolean | null;
 }): NotifyOpenIntent[] {
   const out: NotifyOpenIntent[] = [];
   // Quota is process-global (Resources). Never switch workspaces for it, even if
@@ -429,6 +460,11 @@ export function planNotifyOpen(payload: {
   }
   if (payload.workspaceId != null) {
     out.push({ type: "workspace", workspaceId: payload.workspaceId });
+  }
+  // Hidden curator stalls open the Repo Map curator panel, not board lead chat.
+  if (payload.openCurator) {
+    out.push({ type: "curator" });
+    return out;
   }
   // Write triggers / action-required notices: open the Needs-you surface so the
   // human can act on the control the notification advertised.
