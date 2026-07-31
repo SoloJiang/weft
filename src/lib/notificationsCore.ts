@@ -222,7 +222,10 @@ export function snapshotOf(
   }
   for (const a of asks) {
     const directionId = Number(a.dir);
-    const ws = threadsById[a.thread]?.workspaceId ?? workspaceId ?? undefined;
+    // Global permission asks must not inherit the currently selected workspace.
+    // Prefer thread cache, then backend-provided ownership; omit when unknown.
+    const ws =
+      threadsById[a.thread]?.workspaceId ?? a.workspace_id ?? undefined;
     n.set(`ask:${a.id}`, {
       sample: `${a.thread_title} · ${a.dir_name}`,
       route: {
@@ -230,7 +233,7 @@ export function snapshotOf(
         threadId: a.thread,
         directionId: Number.isFinite(directionId) ? directionId : undefined,
         askId: a.id,
-        workspaceId: ws,
+        workspaceId: ws == null ? undefined : ws,
         openNeeds: true,
       },
     });

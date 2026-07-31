@@ -1971,6 +1971,7 @@ pub async fn pending_asks(
     for a in &mut open {
         if let Ok(Some(t)) = repo::get_thread(&db, a.thread).await {
             a.thread_title = t.title;
+            a.workspace_id = Some(t.workspace_id);
         }
         if let Ok(id) = a.dir.parse::<i32>() {
             if let Ok(Some(d)) = repo::get_direction(&db, id).await {

@@ -410,3 +410,31 @@ test("planNotifyOpen routes curator stalls to curator surface", () => {
     ],
   );
 });
+
+test("snapshotOf does not stamp active workspace onto global asks without ownership", () => {
+  const snap = snapshotOf(
+    [],
+    [ask(9)],
+    [],
+    [],
+    {},
+    {},
+    null,
+    {},
+    1,
+  );
+  assert.equal(snap.needs.get("ask:9")?.route.workspaceId, undefined);
+
+  const owned = snapshotOf(
+    [],
+    [{ ...ask(10), workspace_id: 7 }],
+    [],
+    [],
+    {},
+    {},
+    null,
+    {},
+    1,
+  );
+  assert.equal(owned.needs.get("ask:10")?.route.workspaceId, 7);
+});

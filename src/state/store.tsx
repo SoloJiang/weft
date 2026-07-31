@@ -94,6 +94,8 @@ export interface OpenSession {
   /** the thread this session belongs to (the worker's parent). */
   threadId: number;
   nativeId: string | null;
+  /** Owning workspace when known (adopted/revived workers may predate a visit). */
+  workspaceId?: number;
 }
 
 const SESSION_STATUS: Record<TurnState, SessionStatus> = {
@@ -211,6 +213,8 @@ interface Store {
   threadWorkspaceById: Record<number, number>;
   /** Bumps after each selectWorkspace finishes loading repos/threads. */
   workspaceLoadSeq: number;
+  /** True while selectWorkspace is mid-fetch/reset for the active workspace. */
+  workspaceLoading: boolean;
   directionsByThread: Record<number, Direction[]>;
   worktreesByDirection: Record<number, Worktree[]>;
 
@@ -605,6 +609,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadWorkspaceById, setThreadWorkspaceById] = useState<Record<number, number>>({});
   const [workspaceLoadSeq, setWorkspaceLoadSeq] = useState(0);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const rememberThreads = useCallback((list: Thread[]) => {
     setThreads(list);
     setThreadWorkspaceById((prev) => {
@@ -958,32 +963,40 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const selectWorkspace = useCallback(async (id: number) => {
     setActiveWorkspaceId(id);
-    // Clear the old workspace's repo map first so the curator panel (gated on
-    // repoProfiles.length >= 2) can't mount from stale, other-workspace profiles
-    // during the switch and ensure a thread for the wrong workspace.
-    setRepoProfiles([]);
-    setRepoEdges([]);
-    // Remember the choice so a relaunch/reload lands here, not on the first one.
-    localStorage.setItem(STORAGE_KEYS.activeWorkspace, String(id));
-    // Drop the previous workspace's curator thread id so it is re-ensured lazily.
-    setCuratorThreadId(null);
-    // Repos side panel: open state resets each visit (canvas starts full-width);
-    // per-surface width is remembered in the panel's own localStorage, not here.
-    setRepoDrawerOpen(false);
-    setRepoDrawerTabState("detail");
-    setSelectedRepoId(null);
-    const [r, t] = await Promise.all([api.listRepos(id), api.listThreads(id)]);
-    setRepos(r);
-    rememberThreads(t);
-    setDirections({});
-    setWorktrees({});
-    setActiveThreadId(null);
-    setViewing(null);
-    setShowNeeds(false);
-    setHomeTab("board");
-    setProposal(null);
-    setOverview([]);
-    setWorkspaceLoadSeq((n) => n + 1);
+    setWorkspaceLoading(true);
+    try {
+      // Clear the old workspace's repo map first so the curator panel (gated on
+      // repoProfiles.length >= 2) can't mount from stale, other-workspace profiles
+      // during the switch and ensure a thread for the wrong workspace.
+      setRepoProfiles([]);
+      setRepoEdges([]);
+      // Remember the choice so a relaunch/reload lands here, not on the first one.
+      localStorage.setItem(STORAGE_KEYS.activeWorkspace, String(id));
+      // Drop the previous workspace's curator thread id so it is re-ensured lazily.
+      setCuratorThreadId(null);
+      // Repos side panel: open state resets each visit (canvas starts full-width);
+      // per-surface width is remembered in the panel's own localStorage, not here.
+      setRepoDrawerOpen(false);
+      setRepoDrawerTabState("detail");
+      setSelectedRepoId(null);
+      const [r, t] = await Promise.all([api.listRepos(id), api.listThreads(id)]);
+      setRepos(r);
+      rememberThreads(t);
+      setDirections({});
+      setWorktrees({});
+      setActiveThreadId(null);
+      setViewing(null);
+      setShowNeeds(false);
+      setHomeTab("board");
+      setProposal(null);
+      setOverview([]);
+      setWorkspaceLoadSeq((n) => n + 1);
+    } finally {
+      // Only clear loading if this selection is still the active one.
+      if (activeWorkspaceIdRef.current === id) {
+        setWorkspaceLoading(false);
+      }
+    }
   }, [rememberThreads]);
 
   const loadThreadChildren = useCallback(async (threadId: number) => {
@@ -1492,6 +1505,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               repoId: slot.repo_id,
               threadId: slot.thread_id,
               nativeId: slot.info.native_id,
+              workspaceId: slot.workspace_id ?? undefined,
             },
           },
     );
@@ -1534,6 +1548,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }),
         );
         for (const slot of slots) adoptWorker(slot);
+        // Index adopted workers' thread ownership so notifications can route
+        // even before the user visits those workspaces.
+        setThreadWorkspaceById((prev) => {
+          let changed = false;
+          const next = { ...prev };
+          for (const slot of slots) {
+            if (slot.workspace_id == null) continue;
+            if (next[slot.thread_id] !== slot.workspace_id) {
+              next[slot.thread_id] = slot.workspace_id;
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
       } while (hydratePendingRef.current);
     } catch (e) {
       /* best-effort hydration */
@@ -3156,6 +3184,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     threads,
     threadWorkspaceById,
     workspaceLoadSeq,
+    workspaceLoading,
     directionsByThread,
     worktreesByDirection,
     activeThreadId,

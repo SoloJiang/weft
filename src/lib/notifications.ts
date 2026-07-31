@@ -212,23 +212,31 @@ export async function handleNotifyOpen(
     openSettings: (page?: "resources" | "general" | "appearance" | "automation" | "skills" | "im" | "backup") => void;
     openCurator: () => void;
     activeWorkspaceId: number | null;
+    workspaceLoading?: boolean;
   },
 ): Promise<void> {
   await focusMainWindow();
   const intents = planNotifyOpen(payload);
   const workspaceIntent = intents.find((i) => i.type === "workspace");
-  if (
-    workspaceIntent &&
-    workspaceIntent.type === "workspace" &&
-    workspaceIntent.workspaceId !== deps.activeWorkspaceId
-  ) {
-    // Defer the rest until the store finishes the workspace switch effect.
-    // A second selectWorkspace(activeWorkspaceId) otherwise races and clears
-    // the deep-link destination. Wait for +2 load-seq bumps (direct call +
-    // the [activeWorkspaceId] effect) before applying intents.
-    stashPendingNav(payload, { expectedSeqDelta: 2 });
-    await deps.selectWorkspace(workspaceIntent.workspaceId);
-    return;
+  if (workspaceIntent && workspaceIntent.type === "workspace") {
+    const sameWorkspace =
+      workspaceIntent.workspaceId === deps.activeWorkspaceId;
+    if (!sameWorkspace) {
+      // Defer the rest until the store finishes the workspace switch effect.
+      // A second selectWorkspace(activeWorkspaceId) otherwise races and clears
+      // the deep-link destination. Wait for +2 load-seq bumps (direct call +
+      // the [activeWorkspaceId] effect) before applying intents.
+      stashPendingNav(payload, { expectedSeqDelta: 2 });
+      await deps.selectWorkspace(workspaceIntent.workspaceId);
+      return;
+    }
+    // Same workspace id, but a load may still be in flight (cold-start restore
+    // or manual switch). Defer until that load finishes so its reset cannot
+    // wipe the deep-link destination.
+    if (deps.workspaceLoading) {
+      stashPendingNav(payload, { expectedSeqDelta: 1 });
+      return;
+    }
   }
   await applyNotifyIntents(payload, deps);
 }
@@ -278,6 +286,7 @@ export function useSystemNotifications() {
     needsByWorkspace,
     threadWorkspaceById,
     workspaceLoadSeq,
+    workspaceLoading,
     selectWorkspace,
     goToDirectionRef,
     openNeeds,
@@ -359,6 +368,7 @@ export function useSystemNotifications() {
     openSettings,
     openCurator,
     activeWorkspaceId,
+    workspaceLoading,
   });
   useEffect(() => {
     navDepsRef.current = {
@@ -368,6 +378,7 @@ export function useSystemNotifications() {
       openSettings,
       openCurator,
       activeWorkspaceId,
+      workspaceLoading,
     };
   }, [
     selectWorkspace,
@@ -376,6 +387,7 @@ export function useSystemNotifications() {
     openSettings,
     openCurator,
     activeWorkspaceId,
+    workspaceLoading,
   ]);
 
   useEffect(() => {
@@ -448,6 +460,12 @@ export function useSystemNotifications() {
       putPendingNav(pending);
       return;
     }
+    if (workspaceLoading) {
+      // Active workspace id may already match, but selectWorkspace is still
+      // mid-reset/fetch. Wait for it to finish.
+      putPendingNav(pending);
+      return;
+    }
     // Resolve relative expectedLoadSeq markers against the seq observed when
     // the pending route first becomes eligible for the target workspace.
     if (pending.expectedLoadSeq != null && pending.expectedLoadSeq < 0) {
@@ -484,6 +502,7 @@ export function useSystemNotifications() {
   }, [
     activeWorkspaceId,
     workspaceLoadSeq,
+    workspaceLoading,
     goToDirectionRef,
     openNeeds,
     openSettings,
@@ -500,22 +519,71 @@ export function useSystemNotifications() {
     void setDockBadge(count);
   }, [needsByWorkspace]);
 
+  // Notification sources hydrate asynchronously after mount / workspace switch.
+  // Keep baselining (no OS pings) until the initial snapshot for this workspace
+  // has settled once, so pre-existing quota/needs don't look "new".
+  const hydratedWs = useRef<number | null>(null);
+  const hydrateTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
+    return () => {
+      if (hydrateTimer.current != null) {
+        clearTimeout(hydrateTimer.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const sessionRefs: Record<
+      number,
+      {
+        info: { session_id: number };
+        status: (typeof sessions)[number]["status"];
+        directionId: number;
+        repoId: number;
+        threadId: number;
+        workspaceId?: number;
+      }
+    > = {};
+    for (const [sid, s] of Object.entries(sessions)) {
+      sessionRefs[Number(sid)] = {
+        info: { session_id: s.info.session_id },
+        status: s.status,
+        directionId: s.directionId,
+        repoId: s.repoId,
+        threadId: s.threadId,
+        workspaceId: s.workspaceId,
+      };
+    }
     const next = snapshotOf(
       needs,
       asks,
       writeTriggers,
       overview,
-      sessions,
+      sessionRefs,
       leadTurn,
       processQuota,
       threadsById.current,
       activeWorkspaceId,
     );
-    const base = baselineWs.current === activeWorkspaceId ? prev.current : null;
+    const sameWorkspace = baselineWs.current === activeWorkspaceId;
+    const base = sameWorkspace ? prev.current : null;
     prev.current = next;
     baselineWs.current = activeWorkspaceId;
-    if (!base) return; // first load / workspace switch: baseline only
+
+    // First pass for a workspace, or while the workspace is still loading:
+    // only establish/update the baseline.
+    if (!base || workspaceLoading || hydratedWs.current !== activeWorkspaceId) {
+      if (hydrateTimer.current != null) {
+        clearTimeout(hydrateTimer.current);
+      }
+      // After sources stop changing briefly, mark this workspace hydrated.
+      hydrateTimer.current = setTimeout(() => {
+        if (!workspaceLoading) {
+          hydratedWs.current = activeWorkspaceId;
+        }
+      }, 400);
+      return;
+    }
     if (!notifyEnabled || granted.current !== true) return;
     if (
       isAppInForeground({
@@ -558,6 +626,7 @@ export function useSystemNotifications() {
     notifyCategories,
     quietHours,
     activeWorkspaceId,
+    workspaceLoading,
     windowFocused,
     t,
   ]);

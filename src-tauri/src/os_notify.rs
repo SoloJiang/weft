@@ -237,8 +237,17 @@ pub async fn os_notify_permission() -> Result<String, String> {
             Ok("granted".to_string())
         }
         Ok(false) => {
+            // Native false is ambiguous: never-prompted vs previously denied vs
+            // revoked after grant. Prefer the strongest known negative state.
             if let Ok(guard) = perm_settled().lock() {
                 if guard.as_deref() == Some("denied") {
+                    return Ok("denied".to_string());
+                }
+                if guard.as_deref() == Some("granted") {
+                    // OS reports unauthorized after we previously saw granted —
+                    // treat as revocation so Settings can offer recovery.
+                    drop(guard);
+                    remember_settled_permission("denied");
                     return Ok("denied".to_string());
                 }
             }

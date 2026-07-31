@@ -207,6 +207,8 @@ export interface LiveWorkerSlot {
   direction_id: number;
   repo_id: number;
   thread_id: number;
+  /** Owning workspace when known (boot-revived workers may predate a visit). */
+  workspace_id?: number | null;
   busy: boolean;
   queue: QueuedItem[];
 }
@@ -766,6 +768,8 @@ export interface PermissionAsk {
   /** owning thread title + asking task name, for context on the card. */
   thread_title: string;
   dir_name: string;
+  /** Owning workspace when backend could resolve the thread. */
+  workspace_id?: number | null;
 }
 
 /** A persisted "full access" grant: every ask from this (thread, dir) auto-allows. */
