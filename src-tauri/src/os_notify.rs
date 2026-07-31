@@ -163,10 +163,12 @@ fn focus_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     Ok(())
 }
 
-fn remember_settled_permission(value: &str) {
-    if let Ok(mut guard) = perm_settled().lock() {
-        *guard = Some(value.to_string());
-    }
+fn remember_settled_permission(value: &str) -> Result<(), String> {
+    let mut guard = perm_settled()
+        .lock()
+        .map_err(|e| format!("os_notify permission lock poisoned: {e}"))?;
+    *guard = Some(value.to_string());
+    Ok(())
 }
 
 fn handle_response<R: Runtime>(app: AppHandle<R>, response: NotificationResponse) {
@@ -233,23 +235,24 @@ pub async fn os_notify_permission() -> Result<String, String> {
     // (NotDetermined vs previously denied).
     match mgr.get_notification_permission_state().await {
         Ok(true) => {
-            remember_settled_permission("granted");
+            remember_settled_permission("granted")?;
             Ok("granted".to_string())
         }
         Ok(false) => {
             // Native false is ambiguous: never-prompted vs previously denied vs
             // revoked after grant. Prefer the strongest known negative state.
-            if let Ok(guard) = perm_settled().lock() {
-                if guard.as_deref() == Some("denied") {
-                    return Ok("denied".to_string());
-                }
-                if guard.as_deref() == Some("granted") {
-                    // OS reports unauthorized after we previously saw granted —
-                    // treat as revocation so Settings can offer recovery.
-                    drop(guard);
-                    remember_settled_permission("denied");
-                    return Ok("denied".to_string());
-                }
+            let guard = perm_settled()
+                .lock()
+                .map_err(|e| format!("os_notify permission lock poisoned: {e}"))?;
+            if guard.as_deref() == Some("denied") {
+                return Ok("denied".to_string());
+            }
+            if guard.as_deref() == Some("granted") {
+                // OS reports unauthorized after we previously saw granted —
+                // treat as revocation so Settings can offer recovery.
+                drop(guard);
+                remember_settled_permission("denied")?;
+                return Ok("denied".to_string());
             }
             Ok("prompt".to_string())
         }
@@ -262,11 +265,11 @@ pub async fn os_notify_request_permission() -> Result<String, String> {
     let mgr = manager()?.clone();
     match mgr.first_time_ask_for_notification_permission().await {
         Ok(true) => {
-            remember_settled_permission("granted");
+            remember_settled_permission("granted")?;
             Ok("granted".to_string())
         }
         Ok(false) => {
-            remember_settled_permission("denied");
+            remember_settled_permission("denied")?;
             Ok("denied".to_string())
         }
         Err(e) => Err(format!("os_notify request permission: {e}")),

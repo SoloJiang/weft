@@ -119,23 +119,18 @@ export interface OsNotifyOpenEvent {
 const PENDING_NAV_KEY = "weft-notify-pending-nav";
 
 type PendingNav = OsNotifyOpenEvent & {
-  /**
-   * Absolute workspaceLoadSeq that must be reached before applying intents.
-   * Negative values encode "currentSeq + abs(value)" and are resolved on first
-   * settle attempt so we wait for both the direct selectWorkspace load and the
-   * store's [activeWorkspaceId] re-load.
-   */
+  /** Absolute workspaceLoadSeq that must be reached before applying intents. */
   expectedLoadSeq?: number;
 };
 
 function stashPendingNav(
   payload: OsNotifyOpenEvent,
-  opts?: { expectedSeqDelta?: number },
+  opts?: { expectedLoadSeq?: number },
 ): void {
   try {
     const pending: PendingNav = { ...payload };
-    if (opts?.expectedSeqDelta != null) {
-      pending.expectedLoadSeq = -Math.abs(opts.expectedSeqDelta);
+    if (opts?.expectedLoadSeq != null) {
+      pending.expectedLoadSeq = opts.expectedLoadSeq;
     }
     sessionStorage.setItem(PENDING_NAV_KEY, JSON.stringify(pending));
   } catch {
@@ -212,6 +207,7 @@ export async function handleNotifyOpen(
     openSettings: (page?: "resources" | "general" | "appearance" | "automation" | "skills" | "im" | "backup") => void;
     openCurator: () => void;
     activeWorkspaceId: number | null;
+    workspaceLoadSeq: number;
     workspaceLoading?: boolean;
   },
 ): Promise<void> {
@@ -224,9 +220,11 @@ export async function handleNotifyOpen(
     if (!sameWorkspace) {
       // Defer the rest until the store finishes the workspace switch effect.
       // A second selectWorkspace(activeWorkspaceId) otherwise races and clears
-      // the deep-link destination. Wait for +2 load-seq bumps (direct call +
-      // the [activeWorkspaceId] effect) before applying intents.
-      stashPendingNav(payload, { expectedSeqDelta: 2 });
+      // the deep-link destination. Capture the sequence before starting either
+      // load: the direct call plus the [activeWorkspaceId] effect each bump it.
+      stashPendingNav(payload, {
+        expectedLoadSeq: deps.workspaceLoadSeq + 2,
+      });
       await deps.selectWorkspace(workspaceIntent.workspaceId);
       return;
     }
@@ -234,7 +232,9 @@ export async function handleNotifyOpen(
     // or manual switch). Defer until that load finishes so its reset cannot
     // wipe the deep-link destination.
     if (deps.workspaceLoading) {
-      stashPendingNav(payload, { expectedSeqDelta: 1 });
+      stashPendingNav(payload, {
+        expectedLoadSeq: deps.workspaceLoadSeq + 1,
+      });
       return;
     }
   }
@@ -368,6 +368,7 @@ export function useSystemNotifications() {
     openSettings,
     openCurator,
     activeWorkspaceId,
+    workspaceLoadSeq,
     workspaceLoading,
   });
   useEffect(() => {
@@ -378,6 +379,7 @@ export function useSystemNotifications() {
       openSettings,
       openCurator,
       activeWorkspaceId,
+      workspaceLoadSeq,
       workspaceLoading,
     };
   }, [
@@ -387,29 +389,60 @@ export function useSystemNotifications() {
     openSettings,
     openCurator,
     activeWorkspaceId,
+    workspaceLoadSeq,
     workspaceLoading,
   ]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
-    void (async () => {
+    let takenPending: OsNotifyOpenEvent | null = null;
+
+    const handleOpen = async (payload: OsNotifyOpenEvent) => {
+      await handleNotifyOpen(payload, navDepsRef.current);
+      // Native delivery retains the payload until the frontend confirms it was
+      // handled. This also prevents a live event from being drained again by
+      // the ordered cold-start check below.
       try {
-        unlisten = await listen<OsNotifyOpenEvent>("notify://open", (event) => {
-          void (async () => {
-            await handleNotifyOpen(event.payload, navDepsRef.current);
-            // Live delivery was handled — drop any retained pending copy.
-            try {
-              await api.osNotifyAckOpen();
-            } catch {
-              /* pure-vite */
-            }
-          })();
-        });
+        await api.osNotifyAckOpen();
       } catch {
         /* pure-vite */
       }
-      if (cancelled) unlisten?.();
+    };
+
+    void (async () => {
+      try {
+        unlisten = await listen<OsNotifyOpenEvent>("notify://open", (event) => {
+          void handleOpen(event.payload);
+        });
+        if (cancelled) {
+          unlisten?.();
+          return;
+        }
+        // Register the listener before taking the retained payload. A click
+        // arriving during async listen() setup is then either delivered live
+        // or consumed by this drain, never lost between the two effects.
+        const pending = await api.osNotifyTakePendingOpen();
+        if (!pending) return;
+        takenPending = pending;
+        if (cancelled) {
+          await api.osNotifyRestorePendingOpen(pending);
+          takenPending = null;
+          return;
+        }
+        await handleOpen(pending);
+        takenPending = null;
+      } catch {
+        if (cancelled && takenPending) {
+          try {
+            await api.osNotifyRestorePendingOpen(takenPending);
+            takenPending = null;
+          } catch {
+            /* pure-vite / older backend */
+          }
+        }
+        /* pure-vite */
+      }
     })();
     return () => {
       cancelled = true;
@@ -417,38 +450,10 @@ export function useSystemNotifications() {
     };
   }, []);
 
-  // Cold-start only: drain a pending open once after mount. If StrictMode
-  // cancels the first invocation after take(), put the payload back so the
-  // remount can still consume it.
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const pending = await api.osNotifyTakePendingOpen();
-        if (!pending) return;
-        if (cancelled) {
-          try {
-            await api.osNotifyRestorePendingOpen(pending);
-          } catch {
-            /* pure-vite / older backend */
-          }
-          return;
-        }
-        await handleNotifyOpen(pending, navDepsRef.current);
-      } catch {
-        /* pure-vite */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   // Finish a deep link that had to switch workspaces first. Wait until
   // selectWorkspace has finished loading (workspaceLoadSeq) so a concurrent
   // selection reset cannot clear the destination right after we navigate.
   const pendingAppliedSeq = useRef<number | null>(null);
-  const pendingBaselineSeq = useRef<number | null>(null);
   useEffect(() => {
     const pending = takePendingNav();
     if (!pending) return;
@@ -465,15 +470,6 @@ export function useSystemNotifications() {
       // mid-reset/fetch. Wait for it to finish.
       putPendingNav(pending);
       return;
-    }
-    // Resolve relative expectedLoadSeq markers against the seq observed when
-    // the pending route first becomes eligible for the target workspace.
-    if (pending.expectedLoadSeq != null && pending.expectedLoadSeq < 0) {
-      if (pendingBaselineSeq.current == null) {
-        pendingBaselineSeq.current = workspaceLoadSeq;
-      }
-      pending.expectedLoadSeq =
-        pendingBaselineSeq.current + Math.abs(pending.expectedLoadSeq);
     }
     if (
       pending.expectedLoadSeq != null &&
@@ -492,7 +488,6 @@ export function useSystemNotifications() {
       return;
     }
     pendingAppliedSeq.current = workspaceLoadSeq;
-    pendingBaselineSeq.current = null;
     void applyNotifyIntents(pending, {
       goToDirectionRef,
       openNeeds,
