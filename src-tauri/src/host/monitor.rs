@@ -148,7 +148,12 @@ async fn check_one(
         .await;
         return;
     };
-    let target = PrTarget { owner: pr.host_owner.clone(), repo: pr.host_repo.clone(), number: pr.number };
+    let target = PrTarget {
+        host_base: pr.host_base.clone(),
+        owner: pr.host_owner.clone(),
+        repo: pr.host_repo.clone(),
+        number: pr.number,
+    };
     let result = tokio::task::spawn_blocking(move || {
         super::resolve_host(kind).and_then(|h| h.fetch_status(&target))
     })

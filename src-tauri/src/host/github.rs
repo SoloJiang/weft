@@ -27,23 +27,14 @@ impl PrHost for GitHubHost {
     }
 
     fn fetch_status(&self, target: &PrTarget) -> Result<PrSnapshot, HostError> {
-        // Defense in depth alongside `host::parse_pr_url`'s own validation:
-        // this format! joins owner/repo into a SINGLE `--repo` argument, and
-        // `gh`'s `[HOST/]OWNER/REPO` grammar treats an extra `/`-delimited
-        // segment as a HOST OVERRIDE (the confirmed SSRF — see
-        // `parse_pr_url`'s doc). `parse_pr_url` is the only current producer
-        // of a `PrTarget`, but refusing here too means this call can never be
-        // tricked into a host override even if some future caller builds a
-        // `PrTarget` another way.
-        if target.owner.contains('/') || target.repo.contains('/') {
-            return Err(HostError::Other {
-                message: format!(
-                    "refusing to query a repo slug with an embedded '/' (owner={:?}, repo={:?}) — this would be reinterpreted as a host override",
-                    target.owner, target.repo
-                ),
-            });
-        }
-        let repo_slug = format!("{}/{}", target.owner, target.repo);
+        // `super::qualified_repo_slug` folds `target.host_base` in (GitHub Enterprise support —
+        // Codex review, PR #159 repo.rs:3873: this call used to build a bare OWNER/REPO
+        // argument with no host at all, always querying `gh`'s own configured default instead
+        // of the recorded install) and refuses an embedded '/' in any of the three inputs
+        // before this can ever shell out — the confirmed SSRF this crate's `[HOST/]OWNER/REPO`
+        // grammar otherwise allows (see `parse_pr_url`'s doc).
+        let repo_slug = super::qualified_repo_slug(&target.host_base, &target.owner, &target.repo)
+            .map_err(|message| HostError::Other { message })?;
         let out = Command::new("gh")
             .args(["pr", "view", &target.number.to_string(), "--repo", &repo_slug, "--json", JSON_FIELDS])
             // Checks run user tooling that a GUI launch's minimal PATH can't
@@ -363,8 +354,12 @@ mod tests {
         // without ever spawning a process (the guard returns before
         // `Command::new` runs).
         let host = GitHubHost;
-        let bad_owner =
-            PrTarget { owner: "evil.example.org/ownerx".to_string(), repo: "repox".to_string(), number: 5 };
+        let bad_owner = PrTarget {
+            host_base: String::new(),
+            owner: "evil.example.org/ownerx".to_string(),
+            repo: "repox".to_string(),
+            number: 5,
+        };
         match host.fetch_status(&bad_owner) {
             Err(HostError::Other { message }) => {
                 assert!(message.contains("host override"), "got: {message}");
@@ -372,12 +367,32 @@ mod tests {
             other => panic!("expected the embedded-slash guard's own error, got {other:?}"),
         }
 
-        let bad_repo = PrTarget { owner: "owner".to_string(), repo: "a/b".to_string(), number: 5 };
+        let bad_repo = PrTarget {
+            host_base: String::new(),
+            owner: "owner".to_string(),
+            repo: "a/b".to_string(),
+            number: 5,
+        };
         match host.fetch_status(&bad_repo) {
             Err(HostError::Other { message }) => {
                 assert!(message.contains("host override"), "got: {message}");
             }
             other => panic!("expected the embedded-slash guard's own error, got {other:?}"),
+        }
+
+        // Codex review, PR #159 repo.rs:3873: `host_base` now reaches this call too (it used
+        // to be entirely absent from `PrTarget`) — the guard must cover it just as strictly.
+        let bad_host_base = PrTarget {
+            host_base: "evil.example.org/extra".to_string(),
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            number: 5,
+        };
+        match host.fetch_status(&bad_host_base) {
+            Err(HostError::Other { message }) => {
+                assert!(message.contains("host override"), "got: {message}");
+            }
+            other => panic!("expected the embedded-slash guard's own error for a smuggled host_base, got {other:?}"),
         }
     }
 

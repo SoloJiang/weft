@@ -1209,6 +1209,31 @@ async fn confirm_with_manual_tool_with_session_liveness(
                 recreated_fastpath.push(id);
             }
         }
+        // THE FIX (Codex review, PR #159 planner.rs:1549): `record_upstream_edges` runs AFTER
+        // the plan-confirmation CAS commits (see the main path below), as a separate, best-
+        // effort step — never inside the same transaction (see that function's own doc on why:
+        // it is metadata layered on top of already-durable state, not part of what makes any
+        // SINGLE decision atomic). If the process exits between that CAS committing and
+        // `record_upstream_edges` finishing — a hard crash, not just the in-process transient
+        // errors `set_upstream_edge_if_changed` now falls back safely from — a newly
+        // materialized consumer can be left with `depends_on_direction_id` still at its schema
+        // default `0`, reading as dependency-free forever: THIS fast path only re-dispatches by
+        // recorded id, it never repairs edges, so restart alone could never heal it before this
+        // fix. Closed by re-running the SAME resolution + write here, every time this fast path
+        // is taken (every redispatch, not only the one right after a crash) — cheap and safe
+        // because it is exactly as idempotent as the main path's own call: `resolved` (built
+        // above via `resolved_from_plan`) already carries each lane's save-time-resolved
+        // `depends_on_index`, so no new resolution logic is needed, and
+        // `set_upstream_edge_if_changed`'s own early return (`dir.depends_on_direction_id ==
+        // target`) makes every already-correct edge a no-op — only a genuinely missing/stale one
+        // is actually rewritten.
+        let fastpath_proposal: Proposal = serde_json::from_str(&start_plan.proposal).unwrap_or_default();
+        record_upstream_edges(
+            db,
+            thread_id,
+            &upstream_lanes_from_resolved(&resolved, &fastpath_proposal),
+        )
+        .await;
         return Ok(matching);
     }
     let existing_dirs = repo::list_directions(db, thread_id).await?;
@@ -1787,13 +1812,25 @@ async fn set_upstream_edge_if_changed(db: &Db, thread_id: i32, direction_id: i32
         Ok(Some(_)) => {}
         Ok(None) => return, // the direction is gone — nothing to write.
         Err(e) => {
-            // Asymmetric with the write-failure branch below otherwise: a read failure here is
-            // just as real a reason a stale/missing edge might survive undetected (Codex
-            // review, PR #159 planner.rs:1563).
+            // THE FIX (Codex review, PR #159 planner.rs:1797): a read failure here is JUST AS
+            // REAL a reason a stale/missing edge might survive undetected as the write-failure
+            // branch below, and until this fix it was treated differently — logged, but never
+            // falling back to the sentinel. That asymmetry mattered concretely: a direction that
+            // has NEVER had a successful upstream write (its column still at the schema default
+            // `0`) reads as "no dependency" exactly like a genuinely dependency-free lane, and
+            // this function's caller (`approve_direction`/`confirm`) does not gate its own
+            // success on this call — see this function's own doc: "intentionally best-effort,"
+            // never a hard failure of the causing operation — so the newly materialized
+            // consumer is dispatched, and a later healthy auto-merge read sees `None` and can
+            // merge it before its producer. `set_direction_upstream` does its OWN read
+            // internally before writing (see that function), so a transient failure in THIS
+            // read does not imply the fallback write below will also fail.
             eprintln!(
                 "[weft][planner] direction {direction_id}: could not read current state before \
                  recording upstream {target}: {e}"
             );
+            notify_upstream_edge_write_failed(thread_id, direction_id, target, &e);
+            fall_back_to_unresolved_sentinel(db, direction_id, "the read failure above").await;
             return;
         }
     }
@@ -1813,13 +1850,25 @@ async fn set_upstream_edge_if_changed(db: &Db, thread_id: i32, direction_id: i32
         // sentinel can never itself be rejected as a cycle (it is never a real row's id — see
         // `set_direction_upstream`'s doc), so this fallback write is unconditionally safe to
         // attempt regardless of what the original `target` was.
-        if let Err(e2) = repo::set_direction_upstream(db, direction_id, repo::UNRESOLVED_UPSTREAM_SENTINEL).await {
-            eprintln!(
-                "[weft][planner] direction {direction_id}: ALSO could not fall back to the \
-                 blocking sentinel after the rejected write above: {e2} — this direction's \
-                 upstream edge may still read as a stale, possibly-\"no dependency\" value"
-            );
-        }
+        fall_back_to_unresolved_sentinel(db, direction_id, "the rejected write above").await;
+    }
+}
+
+/// Shared tail of both `set_upstream_edge_if_changed` failure branches (a rejected write, or a
+/// read that failed before a write was even attempted): write the blocking sentinel so the edge
+/// is never left at whatever value it happened to have before this call — see the two call
+/// sites' own doc for why `0` surviving either failure is unsafe. `context` names which prior
+/// failure this is recovering from, for the log line only; the fallback write itself is
+/// unconditionally safe to attempt regardless of what failed above (`UNRESOLVED_UPSTREAM_
+/// SENTINEL` is never a real row's id, so `set_direction_upstream`'s cycle check can never
+/// reject it — see that function's doc).
+async fn fall_back_to_unresolved_sentinel(db: &Db, direction_id: i32, context: &str) {
+    if let Err(e2) = repo::set_direction_upstream(db, direction_id, repo::UNRESOLVED_UPSTREAM_SENTINEL).await {
+        eprintln!(
+            "[weft][planner] direction {direction_id}: ALSO could not fall back to the \
+             blocking sentinel after {context}: {e2} — this direction's upstream edge may \
+             still read as a stale, possibly-\"no dependency\" value"
+        );
     }
 }
 
@@ -1890,6 +1939,23 @@ fn upstream_edge_write_failed_text(direction_id: i32, upstream_id: i32, err: &an
 /// every real (non-test) run this branch is live. The `None` branches below
 /// exist for the headless test harness, which is also why the notice TEXT is
 /// unit-tested separately above rather than through this call site.
+///
+/// FOLLOW-UP (Codex review, PR #159 planner.rs:1905), deliberately not done here: this
+/// notice is never retracted if a LATER re-propose successfully rewrites the same
+/// direction's edge — a human can be left staring at a stale warning after the underlying
+/// problem is already fixed. `BusRegistry::cancel_open_asks_by_id` (used by `host::monitor`
+/// for exactly this "supersede an earlier notice" purpose) could retract it, but
+/// `host::monitor`'s use of that primitive leans on a `HashMap<i32, (i32, u64, String)>` that
+/// its OWN long-lived sweep loop owns and threads as `&mut` across every iteration (see
+/// `host::monitor`'s `notices` parameter) — this call site has no equivalent: it is reached
+/// from one-shot confirm/re-propose IPC handlers, not a loop, with no natural owner for
+/// mutable state that must survive between two calls that can be minutes or hours apart.
+/// Wiring retraction in here would mean introducing a NEW global correlation map
+/// (direction_id -> last-posted ask id) purely to track that, plus its own tests (posted/
+/// retracted/no-cross-direction-cancel/no-double-post) — real but non-trivial new machinery
+/// for a UX polish concern, not a correctness one (the sentinel this notice warns about
+/// already blocks a free merge regardless of whether the notice itself is ever retracted).
+/// Left as a follow-up rather than bundled into this review response.
 fn notify_upstream_edge_write_failed(thread_id: i32, direction_id: i32, upstream_id: i32, err: &anyhow::Error) {
     use tauri::Manager;
     let Some(app) = crate::APP_HANDLE.get() else {
@@ -7401,6 +7467,129 @@ mod tests {
             crate::host::UpstreamStatus::Unknown { .. } => {}
             other => panic!("the rejected half of a cycle must read Unknown (blocking), never {other:?}"),
         }
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1797): a read failure in
+    /// `set_upstream_edge_if_changed`, BEFORE any write is even attempted, must fall back to
+    /// the blocking sentinel exactly like a rejected write does — otherwise a direction that
+    /// has never had a successful edge write stays at the schema default `0`, indistinguishable
+    /// from a genuinely dependency-free lane.
+    #[tokio::test]
+    async fn a_read_failure_before_the_write_falls_back_to_the_blocking_sentinel() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-read-fail-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 2);
+        let (producer_id, consumer_id) = (ids[0], ids[1]);
+        let before = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(before.depends_on_direction_id, producer_id, "precondition: the edge landed normally");
+
+        // Simulate a later re-check (the same call every confirm/approve makes internally)
+        // whose READ transiently fails, before it can even attempt a write.
+        repo::fail_write::while_failing("get_direction", async {
+            set_upstream_edge_if_changed(&db, t.id, consumer_id, producer_id).await;
+        })
+        .await;
+
+        let after = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.depends_on_direction_id,
+            repo::UNRESOLVED_UPSTREAM_SENTINEL,
+            "a read failure before the write must fall back to the blocking sentinel — a \
+             caller cannot tell 'the read failed, the prior value happened to already be \
+             right' from 'the read failed, and the prior value was 0 (unset)' without this \
+             signal, so the safe choice is to always land on the blocking sentinel"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1549): `record_upstream_edges` runs AFTER the
+    /// plan-confirmation CAS commits, as a separate best-effort step (see that function's own
+    /// doc). Simulates a crash in exactly that window: the edge is reset to the untouched
+    /// schema default `0`, precisely as it would read if `record_upstream_edges` had never run
+    /// at all after a real CAS commit. A restart's redispatch (the idempotent "already
+    /// confirmed" fast path `confirm()` takes on a second call) must REPAIR the edge, not just
+    /// re-dispatch workers against a permanently dependency-free-looking consumer forever.
+    #[tokio::test]
+    async fn the_confirmed_fast_path_repairs_an_upstream_edge_left_at_the_default_by_an_interrupted_record() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-fastpath-repair-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 2);
+        let (producer_id, consumer_id) = (ids[0], ids[1]);
+        let before = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(before.depends_on_direction_id, producer_id, "precondition: the normal path wrote the edge");
+
+        // Simulate the crash: reset the edge to the untouched schema default, exactly as if
+        // `record_upstream_edges` had never run after the CAS commit above.
+        repo::set_direction_upstream(&db, consumer_id, 0).await.unwrap();
+        let mid = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(mid.depends_on_direction_id, 0, "precondition: the edge now reads exactly like a crash-interrupted one");
+
+        // The plan is ALREADY "confirmed" (the first confirm() call above set that) — this
+        // second call takes the idempotent fast path, not the main materialize-and-CAS path.
+        let redispatched = confirm(&db, t.id).await.unwrap();
+        assert_eq!(redispatched.len(), 2, "the fast path still redispatches both lanes by their recorded ids");
+
+        let after = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.depends_on_direction_id, producer_id,
+            "the fast path must REPAIR a missing upstream edge on every redispatch, not just \
+             re-dispatch workers against a permanently dependency-free-looking consumer"
+        );
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;

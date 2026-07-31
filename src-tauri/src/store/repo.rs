@@ -90,7 +90,10 @@ pub(crate) mod fail_write {
 /// Mark a store write as injectable by [`fail_write`]'s `name`. Expands to
 /// NOTHING outside `cfg(test)` — see that module's doc for the boundary. Place
 /// it as the first statement of a write that returns `anyhow::Result`, so an
-/// armed failure lands before any partial mutation.
+/// armed failure lands before any partial mutation. The mechanism is equally
+/// valid on a READ that returns `anyhow::Result` (e.g. `get_direction`,
+/// PR #159 planner.rs:1797's read-before-write failure path) — the macro name
+/// follows this module's dominant use, not a hard restriction to writes.
 macro_rules! fail_write {
     ($name:literal) => {
         #[cfg(test)]
@@ -1559,6 +1562,7 @@ pub fn normalize_mandate(m: &str) -> &'static str {
 }
 
 pub async fn get_direction(db: &Db, direction_id: i32) -> Result<Option<direction::Model>> {
+    fail_write!("get_direction");
     Ok(direction::Entity::find_by_id(direction_id)
         .one(&db.0)
         .await?)
@@ -3905,12 +3909,16 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
 struct RemoteHostPath {
     host: String,
     path: String,
-    /// The remote's OWN explicit port, but ONLY when it came from a web transport scheme
+    /// The remote's EFFECTIVE port, but ONLY when it came from a web transport scheme
     /// (`https://`/`http://`) — the ONE case where it is meaningfully comparable to
-    /// `host_base`'s own port (see [`remote_matches_pr_host`]'s doc). `None` for `ssh://`,
-    /// scp-style (`user@host:path`), and bare `host:path` (no `://` at all) — a port on any
-    /// of those is (or would be) an SSH port, unrelated to the API's own port — and `None`
-    /// when no port was written at all, web transport or not.
+    /// `host_base`'s own port (see [`remote_matches_pr_host`]'s doc). When the URL omits
+    /// the port, this fills in the SCHEME'S OWN standard port (443 for https, 80 for
+    /// http) rather than leaving it absent — an omitted port on a web URL is not
+    /// ambiguous, it unambiguously IS that standard port (Codex review, PR #159
+    /// repo.rs:4035). `None` for `ssh://`, scp-style (`user@host:path`), and bare
+    /// `host:path` (no `://` at all) — a port on any of those is (or would be) an SSH
+    /// port, unrelated to the API's own port, so there is no web-facing "effective port"
+    /// to compute at all, written or not.
     comparable_port: Option<String>,
 }
 
@@ -3948,9 +3956,18 @@ fn parse_remote_host_and_path(remote_url: &str) -> Option<RemoteHostPath> {
         return None;
     }
     let comparable_port = match scheme.map(str::to_lowercase).as_deref() {
-        Some("https") | Some("http") => {
-            host_maybe_port.rsplit_once(':').map(|(_, port)| port.to_string())
-        }
+        Some("https") => Some(
+            host_maybe_port
+                .rsplit_once(':')
+                .map(|(_, port)| port.to_string())
+                .unwrap_or_else(|| "443".to_string()),
+        ),
+        Some("http") => Some(
+            host_maybe_port
+                .rsplit_once(':')
+                .map(|(_, port)| port.to_string())
+                .unwrap_or_else(|| "80".to_string()),
+        ),
         _ => None,
     };
     Some(RemoteHostPath {
@@ -4006,14 +4023,28 @@ fn parse_remote_host_and_path(remote_url: &str) -> Option<RemoteHostPath> {
 /// matter when it is unambiguously comparable — an `https://`/`http://`
 /// remote's own port against `host_base`'s (see [`parse_remote_host_and_path`]'s
 /// `comparable_port` — `None` for ssh:///scp-style/bare, exactly the shapes the
-/// third round's fix was protecting). So: reject ONLY when BOTH sides carry an
-/// EXPLICIT web-transport port and they DIFFER; an unspecified port on either
-/// side is not itself a rejection signal (a plain `https://host/path` with no
-/// port and a `host_base` of `host:8443` are not distinguishable from "the
-/// same install, the git remote just didn't spell out the standard-looking
-/// port" — forcing an exact match there would trade a narrow false-accept for
-/// a broader false-reject, the wrong direction for a check whose job is to
-/// FREE a merge determination, not to gate one).
+/// third round's fix was protecting).
+///
+/// A fifth review round (Codex review, PR #159 repo.rs:4035) caught that the
+/// fourth round's fix went too far in the OTHER direction: it treated an
+/// OMITTED web-transport port as "no signal," matching it against ANY
+/// `host_base` port including a non-standard one. But `https://host/path`
+/// with no port isn't ambiguous — by the same standard `gh`/a browser itself
+/// uses, it unambiguously means port 443 (80 for `http://`). `host_base` is
+/// symmetric: it is always extracted from a PR's OWN `https://`/`http://` web
+/// URL (see `parse_pr_url`, which requires one of those two prefixes) and
+/// never carries a scheme of its own, so an omitted `host_base` port means
+/// the same standard 443 by that same convention — not "unspecified" either.
+/// So both sides now fill in the scheme's standard port when it isn't
+/// written (see `comparable_port`'s doc and this function's `expected_port`
+/// below) and compare like any other explicit port: a `gitlab.corp` remote
+/// with no port and a `host_base` of `gitlab.corp:8443` now correctly
+/// DISAGREE (443 vs. 8443) rather than vacuously matching. The ONLY
+/// remaining carve-out is for transports where the port concept doesn't
+/// apply to this comparison at all — ssh://, scp-style, and bare
+/// `host:path`, whose port (if any) denotes an SSH port unrelated to the
+/// API's own HTTPS port — those keep skipping the port check entirely,
+/// exactly as the third round's fix intended.
 fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, host_repo: &str) -> bool {
     let host_base = host_base.trim();
     let host_owner = host_owner.trim();
@@ -4029,10 +4060,20 @@ fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, h
     if remote.host != expected_host || remote.path != expected_path {
         return false;
     }
-    let expected_port = host_base.split(':').nth(1);
-    match (&remote.comparable_port, expected_port) {
-        (Some(remote_port), Some(expected_port)) => remote_port == expected_port,
-        _ => true,
+    // `host_base` never carries a scheme of its own, but (see this function's doc above)
+    // it is always extracted from a PR's OWN `https://`/`http://` web URL — so an omitted
+    // port here means the same standard port (443) an omitted port on an `https://`
+    // remote means, not "unspecified."
+    let expected_port = host_base
+        .split(':')
+        .nth(1)
+        .map(str::to_string)
+        .unwrap_or_else(|| "443".to_string());
+    match &remote.comparable_port {
+        Some(remote_port) => *remote_port == expected_port,
+        // ssh/scp/bare: the port, if any, is an SSH port — not comparable to
+        // `host_base`'s web-facing port at all, so it never blocks a match.
+        None => true,
     }
 }
 
@@ -8622,15 +8663,81 @@ mod tests {
             ));
         }
 
-        /// The port fix above must not overcorrect into rejecting a remote that simply omits
-        /// an explicit port — only a port that IS written down and DISAGREES is a rejection
-        /// signal; an absent one is not distinguishable from "the same install, this remote
-        /// just didn't spell out the port."
+        /// SUPERSEDED (Codex review, PR #159 repo.rs:4035 — a fifth review round): this test
+        /// used to assert the OPPOSITE (`accepts_an_https_remote_with_no_explicit_port_even_when_host_base_records_one`)
+        /// on the theory that an omitted port is "not distinguishable from... didn't spell out
+        /// the port." That theory was wrong: an omitted port on an `https://` URL is NOT
+        /// ambiguous, it unambiguously means the standard port 443 — so a remote silently on
+        /// 443 and a `host_base` explicitly on 8443 are a genuine, detectable port mismatch,
+        /// not a "maybe the same install" case. See the near-miss pair below for the corrected
+        /// behavior at both standard (443) and non-standard (8443) ports, from both sides.
         #[test]
-        fn accepts_an_https_remote_with_no_explicit_port_even_when_host_base_records_one() {
-            assert!(remote_matches_pr_host(
+        fn rejects_an_https_remote_with_no_explicit_port_against_a_host_base_on_a_non_standard_port() {
+            assert!(!remote_matches_pr_host(
                 "https://gitlab.corp/acme/api.git",
                 "gitlab.corp:8443",
+                "acme",
+                "api"
+            ));
+        }
+
+        /// THE FIX (Codex review, PR #159 repo.rs:4035): an omitted HTTPS port means the
+        /// standard port 443 by definition (the same convention `gh`/a browser use), not "no
+        /// signal" — so it MATCHES an explicit `:443` on the other side, from either
+        /// direction (remote omits/host_base spells it out, and vice versa). `host_base` is
+        /// always derived from a PR's own `https://`/`http://` URL (`parse_pr_url`), so the
+        /// same standard-port convention applies to its own omitted port too.
+        #[test]
+        fn an_omitted_https_port_matches_an_explicit_standard_443_from_either_side() {
+            assert!(remote_matches_pr_host(
+                "https://gitlab.corp/acme/api.git",
+                "gitlab.corp:443",
+                "acme",
+                "api"
+            ));
+            assert!(remote_matches_pr_host(
+                "https://gitlab.corp:443/acme/api.git",
+                "gitlab.corp",
+                "acme",
+                "api"
+            ));
+        }
+
+        /// The flip side of the fix above: since an omitted port unambiguously means 443, it
+        /// must NOT match an explicit NON-standard port (8443) on the other side, from either
+        /// direction. This is the exact near-miss the previous "absent port is not a signal"
+        /// design let through.
+        #[test]
+        fn an_omitted_https_port_does_not_match_an_explicit_non_standard_port_from_either_side() {
+            assert!(!remote_matches_pr_host(
+                "https://gitlab.corp/acme/api.git",
+                "gitlab.corp:8443",
+                "acme",
+                "api"
+            ));
+            assert!(!remote_matches_pr_host(
+                "https://gitlab.corp:8443/acme/api.git",
+                "gitlab.corp",
+                "acme",
+                "api"
+            ));
+        }
+
+        /// Scheme-awareness check: `http://` (not `https://`) must default its omitted port to
+        /// the plain-HTTP standard (80), not silently reuse 443 — a copy-paste mutation that
+        /// hardcoded 443 for both match arms would make this test the only one to catch it,
+        /// since every other case in this module uses `https://`.
+        #[test]
+        fn an_omitted_http_port_is_the_standard_80_not_443() {
+            assert!(remote_matches_pr_host(
+                "http://gitlab.corp/acme/api.git",
+                "gitlab.corp:80",
+                "acme",
+                "api"
+            ));
+            assert!(!remote_matches_pr_host(
+                "http://gitlab.corp/acme/api.git",
+                "gitlab.corp:443",
                 "acme",
                 "api"
             ));

@@ -367,6 +367,7 @@ async fn evaluate_row(
     // 5). Mirrors `host::monitor`'s own `check_one` exactly (same
     // `spawn_blocking` discipline).
     let target = PrTarget {
+        host_base: pr.host_base.clone(),
         owner: pr.host_owner.clone(),
         repo: pr.host_repo.clone(),
         number: pr.number,
@@ -442,6 +443,43 @@ async fn evaluate_row(
     // truth closer to the action is sufficient — no new lock or generation counter needed, and
     // none of that machinery would help here anyway (it does not extend the window this file's
     // own control flow takes to reach `run_gh_merge`).
+    //
+    // A sixth review round (Codex review, PR #159 automerge.rs:457) pressed on the word
+    // "narrows" above: this re-check does NOT close the window, it only moves it as late as
+    // this file's own control flow allows. The REMAINING window runs from the instant this
+    // read returns to the instant GitHub actually processes the `gh pr merge` call dispatched
+    // in `maybe_merge_one`'s step 6 — dominated by process-spawn + network round-trip time to
+    // GitHub's API (realistically ~100ms to a few seconds, NOT a negligible number of CPU
+    // cycles; the handful of synchronous Rust statements between this check and the
+    // `spawn_blocking` call in step 6 contribute microseconds, not the risk).
+    //
+    // Full closure was considered and rejected as disproportionate to the residual risk:
+    //   - A lock held from this re-check through `run_gh_merge`'s completion would need a NEW
+    //     coordination primitive between this module and every writer of
+    //     `depends_on_direction_id` (`planner::set_upstream_edge_if_changed`) — a module that
+    //     today has zero automerge awareness — plus its own stuck-lock recovery story for a
+    //     crashed/hung `gh` process, to gate a race this narrow.
+    //   - A generation counter checked just before dispatch does not actually help: unlike
+    //     `--match-head-commit` (enforced ATOMICALLY by GitHub itself, server-side, as part of
+    //     executing the merge), there is no GitHub-side hook for this Weft-only axis, so
+    //     "check-then-dispatch" has the identical TOCTOU shape no matter how late the check
+    //     runs, unless it is ITSELF paired with the same lock above — it does not remove the
+    //     cost, it only relocates it.
+    //   - A synthetic GitHub check run plus a required branch-protection rule could in
+    //     principle give this axis the same atomic, server-side enforcement
+    //     `--match-head-commit` gets for head-sha staleness — but that depends on external repo
+    //     configuration this codebase does not manage today, and would be a new integration
+    //     surface (Checks API, a setup burden on every target repo) rather than a
+    //     review-response-sized fix.
+    //
+    // The residual window is accepted, not ignored: reaching it requires a human or lead to
+    // CONFIRM a re-proposal that changes THIS SPECIFIC direction's upstream within a
+    // sub-few-second window that carries no visible "a merge is dispatching right now" cue —
+    // and even if hit, `maybe_merge_one`'s own step 7 re-reads and re-persists this exact row's
+    // true state, INCLUDING this axis, immediately after the merge attempt completes, so the
+    // consequence is bounded to one merge whose upstream had just changed (a recoverable,
+    // visible-on-CI outcome, the same class of risk as any other check-then-merge gap) and
+    // self-corrects in the DB rather than silently drifting.
     match repo::upstream_merge_state(db, pr.direction_id).await {
         super::UpstreamStatus::None | super::UpstreamStatus::Merged => {}
         other => {
@@ -508,7 +546,12 @@ async fn maybe_merge_one(
 
     // Step 7: regardless of outcome, one more fresh read (same injected
     // resolver as step 4) + persist + marker.
-    let target2 = PrTarget { owner: pr.host_owner.clone(), repo: pr.host_repo.clone(), number: pr.number };
+    let target2 = PrTarget {
+        host_base: pr.host_base.clone(),
+        owner: pr.host_owner.clone(),
+        repo: pr.host_repo.clone(),
+        number: pr.number,
+    };
     let confirmed = tokio::task::spawn_blocking(move || {
         resolver(host_kind).and_then(|h| h.fetch_status(&target2))
     })
@@ -598,22 +641,13 @@ fn lifecycle_state_tag(lifecycle: PrLifecycle) -> &'static str {
 ///
 /// `host_base` (the hostname recorded at registration — see `host/mod.rs`'s
 /// module doc on why GitHub Enterprise needs this recorded per row) is
-/// threaded into `--repo` as `HOST/OWNER/REPO` when non-empty, so this call
-/// targets the SAME host the row was registered against rather than
-/// whatever `gh`'s own configured default happens to be (review round 1
-/// Codex P1).
+/// threaded into `--repo` as `HOST/OWNER/REPO` when non-empty, via the SAME
+/// `super::qualified_repo_slug` `github::GitHubHost::fetch_status` uses, so this call and every
+/// status read of the same row can never independently drift on which host they each target
+/// (review round 1 Codex P1; Codex review, PR #159 repo.rs:3873 — the status-fetch path used
+/// to skip this entirely).
 fn run_gh_merge(host_base: &str, owner: &str, repo: &str, number: i32, head_sha: &str) -> Result<(), String> {
-    // Same defense-in-depth guard `github::GitHubHost::fetch_status` applies
-    // independently of `parse_pr_url`'s own validation, for the exact same
-    // reason: `--repo` here is built the same way (a joined argument), so it
-    // inherits the exact same confirmed SSRF risk (see `parse_pr_url`'s doc)
-    // and gets the exact same guard — extended to `host_base` too, since
-    // that is now ALSO folded into the same argument.
-    if host_base.contains('/') || owner.contains('/') || repo.contains('/') {
-        return Err(format!(
-            "refusing to merge a repo slug with an embedded '/' (host_base={host_base:?}, owner={owner:?}, repo={repo:?}) — this would be reinterpreted as a host override"
-        ));
-    }
+    let repo_arg = super::qualified_repo_slug(host_base, owner, repo)?;
     // A `Ready` verdict can only ever be produced from a SUCCESSFUL snapshot
     // (which always sets a real `head_sha`), so this should be unreachable
     // through the gate above — kept anyway as cheap, independent insurance
@@ -621,9 +655,8 @@ fn run_gh_merge(host_base: &str, owner: &str, repo: &str, number: i32, head_sha:
     if head_sha.is_empty() {
         return Err("refusing to merge: no confirmed head_sha on record".to_string());
     }
-    let repo_slug = format!("{owner}/{repo}");
     let out = Command::new("gh")
-        .args(build_merge_args(host_base, &repo_slug, number, head_sha))
+        .args(build_merge_args(&repo_arg, number, head_sha))
         // Checks run user tooling that a GUI launch's minimal PATH can't
         // resolve (Homebrew/local installs of `gh`) — same reasoning as
         // `github::GitHubHost::fetch_status` / `check::run_check`.
@@ -644,29 +677,22 @@ fn run_gh_merge(host_base: &str, owner: &str, repo: &str, number: i32, head_sha:
 }
 
 /// The exact `gh pr merge` argument vector, pulled out as its own pure
-/// function so both the presence of `--match-head-commit` (this feature's
+/// function so the presence of `--match-head-commit` (this feature's
 /// server-side head-consistency enforcement — the mechanism `gate`'s own doc
-/// points to instead of a second client-side sha comparison) AND the
-/// host-targeting `--repo` value are independently, directly unit-tested
-/// below without ever spawning a process. `run_gh_merge` is the only caller;
-/// nothing here talks to `gh`.
-fn build_merge_args(host_base: &str, repo_slug: &str, number: i32, head_sha: &str) -> Vec<String> {
-    // `gh`'s `-R/--repo` grammar is `[HOST/]OWNER/REPO` — an explicit host
-    // segment selects that host instead of `gh`'s own configured default.
-    // Empty `host_base` (a row from before this field existed) falls back to
-    // the plain two-segment form, preserving `gh`'s own default-host
-    // behavior exactly as before this fix.
-    let repo_arg = if host_base.is_empty() {
-        repo_slug.to_string()
-    } else {
-        format!("{host_base}/{repo_slug}")
-    };
+/// points to instead of a second client-side sha comparison) is
+/// independently, directly unit-tested below without ever spawning a
+/// process. `run_gh_merge` is the only caller; nothing here talks to `gh`.
+/// `repo_arg` arrives ALREADY host-qualified (`super::qualified_repo_slug`,
+/// called by `run_gh_merge` — see that function's doc for why the folding
+/// itself lives there, shared with `github::GitHubHost::fetch_status`,
+/// rather than duplicated in this formatter too).
+fn build_merge_args(repo_arg: &str, number: i32, head_sha: &str) -> Vec<String> {
     vec![
         "pr".to_string(),
         "merge".to_string(),
         number.to_string(),
         "--repo".to_string(),
-        repo_arg,
+        repo_arg.to_string(),
         "--squash".to_string(),
         "--match-head-commit".to_string(),
         head_sha.to_string(),
@@ -809,13 +835,15 @@ mod tests {
         }
     }
 
-    // --- build_merge_args: the head-consistency AND host-targeting
-    // enforcement must actually reach the `gh` invocation, not just exist in
-    // a doc comment --------------------------------------------------------
+    // --- build_merge_args: the head-consistency enforcement must actually
+    // reach the `gh` invocation, not just exist in a doc comment. Host-
+    // targeting (`[HOST/]OWNER/REPO` folding) is `super::qualified_repo_slug`'s
+    // job now — see `host::tests` for that coverage, shared with
+    // `github::GitHubHost::fetch_status` --------------------------------------
 
     #[test]
     fn build_merge_args_always_squashes_and_pins_match_head_commit_to_the_exact_sha() {
-        let args = build_merge_args("", "acme/widgets", 42, "deadbeef");
+        let args = build_merge_args("acme/widgets", 42, "deadbeef");
         assert_eq!(
             args,
             vec!["pr", "merge", "42", "--repo", "acme/widgets", "--squash", "--match-head-commit", "deadbeef"]
@@ -833,23 +861,14 @@ mod tests {
     }
 
     #[test]
-    fn build_merge_args_folds_a_non_empty_host_base_into_the_repo_argument() {
-        // Review round 1 Codex P1: a GitHub Enterprise row's recorded host
-        // must actually reach the invocation, not silently fall back to
-        // `gh`'s own default host.
-        let args = build_merge_args("github.acme-corp.com", "acme/widgets", 42, "deadbeef");
+    fn build_merge_args_passes_through_an_already_host_qualified_repo_arg_verbatim() {
+        // Review round 1 Codex P1 / Codex review PR #159 repo.rs:3873: a GitHub Enterprise
+        // row's recorded host must actually reach the invocation — folding now happens in
+        // `super::qualified_repo_slug` (`run_gh_merge`'s job to call), so this only needs to
+        // prove the ALREADY-qualified string reaches --repo verbatim, untouched.
+        let args = build_merge_args("github.acme-corp.com/acme/widgets", 42, "deadbeef");
         let idx = args.iter().position(|a| a == "--repo").unwrap();
         assert_eq!(args[idx + 1], "github.acme-corp.com/acme/widgets");
-    }
-
-    #[test]
-    fn build_merge_args_empty_host_base_preserves_the_plain_two_segment_form() {
-        // A row from before `host_base` was recorded (or a plain github.com
-        // one, if this crate ever stops populating it for that case) must
-        // not regress into passing a bare empty host segment.
-        let args = build_merge_args("", "acme/widgets", 42, "deadbeef");
-        let idx = args.iter().position(|a| a == "--repo").unwrap();
-        assert_eq!(args[idx + 1], "acme/widgets");
     }
 
     // --- lifecycle_state_tag: exhaustive, always distinguishable ----------
