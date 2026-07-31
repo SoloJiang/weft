@@ -3791,9 +3791,18 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
     // release, or a stacked feature branch has not reached what other repos
     // actually consume (see this function's doc).
     if !prs.is_empty() && prs.iter().all(|p| p.lifecycle == "merged") {
-        let Some(default_branch) = live_default_branch_for_repo(db, upstream.repo_id).await else {
+        // Every PR on one task normally targets the same host repo; use the FIRST as the
+        // identity `live_default_branch_for_repo` must see reflected in the local clone's
+        // recorded remote before it trusts that clone to answer "what is the default branch"
+        // (a fork/mirror checkout's `origin` need not be the repo this PR actually targets).
+        let pr0 = &prs[0];
+        let Some(default_branch) =
+            live_default_branch_for_repo(db, upstream.repo_id, &pr0.host_base, &pr0.host_owner, &pr0.host_repo)
+                .await
+        else {
             // Never optimistically release the merge on an unresolvable default
-            // branch (offline, repo row gone) — the honest answer is "can't
+            // branch (offline, repo row gone, local clone doesn't provably match
+            // the PR's own recorded host repo) — the honest answer is "can't
             // tell", the same rule every other failure branch above follows.
             return host::UpstreamStatus::Unknown {
                 reason: "无法确认上游仓库的默认分支".into(),
@@ -3808,17 +3817,77 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
     }
 }
 
+/// Does `remote_url` (a `repo_ref`'s recorded origin, captured at add/clone
+/// time) plausibly point at the SAME host repo a PR row's recorded identity
+/// (`host_base`, `host_owner`, `host_repo`) claims?
+///
+/// `live_default_branch_for_repo` runs this BEFORE trusting a local clone's
+/// live default branch to answer for a specific PR (Codex review, PR #159
+/// repo.rs:3794): the clone's `origin` is whatever repo it happens to be
+/// checked out against — a fork, a mirror, a re-pointed remote — which is not
+/// guaranteed to be the repo the PR's `host_owner`/`host_repo` actually name.
+/// Trusting it blindly could read a fork's default branch as the upstream's,
+/// letting a coincidental name match (or mismatch) flip `Merged` the wrong
+/// way in either direction.
+///
+/// A substring/suffix check rather than `git::git_url_key` equality: remotes
+/// come in incompatible shapes for the SAME repo (`https://host/o/r`,
+/// `git@host:o/r.git`, `ssh://git@host/o/r`) that `git_url_key` does not
+/// unify across schemes, and a false MISMATCH here fails safe to `Unknown`
+/// (never optimistically `Merged`) — so a looser match earns its keep by not
+/// punishing an honest recorded remote for using a different transport than
+/// this check happens to prefer.
+fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, host_repo: &str) -> bool {
+    if host_base.trim().is_empty() || host_owner.trim().is_empty() || host_repo.trim().is_empty() {
+        return false;
+    }
+    let remote_lower = remote_url.trim().to_lowercase();
+    if remote_lower.is_empty() {
+        return false;
+    }
+    let host_base_lower = host_base.trim().to_lowercase();
+    let owner_repo = format!("{}/{}", host_owner.trim().to_lowercase(), host_repo.trim().to_lowercase());
+    remote_lower.contains(&host_base_lower)
+        && (remote_lower.ends_with(&owner_repo) || remote_lower.ends_with(&format!("{owner_repo}.git")))
+}
+
 /// The live default branch of the repo behind `repo_id`, for vetting whether a
-/// merged upstream PR actually reached it (see `upstream_merge_state`).
+/// merged upstream PR actually reached it (see `upstream_merge_state`). Only
+/// trusts the local clone when its recorded `remote_url` plausibly matches
+/// the PR's OWN recorded host identity ([`remote_matches_pr_host`]) — never
+/// for a repo_id whose checkout could belong to a different repo than the PR
+/// being vetted.
+///
 /// Deliberately does NOT fall back to `git::recorded_base_or_default`'s
 /// offline "best guess" the way materializing a worktree does — that fallback
 /// exists because a new worktree must branch off SOMETHING, but here a wrong
 /// guess could optimistically release a merge that has not actually reached
 /// the default branch. `None` on ANY failure (repo row gone, unreadable DB,
-/// offline/no remote) — the caller turns that into `Unknown`, never `Merged`.
-async fn live_default_branch_for_repo(db: &Db, repo_id: i32) -> Option<String> {
+/// remote doesn't match, offline/no remote) — the caller turns that into
+/// `Unknown`, never `Merged`.
+///
+/// Runs the actual `git ls-remote` off the async runtime (Codex review, PR
+/// #159 repo.rs:3821): this is reached from the monitor's per-sweep-tick probe
+/// and both of automerge's confirmation reads, so a slow/unreachable remote
+/// must not tie up a Tokio worker the way `host::monitor::check_one`'s host
+/// probe already avoids doing (same `spawn_blocking` discipline, no new
+/// pattern).
+async fn live_default_branch_for_repo(
+    db: &Db,
+    repo_id: i32,
+    host_base: &str,
+    host_owner: &str,
+    host_repo: &str,
+) -> Option<String> {
     let repo_ref = get_repo(db, repo_id).await.ok().flatten()?;
-    crate::git::live_default_branch(std::path::Path::new(&repo_ref.local_git_path))
+    if !remote_matches_pr_host(&repo_ref.remote_url, host_base, host_owner, host_repo) {
+        return None;
+    }
+    let path = std::path::PathBuf::from(repo_ref.local_git_path);
+    tokio::task::spawn_blocking(move || crate::git::live_default_branch(&path))
+        .await
+        .ok()
+        .flatten()
 }
 
 pub async fn list_open_pull_requests(
@@ -7587,9 +7656,19 @@ mod tests {
     /// (Pending/Unknown) — pass a fake path (see [`ordered_pair`]) for those.
     /// The "actually Merged" happy path needs a REAL repo with a resolvable
     /// live default branch instead — pass a [`make_repo_with_origin`] clone.
+    ///
+    /// `remote_url` is recorded as `"https://github.com/o/r"` — matching
+    /// [`register_open_pr`]'s hardcoded `host_base`/`host_owner`/`host_repo`
+    /// ("github.com"/"o"/"r") — so `remote_matches_pr_host` accepts this fixture
+    /// by default. [`ordered_pair_mismatched_host`] below overrides it for the
+    /// negative case.
     async fn ordered_pair_at(db: &Db, repo_path: &str) -> (i32, i32) {
+        ordered_pair_at_with_remote(db, repo_path, "https://github.com/o/r").await
+    }
+
+    async fn ordered_pair_at_with_remote(db: &Db, repo_path: &str, remote_url: &str) -> (i32, i32) {
         let ws = create_workspace(db, "ws_order").await.unwrap();
-        let r = add_repo_ref(db, ws.id, "api", repo_path, "main", "", true)
+        let r = add_repo_ref(db, ws.id, "api", repo_path, "main", remote_url, true)
             .await
             .unwrap();
         let t = create_thread(db, ws.id, "t", "feature", "claude").await.unwrap();
@@ -7818,6 +7897,55 @@ mod tests {
                 "an unresolvable default branch must be Unknown, never an optimistic verdict: {other:?}"
             ),
         }
+    }
+
+    /// THE FIX (Codex review, PR #159 repo.rs:3794): the local clone's `origin` need not be
+    /// the repo the PR actually targets (a fork checkout, a re-pointed remote, a mirror). This
+    /// sets up the WORST case — the local clone's live default branch happens to COINCIDE with
+    /// the merged PR's `base_ref` ("main" == "main") — while the `repo_ref`'s recorded
+    /// `remote_url` does NOT match the PR's recorded host identity. Before this fix that
+    /// coincidence would have read `Merged`; it must now fail safe to `Unknown`.
+    #[tokio::test]
+    async fn a_local_clone_that_does_not_match_the_prs_host_identity_is_unknown_not_merged() {
+        let db = mem().await;
+        let root = std::env::temp_dir()
+            .join(format!("weft-upstream-merged-mismatched-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let clone_path = make_repo_with_origin(&root, "main");
+        // The repo_ref's recorded remote is a DIFFERENT repo than the PR below claims.
+        let (producer, consumer) = ordered_pair_at_with_remote(
+            &db,
+            clone_path.to_str().unwrap(),
+            "https://github.com/unrelated-owner/unrelated-repo",
+        )
+        .await;
+        let pr = register_open_pr(&db, producer, 1).await; // host_owner="o", host_repo="r", host_base="github.com"
+
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: "abc".into(),
+            base_ref: "main".into(), // COINCIDENTALLY equal to the local clone's live default.
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Merged,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+            .await
+            .unwrap();
+
+        match upstream_merge_state(&db, consumer).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!(
+                "a local clone whose recorded remote does NOT match the PR's own host identity \
+                 must never be trusted to vet its default branch, even on a coincidental \
+                 base_ref match: got {other:?}"
+            ),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// TWO upstream PRs, one merged: still pending. A task is not done because
