@@ -105,8 +105,24 @@ pub struct ResolvedDirection {
     /// #110 T4). `""` = no upstream. Same extension-field mechanism as
     /// `hint` (see `depends_on_from_value`) rather than a `ProposedDirection`
     /// field — that struct is used by a large test/DB surface (R47-3-style
-    /// concern), so the extension lives in plan JSON instead.
+    /// concern), so the extension lives in plan JSON instead. DISPLAY-facing
+    /// only — the human-readable name shown in `ScopeReview`/the Needs-you
+    /// card (`dependsOnLabel` on the frontend). The backend does not resolve
+    /// depends_on by re-matching this name; see `depends_on_index`.
     pub depends_on: String,
+    /// The STABLE index into this SAME proposal's `directions` that `depends_on`'s name
+    /// resolved to — computed ONCE at proposal-save time (`resolve_depends_on_indices`), not
+    /// re-derived by name search later. `None` when `depends_on` is empty (no dependency) OR
+    /// when the name did not resolve to exactly one OTHER lane (self-reference, an ambiguous
+    /// duplicate, or not found) — `record_upstream_edges` tells those two `None` cases apart by
+    /// checking whether `depends_on` itself is empty. `#[serde(skip)]`: purely a backend
+    /// resolution detail, never sent to the frontend (which only ever needs the name, for
+    /// display) — replaces the OLD design where `record_upstream_edges` re-searched sibling
+    /// lanes by name on every approve/deny (Codex review, PR #159 planner.rs:1554 and
+    /// planner.rs:1557 — both root-caused in that re-search's decision-state/self-reference
+    /// blind spots; see the PR body for the full redesign rationale).
+    #[serde(skip)]
+    pub depends_on_index: Option<usize>,
 }
 
 /// Resolve one proposed direction's write-repo name to a workspace repo id.
@@ -134,6 +150,7 @@ pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDire
         // need the real value overlay it from the raw JSON afterward, exactly as
         // `resolved_from_plan` already does for `hint`.
         depends_on: String::new(),
+        depends_on_index: None,
     }
 }
 
@@ -329,6 +346,7 @@ pub async fn save_proposal_value(db: &Db, thread_id: i32, input: &Value) -> Resu
     let mut value = serde_json::to_value(&p)?;
     normalize_input_hints(&mut value, input);
     normalize_input_depends_on(&mut value, input);
+    resolve_depends_on_indices(&mut value);
     let json = serde_json::to_string(&value)?;
     // Bump the proposal VERSION on EVERY re-propose (R50-2). `upsert_plan` uses `version` as the
     // INSERT created_at but PRESERVES created_at on UPDATE; for a re-propose (existing row) the
@@ -461,11 +479,116 @@ fn preserve_depends_on_from_baseline(value: &mut Value, baseline: Option<&Value>
     }
 }
 
+/// Read the `depends_on_index` extension value written by [`resolve_depends_on_indices`] —
+/// `Some(i)` when `depends_on`'s name resolved to sibling index `i` in THIS SAME proposal,
+/// `None` when it did not (which callers distinguish from "no `depends_on` at all" by checking
+/// whether the name itself, from `depends_on_from_value`, is empty).
+fn depends_on_index_from_value(value: &Value, index: usize) -> Option<usize> {
+    value
+        .get("directions")
+        .and_then(Value::as_array)
+        .and_then(|directions| directions.get(index))
+        .and_then(|direction| direction.get("depends_on_index"))
+        .and_then(Value::as_u64)
+        .map(|i| i as usize)
+}
+
+/// Resolve every lane's `depends_on` NAME to a STABLE INDEX into this SAME proposal's
+/// `directions`, once, right here — not deferred to `record_upstream_edges`, which used to
+/// re-search sibling lanes BY NAME on every single approve/deny (Codex review, PR #159: the
+/// index-based redesign this function anchors; see the PR body for the full rationale). Called
+/// from BOTH places a proposal's `depends_on` names get established: `save_proposal_value`
+/// (after `normalize_input_depends_on`) for a fresh lead proposal, and `proposal_json_with_hints`
+/// (after `preserve_depends_on_from_baseline`) for every server-driven re-save (approve/deny/
+/// settle) — recomputing fresh from whatever names are in `value` at that point is always
+/// correct and cheap (a handful of string comparisons), since the RESULT only ever depends on
+/// the CURRENT set of names, never on decision/materialization state (which is exactly the bug
+/// the old name-search-at-write-time design had: `record_upstream_edges` used to filter
+/// candidates by `direction_id != 0`, so a duplicate name could look like a false singleton
+/// purely because one sibling hadn't materialized YET — Codex review, PR #159 planner.rs:1554).
+///
+/// A name resolves to `Some(index)` only when it matches EXACTLY ONE OTHER lane's name (never
+/// itself — Codex review, PR #159 planner.rs:1557: a self-reference used to resolve to a
+/// singleton match of the lane's OWN materialized id, attempt a self-edge write,
+/// `set_direction_upstream` would reject that write, and the rejection was invisible —
+/// `depends_on_direction_id` just stayed at its prior value, `0`, reading as "no dependency"
+/// instead of blocked). Anything else — empty match (typo / a name from outside this proposal,
+/// which the tool contract already says never resolves), 2+ matches (a genuine ambiguous
+/// duplicate name — this codebase explicitly supports duplicate same-name lanes elsewhere), or
+/// a match on nothing but the lane's own index (self-reference) — resolves to `None`, and
+/// `record_upstream_edges` maps that (given a non-empty `depends_on` name) to the SAME blocking
+/// sentinel every other unresolvable case in this feature uses. Never silently free to merge.
+fn resolve_depends_on_indices(value: &mut Value) {
+    let Some(directions) = value.get("directions").and_then(Value::as_array) else {
+        return;
+    };
+    // Every lane's name and depends_on, in order — the ONLY inputs resolution needs. Collected
+    // as owned data up front so the write pass below can hold a fresh `&mut` without conflicting
+    // with these reads (this loop needs every OTHER lane's name to resolve any ONE lane's target).
+    let names: Vec<String> = directions
+        .iter()
+        .map(|d| d.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string())
+        .collect();
+    let depends_on: Vec<String> = directions
+        .iter()
+        .map(|d| d.get("depends_on").and_then(Value::as_str).unwrap_or("").trim().to_string())
+        .collect();
+    let resolved: Vec<Option<usize>> = depends_on
+        .iter()
+        .enumerate()
+        .map(|(own_index, name)| {
+            if name.is_empty() {
+                return None; // no dependency declared
+            }
+            let matches: Vec<usize> = names
+                .iter()
+                .enumerate()
+                .filter(|(i, n)| *i != own_index && n.as_str() == name.as_str())
+                .map(|(i, _)| i)
+                .collect();
+            match matches.as_slice() {
+                [i] => Some(*i),
+                [] => {
+                    eprintln!(
+                        "[weft][planner] lane {own_index} ({:?}): depends_on {name:?} matches no \
+                         OTHER lane in this proposal by name — blocking rather than guessing",
+                        names.get(own_index).map(String::as_str).unwrap_or("")
+                    );
+                    None
+                }
+                _ => {
+                    eprintln!(
+                        "[weft][planner] lane {own_index} ({:?}): depends_on {name:?} matches {} \
+                         other lanes in this proposal ambiguously — blocking rather than guessing",
+                        names.get(own_index).map(String::as_str).unwrap_or(""),
+                        matches.len()
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
+    let Some(directions) = value.get_mut("directions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (index, direction) in directions.iter_mut().enumerate() {
+        let Some(object) = direction.as_object_mut() else {
+            continue;
+        };
+        let index_value = match resolved.get(index).copied().flatten() {
+            Some(i) => Value::Number(i.into()),
+            None => Value::Null,
+        };
+        object.insert("depends_on_index".to_string(), index_value);
+    }
+}
+
 fn proposal_json_with_hints(proposal: &Proposal, baseline: &str) -> Result<String> {
     let mut value = serde_json::to_value(proposal)?;
     let baseline = serde_json::from_str::<Value>(baseline).ok();
     preserve_hints_from_baseline(&mut value, baseline.as_ref());
     preserve_depends_on_from_baseline(&mut value, baseline.as_ref());
+    resolve_depends_on_indices(&mut value);
     Ok(serde_json::to_string(&value)?)
 }
 
@@ -646,6 +769,7 @@ async fn resolved_from_plan(
     for (index, direction) in directions.iter_mut().enumerate() {
         direction.hint = hint_from_value(&raw, index);
         direction.depends_on = depends_on_from_value(&raw, index);
+        direction.depends_on_index = depends_on_index_from_value(&raw, index);
     }
     Ok(ResolvedProposal {
         thread_id,
@@ -1437,9 +1561,40 @@ async fn confirm_with_manual_tool_with_session_liveness(
 /// borrowing so both call sites can build it without lifetime gymnastics —
 /// this runs at most once per confirm/settle, so the extra allocations are
 /// immaterial.
+/// How a lane's `depends_on` resolves, as already decided by [`resolve_depends_on_indices`] at
+/// proposal-save time — `record_upstream_edges` never re-derives this by name. A discriminated
+/// value (CLAUDE.md "discriminated state, exhaustive map"), not a name string plus a
+/// separately-searched candidate list, so every caller maps it with one exhaustive `match`
+/// instead of re-deriving "is this ambiguous / self-referential / just not decided yet" at each
+/// use site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DependsOnTarget {
+    /// No `depends_on` was declared — this lane has no upstream.
+    None,
+    /// Resolved to exactly one OTHER lane in this SAME proposal, by its stable index.
+    Index(usize),
+    /// A `depends_on` name was declared but did not resolve to exactly one OTHER lane at
+    /// proposal-save time — empty match, ambiguous duplicate match, or a self-reference (Codex
+    /// review, PR #159 planner.rs:1554 / planner.rs:1557). Always blocking.
+    Unresolved,
+}
+
+/// Combine a lane's raw `depends_on` name with its already-resolved `depends_on_index` into one
+/// [`DependsOnTarget`] — the single place that decides "no dependency" (empty name) apart from
+/// "declared but unresolved" (non-empty name, no index), shared by both `UpstreamLane` builders
+/// below so they can't drift on this distinction.
+fn depends_on_target_of(name: &str, index: Option<usize>) -> DependsOnTarget {
+    if name.trim().is_empty() {
+        DependsOnTarget::None
+    } else {
+        match index {
+            Some(i) => DependsOnTarget::Index(i),
+            None => DependsOnTarget::Unresolved,
+        }
+    }
+}
+
 struct UpstreamLane {
-    name: String,
-    depends_on: String,
     direction_id: i32,
     /// This lane's OWN decision ("" | "approved" | "denied") — needed to tell
     /// "not decided / referenced by typo" apart from "explicitly denied" when
@@ -1449,31 +1604,31 @@ struct UpstreamLane {
     /// a permanent, decided fact — not a "maybe later" — and a consumer
     /// naming it must be actively blocked, not silently left as "no upstream".
     decision: String,
+    depends_on: DependsOnTarget,
 }
 
 /// Build [`UpstreamLane`]s from a `ResolvedProposal` (confirm's main body,
-/// which already resolved `depends_on` via `resolved_from_plan`) zipped with
+/// which already resolved `depends_on`/`depends_on_index` via `resolved_from_plan`) zipped with
 /// the `Proposal`'s per-lane materialized ids. Indices align 1:1 — both
 /// derive from the same stored proposal snapshot (see `resolved_from_plan`'s
-/// doc).
+/// doc), which is also what makes a resolved `DependsOnTarget::Index` a valid index into THIS
+/// SAME `lanes` vec.
 fn upstream_lanes_from_resolved(resolved: &ResolvedProposal, proposal: &Proposal) -> Vec<UpstreamLane> {
     resolved
         .directions
         .iter()
         .zip(proposal.directions.iter())
         .map(|(r, p)| UpstreamLane {
-            name: r.name.clone(),
-            depends_on: r.depends_on.clone(),
             direction_id: p.direction_id,
             decision: p.decision.clone(),
+            depends_on: depends_on_target_of(&r.depends_on, r.depends_on_index),
         })
         .collect()
 }
 
-/// Build [`UpstreamLane`]s from a typed `Proposal` (has `name`/`direction_id`/
-/// `decision` but never `depends_on` — see that field's doc) plus the raw
-/// JSON `Value` of the SAME proposal (has `depends_on`, read via
-/// `depends_on_from_value`). Used by `auto_settle_if_fully_decided`, which
+/// Build [`UpstreamLane`]s from a typed `Proposal` (has `direction_id`/
+/// `decision` but never `depends_on`/`depends_on_index` — see those fields' docs) plus the raw
+/// JSON `Value` of the SAME proposal. Used by `auto_settle_if_fully_decided`, which
 /// persists via `proposal_json_with_hints` rather than `resolved_from_plan`
 /// and so never builds a full `ResolvedProposal` (that additionally needs a
 /// live workspace-repo lookup this settle path has no reason to pay for).
@@ -1483,10 +1638,9 @@ fn upstream_lanes_from_raw(proposal: &Proposal, raw: &Value) -> Vec<UpstreamLane
         .iter()
         .enumerate()
         .map(|(idx, p)| UpstreamLane {
-            name: p.name.clone(),
-            depends_on: depends_on_from_value(raw, idx),
             direction_id: p.direction_id,
             decision: p.decision.clone(),
+            depends_on: depends_on_target_of(&depends_on_from_value(raw, idx), depends_on_index_from_value(raw, idx)),
         })
         .collect()
 }
@@ -1517,17 +1671,19 @@ fn upstream_lanes_from_raw(proposal: &Proposal, raw: &Value) -> Vec<UpstreamLane
 /// failure escalates to a Needs-you notice instead of failing the causing
 /// operation outright (Codex review, planner.rs:1470).
 ///
-/// Per lane: an EMPTY `depends_on` clears any STALE edge a previous proposal
+/// Per lane: `DependsOnTarget::None` clears any STALE edge a previous proposal
 /// left behind (Codex review, planner.rs:1447 — a re-proposal that drops
-/// `depends_on` must not leave the old upstream blocking forever). A
-/// NON-empty `depends_on` that resolves to EXACTLY ONE materialized,
-/// non-denied lane records that lane's real id. Anything else — no candidate
-/// yet (not decided / a typo / cross-proposal name), an explicitly DENIED
-/// referenced lane (Codex review, planner.rs:1534), or an AMBIGUOUS match
-/// (Codex review, planner.rs:1461 — this codebase explicitly supports
-/// duplicate same-name lanes elsewhere) — records a BLOCKING sentinel
-/// (`DENIED_UPSTREAM_SENTINEL` / `UNRESOLVED_UPSTREAM_SENTINEL`) rather than
-/// leaving the edge at `0`, which would read as "no upstream, free to merge."
+/// `depends_on` must not leave the old upstream blocking forever).
+/// `DependsOnTarget::Index(i)` was ALREADY resolved unambiguously against sibling NAMES at
+/// proposal-save time (`resolve_depends_on_indices`) — the only thing still dynamic here is
+/// lane `i`'s CURRENT decision: not yet materialized (may still resolve on a later decision),
+/// explicitly DENIED (Codex review, planner.rs:1534 — a permanent, decided fact, not a "maybe
+/// later"), or materialized (its real id). `DependsOnTarget::Unresolved` (an empty match, an
+/// AMBIGUOUS match — this codebase explicitly supports duplicate same-name lanes elsewhere — or
+/// a self-reference, ALL decided once at save time, never re-derived here) is unconditionally
+/// blocking. Every blocking case records `DENIED_UPSTREAM_SENTINEL` / `UNRESOLVED_UPSTREAM_
+/// SENTINEL` rather than leaving the edge at `0`, which would read as "no upstream, free to
+/// merge."
 ///
 /// Resolves EVERY lane's target before writing any of them, then applies in two passes
 /// (release-stale, then apply-real) rather than one straight-through pass (Codex review, PR
@@ -1544,39 +1700,25 @@ async fn record_upstream_edges(db: &Db, thread_id: i32, lanes: &[UpstreamLane]) 
         if lane.direction_id == 0 {
             continue; // this lane never materialized — nothing to record an edge ON.
         }
-        let depends_on_name = lane.depends_on.trim();
-        let target = if depends_on_name.is_empty() {
-            0
-        } else {
-            let candidates: Vec<i32> = lanes
-                .iter()
-                .filter(|u| u.name == depends_on_name && u.direction_id != 0)
-                .map(|u| u.direction_id)
-                .collect();
-            match candidates.as_slice() {
-                [id] => *id,
-                [] => {
-                    // No MATERIALIZED lane by that name YET. Distinguish "explicitly denied" (a
-                    // decided, permanent fact) from "not decided yet / a typo / a cross-proposal
-                    // name" (may still resolve later, or may not — either way, block in the
-                    // meantime, never silently 0).
-                    let denied = lanes.iter().any(|u| u.name == depends_on_name && u.decision == "denied");
-                    if denied {
-                        repo::DENIED_UPSTREAM_SENTINEL
-                    } else {
-                        repo::UNRESOLVED_UPSTREAM_SENTINEL
-                    }
-                }
-                _ => {
-                    eprintln!(
-                        "[weft][planner] direction {}: depends_on {depends_on_name:?} matches {} \
-                         materialized lanes ambiguously — blocking rather than guessing",
-                        lane.direction_id,
-                        candidates.len()
-                    );
-                    repo::UNRESOLVED_UPSTREAM_SENTINEL
-                }
-            }
+        let target = match lane.depends_on {
+            DependsOnTarget::None => 0,
+            DependsOnTarget::Unresolved => repo::UNRESOLVED_UPSTREAM_SENTINEL,
+            DependsOnTarget::Index(i) => match lanes.get(i) {
+                // The named lane is a decided, permanent dead end — block, don't guess it might
+                // still work out (Codex review, planner.rs:1534).
+                Some(target_lane) if target_lane.decision == "denied" => repo::DENIED_UPSTREAM_SENTINEL,
+                // Materialized: its real id.
+                Some(target_lane) if target_lane.direction_id != 0 => target_lane.direction_id,
+                // Named lane exists (the index was resolved against THIS SAME proposal) but
+                // hasn't been decided/materialized yet — may still resolve once it is; block in
+                // the meantime, never silently 0.
+                Some(_) => repo::UNRESOLVED_UPSTREAM_SENTINEL,
+                // Defensive: `resolve_depends_on_indices` only ever produces an index into THIS
+                // SAME proposal's directions, so `lanes` (built 1:1 from that same snapshot —
+                // see `upstream_lanes_from_resolved`/`upstream_lanes_from_raw`'s docs) should
+                // never actually miss it. Fail closed if it somehow does anyway.
+                None => repo::UNRESOLVED_UPSTREAM_SENTINEL,
+            },
         };
         targets.push((lane.direction_id, target));
     }
@@ -6994,6 +7136,187 @@ mod tests {
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (index-based redesign, Codex review PR #159 planner.rs:1557): a lane whose
+    /// `depends_on` names ITSELF must be rejected at PROPOSAL-SAVE time, not deferred to
+    /// `set_direction_upstream`'s best-effort write. Under the OLD name-search design, a
+    /// uniquely-named self-reference resolved via candidate search to a SINGLETON match — the
+    /// lane's own materialized id — attempted a self-edge write, `set_direction_upstream`
+    /// rejected it, and the rejection was invisible: `depends_on_direction_id` just stayed at
+    /// its prior value, `0`, reading as "no dependency" instead of blocked. Proves BOTH halves:
+    /// the rejection is a SAVE-TIME, structural fact (`depends_on_index` is `null` immediately
+    /// after `save_proposal_value`, before any confirm/materialize — no write is ever
+    /// attempted), and the end-to-end result is VISIBLY blocking, never silently free to merge.
+    #[tokio::test]
+    async fn a_self_referential_depends_on_is_rejected_at_proposal_save_time() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-self-ref-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "solo", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "solo"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+
+        // SAVE-TIME: the rejection is a structural fact in the stored JSON, before anything is
+        // confirmed or materialized — proving this is caught at resolution, not deferred to a
+        // write that then silently fails.
+        let stored = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let stored_json: Value = serde_json::from_str(&stored.proposal).unwrap();
+        assert_eq!(
+            stored_json["directions"][0]["depends_on_index"],
+            Value::Null,
+            "a self-reference must be flagged unresolvable at proposal-save time, not left \
+             looking like a valid pending reference to itself"
+        );
+
+        // END-TO-END: confirming it must read as VISIBLY blocked, never silently free to merge.
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 1);
+        let dir = repo::get_direction(&db, ids[0]).await.unwrap().unwrap();
+        assert_ne!(
+            dir.depends_on_direction_id, 0,
+            "a self-reference must never silently read as \"no dependency\" — the exact bug \
+             the old name-search-at-write-time design had (the self-edge write was rejected by \
+             set_direction_upstream, but the rejection left depends_on_direction_id at its \
+             prior value, 0)"
+        );
+        match repo::upstream_merge_state(&db, ids[0]).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!("a self-reference must read Unknown (blocking), never {other:?}"),
+        }
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (index-based redesign, Codex review PR #159 planner.rs:1554): two lanes share a
+    /// name, and a third names it via `depends_on`. Under the OLD design, `record_upstream_
+    /// edges`'s candidate search filtered by `direction_id != 0` ("materialized") on EVERY
+    /// approve/deny re-run — so once ONE of the two duplicates got individually approved (while
+    /// the other stayed pending), the filter saw only ONE candidate and silently bound the
+    /// consumer to WHICHEVER duplicate happened to materialize first, even though the name was
+    /// genuinely ambiguous. Proves resolution is now a FIXED, save-time fact that decision
+    /// state cannot retroactively change: approves ONE duplicate individually (materializing
+    /// it, leaving the other genuinely pending) and confirms the ambiguity is UNCHANGED by that.
+    #[tokio::test]
+    async fn a_duplicate_name_stays_ambiguous_regardless_of_which_sibling_materializes_first() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-dup-name-decision-state-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // TWO lanes named "producer" (index 0 and 1) + "consumer" naming "producer" (index 2).
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r1", "mandate": "impl-only"},
+                {"name": "producer", "repo": "api", "reason": "r2", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r3", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+
+        // Approve ONLY the first "producer" duplicate (index 0) — materializing it while the
+        // second duplicate (index 1) and "consumer" (index 2) stay pending, undecided.
+        let first_producer_id = approve_direction(&db, t.id, 0, "claude").await.unwrap();
+
+        // Now approve "consumer" — this re-resolves depends_on with ONE duplicate materialized
+        // and the OTHER still pending. Under the old design this is exactly where the false
+        // singleton bug fired.
+        let consumer_id = approve_direction(&db, t.id, 2, "claude").await.unwrap();
+
+        let consumer_dir = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_ne!(
+            consumer_dir.depends_on_direction_id, first_producer_id,
+            "the ambiguous name must NOT silently bind to whichever duplicate happened to \
+             materialize first — that is the exact bug this test guards against"
+        );
+        assert_eq!(
+            consumer_dir.depends_on_direction_id,
+            repo::UNRESOLVED_UPSTREAM_SENTINEL,
+            "an ambiguous name must actively block regardless of the duplicates' decision states"
+        );
+        match repo::upstream_merge_state(&db, consumer_id).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!(
+                "a consumer bound to an ambiguous name must never read as free to merge, even \
+                 with one duplicate materialized: {other:?}"
+            ),
+        }
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (index-based redesign): proves duplicate-name ambiguity is now a STRUCTURAL,
+    /// proposal-save-time fact (`depends_on_index` is `null` the instant `save_proposal_value`
+    /// returns), not something `record_upstream_edges` has to re-derive by searching sibling
+    /// lanes' names and materialization state on every decision — under the new design, there
+    /// is no more "ambiguity resolution" happening at write time at all, only a lookup of an
+    /// already-decided fact. Companion to `record_upstream_edges_blocks_an_ambiguous_
+    /// duplicate_name_instead_of_guessing` (below), which proves the END-TO-END behavior; this
+    /// one proves WHEN the decision is made.
+    #[tokio::test]
+    async fn duplicate_name_ambiguity_is_decided_at_save_time_before_any_decision_is_made() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", "/tmp/dup-ambiguity-save-time-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r1", "mandate": "impl-only"},
+                {"name": "producer", "repo": "api", "reason": "r2", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r3", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+
+        // No confirm, no approve, nothing materialized — just the raw stored proposal.
+        let stored = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let stored_json: Value = serde_json::from_str(&stored.proposal).unwrap();
+        assert_eq!(
+            stored_json["directions"][2]["depends_on_index"],
+            Value::Null,
+            "an ambiguous duplicate name must be flagged unresolvable the instant the proposal \
+             is saved — this is a structural fact about the proposal's own shape, decidable \
+             with zero knowledge of any decision that hasn't happened yet"
+        );
     }
 
     /// THE FIX (Codex review, PR #159 planner.rs:1447): a lead re-proposes a reusable

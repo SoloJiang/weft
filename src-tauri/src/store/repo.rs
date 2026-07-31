@@ -4022,13 +4022,27 @@ fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, h
 /// and the PR falls back to the name check (unresolved either way, same honest `Pending` as
 /// before this fallback existed) rather than erroring or blocking the whole function.
 ///
+/// Every `prs` row must share the SAME host identity as `prs[0]` (Codex review, PR #159,
+/// post-round-6 pass: "verify every PR's target repository separately"): `register_pr_tool`
+/// parses each PR's host/owner/repo straight from whatever URL it's given, with no check that
+/// it matches the direction's own repo, so nothing stops two PRs on the SAME direction from
+/// genuinely targeting DIFFERENT host repos. This function only ever vets ONE local checkout
+/// (`repo_id`'s), so it can only meaningfully verify the identity it already checked
+/// (`prs[0]`'s) — for any OTHER row, `base_ref == default_branch` is a coincidence of two
+/// repos sharing a common branch name (`main`, `master`, …), not a real verification, and would
+/// let a PR that never touched this repo at all count as "landed" by name alone. Rather than
+/// resolving and verifying each row against its OWN target repo (which may have no local clone
+/// registered in this workspace at all), this fails closed: a mixed-identity roster reads
+/// `Unknown`, same as an unresolvable default branch — never silently trusts a coincidental
+/// name match against the wrong repo's history.
+///
 /// Deliberately does NOT fall back to `git::recorded_base_or_default`'s
 /// offline "best guess" the way materializing a worktree does — that fallback
 /// exists because a new worktree must branch off SOMETHING, but here a wrong
 /// guess could optimistically release a merge that has not actually reached
 /// the default branch. `None` on ANY failure (repo row gone, unreadable DB,
-/// remote doesn't match, offline/no remote) — the caller turns that into
-/// `Unknown`, never `Merged`.
+/// remote doesn't match, offline/no remote, mixed PR host identities) — the caller turns that
+/// into `Unknown`, never `Merged`.
 ///
 /// Runs entirely off the async runtime (Codex review, PR #159 repo.rs:3821):
 /// this is reached from the monitor's per-sweep-tick probe and both of
@@ -4053,6 +4067,17 @@ async fn all_prs_landed_on_live_default_branch(
     tokio::task::spawn_blocking(move || {
         let live_remote = crate::git::remote_url(&path)?;
         if !remote_matches_pr_host(&live_remote, &host_base, &host_owner, &host_repo) {
+            return None;
+        }
+        // Every row must share `prs[0]`'s (the only identity actually vetted above) host
+        // identity — this function only ever checks ONE local checkout, so a row targeting a
+        // genuinely different repo can only ever be "verified" by a coincidental base_ref name
+        // match, never a real one (see this function's doc).
+        if !prs.iter().all(|p| {
+            p.host_base.eq_ignore_ascii_case(&host_base)
+                && p.host_owner.eq_ignore_ascii_case(&host_owner)
+                && p.host_repo.eq_ignore_ascii_case(&host_repo)
+        }) {
             return None;
         }
         let default_branch = crate::git::live_default_branch(&path)?;
@@ -8310,6 +8335,72 @@ mod tests {
                 "a local clone whose recorded remote does NOT match the PR's own host identity \
                  must never be trusted to vet its default branch, even on a coincidental \
                  base_ref match: got {other:?}"
+            ),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE FIX (Codex review, post-round-6 pass: "verify every PR's target repository
+    /// separately"): an upstream direction with TWO merged PR rows where only the FIRST row's
+    /// host identity actually matches the local checkout — `register_pr_tool` parses each PR's
+    /// host/owner/repo straight from whatever URL it's given, with no cross-check against the
+    /// direction's own repo, so nothing prevents this. Before this fix, the SECOND row's
+    /// `base_ref` happening to equal "main" (a name shared by countless unrelated repos) was
+    /// enough to make this return `Merged`, even though that row has nothing to do with the
+    /// repo the local checkout actually verified — a coincidental name match standing in for a
+    /// real verification.
+    #[tokio::test]
+    async fn a_merged_pr_targeting_an_unrelated_repo_is_unknown_not_merged_even_on_a_coincidental_base_ref() {
+        let db = mem().await;
+        let root = std::env::temp_dir()
+            .join(format!("weft-upstream-mixed-pr-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (clone_path, host_base, host_owner, host_repo) = make_repo_with_origin(&root, "main");
+        let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
+        // #1 genuinely matches the local checkout's identity.
+        let matching = register_open_pr_at(&db, producer, 1, &host_base, &host_owner, &host_repo).await;
+        // #2 targets a COMPLETELY unrelated repo — registered against the SAME direction, which
+        // nothing today prevents.
+        let unrelated = register_open_pr_at(&db, producer, 2, "localhost", "totally-unrelated-owner", "unrelated-repo").await;
+
+        let matching_snapshot = crate::host::PrSnapshot {
+            head_sha: "abc".into(),
+            base_ref: "main".into(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Merged,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        apply_pull_request_snapshot(&db, matching.id, &matching_snapshot, &crate::host::MergeReadiness::Ready)
+            .await
+            .unwrap();
+        // The unrelated repo's PR merged into a branch that COINCIDENTALLY shares the real
+        // checkout's default branch NAME ("main") — the exact false-positive shape this fix
+        // closes.
+        let unrelated_snapshot = crate::host::PrSnapshot {
+            head_sha: "def".into(),
+            base_ref: "main".into(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Merged,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        apply_pull_request_snapshot(&db, unrelated.id, &unrelated_snapshot, &crate::host::MergeReadiness::Ready)
+            .await
+            .unwrap();
+
+        match upstream_merge_state(&db, consumer).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!(
+                "a roster of PRs spanning more than one host identity must never resolve via a \
+                 coincidental base_ref name match against the ONE checkout this function \
+                 actually verified: got {other:?}"
             ),
         }
 
