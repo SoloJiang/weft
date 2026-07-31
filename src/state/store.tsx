@@ -75,6 +75,11 @@ export type HomeTab = "board" | "repos" | "settings";
 export type ThreadTab = "lead" | "board";
 export interface NotificationHydration {
   workspaceId: number | null;
+  /** Global permission asks have completed one authoritative pull. */
+  asks: boolean;
+  /** Active workspace Needs-you rows have completed one authoritative pull. */
+  workspaceNeeds: boolean;
+  /** Both Needs-you sources are ready for opening the combined surface. */
   needs: boolean;
   overview: boolean;
   quota: boolean;
@@ -224,6 +229,8 @@ interface Store {
   workspaceLoadSeq: number;
   /** True while selectWorkspace is mid-fetch/reset for the active workspace. */
   workspaceLoading: boolean;
+  /** True while the workspace list is being restored during startup/refresh. */
+  workspaceRestoring: boolean;
   /** True only after the latest workspace selection committed repos and threads. */
   workspaceLoadReady: boolean;
   directionsByThread: Record<number, Direction[]>;
@@ -623,9 +630,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [threadWorkspaceById, setThreadWorkspaceById] = useState<Record<number, number>>({});
   const [workspaceLoadSeq, setWorkspaceLoadSeq] = useState(0);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceRestoring, setWorkspaceRestoring] = useState(true);
   const [workspaceLoadReady, setWorkspaceLoadReady] = useState(false);
   const workspaceLoadCountRef = useRef(0);
   const workspaceSelectionGenerationRef = useRef(0);
+  const workspaceSelectionInFlightRef = useRef<Map<number, Promise<void>>>(new Map());
   const rememberThreads = useCallback((list: Thread[]) => {
     setThreads(list);
     setThreadWorkspaceById((prev) => {
@@ -650,6 +659,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [sessions, setSessions] = useState<Record<number, OpenSession>>({});
   const [notificationHydration, setNotificationHydration] = useState<NotificationHydration>({
     workspaceId: null,
+    asks: false,
+    workspaceNeeds: false,
     needs: false,
     overview: false,
     quota: false,
@@ -984,25 +995,34 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refreshWorkspaces = useCallback(async () => {
-    const ws = await api.listWorkspaces();
-    setWorkspaces(ws);
-    setActiveWorkspaceId((cur) => {
-      // Keep the live selection as long as it still exists.
-      if (cur != null && ws.some((w) => w.id === cur)) return cur;
-      // Cold start / webview reload drops the in-memory selection back to null;
-      // restore the last-used workspace instead of snapping to the first one.
-      // Only fall back to the first when the saved id is gone (deleted) or there
-      // is none yet.
-      const saved = Number(localStorage.getItem(STORAGE_KEYS.activeWorkspace));
-      if (saved && ws.some((w) => w.id === saved)) return saved;
-      return ws[0]?.id ?? null;
-    });
+    setWorkspaceRestoring(true);
+    try {
+      const ws = await api.listWorkspaces();
+      setWorkspaces(ws);
+      setActiveWorkspaceId((cur) => {
+        // Keep the live selection as long as it still exists.
+        if (cur != null && ws.some((w) => w.id === cur)) return cur;
+        // Cold start / webview reload drops the in-memory selection back to null;
+        // restore the last-used workspace instead of snapping to the first one.
+        // Only fall back to the first when the saved id is gone (deleted) or there
+        // is none yet.
+        const saved = Number(localStorage.getItem(STORAGE_KEYS.activeWorkspace));
+        if (saved && ws.some((w) => w.id === saved)) return saved;
+        return ws[0]?.id ?? null;
+      });
+    } finally {
+      setWorkspaceRestoring(false);
+    }
   }, []);
 
-  const selectWorkspace = useCallback(async (id: number) => {
+  const selectWorkspace = useCallback((id: number): Promise<void> => {
+    const inFlight = workspaceSelectionInFlightRef.current.get(id);
+    if (inFlight) return inFlight;
+    const load = (async () => {
     const selectionGeneration = ++workspaceSelectionGenerationRef.current;
     workspaceLoadCountRef.current += 1;
     setActiveWorkspaceId(id);
+    setWorkspaceRestoring(false);
     setWorkspaceLoading(true);
     setWorkspaceLoadReady(false);
     // Do not render the previous workspace's actionable rows under the new
@@ -1012,6 +1032,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setNotificationHydration((current) => ({
       ...current,
       workspaceId: id,
+      workspaceNeeds: false,
       needs: false,
       overview: false,
     }));
@@ -1059,6 +1080,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       workspaceLoadCountRef.current -= 1;
       if (workspaceLoadCountRef.current === 0) setWorkspaceLoading(false);
     }
+    })();
+    const tracked = load.then(
+      () => {
+        if (workspaceSelectionInFlightRef.current.get(id) === tracked) {
+          workspaceSelectionInFlightRef.current.delete(id);
+        }
+      },
+      (error) => {
+        if (workspaceSelectionInFlightRef.current.get(id) === tracked) {
+          workspaceSelectionInFlightRef.current.delete(id);
+        }
+        throw error;
+      },
+    );
+    workspaceSelectionInFlightRef.current.set(id, tracked);
+    return tracked;
   }, [rememberThreads]);
 
   const loadThreadChildren = useCallback(async (threadId: number) => {
@@ -2436,13 +2473,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const requestId = ++needsRefreshSeqRef.current;
     const isLatestRequest = () => requestId === needsRefreshSeqRef.current;
     // Permission Asks are global (not workspace-scoped); always refresh them.
-    let notificationNeedsReady = true;
     try {
       const nextAsks = await api.pendingAsks();
-      if (isLatestRequest()) setAsks(nextAsks);
+      if (isLatestRequest()) {
+        setAsks(nextAsks);
+        setNotificationHydration((current) => ({
+          ...current,
+          asks: true,
+          needs: current.workspaceNeeds,
+        }));
+      }
     } catch (e) {
       /* server may not be ready */
-      notificationNeedsReady = false;
       console.error(e);
     }
     // Standing grants are global too; refresh so "inherited access" markers stay
@@ -2467,6 +2509,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (isLatestRequest() && activeWorkspaceIdRef.current == null) {
         setNeeds([]);
         setWriteTriggers([]);
+        setNotificationHydration((current) => ({
+          ...current,
+          workspaceNeeds: true,
+          needs: current.asks,
+        }));
       }
       return;
     }
@@ -2478,10 +2525,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (isLatestRequest() && activeWorkspaceIdRef.current === workspaceId) {
         setNeeds(nextNeeds);
         setWriteTriggers(nextWriteTriggers);
+        setNotificationHydration((current) => {
+          if (current.workspaceId !== workspaceId) return current;
+          return {
+            ...current,
+            workspaceNeeds: true,
+            needs: current.asks,
+          };
+        });
       }
     } catch (e) {
       /* bus may not be ready */
-      notificationNeedsReady = false;
       console.error(e);
     }
     // per-workspace counts so the switcher can flag OTHER workspaces.
@@ -2491,12 +2545,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       /* ignore */
       console.error(e);
-    }
-    if (isLatestRequest() && notificationNeedsReady && activeWorkspaceIdRef.current === workspaceId) {
-      setNotificationHydration((current) => {
-        if (current.workspaceId !== workspaceId) return current;
-        return { ...current, needs: true };
-      });
     }
   }, []);
 
@@ -3114,16 +3162,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const directionId = Number(dir);
       const all = Object.values(sessions);
       let live =
-        opts?.sessionId != null
-          ? all.find((s) => s.info.session_id === opts.sessionId)
-          : undefined;
+      opts?.sessionId != null
+        ? all.find(
+            (s) => s.info.session_id === opts.sessionId && s.status !== "exited",
+          )
+        : undefined;
       if (!live && opts?.repoId != null && Number.isFinite(directionId)) {
         live = all.find(
-          (s) => s.directionId === directionId && s.repoId === opts.repoId,
+          (s) =>
+            s.directionId === directionId &&
+            s.repoId === opts.repoId &&
+            s.status !== "exited",
         );
       }
       if (!live && opts?.repoId == null && Number.isFinite(directionId)) {
-        live = all.find((s) => s.directionId === directionId);
+        live = all.find(
+          (s) => s.directionId === directionId && s.status !== "exited",
+        );
       }
       if (live) {
         setActiveThreadId(thread);
@@ -3144,9 +3199,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     void refreshWorkspaces();
   }, [refreshWorkspaces]);
   useEffect(() => {
-    if (activeWorkspaceId != null) void selectWorkspace(activeWorkspaceId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeWorkspaceId]);
+    if (activeWorkspaceId != null && !workspaceLoadReady) {
+      void selectWorkspace(activeWorkspaceId);
+    }
+  }, [activeWorkspaceId, workspaceLoadReady, selectWorkspace]);
 
   // Reset a thread's sub-view (lead tab, in-flight proposal review) only when the
   // active thread actually CHANGES. This lives in the store — not in ThreadBoard —
@@ -3355,6 +3411,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     threadWorkspaceById,
     workspaceLoadSeq,
     workspaceLoading,
+    workspaceRestoring,
     workspaceLoadReady,
     directionsByThread,
     worktreesByDirection,

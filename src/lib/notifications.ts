@@ -244,6 +244,7 @@ export async function handleNotifyOpen(
     activeWorkspaceId: number | null;
     workspaceLoadSeq: number;
     workspaceLoading?: boolean;
+    workspaceRestoring?: boolean;
     workspaceLoadReady?: boolean;
     needsHydrated?: boolean;
   },
@@ -257,10 +258,10 @@ export async function handleNotifyOpen(
     if (!sameWorkspace) {
       // Defer the rest until the store finishes the workspace switch effect.
       // A second selectWorkspace(activeWorkspaceId) otherwise races and clears
-      // the deep-link destination. Capture the sequence before starting either
-      // load: the direct call plus the [activeWorkspaceId] effect each bump it.
+      // the deep-link destination. The store coalesces the direct call with the
+      // activeWorkspaceId effect, so one successful load advances the marker.
       stashPendingNav(payload, {
-        expectedLoadSeq: deps.workspaceLoadSeq + 2,
+        expectedLoadSeq: deps.workspaceLoadSeq + 1,
       });
       await deps.selectWorkspace(workspaceIntent.workspaceId);
       return;
@@ -287,6 +288,10 @@ export async function handleNotifyOpen(
     } catch {
       /* Keep the deferred route; a later successful load can apply it. */
     }
+    return;
+  }
+  if (deps.workspaceRestoring) {
+    stashPendingNav(payload);
     return;
   }
   const needsIntent = intents.some((intent) => intent.type === "needs");
@@ -351,6 +356,7 @@ export function useSystemNotifications() {
     threadWorkspaceById,
     workspaceLoadSeq,
     workspaceLoading,
+    workspaceRestoring,
     workspaceLoadReady,
     selectWorkspace,
     goToDirectionRef,
@@ -372,6 +378,8 @@ export function useSystemNotifications() {
     quota: false,
   });
   const liveWorkersReadyPrevious = useRef(false);
+  const asksReadyPrevious = useRef(false);
+  const workspaceNeedsReadyPrevious = useRef(false);
   const [permissionState, setPermissionState] = useState<NotifyPermission>("prompt");
   const [windowFocused, setWindowFocused] = useState<boolean | null>(null);
   const lastBadge = useRef<number | null>(null);
@@ -456,6 +464,7 @@ export function useSystemNotifications() {
     activeWorkspaceId,
     workspaceLoadSeq,
     workspaceLoading,
+    workspaceRestoring,
     workspaceLoadReady,
     needsHydrated,
   });
@@ -466,6 +475,7 @@ export function useSystemNotifications() {
       // async workspace load so a following click cannot open over the reset.
       navDepsRef.current.activeWorkspaceId = id;
       navDepsRef.current.workspaceLoading = true;
+      navDepsRef.current.workspaceRestoring = false;
       navDepsRef.current.workspaceLoadReady = false;
       await selectWorkspace(id);
     },
@@ -481,6 +491,7 @@ export function useSystemNotifications() {
       activeWorkspaceId,
       workspaceLoadSeq,
       workspaceLoading,
+      workspaceRestoring,
       workspaceLoadReady,
       needsHydrated,
     };
@@ -493,6 +504,7 @@ export function useSystemNotifications() {
     activeWorkspaceId,
     workspaceLoadSeq,
     workspaceLoading,
+    workspaceRestoring,
     workspaceLoadReady,
     needsHydrated,
   ]);
@@ -612,6 +624,10 @@ export function useSystemNotifications() {
       putPendingNav(pending);
       return;
     }
+    if (workspaceRestoring) {
+      putPendingNav(pending);
+      return;
+    }
     if (activeWorkspaceId != null && !workspaceLoadReady) {
       // A failed workspace load must never be treated as a route prerequisite;
       // leave the click pending until a later selection commits successfully.
@@ -673,6 +689,7 @@ export function useSystemNotifications() {
     activeWorkspaceId,
     workspaceLoadSeq,
     workspaceLoading,
+    workspaceRestoring,
     workspaceLoadReady,
     needsHydrated,
     goToDirectionRef,
@@ -700,6 +717,9 @@ export function useSystemNotifications() {
   useEffect(() => {
     const sourceWorkspaceMatches =
       notificationHydration.workspaceId === activeWorkspaceId;
+    const asksReady = sourceWorkspaceMatches && notificationHydration.asks;
+    const workspaceNeedsReady =
+      sourceWorkspaceMatches && notificationHydration.workspaceNeeds;
     const liveWorkersReady =
       sourceWorkspaceMatches && notificationHydration.liveWorkers;
     const sessionRefs: Record<
@@ -738,7 +758,7 @@ export function useSystemNotifications() {
       activeWorkspaceId,
     );
     const sourceReady: Record<NotifyCategory, boolean> = {
-      needs: sourceWorkspaceMatches && notificationHydration.needs,
+      needs: asksReady || workspaceNeedsReady,
       review: sourceWorkspaceMatches && notificationHydration.overview,
       // Lead-turn pushes and locally observed sessions are authoritative even
       // while the adopted-worker snapshot is retrying.
@@ -761,25 +781,57 @@ export function useSystemNotifications() {
     }
     const sameWorkspace =
       baselineWs.current === activeWorkspaceId && prev.current != null;
+    const needsSourceBecameUnready =
+      (asksReadyPrevious.current && !asksReady) ||
+      (workspaceNeedsReadyPrevious.current && !workspaceNeedsReady);
     const liveWorkersBecameReady =
       liveWorkersReady && !liveWorkersReadyPrevious.current;
-    const sourceBecameUnready = NOTIFY_CATEGORIES.some(
-      (kind) => sourceReadyPrevious.current[kind] && !sourceReady[kind],
-    );
+    const sourceBecameUnready =
+      needsSourceBecameUnready ||
+      NOTIFY_CATEGORIES.some(
+        (kind) => sourceReadyPrevious.current[kind] && !sourceReady[kind],
+      );
     if (!sameWorkspace || sourceBecameUnready) {
       baselineWs.current = activeWorkspaceId;
       prev.current = emptyNotifySnapshot();
       baselineReady.current.clear();
       liveWorkersReadyPrevious.current = false;
+      asksReadyPrevious.current = false;
+      workspaceNeedsReadyPrevious.current = false;
     }
     sourceReadyPrevious.current = sourceReady;
     liveWorkersReadyPrevious.current = liveWorkersReady;
+    const asksBecameReady = asksReady && !asksReadyPrevious.current;
+    const workspaceNeedsBecameReady =
+      workspaceNeedsReady && !workspaceNeedsReadyPrevious.current;
+    asksReadyPrevious.current = asksReady;
+    workspaceNeedsReadyPrevious.current = workspaceNeedsReady;
     const base = prev.current;
     if (!base) return;
+    const isNeedsKeyReady = (key: string): boolean => {
+      if (key.startsWith("ask:")) return asksReady;
+      return workspaceNeedsReady;
+    };
     for (const kind of NOTIFY_CATEGORIES) {
       if (sourceReady[kind] && !baselineReady.current.has(kind)) {
-        base[kind] = new Map(next[kind]);
+        if (kind === "needs") {
+          base.needs = new Map(
+            [...next.needs].filter(([key]) => isNeedsKeyReady(key)),
+          );
+        } else {
+          base[kind] = new Map(next[kind]);
+        }
         baselineReady.current.add(kind);
+      }
+    }
+    if (asksBecameReady) {
+      for (const [key, entry] of next.needs) {
+        if (key.startsWith("ask:")) base.needs.set(key, entry);
+      }
+    }
+    if (workspaceNeedsBecameReady) {
+      for (const [key, entry] of next.needs) {
+        if (!key.startsWith("ask:")) base.needs.set(key, entry);
       }
     }
     if (liveWorkersBecameReady) {
@@ -797,10 +849,22 @@ export function useSystemNotifications() {
       // compared once the unrelated source also becomes authoritative.
       return;
     }
-    const events = diffForNotifications(base, next, notifyCategories);
+    const nextForDiff = {
+      ...next,
+      needs: new Map(
+        [...next.needs].filter(([key]) => isNeedsKeyReady(key)),
+      ),
+    };
+    const events = diffForNotifications(base, nextForDiff, notifyCategories);
     // Advance every category before the foreground/quiet-hours gate, preserving
     // the existing behavior that suppressed events are not replayed later.
-    prev.current = next;
+    const baselineNeeds = new Map(
+      [...base.needs].filter(([key]) => !isNeedsKeyReady(key)),
+    );
+    for (const [key, entry] of next.needs) {
+      if (isNeedsKeyReady(key)) baselineNeeds.set(key, entry);
+    }
+    prev.current = { ...next, needs: baselineNeeds };
     if (workspaceLoading) return;
     if (!notifyEnabled || permissionState !== "granted") return;
     if (
