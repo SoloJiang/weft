@@ -634,7 +634,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [workspaceLoadReady, setWorkspaceLoadReady] = useState(false);
   const workspaceLoadCountRef = useRef(0);
   const workspaceSelectionGenerationRef = useRef(0);
-  const workspaceSelectionInFlightRef = useRef<Map<number, Promise<void>>>(new Map());
+  const workspaceSelectionInFlightRef = useRef<
+    Map<number, { generation: number; promise: Promise<void> }>
+  >(new Map());
   const rememberThreads = useCallback((list: Thread[]) => {
     setThreads(list);
     setThreadWorkspaceById((prev) => {
@@ -733,6 +735,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // post-create refresh) can never clobber a fresher one that already landed —
   // last REQUEST issued wins, not last response to arrive.
   const overviewReqRef = useRef(0);
+  const overviewInFlightRef = useRef<Promise<void> | null>(null);
+  const overviewPendingRef = useRef(false);
+  const overviewTrailingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshOverviewRef = useRef<() => Promise<void>>(() => Promise.resolve());
   // Thread-bus drawer + proposal-review state.
   const [showBus, setShowBus] = useState(false);
   const [reviewingProposal, setReviewingProposal] = useState(false);
@@ -999,6 +1005,31 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     try {
       const ws = await api.listWorkspaces();
       setWorkspaces(ws);
+      // Lead turns are global and can belong to a workspace the user has not
+      // visited since this WebView launched. Index all thread owners before the
+      // notification baseline arms, so a background lead stall is not dropped.
+      const threadLists = await Promise.all(
+        ws.map(async (workspace) => {
+          try {
+            return await api.listThreads(workspace.id);
+          } catch (e) {
+            console.error(e);
+            return [];
+          }
+        }),
+      );
+      setThreadWorkspaceById((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const list of threadLists) {
+          for (const thread of list) {
+            if (next[thread.id] === thread.workspace_id) continue;
+            next[thread.id] = thread.workspace_id;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
       setActiveWorkspaceId((cur) => {
         // Keep the live selection as long as it still exists.
         if (cur != null && ws.some((w) => w.id === cur)) return cur;
@@ -1017,7 +1048,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const selectWorkspace = useCallback((id: number): Promise<void> => {
     const inFlight = workspaceSelectionInFlightRef.current.get(id);
-    if (inFlight) return inFlight;
+    if (inFlight && inFlight.generation === workspaceSelectionGenerationRef.current) {
+      return inFlight.promise;
+    }
     const load = (async () => {
     const selectionGeneration = ++workspaceSelectionGenerationRef.current;
     workspaceLoadCountRef.current += 1;
@@ -1083,18 +1116,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     })();
     const tracked = load.then(
       () => {
-        if (workspaceSelectionInFlightRef.current.get(id) === tracked) {
+        if (workspaceSelectionInFlightRef.current.get(id)?.promise === tracked) {
           workspaceSelectionInFlightRef.current.delete(id);
         }
       },
       (error) => {
-        if (workspaceSelectionInFlightRef.current.get(id) === tracked) {
+        if (workspaceSelectionInFlightRef.current.get(id)?.promise === tracked) {
           workspaceSelectionInFlightRef.current.delete(id);
         }
         throw error;
       },
     );
-    workspaceSelectionInFlightRef.current.set(id, tracked);
+    workspaceSelectionInFlightRef.current.set(id, {
+      generation: workspaceSelectionGenerationRef.current,
+      promise: tracked,
+    });
     return tracked;
   }, [rememberThreads]);
 
@@ -1130,28 +1166,67 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [loadThreadChildren],
   );
 
-  const refreshOverview = useCallback(async () => {
-    if (activeWorkspaceId == null) {
+  const refreshOverviewOnce = useCallback(async () => {
+    const workspaceId = activeWorkspaceIdRef.current;
+    if (workspaceId == null) {
       overviewReqRef.current += 1;
       setOverview([]);
       return;
     }
     const reqId = ++overviewReqRef.current;
     try {
-      const data = await api.workspaceOverview(activeWorkspaceId);
-      // A newer refreshOverview() was issued while this one was in flight —
+      const data = await api.workspaceOverview(workspaceId);
+      // A newer refreshOverviewOnce() was issued while this one was in flight —
       // drop this stale response instead of overwriting the fresher state.
-      if (reqId !== overviewReqRef.current) return;
+      if (
+        reqId !== overviewReqRef.current ||
+        activeWorkspaceIdRef.current !== workspaceId
+      ) {
+        return;
+      }
       setOverview(data);
       setNotificationHydration((current) => {
-        if (current.workspaceId !== activeWorkspaceId) return current;
+        if (current.workspaceId !== workspaceId) return current;
         return { ...current, overview: true };
       });
     } catch (e) {
       /* ignore */
       console.error(e);
     }
-  }, [activeWorkspaceId]);
+  }, []);
+
+  const scheduleTrailingOverviewRefresh = useCallback(() => {
+    if (overviewTrailingTimerRef.current != null) return;
+    overviewTrailingTimerRef.current = setTimeout(() => {
+      overviewTrailingTimerRef.current = null;
+      if (overviewInFlightRef.current != null) return;
+      void refreshOverviewRef.current().catch((error) => console.error(error));
+    }, 0);
+  }, []);
+
+  const refreshOverview = useCallback(async () => {
+    const inFlight = overviewInFlightRef.current;
+    if (inFlight) {
+      // Let the current waiter resolve with the current pass; a slow poll gets
+      // one independent trailing refresh instead of an unbounded wait chain.
+      overviewPendingRef.current = true;
+      await inFlight;
+      return;
+    }
+    const current = refreshOverviewOnce();
+    overviewInFlightRef.current = current;
+    try {
+      await current;
+    } finally {
+      if (overviewInFlightRef.current !== current) return;
+      overviewInFlightRef.current = null;
+      if (overviewPendingRef.current) {
+        overviewPendingRef.current = false;
+        scheduleTrailingOverviewRefresh();
+      }
+    }
+  }, [refreshOverviewOnce, scheduleTrailingOverviewRefresh]);
+  refreshOverviewRef.current = refreshOverview;
 
   const backToWorkspace = useCallback(() => {
     setActiveThreadId(null);
@@ -1642,7 +1717,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const hydratingRef = useRef(false);
   const hydratePendingRef = useRef(false);
   const hydratePendingEventRef = useRef(false);
+  const hydrateTrailingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hydrateLiveWorkersRef = useRef<
+    (eventDriven?: boolean) => Promise<void>
+  >(() => Promise.resolve());
   const liveWorkersHydratedRef = useRef(false);
+  const scheduleTrailingHydrate = useCallback(() => {
+    if (hydrateTrailingTimerRef.current != null) return;
+    hydrateTrailingTimerRef.current = setTimeout(() => {
+      hydrateTrailingTimerRef.current = null;
+      if (hydratingRef.current) return;
+      void hydrateLiveWorkersRef.current().catch((error) => console.error(error));
+    }, 0);
+  }, []);
   const hydrateLiveWorkers = useCallback(async (eventDriven = false) => {
     if (hydratingRef.current) {
       hydratePendingRef.current = true;
@@ -1650,51 +1737,46 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       return;
     }
     hydratingRef.current = true;
+    const passEventDriven =
+      eventDriven ||
+      hydratePendingEventRef.current ||
+      liveWorkersHydratedRef.current;
+    hydratePendingEventRef.current = false;
     try {
-      let requestedEventDriven = eventDriven;
-      do {
-        hydratePendingRef.current = false;
-        const passEventDriven =
-          requestedEventDriven ||
-          hydratePendingEventRef.current ||
-          liveWorkersHydratedRef.current;
-        hydratePendingEventRef.current = false;
-        const slots = await api.listLiveWorkerSlots();
-        // Load each adopted worker's thread directions so WorkspaceNav can match the
-        // session to its direction and count it as running — a revived worker can
-        // live in a thread the user never opened this session, whose
-        // directionsByThread entry would otherwise be empty. (Best-effort; verify
-        // does not depend on this — the backend reads the phase itself.)
-        const threadIds = [...new Set(slots.map((s) => s.thread_id))];
-        await Promise.all(
-          threadIds.map(async (tid) => {
-            try {
-              const dirs = await api.listDirections(tid);
-              setDirections((m) => ({ ...m, [tid]: dirs }));
-            } catch (e) {
-              /* best-effort: a thread whose directions fail to load just won't
-                 show its running count until opened */
-      console.error(e);
-    }
-          }),
-        );
-        for (const slot of slots) adoptWorker(slot, passEventDriven);
-        // Index adopted workers' thread ownership so notifications can route
-        // even before the user visits those workspaces.
-        setThreadWorkspaceById((prev) => {
-          let changed = false;
-          const next = { ...prev };
-          for (const slot of slots) {
-            if (slot.workspace_id == null) continue;
-            if (next[slot.thread_id] !== slot.workspace_id) {
-              next[slot.thread_id] = slot.workspace_id;
-              changed = true;
-            }
+      const slots = await api.listLiveWorkerSlots();
+      // Load each adopted worker's thread directions so WorkspaceNav can match the
+      // session to its direction and count it as running — a revived worker can
+      // live in a thread the user never opened this session, whose
+      // directionsByThread entry would otherwise be empty. (Best-effort; verify
+      // does not depend on this — the backend reads the phase itself.)
+      const threadIds = [...new Set(slots.map((s) => s.thread_id))];
+      await Promise.all(
+        threadIds.map(async (tid) => {
+          try {
+            const dirs = await api.listDirections(tid);
+            setDirections((m) => ({ ...m, [tid]: dirs }));
+          } catch (e) {
+            /* best-effort: a thread whose directions fail to load just won't
+               show its running count until opened */
+            console.error(e);
           }
-          return changed ? next : prev;
-        });
-        requestedEventDriven = false;
-      } while (hydratePendingRef.current);
+        }),
+      );
+      for (const slot of slots) adoptWorker(slot, passEventDriven);
+      // Index adopted workers' thread ownership so notifications can route
+      // even before the user visits those workspaces.
+      setThreadWorkspaceById((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const slot of slots) {
+          if (slot.workspace_id == null) continue;
+          if (next[slot.thread_id] !== slot.workspace_id) {
+            next[slot.thread_id] = slot.workspace_id;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
       liveWorkersHydratedRef.current = true;
       setNotificationHydration((current) => ({ ...current, liveWorkers: true }));
     } catch (e) {
@@ -1702,8 +1784,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       console.error(e);
     } finally {
       hydratingRef.current = false;
+      if (hydratePendingRef.current) {
+        hydratePendingRef.current = false;
+        scheduleTrailingHydrate();
+      }
     }
-  }, [adoptWorker]);
+  }, [adoptWorker, scheduleTrailingHydrate]);
+  hydrateLiveWorkersRef.current = hydrateLiveWorkers;
 
   // Adopt backend-headless workers the frontend never drove (boot revive, or
   // alive after a reload/HMR). Register the `worker-revived` listener BEFORE the
@@ -1733,6 +1820,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       cancelled = true;
       un?.();
       clearInterval(retryId);
+      if (hydrateTrailingTimerRef.current != null) {
+        clearTimeout(hydrateTrailingTimerRef.current);
+        hydrateTrailingTimerRef.current = null;
+      }
     };
   }, [hydrateLiveWorkers]);
 
@@ -3246,6 +3337,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (needsRefreshTrailingTimerRef.current != null) {
         clearTimeout(needsRefreshTrailingTimerRef.current);
         needsRefreshTrailingTimerRef.current = null;
+      }
+      if (overviewTrailingTimerRef.current != null) {
+        clearTimeout(overviewTrailingTimerRef.current);
+        overviewTrailingTimerRef.current = null;
       }
     };
   }, []);

@@ -468,6 +468,7 @@ export function useSystemNotifications() {
     workspaceLoadReady,
     needsHydrated,
   });
+  const navigationTailRef = useRef<Promise<void>>(Promise.resolve());
   const navigationSelectWorkspace = useCallback(
     async (id: number) => {
       // React's passive effects can lag a notification event by one tick. Keep
@@ -514,13 +515,12 @@ export function useSystemNotifications() {
     let cancelled = false;
     let takenPending: OsNotifyOpenEvent | null = null;
     const openInFlight = new Map<string, Promise<void>>();
-    let openTail: Promise<void> = Promise.resolve();
 
     const handleOpen = (payload: OsNotifyOpenEvent): Promise<void> => {
       const key = notifyOpenKey(payload);
       const existing = openInFlight.get(key);
       if (existing) return existing;
-      const task = openTail.then(async () => {
+      const task = navigationTailRef.current.then(async () => {
         await handleNotifyOpen(payload, navDepsRef.current);
         // Native delivery retains the payload until the frontend confirms it was
         // handled. This also prevents a live event from being drained again by
@@ -531,7 +531,7 @@ export function useSystemNotifications() {
           /* pure-vite */
         }
       });
-      openTail = task.catch(() => undefined);
+      navigationTailRef.current = task.catch(() => undefined);
       openInFlight.set(key, task);
       void task.then(
         () => {
@@ -664,12 +664,16 @@ export function useSystemNotifications() {
       return;
     }
     pendingApplyingKey.current = applicationKey;
-    void applyNotifyIntents(pending, {
-      goToDirectionRef,
-      openNeeds,
-      openSettings,
-      openCurator,
-    }).then(
+    const application = navigationTailRef.current.then(() =>
+      applyNotifyIntents(pending, {
+        goToDirectionRef,
+        openNeeds,
+        openSettings,
+        openCurator,
+      }),
+    );
+    navigationTailRef.current = application.catch(() => undefined);
+    void application.then(
       () => {
         pendingApplyingKey.current = null;
         pendingAppliedKey.current = applicationKey;
