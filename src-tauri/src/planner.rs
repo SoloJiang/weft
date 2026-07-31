@@ -100,6 +100,13 @@ pub struct ResolvedDirection {
     /// The direction id this lane was materialized into (0 = unset). Carried through from the
     /// stored proposal so the confirmed fast-path can re-dispatch by recorded id (no matching).
     pub direction_id: i32,
+    /// Optional: the `name` of ANOTHER direction in this SAME proposal that
+    /// this one must merge after (a producer→consumer ordering edge; issue
+    /// #110 T4). `""` = no upstream. Same extension-field mechanism as
+    /// `hint` (see `depends_on_from_value`) rather than a `ProposedDirection`
+    /// field — that struct is used by a large test/DB surface (R47-3-style
+    /// concern), so the extension lives in plan JSON instead.
+    pub depends_on: String,
 }
 
 /// Resolve one proposed direction's write-repo name to a workspace repo id.
@@ -123,6 +130,10 @@ pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDire
         hint: crate::engine_routing::RoutingHint::default(),
         route: None,
         direction_id: dir.direction_id,
+        // Not carried by `ProposedDirection` (see that field's doc) — callers that
+        // need the real value overlay it from the raw JSON afterward, exactly as
+        // `resolved_from_plan` already does for `hint`.
+        depends_on: String::new(),
     }
 }
 
@@ -298,8 +309,10 @@ pub async fn save_proposal(db: &Db, thread_id: i32, proposal: &Proposal) -> Resu
 
 /// Store a proposal received across an untrusted JSON boundary. Keeping this
 /// raw-value seam lets older typed callers remain source-compatible while the
-/// optional planner `hint` survives round-trips through human edits and the
-/// server-owned decision/id fields. Unknown hints are normalized to `normal`.
+/// optional planner `hint` AND `depends_on` (issue #110 T4 ordering edge)
+/// survive round-trips through human edits and the server-owned decision/id
+/// fields. Unknown hints are normalized to `normal`; `depends_on` is a bare
+/// name reference, resolved to an id later (see `confirm`).
 pub async fn save_proposal_value(db: &Db, thread_id: i32, input: &Value) -> Result<()> {
     let gate = thread_gate(thread_id);
     let _gate = gate.lock().await;
@@ -315,6 +328,7 @@ pub async fn save_proposal_value(db: &Db, thread_id: i32, input: &Value) -> Resu
     }
     let mut value = serde_json::to_value(&p)?;
     normalize_input_hints(&mut value, input);
+    normalize_input_depends_on(&mut value, input);
     let json = serde_json::to_string(&value)?;
     // Bump the proposal VERSION on EVERY re-propose (R50-2). `upsert_plan` uses `version` as the
     // INSERT created_at but PRESERVES created_at on UPDATE; for a re-propose (existing row) the
@@ -385,10 +399,73 @@ fn preserve_hints_from_baseline(value: &mut Value, baseline: Option<&Value>) {
     }
 }
 
+/// Read the optional `depends_on` extension value (the `name` of ANOTHER
+/// direction in the SAME proposal this one must merge after — issue #110 T4
+/// ordering edge) without making it part of the long-standing
+/// `ProposedDirection` Rust struct. Same reasoning and mechanism as
+/// `hint_from_value`: that struct is used by a large test/DB surface, so this
+/// extension lives in plan JSON instead. `""` (absent / not a string) means
+/// no upstream.
+fn depends_on_from_value(value: &Value, index: usize) -> String {
+    value
+        .get("directions")
+        .and_then(Value::as_array)
+        .and_then(|directions| directions.get(index))
+        .and_then(|direction| direction.get("depends_on"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A fresh lead proposal owns its `depends_on` values — mirrors
+/// `normalize_input_hints`: do not inherit a prior lane's value by index
+/// position just because this proposal happens to be the same length.
+fn normalize_input_depends_on(value: &mut Value, input: &Value) {
+    let Some(directions) = value.get_mut("directions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let input_directions = input.get("directions").and_then(Value::as_array);
+    for (index, direction) in directions.iter_mut().enumerate() {
+        let Some(object) = direction.as_object_mut() else {
+            continue;
+        };
+        let depends_on = input_directions
+            .and_then(|items| items.get(index))
+            .and_then(|item| item.get("depends_on"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        object.insert("depends_on".to_string(), Value::String(depends_on.to_string()));
+    }
+}
+
+/// Server-side approve/confirm updates deserialize the long-standing Proposal
+/// type, which intentionally does not carry `depends_on` — mirrors
+/// `preserve_hints_from_baseline`: preserve the stored value by index for
+/// those updates only; a fresh lead proposal goes through
+/// `normalize_input_depends_on` instead.
+fn preserve_depends_on_from_baseline(value: &mut Value, baseline: Option<&Value>) {
+    let Some(directions) = value.get_mut("directions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let baseline_directions = baseline.and_then(|value| value.get("directions")).and_then(Value::as_array);
+    for (index, direction) in directions.iter_mut().enumerate() {
+        let Some(object) = direction.as_object_mut() else {
+            continue;
+        };
+        let depends_on = baseline_directions
+            .and_then(|items| items.get(index))
+            .and_then(|item| item.get("depends_on"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        object.insert("depends_on".to_string(), Value::String(depends_on.to_string()));
+    }
+}
+
 fn proposal_json_with_hints(proposal: &Proposal, baseline: &str) -> Result<String> {
     let mut value = serde_json::to_value(proposal)?;
     let baseline = serde_json::from_str::<Value>(baseline).ok();
     preserve_hints_from_baseline(&mut value, baseline.as_ref());
+    preserve_depends_on_from_baseline(&mut value, baseline.as_ref());
     Ok(serde_json::to_string(&value)?)
 }
 
@@ -568,6 +645,7 @@ async fn resolved_from_plan(
         .collect();
     for (index, direction) in directions.iter_mut().enumerate() {
         direction.hint = hint_from_value(&raw, index);
+        direction.depends_on = depends_on_from_value(&raw, index);
     }
     Ok(ResolvedProposal {
         thread_id,
@@ -1339,7 +1417,59 @@ async fn confirm_with_manual_tool_with_session_liveness(
         )
         .await;
     }
+    record_upstream_edges(db, &resolved, &proposal).await;
     Ok(dispatch_ids)
+}
+
+/// Resolve every lane's `depends_on` (the `name` of ANOTHER direction in this
+/// SAME proposal it must merge after — issue #110 T4) to that direction's
+/// materialized id, and record the edge via `set_direction_upstream`. Runs
+/// AFTER the plan CAS has committed: the ordering edge is metadata layered on
+/// top of already-durable directions, not part of what makes confirm atomic,
+/// so it is intentionally best-effort here (mirrors `committed_route_markers`
+/// just above) rather than folded into the create/rollback dance above.
+///
+/// `resolved` (read at the START of confirm, before this call's own
+/// materialization) carries the lead's `depends_on` name per lane;
+/// `proposal.directions[].direction_id` (updated throughout confirm, for BOTH
+/// lanes this call just materialized AND ones a prior confirm/approve already
+/// did) carries every lane's current materialized id. Their `.directions`
+/// indices align 1:1 (both come from the same stored proposal snapshot — see
+/// `resolved_from_plan`'s doc), so a plain zip-by-index resolves names to ids
+/// without re-reading the DB. A bad reference (typo, self/other-thread name,
+/// a lane that never materialized) is silently skipped — `set_direction_
+/// upstream` separately refuses a self-edge or a cycle; anything else here is
+/// simply "no edge recorded", the same state as before this feature existed.
+async fn record_upstream_edges(db: &Db, resolved: &ResolvedProposal, proposal: &Proposal) {
+    for (idx, resolved_dir) in resolved.directions.iter().enumerate() {
+        let depends_on_name = resolved_dir.depends_on.trim();
+        if depends_on_name.is_empty() {
+            continue;
+        }
+        let Some(this_id) = proposal
+            .directions
+            .get(idx)
+            .map(|p| p.direction_id)
+            .filter(|id| *id != 0)
+        else {
+            continue;
+        };
+        let Some(upstream_id) = proposal
+            .directions
+            .iter()
+            .zip(resolved.directions.iter())
+            .find(|(_, r)| r.name == depends_on_name)
+            .map(|(p, _)| p.direction_id)
+            .filter(|id| *id != 0)
+        else {
+            continue;
+        };
+        if let Err(e) = repo::set_direction_upstream(db, this_id, upstream_id).await {
+            eprintln!(
+                "[weft][planner] direction {this_id}: could not record upstream {upstream_id}: {e}"
+            );
+        }
+    }
 }
 
 /// Tear down lanes created in the current confirm attempt (used on any failure to keep
@@ -6114,6 +6244,76 @@ mod tests {
         for id in &ids {
             assert!(dirs.iter().any(|d| d.id == *id), "recorded id {id} is a real direction");
         }
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE WIRING (issue #110 T4, Codex review on PR #159): before this test existed,
+    /// `repo::set_direction_upstream` was called ONLY by `repo.rs`'s own unit tests — no
+    /// production path (planner or command) ever wrote `depends_on_direction_id`, so
+    /// `upstream_merge_state` returned `None` for every production-created task and the
+    /// auto-merge gate could still merge a consumer before its producer. This drives the
+    /// REAL production entry point (`confirm`, exactly what a human's "confirm" click and
+    /// the lead's `propose_directions` tool ultimately reach) with a producer/consumer pair
+    /// proposed in ONE call, the consumer naming the producer by `name` via `depends_on` —
+    /// then asserts the edge landed on the REAL direction rows, not a parallel copy.
+    #[tokio::test]
+    async fn confirm_records_the_upstream_edge_from_depends_on() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-upstream-edge-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // `depends_on` is a JSON extension field (not on the typed `ProposedDirection` — see
+        // its doc), so it is exercised through the SAME raw-JSON boundary a real
+        // `propose_directions` tool call crosses (`save_proposal_value`), not the typed struct.
+        let raw = serde_json::json!({
+            "rationale": "cross-repo change set",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 2, "both known-repo lanes are dispatched");
+
+        let producer_dir = repo::get_direction(&db, ids[0]).await.unwrap().unwrap();
+        let consumer_dir = repo::get_direction(&db, ids[1]).await.unwrap().unwrap();
+        assert_eq!(producer_dir.name, "producer");
+        assert_eq!(consumer_dir.name, "consumer");
+        assert_eq!(
+            consumer_dir.depends_on_direction_id, producer_dir.id,
+            "confirm must resolve depends_on:\"producer\" to the producer's REAL materialized \
+             id and persist it on the consumer's OWN direction row — this is the write no \
+             production path used to reach"
+        );
+        assert_eq!(producer_dir.depends_on_direction_id, 0, "the producer itself has no upstream");
+
+        // The axis this edge exists to feed: with no PR registered yet, the consumer must read
+        // as genuinely blocked — proving the wired edge actually reaches merge_readiness's
+        // fourth axis end to end, not just the DB column.
+        assert!(
+            matches!(
+                repo::upstream_merge_state(&db, consumer_dir.id).await,
+                crate::host::UpstreamStatus::Pending { .. }
+            ),
+            "the wired edge must gate upstream_merge_state, which feeds judge::merge_readiness"
+        );
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;

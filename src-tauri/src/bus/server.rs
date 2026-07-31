@@ -1196,7 +1196,9 @@ fn planner_specs() -> Value {
                     "hint": { "type": "string", "enum": ["normal", "deep"],
                         "description": "Optional routing hint only: normal prefers Codex for cheap batches; deep prefers Claude for deeper reasoning. This is not a tool choice." },
                     "base_branch": { "type": "string",
-                        "description": "Branch in the target repo to branch the new work OFF. Leave empty to use the repo's default branch (main/master). Set it only when the repo merges into a non-default branch (develop/staging/a release branch)." }
+                        "description": "Branch in the target repo to branch the new work OFF. Leave empty to use the repo's default branch (main/master). Set it only when the repo merges into a non-default branch (develop/staging/a release branch)." },
+                    "depends_on": { "type": "string",
+                        "description": "Optional: the exact `name` of ANOTHER task in THIS SAME call's `directions` list that must be merged before this one is allowed to merge — use this for a cross-repo change set where this task consumes something the other task produces (e.g. a submodule SHA bump, a version bump). Leave empty when this task has no upstream. Only names within this same call resolve; a typo or a name from an earlier/later proposal is silently ignored." }
                 }, "required": ["name", "repo", "reason"] } }
             }, "required": ["directions"] }
         },

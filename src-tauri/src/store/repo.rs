@@ -1569,9 +1569,15 @@ pub async fn get_direction(db: &Db, direction_id: i32) -> Result<Option<directio
 /// Deliberately refuses a SELF edge: a task waiting on itself can never
 /// resolve, and `upstream_merge_state` would report it as permanently
 /// `Pending` — a task no human could ever merge, with a reason that reads like
-/// a bug. Longer cycles are not detected here; a single upstream per task
-/// cannot express one, and the day this becomes a real graph it needs a real
-/// cycle check (see `M0046DirectionUpstream`).
+/// a bug.
+///
+/// Also refuses any LONGER cycle (A→B→C→A, …). A single upstream per task
+/// cannot express a fan-in graph, but it can still express a cycle: each hop
+/// only needs its own one upstream slot to point back around. Every task on a
+/// cycle would report the OTHER as still-`Pending` forever — both PRs
+/// permanently unmergeable, with no reason that names the actual problem. See
+/// [`creates_cycle`]; the day this becomes a real many-to-many graph it needs
+/// a real graph-level cycle check (see `M0046DirectionUpstream`).
 pub async fn set_direction_upstream(
     db: &Db,
     direction_id: i32,
@@ -1580,6 +1586,9 @@ pub async fn set_direction_upstream(
     if upstream_id == direction_id {
         anyhow::bail!("a task cannot depend on itself");
     }
+    if creates_cycle(db, direction_id, upstream_id).await? {
+        anyhow::bail!("this would create a dependency cycle");
+    }
     let Some(row) = direction::Entity::find_by_id(direction_id).one(&db.0).await? else {
         return Ok(());
     };
@@ -1587,6 +1596,32 @@ pub async fn set_direction_upstream(
     a.depends_on_direction_id = Set(upstream_id);
     a.update(&db.0).await?;
     Ok(())
+}
+
+/// Would recording `direction_id → upstream_id` close a cycle? Walks
+/// `upstream_id`'s OWN chain (its upstream, that task's upstream, …): if the
+/// walk ever reaches `direction_id`, adding the new edge would complete a
+/// loop back to where it started. A `visited` set bounds the walk at the
+/// number of distinct tasks touched even if the existing data already
+/// contains a cycle (defense in depth — this function is the only writer, so
+/// that should not be reachable, but the walk must still terminate if it
+/// somehow is). `0` (no upstream) and a dangling/missing row both end the
+/// walk with "no cycle" — a chain that runs out is not a loop.
+async fn creates_cycle(db: &Db, direction_id: i32, upstream_id: i32) -> Result<bool> {
+    let mut visited: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut current = upstream_id;
+    loop {
+        if current == direction_id {
+            return Ok(true);
+        }
+        if current == 0 || !visited.insert(current) {
+            return Ok(false);
+        }
+        current = match direction::Entity::find_by_id(current).one(&db.0).await? {
+            Some(row) => row.depends_on_direction_id,
+            None => return Ok(false),
+        };
+    }
 }
 
 pub async fn set_direction_engine_pinned(
@@ -3697,6 +3732,17 @@ pub async fn get_pull_request(db: &Db, id: i32) -> Result<Option<pull_request::M
 /// An upstream with NO registered PR is `Pending`, not `Unknown`: the task
 /// demonstrably has not merged anything yet. That is a fact, not an absence of
 /// information.
+///
+/// A `merged` lifecycle is not sufficient on its own: a PR can merge into a
+/// staging/release/stacked-feature branch and still never reach the
+/// repository's DEFAULT branch, which is what a consumer pinned to this
+/// producer (a submodule SHA, a version bump) actually needs. `Merged` also
+/// requires every merged PR's stored `base_ref` to equal the upstream repo's
+/// LIVE default branch (see [`live_default_branch_for_repo`] — deliberately
+/// NOT the offline "best guess" fallback used for materializing worktrees): an
+/// unresolvable default branch must never optimistically release the merge on
+/// a guess, so it returns `Unknown`, same as every other failure in this
+/// function.
 pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamStatus {
     let dir = match get_direction(db, direction_id).await {
         Ok(Some(d)) => d,
@@ -3739,14 +3785,40 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
             }
         }
     };
-    // Merged only when the upstream has at least one PR and EVERY one of them
-    // has landed: a task that opened two PRs is not done because one merged.
+    // Merged only when the upstream has at least one PR, EVERY one of them has
+    // landed (a task that opened two PRs is not done because one merged), AND
+    // each one landed on the repo's DEFAULT branch — a merge into staging,
+    // release, or a stacked feature branch has not reached what other repos
+    // actually consume (see this function's doc).
     if !prs.is_empty() && prs.iter().all(|p| p.lifecycle == "merged") {
-        return host::UpstreamStatus::Merged;
+        let Some(default_branch) = live_default_branch_for_repo(db, upstream.repo_id).await else {
+            // Never optimistically release the merge on an unresolvable default
+            // branch (offline, repo row gone) — the honest answer is "can't
+            // tell", the same rule every other failure branch above follows.
+            return host::UpstreamStatus::Unknown {
+                reason: "无法确认上游仓库的默认分支".into(),
+            };
+        };
+        if prs.iter().all(|p| p.base_ref.trim() == default_branch) {
+            return host::UpstreamStatus::Merged;
+        }
     }
     host::UpstreamStatus::Pending {
         what: upstream.name.clone(),
     }
+}
+
+/// The live default branch of the repo behind `repo_id`, for vetting whether a
+/// merged upstream PR actually reached it (see `upstream_merge_state`).
+/// Deliberately does NOT fall back to `git::recorded_base_or_default`'s
+/// offline "best guess" the way materializing a worktree does — that fallback
+/// exists because a new worktree must branch off SOMETHING, but here a wrong
+/// guess could optimistically release a merge that has not actually reached
+/// the default branch. `None` on ANY failure (repo row gone, unreadable DB,
+/// offline/no remote) — the caller turns that into `Unknown`, never `Merged`.
+async fn live_default_branch_for_repo(db: &Db, repo_id: i32) -> Option<String> {
+    let repo_ref = get_repo(db, repo_id).await.ok().flatten()?;
+    crate::git::live_default_branch(std::path::Path::new(&repo_ref.local_git_path))
 }
 
 pub async fn list_open_pull_requests(
@@ -7510,10 +7582,14 @@ mod tests {
     }
 
     /// Fixture: a workspace + thread + two tasks, the second depending on the
-    /// first, mirroring a producer→consumer change set.
-    async fn ordered_pair(db: &Db) -> (i32, i32) {
+    /// first, mirroring a producer→consumer change set. `repo_path` need not
+    /// resolve to a real git repo for tests that only exercise PR/DB state
+    /// (Pending/Unknown) — pass a fake path (see [`ordered_pair`]) for those.
+    /// The "actually Merged" happy path needs a REAL repo with a resolvable
+    /// live default branch instead — pass a [`make_repo_with_origin`] clone.
+    async fn ordered_pair_at(db: &Db, repo_path: &str) -> (i32, i32) {
         let ws = create_workspace(db, "ws_order").await.unwrap();
-        let r = add_repo_ref(db, ws.id, "api", "/tmp/ordered-api", "main", "", true)
+        let r = add_repo_ref(db, ws.id, "api", repo_path, "main", "", true)
             .await
             .unwrap();
         let t = create_thread(db, ws.id, "t", "feature", "claude").await.unwrap();
@@ -7525,6 +7601,52 @@ mod tests {
             .unwrap();
         set_direction_upstream(db, consumer.id, producer.id).await.unwrap();
         (producer.id, consumer.id)
+    }
+
+    /// [`ordered_pair_at`] with a FAKE, non-existent repo path — fine for any
+    /// test that only exercises PR/DB state (Pending/Unknown), which never
+    /// touches git. `upstream_merge_state`'s "actually reached the default
+    /// branch" check needs a REAL repo instead (see `make_repo_with_origin`).
+    async fn ordered_pair(db: &Db) -> (i32, i32) {
+        ordered_pair_at(db, "/tmp/ordered-api").await
+    }
+
+    fn sh(dir: &std::path::Path, args: &[&str]) {
+        let st = std::process::Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(st.success(), "cmd {:?} failed", args);
+    }
+
+    /// A real git repo whose LIVE default branch is genuinely resolvable —
+    /// `repo.rs`'s test suite is otherwise DB-only and has never needed one
+    /// before; `upstream_merge_state`'s default-branch check is the one
+    /// exception (it deliberately shells out via `crate::git::live_default_branch`,
+    /// which needs a real `origin` remote — see that function's doc). Mirrors
+    /// `planner::tests::make_repo`/`sh`, duplicated locally rather than shared
+    /// across modules (both are private `#[cfg(test)]` helpers). Returns the
+    /// CLONE's path (what a `repo_ref.local_git_path` would record) — `origin`
+    /// itself is a plain directory under `root`, sibling to the clone.
+    fn make_repo_with_origin(root: &std::path::Path, default_branch: &str) -> std::path::PathBuf {
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        sh(&origin, &["git", "init", "-q"]);
+        sh(&origin, &["git", "config", "user.email", "t@t.t"]);
+        sh(&origin, &["git", "config", "user.name", "t"]);
+        std::fs::write(origin.join("README.md"), "# x\n").unwrap();
+        sh(&origin, &["git", "add", "-A"]);
+        sh(&origin, &["git", "commit", "-q", "-m", "init"]);
+        sh(&origin, &["git", "branch", "-M", default_branch]);
+        let clone = root.join("clone");
+        sh(
+            root,
+            &["git", "clone", "-q", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        sh(&clone, &["git", "config", "user.email", "t@t.t"]);
+        sh(&clone, &["git", "config", "user.name", "t"]);
+        clone
     }
 
     async fn register_open_pr(db: &Db, direction_id: i32, number: i32) -> pull_request::Model {
@@ -7570,11 +7692,20 @@ mod tests {
         }
     }
 
-    /// The ordering itself: open upstream PR → blocked; merged → free.
+    /// The ordering itself: open upstream PR → blocked; merged (AND landed on
+    /// the repo's real default branch) → free. Needs a REAL repo (not the fake
+    /// `/tmp/ordered-api` path `ordered_pair` uses elsewhere in this file) so
+    /// the default-branch check below has a genuine live default to resolve
+    /// against — see `make_repo_with_origin`.
     #[tokio::test]
     async fn an_upstream_pr_releases_the_consumer_only_once_merged() {
         let db = mem().await;
-        let (producer, consumer) = ordered_pair(&db).await;
+        let root = std::env::temp_dir()
+            .join(format!("weft-upstream-merged-releases-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let clone_path = make_repo_with_origin(&root, "main");
+        let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
         let pr = register_open_pr(&db, producer, 1).await;
 
         assert!(
@@ -7601,8 +7732,92 @@ mod tests {
 
         assert_eq!(
             upstream_merge_state(&db, consumer).await,
-            crate::host::UpstreamStatus::Merged
+            crate::host::UpstreamStatus::Merged,
+            "base_ref \"main\" matches the repo's real live default branch, so this must still \
+             read Merged under the new default-branch check"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE FIX (Codex P1, PR #159 review): a `merged` lifecycle alone is not
+    /// enough. A PR that merged into a staging/release/stacked-feature branch
+    /// has landed on THAT PR's base, not on the repo's default branch — so the
+    /// producer change a submodule-pinned/version-bumped consumer actually
+    /// needs is still absent from what other repos consume. Before this fix,
+    /// `upstream_merge_state` ignored the stored `base_ref` entirely and would
+    /// have returned `Merged` here, releasing the consumer's auto-merge on a
+    /// change that never reached `main`.
+    #[tokio::test]
+    async fn a_merged_pr_targeting_a_non_default_branch_does_not_release_the_consumer() {
+        let db = mem().await;
+        let root = std::env::temp_dir()
+            .join(format!("weft-upstream-merged-non-default-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let clone_path = make_repo_with_origin(&root, "main");
+        let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
+        let pr = register_open_pr(&db, producer, 1).await;
+
+        // "Merged" — but into `release`, not the repo's real default `main`.
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: "abc".into(),
+            base_ref: "release".into(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Merged,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                upstream_merge_state(&db, consumer).await,
+                crate::host::UpstreamStatus::Pending { .. }
+            ),
+            "a PR merged into a non-default branch must NOT release the consumer — the producer \
+             change has not reached main, which is what a cross-repo consumer actually needs"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FAIL-SAFE (Codex P1, PR #159 review): when the upstream repo's live
+    /// default branch cannot be resolved at all (offline, no remote, the repo
+    /// row's path is gone) this must NEVER optimistically fall back to a best
+    /// guess and release the merge — it must read `Unknown`, the same honest
+    /// "can't tell" every other failure branch in this function returns.
+    /// Reuses the ordinary fake-path `ordered_pair` fixture: `/tmp/ordered-api`
+    /// is not a real git repo, so `live_default_branch` genuinely fails here.
+    #[tokio::test]
+    async fn an_unresolvable_default_branch_is_unknown_never_optimistically_merged() {
+        let db = mem().await;
+        let (producer, consumer) = ordered_pair(&db).await;
+        let pr = register_open_pr(&db, producer, 1).await;
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: "abc".into(),
+            base_ref: "main".into(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Merged,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+            .await
+            .unwrap();
+
+        match upstream_merge_state(&db, consumer).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!(
+                "an unresolvable default branch must be Unknown, never an optimistic verdict: {other:?}"
+            ),
+        }
     }
 
     /// TWO upstream PRs, one merged: still pending. A task is not done because
@@ -7670,6 +7885,92 @@ mod tests {
             crate::host::UpstreamStatus::Unknown { .. } => {}
             other => panic!("expected unknown, got {other:?}"),
         }
+    }
+
+    /// Fixture: `count` bare tasks (same workspace/thread/repo, no upstream
+    /// edges yet) for the cycle-rejection tests below to wire up.
+    async fn bare_directions(db: &Db, count: usize) -> Vec<i32> {
+        let ws = create_workspace(db, "ws_cycle").await.unwrap();
+        let r = add_repo_ref(db, ws.id, "api", "/tmp/cycle-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(db, ws.id, "t", "feature", "claude").await.unwrap();
+        let mut ids = Vec::with_capacity(count);
+        for i in 0..count {
+            let d = create_direction(db, t.id, &format!("d{i}"), "claude", r.id, "r", "impl-only", "")
+                .await
+                .unwrap();
+            ids.push(d.id);
+        }
+        ids
+    }
+
+    /// THE FIX (Codex P2, PR #159 review): the old check only rejected a
+    /// SELF edge (A depends on A). A→B, then B→A closes a 2-cycle through two
+    /// perfectly legal single-upstream writes — the old code accepted both.
+    /// Once closed, EACH side's `upstream_merge_state` reads the OTHER as
+    /// permanently `Pending`: neither PR can ever become mergeable, with no
+    /// reason that names the actual problem.
+    #[tokio::test]
+    async fn set_direction_upstream_rejects_a_two_cycle() {
+        let db = mem().await;
+        let ids = bare_directions(&db, 2).await;
+        let (a, b) = (ids[0], ids[1]);
+
+        set_direction_upstream(&db, a, b).await.unwrap();
+        let err = set_direction_upstream(&db, b, a)
+            .await
+            .expect_err("B depending on A must be rejected — it would close A→B→A");
+        assert!(
+            err.to_string().contains("cycle"),
+            "error should name the problem: {err}"
+        );
+
+        // The rejected write must not have landed: B still has no upstream.
+        let b_dir = get_direction(&db, b).await.unwrap().unwrap();
+        assert_eq!(b_dir.depends_on_direction_id, 0, "the rejected edge must not persist");
+    }
+
+    /// A single-upstream-per-task graph can still contain an arbitrarily LONG
+    /// cycle (A→B→C→A): each hop only needs its own one upstream slot to point
+    /// back around. The rejection must walk the whole chain, not just the
+    /// immediate edge.
+    #[tokio::test]
+    async fn set_direction_upstream_rejects_a_longer_cycle() {
+        let db = mem().await;
+        let ids = bare_directions(&db, 3).await;
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+
+        set_direction_upstream(&db, a, b).await.unwrap(); // A -> B
+        set_direction_upstream(&db, b, c).await.unwrap(); // B -> C
+        let err = set_direction_upstream(&db, c, a)
+            .await
+            .expect_err("C depending on A must be rejected — it would close A→B→C→A");
+        assert!(
+            err.to_string().contains("cycle"),
+            "error should name the problem: {err}"
+        );
+
+        let c_dir = get_direction(&db, c).await.unwrap().unwrap();
+        assert_eq!(c_dir.depends_on_direction_id, 0, "the rejected edge must not persist");
+    }
+
+    /// Two INDEPENDENT tasks pointing at the SAME upstream is a fan-in, not a
+    /// cycle — must stay allowed. A single-upstream-per-task model can't
+    /// express fan-OUT (one producer, many consumers) any other way.
+    #[tokio::test]
+    async fn set_direction_upstream_allows_two_consumers_of_the_same_producer() {
+        let db = mem().await;
+        let ids = bare_directions(&db, 3).await;
+        let (producer, consumer_1, consumer_2) = (ids[0], ids[1], ids[2]);
+
+        set_direction_upstream(&db, consumer_1, producer).await.unwrap();
+        set_direction_upstream(&db, consumer_2, producer).await.unwrap();
+
+        let c1 = get_direction(&db, consumer_1).await.unwrap().unwrap();
+        let c2 = get_direction(&db, consumer_2).await.unwrap().unwrap();
+        assert_eq!(c1.depends_on_direction_id, producer);
+        assert_eq!(c2.depends_on_direction_id, producer);
     }
 
     #[tokio::test]
