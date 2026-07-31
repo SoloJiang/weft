@@ -121,31 +121,29 @@ export function isInFlight(state: TurnState): boolean {
   return state === "busy" || state === "stalled";
 }
 
-/** A NeedItem the human must actually act on — excludes EITHER display-only
- *  NOTICE kind (`item.kind !== "question"`: the self-clearing stall hint, the
- *  stopped-worker hint, or the non-self-clearing PR/MR give-up notice). Every
- *  notice surfaces in the Needs-you queue as an FYI row but has no answer to
- *  give. Single source of truth for every "needs you" badge/count/urgent-flag
- *  so a notice can't inflate a number that promises "N things need your
- *  action" (issue #105) — even the one notice kind that, unlike the others,
- *  won't clear itself; see `NeedsRows.tsx`'s `AskRow` for how that one is
- *  instead made visually unmissable. */
+/** A NeedItem that accepts a human reply in a worker conversation. Persistent
+ *  action-required notices have a retry control instead, so they remain
+ *  excluded from the inline answer form and urgency checks. */
 export function isPendingNeed(item: NeedItem): boolean {
   return item.kind === "question";
 }
 
-/** Workspace-wide "needs you" count: real agent questions (excludes
- *  self-clearing NOTICEs via `isPendingNeed`) + tool-permission asks + pending
- *  write triggers — everything actually waiting on the human. Single source for
- *  every numeric badge (dock strip, nav item) so they can't drift apart; the
- *  Needs-you queue itself still RENDERS a notice row (so a stall hint stays
- *  reachable) — it just doesn't count toward this number. */
+/** A NeedItem that contributes to numeric "needs you" badges. Ordinary notices
+ *  are FYI-only; action-required notices stay counted because their retry
+ *  control needs explicit human attention. */
+export function isActionableNeed(item: NeedItem): boolean {
+  return item.kind === "question" || item.kind === "notice_action_required";
+}
+
+/** Workspace-wide "needs you" count: actionable Needs-you rows + tool-
+ *  permission asks + pending write triggers. The queue still renders ordinary
+ *  self-clearing notices as FYI rows without counting them. */
 export function pendingNeedsCount(
   needs: NeedItem[],
   asks: PermissionAsk[],
   writeTriggers: WriteTrigger[],
 ): number {
-  return needs.filter(isPendingNeed).length + asks.length + writeTriggers.length;
+  return needs.filter(isActionableNeed).length + asks.length + writeTriggers.length;
 }
 
 const PROCESS_QUOTA_NOTICE_VIEW: Record<
@@ -678,6 +676,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [writeTriggers, setWriteTriggers] = useState<WriteTrigger[]>([]);
   const [needsByWorkspace, setNeedsByWorkspace] = useState<Record<number, number>>({});
   const needsRefreshSeqRef = useRef(0);
+  const needsRefreshInFlightRef = useRef<Promise<void> | null>(null);
+  const needsRefreshPendingRef = useRef(false);
   const [showNeeds, setShowNeeds] = useState(false);
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
@@ -1507,7 +1507,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             status: "running",
             directionId,
             repoId,
-            threadId: activeThreadId ?? -1,
+            // The backend resolves the direction's owning thread. Do not use
+            // activeThreadId here: background auto-review can start a worker
+            // for a different cached thread while another issue is open.
+            threadId: info.thread_id,
             nativeId: info.native_id,
           },
         };
@@ -1515,7 +1518,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (focus) openWorker(directionId, repoId);
       return info.session_id;
     },
-    [activeThreadId, openWorker],
+    [openWorker],
   );
 
   // Adopt a backend-initiated worker (boot revive, or one still alive after a
@@ -2389,8 +2392,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [activeThreadId],
   );
 
-  const refreshNeeds = useCallback(async () => {
-    const workspaceId = activeWorkspaceId;
+  const refreshNeedsOnce = useCallback(async () => {
+    const workspaceId = activeWorkspaceIdRef.current;
     const requestId = ++needsRefreshSeqRef.current;
     const isLatestRequest = () => requestId === needsRefreshSeqRef.current;
     // Permission Asks are global (not workspace-scoped); always refresh them.
@@ -2456,7 +2459,31 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return { ...current, needs: true };
       });
     }
-  }, [activeWorkspaceId]);
+  }, []);
+
+  const refreshNeeds = useCallback(async () => {
+    const inFlight = needsRefreshInFlightRef.current;
+    if (inFlight) {
+      needsRefreshPendingRef.current = true;
+      await inFlight;
+      return;
+    }
+    const run = async () => {
+      do {
+        needsRefreshPendingRef.current = false;
+        await refreshNeedsOnce();
+      } while (needsRefreshPendingRef.current);
+    };
+    const current = run();
+    needsRefreshInFlightRef.current = current;
+    try {
+      await current;
+    } finally {
+      if (needsRefreshInFlightRef.current === current) {
+        needsRefreshInFlightRef.current = null;
+      }
+    }
+  }, [refreshNeedsOnce]);
 
   const openNeeds = useCallback(() => {
     setViewing(null);

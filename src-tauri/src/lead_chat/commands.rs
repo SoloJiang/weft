@@ -52,6 +52,7 @@ fn push_model_arg(extra: &mut Vec<String>, model: Option<&str>) {
 #[derive(serde::Serialize, Clone)]
 pub struct SessionInfo {
     pub session_id: i32,
+    pub thread_id: i32,
     pub repo: String,
     pub worktree: String,
     pub branch: String,
@@ -1130,6 +1131,7 @@ async fn build_worker_slots(db: &Db, snaps: Vec<WorkerSnapshot>) -> Vec<LiveWork
         out.push(LiveWorkerSlot {
             info: SessionInfo {
                 session_id: sess.id,
+                thread_id: s.thread_id,
                 repo: wt.path.clone(),
                 worktree: wt.path,
                 branch: wt.branch,
@@ -1569,6 +1571,7 @@ pub(crate) async fn chat_open_worker_impl(
     let command = crate::tool_command::effective(sess.command.as_deref(), &session_tool);
     Ok(SessionInfo {
         session_id: sess.id,
+        thread_id: dir.thread_id,
         repo: wt.path.clone(),
         worktree: wt.path,
         branch: wt.branch,

@@ -189,6 +189,7 @@ export interface Worktree {
 
 export interface SessionInfo {
   session_id: number;
+  thread_id: number;
   repo: string;
   worktree: string;
   branch: string;

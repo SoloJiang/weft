@@ -256,6 +256,13 @@ export async function handleNotifyOpen(
       return;
     }
   }
+  // Global routes (quota and ownership-unknown Needs-you entries) also mutate
+  // the current surface. A workspace reset that is already in flight would
+  // otherwise erase Resources/Needs immediately after this handler opens it.
+  if (deps.workspaceLoading) {
+    stashPendingNav(payload);
+    return;
+  }
   await applyNotifyIntents(payload, deps);
 }
 
@@ -478,7 +485,7 @@ export function useSystemNotifications() {
         await handleOpen(pending);
         takenPending = null;
       } catch {
-        if (cancelled && takenPending) {
+        if (takenPending) {
           try {
             await api.osNotifyRestorePendingOpen(takenPending);
             takenPending = null;

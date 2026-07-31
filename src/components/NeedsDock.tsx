@@ -1,15 +1,15 @@
-import { GitBranch, HelpCircle, Layers, ShieldQuestion } from "lucide-react";
+import { AlertTriangle, GitBranch, HelpCircle, Layers, ShieldQuestion } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import type { PermissionAsk, WriteTrigger, NeedItem } from "../lib/types";
 import { cn } from "../lib/cn";
-import { isPendingNeed, pendingNeedsCount, useStore } from "../state/store";
+import { isActionableNeed, pendingNeedsCount, useStore } from "../state/store";
 import { needsBarMotion } from "../lib/motion";
 
 type DockItem =
   | { kind: "write"; item: WriteTrigger }
   | { kind: "permission"; item: PermissionAsk }
-  | { kind: "question"; item: NeedItem };
+  | { kind: "need"; item: NeedItem };
 
 /**
  * Workspace-wide "Needs you" strip: a quiet indicator + router only. It shows
@@ -22,11 +22,10 @@ export function NeedsDock() {
   const { needs, asks, writeTriggers, openNeeds } = useStore();
   const { t } = useTranslation();
   const reduce = useReducedMotion();
-  // Self-clearing stall notices don't count — this strip promises "N things
-  // need your action" (issue #105), and a notice has none. It still shows up
-  // once you open the queue via the persistent "Needs you" nav entry.
+  // Self-clearing stall notices don't count; persistent action-required notices
+  // do count because their retry control needs explicit attention.
   const total = pendingNeedsCount(needs, asks, writeTriggers);
-  const top = topDockItem(writeTriggers, asks, needs.filter(isPendingNeed));
+  const top = topDockItem(writeTriggers, asks, needs.filter(isActionableNeed));
 
   return (
     <AnimatePresence initial={false}>
@@ -63,7 +62,7 @@ function topDockItem(
 ): DockItem | null {
   if (writeTriggers[0] != null) return { kind: "write", item: writeTriggers[0] };
   if (asks[0] != null) return { kind: "permission", item: asks[0] };
-  if (needs[0] != null) return { kind: "question", item: needs[0] };
+  if (needs[0] != null) return { kind: "need", item: needs[0] };
   return null;
 }
 
@@ -94,6 +93,15 @@ function DockSummary({ top }: { top: DockItem }) {
   }
 
   const item = top.item;
+  if (item.kind === "notice_action_required") {
+    return (
+      <span className="flex min-w-0 items-center gap-1.5 text-ink-muted">
+        <AlertTriangle size={13} className="shrink-0 text-danger" />
+        <span>{t("needs.actionRequired")}</span>
+        <ContextText text={[item.thread_title, item.direction_name].filter(Boolean).join(" · ")} />
+      </span>
+    );
+  }
   return (
     <span className="flex min-w-0 items-center gap-1.5 text-ink-muted">
       <HelpCircle size={13} className="shrink-0 text-waiting" />
