@@ -221,6 +221,7 @@ mod tests {
             ts: 0,
             thread_title: "登录超时修复".into(),
             dir_name: "backend".into(),
+            workspace_id: None,
             action_key: "claude:npm test".into(),
         }
     }
