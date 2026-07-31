@@ -831,6 +831,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const [processQuota, setProcessQuota] = useState<ProcessQuotaStatus | null>(null);
   const processQuotaRef = useRef<ProcessQuotaStatus | null>(null);
+  const processQuotaObservedRef = useRef<ProcessQuotaStatus | null>(null);
   const processQuotaHydratedRef = useRef(false);
   const applyProcessQuota = useCallback((next: ProcessQuotaStatus) => {
     const previous = processQuotaRef.current;
@@ -848,6 +849,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     try {
       const next = await api.processQuotaStatus();
       applyProcessQuota(next);
+      const observed = processQuotaObservedRef.current;
+      if (observed === null || shouldApplyProcessQuotaStatus(observed, next)) {
+        processQuotaObservedRef.current = next;
+      }
       processQuotaHydratedRef.current = true;
       setNotificationHydration((current) => ({ ...current, quota: true }));
     } catch (error) {
@@ -857,11 +862,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [applyProcessQuota]);
   useEffect(() => {
     const unlisten = listen<ProcessQuotaStatus>("process-quota://changed", (event) => {
+      const previous = processQuotaObservedRef.current;
+      const isNewTransition =
+        previous !== null && event.payload.transitionSeq > previous.transitionSeq;
+      if (
+        previous === null ||
+        shouldApplyProcessQuotaStatus(previous, event.payload)
+      ) {
+        processQuotaObservedRef.current = event.payload;
+      }
       applyProcessQuota(event.payload);
       setNotificationHydration((current) => ({
         ...current,
         quota: processQuotaHydratedRef.current,
-        quotaPushPending: true,
+        quotaPushPending: current.quotaPushPending || isNewTransition,
       }));
     });
     void refreshProcessQuota();

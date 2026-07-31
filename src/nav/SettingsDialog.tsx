@@ -239,6 +239,19 @@ function GeneralSettings() {
 
   const spawnable = spawnableToolsOf(installedTools);
   const canOpenNotificationSettings = canOpenSystemNotificationSettings();
+  const deniedNotificationHint = canOpenNotificationSettings ? (
+    <button
+      type="button"
+      onClick={() => void openSystemNotificationSettings()}
+      className="text-[11px] text-waiting transition-colors hover:text-ink hover:underline"
+    >
+      {t("settings.notifyDenied")}
+    </button>
+  ) : (
+    <span className="text-[11px] text-waiting">
+      {t("settings.notifyDeniedUnavailable")}
+    </span>
+  );
 
   // Per-tool command overrides ("aliases", e.g. claude → cc-claude). `draft`
   // holds in-progress edits; `saved` is what the backend persisted, so a Save
@@ -405,15 +418,7 @@ function GeneralSettings() {
               onChange={onNotifyToggle}
               label={t("settings.notifications")}
             />
-            {notifyEnabled && notifyPerm === "denied" && canOpenNotificationSettings && (
-              <button
-                type="button"
-                onClick={() => void openSystemNotificationSettings()}
-                className="text-[11px] text-waiting transition-colors hover:text-ink hover:underline"
-              >
-                {t("settings.notifyDenied")}
-              </button>
-            )}
+            {notifyEnabled && notifyPerm === "denied" && deniedNotificationHint}
             {notifyEnabled && (
               <div className="flex w-full max-w-[280px] flex-col gap-1.5 rounded-[var(--radius-md)] border border-border bg-bg/50 px-2.5 py-2">
                 {NOTIFY_CATEGORIES.map((kind) => (

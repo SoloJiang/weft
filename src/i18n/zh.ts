@@ -728,6 +728,7 @@ export const zh = {
     notifications: "系统通知",
     notificationsHint: "窗口不在前台时，按下方勾选的事件弹出系统通知；点击通知可跳转到对应位置。Dock 角标始终反映待你处理数量。",
     notifyDenied: "系统已拒绝通知 — 打开系统设置开启",
+    notifyDeniedUnavailable: "系统已阻止通知。",
     notifyCat_needs: "待你处理",
     notifyCat_review: "可以 review 了",
     notifyCat_stalled: "会话停滞",

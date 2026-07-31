@@ -270,6 +270,7 @@ export async function handleNotifyOpen(
     workspaceRestoring?: boolean;
     workspaceLoadReady?: boolean;
     needsHydrated?: boolean;
+    liveWorkersHydrated?: boolean;
   },
 ): Promise<boolean> {
   await focusMainWindow();
@@ -319,6 +320,13 @@ export async function handleNotifyOpen(
   }
   const needsIntent = intents.some((intent) => intent.type === "needs");
   if (needsIntent && deps.needsHydrated === false) {
+    stashPendingNav(payload);
+    return false;
+  }
+  const workerIntent = intents.some(
+    (intent) => intent.type === "direction" && intent.sessionId != null,
+  );
+  if (workerIntent && deps.liveWorkersHydrated === false) {
     stashPendingNav(payload);
     return false;
   }
@@ -392,6 +400,7 @@ export function useSystemNotifications() {
   const needsHydrated =
     notificationHydration.workspaceId === activeWorkspaceId &&
     notificationHydration.needs;
+  const liveWorkersHydrated = notificationHydration.liveWorkers;
   const { t } = useTranslation();
   const prev = useRef<NotifySnapshot | null>(null);
   const baselineWs = useRef<number | null>(null);
@@ -501,6 +510,7 @@ export function useSystemNotifications() {
     workspaceRestoring,
     workspaceLoadReady,
     needsHydrated,
+    liveWorkersHydrated,
   });
   const navigationTailRef = useRef<Promise<void>>(Promise.resolve());
   const navigationSelectWorkspace = useCallback(
@@ -529,6 +539,7 @@ export function useSystemNotifications() {
       workspaceRestoring,
       workspaceLoadReady,
       needsHydrated,
+      liveWorkersHydrated,
     };
   }, [
     navigationSelectWorkspace,
@@ -542,6 +553,7 @@ export function useSystemNotifications() {
     workspaceRestoring,
     workspaceLoadReady,
     needsHydrated,
+    liveWorkersHydrated,
   ]);
 
   useEffect(() => {
@@ -709,6 +721,15 @@ export function useSystemNotifications() {
       putPendingNav(pending);
       return;
     }
+    const workerIntent = planNotifyOpen(pending).some(
+      (intent) => intent.type === "direction" && intent.sessionId != null,
+    );
+    if (workerIntent && !liveWorkersHydrated) {
+      // A retained stalled-worker click must wait for adopted sessions before
+      // resolving the exact session route; otherwise it falls back to lead.
+      putPendingNav(pending);
+      return;
+    }
     pendingApplyingKey.current = applicationKey;
     const application = navigationTailRef.current.then(() =>
       applyNotifyIntents(pending, {
@@ -745,6 +766,7 @@ export function useSystemNotifications() {
     workspaceRestoring,
     workspaceLoadReady,
     needsHydrated,
+    liveWorkersHydrated,
     goToDirectionRef,
     openNeeds,
     openSettings,
@@ -810,10 +832,6 @@ export function useSystemNotifications() {
       threadsById.current,
       activeWorkspaceId,
     );
-    // Do not advance any baseline while the current workspace selection is
-    // resetting. Global asks/stalls/quota/review transitions must survive until
-    // the settled snapshot can be compared.
-    if (workspaceLoading) return;
     const reviewNotificationsEnabled = notifyEnabled && notifyCategories.review;
     const reviewMuteBegan =
       reviewNotificationsEnabledPrevious.current && !reviewNotificationsEnabled;
@@ -824,6 +842,10 @@ export function useSystemNotifications() {
       globalBaselineReady.current.review = false;
       baselineReady.current.delete("review");
     }
+    // Do not advance any baseline while the current workspace selection is
+    // resetting. Global asks/stalls/quota/review transitions must survive until
+    // the settled snapshot can be compared.
+    if (workspaceLoading) return;
     const sourceReady: Record<NotifyCategory, boolean> = {
       needs: asksReady || workspaceNeedsReady,
       review:

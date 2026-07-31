@@ -756,6 +756,7 @@ export const en = {
     notifications: "System notifications",
     notificationsHint: "While the window is unfocused, Weft raises OS notifications for the events you enable below. Dock badge tracks Needs-you regardless. Click a notification to jump to it.",
     notifyDenied: "Notifications are blocked by the OS — open System Settings",
+    notifyDeniedUnavailable: "Notifications are blocked by the OS.",
     notifyCat_needs: "Needs you",
     notifyCat_review: "Ready for review",
     notifyCat_stalled: "Stalled sessions",
