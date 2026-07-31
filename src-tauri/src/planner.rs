@@ -1800,6 +1800,26 @@ async fn set_upstream_edge_if_changed(db: &Db, thread_id: i32, direction_id: i32
     if let Err(e) = repo::set_direction_upstream(db, direction_id, target).await {
         eprintln!("[weft][planner] direction {direction_id}: could not record upstream {target}: {e}");
         notify_upstream_edge_write_failed(thread_id, direction_id, target, &e);
+        // A REJECTED/FAILED write must never leave the edge at whatever it happened to be
+        // BEFORE this call — if that prior value is `0` ("no dependency"), the direction would
+        // read as free to merge despite a prerequisite that was just rejected, not satisfied
+        // (Codex review, PR #159 planner.rs:1772: a mutual 2-cycle's SECOND edge is correctly
+        // rejected by `set_direction_upstream`'s cycle check — self-reference can no longer
+        // reach this point at all, excluded at resolve time, but a LONGER cycle only shows up
+        // graph-globally and still reaches this write-time check — and that rejection was
+        // silently swallowed here, leaving the rejected lane looking dependency-free). Falls
+        // back to the SAME blocking sentinel every other unresolvable case in this feature
+        // already uses (`UNRESOLVED_UPSTREAM_SENTINEL` — reused, not a new one): writing a
+        // sentinel can never itself be rejected as a cycle (it is never a real row's id — see
+        // `set_direction_upstream`'s doc), so this fallback write is unconditionally safe to
+        // attempt regardless of what the original `target` was.
+        if let Err(e2) = repo::set_direction_upstream(db, direction_id, repo::UNRESOLVED_UPSTREAM_SENTINEL).await {
+            eprintln!(
+                "[weft][planner] direction {direction_id}: ALSO could not fall back to the \
+                 blocking sentinel after the rejected write above: {e2} — this direction's \
+                 upstream edge may still read as a stale, possibly-\"no dependency\" value"
+            );
+        }
     }
 }
 
@@ -7317,6 +7337,76 @@ mod tests {
              is saved — this is a structural fact about the proposal's own shape, decidable \
              with zero knowledge of any decision that hasn't happened yet"
         );
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1772): a mutual 2-cycle (`a` depends on `b`,
+    /// `b` depends on `a`) is NOT a self-reference (excluded at resolve time — see
+    /// `resolve_depends_on_indices`) and NOT an ambiguous name — each name resolves to exactly
+    /// ONE other lane, cleanly, at save time. The cycle only exists at the GRAPH level, which
+    /// per-lane index resolution cannot see; it only surfaces when `record_upstream_edges`'s
+    /// two-pass write actually tries to install both edges: whichever lane processes first
+    /// writes successfully, and the second write is correctly rejected by
+    /// `set_direction_upstream`'s `creates_cycle` check. Before this fix, that rejection was
+    /// swallowed by `set_upstream_edge_if_changed`, leaving the rejected lane's
+    /// `depends_on_direction_id` at its prior value (`0`) — reading as dependency-free and
+    /// free to auto-merge despite its declared (if cyclic) prerequisite never being satisfied.
+    #[tokio::test]
+    async fn a_mutual_cycle_leaves_the_rejected_lane_blocked_not_dependency_free() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-mutual-cycle-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "a", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "b"},
+                {"name": "b", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "a"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 2, "both lanes are dispatched — the cycle blocks EDGES, not materialization");
+        let (a_id, b_id) = (ids[0], ids[1]);
+
+        let a_dir = repo::get_direction(&db, a_id).await.unwrap().unwrap();
+        let b_dir = repo::get_direction(&db, b_id).await.unwrap().unwrap();
+        // `record_upstream_edges`'s two-pass write processes lanes in PROPOSAL ARRAY ORDER
+        // (`a` at index 0, `b` at index 1 — see `upstream_lanes_from_resolved`'s "indices
+        // align 1:1" doc): `a`'s write (a -> b) lands first, while b -> a does not exist yet,
+        // so it succeeds cleanly; `b`'s write (b -> a) then finds a -> b ALREADY in the DB and
+        // is correctly rejected as a cycle by `set_direction_upstream`.
+        assert_eq!(
+            a_dir.depends_on_direction_id, b_id,
+            "the FIRST half of the cycle to be written wins cleanly"
+        );
+        assert_eq!(
+            b_dir.depends_on_direction_id,
+            repo::UNRESOLVED_UPSTREAM_SENTINEL,
+            "the SECOND half — rejected by the cycle check — must land on the blocking \
+             sentinel, not silently stay at 0 (\"no dependency\") just because \
+             set_direction_upstream's write failed"
+        );
+        match repo::upstream_merge_state(&db, b_id).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!("the rejected half of a cycle must read Unknown (blocking), never {other:?}"),
+        }
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
     }
 
     /// THE FIX (Codex review, PR #159 planner.rs:1447): a lead re-proposes a reusable
