@@ -37,6 +37,7 @@ import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 import { spawnableToolsOf } from "../lib/toolStatus.ts";
 import {
+  canOpenSystemNotificationSettings,
   ensureNotifyPermission,
   formatQuietTime,
   NOTIFY_CATEGORIES,
@@ -237,6 +238,7 @@ function GeneralSettings() {
   const [lang, setLangState] = useState<Lang>(currentLang());
 
   const spawnable = spawnableToolsOf(installedTools);
+  const canOpenNotificationSettings = canOpenSystemNotificationSettings();
 
   // Per-tool command overrides ("aliases", e.g. claude → cc-claude). `draft`
   // holds in-progress edits; `saved` is what the backend persisted, so a Save
@@ -403,7 +405,7 @@ function GeneralSettings() {
               onChange={onNotifyToggle}
               label={t("settings.notifications")}
             />
-            {notifyEnabled && notifyPerm === "denied" && (
+            {notifyEnabled && notifyPerm === "denied" && canOpenNotificationSettings && (
               <button
                 type="button"
                 onClick={() => void openSystemNotificationSettings()}

@@ -898,6 +898,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const setNotifyEnabled = useCallback((on: boolean) => {
     localStorage.setItem(STORAGE_KEYS.notify, on ? "1" : "0");
     setNotifyEnabledState(on);
+    setNotificationHydration((current) => ({ ...current, overview: false }));
+    setNotificationOverview([]);
   }, []);
   const [notifyCategories, setNotifyCategoriesState] = useState<NotifyCategoryFlags>(
     () => parseNotifyCategories(localStorage.getItem(STORAGE_KEYS.notifyCategories)),
@@ -908,6 +910,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       localStorage.setItem(STORAGE_KEYS.notifyCategories, serializeNotifyCategories(next));
       return next;
     });
+    if (kind === "review") {
+      setNotificationHydration((current) => ({ ...current, overview: false }));
+      setNotificationOverview([]);
+    }
   }, []);
   const [quietHours, setQuietHoursState] = useState<QuietHours>(
     () => parseQuietHours(localStorage.getItem(STORAGE_KEYS.notifyQuietHours)),
@@ -1194,9 +1200,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setThreadTab("lead");
       setShowBus(false);
       setReviewingProposal(false);
+      setProposal(null);
       try {
         const nextProposal = await api.getProposal(threadId);
-        if (selectionGeneration !== threadSelectionGenerationRef.current) return;
+        if (
+          selectionGeneration !== threadSelectionGenerationRef.current ||
+          (nextProposal != null && nextProposal.thread_id !== threadId)
+        ) {
+          return;
+        }
         setProposal(nextProposal);
       } catch (e) {
         if (selectionGeneration === threadSelectionGenerationRef.current) {
@@ -3337,6 +3349,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         );
       }
       if (live) {
+        threadSelectionGenerationRef.current += 1;
+        setProposal(null);
         setActiveThreadId(thread);
         openWorker(live.directionId, live.repoId);
         return;

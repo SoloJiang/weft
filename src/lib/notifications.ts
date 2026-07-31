@@ -77,6 +77,12 @@ export function ensureNotifyPermission(): Promise<NotifyPermission> {
 
 /** Jump to the OS notification settings. macOS / Windows have stable URLs;
  *  Linux has no portable one — returns false and the caller's copy stands. */
+export function canOpenSystemNotificationSettings(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent;
+  return ua.includes("Mac") || ua.includes("Windows");
+}
+
 export async function openSystemNotificationSettings(): Promise<boolean> {
   const ua = navigator.userAgent;
   let url: string | null = null;
@@ -405,6 +411,9 @@ export function useSystemNotifications() {
     stalled: false,
     quota: false,
   });
+  const reviewNotificationsEnabledPrevious = useRef(
+    notifyEnabled && notifyCategories.review,
+  );
   const [permissionState, setPermissionState] = useState<NotifyPermission>("prompt");
   const [windowFocused, setWindowFocused] = useState<boolean | null>(null);
   const lastBadge = useRef<number | null>(null);
@@ -805,9 +814,21 @@ export function useSystemNotifications() {
     // resetting. Global asks/stalls/quota/review transitions must survive until
     // the settled snapshot can be compared.
     if (workspaceLoading) return;
+    const reviewNotificationsEnabled = notifyEnabled && notifyCategories.review;
+    const reviewMuteBegan =
+      reviewNotificationsEnabledPrevious.current && !reviewNotificationsEnabled;
+    reviewNotificationsEnabledPrevious.current = reviewNotificationsEnabled;
+    if (reviewMuteBegan) {
+      // A muted review source must be rebaselined when it returns; transitions
+      // that happened while muted are not notification events.
+      globalBaselineReady.current.review = false;
+    }
     const sourceReady: Record<NotifyCategory, boolean> = {
       needs: asksReady || workspaceNeedsReady,
-      review: sourceWorkspaceMatches && notificationHydration.overview,
+      review:
+        reviewNotificationsEnabled &&
+        sourceWorkspaceMatches &&
+        notificationHydration.overview,
       // Lead-turn pushes and locally observed sessions are authoritative even
       // while the adopted-worker snapshot is retrying.
       stalled: sourceWorkspaceMatches,
