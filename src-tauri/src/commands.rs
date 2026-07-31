@@ -2370,13 +2370,14 @@ pub async fn workspace_needs_counts(
     let open_asks = asks.open();
     let mut out = Vec::new();
     for w in repo::list_workspaces(&db).await.map_err(e)? {
-        let threads: Vec<_> = repo::list_threads(&db, w.id)
+        let all_threads = repo::list_threads(&db, w.id)
             .await
-            .map_err(e)?
+            .map_err(e)?;
+        let workspace_tids: HashSet<i32> = all_threads.iter().map(|t| t.id).collect();
+        let threads: Vec<_> = all_threads
             .into_iter()
             .filter(|t| t.kind != "curator") // hidden curator chat isn't a board issue
             .collect();
-        let tids: HashSet<i32> = threads.iter().map(|t| t.id).collect();
         let mut count: u32 = 0;
         for t in &threads {
             // Questions still come from open_answerable_ask_count (issue #105).
@@ -2396,7 +2397,10 @@ pub async fn workspace_needs_counts(
         }
         count += open_asks
             .iter()
-            .filter(|a| tids.contains(&a.thread))
+            // Permission asks are global and the hidden curator thread is not
+            // part of `threads` above, but its asks still belong to this
+            // workspace and appear in Needs-you.
+            .filter(|a| workspace_tids.contains(&a.thread))
             .count() as u32;
         out.push((w.id, count));
     }

@@ -619,6 +619,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [threadWorkspaceById, setThreadWorkspaceById] = useState<Record<number, number>>({});
   const [workspaceLoadSeq, setWorkspaceLoadSeq] = useState(0);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const workspaceLoadCountRef = useRef(0);
   const rememberThreads = useCallback((list: Thread[]) => {
     setThreads(list);
     setThreadWorkspaceById((prev) => {
@@ -980,6 +981,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const selectWorkspace = useCallback(async (id: number) => {
+    workspaceLoadCountRef.current += 1;
     setActiveWorkspaceId(id);
     setWorkspaceLoading(true);
     setNotificationHydration((current) => ({
@@ -1013,13 +1015,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setShowNeeds(false);
       setHomeTab("board");
       setProposal(null);
+      // A concurrent overview poll may have marked the source ready before this
+      // load resets its data. Invalidate that response and re-arm hydration for
+      // the empty snapshot that is now authoritative until the next poll.
+      overviewReqRef.current += 1;
       setOverview([]);
+      setNotificationHydration((current) => {
+        if (current.workspaceId !== id) return current;
+        return { ...current, overview: false };
+      });
       setWorkspaceLoadSeq((n) => n + 1);
     } finally {
-      // Only clear loading if this selection is still the active one.
-      if (activeWorkspaceIdRef.current === id) {
-        setWorkspaceLoading(false);
-      }
+      workspaceLoadCountRef.current -= 1;
+      if (workspaceLoadCountRef.current === 0) setWorkspaceLoading(false);
     }
   }, [rememberThreads]);
 
