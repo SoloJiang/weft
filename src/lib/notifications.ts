@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
@@ -371,6 +371,7 @@ export function useSystemNotifications() {
     stalled: false,
     quota: false,
   });
+  const liveWorkersReadyPrevious = useRef(false);
   const [permissionState, setPermissionState] = useState<NotifyPermission>("prompt");
   const [windowFocused, setWindowFocused] = useState<boolean | null>(null);
   const lastBadge = useRef<number | null>(null);
@@ -458,9 +459,21 @@ export function useSystemNotifications() {
     workspaceLoadReady,
     needsHydrated,
   });
+  const navigationSelectWorkspace = useCallback(
+    async (id: number) => {
+      // React's passive effects can lag a notification event by one tick. Keep
+      // the navigation snapshot synchronously honest while the store starts its
+      // async workspace load so a following click cannot open over the reset.
+      navDepsRef.current.activeWorkspaceId = id;
+      navDepsRef.current.workspaceLoading = true;
+      navDepsRef.current.workspaceLoadReady = false;
+      await selectWorkspace(id);
+    },
+    [selectWorkspace],
+  );
   useEffect(() => {
     navDepsRef.current = {
-      selectWorkspace,
+      selectWorkspace: navigationSelectWorkspace,
       goToDirectionRef,
       openNeeds,
       openSettings,
@@ -472,7 +485,7 @@ export function useSystemNotifications() {
       needsHydrated,
     };
   }, [
-    selectWorkspace,
+    navigationSelectWorkspace,
     goToDirectionRef,
     openNeeds,
     openSettings,
@@ -489,12 +502,13 @@ export function useSystemNotifications() {
     let cancelled = false;
     let takenPending: OsNotifyOpenEvent | null = null;
     const openInFlight = new Map<string, Promise<void>>();
+    let openTail: Promise<void> = Promise.resolve();
 
     const handleOpen = (payload: OsNotifyOpenEvent): Promise<void> => {
       const key = notifyOpenKey(payload);
       const existing = openInFlight.get(key);
       if (existing) return existing;
-      const task = (async () => {
+      const task = openTail.then(async () => {
         await handleNotifyOpen(payload, navDepsRef.current);
         // Native delivery retains the payload until the frontend confirms it was
         // handled. This also prevents a live event from being drained again by
@@ -504,7 +518,8 @@ export function useSystemNotifications() {
         } catch {
           /* pure-vite */
         }
-      })();
+      });
+      openTail = task.catch(() => undefined);
       openInFlight.set(key, task);
       void task.then(
         () => {
@@ -683,6 +698,10 @@ export function useSystemNotifications() {
   // Each category keeps its own baseline so a ready source can accumulate real
   // events while an unrelated source is still retrying.
   useEffect(() => {
+    const sourceWorkspaceMatches =
+      notificationHydration.workspaceId === activeWorkspaceId;
+    const liveWorkersReady =
+      sourceWorkspaceMatches && notificationHydration.liveWorkers;
     const sessionRefs: Record<
       number,
       {
@@ -691,16 +710,19 @@ export function useSystemNotifications() {
         directionId: number;
         repoId: number;
         threadId: number;
+        eventDriven?: boolean;
         workspaceId?: number;
       }
     > = {};
     for (const [sid, s] of Object.entries(sessions)) {
+      if (!liveWorkersReady && !s.eventDriven) continue;
       sessionRefs[Number(sid)] = {
         info: { session_id: s.info.session_id },
         status: s.status,
         directionId: s.directionId,
         repoId: s.repoId,
         threadId: s.threadId,
+        eventDriven: s.eventDriven,
         workspaceId: s.workspaceId,
       };
     }
@@ -715,16 +737,32 @@ export function useSystemNotifications() {
       threadsById.current,
       activeWorkspaceId,
     );
-    const sourceWorkspaceMatches =
-      notificationHydration.workspaceId === activeWorkspaceId;
     const sourceReady: Record<NotifyCategory, boolean> = {
       needs: sourceWorkspaceMatches && notificationHydration.needs,
       review: sourceWorkspaceMatches && notificationHydration.overview,
-      stalled: sourceWorkspaceMatches && notificationHydration.liveWorkers,
+      // Lead-turn pushes and locally observed sessions are authoritative even
+      // while the adopted-worker snapshot is retrying.
+      stalled: sourceWorkspaceMatches,
       quota: sourceWorkspaceMatches && notificationHydration.quota,
     };
+    const eventStalledKeys = new Set<string>();
+    for (const s of Object.values(sessionRefs)) {
+      if (s.eventDriven && s.status === "stalled") {
+        eventStalledKeys.add(`stall:worker:${s.info.session_id}`);
+      }
+    }
+    for (const [tidStr, turn] of Object.entries(leadTurn)) {
+      if (turn.state !== "stalled") continue;
+      const tid = Number(tidStr);
+      const kind = threadsById.current[tid]?.kind;
+      eventStalledKeys.add(
+        kind === "curator" ? `stall:curator:${tid}` : `stall:lead:${tid}`,
+      );
+    }
     const sameWorkspace =
       baselineWs.current === activeWorkspaceId && prev.current != null;
+    const liveWorkersBecameReady =
+      liveWorkersReady && !liveWorkersReadyPrevious.current;
     const sourceBecameUnready = NOTIFY_CATEGORIES.some(
       (kind) => sourceReadyPrevious.current[kind] && !sourceReady[kind],
     );
@@ -732,14 +770,23 @@ export function useSystemNotifications() {
       baselineWs.current = activeWorkspaceId;
       prev.current = emptyNotifySnapshot();
       baselineReady.current.clear();
+      liveWorkersReadyPrevious.current = false;
     }
     sourceReadyPrevious.current = sourceReady;
+    liveWorkersReadyPrevious.current = liveWorkersReady;
     const base = prev.current;
     if (!base) return;
     for (const kind of NOTIFY_CATEGORIES) {
       if (sourceReady[kind] && !baselineReady.current.has(kind)) {
         base[kind] = new Map(next[kind]);
         baselineReady.current.add(kind);
+      }
+    }
+    if (liveWorkersBecameReady) {
+      // Initial adopted-worker rows are not transitions. Keep lead/local event
+      // keys in the diff baseline so stalls observed before hydration survive.
+      for (const [key, entry] of next.stalled) {
+        if (!eventStalledKeys.has(key)) base.stalled.set(key, entry);
       }
     }
     const allSourcesHydrated = NOTIFY_CATEGORIES.every(

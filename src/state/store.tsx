@@ -103,6 +103,8 @@ export interface OpenSession {
   /** the thread this session belongs to (the worker's parent). */
   threadId: number;
   nativeId: string | null;
+  /** True when the frontend observed this session from a local/event-driven start. */
+  eventDriven?: boolean;
   /** Owning workspace when known (adopted/revived workers may predate a visit). */
   workspaceId?: number;
 }
@@ -1466,13 +1468,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           status: "running",
           directionId,
           repoId,
-          threadId: activeThreadId ?? -1,
+          threadId: info.thread_id,
           nativeId: info.native_id,
+          eventDriven: true,
         },
       }));
       if (focus) openWorker(directionId, repoId);
     },
-    [activeThreadId, openWorker],
+    [openWorker],
   );
 
   const viewDirection = useCallback(
@@ -1524,6 +1527,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // for a different cached thread while another issue is open.
             threadId: info.thread_id,
             nativeId: info.native_id,
+            eventDriven: true,
           },
         };
       });
@@ -1542,42 +1546,55 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // authoritatively by the backend (see the idle-turn handler), so the busy seed
   // below is UI-only (typing indicator / Stop button / nav running count) and arms
   // no verify latch.
-  const adoptWorker = useCallback((slot: LiveWorkerSlot) => {
-    const sid = slot.info.session_id;
-    if (slot.busy) {
-      // Seed the worker's busy turn state so the chat surface shows the typing
-      // indicator + Stop button and WorkspaceNav counts it as running — a revived
-      // worker emits no turn push until its turn completes. Done BEFORE the
-      // already-mapped early return so a session that driveDirection (the
-      // active-thread redispatch) inserted without a workerTurn entry still gets
-      // seeded. Guard on absence so a raced idle/stopped value the listener already
-      // recorded wins. (Verify is backend-driven, so this seeds UI state only.)
-      setWorkerTurn((t) =>
-        t[sid] ? t : { ...t, [sid]: { state: "busy", queue: slot.queue ?? [] } },
-      );
-    }
-    if (sessionsRef.current[sid]) return;
-    // Reconcile status with any turn state the lead-chat listener already recorded:
-    // if the worker's idle push raced in before this adoption, the live slot still
-    // says busy, but the dot/live-counts must show idle (not stuck "running").
-    const status = adoptionStatus(workerTurnRef.current[sid]?.state, slot.busy);
-    setSessions((m) =>
-      m[sid]
-        ? m
-        : {
-            ...m,
-            [sid]: {
-              info: slot.info,
-              status,
-              directionId: slot.direction_id,
-              repoId: slot.repo_id,
-              threadId: slot.thread_id,
-              nativeId: slot.info.native_id,
-              workspaceId: slot.workspace_id ?? undefined,
+  const adoptWorker = useCallback(
+    (slot: LiveWorkerSlot, eventDriven = false) => {
+      const sid = slot.info.session_id;
+      if (slot.busy) {
+        // Seed the worker's busy turn state so the chat surface shows the typing
+        // indicator + Stop button and WorkspaceNav counts it as running — a revived
+        // worker emits no turn push until its turn completes. Done BEFORE the
+        // already-mapped early return so a session that driveDirection (the
+        // active-thread redispatch) inserted without a workerTurn entry still gets
+        // seeded. Guard on absence so a raced idle/stopped value the listener already
+        // recorded wins. (Verify is backend-driven, so this seeds UI state only.)
+        setWorkerTurn((t) =>
+          t[sid] ? t : { ...t, [sid]: { state: "busy", queue: slot.queue ?? [] } },
+        );
+      }
+      if (sessionsRef.current[sid]) {
+        if (eventDriven && !sessionsRef.current[sid].eventDriven) {
+          setSessions((m) =>
+            m[sid] && !m[sid].eventDriven
+              ? { ...m, [sid]: { ...m[sid], eventDriven: true } }
+              : m,
+          );
+        }
+        return;
+      }
+      // Reconcile status with any turn state the lead-chat listener already recorded:
+      // if the worker's idle push raced in before this adoption, the live slot still
+      // says busy, but the dot/live-counts must show idle (not stuck "running").
+      const status = adoptionStatus(workerTurnRef.current[sid]?.state, slot.busy);
+      setSessions((m) =>
+        m[sid]
+          ? m
+          : {
+              ...m,
+              [sid]: {
+                info: slot.info,
+                status,
+                directionId: slot.direction_id,
+                repoId: slot.repo_id,
+                threadId: slot.thread_id,
+                nativeId: slot.info.native_id,
+                eventDriven,
+                workspaceId: slot.workspace_id ?? undefined,
+              },
             },
-          },
-    );
-  }, []);
+      );
+    },
+    [],
+  );
 
   // Pull the backend's live worker engines and adopt any the frontend doesn't
   // know about. Called on mount (backstop for workers live before the listener
@@ -1587,16 +1604,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // (e.g. the revive event firing while the mount pull is still in flight).
   const hydratingRef = useRef(false);
   const hydratePendingRef = useRef(false);
+  const hydratePendingEventRef = useRef(false);
   const liveWorkersHydratedRef = useRef(false);
-  const hydrateLiveWorkers = useCallback(async () => {
+  const hydrateLiveWorkers = useCallback(async (eventDriven = false) => {
     if (hydratingRef.current) {
       hydratePendingRef.current = true;
+      hydratePendingEventRef.current ||= eventDriven;
       return;
     }
     hydratingRef.current = true;
     try {
+      let requestedEventDriven = eventDriven;
       do {
         hydratePendingRef.current = false;
+        const passEventDriven =
+          requestedEventDriven ||
+          hydratePendingEventRef.current ||
+          liveWorkersHydratedRef.current;
+        hydratePendingEventRef.current = false;
         const slots = await api.listLiveWorkerSlots();
         // Load each adopted worker's thread directions so WorkspaceNav can match the
         // session to its direction and count it as running — a revived worker can
@@ -1616,7 +1641,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
           }),
         );
-        for (const slot of slots) adoptWorker(slot);
+        for (const slot of slots) adoptWorker(slot, passEventDriven);
         // Index adopted workers' thread ownership so notifications can route
         // even before the user visits those workspaces.
         setThreadWorkspaceById((prev) => {
@@ -1631,6 +1656,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           return changed ? next : prev;
         });
+        requestedEventDriven = false;
       } while (hydratePendingRef.current);
       liveWorkersHydratedRef.current = true;
       setNotificationHydration((current) => ({ ...current, liveWorkers: true }));
@@ -1657,7 +1683,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (!liveWorkersHydratedRef.current) void hydrateLiveWorkers();
     }, NOTIFICATION_SOURCE_RETRY_MS);
     async function attach() {
-      un = await listen("worker-revived", () => void hydrateLiveWorkers());
+      un = await listen("worker-revived", () => void hydrateLiveWorkers(true));
       if (cancelled) {
         un();
         un = undefined;
@@ -2054,6 +2080,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                   [sid]: {
                     ...m[sid],
                     status: SESSION_STATUS[p.state],
+                    eventDriven: true,
                   },
                 }
               : m,

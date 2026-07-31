@@ -144,6 +144,8 @@ export interface NotifySessionRef {
   directionId: number;
   repoId: number;
   threadId: number;
+  /** True when the frontend observed this session from a local/event-driven start. */
+  eventDriven?: boolean;
   /** Owning workspace when known (adopted live sessions may predate a visit). */
   workspaceId?: number;
 }
