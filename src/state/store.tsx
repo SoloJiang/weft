@@ -632,7 +632,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceRestoring, setWorkspaceRestoring] = useState(true);
   const [workspaceLoadReady, setWorkspaceLoadReady] = useState(false);
-  const workspaceLoadCountRef = useRef(0);
   const workspaceSelectionGenerationRef = useRef(0);
   const workspaceSelectionInFlightRef = useRef<
     Map<number, { generation: number; promise: Promise<void> }>
@@ -1052,67 +1051,67 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       return inFlight.promise;
     }
     const load = (async () => {
-    const selectionGeneration = ++workspaceSelectionGenerationRef.current;
-    workspaceLoadCountRef.current += 1;
-    setActiveWorkspaceId(id);
-    setWorkspaceRestoring(false);
-    setWorkspaceLoading(true);
-    setWorkspaceLoadReady(false);
-    // Do not render the previous workspace's actionable rows under the new
-    // workspace while its authoritative Needs refresh is still pending.
-    setNeeds([]);
-    setWriteTriggers([]);
-    setNotificationHydration((current) => ({
-      ...current,
-      workspaceId: id,
-      workspaceNeeds: false,
-      needs: false,
-      overview: false,
-    }));
-    try {
-      // Clear the old workspace's repo map first so the curator panel (gated on
-      // repoProfiles.length >= 2) can't mount from stale, other-workspace profiles
-      // during the switch and ensure a thread for the wrong workspace.
-      setRepoProfiles([]);
-      setRepoEdges([]);
-      // Remember the choice so a relaunch/reload lands here, not on the first one.
-      localStorage.setItem(STORAGE_KEYS.activeWorkspace, String(id));
-      // Drop the previous workspace's curator thread id so it is re-ensured lazily.
-      setCuratorThreadId(null);
-      // Repos side panel: open state resets each visit (canvas starts full-width);
-      // per-surface width is remembered in the panel's own localStorage, not here.
-      setRepoDrawerOpen(false);
-      setRepoDrawerTabState("detail");
-      setSelectedRepoId(null);
-      const [r, t] = await Promise.all([api.listRepos(id), api.listThreads(id)]);
-      if (selectionGeneration !== workspaceSelectionGenerationRef.current) return;
-      setRepos(r);
-      rememberThreads(t);
-      setDirections({});
-      setWorktrees({});
-      setActiveThreadId(null);
-      setViewing(null);
-      setShowNeeds(false);
-      setHomeTab("board");
-      setProposal(null);
-      // A concurrent overview poll may have marked the source ready before this
-      // load resets its data. Invalidate that response and re-arm hydration for
-      // the empty snapshot that is now authoritative until the next poll.
-      overviewReqRef.current += 1;
-      setOverview([]);
-      setNotificationHydration((current) => {
-        if (current.workspaceId !== id) return current;
-        return { ...current, overview: false };
-      });
-      setWorkspaceLoadReady(true);
-    } finally {
-      // Deep-link markers count every settled load. Route application separately
-      // checks workspaceLoadReady so a rejected load can never satisfy a route
-      // prerequisite with stale repos/threads.
-      setWorkspaceLoadSeq((n) => n + 1);
-      workspaceLoadCountRef.current -= 1;
-      if (workspaceLoadCountRef.current === 0) setWorkspaceLoading(false);
-    }
+      const selectionGeneration = ++workspaceSelectionGenerationRef.current;
+      setActiveWorkspaceId(id);
+      setWorkspaceRestoring(false);
+      setWorkspaceLoading(true);
+      setWorkspaceLoadReady(false);
+      // Do not render the previous workspace's actionable rows under the new
+      // workspace while its authoritative Needs refresh is still pending.
+      setNeeds([]);
+      setWriteTriggers([]);
+      setNotificationHydration((current) => ({
+        ...current,
+        workspaceId: id,
+        workspaceNeeds: false,
+        needs: false,
+        overview: false,
+      }));
+      try {
+        // Clear the old workspace's repo map first so the curator panel (gated on
+        // repoProfiles.length >= 2) can't mount from stale, other-workspace profiles
+        // during the switch and ensure a thread for the wrong workspace.
+        setRepoProfiles([]);
+        setRepoEdges([]);
+        // Remember the choice so a relaunch/reload lands here, not on the first one.
+        localStorage.setItem(STORAGE_KEYS.activeWorkspace, String(id));
+        // Drop the previous workspace's curator thread id so it is re-ensured lazily.
+        setCuratorThreadId(null);
+        // Repos side panel: open state resets each visit (canvas starts full-width);
+        // per-surface width is remembered in the panel's own localStorage, not here.
+        setRepoDrawerOpen(false);
+        setRepoDrawerTabState("detail");
+        setSelectedRepoId(null);
+        const [r, t] = await Promise.all([api.listRepos(id), api.listThreads(id)]);
+        if (selectionGeneration !== workspaceSelectionGenerationRef.current) return;
+        setRepos(r);
+        rememberThreads(t);
+        setDirections({});
+        setWorktrees({});
+        setActiveThreadId(null);
+        setViewing(null);
+        setShowNeeds(false);
+        setHomeTab("board");
+        setProposal(null);
+        // A concurrent overview poll may have marked the source ready before this
+        // load resets its data. Invalidate that response and re-arm hydration for
+        // the empty snapshot that is now authoritative until the next poll.
+        overviewReqRef.current += 1;
+        setOverview([]);
+        setNotificationHydration((current) => {
+          if (current.workspaceId !== id) return current;
+          return { ...current, overview: false };
+        });
+        setWorkspaceLoadReady(true);
+      } finally {
+        // Deep-link markers count every settled load. Route application separately
+        // checks workspaceLoadReady so a rejected load can never satisfy a route
+        // prerequisite with stale repos/threads.
+        setWorkspaceLoadSeq((n) => n + 1);
+        if (selectionGeneration === workspaceSelectionGenerationRef.current) {
+          setWorkspaceLoading(false);
+        }
+      }
     })();
     const tracked = load.then(
       () => {

@@ -48,14 +48,30 @@ export async function notifyPermission(): Promise<NotifyPermission> {
 }
 
 /** Resolve to a settled state, asking the OS only from "prompt". */
-export async function ensureNotifyPermission(): Promise<NotifyPermission> {
-  const p = await notifyPermission();
-  if (p !== "prompt") return p;
-  try {
-    return asNotifyPermission(await api.osNotifyRequestPermission());
-  } catch {
-    return "denied";
-  }
+let notifyPermissionInFlight: Promise<NotifyPermission> | null = null;
+
+export function ensureNotifyPermission(): Promise<NotifyPermission> {
+  if (notifyPermissionInFlight) return notifyPermissionInFlight;
+
+  const request = (async () => {
+    const p = await notifyPermission();
+    if (p !== "prompt") return p;
+    try {
+      return asNotifyPermission(await api.osNotifyRequestPermission());
+    } catch {
+      return "denied";
+    }
+  })();
+  notifyPermissionInFlight = request;
+  void request.then(
+    () => {
+      if (notifyPermissionInFlight === request) notifyPermissionInFlight = null;
+    },
+    () => {
+      if (notifyPermissionInFlight === request) notifyPermissionInFlight = null;
+    },
+  );
+  return request;
 }
 
 /** Jump to the OS notification settings. macOS / Windows have stable URLs;
@@ -677,6 +693,9 @@ export function useSystemNotifications() {
       () => {
         pendingApplyingKey.current = null;
         pendingAppliedKey.current = applicationKey;
+        void api.osNotifyAckOpen(pending).catch(() => {
+          /* pure-vite / older backend */
+        });
       },
       () => {
         pendingApplyingKey.current = null;
