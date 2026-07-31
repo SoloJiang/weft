@@ -33,6 +33,7 @@ import {
   serializeQuietHours,
   type NotifyCategory,
   type NotifyCategoryFlags,
+  type NotificationOverview,
   type QuietHours,
 } from "../lib/notificationsCore";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
@@ -483,8 +484,8 @@ interface Store {
   /** Workspace board: per-thread roll-ups for the portfolio view. */
   overview: ThreadOverview[];
   /** All-workspace roll-ups used by background review notifications. */
-  notificationOverview: ThreadOverview[];
-  refreshOverview: () => Promise<void>;
+  notificationOverview: NotificationOverview[];
+  refreshOverview: (force?: boolean) => Promise<void>;
 
   selectWorkspace: (id: number) => Promise<void>;
   refreshWorkspaces: () => Promise<void>;
@@ -747,7 +748,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   } | null>(null);
   const [proposal, setProposal] = useState<ResolvedProposal | null>(null);
   const [overview, setOverview] = useState<ThreadOverview[]>([]);
-  const [notificationOverview, setNotificationOverview] = useState<ThreadOverview[]>([]);
+  const [notificationOverview, setNotificationOverview] = useState<NotificationOverview[]>([]);
   // Monotonic request token so an older, slower-resolving workspace_overview
   // fetch (e.g. the WorkspaceKanban mount fetch racing a just-issued
   // post-create refresh) can never clobber a fresher one that already landed —
@@ -755,7 +756,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const overviewReqRef = useRef(0);
   const overviewInFlightRef = useRef<Promise<void> | null>(null);
   const overviewPendingRef = useRef(false);
-  const refreshOverviewRef = useRef<() => Promise<void>>(() => Promise.resolve());
+  const refreshOverviewRef = useRef<(force?: boolean) => Promise<void>>(
+    () => Promise.resolve(),
+  );
   // Thread-bus drawer + proposal-review state.
   const [showBus, setShowBus] = useState(false);
   const [reviewingProposal, setReviewingProposal] = useState(false);
@@ -1209,10 +1212,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const reqId = ++overviewReqRef.current;
     try {
       const entries = await Promise.all(
-        [...workspaceIds].map(async (workspaceId) => [
-          workspaceId,
-          await api.workspaceOverview(workspaceId),
-        ] as const),
+        [...workspaceIds].map(async (workspaceId) => {
+          try {
+            return {
+              workspaceId,
+              data: await api.workspaceOverview(workspaceId),
+            };
+          } catch (error) {
+            console.error(error);
+            return { workspaceId, data: null };
+          }
+        }),
       );
       // A newer refreshOverviewOnce() was issued while this one was in flight —
       // drop this stale response instead of overwriting the fresher state.
@@ -1222,13 +1232,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       ) {
         return;
       }
-      const allOverview = entries.flatMap(([, data]) => data);
-      const activeOverview = entries.find(([workspaceId]) => workspaceId === activeId)?.[1] ?? [];
-      setOverview(activeOverview);
+      const activeOverview = entries.find((entry) => entry.workspaceId === activeId);
+      if (activeOverview?.data != null) setOverview(activeOverview.data);
+      const allOverview = entries.flatMap((entry) =>
+        entry.data?.map((row) => ({ ...row, workspace_id: entry.workspaceId })) ?? [],
+      );
       setNotificationOverview(allOverview);
+      const allWorkspacesSucceeded = entries.every((entry) => entry.data != null);
       setNotificationHydration((current) => {
         if (current.workspaceId !== activeId) return current;
-        return { ...current, overview: true };
+        return { ...current, overview: allWorkspacesSucceeded };
       });
     } catch (e) {
       /* ignore */
@@ -1236,9 +1249,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const refreshOverview = useCallback(async () => {
+  const refreshOverview = useCallback(async (force = false) => {
     const inFlight = overviewInFlightRef.current;
     if (inFlight) {
+      if (!force) {
+        await inFlight;
+        return;
+      }
       // A mutation caller must observe a pass issued AFTER the in-flight poll,
       // not merely the stale pass that started before its backend mutation.
       overviewPendingRef.current = true;
@@ -1250,7 +1267,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
       if (overviewPendingRef.current) {
         overviewPendingRef.current = false;
-        await refreshOverviewRef.current();
+        await refreshOverviewRef.current(true);
       }
       return;
     }
@@ -1542,7 +1559,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // views are already consistent. See issue #106.
       const [threadList] = await Promise.all([
         api.listThreads(activeWorkspaceId),
-        refreshOverview(),
+        refreshOverview(true),
       ]);
       rememberThreads(threadList);
       return t;
@@ -2775,7 +2792,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // across threads — refresh the board overview and the open thread's children
       // so stale task cards (now pointing at deleted rows) don't linger and open
       // blank worker views or failed diff/session fetches.
-      await refreshOverview();
+      await refreshOverview(true);
       if (activeThreadId != null) await loadThreadChildren(activeThreadId);
     },
     [activeWorkspaceId, refreshReposAndMap, refreshOverview, activeThreadId, loadThreadChildren],

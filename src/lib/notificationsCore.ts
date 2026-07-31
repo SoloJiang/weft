@@ -22,6 +22,9 @@ export const NOTIFY_CATEGORIES: readonly NotifyCategory[] = [
 
 export type NotifyCategoryFlags = Record<NotifyCategory, boolean>;
 
+/** Overview row enriched by the all-workspace notification poll. */
+export type NotificationOverview = ThreadOverview & { workspace_id?: number };
+
 export const DEFAULT_NOTIFY_CATEGORIES: NotifyCategoryFlags = {
   needs: true,
   review: true,
@@ -193,7 +196,7 @@ export function snapshotOf(
   needs: NeedItem[],
   asks: PermissionAsk[],
   triggers: WriteTrigger[],
-  overview: ThreadOverview[],
+  overview: NotificationOverview[],
   sessions: Record<number, NotifySessionRef>,
   leadTurn: Record<number, { state: TurnState; queue: unknown[] }>,
   processQuota: ProcessQuotaStatus | null,
@@ -259,7 +262,10 @@ export function snapshotOf(
       if (s !== "review") return;
       const directionId = o.direction_ids[i];
       const ws =
-        threadsById[o.thread_id]?.workspaceId ?? workspaceId ?? undefined;
+        o.workspace_id ??
+        threadsById[o.thread_id]?.workspaceId ??
+        workspaceId ??
+        undefined;
       r.set(`rev:${directionId}`, {
         sample: o.title,
         route: {
