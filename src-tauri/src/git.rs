@@ -1099,8 +1099,25 @@ pub fn current_branch(repo: &Path) -> Result<String> {
 /// The repo's `origin` remote URL, if one is configured. None for a freshly
 /// `git init`-ed local repo (no origin) or any git error — callers treat that
 /// as "no remote identity, dedup by path only".
+///
+/// Reads `remote.origin.url` directly (`git config --get`) rather than
+/// `git remote get-url origin`: the latter EXPANDS any `url.<x>.insteadOf`
+/// rewrite configured for it (documented git behavior — confirmed against a
+/// real repo while fixing PR #159 repo.rs:3925, since `--raw` does not exist
+/// on `remote get-url` to suppress this), returning the REDIRECT TARGET
+/// (e.g. an internal mirror) instead of what the user actually told git this
+/// remote IS. Every caller of this function wants the latter: `commands.rs`
+/// captures it as a stable dedup identity (a mirror rewrite must not make two
+/// clones of the SAME conceptual repo dedup as different repos, or vice
+/// versa), and `store::repo::live_default_branch_for_repo` compares it
+/// against a PR's recorded host identity (`host_base`/`host_owner`/
+/// `host_repo`, which name the repo the user's config claims this remote to
+/// be — not whatever transport quietly serves the bytes). Identical output to
+/// the old `get-url` call whenever no `insteadOf` rule applies, i.e. every
+/// repo that doesn't use this git feature — a no-op change for the
+/// overwhelming majority of checkouts.
 pub fn remote_url(repo: &Path) -> Option<String> {
-    git(repo, &["remote", "get-url", "origin"])
+    git(repo, &["config", "--get", "remote.origin.url"])
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())

@@ -1441,6 +1441,14 @@ struct UpstreamLane {
     name: String,
     depends_on: String,
     direction_id: i32,
+    /// This lane's OWN decision ("" | "approved" | "denied") — needed to tell
+    /// "not decided / referenced by typo" apart from "explicitly denied" when
+    /// this lane is the TARGET of another lane's `depends_on` (Codex review,
+    /// PR #159 planner.rs:1534): a denied producer never materializes
+    /// (`direction_id` stays 0 forever, same as an undecided one), but it is
+    /// a permanent, decided fact — not a "maybe later" — and a consumer
+    /// naming it must be actively blocked, not silently left as "no upstream".
+    decision: String,
 }
 
 /// Build [`UpstreamLane`]s from a `ResolvedProposal` (confirm's main body,
@@ -1457,17 +1465,18 @@ fn upstream_lanes_from_resolved(resolved: &ResolvedProposal, proposal: &Proposal
             name: r.name.clone(),
             depends_on: r.depends_on.clone(),
             direction_id: p.direction_id,
+            decision: p.decision.clone(),
         })
         .collect()
 }
 
-/// Build [`UpstreamLane`]s from a typed `Proposal` (has `name`/`direction_id`
-/// but never `depends_on` — see that field's doc) plus the raw JSON `Value`
-/// of the SAME proposal (has `depends_on`, read via `depends_on_from_value`).
-/// Used by `auto_settle_if_fully_decided`, which persists via
-/// `proposal_json_with_hints` rather than `resolved_from_plan` and so never
-/// builds a full `ResolvedProposal` (that additionally needs a live
-/// workspace-repo lookup this settle path has no reason to pay for).
+/// Build [`UpstreamLane`]s from a typed `Proposal` (has `name`/`direction_id`/
+/// `decision` but never `depends_on` — see that field's doc) plus the raw
+/// JSON `Value` of the SAME proposal (has `depends_on`, read via
+/// `depends_on_from_value`). Used by `auto_settle_if_fully_decided`, which
+/// persists via `proposal_json_with_hints` rather than `resolved_from_plan`
+/// and so never builds a full `ResolvedProposal` (that additionally needs a
+/// live workspace-repo lookup this settle path has no reason to pay for).
 fn upstream_lanes_from_raw(proposal: &Proposal, raw: &Value) -> Vec<UpstreamLane> {
     proposal
         .directions
@@ -1477,6 +1486,7 @@ fn upstream_lanes_from_raw(proposal: &Proposal, raw: &Value) -> Vec<UpstreamLane
             name: p.name.clone(),
             depends_on: depends_on_from_value(raw, idx),
             direction_id: p.direction_id,
+            decision: p.decision.clone(),
         })
         .collect()
 }
@@ -1513,7 +1523,12 @@ fn upstream_lanes_from_raw(proposal: &Proposal, raw: &Value) -> Vec<UpstreamLane
 /// name is ambiguous and is skipped, never silently bound to the first match
 /// (Codex review, planner.rs:1461 — this codebase explicitly supports
 /// duplicate same-name lanes elsewhere, via `confirm`'s consumed-set
-/// reconciliation, so "first match" here could bind the wrong producer).
+/// reconciliation, so "first match" here could bind the wrong producer); a
+/// `depends_on` naming a lane that was explicitly DENIED (decided, not merely
+/// unmaterialized) records `repo::DENIED_UPSTREAM_SENTINEL` instead of
+/// leaving the edge at `0` (Codex review, PR #159 planner.rs:1534 — `0` means
+/// "no upstream" and would let the consumer merge even though its declared
+/// prerequisite was refused and can never land).
 async fn record_upstream_edges(db: &Db, thread_id: i32, lanes: &[UpstreamLane]) {
     for lane in lanes {
         if lane.direction_id == 0 {
@@ -1531,7 +1546,32 @@ async fn record_upstream_edges(db: &Db, thread_id: i32, lanes: &[UpstreamLane]) 
             .collect();
         let upstream_id = match candidates.as_slice() {
             [id] => *id,
-            [] => continue, // no materialized lane by that name (typo, cross-proposal name) — best-effort skip.
+            [] => {
+                // No MATERIALIZED lane by that name. Distinguish "not decided yet / a typo /
+                // a cross-proposal name" (best-effort skip, unchanged) from "explicitly
+                // denied" (a decided, permanent fact — the consumer's stated prerequisite
+                // will never land, so it must be actively blocked, not silently treated as
+                // having no upstream at all).
+                let denied = lanes.iter().any(|u| u.name == depends_on_name && u.decision == "denied");
+                if denied {
+                    if let Err(e) =
+                        repo::set_direction_upstream(db, lane.direction_id, repo::DENIED_UPSTREAM_SENTINEL)
+                            .await
+                    {
+                        eprintln!(
+                            "[weft][planner] direction {}: could not record denied-upstream sentinel: {e}",
+                            lane.direction_id
+                        );
+                        notify_upstream_edge_write_failed(
+                            thread_id,
+                            lane.direction_id,
+                            repo::DENIED_UPSTREAM_SENTINEL,
+                            &e,
+                        );
+                    }
+                }
+                continue;
+            }
             _ => {
                 eprintln!(
                     "[weft][planner] direction {}: depends_on {depends_on_name:?} matches {} \
@@ -6760,6 +6800,67 @@ mod tests {
             crate::host::UpstreamStatus::None,
             "with the edge cleared, the ordering axis must read as no-upstream again"
         );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1534): when the human DENIES the producer lane
+    /// (not merely leaves it undecided), a consumer naming it via `depends_on` must NOT read as
+    /// having no upstream — its declared prerequisite is a decided, permanent dead end. Denying
+    /// producer then confirming the still-pending consumer must record the deny-sentinel edge,
+    /// keeping `upstream_merge_state` (and therefore the auto-merge gate) blocked rather than
+    /// silently free.
+    #[tokio::test]
+    async fn confirm_blocks_a_consumer_whose_named_upstream_was_denied() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-denied-producer-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "cross-repo change set",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+
+        // Deny the producer lane — it never materializes (direction_id stays 0), but this is a
+        // DECIDED fact, not an undecided/typo'd reference.
+        deny_direction(&db, t.id, 0).await.unwrap();
+        // Batch-confirm the still-pending consumer.
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 1, "only the pending consumer lane is dispatched");
+        let consumer_id = ids[0];
+
+        let consumer_dir = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            consumer_dir.depends_on_direction_id,
+            repo::DENIED_UPSTREAM_SENTINEL,
+            "a denied producer must record the deny-sentinel, not 0 (no upstream)"
+        );
+        match repo::upstream_merge_state(&db, consumer_id).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!(
+                "a consumer whose named upstream was denied must NOT read as free to merge \
+                 (None) — its declared prerequisite can never land: got {other:?}"
+            ),
+        }
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
