@@ -73,6 +73,13 @@ import type {
 
 export type HomeTab = "board" | "repos" | "settings";
 export type ThreadTab = "lead" | "board";
+export interface NotificationHydration {
+  workspaceId: number | null;
+  needs: boolean;
+  overview: boolean;
+  quota: boolean;
+  liveWorkers: boolean;
+}
 /** Settings nav destinations (mirrors `nav/SettingsDialog.tsx`'s own list —
  *  that file imports this type rather than redeclaring it, so the two can't
  *  drift). */
@@ -308,6 +315,8 @@ interface Store {
   /** App-wide process quota state; null until the governor's first snapshot. */
   processQuota: ProcessQuotaStatus | null;
   refreshProcessQuota: () => Promise<void>;
+  /** Initial notification sources have completed at least one authoritative load. */
+  notificationHydration: NotificationHydration;
   /** Whether the board canvas is showing the proposal's scope-confirm. */
   reviewingProposal: boolean;
   setReviewingProposal: (v: boolean) => void;
@@ -632,6 +641,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const activeThreadIdRef = useRef(activeThreadId);
   activeThreadIdRef.current = activeThreadId;
   const [sessions, setSessions] = useState<Record<number, OpenSession>>({});
+  const [notificationHydration, setNotificationHydration] = useState<NotificationHydration>({
+    workspaceId: null,
+    needs: false,
+    overview: false,
+    quota: false,
+    liveWorkers: false,
+  });
   const [checksByDirection, setChecksByDirection] = useState<Record<number, RepoChecks[]>>({});
   const [checkingDirections, setCheckingDirections] = useState<Record<number, boolean>>({});
   // Directions with an auto-(re)dispatch in flight, so the poll-driven effect
@@ -774,6 +790,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const refreshProcessQuota = useCallback(async () => {
     try {
       applyProcessQuota(await api.processQuotaStatus());
+      setNotificationHydration((current) => ({ ...current, quota: true }));
     } catch (error) {
       // Pure Vite dev and an older backend do not expose the governor command.
       if (import.meta.env.DEV) console.error(error);
@@ -782,6 +799,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const unlisten = listen<ProcessQuotaStatus>("process-quota://changed", (event) => {
       applyProcessQuota(event.payload);
+      setNotificationHydration((current) => ({ ...current, quota: true }));
     });
     void refreshProcessQuota();
     return () => {
@@ -964,6 +982,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const selectWorkspace = useCallback(async (id: number) => {
     setActiveWorkspaceId(id);
     setWorkspaceLoading(true);
+    setNotificationHydration((current) => ({
+      ...current,
+      workspaceId: id,
+      needs: false,
+      overview: false,
+    }));
     try {
       // Clear the old workspace's repo map first so the curator panel (gated on
       // repoProfiles.length >= 2) can't mount from stale, other-workspace profiles
@@ -1044,6 +1068,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // drop this stale response instead of overwriting the fresher state.
       if (reqId !== overviewReqRef.current) return;
       setOverview(data);
+      setNotificationHydration((current) => {
+        if (current.workspaceId !== activeWorkspaceId) return current;
+        return { ...current, overview: true };
+      });
     } catch (e) {
       /* ignore */
       console.error(e);
@@ -1563,6 +1591,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return changed ? next : prev;
         });
       } while (hydratePendingRef.current);
+      setNotificationHydration((current) => ({ ...current, liveWorkers: true }));
     } catch (e) {
       /* best-effort hydration */
       console.error(e);
@@ -2331,10 +2360,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const refreshNeeds = useCallback(async () => {
     // Permission Asks are global (not workspace-scoped); always refresh them.
+    let notificationNeedsReady = true;
     try {
       setAsks(await api.pendingAsks());
     } catch (e) {
       /* server may not be ready */
+      notificationNeedsReady = false;
       console.error(e);
     }
     // Standing grants are global too; refresh so "inherited access" markers stay
@@ -2363,6 +2394,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setWriteTriggers(await api.writeTriggers(activeWorkspaceId));
     } catch (e) {
       /* bus may not be ready */
+      notificationNeedsReady = false;
       console.error(e);
     }
     // per-workspace counts so the switcher can flag OTHER workspaces.
@@ -2371,6 +2403,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       /* ignore */
       console.error(e);
+    }
+    if (notificationNeedsReady && activeWorkspaceIdRef.current === activeWorkspaceId) {
+      setNotificationHydration((current) => {
+        if (current.workspaceId !== activeWorkspaceId) return current;
+        return { ...current, needs: true };
+      });
     }
   }, [activeWorkspaceId]);
 
@@ -3242,6 +3280,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setGuardrails,
     processQuota,
     refreshProcessQuota,
+    notificationHydration,
     needs,
     asks,
     authGrants,

@@ -117,10 +117,13 @@ export interface OsNotifyOpenEvent {
 
 /** Apply a notification click to the in-app navigation surface. */
 const PENDING_NAV_KEY = "weft-notify-pending-nav";
+const NAV_RUNTIME_GENERATION = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 type PendingNav = OsNotifyOpenEvent & {
   /** Absolute workspaceLoadSeq that must be reached before applying intents. */
   expectedLoadSeq?: number;
+  /** Runtime token used to rebase sequence markers after a WebView reload. */
+  loadGeneration?: string;
 };
 
 function stashPendingNav(
@@ -129,6 +132,7 @@ function stashPendingNav(
 ): void {
   try {
     const pending: PendingNav = { ...payload };
+    pending.loadGeneration = NAV_RUNTIME_GENERATION;
     if (opts?.expectedLoadSeq != null) {
       pending.expectedLoadSeq = opts.expectedLoadSeq;
     }
@@ -278,6 +282,7 @@ export function useSystemNotifications() {
     sessions,
     leadTurn,
     processQuota,
+    notificationHydration,
     threads,
     notifyEnabled,
     notifyCategories,
@@ -347,8 +352,12 @@ export function useSystemNotifications() {
         const focused = await win.isFocused();
         if (!cancelled) setWindowFocused(focused);
         unFocus = await win.onFocusChanged(({ payload }) => {
-          setWindowFocused(payload);
+          if (!cancelled) setWindowFocused(payload);
         });
+        if (cancelled) {
+          unFocus();
+          unFocus = undefined;
+        }
       } catch {
         if (!cancelled) setWindowFocused(null);
       }
@@ -465,6 +474,13 @@ export function useSystemNotifications() {
       putPendingNav(pending);
       return;
     }
+    if (pending.loadGeneration !== NAV_RUNTIME_GENERATION) {
+      // sessionStorage survives a WebView reload, but workspaceLoadSeq does
+      // not. The original absolute marker belongs to the old runtime; after a
+      // reload only the current workspace load needs to settle.
+      pending.loadGeneration = NAV_RUNTIME_GENERATION;
+      pending.expectedLoadSeq = workspaceLoadSeq + (workspaceLoading ? 1 : 0);
+    }
     if (workspaceLoading) {
       // Active workspace id may already match, but selectWorkspace is still
       // mid-reset/fetch. Wait for it to finish.
@@ -515,18 +531,14 @@ export function useSystemNotifications() {
   }, [needsByWorkspace]);
 
   // Notification sources hydrate asynchronously after mount / workspace switch.
-  // Keep baselining (no OS pings) until the initial snapshot for this workspace
-  // has settled once, so pre-existing quota/needs don't look "new".
-  const hydratedWs = useRef<number | null>(null);
-  const hydrateTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    return () => {
-      if (hydrateTimer.current != null) {
-        clearTimeout(hydrateTimer.current);
-      }
-    };
-  }, []);
-
+  // The store marks each source only after its authoritative request completes;
+  // do not arm diffs from a fixed timeout while those requests are still empty.
+  const sourcesHydrated =
+    notificationHydration.workspaceId === activeWorkspaceId &&
+    notificationHydration.needs &&
+    notificationHydration.overview &&
+    notificationHydration.quota &&
+    notificationHydration.liveWorkers;
   useEffect(() => {
     const sessionRefs: Record<
       number,
@@ -565,18 +577,9 @@ export function useSystemNotifications() {
     prev.current = next;
     baselineWs.current = activeWorkspaceId;
 
-    // First pass for a workspace, or while the workspace is still loading:
-    // only establish/update the baseline.
-    if (!base || workspaceLoading || hydratedWs.current !== activeWorkspaceId) {
-      if (hydrateTimer.current != null) {
-        clearTimeout(hydrateTimer.current);
-      }
-      // After sources stop changing briefly, mark this workspace hydrated.
-      hydrateTimer.current = setTimeout(() => {
-        if (!workspaceLoading) {
-          hydratedWs.current = activeWorkspaceId;
-        }
-      }, 400);
+    // First pass for a workspace, while it is loading, or before every initial
+    // source has completed: only establish/update the silent baseline.
+    if (!base || workspaceLoading || !sourcesHydrated) {
       return;
     }
     if (!notifyEnabled || granted.current !== true) return;
@@ -617,6 +620,7 @@ export function useSystemNotifications() {
     sessions,
     leadTurn,
     processQuota,
+    notificationHydration,
     notifyEnabled,
     notifyCategories,
     quietHours,
@@ -624,5 +628,6 @@ export function useSystemNotifications() {
     workspaceLoading,
     windowFocused,
     t,
+    sourcesHydrated,
   ]);
 }

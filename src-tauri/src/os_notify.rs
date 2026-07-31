@@ -315,6 +315,15 @@ pub fn os_notify_ack_open() -> Result<(), String> {
     Ok(())
 }
 
+fn restore_pending_if_empty(
+    pending: &mut Option<NotifyOpenPayload>,
+    payload: NotifyOpenPayload,
+) {
+    if pending.is_none() {
+        *pending = Some(payload);
+    }
+}
+
 /// Put a previously taken pending open back — used when StrictMode cancels the
 /// first cold-start drain before the frontend can apply it.
 #[tauri::command]
@@ -322,7 +331,9 @@ pub fn os_notify_restore_pending_open(payload: NotifyOpenPayload) -> Result<(), 
     let mut guard = pending_open()
         .lock()
         .map_err(|e| format!("os_notify pending lock poisoned: {e}"))?;
-    *guard = Some(payload);
+    // A newer click may have arrived during listener teardown. Preserve it
+    // instead of allowing the older taken payload to overwrite it.
+    restore_pending_if_empty(&mut guard, payload);
     Ok(())
 }
 
@@ -374,5 +385,27 @@ mod tests {
             open_curator: None,
         };
         assert!(user_info_from_req(&req).is_empty());
+    }
+
+    #[test]
+    fn restoring_taken_payload_preserves_newer_pending_click() {
+        let newer = NotifyOpenPayload {
+            kind: "newer".into(),
+            thread_id: None,
+            direction_id: None,
+            repo_id: None,
+            session_id: None,
+            ask_id: None,
+            workspace_id: None,
+            open_needs: None,
+            open_curator: None,
+        };
+        let older = NotifyOpenPayload {
+            kind: "older".into(),
+            ..newer.clone()
+        };
+        let mut pending = Some(newer);
+        restore_pending_if_empty(&mut pending, older);
+        assert_eq!(pending.as_ref().map(|p| p.kind.as_str()), Some("newer"));
     }
 }
