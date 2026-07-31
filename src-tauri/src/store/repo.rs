@@ -3817,8 +3817,42 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
     }
 }
 
+/// Split a git remote URL into (bare lowercase host, lowercase repo path —
+/// leading/trailing slashes and a trailing `.git` stripped), or `None` when
+/// the shape isn't one of the three this codebase's remotes actually take:
+/// `scheme://[user@]host[:port]/path` (https/ssh), `[user@]host:path`
+/// (scp-style, e.g. `git@github.com:owner/repo.git`), or a bare `host:path`.
+/// Structural parsing, not `git::git_url_key` (which normalizes for EQUALITY
+/// between two remote strings, not for extracting a host/path to compare
+/// against a SEPARATELY-recorded host/owner/repo triple) and not a
+/// substring/suffix scan (see [`remote_matches_pr_host`]'s doc for why the
+/// latter is unsafe here).
+fn parse_remote_host_and_path(remote_url: &str) -> Option<(String, String)> {
+    let no_slash = remote_url.trim().trim_end_matches('/');
+    let without_git = no_slash.strip_suffix(".git").unwrap_or(no_slash);
+    let (authority, path) = if let Some(pos) = without_git.find("://") {
+        let rest = &without_git[pos + 3..];
+        match rest.find('/') {
+            Some(s) => (&rest[..s], &rest[s + 1..]),
+            None => (rest, ""),
+        }
+    } else if let Some(colon) = without_git.find(':') {
+        (&without_git[..colon], &without_git[colon + 1..])
+    } else {
+        return None;
+    };
+    // Strip `user@` (userinfo) then `:port`, in that order, to reach the bare host.
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    let path = path.trim_matches('/');
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((host.to_lowercase(), path.to_lowercase()))
+}
+
 /// Does `remote_url` (a `repo_ref`'s recorded origin, captured at add/clone
-/// time) plausibly point at the SAME host repo a PR row's recorded identity
+/// time) point at the EXACT SAME host repo a PR row's recorded identity
 /// (`host_base`, `host_owner`, `host_repo`) claims?
 ///
 /// `live_default_branch_for_repo` runs this BEFORE trusting a local clone's
@@ -3830,25 +3864,33 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
 /// letting a coincidental name match (or mismatch) flip `Merged` the wrong
 /// way in either direction.
 ///
-/// A substring/suffix check rather than `git::git_url_key` equality: remotes
-/// come in incompatible shapes for the SAME repo (`https://host/o/r`,
-/// `git@host:o/r.git`, `ssh://git@host/o/r`) that `git_url_key` does not
-/// unify across schemes, and a false MISMATCH here fails safe to `Unknown`
-/// (never optimistically `Merged`) — so a looser match earns its keep by not
-/// punishing an honest recorded remote for using a different transport than
-/// this check happens to prefer.
+/// EXACT equality on the parsed host and path (via [`parse_remote_host_and_path`]),
+/// not a substring/suffix check: a prior version of this function used
+/// `.contains()`/`.ends_with()`, which a second independent review round
+/// caught accepting `other-acme/api` for `acme/api` (GitHub owner names allow
+/// hyphens, and a fork commonly keeps the upstream's repo name — `other-acme`
+/// ending in `acme/api` is not a hypothetical) and `mygitlab.com` for
+/// `gitlab.com` — reopening, via a different trigger, the exact
+/// wrong-repo-vetted-as-Merged hole this function exists to close. `host_owner`
+/// may itself contain `/` (a GitLab nested subgroup path — see that field's
+/// doc on `pull_request::Model`), which plain path equality handles for free:
+/// the FULL owner/subgroup/repo path must match, not just the trailing
+/// segment, closing the same collision class for nested groups too (currently
+/// unreachable — `HostKind::parse`/`resolve_host` have no GitLab backend yet —
+/// but fixed here alongside the GitHub case since the root cause is shared).
 fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, host_repo: &str) -> bool {
-    if host_base.trim().is_empty() || host_owner.trim().is_empty() || host_repo.trim().is_empty() {
+    let host_base = host_base.trim();
+    let host_owner = host_owner.trim();
+    let host_repo = host_repo.trim();
+    if host_base.is_empty() || host_owner.is_empty() || host_repo.is_empty() {
         return false;
     }
-    let remote_lower = remote_url.trim().to_lowercase();
-    if remote_lower.is_empty() {
+    let Some((host, path)) = parse_remote_host_and_path(remote_url) else {
         return false;
-    }
-    let host_base_lower = host_base.trim().to_lowercase();
-    let owner_repo = format!("{}/{}", host_owner.trim().to_lowercase(), host_repo.trim().to_lowercase());
-    remote_lower.contains(&host_base_lower)
-        && (remote_lower.ends_with(&owner_repo) || remote_lower.ends_with(&format!("{owner_repo}.git")))
+    };
+    let expected_host = host_base.to_lowercase();
+    let expected_path = format!("{}/{}", host_owner.to_lowercase(), host_repo.to_lowercase());
+    host == expected_host && path == expected_path
 }
 
 /// The live default branch of the repo behind `repo_id`, for vetting whether a
@@ -7946,6 +7988,118 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// DIRECT tests of `remote_matches_pr_host` (a third independent review round on PR #159
+    /// caught a boundary-anchoring bug: a prior `.contains()`/`.ends_with()` version was only
+    /// covered INDIRECTLY through `upstream_merge_state`, and that fixture used
+    /// `"unrelated-owner"`/`"unrelated-repo"` — a "completely unrelated" negative that cannot
+    /// exercise a NEAR-MISS boundary collision, giving false confidence). Every reject case
+    /// below is a NEAR miss on purpose: differs from the expected identity by exactly the kind
+    /// of thing a naive substring/suffix check would let through.
+    mod remote_matches_pr_host_tests {
+        use super::*;
+
+        /// A fork commonly keeps the upstream's repo name, and GitHub owner/org names allow
+        /// hyphens — `other-acme` legitimately ending in `acme` is not a hypothetical.
+        #[test]
+        fn rejects_an_owner_that_merely_ends_with_the_expected_owner() {
+            assert!(!remote_matches_pr_host("https://github.com/other-acme/api.git", "github.com", "acme", "api"));
+            assert!(!remote_matches_pr_host("git@github.com:other-acme/api.git", "github.com", "acme", "api"));
+        }
+
+        /// The other direction: `acme-corp` starts with `acme` but is a different owner.
+        #[test]
+        fn rejects_an_owner_that_merely_starts_with_the_expected_owner() {
+            assert!(!remote_matches_pr_host("https://github.com/acme-corp/api.git", "github.com", "acme", "api"));
+        }
+
+        /// `api-v2` shares a prefix with `api` but is a different repo.
+        #[test]
+        fn rejects_a_repo_that_merely_shares_a_prefix_with_the_expected_repo() {
+            assert!(!remote_matches_pr_host("https://github.com/acme/api-v2.git", "github.com", "acme", "api"));
+        }
+
+        /// `mygitlab.com` CONTAINS `gitlab.com` as a substring but is a different host.
+        #[test]
+        fn rejects_a_host_that_merely_contains_the_expected_host_as_a_substring() {
+            assert!(!remote_matches_pr_host("https://mygitlab.com/o/r.git", "gitlab.com", "o", "r"));
+        }
+
+        /// `gitlab.com.evil.tld` has `gitlab.com` as a PREFIX (a classic domain-spoofing
+        /// shape) but is a different host entirely.
+        #[test]
+        fn rejects_a_host_that_merely_has_the_expected_host_as_a_prefix() {
+            assert!(!remote_matches_pr_host("https://gitlab.com.evil.tld/o/r.git", "gitlab.com", "o", "r"));
+        }
+
+        /// A GitLab nested-subgroup analogue of the owner-suffix collision: `host_owner` can
+        /// itself contain `/` (see that field's doc on `pull_request::Model`), and an
+        /// "evil-group/subgroup" must not match a bare "group/subgroup" owner just because the
+        /// tail segments agree — same root cause as the GitHub case, fixed together even
+        /// though no GitLab backend is wired up yet to reach this in production.
+        #[test]
+        fn rejects_a_nested_subgroup_path_that_merely_ends_with_the_expected_path() {
+            assert!(!remote_matches_pr_host(
+                "https://gitlab.com/evil-group/subgroup/repo.git",
+                "gitlab.com",
+                "group/subgroup",
+                "repo"
+            ));
+        }
+
+        /// A genuine nested subgroup DOES match — the fix must not overcorrect into rejecting
+        /// every multi-segment owner.
+        #[test]
+        fn accepts_a_genuine_nested_subgroup_path() {
+            assert!(remote_matches_pr_host(
+                "https://gitlab.com/group/subgroup/repo.git",
+                "gitlab.com",
+                "group/subgroup",
+                "repo"
+            ));
+        }
+
+        /// The full accepted matrix for a genuinely matching identity: HTTPS/SSH/scp-style,
+        /// with and without `.git`, with a port, mixed case, and a trailing slash all resolve
+        /// to the SAME repo and must all accept.
+        #[test]
+        fn accepts_every_remote_shape_for_a_genuinely_matching_identity() {
+            let cases = [
+                "https://github.com/acme/api",
+                "https://github.com/acme/api.git",
+                "https://github.com/acme/api.git/",
+                "https://github.com/acme/api/",
+                "git@github.com:acme/api.git",
+                "git@github.com:acme/api",
+                "ssh://git@github.com/acme/api.git",
+                "ssh://git@github.com:22/acme/api.git",
+                "https://GitHub.com/Acme/API.git",
+                "HTTPS://GITHUB.COM/ACME/API",
+            ];
+            for remote in cases {
+                assert!(
+                    remote_matches_pr_host(remote, "github.com", "acme", "api"),
+                    "expected a match for {remote:?}"
+                );
+            }
+        }
+
+        /// Empty/missing identity components must never match (an unset `remote_url` — the
+        /// common case before this feature existed — must fail safe, not vacuously match).
+        #[test]
+        fn rejects_empty_inputs() {
+            assert!(!remote_matches_pr_host("", "github.com", "acme", "api"));
+            assert!(!remote_matches_pr_host("https://github.com/acme/api", "", "acme", "api"));
+            assert!(!remote_matches_pr_host("https://github.com/acme/api", "github.com", "", "api"));
+            assert!(!remote_matches_pr_host("https://github.com/acme/api", "github.com", "acme", ""));
+        }
+
+        /// A malformed/unrecognized remote shape (no scheme, no colon) must fail safe.
+        #[test]
+        fn rejects_an_unparseable_remote() {
+            assert!(!remote_matches_pr_host("not-a-remote-url", "github.com", "acme", "api"));
+        }
     }
 
     /// TWO upstream PRs, one merged: still pending. A task is not done because

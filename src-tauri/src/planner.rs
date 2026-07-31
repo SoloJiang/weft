@@ -1561,8 +1561,16 @@ async fn record_upstream_edges(db: &Db, thread_id: i32, lanes: &[UpstreamLane]) 
 /// costs one read and zero writes, rather than an unconditional 0→0 UPDATE on
 /// every confirm/settle for every plan that never touches this feature.
 async fn clear_stale_upstream_edge(db: &Db, thread_id: i32, direction_id: i32) {
-    let Ok(Some(dir)) = repo::get_direction(db, direction_id).await else {
-        return;
+    let dir = match repo::get_direction(db, direction_id).await {
+        Ok(Some(dir)) => dir,
+        Ok(None) => return, // the direction is gone — nothing to clear, not a failure.
+        Err(e) => {
+            // Asymmetric with the write-failure branch below otherwise: a read failure here is
+            // just as real a reason the stale edge might survive undetected (Codex review, PR
+            // #159 planner.rs:1563).
+            eprintln!("[weft][planner] direction {direction_id}: could not read current state before clearing stale upstream: {e}");
+            return;
+        }
     };
     if dir.depends_on_direction_id == 0 {
         return;
@@ -1584,13 +1592,17 @@ async fn clear_stale_upstream_edge(db: &Db, thread_id: i32, direction_id: i32) {
 /// `notify_upstream_edge_write_failed`. `upstream_id == 0` means this was a
 /// stale-edge CLEAR that failed, not a fresh write.
 fn upstream_edge_write_failed_text(direction_id: i32, upstream_id: i32, err: &anyhow::Error) -> String {
+    // The recovery instruction deliberately does NOT say "just confirm/approve again": the
+    // confirmed-fast-path retry never re-calls record_upstream_edges (only the transition INTO
+    // "confirmed" does), so a bare retry cannot rescue this edge — only a fresh re-propose
+    // (which resets status back to "proposed") re-earns a pass through it.
     if upstream_id == 0 {
         format!(
-            "⚠️ 任务 #{direction_id} 清除过期的上游依赖失败:{err}。自动合并的排序保护可能仍卡在一个已经不存在的依赖上——请让 agent 重新走一次审批/确认。"
+            "⚠️ 任务 #{direction_id} 清除过期的上游依赖失败:{err}。自动合并的排序保护可能仍卡在一个已经不存在的依赖上——单纯重新确认/批准不会重试这次写入,请让 agent 针对这个任务重新完整提一次案(re-propose)。"
         )
     } else {
         format!(
-            "⚠️ 任务 #{direction_id} 的上游依赖(#{upstream_id})记录失败:{err}。跨仓合并排序保护可能未生效,这个任务有可能在它依赖的任务之前被自动合并——请让 agent 重新走一次审批/确认。"
+            "⚠️ 任务 #{direction_id} 的上游依赖(#{upstream_id})记录失败:{err}。跨仓合并排序保护可能未生效,这个任务有可能在它依赖的任务之前被自动合并——单纯重新确认/批准不会重试这次写入,请让 agent 针对这个任务重新完整提一次案(re-propose)。"
         )
     }
 }
@@ -1600,20 +1612,42 @@ fn upstream_edge_write_failed_text(direction_id: i32, upstream_id: i32, err: &an
 /// Deliberately NOT made transactional with (or a hard failure of) the
 /// confirm/settle call that reached this point, despite Codex's review
 /// suggesting exactly that (planner.rs:1470): by the time `record_upstream_
-/// edges` runs, the plan's directions are ALREADY durably created and
-/// dispatched (workers may already be spawning) — turning THIS failure into
-/// an `Err` this late would make `confirm`/`approve_direction` report failure
-/// for work that in fact succeeded, inviting a caller to retry and duplicate
-/// it. A visible-but-non-blocking notice is the correct shape for a write
-/// that is supplementary safety metadata layered on top of already-real work,
-/// not a coin flip on whether that work happened at all.
+/// edges` runs, the plan's directions are ALREADY durably created (materialize_
+/// direction already ran) and this call's own return is what the caller uses
+/// to dispatch workers against them — turning THIS failure into an `Err` this
+/// late would make `confirm`/`approve_direction` report failure for work that
+/// in fact succeeded. And a "just retry" recovery does not actually help: the
+/// confirmed-fast-path retry re-dispatches directions but never re-calls
+/// `record_upstream_edges` (that only runs on the transition INTO "confirmed",
+/// not on every re-entry), so neither path can rescue this specific edge —
+/// only a fresh `save_proposal`/re-propose can, since that resets status back
+/// to "proposed" and re-earns a pass through this function. A visible-but-
+/// non-blocking notice is the correct shape for a write that is supplementary
+/// safety metadata layered on top of already-real work, not a coin flip on
+/// whether that work happened at all.
 ///
 /// Uses the same `crate::APP_HANDLE` global fallback `bus::server::
-/// emit_proposal_row` already relies on for a notification from deep inside
-/// planner/bus logic that has no `BusRegistry` of its own to thread through —
-/// a no-op in a headless test harness (no live `AppHandle` there), which is
-/// why the notice TEXT is unit-tested separately above rather than through
-/// this call site.
+/// emit_proposal_row` also reaches for from deep inside planner/bus logic
+/// that has no `BusRegistry` of its own to thread through — but NOT an exact
+/// mirror of that function's shape, and weaker: `emit_proposal_row` durably
+/// writes to `lead_message` FIRST and only gates the LIVE push notification on
+/// `APP_HANDLE`, so a restart before the live push is seen still leaves the
+/// row for the human to find. This function has no durable counterpart to
+/// fall back on — `BusRegistry`'s asks/notices are in-memory only (this
+/// codebase has no ask/notice DB table at all), so a restart between the
+/// write failure and a human seeing the notice loses BOTH silently, quietly
+/// reverting to the original "nobody can tell" problem with a narrower (but
+/// nonzero) window. This is an EXISTING tradeoff already made elsewhere in
+/// this codebase (issue #88's stall notice is the same shape: memory-only,
+/// no reboot re-scan), not a regression unique to this function — but it is a
+/// real limitation, not a fully-closed gap.
+///
+/// `APP_HANDLE` itself is not the weak link here: it is set once, synchronously,
+/// inside `.setup()`, and `confirm`/`approve_direction` are reachable only
+/// through Tauri IPC, which cannot fire before `.setup()` completes — so in
+/// every real (non-test) run this branch is live. The `None` branches below
+/// exist for the headless test harness, which is also why the notice TEXT is
+/// unit-tested separately above rather than through this call site.
 fn notify_upstream_edge_write_failed(thread_id: i32, direction_id: i32, upstream_id: i32, err: &anyhow::Error) {
     use tauri::Manager;
     let Some(app) = crate::APP_HANDLE.get() else {
