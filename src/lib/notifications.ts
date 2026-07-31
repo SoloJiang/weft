@@ -115,6 +115,20 @@ export interface OsNotifyOpenEvent {
   openCurator?: boolean | null;
 }
 
+function notifyOpenKey(payload: OsNotifyOpenEvent): string {
+  return JSON.stringify([
+    payload.kind,
+    payload.threadId ?? null,
+    payload.directionId ?? null,
+    payload.repoId ?? null,
+    payload.sessionId ?? null,
+    payload.askId ?? null,
+    payload.workspaceId ?? null,
+    payload.openNeeds ?? null,
+    payload.openCurator ?? null,
+  ]);
+}
+
 /** Apply a notification click to the in-app navigation surface. */
 const PENDING_NAV_KEY = "weft-notify-pending-nav";
 const NAV_RUNTIME_GENERATION = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -412,23 +426,39 @@ export function useSystemNotifications() {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     let takenPending: OsNotifyOpenEvent | null = null;
+    const openInFlight = new Map<string, Promise<void>>();
 
-    const handleOpen = async (payload: OsNotifyOpenEvent) => {
-      await handleNotifyOpen(payload, navDepsRef.current);
-      // Native delivery retains the payload until the frontend confirms it was
-      // handled. This also prevents a live event from being drained again by
-      // the ordered cold-start check below.
-      try {
-        await api.osNotifyAckOpen();
-      } catch {
-        /* pure-vite */
-      }
+    const handleOpen = (payload: OsNotifyOpenEvent): Promise<void> => {
+      const key = notifyOpenKey(payload);
+      const existing = openInFlight.get(key);
+      if (existing) return existing;
+      const task = (async () => {
+        await handleNotifyOpen(payload, navDepsRef.current);
+        // Native delivery retains the payload until the frontend confirms it was
+        // handled. This also prevents a live event from being drained again by
+        // the ordered cold-start check below.
+        try {
+          await api.osNotifyAckOpen();
+        } catch {
+          /* pure-vite */
+        }
+      })();
+      openInFlight.set(key, task);
+      void task.then(
+        () => {
+          if (openInFlight.get(key) === task) openInFlight.delete(key);
+        },
+        () => {
+          if (openInFlight.get(key) === task) openInFlight.delete(key);
+        },
+      );
+      return task;
     };
 
     void (async () => {
       try {
         unlisten = await listen<OsNotifyOpenEvent>("notify://open", (event) => {
-          void handleOpen(event.payload);
+          void handleOpen(event.payload).catch(() => undefined);
         });
         if (cancelled) {
           unlisten?.();

@@ -80,6 +80,8 @@ export interface NotificationHydration {
   quota: boolean;
   liveWorkers: boolean;
 }
+
+const NOTIFICATION_SOURCE_RETRY_MS = 10_000;
 /** Settings nav destinations (mirrors `nav/SettingsDialog.tsx`'s own list —
  *  that file imports this type rather than redeclaring it, so the two can't
  *  drift). */
@@ -674,6 +676,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   });
   const [writeTriggers, setWriteTriggers] = useState<WriteTrigger[]>([]);
   const [needsByWorkspace, setNeedsByWorkspace] = useState<Record<number, number>>({});
+  const needsRefreshSeqRef = useRef(0);
   const [showNeeds, setShowNeeds] = useState(false);
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
@@ -776,6 +779,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const [processQuota, setProcessQuota] = useState<ProcessQuotaStatus | null>(null);
   const processQuotaRef = useRef<ProcessQuotaStatus | null>(null);
+  const processQuotaHydratedRef = useRef(false);
   const applyProcessQuota = useCallback((next: ProcessQuotaStatus) => {
     const previous = processQuotaRef.current;
     if (!shouldApplyProcessQuotaStatus(previous, next)) return;
@@ -790,7 +794,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
   const refreshProcessQuota = useCallback(async () => {
     try {
-      applyProcessQuota(await api.processQuotaStatus());
+      const next = await api.processQuotaStatus();
+      applyProcessQuota(next);
+      processQuotaHydratedRef.current = true;
       setNotificationHydration((current) => ({ ...current, quota: true }));
     } catch (error) {
       // Pure Vite dev and an older backend do not expose the governor command.
@@ -800,11 +806,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const unlisten = listen<ProcessQuotaStatus>("process-quota://changed", (event) => {
       applyProcessQuota(event.payload);
+      processQuotaHydratedRef.current = true;
       setNotificationHydration((current) => ({ ...current, quota: true }));
     });
     void refreshProcessQuota();
+    const retryId = setInterval(() => {
+      if (!processQuotaHydratedRef.current) void refreshProcessQuota();
+    }, NOTIFICATION_SOURCE_RETRY_MS);
     return () => {
       void unlisten.then((stop) => stop());
+      clearInterval(retryId);
     };
   }, [applyProcessQuota, refreshProcessQuota]);
 
@@ -1024,8 +1035,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (current.workspaceId !== id) return current;
         return { ...current, overview: false };
       });
-      setWorkspaceLoadSeq((n) => n + 1);
     } finally {
+      // Deep-link markers count every settled load, including a rejected
+      // listRepos/listThreads request, so a failed sibling cannot leave a
+      // pending click waiting for an impossible sequence number.
+      setWorkspaceLoadSeq((n) => n + 1);
       workspaceLoadCountRef.current -= 1;
       if (workspaceLoadCountRef.current === 0) setWorkspaceLoading(false);
     }
@@ -1555,6 +1569,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // (e.g. the revive event firing while the mount pull is still in flight).
   const hydratingRef = useRef(false);
   const hydratePendingRef = useRef(false);
+  const liveWorkersHydratedRef = useRef(false);
   const hydrateLiveWorkers = useCallback(async () => {
     if (hydratingRef.current) {
       hydratePendingRef.current = true;
@@ -1599,6 +1614,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return changed ? next : prev;
         });
       } while (hydratePendingRef.current);
+      liveWorkersHydratedRef.current = true;
       setNotificationHydration((current) => ({ ...current, liveWorkers: true }));
     } catch (e) {
       /* best-effort hydration */
@@ -1619,6 +1635,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let un: (() => void) | undefined;
     let cancelled = false;
+    const retryId = setInterval(() => {
+      if (!liveWorkersHydratedRef.current) void hydrateLiveWorkers();
+    }, NOTIFICATION_SOURCE_RETRY_MS);
     async function attach() {
       un = await listen("worker-revived", () => void hydrateLiveWorkers());
       if (cancelled) {
@@ -1632,6 +1651,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
       un?.();
+      clearInterval(retryId);
     };
   }, [hydrateLiveWorkers]);
 
@@ -2367,10 +2387,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 
   const refreshNeeds = useCallback(async () => {
+    const workspaceId = activeWorkspaceId;
+    const requestId = ++needsRefreshSeqRef.current;
+    const isLatestRequest = () => requestId === needsRefreshSeqRef.current;
     // Permission Asks are global (not workspace-scoped); always refresh them.
     let notificationNeedsReady = true;
     try {
-      setAsks(await api.pendingAsks());
+      const nextAsks = await api.pendingAsks();
+      if (isLatestRequest()) setAsks(nextAsks);
     } catch (e) {
       /* server may not be ready */
       notificationNeedsReady = false;
@@ -2379,7 +2403,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // Standing grants are global too; refresh so "inherited access" markers stay
     // in sync (e.g. seeded from disk at boot, or granted in another view).
     try {
-      setAuthGrants(await api.listAuthGrants());
+      const nextGrants = await api.listAuthGrants();
+      if (isLatestRequest()) setAuthGrants(nextGrants);
     } catch (e) {
       console.error(e);
     }
@@ -2388,18 +2413,27 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // releaseSessionReadOnly/revokeReadOnlyGrant below) is the only way the
     // frontend's copy stays honest; the backend's own gate never depends on it.
     try {
-      setReadOnlyGrants(await api.readOnlyGrants());
+      const nextGrants = await api.readOnlyGrants();
+      if (isLatestRequest()) setReadOnlyGrants(nextGrants);
     } catch (e) {
       console.error(e);
     }
-    if (activeWorkspaceId == null) {
-      setNeeds([]);
-      setWriteTriggers([]);
+    if (workspaceId == null) {
+      if (isLatestRequest() && activeWorkspaceIdRef.current == null) {
+        setNeeds([]);
+        setWriteTriggers([]);
+      }
       return;
     }
     try {
-      setNeeds(await api.needsYou(activeWorkspaceId));
-      setWriteTriggers(await api.writeTriggers(activeWorkspaceId));
+      const [nextNeeds, nextWriteTriggers] = await Promise.all([
+        api.needsYou(workspaceId),
+        api.writeTriggers(workspaceId),
+      ]);
+      if (isLatestRequest() && activeWorkspaceIdRef.current === workspaceId) {
+        setNeeds(nextNeeds);
+        setWriteTriggers(nextWriteTriggers);
+      }
     } catch (e) {
       /* bus may not be ready */
       notificationNeedsReady = false;
@@ -2407,14 +2441,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
     // per-workspace counts so the switcher can flag OTHER workspaces.
     try {
-      setNeedsByWorkspace(Object.fromEntries(await api.workspaceNeedsCounts()));
+      const counts = await api.workspaceNeedsCounts();
+      if (isLatestRequest()) setNeedsByWorkspace(Object.fromEntries(counts));
     } catch (e) {
       /* ignore */
       console.error(e);
     }
-    if (notificationNeedsReady && activeWorkspaceIdRef.current === activeWorkspaceId) {
+    if (isLatestRequest() && notificationNeedsReady && activeWorkspaceIdRef.current === workspaceId) {
       setNotificationHydration((current) => {
-        if (current.workspaceId !== activeWorkspaceId) return current;
+        if (current.workspaceId !== workspaceId) return current;
         return { ...current, needs: true };
       });
     }
