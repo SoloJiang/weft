@@ -1100,24 +1100,31 @@ pub fn current_branch(repo: &Path) -> Result<String> {
 /// `git init`-ed local repo (no origin) or any git error — callers treat that
 /// as "no remote identity, dedup by path only".
 ///
-/// Reads `remote.origin.url` directly (`git config --get`) rather than
-/// `git remote get-url origin`: the latter EXPANDS any `url.<x>.insteadOf`
-/// rewrite configured for it (documented git behavior — confirmed against a
-/// real repo while fixing PR #159 repo.rs:3925, since `--raw` does not exist
-/// on `remote get-url` to suppress this), returning the REDIRECT TARGET
-/// (e.g. an internal mirror) instead of what the user actually told git this
-/// remote IS. Every caller of this function wants the latter: `commands.rs`
-/// captures it as a stable dedup identity (a mirror rewrite must not make two
-/// clones of the SAME conceptual repo dedup as different repos, or vice
-/// versa), and `store::repo::live_default_branch_for_repo` compares it
-/// against a PR's recorded host identity (`host_base`/`host_owner`/
-/// `host_repo`, which name the repo the user's config claims this remote to
-/// be — not whatever transport quietly serves the bytes). Identical output to
-/// the old `get-url` call whenever no `insteadOf` rule applies, i.e. every
-/// repo that doesn't use this git feature — a no-op change for the
-/// overwhelming majority of checkouts.
+/// Uses `git remote get-url origin` — which EXPANDS any `url.<x>.insteadOf`
+/// rewrite configured for it — DELIBERATELY, not `git config --get remote.
+/// origin.url` (the raw, unexpanded value a prior version of this function
+/// used). A fourth independent review round on PR #159 (repo.rs:3925 →
+/// git.rs:1120) proved with `GIT_TRACE` against a real repo that this
+/// matters for safety, not just semantics: `live_default_branch` (this
+/// module) runs `git ls-remote origin`, which git ALWAYS resolves through any
+/// configured `insteadOf` rewrite — there is no way to make an actual fetch
+/// operation skip it. If this function returned the raw pre-rewrite value
+/// while `ls-remote` queries the rewritten target, `store::repo::
+/// remote_matches_pr_host` would validate an identity that is NOT the one
+/// `ls-remote` is about to answer for — an attacker (or an innocent corporate
+/// mirror setup with a stale HEAD) could make a merge-readiness check pass
+/// while the actual git operation talks to a different repository entirely.
+/// The raw value's own justification (a mirror rewrite must not make dedup
+/// treat two clones of the same conceptual repo as different repos) is a
+/// real but much lower-stakes tradeoff than an irreversible auto-merge
+/// decision, and applies to EVERY caller of this shared function — better to
+/// accept an occasional missed dedup than to weaken the one check standing
+/// between "vetted this is really the PR's repo" and auto-merge. Identical
+/// output whenever no `insteadOf` rule applies, i.e. every repo that doesn't
+/// use this git feature — this is a no-op for the overwhelming majority of
+/// checkouts either way.
 pub fn remote_url(repo: &Path) -> Option<String> {
-    git(repo, &["config", "--get", "remote.origin.url"])
+    git(repo, &["remote", "get-url", "origin"])
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -1325,6 +1332,55 @@ mod tests {
             Some("https://github.com/acme/app.git")
         );
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// THE FIX (Codex review, PR #159 repo.rs:3925 → git.rs:1120, a fourth independent review
+    /// round): `remote_url_reads_origin_or_none` above configures no `insteadOf` rewrite, so
+    /// the raw config value and the expanded value happen to coincide there — it cannot tell
+    /// `git remote get-url origin` (expanded) apart from `git config --get remote.origin.url`
+    /// (raw), which is exactly how a prior version of this function silently regressed to the
+    /// unsafe raw reading. This test configures a LOCAL (repo-scoped, never global) `insteadOf`
+    /// rewrite that redirects the configured URL to a totally different "decoy" path, so the
+    /// two readings genuinely disagree — proving `remote_url` reports what `ls-remote`/fetch
+    /// will ACTUALLY resolve to, not merely what the config text says.
+    #[test]
+    fn remote_url_reports_the_insteadof_expanded_target_not_the_raw_configured_value() {
+        let decoy = tmp("remote-insteadof-decoy");
+        init_repo(&decoy).unwrap();
+        let repo = tmp("remote-insteadof-repo");
+        init_repo(&repo).unwrap();
+        git(
+            &repo,
+            &["remote", "add", "origin", "https://github.com/acme/real-repo.git"],
+        )
+        .unwrap();
+        let key = format!("url.{}.insteadOf", decoy.to_str().unwrap());
+        git(&repo, &[
+            "config",
+            &key,
+            "https://github.com/acme/real-repo.git",
+        ])
+        .unwrap();
+
+        // The raw configured value never changed...
+        assert_eq!(
+            git(&repo, &["config", "--get", "remote.origin.url"]).unwrap(),
+            "https://github.com/acme/real-repo.git"
+        );
+        // ...but `remote_url` must report the EXPANDED target: that's what an actual
+        // `git ls-remote origin` (and every other real fetch) resolves to. A caller that
+        // validated identity against the raw value while the real operation went through the
+        // rewrite would vet one repository and talk to a completely different one.
+        assert_eq!(
+            remote_url(&repo).as_deref(),
+            Some(decoy.to_str().unwrap()),
+            "remote_url must return the insteadOf-expanded target, not the pre-rewrite config \
+             text — otherwise identity checks built on it can pass while the real fetch talks \
+             to a different repo entirely"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&decoy);
     }
 
     #[test]

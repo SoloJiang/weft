@@ -1528,46 +1528,84 @@ fn upstream_lanes_from_raw(proposal: &Proposal, raw: &Value) -> Vec<UpstreamLane
 /// duplicate same-name lanes elsewhere) — records a BLOCKING sentinel
 /// (`DENIED_UPSTREAM_SENTINEL` / `UNRESOLVED_UPSTREAM_SENTINEL`) rather than
 /// leaving the edge at `0`, which would read as "no upstream, free to merge."
+///
+/// Resolves EVERY lane's target before writing any of them, then applies in two passes
+/// (release-stale, then apply-real) rather than one straight-through pass (Codex review, PR
+/// #159 planner.rs:1570): a re-proposal that REVERSES a reused dependency (A depended on B; B
+/// should now depend on A instead) can list the lanes in either order, and a single pass that
+/// happens to process the new dependent before the old one tries to write the reversed edge
+/// while the stale original is still in the DB — `set_direction_upstream`'s cycle check
+/// correctly (if unhelpfully, for a same-batch artifact) rejects that as a cycle, silently
+/// stranding the new edge at `0`. See the two-pass loop's own comments for why clearing first
+/// is unconditionally cycle-safe and stays a no-op for every lane that isn't actually changing.
 async fn record_upstream_edges(db: &Db, thread_id: i32, lanes: &[UpstreamLane]) {
+    let mut targets: Vec<(i32, i32)> = Vec::with_capacity(lanes.len());
     for lane in lanes {
         if lane.direction_id == 0 {
             continue; // this lane never materialized — nothing to record an edge ON.
         }
         let depends_on_name = lane.depends_on.trim();
-        if depends_on_name.is_empty() {
-            set_upstream_edge_if_changed(db, thread_id, lane.direction_id, 0).await;
-            continue;
-        }
-        let candidates: Vec<i32> = lanes
-            .iter()
-            .filter(|u| u.name == depends_on_name && u.direction_id != 0)
-            .map(|u| u.direction_id)
-            .collect();
-        let target = match candidates.as_slice() {
-            [id] => *id,
-            [] => {
-                // No MATERIALIZED lane by that name YET. Distinguish "explicitly denied" (a
-                // decided, permanent fact) from "not decided yet / a typo / a cross-proposal
-                // name" (may still resolve later, or may not — either way, block in the
-                // meantime, never silently 0).
-                let denied = lanes.iter().any(|u| u.name == depends_on_name && u.decision == "denied");
-                if denied {
-                    repo::DENIED_UPSTREAM_SENTINEL
-                } else {
+        let target = if depends_on_name.is_empty() {
+            0
+        } else {
+            let candidates: Vec<i32> = lanes
+                .iter()
+                .filter(|u| u.name == depends_on_name && u.direction_id != 0)
+                .map(|u| u.direction_id)
+                .collect();
+            match candidates.as_slice() {
+                [id] => *id,
+                [] => {
+                    // No MATERIALIZED lane by that name YET. Distinguish "explicitly denied" (a
+                    // decided, permanent fact) from "not decided yet / a typo / a cross-proposal
+                    // name" (may still resolve later, or may not — either way, block in the
+                    // meantime, never silently 0).
+                    let denied = lanes.iter().any(|u| u.name == depends_on_name && u.decision == "denied");
+                    if denied {
+                        repo::DENIED_UPSTREAM_SENTINEL
+                    } else {
+                        repo::UNRESOLVED_UPSTREAM_SENTINEL
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "[weft][planner] direction {}: depends_on {depends_on_name:?} matches {} \
+                         materialized lanes ambiguously — blocking rather than guessing",
+                        lane.direction_id,
+                        candidates.len()
+                    );
                     repo::UNRESOLVED_UPSTREAM_SENTINEL
                 }
             }
-            _ => {
-                eprintln!(
-                    "[weft][planner] direction {}: depends_on {depends_on_name:?} matches {} \
-                     materialized lanes ambiguously — blocking rather than guessing",
-                    lane.direction_id,
-                    candidates.len()
-                );
-                repo::UNRESOLVED_UPSTREAM_SENTINEL
-            }
         };
-        set_upstream_edge_if_changed(db, thread_id, lane.direction_id, target).await;
+        targets.push((lane.direction_id, target));
+    }
+
+    // PASS 1 — release every STALE edge that this call is about to REPLACE, before pass 2
+    // writes any real (possibly non-zero) target. Without this, a re-proposal that REVERSES a
+    // reused dependency (A depended on B; the new shape has B depend on A instead) processed in
+    // the "wrong" lane order would try to write B→A while the old A→B edge is still in the DB:
+    // `set_direction_upstream`'s cycle walk correctly (if unhelpfully, for a same-batch
+    // artifact) sees that as a genuine cycle and rejects the write, silently leaving B's real
+    // new dependency stuck at 0 — allowing it to merge before A (Codex review, PR #159
+    // planner.rs:1570). Clearing to 0 can never itself trip the cycle check (`creates_cycle`
+    // dead-ends at 0 immediately), so this pass is unconditionally safe; only touching lanes
+    // whose target is ACTUALLY different from their current value (not every lane in the
+    // batch) keeps the common case — most decisions touch no `depends_on` at all, and most
+    // existing edges aren't changing — at zero extra writes, and avoids a lane that ISN'T
+    // changing ever transiently reading 0 ("no upstream, free to merge") between the passes.
+    for &(direction_id, target) in &targets {
+        if let Ok(Some(dir)) = repo::get_direction(db, direction_id).await {
+            if dir.depends_on_direction_id != 0 && dir.depends_on_direction_id != target {
+                set_upstream_edge_if_changed(db, thread_id, direction_id, 0).await;
+            }
+        }
+    }
+
+    // PASS 2 — apply every real target now that no stale edge from this same batch can still
+    // be in the way of a legitimate reversal.
+    for (direction_id, target) in targets {
+        set_upstream_edge_if_changed(db, thread_id, direction_id, target).await;
     }
 }
 
@@ -6787,7 +6825,7 @@ mod tests {
     /// free to merge") — it must actively BLOCK via `UNRESOLVED_UPSTREAM_SENTINEL` until the
     /// lead disambiguates the names.
     #[tokio::test]
-    async fn record_upstream_edges_skips_an_ambiguous_duplicate_name_instead_of_guessing() {
+    async fn record_upstream_edges_blocks_an_ambiguous_duplicate_name_instead_of_guessing() {
         let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tag = format!("weft-upstream-ambiguous-name-{}", std::process::id());
         let root = std::env::temp_dir().join(format!("{tag}-root"));
@@ -6901,6 +6939,88 @@ mod tests {
             repo::upstream_merge_state(&db, consumer_id).await,
             crate::host::UpstreamStatus::None,
             "with the edge cleared, the ordering axis must read as no-upstream again"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1570): a re-proposal that REVERSES a reused
+    /// dependency (round 1: "x" depends on "y"; round 2: "y" depends on "x" instead) must land
+    /// the reversed edge regardless of which lane the lead happens to list first. Lists the NEW
+    /// consumer ("y") BEFORE the new producer ("x") deliberately — the exact shape that, before
+    /// `record_upstream_edges`'s two-pass fix, hit `set_direction_upstream`'s cycle check while
+    /// the stale x→y edge was still in the DB (a single straight-through pass would try writing
+    /// y→x first, see x still pointing at y, and reject it as a cycle) and silently stranded
+    /// y's real new dependency at `0`.
+    #[tokio::test]
+    async fn confirm_applies_a_reversed_dependency_regardless_of_lane_order() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-reversed-edge-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Round 1: x depends on y.
+        let first = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "x", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "y"},
+                {"name": "y", "repo": "api", "reason": "r", "mandate": "impl-only"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &first).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 2, "both lanes are dispatched");
+        let x_id = ids[0];
+        let y_id = ids[1];
+        assert_eq!(
+            repo::get_direction(&db, x_id).await.unwrap().unwrap().depends_on_direction_id,
+            y_id,
+            "precondition: the first proposal's x→y edge landed"
+        );
+
+        // Round 2: SAME two lanes reused (same name+repo+base — matched by
+        // `reusable_direction_for_preview`'s identity, not array position), REVERSED: y now
+        // depends on x, x drops its dependency. "y" (the NEW consumer) is listed FIRST.
+        let second = serde_json::json!({
+            "rationale": "r2",
+            "directions": [
+                {"name": "y", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "x"},
+                {"name": "x", "repo": "api", "reason": "r", "mandate": "impl-only"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &second).await.unwrap();
+        let ids2 = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids2.len(), 2, "both reused lanes are re-dispatched");
+
+        let x_after = repo::get_direction(&db, x_id).await.unwrap().unwrap();
+        let y_after = repo::get_direction(&db, y_id).await.unwrap().unwrap();
+        assert_eq!(
+            x_after.depends_on_direction_id, 0,
+            "x no longer names a dependency — its stale edge must be cleared"
+        );
+        assert_eq!(
+            y_after.depends_on_direction_id, x_id,
+            "y must end up depending on x — the REVERSED edge — not stuck at 0 just because \
+             the stale x→y edge was still in the DB when y's lane was processed first"
+        );
+        assert_eq!(
+            repo::upstream_merge_state(&db, y_id).await,
+            crate::host::UpstreamStatus::Pending { what: "x".into() },
+            "the axis this edge feeds must see the REVERSED relationship: y now blocked on x"
         );
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();

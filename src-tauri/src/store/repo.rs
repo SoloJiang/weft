@@ -3785,6 +3785,22 @@ pub async fn get_pull_request(db: &Db, id: i32) -> Result<Option<pull_request::M
 /// a guess, so it returns `Unknown`, same as every other failure in this
 /// function.
 pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamStatus {
+    if direction_id == 0 {
+        // The pre-existing "no owning direction" convention (`direction.repo_id`'s own
+        // "0 = unset" sentinel; see `register_pr_tool_from_the_lead_falls_back_to_unset_
+        // direction` in `bus/server.rs`, a real, tested, supported production path): a PR the
+        // lead registers without a numeric direction argument is tracked with
+        // `pull_request.direction_id = 0`, and every caller of this function
+        // (`host::automerge`, `host::monitor`) passes that field straight through as
+        // `direction_id`. Falling through to `get_direction(db, 0)` below always finds
+        // nothing and reads `Unknown` ("找不到这个任务"), which forces every such PR's
+        // readiness to `Indeterminate` FOREVER (Codex review, PR #159 repo.rs:3792) — there is
+        // no direction row here that could ever carry a `depends_on_direction_id`, so "no
+        // upstream" is the honest answer, not "can't tell". `judge::merge_readiness` already
+        // treats `None` identically to having no axis at all (see judge.rs's
+        // `no_upstream_is_indistinguishable_from_the_three_axis_judgement`).
+        return host::UpstreamStatus::None;
+    }
     let dir = match get_direction(db, direction_id).await {
         Ok(Some(d)) => d,
         Ok(None) => {
@@ -3836,25 +3852,30 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
             }
         }
     };
-    // Merged only when the upstream has at least one MERGED PR and NONE still
-    // OPEN (undecided) — a CLOSED-without-merging PR is ignored rather than
-    // required to also be "merged" (Codex review, PR #159 repo.rs:3793): a
-    // task that abandons PR #1 and lands its replacement PR #2 must not stay
-    // Pending forever just because #1's row still says "closed", and a task
-    // that never merged anything still correctly stays Pending (`merged`
-    // stays empty either way). Every LANDED PR must have reached the repo's
-    // DEFAULT branch — a merge into staging, release, or a stacked feature
-    // branch has not reached what other repos actually consume (see this
-    // function's doc).
-    let merged: Vec<&pull_request::Model> = prs.iter().filter(|p| p.lifecycle == "merged").collect();
-    let still_open = prs.iter().any(|p| p.lifecycle == "open");
-    if !merged.is_empty() && !still_open {
-        // Every PR on one task normally targets the same host repo; use the FIRST MERGED one
-        // as the identity `live_default_branch_for_repo` must see reflected in the local
-        // clone's recorded remote before it trusts that clone to answer "what is the default
-        // branch" (a fork/mirror checkout's `origin` need not be the repo this PR actually
-        // targets) — a closed, never-merged sibling's identity is irrelevant here.
-        let pr0 = merged[0];
+    // Merged only when EVERY registered PR for the upstream reads "merged" — a CLOSED-without-
+    // merging row blocks, exactly like an OPEN one (Codex review, PR #159 repo.rs:3850,
+    // reverting repo.rs:3793's "ignore closed rows" from an earlier round of this same review
+    // chain). That earlier version ignored any closed-without-merging row on the theory it was
+    // always a superseded/abandoned retry (PR #1 closed, replacement PR #2 merged) — but
+    // `one_merged_pr_does_not_release_an_upstream_with_two` (below) already establishes that a
+    // SINGLE upstream can legitimately own multiple INDEPENDENTLY required PRs, not only
+    // sequential retries of the same one, and this store has no persisted "supersedes"
+    // relationship to tell those two shapes apart: {PR #1 closed, PR #2 merged} is IDENTICAL
+    // data whether #2 replaced #1 or #1 was a second required PR that got abandoned while #2
+    // (unrelated in scope) merged. Given that ambiguity, this axis fails closed — the same
+    // posture as every other branch in this function and this PR's own design constraint
+    // (T4 may only ADD rejection reasons, never a release path): a superseded PR now blocks its
+    // consumer forever again (a visible, human-recoverable liveness gap — auto-merge stays
+    // opt-in and a human can always see and act on a stuck `Pending`), which is safer than
+    // silently releasing a consumer whose producer's real required work never landed. A proper
+    // fix needs an explicit, persisted supersedes/replaces relationship (who marks it, and
+    // when) — real scope beyond this review round; flagged as a follow-up.
+    if !prs.is_empty() && prs.iter().all(|p| p.lifecycle == "merged") {
+        // Every PR on one task normally targets the same host repo; use the FIRST one as the
+        // identity `live_default_branch_for_repo` must see reflected in the local clone's
+        // recorded remote before it trusts that clone to answer "what is the default branch"
+        // (a fork/mirror checkout's `origin` need not be the repo this PR actually targets).
+        let pr0 = &prs[0];
         let Some(default_branch) =
             live_default_branch_for_repo(db, upstream.repo_id, &pr0.host_base, &pr0.host_owner, &pr0.host_repo)
                 .await
@@ -3867,7 +3888,7 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
                 reason: "无法确认上游仓库的默认分支".into(),
             };
         };
-        if merged.iter().all(|p| p.base_ref.trim() == default_branch) {
+        if prs.iter().all(|p| p.base_ref.trim() == default_branch) {
             return host::UpstreamStatus::Merged;
         }
     }
@@ -7826,68 +7847,85 @@ mod tests {
         assert!(st.success(), "cmd {:?} failed", args);
     }
 
-    /// A real git repo whose LIVE default branch is genuinely resolvable —
-    /// `repo.rs`'s test suite is otherwise DB-only and has never needed one
-    /// before; `upstream_merge_state`'s default-branch check is the one
-    /// exception (it deliberately shells out via `crate::git::live_default_branch`,
-    /// which needs a real `origin` remote — see that function's doc). Mirrors
-    /// `planner::tests::make_repo`/`sh`, duplicated locally rather than shared
-    /// across modules (both are private `#[cfg(test)]` helpers). Returns the
-    /// CLONE's path (what a `repo_ref.local_git_path` would record) — `origin`
-    /// itself is a plain directory under `root`, sibling to the clone.
-    ///
-    /// The clone's `origin` reports (`git remote get-url`) as
-    /// `https://github.com/o/r` — matching `register_open_pr`'s hardcoded PR
-    /// host identity, so `remote_matches_pr_host` accepts it by default — via
-    /// a LOCAL `url.<path>.insteadOf` rewrite that transparently redirects the
-    /// actual `git ls-remote`/fetch traffic to the real local `origin`
-    /// directory. This is what makes `live_default_branch_for_repo`'s
-    /// LIVE-remote check (not the DB-recorded `remote_url`, since the fix for
-    /// repo.rs:3925) exercisable at all in a fully offline test: `get-url`
-    /// and the actual network-shaped operation see the SAME configured value,
-    /// exactly as they do for a real re-pointed remote in production —
-    /// `insteadOf` only changes where the bytes come from, never what
-    /// `get-url` reports. See [`make_repo_with_origin_reporting`] for a clone
-    /// that reports a DIFFERENT (deliberately non-matching) remote.
-    fn make_repo_with_origin(root: &std::path::Path, default_branch: &str) -> std::path::PathBuf {
-        make_repo_with_origin_reporting(root, default_branch, "https://github.com/o/r")
+    /// A real, bare LOCAL git repo, at `<root>/<name>/acme/api` so its
+    /// absolute path always ends in a clean two-segment "owner/repo" tail.
+    /// Returns (absolute repo path, host_owner, host_repo) — the identity
+    /// `remote_matches_pr_host` will accept for a `file://localhost/<path>`
+    /// remote pointed at it (see [`file_url`]), DERIVED from wherever `root`
+    /// actually lives on disk (varies per test run) rather than a fixed
+    /// literal; `host_owner` is everything in the path before the final
+    /// segment (so it naturally absorbs the long temp-dir prefix, exactly
+    /// the same way a GitLab nested-subgroup path would — see
+    /// `remote_matches_pr_host`'s doc on that).
+    fn make_bare_repo(root: &std::path::Path, name: &str, default_branch: &str) -> (std::path::PathBuf, String, String) {
+        let repo = root.join(name).join("acme").join("api");
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["git", "init", "-q"]);
+        sh(&repo, &["git", "config", "user.email", "t@t.t"]);
+        sh(&repo, &["git", "config", "user.name", "t"]);
+        std::fs::write(repo.join("README.md"), "# x\n").unwrap();
+        sh(&repo, &["git", "add", "-A"]);
+        sh(&repo, &["git", "commit", "-q", "-m", "init"]);
+        sh(&repo, &["git", "branch", "-M", default_branch]);
+        let abs = repo.canonicalize().unwrap();
+        let path_str = abs.to_str().unwrap().trim_start_matches('/').to_string();
+        let (owner, name) = path_str.rsplit_once('/').expect("temp path has multiple segments");
+        (abs, owner.to_string(), name.to_string())
     }
 
-    /// [`make_repo_with_origin`], but the clone's `origin` reports
-    /// `reported_remote` (via the same `insteadOf` rewrite trick) instead of
-    /// the default `https://github.com/o/r` — for tests that need a real,
-    /// resolvable clone whose LIVE remote identity deliberately does NOT
-    /// match `register_open_pr`'s PR host identity.
-    fn make_repo_with_origin_reporting(
+    /// A direct `file://localhost/<absolute-path>` URL for a [`make_bare_repo`]
+    /// repo — resolvable by `git ls-remote`/`git clone` with NO `url.*.
+    /// insteadOf` rewrite involved, so `git remote get-url origin` on a clone
+    /// pointed at it reports this SAME string verbatim. A prior version of
+    /// these fixtures used `git remote set-url` to a fake `https://github.com/
+    /// o/r` plus an `insteadOf` redirect to make a real local repo LOOK like a
+    /// clean GitHub identity; a FOURTH independent review round proved that
+    /// unsafe (PR #159 repo.rs:3925 → git.rs:1120): `insteadOf` is ALWAYS
+    /// applied to the actual fetch/`ls-remote` operation regardless of which
+    /// value `git::remote_url` happens to read, so a test built on that trick
+    /// could pass while hiding exactly the "vetted identity ≠ actually-queried
+    /// identity" mismatch this whole feature exists to catch — see
+    /// `crate::git::remote_url`'s doc. `file://localhost/...` needs no
+    /// rewrite at all: there is nothing to expand, so a test built on it
+    /// stays valid regardless of whether production reads the raw or the
+    /// `insteadOf`-expanded value.
+    fn file_url(abs_path: &std::path::Path) -> String {
+        format!("file://localhost{}", abs_path.to_str().unwrap())
+    }
+
+    /// A clone of a fresh [`make_bare_repo`] repo, with its `origin` set to
+    /// that repo's [`file_url`] — genuinely resolvable, no rewrite tricks.
+    /// Returns (clone path, host_base = "localhost", host_owner, host_repo)
+    /// — the identity `remote_matches_pr_host` will accept for this clone.
+    fn make_repo_with_origin(
         root: &std::path::Path,
         default_branch: &str,
-        reported_remote: &str,
-    ) -> std::path::PathBuf {
-        let origin = root.join("origin");
-        std::fs::create_dir_all(&origin).unwrap();
-        sh(&origin, &["git", "init", "-q"]);
-        sh(&origin, &["git", "config", "user.email", "t@t.t"]);
-        sh(&origin, &["git", "config", "user.name", "t"]);
-        std::fs::write(origin.join("README.md"), "# x\n").unwrap();
-        sh(&origin, &["git", "add", "-A"]);
-        sh(&origin, &["git", "commit", "-q", "-m", "init"]);
-        sh(&origin, &["git", "branch", "-M", default_branch]);
+    ) -> (std::path::PathBuf, String, String, String) {
+        let (origin_abs, host_owner, host_repo) = make_bare_repo(root, "origin", default_branch);
         let clone = root.join("clone");
-        sh(
-            root,
-            &["git", "clone", "-q", origin.to_str().unwrap(), clone.to_str().unwrap()],
-        );
+        sh(root, &["git", "clone", "-q", &file_url(&origin_abs), clone.to_str().unwrap()]);
         sh(&clone, &["git", "config", "user.email", "t@t.t"]);
         sh(&clone, &["git", "config", "user.name", "t"]);
-        sh(&clone, &["git", "remote", "set-url", "origin", reported_remote]);
-        let insteadof_key = format!("url.{}.insteadOf", origin.to_str().unwrap());
-        sh(&clone, &["git", "config", &insteadof_key, reported_remote]);
-        clone
+        (clone, "localhost".to_string(), host_owner, host_repo)
     }
 
     async fn register_open_pr(db: &Db, direction_id: i32, number: i32) -> pull_request::Model {
+        register_open_pr_at(db, direction_id, number, "github.com", "o", "r").await
+    }
+
+    /// [`register_open_pr`] with an explicit host identity — for tests that
+    /// need it to match (or deliberately NOT match) a real [`make_repo_with_origin`]
+    /// clone's derived (host_base, host_owner, host_repo).
+    async fn register_open_pr_at(
+        db: &Db,
+        direction_id: i32,
+        number: i32,
+        host_base: &str,
+        host_owner: &str,
+        host_repo: &str,
+    ) -> pull_request::Model {
         register_pull_request(
-            db, 1, direction_id, 0, "github", "github.com", "o", "r", number, "", "",
+            db, 1, direction_id, 0, "github", host_base, host_owner, host_repo, number, "", "",
         )
         .await
         .unwrap()
@@ -7910,6 +7948,35 @@ mod tests {
         assert_eq!(
             upstream_merge_state(&db, d.id).await,
             crate::host::UpstreamStatus::None
+        );
+    }
+
+    /// THE FIX (Codex review, PR #159 repo.rs:3792): `pull_request.direction_id == 0` is a
+    /// pre-existing, legitimate, TESTED state — a PR the lead registers without a numeric
+    /// direction argument (see `bus::server::register_pr_tool_from_the_lead_falls_back_to_
+    /// unset_direction`) is tracked exactly this way, and both real callers of this function
+    /// (`host::automerge`, `host::monitor`) pass `pr.direction_id` straight through as the
+    /// `direction_id` argument. Before this fix, `direction_id == 0` fell through to
+    /// `get_direction(db, 0)`, which always finds nothing and returns `Unknown` — forcing
+    /// every such PR's readiness to `Indeterminate` FOREVER, even though there is no direction
+    /// row here that ever could carry a dependency. `judge::merge_readiness` already proves
+    /// `None` behaves exactly like having no axis at all (judge.rs's
+    /// `no_upstream_is_indistinguishable_from_the_three_axis_judgement`), so the only gap
+    /// actually worth covering here is whether `upstream_merge_state` itself produces `None`
+    /// for this input, not `Unknown`.
+    #[tokio::test]
+    async fn a_pr_with_no_owning_direction_reports_none_not_unknown() {
+        let db = mem().await;
+        // Mirrors `register_pr_tool_from_the_lead_falls_back_to_unset_direction`'s DB state:
+        // `direction_id = 0`, no direction row exists at all.
+        register_open_pr(&db, 0, 1).await;
+
+        assert_eq!(
+            upstream_merge_state(&db, 0).await,
+            crate::host::UpstreamStatus::None,
+            "a PR with no owning direction has no direction row that could ever carry a \
+             dependency — this must never read Unknown (which would force Indeterminate \
+             readiness forever)"
         );
     }
 
@@ -7940,9 +8007,9 @@ mod tests {
             .join(format!("weft-upstream-merged-releases-once-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let clone_path = make_repo_with_origin(&root, "main");
+        let (clone_path, host_base, host_owner, host_repo) = make_repo_with_origin(&root, "main");
         let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
-        let pr = register_open_pr(&db, producer, 1).await;
+        let pr = register_open_pr_at(&db, producer, 1, &host_base, &host_owner, &host_repo).await;
 
         assert!(
             matches!(
@@ -7991,9 +8058,9 @@ mod tests {
             .join(format!("weft-upstream-merged-non-default-base-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let clone_path = make_repo_with_origin(&root, "main");
+        let (clone_path, host_base, host_owner, host_repo) = make_repo_with_origin(&root, "main");
         let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
-        let pr = register_open_pr(&db, producer, 1).await;
+        let pr = register_open_pr_at(&db, producer, 1, &host_base, &host_owner, &host_repo).await;
 
         // "Merged" — but into `release`, not the repo's real default `main`.
         let snapshot = crate::host::PrSnapshot {
@@ -8070,9 +8137,12 @@ mod tests {
             .join(format!("weft-upstream-merged-mismatched-host-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        // The clone's LIVE origin reports a DIFFERENT repo than the PR below claims (host_owner
-        // "o", host_repo "r" — register_open_pr's hardcoded identity).
-        let clone_path = make_repo_with_origin_reporting(&root, "main", "https://github.com/unrelated-owner/unrelated-repo");
+        // A REAL clone (host_base "localhost", host_owner/host_repo derived from the filesystem
+        // path) registered against the PR's UNRELATED, hardcoded identity (host_base
+        // "github.com", host_owner "o", host_repo "r" — register_open_pr's default) — a genuine
+        // mismatch, not a manufactured one: no fixture trick is needed to make the clone's live
+        // origin disagree with the PR's recorded host identity, it simply does.
+        let (clone_path, _host_base, _host_owner, _host_repo) = make_repo_with_origin(&root, "main");
         let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
         let pr = register_open_pr(&db, producer, 1).await; // host_owner="o", host_repo="r", host_base="github.com"
 
@@ -8116,9 +8186,10 @@ mod tests {
             .join(format!("weft-upstream-repointed-remote-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let clone_path = make_repo_with_origin(&root, "main"); // live origin reports "https://github.com/o/r"
+        // live origin is a real, resolvable file:// repo whose derived identity is registered below
+        let (clone_path, host_base, host_owner, host_repo) = make_repo_with_origin(&root, "main");
         let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
-        let pr = register_open_pr(&db, producer, 1).await; // host_owner="o", host_repo="r", host_base="github.com"
+        let pr = register_open_pr_at(&db, producer, 1, &host_base, &host_owner, &host_repo).await;
         let snapshot = crate::host::PrSnapshot {
             head_sha: "abc".into(),
             base_ref: "main".into(),
@@ -8339,24 +8410,31 @@ mod tests {
         );
     }
 
-    /// THE FIX (Codex review, PR #159 repo.rs:3793): the producer closes PR #1 without merging
-    /// (rebased/recreated as PR #2, a common "superseded" pattern) and PR #2 genuinely merges
-    /// into the default branch. Requiring EVERY registered row — including the abandoned #1 —
-    /// to read "merged" made this Pending forever even after the real, current PR landed;
-    /// closed-without-merging rows must be ignored once something else actually merged.
+    /// THE FIX (Codex review, PR #159 repo.rs:3850): reverts repo.rs:3793's "ignore a closed
+    /// row once something else merged" from an earlier round of this same review chain. That
+    /// version assumed a closed-without-merging row was always a superseded/abandoned retry of
+    /// the SAME work — but `one_merged_pr_does_not_release_an_upstream_with_two` (this file)
+    /// already establishes a single upstream can legitimately own multiple INDEPENDENTLY
+    /// required PRs, and this store has no persisted "supersedes" relationship to tell a
+    /// replacement apart from a second required PR that got abandoned: {PR #1 closed, PR #2
+    /// merged} is IDENTICAL data either way. This test proves the axis now fails closed on
+    /// that ambiguity — a closed-without-merging row blocks the SAME as an open one, exactly
+    /// mirroring `one_merged_pr_does_not_release_an_upstream_with_two`'s existing open-PR case
+    /// (see `upstream_merge_state`'s doc for the full reasoning and the deferred proper fix).
     #[tokio::test]
-    async fn a_merged_replacement_pr_releases_the_consumer_even_with_a_closed_predecessor() {
+    async fn a_closed_without_merging_pr_still_blocks_the_consumer_even_with_a_later_merge() {
         let db = mem().await;
         let root = std::env::temp_dir()
-            .join(format!("weft-upstream-superseded-pr-{}", std::process::id()));
+            .join(format!("weft-upstream-closed-sibling-pr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let clone_path = make_repo_with_origin(&root, "main");
+        let (clone_path, host_base, host_owner, host_repo) = make_repo_with_origin(&root, "main");
         let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
-        let superseded = register_open_pr(&db, producer, 1).await;
-        let replacement = register_open_pr(&db, producer, 2).await;
+        let closed = register_open_pr_at(&db, producer, 1, &host_base, &host_owner, &host_repo).await;
+        let merged = register_open_pr_at(&db, producer, 2, &host_base, &host_owner, &host_repo).await;
 
-        // #1 is abandoned (closed, never merged) — superseded by #2.
+        // #1 closes WITHOUT merging — could be a superseded retry, or could be a second
+        // independently required PR that got abandoned. This store cannot tell which.
         let closed_snapshot = crate::host::PrSnapshot {
             head_sha: "abc".into(),
             base_ref: "main".into(),
@@ -8367,7 +8445,7 @@ mod tests {
             review: crate::host::ReviewStatus::Approved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, superseded.id, &closed_snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, closed.id, &closed_snapshot, &crate::host::MergeReadiness::Ready)
             .await
             .unwrap();
         assert!(
@@ -8378,7 +8456,7 @@ mod tests {
             "precondition: nothing has merged yet"
         );
 
-        // #2 (the replacement) genuinely merges into the real default branch.
+        // #2 genuinely merges into the real default branch — #1 stays closed-without-merging.
         let merged_snapshot = crate::host::PrSnapshot {
             head_sha: "def".into(),
             base_ref: "main".into(),
@@ -8389,15 +8467,19 @@ mod tests {
             review: crate::host::ReviewStatus::Approved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, replacement.id, &merged_snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, merged.id, &merged_snapshot, &crate::host::MergeReadiness::Ready)
             .await
             .unwrap();
 
-        assert_eq!(
-            upstream_merge_state(&db, consumer).await,
-            crate::host::UpstreamStatus::Merged,
-            "the closed, superseded PR must not keep this Pending forever once its replacement \
-             actually merged into the default branch"
+        assert!(
+            matches!(
+                upstream_merge_state(&db, consumer).await,
+                crate::host::UpstreamStatus::Pending { .. }
+            ),
+            "a closed-without-merging sibling PR must keep blocking the consumer even after \
+             another PR on the same upstream merged — this store cannot tell a superseded \
+             retry apart from a second required PR that never landed, so it must fail closed \
+             exactly like the still-open case already does"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -8426,13 +8508,19 @@ mod tests {
         }
     }
 
-    /// A PR row whose task is gone (legacy `direction_id == 0`) is Unknown too
-    /// — the monitor resolves ordering by direction, and "no such task" is not
-    /// evidence of "no dependency".
+    /// A task row that is genuinely gone (deleted, or an id that was never valid) is Unknown —
+    /// the monitor resolves ordering by direction, and "no such task" is not evidence of "no
+    /// dependency". Uses `4242` (this file's established "definitely nonexistent" id, same as
+    /// `a_dangling_upstream_edge_is_unknown_never_none`), NOT `0`: an earlier version of this
+    /// test used `0` itself and called it "legacy `direction_id == 0`", conflating a genuinely
+    /// missing row with the separate, legitimate, TESTED "no owning direction" convention a
+    /// lead-registered PR uses (see `a_pr_with_no_owning_direction_reports_none_not_unknown`
+    /// and `bus::server::register_pr_tool_from_the_lead_falls_back_to_unset_direction`) — the
+    /// exact mistake Codex review (PR #159 repo.rs:3792) caught.
     #[tokio::test]
     async fn an_unknown_task_is_unknown_not_none() {
         let db = mem().await;
-        match upstream_merge_state(&db, 0).await {
+        match upstream_merge_state(&db, 4242).await {
             crate::host::UpstreamStatus::Unknown { .. } => {}
             other => panic!("expected unknown, got {other:?}"),
         }
