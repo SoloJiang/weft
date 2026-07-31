@@ -622,6 +622,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [workspaceLoadSeq, setWorkspaceLoadSeq] = useState(0);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const workspaceLoadCountRef = useRef(0);
+  const workspaceSelectionGenerationRef = useRef(0);
   const rememberThreads = useCallback((list: Thread[]) => {
     setThreads(list);
     setThreadWorkspaceById((prev) => {
@@ -992,6 +993,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const selectWorkspace = useCallback(async (id: number) => {
+    const selectionGeneration = ++workspaceSelectionGenerationRef.current;
     workspaceLoadCountRef.current += 1;
     setActiveWorkspaceId(id);
     setWorkspaceLoading(true);
@@ -1017,6 +1019,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setRepoDrawerTabState("detail");
       setSelectedRepoId(null);
       const [r, t] = await Promise.all([api.listRepos(id), api.listThreads(id)]);
+      if (selectionGeneration !== workspaceSelectionGenerationRef.current) return;
       setRepos(r);
       rememberThreads(t);
       setDirections({});

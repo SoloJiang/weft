@@ -438,7 +438,7 @@ export function useSystemNotifications() {
         // handled. This also prevents a live event from being drained again by
         // the ordered cold-start check below.
         try {
-          await api.osNotifyAckOpen();
+          await api.osNotifyAckOpen(payload);
         } catch {
           /* pure-vite */
         }
@@ -498,8 +498,20 @@ export function useSystemNotifications() {
   // Finish a deep link that had to switch workspaces first. Wait until
   // selectWorkspace has finished loading (workspaceLoadSeq) so a concurrent
   // selection reset cannot clear the destination right after we navigate.
-  const pendingAppliedSeq = useRef<number | null>(null);
+  const pendingAppliedKey = useRef<string | null>(null);
+  const pendingApplyingKey = useRef<string | null>(null);
+  const pendingNavRetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [pendingNavRetry, setPendingNavRetry] = useState(0);
   useEffect(() => {
+    return () => {
+      if (pendingNavRetryTimer.current != null) {
+        clearTimeout(pendingNavRetryTimer.current);
+        pendingNavRetryTimer.current = null;
+      }
+    };
+  }, []);
+  useEffect(() => {
+    void pendingNavRetry;
     const pending = takePendingNav();
     if (!pending) return;
     if (
@@ -530,7 +542,11 @@ export function useSystemNotifications() {
       putPendingNav(pending);
       return;
     }
-    if (pendingAppliedSeq.current === workspaceLoadSeq) {
+    const applicationKey = `${workspaceLoadSeq}:${notifyOpenKey(pending)}`;
+    if (
+      pendingAppliedKey.current === applicationKey ||
+      pendingApplyingKey.current === applicationKey
+    ) {
       // Already applied for this load.
       return;
     }
@@ -539,13 +555,28 @@ export function useSystemNotifications() {
       putPendingNav(pending);
       return;
     }
-    pendingAppliedSeq.current = workspaceLoadSeq;
+    pendingApplyingKey.current = applicationKey;
     void applyNotifyIntents(pending, {
       goToDirectionRef,
       openNeeds,
       openSettings,
       openCurator,
-    });
+    }).then(
+      () => {
+        pendingApplyingKey.current = null;
+        pendingAppliedKey.current = applicationKey;
+      },
+      () => {
+        pendingApplyingKey.current = null;
+        putPendingNav(pending);
+        if (pendingNavRetryTimer.current == null) {
+          pendingNavRetryTimer.current = setTimeout(() => {
+            pendingNavRetryTimer.current = null;
+            setPendingNavRetry((n) => n + 1);
+          }, 1_000);
+        }
+      }
+    );
   }, [
     activeWorkspaceId,
     workspaceLoadSeq,
@@ -554,6 +585,7 @@ export function useSystemNotifications() {
     openNeeds,
     openSettings,
     openCurator,
+    pendingNavRetry,
   ]);
 
   // Dock / taskbar badge tracks actionable Needs-you across all workspaces.

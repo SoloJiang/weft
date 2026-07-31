@@ -364,7 +364,17 @@ export const api = {
   // Desktop OS notifications via user-notify (click deep-link capable).
   osNotifyPermission: () => invoke<string>("os_notify_permission"),
   osNotifyRequestPermission: () => invoke<string>("os_notify_request_permission"),
-  osNotifyAckOpen: () => invoke<void>("os_notify_ack_open"),
+  osNotifyAckOpen: (payload: {
+    kind: string;
+    threadId?: number | null;
+    directionId?: number | null;
+    repoId?: number | null;
+    sessionId?: number | null;
+    askId?: number | null;
+    workspaceId?: number | null;
+    openNeeds?: boolean | null;
+    openCurator?: boolean | null;
+  }) => invoke<void>("os_notify_ack_open", { payload }),
   osNotifyTakePendingOpen: () =>
     invoke<{
       kind: string;

@@ -42,7 +42,7 @@ fn pending_open() -> &'static Mutex<Option<NotifyOpenPayload>> {
 }
 
 /// Payload the frontend stores in `user_info` and gets back on click.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NotifyOpenPayload {
     pub kind: String,
@@ -307,12 +307,21 @@ pub fn os_notify_take_pending_open() -> Result<Option<NotifyOpenPayload>, String
 
 /// Clear a retained pending open after the frontend has handled a live event.
 #[tauri::command]
-pub fn os_notify_ack_open() -> Result<(), String> {
+pub fn os_notify_ack_open(payload: NotifyOpenPayload) -> Result<(), String> {
     let mut guard = pending_open()
         .lock()
         .map_err(|e| format!("os_notify pending lock poisoned: {e}"))?;
-    *guard = None;
+    ack_pending_if_matches(&mut guard, &payload);
     Ok(())
+}
+
+fn ack_pending_if_matches(
+    pending: &mut Option<NotifyOpenPayload>,
+    handled: &NotifyOpenPayload,
+) {
+    if pending.as_ref() == Some(handled) {
+        *pending = None;
+    }
 }
 
 fn restore_pending_if_empty(
@@ -407,5 +416,31 @@ mod tests {
         let mut pending = Some(newer);
         restore_pending_if_empty(&mut pending, older);
         assert_eq!(pending.as_ref().map(|p| p.kind.as_str()), Some("newer"));
+    }
+
+    #[test]
+    fn acknowledging_only_clears_the_matching_pending_click() {
+        let pending_payload = NotifyOpenPayload {
+            kind: "pending".into(),
+            thread_id: Some(7),
+            direction_id: None,
+            repo_id: None,
+            session_id: None,
+            ask_id: None,
+            workspace_id: Some(3),
+            open_needs: None,
+            open_curator: None,
+        };
+        let other_payload = NotifyOpenPayload {
+            kind: "other".into(),
+            ..pending_payload.clone()
+        };
+        let mut pending = Some(pending_payload.clone());
+
+        ack_pending_if_matches(&mut pending, &other_payload);
+        assert_eq!(pending, Some(pending_payload.clone()));
+
+        ack_pending_if_matches(&mut pending, &pending_payload);
+        assert!(pending.is_none());
     }
 }
