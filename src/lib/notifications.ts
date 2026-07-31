@@ -301,7 +301,7 @@ export function useSystemNotifications() {
   const { t } = useTranslation();
   const prev = useRef<NotifySnapshot | null>(null);
   const baselineWs = useRef<number | null>(null);
-  const granted = useRef<boolean | null>(null);
+  const [permissionState, setPermissionState] = useState<NotifyPermission>("prompt");
   const [windowFocused, setWindowFocused] = useState<boolean | null>(null);
   const lastBadge = useRef<number | null>(null);
 
@@ -338,7 +338,7 @@ export function useSystemNotifications() {
   useEffect(() => {
     if (!notifyEnabled) return;
     void ensureNotifyPermission().then((p) => {
-      granted.current = p === "granted";
+      setPermissionState(p);
     });
   }, [notifyEnabled]);
 
@@ -352,7 +352,13 @@ export function useSystemNotifications() {
         const focused = await win.isFocused();
         if (!cancelled) setWindowFocused(focused);
         unFocus = await win.onFocusChanged(({ payload }) => {
-          if (!cancelled) setWindowFocused(payload);
+          if (cancelled) return;
+          setWindowFocused(payload);
+          if (payload && notifyEnabled) {
+            void notifyPermission().then((p) => {
+              if (!cancelled) setPermissionState(p);
+            });
+          }
         });
         if (cancelled) {
           unFocus();
@@ -366,7 +372,7 @@ export function useSystemNotifications() {
       cancelled = true;
       unFocus?.();
     };
-  }, []);
+  }, [notifyEnabled]);
 
   // Live click / action deep-link from the native bridge. Keep this effect
   // dependency-light so we do not re-drain pending opens on every navigation.
@@ -539,6 +545,7 @@ export function useSystemNotifications() {
     notificationHydration.overview &&
     notificationHydration.quota &&
     notificationHydration.liveWorkers;
+  const sourcesJustHydrated = useRef(false);
   useEffect(() => {
     const sessionRefs: Record<
       number,
@@ -576,13 +583,15 @@ export function useSystemNotifications() {
     const base = sameWorkspace ? prev.current : null;
     prev.current = next;
     baselineWs.current = activeWorkspaceId;
+    const becameHydrated = sourcesHydrated && !sourcesJustHydrated.current;
+    sourcesJustHydrated.current = sourcesHydrated;
 
     // First pass for a workspace, while it is loading, or before every initial
     // source has completed: only establish/update the silent baseline.
-    if (!base || workspaceLoading || !sourcesHydrated) {
+    if (!base || workspaceLoading || !sourcesHydrated || becameHydrated) {
       return;
     }
-    if (!notifyEnabled || granted.current !== true) return;
+    if (!notifyEnabled || permissionState !== "granted") return;
     if (
       isAppInForeground({
         windowFocused,
@@ -629,5 +638,6 @@ export function useSystemNotifications() {
     windowFocused,
     t,
     sourcesHydrated,
+    permissionState,
   ]);
 }

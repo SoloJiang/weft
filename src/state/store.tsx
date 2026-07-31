@@ -2999,7 +2999,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           (s) => s.directionId === directionId && s.repoId === opts.repoId,
         );
       }
-      if (!live && Number.isFinite(directionId)) {
+      if (!live && opts?.repoId == null && Number.isFinite(directionId)) {
         live = all.find((s) => s.directionId === directionId);
       }
       if (live) {
