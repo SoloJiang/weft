@@ -7,11 +7,14 @@ import { useStore } from "../state/store";
 import { api } from "./api";
 import {
   diffForNotifications,
+  emptyNotifySnapshot,
   isAppInForeground,
   isInQuietHours,
+  NOTIFY_CATEGORIES,
   notifyCopyKeys,
   planNotifyOpen,
   snapshotOf,
+  type NotifyCategory,
   type NotifyRoute,
   type NotifySnapshot,
 } from "./notificationsCore";
@@ -361,6 +364,13 @@ export function useSystemNotifications() {
   const { t } = useTranslation();
   const prev = useRef<NotifySnapshot | null>(null);
   const baselineWs = useRef<number | null>(null);
+  const baselineReady = useRef<Set<NotifyCategory>>(new Set());
+  const sourceReadyPrevious = useRef<Record<NotifyCategory, boolean>>({
+    needs: false,
+    review: false,
+    stalled: false,
+    quota: false,
+  });
   const [permissionState, setPermissionState] = useState<NotifyPermission>("prompt");
   const [windowFocused, setWindowFocused] = useState<boolean | null>(null);
   const lastBadge = useRef<number | null>(null);
@@ -670,13 +680,8 @@ export function useSystemNotifications() {
   // Notification sources hydrate asynchronously after mount / workspace switch.
   // The store marks each source only after its authoritative request completes;
   // do not arm diffs from a fixed timeout while those requests are still empty.
-  const sourcesHydrated =
-    notificationHydration.workspaceId === activeWorkspaceId &&
-    notificationHydration.needs &&
-    notificationHydration.overview &&
-    notificationHydration.quota &&
-    notificationHydration.liveWorkers;
-  const sourcesJustHydrated = useRef(false);
+  // Each category keeps its own baseline so a ready source can accumulate real
+  // events while an unrelated source is still retrying.
   useEffect(() => {
     const sessionRefs: Record<
       number,
@@ -710,18 +715,46 @@ export function useSystemNotifications() {
       threadsById.current,
       activeWorkspaceId,
     );
-    const sameWorkspace = baselineWs.current === activeWorkspaceId;
-    const base = sameWorkspace ? prev.current : null;
-    prev.current = next;
-    baselineWs.current = activeWorkspaceId;
-    const becameHydrated = sourcesHydrated && !sourcesJustHydrated.current;
-    sourcesJustHydrated.current = sourcesHydrated;
-
-    // First pass for a workspace, while it is loading, or before every initial
-    // source has completed: only establish/update the silent baseline.
-    if (!base || workspaceLoading || !sourcesHydrated || becameHydrated) {
+    const sourceWorkspaceMatches =
+      notificationHydration.workspaceId === activeWorkspaceId;
+    const sourceReady: Record<NotifyCategory, boolean> = {
+      needs: sourceWorkspaceMatches && notificationHydration.needs,
+      review: sourceWorkspaceMatches && notificationHydration.overview,
+      stalled: sourceWorkspaceMatches && notificationHydration.liveWorkers,
+      quota: sourceWorkspaceMatches && notificationHydration.quota,
+    };
+    const sameWorkspace =
+      baselineWs.current === activeWorkspaceId && prev.current != null;
+    const sourceBecameUnready = NOTIFY_CATEGORIES.some(
+      (kind) => sourceReadyPrevious.current[kind] && !sourceReady[kind],
+    );
+    if (!sameWorkspace || sourceBecameUnready) {
+      baselineWs.current = activeWorkspaceId;
+      prev.current = emptyNotifySnapshot();
+      baselineReady.current.clear();
+    }
+    sourceReadyPrevious.current = sourceReady;
+    const base = prev.current;
+    if (!base) return;
+    for (const kind of NOTIFY_CATEGORIES) {
+      if (sourceReady[kind] && !baselineReady.current.has(kind)) {
+        base[kind] = new Map(next[kind]);
+        baselineReady.current.add(kind);
+      }
+    }
+    const allSourcesHydrated = NOTIFY_CATEGORIES.every(
+      (kind) => sourceReady[kind],
+    );
+    if (!allSourcesHydrated) {
+      // Keep ready categories' old baselines; newly arrived entries will be
+      // compared once the unrelated source also becomes authoritative.
       return;
     }
+    const events = diffForNotifications(base, next, notifyCategories);
+    // Advance every category before the foreground/quiet-hours gate, preserving
+    // the existing behavior that suppressed events are not replayed later.
+    prev.current = next;
+    if (workspaceLoading) return;
     if (!notifyEnabled || permissionState !== "granted") return;
     if (
       isAppInForeground({
@@ -733,7 +766,6 @@ export function useSystemNotifications() {
     }
     if (isInQuietHours(quietHours)) return;
 
-    const events = diffForNotifications(base, next, notifyCategories);
     if (events.length === 0) return;
 
     void (async () => {
@@ -768,7 +800,6 @@ export function useSystemNotifications() {
     workspaceLoading,
     windowFocused,
     t,
-    sourcesHydrated,
     permissionState,
   ]);
 }
