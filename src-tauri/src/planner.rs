@@ -2403,6 +2403,13 @@ pub struct PendingWrite {
     pub base_branch: String,
     pub hint: crate::engine_routing::RoutingHint,
     pub route: Option<crate::engine_routing::RouteDecision>,
+    /// The `name` of ANOTHER direction in this SAME proposal this one must merge after (issue
+    /// #110 T4); `""` = no upstream. Carried through so the per-lane Needs-you card can show
+    /// the human WHICH producer gates this consumer at the moment they approve it — before
+    /// this field existed, the edge that decides whether the consumer's merge stays blocked
+    /// was invisible at exactly the point the human made the decision (Codex review, PR #159
+    /// planner.rs:109).
+    pub depends_on: String,
 }
 
 /// The pending write declarations for a thread (known repo + undecided).
@@ -2444,6 +2451,7 @@ async fn pending_writes_with_session_liveness(
                 base_branch: d.base_branch.clone(),
                 hint: d.hint,
                 route: d.route.clone(),
+                depends_on: d.depends_on.clone(),
             });
         }
     }
@@ -5348,6 +5356,54 @@ mod tests {
         let pending = pending_writes(&db, t.id).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].base_branch, "develop", "base_branch flows into PendingWrite");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:109): `depends_on` must flow all the way
+    /// through to `PendingWrite` — the per-lane Needs-you card's data source (via
+    /// `commands::WriteTrigger`) — not only into the batch `ScopeReview` dialog's
+    /// `ResolvedDirection`. Before this field existed on `PendingWrite`, the human approving a
+    /// single lane through the Needs-you card could not see which producer gates it, even
+    /// though the edge was already decided in the data. Mirrors
+    /// `pending_writes_carry_base_branch`'s pattern but exercises the RAW-JSON `depends_on`
+    /// path (`save_proposal_value`, not the typed `Proposal`/`ProposedDirection` — see that
+    /// field's doc on `ResolvedDirection`).
+    #[tokio::test]
+    async fn pending_writes_carry_depends_on() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-pwdeps-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+        let pending = pending_writes(&db, t.id).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].depends_on, "", "producer names no upstream");
+        assert_eq!(
+            pending[1].depends_on, "producer",
+            "depends_on must flow from the proposal into PendingWrite, not stay stuck at \
+             ResolvedDirection — this is what the per-lane Needs-you card renders"
+        );
 
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);

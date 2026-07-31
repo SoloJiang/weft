@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
-import { AlertTriangle, Check, GitBranch, Sparkles, X } from "lucide-react";
+import { AlertTriangle, Check, GitBranch, GitMerge, Sparkles, X } from "lucide-react";
 import { useStore } from "../state/store";
 import type { ResolvedDirection } from "../lib/types";
 import { Button } from "../components/ui/Button";
@@ -12,6 +12,7 @@ import { spawnableToolsOf } from "../lib/toolStatus.ts";
 import { PlanSummary } from "../session/blocks/PlanSummary";
 import { latestPlanCard, type ParsedPlanCard } from "../session/planCard";
 import { SCOPE_CONFIRM_DISABLED, scopeConfirmStateOf } from "./scopeConfirmState";
+import { dependsOnLabel } from "./dependsOnView";
 
 // One sub-task lane: exactly one write repo per direction (scope rework). The
 // old read/write/none taxonomy is gone from this gate — every lane here is a
@@ -296,6 +297,7 @@ function ScopeLaneRow({ lane, index, confirming }: { lane: ScopeLane; index: num
   // Per-proposal version: changes on EVERY re-proposal (R50-2). Threaded into BaseBranchField so a
   // re-propose with the same name/repo/base still resets a dirty (unblurred) base edit.
   const proposalVersion = proposal?.created_at ?? "";
+  const dependsOn = dependsOnLabel(lane.direction.depends_on);
   return (
     <motion.div
       initial={{ opacity: 0, y: 6 }}
@@ -318,6 +320,15 @@ function ScopeLaneRow({ lane, index, confirming }: { lane: ScopeLane; index: num
           <div className="mt-0.5 flex items-center gap-1 text-[10.5px] text-waiting">
             <AlertTriangle size={10} />
             {t("scope.unknownRepo")}
+          </div>
+        )}
+        {dependsOn && (
+          <div
+            className="mt-0.5 flex min-w-0 items-center gap-1 text-[10.5px] text-ink-faint"
+            title={t("scope.dependsOnHint", { name: dependsOn })}
+          >
+            <GitMerge size={10} className="shrink-0" />
+            <span className="truncate">{t("scope.dependsOn", { name: dependsOn })}</span>
           </div>
         )}
       </div>
