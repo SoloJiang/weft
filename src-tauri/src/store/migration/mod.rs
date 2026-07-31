@@ -2100,7 +2100,7 @@ impl MigrationTrait for M0045PullRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest};
+    use super::{gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest, M0046DirectionUpstream};
 
     #[test]
     fn gateway_tier_rewritten_to_backend() {
@@ -2457,6 +2457,83 @@ mod tests {
         // to the whole natural key, not falsely global on e.g. just the host.
         let distinct = db.execute(Statement::from_string(backend, insert_sql(2))).await;
         assert!(distinct.is_ok(), "a different PR number must still insert cleanly");
+    }
+
+    /// M0046 (issue #110 T4, Codex review PR #159 migration/mod.rs:2036): the
+    /// planner/store tests otherwise use a freshly-migrated database whose earliest
+    /// migration already creates `direction` WITH `depends_on_direction_id` present —
+    /// they can never detect a regression in THIS migration's actual upgrade path.
+    /// This starts from a pre-M0046 `direction` table (no such column at all, mirroring
+    /// what a real user's existing database looks like right before upgrading), and
+    /// verifies: the column gets added, EXISTING rows default to `0` (never inventing a
+    /// dependency that would block a task the user could already merge — the migration's
+    /// own doc comment's promise), an explicit non-zero value set afterward is a normal
+    /// column value, and a RERUN (the "duplicate column" catch in `up()`) is safe and
+    /// does not clobber it.
+    #[tokio::test]
+    async fn m0046_direction_upstream_column_defaults_existing_rows_to_zero_and_reruns_safely() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        // Pre-M0046 shape: a `direction` table that predates this migration entirely —
+        // no `depends_on_direction_id` column at all, only what an upgrade needs to
+        // exercise (ALTER TABLE ADD COLUMN does not care about sibling columns).
+        db.execute(Statement::from_string(
+            backend,
+            "CREATE TABLE direction (id INTEGER PRIMARY KEY, name TEXT NOT NULL)".to_owned(),
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_string(
+            backend,
+            "INSERT INTO direction (id, name) VALUES (1, 'producer'), (2, 'consumer')".to_owned(),
+        ))
+        .await
+        .unwrap();
+
+        M0046DirectionUpstream.up(&SchemaManager::new(&db)).await.unwrap();
+
+        for id in [1, 2] {
+            let row = db
+                .query_one(Statement::from_string(
+                    backend,
+                    format!("SELECT depends_on_direction_id FROM direction WHERE id = {id}"),
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            let value: i32 = row.try_get("", "depends_on_direction_id").unwrap();
+            assert_eq!(
+                value, 0,
+                "an existing pre-M0046 row must default to 0 (no upstream) — never invent a \
+                 dependency that would block a task the user could already merge"
+            );
+        }
+
+        // An explicit edge, set the way `repo::set_direction_upstream` would.
+        db.execute(Statement::from_string(
+            backend,
+            "UPDATE direction SET depends_on_direction_id = 1 WHERE id = 2".to_owned(),
+        ))
+        .await
+        .unwrap();
+
+        // Re-running the migration (the "duplicate column" catch in `up()`) must succeed,
+        // not error — and must not reset the explicit value back to the column default.
+        M0046DirectionUpstream.up(&SchemaManager::new(&db)).await.unwrap();
+
+        let row = db
+            .query_one(Statement::from_string(
+                backend,
+                "SELECT depends_on_direction_id FROM direction WHERE id = 2".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let value: i32 = row.try_get("", "depends_on_direction_id").unwrap();
+        assert_eq!(value, 1, "a rerun must not clobber an already-recorded upstream edge");
     }
 
     /// M0037: code_checkpoint exists after migration and round-trips a row.

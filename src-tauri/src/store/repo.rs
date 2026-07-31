@@ -1576,6 +1576,30 @@ pub async fn get_direction(db: &Db, direction_id: i32) -> Result<Option<directio
 /// prerequisite was refused merge anyway.
 pub(crate) const DENIED_UPSTREAM_SENTINEL: i32 = -1;
 
+/// `direction.depends_on_direction_id` sentinel meaning "a `depends_on` name
+/// was declared but does not (yet, or ever) resolve to exactly one
+/// materialized, non-denied lane in the same proposal" — a lane that is
+/// still pending, a typo'd/cross-proposal name, or an AMBIGUOUS match (two+
+/// candidates). Distinct from `0` for the SAME reason `DENIED_UPSTREAM_
+/// SENTINEL` is: this lane's stated prerequisite is not satisfied, so it
+/// must not read as having no upstream at all.
+///
+/// This is the fix for the race Codex found on the round-3 push (PR #159
+/// planner.rs:1776): `record_upstream_edges` used to run ONLY once a
+/// proposal's LAST lane was decided (`auto_settle_if_fully_decided`) or once
+/// a whole batch materialized (`confirm`). But `approve_direction` DISPATCHES
+/// the lane it just approved immediately on return — if a consumer is
+/// approved before its producer is even decided, the window between "this
+/// call returns and a worker starts" to "the producer is later decided" left
+/// `depends_on_direction_id` at `0`, i.e. exactly the state that reads as
+/// "no upstream, free to merge." `record_upstream_edges` now runs after
+/// EVERY individual approve/deny (see `resolve_and_record_upstream_edges`),
+/// and writes THIS sentinel whenever a lane's `depends_on` cannot yet be
+/// resolved — self-healing once the referenced lane later materializes,
+/// since the next decision's call re-resolves every lane again from
+/// scratch and upgrades the sentinel to the real id.
+pub(crate) const UNRESOLVED_UPSTREAM_SENTINEL: i32 = -2;
+
 /// Record (or clear, with `0`) the task this one must merge after.
 ///
 /// Deliberately refuses a SELF edge: a task waiting on itself can never
@@ -3782,6 +3806,11 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
             reason: "所依赖的上游任务已被拒绝,这个任务的前提不再成立".into(),
         };
     }
+    if dir.depends_on_direction_id == UNRESOLVED_UPSTREAM_SENTINEL {
+        return host::UpstreamStatus::Unknown {
+            reason: "上游任务尚未确定(可能还未审批,或依赖的名字有歧义),暂时无法判断是否可以合并".into(),
+        };
+    }
     let upstream = match get_direction(db, dir.depends_on_direction_id).await {
         Ok(Some(u)) => u,
         Ok(None) => {
@@ -3909,6 +3938,18 @@ fn parse_remote_host_and_path(remote_url: &str) -> Option<(String, String)> {
 /// segment, closing the same collision class for nested groups too (currently
 /// unreachable — `HostKind::parse`/`resolve_host` have no GitLab backend yet —
 /// but fixed here alongside the GitHub case since the root cause is shared).
+///
+/// Both sides compare WITHOUT a port (a third review round caught the
+/// asymmetry: `parse_remote_host_and_path` already strips the remote's port,
+/// but `host_base` — which for a self-hosted install can read like
+/// `git.internal:8443` — was compared as-is, so even a genuinely matching
+/// host on a non-standard port always failed). Stripping it from BOTH sides
+/// rather than requiring an exact port match on either is deliberate: SSH and
+/// HTTPS remotes for the SAME repo commonly use DIFFERENT ports (22 vs. a
+/// custom HTTPS port), and `host_base` names the API host, not any one
+/// transport's port — the hostname alone is the repo identity this check
+/// exists to verify; a port mismatch between two legitimate access paths to
+/// the same host must not read as "different repo."
 fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, host_repo: &str) -> bool {
     let host_base = host_base.trim();
     let host_owner = host_owner.trim();
@@ -3919,7 +3960,7 @@ fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, h
     let Some((host, path)) = parse_remote_host_and_path(remote_url) else {
         return false;
     };
-    let expected_host = host_base.to_lowercase();
+    let expected_host = host_base.split(':').next().unwrap_or(host_base).to_lowercase();
     let expected_path = format!("{}/{}", host_owner.to_lowercase(), host_repo.to_lowercase());
     host == expected_host && path == expected_path
 }
@@ -8208,6 +8249,45 @@ mod tests {
                     "expected a match for {remote:?}"
                 );
             }
+        }
+
+        /// THE FIX (Codex review, PR #159 repo.rs:3924): a self-hosted install's `host_base`
+        /// can read like `git.internal:8443` (the API's port). The remote's OWN port
+        /// (SSH's 22 here, deliberately DIFFERENT from the API port) must not prevent a
+        /// match — both sides compare host WITHOUT a port, since SSH and HTTPS access to the
+        /// SAME repo routinely use different ports.
+        #[test]
+        fn accepts_a_self_hosted_host_base_with_an_explicit_port_regardless_of_the_remotes_own_port() {
+            assert!(remote_matches_pr_host(
+                "https://git.internal:8443/acme/api.git",
+                "git.internal:8443",
+                "acme",
+                "api"
+            ));
+            assert!(remote_matches_pr_host(
+                "git@git.internal:acme/api.git", // SSH, no port at all in the remote
+                "git.internal:8443",
+                "acme",
+                "api"
+            ));
+            assert!(remote_matches_pr_host(
+                "ssh://git@git.internal:22/acme/api.git", // SSH on port 22, API on 8443
+                "git.internal:8443",
+                "acme",
+                "api"
+            ));
+        }
+
+        /// The port-stripping above must not turn into a substring/prefix hole of its own —
+        /// a DIFFERENT host that merely shares a port suffix must still be rejected.
+        #[test]
+        fn rejects_a_different_host_that_happens_to_share_a_port() {
+            assert!(!remote_matches_pr_host(
+                "https://evil.example:8443/acme/api.git",
+                "git.internal:8443",
+                "acme",
+                "api"
+            ));
         }
 
         /// Empty/missing identity components must never match (an unset `remote_url` — the
