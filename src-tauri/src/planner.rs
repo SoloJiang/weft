@@ -100,6 +100,29 @@ pub struct ResolvedDirection {
     /// The direction id this lane was materialized into (0 = unset). Carried through from the
     /// stored proposal so the confirmed fast-path can re-dispatch by recorded id (no matching).
     pub direction_id: i32,
+    /// Optional: the `name` of ANOTHER direction in this SAME proposal that
+    /// this one must merge after (a producer→consumer ordering edge; issue
+    /// #110 T4). `""` = no upstream. Same extension-field mechanism as
+    /// `hint` (see `depends_on_from_value`) rather than a `ProposedDirection`
+    /// field — that struct is used by a large test/DB surface (R47-3-style
+    /// concern), so the extension lives in plan JSON instead. DISPLAY-facing
+    /// only — the human-readable name shown in `ScopeReview`/the Needs-you
+    /// card (`dependsOnLabel` on the frontend). The backend does not resolve
+    /// depends_on by re-matching this name; see `depends_on_index`.
+    pub depends_on: String,
+    /// The STABLE index into this SAME proposal's `directions` that `depends_on`'s name
+    /// resolved to — computed ONCE at proposal-save time (`resolve_depends_on_indices`), not
+    /// re-derived by name search later. `None` when `depends_on` is empty (no dependency) OR
+    /// when the name did not resolve to exactly one OTHER lane (self-reference, an ambiguous
+    /// duplicate, or not found) — `record_upstream_edges` tells those two `None` cases apart by
+    /// checking whether `depends_on` itself is empty. `#[serde(skip)]`: purely a backend
+    /// resolution detail, never sent to the frontend (which only ever needs the name, for
+    /// display) — replaces the OLD design where `record_upstream_edges` re-searched sibling
+    /// lanes by name on every approve/deny (Codex review, PR #159 planner.rs:1554 and
+    /// planner.rs:1557 — both root-caused in that re-search's decision-state/self-reference
+    /// blind spots; see the PR body for the full redesign rationale).
+    #[serde(skip)]
+    pub depends_on_index: Option<usize>,
 }
 
 /// Resolve one proposed direction's write-repo name to a workspace repo id.
@@ -123,6 +146,11 @@ pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDire
         hint: crate::engine_routing::RoutingHint::default(),
         route: None,
         direction_id: dir.direction_id,
+        // Not carried by `ProposedDirection` (see that field's doc) — callers that
+        // need the real value overlay it from the raw JSON afterward, exactly as
+        // `resolved_from_plan` already does for `hint`.
+        depends_on: String::new(),
+        depends_on_index: None,
     }
 }
 
@@ -298,8 +326,10 @@ pub async fn save_proposal(db: &Db, thread_id: i32, proposal: &Proposal) -> Resu
 
 /// Store a proposal received across an untrusted JSON boundary. Keeping this
 /// raw-value seam lets older typed callers remain source-compatible while the
-/// optional planner `hint` survives round-trips through human edits and the
-/// server-owned decision/id fields. Unknown hints are normalized to `normal`.
+/// optional planner `hint` AND `depends_on` (issue #110 T4 ordering edge)
+/// survive round-trips through human edits and the server-owned decision/id
+/// fields. Unknown hints are normalized to `normal`; `depends_on` is a bare
+/// name reference, resolved to an id later (see `confirm`).
 pub async fn save_proposal_value(db: &Db, thread_id: i32, input: &Value) -> Result<()> {
     let gate = thread_gate(thread_id);
     let _gate = gate.lock().await;
@@ -315,6 +345,8 @@ pub async fn save_proposal_value(db: &Db, thread_id: i32, input: &Value) -> Resu
     }
     let mut value = serde_json::to_value(&p)?;
     normalize_input_hints(&mut value, input);
+    normalize_input_depends_on(&mut value, input);
+    resolve_depends_on_indices(&mut value);
     let json = serde_json::to_string(&value)?;
     // Bump the proposal VERSION on EVERY re-propose (R50-2). `upsert_plan` uses `version` as the
     // INSERT created_at but PRESERVES created_at on UPDATE; for a re-propose (existing row) the
@@ -385,10 +417,178 @@ fn preserve_hints_from_baseline(value: &mut Value, baseline: Option<&Value>) {
     }
 }
 
+/// Read the optional `depends_on` extension value (the `name` of ANOTHER
+/// direction in the SAME proposal this one must merge after — issue #110 T4
+/// ordering edge) without making it part of the long-standing
+/// `ProposedDirection` Rust struct. Same reasoning and mechanism as
+/// `hint_from_value`: that struct is used by a large test/DB surface, so this
+/// extension lives in plan JSON instead. `""` (absent / not a string) means
+/// no upstream.
+fn depends_on_from_value(value: &Value, index: usize) -> String {
+    value
+        .get("directions")
+        .and_then(Value::as_array)
+        .and_then(|directions| directions.get(index))
+        .and_then(|direction| direction.get("depends_on"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A fresh lead proposal owns its `depends_on` values — mirrors
+/// `normalize_input_hints`: do not inherit a prior lane's value by index
+/// position just because this proposal happens to be the same length.
+fn normalize_input_depends_on(value: &mut Value, input: &Value) {
+    let Some(directions) = value.get_mut("directions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let input_directions = input.get("directions").and_then(Value::as_array);
+    for (index, direction) in directions.iter_mut().enumerate() {
+        let Some(object) = direction.as_object_mut() else {
+            continue;
+        };
+        let depends_on = input_directions
+            .and_then(|items| items.get(index))
+            .and_then(|item| item.get("depends_on"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        object.insert("depends_on".to_string(), Value::String(depends_on.to_string()));
+    }
+}
+
+/// Server-side approve/confirm updates deserialize the long-standing Proposal
+/// type, which intentionally does not carry `depends_on` — mirrors
+/// `preserve_hints_from_baseline`: preserve the stored value by index for
+/// those updates only; a fresh lead proposal goes through
+/// `normalize_input_depends_on` instead.
+fn preserve_depends_on_from_baseline(value: &mut Value, baseline: Option<&Value>) {
+    let Some(directions) = value.get_mut("directions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let baseline_directions = baseline.and_then(|value| value.get("directions")).and_then(Value::as_array);
+    for (index, direction) in directions.iter_mut().enumerate() {
+        let Some(object) = direction.as_object_mut() else {
+            continue;
+        };
+        let depends_on = baseline_directions
+            .and_then(|items| items.get(index))
+            .and_then(|item| item.get("depends_on"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        object.insert("depends_on".to_string(), Value::String(depends_on.to_string()));
+    }
+}
+
+/// Read the `depends_on_index` extension value written by [`resolve_depends_on_indices`] —
+/// `Some(i)` when `depends_on`'s name resolved to sibling index `i` in THIS SAME proposal,
+/// `None` when it did not (which callers distinguish from "no `depends_on` at all" by checking
+/// whether the name itself, from `depends_on_from_value`, is empty).
+fn depends_on_index_from_value(value: &Value, index: usize) -> Option<usize> {
+    value
+        .get("directions")
+        .and_then(Value::as_array)
+        .and_then(|directions| directions.get(index))
+        .and_then(|direction| direction.get("depends_on_index"))
+        .and_then(Value::as_u64)
+        .map(|i| i as usize)
+}
+
+/// Resolve every lane's `depends_on` NAME to a STABLE INDEX into this SAME proposal's
+/// `directions`, once, right here — not deferred to `record_upstream_edges`, which used to
+/// re-search sibling lanes BY NAME on every single approve/deny (Codex review, PR #159: the
+/// index-based redesign this function anchors; see the PR body for the full rationale). Called
+/// from BOTH places a proposal's `depends_on` names get established: `save_proposal_value`
+/// (after `normalize_input_depends_on`) for a fresh lead proposal, and `proposal_json_with_hints`
+/// (after `preserve_depends_on_from_baseline`) for every server-driven re-save (approve/deny/
+/// settle) — recomputing fresh from whatever names are in `value` at that point is always
+/// correct and cheap (a handful of string comparisons), since the RESULT only ever depends on
+/// the CURRENT set of names, never on decision/materialization state (which is exactly the bug
+/// the old name-search-at-write-time design had: `record_upstream_edges` used to filter
+/// candidates by `direction_id != 0`, so a duplicate name could look like a false singleton
+/// purely because one sibling hadn't materialized YET — Codex review, PR #159 planner.rs:1554).
+///
+/// A name resolves to `Some(index)` only when it matches EXACTLY ONE OTHER lane's name (never
+/// itself — Codex review, PR #159 planner.rs:1557: a self-reference used to resolve to a
+/// singleton match of the lane's OWN materialized id, attempt a self-edge write,
+/// `set_direction_upstream` would reject that write, and the rejection was invisible —
+/// `depends_on_direction_id` just stayed at its prior value, `0`, reading as "no dependency"
+/// instead of blocked). Anything else — empty match (typo / a name from outside this proposal,
+/// which the tool contract already says never resolves), 2+ matches (a genuine ambiguous
+/// duplicate name — this codebase explicitly supports duplicate same-name lanes elsewhere), or
+/// a match on nothing but the lane's own index (self-reference) — resolves to `None`, and
+/// `record_upstream_edges` maps that (given a non-empty `depends_on` name) to the SAME blocking
+/// sentinel every other unresolvable case in this feature uses. Never silently free to merge.
+fn resolve_depends_on_indices(value: &mut Value) {
+    let Some(directions) = value.get("directions").and_then(Value::as_array) else {
+        return;
+    };
+    // Every lane's name and depends_on, in order — the ONLY inputs resolution needs. Collected
+    // as owned data up front so the write pass below can hold a fresh `&mut` without conflicting
+    // with these reads (this loop needs every OTHER lane's name to resolve any ONE lane's target).
+    let names: Vec<String> = directions
+        .iter()
+        .map(|d| d.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string())
+        .collect();
+    let depends_on: Vec<String> = directions
+        .iter()
+        .map(|d| d.get("depends_on").and_then(Value::as_str).unwrap_or("").trim().to_string())
+        .collect();
+    let resolved: Vec<Option<usize>> = depends_on
+        .iter()
+        .enumerate()
+        .map(|(own_index, name)| {
+            if name.is_empty() {
+                return None; // no dependency declared
+            }
+            let matches: Vec<usize> = names
+                .iter()
+                .enumerate()
+                .filter(|(i, n)| *i != own_index && n.as_str() == name.as_str())
+                .map(|(i, _)| i)
+                .collect();
+            match matches.as_slice() {
+                [i] => Some(*i),
+                [] => {
+                    eprintln!(
+                        "[weft][planner] lane {own_index} ({:?}): depends_on {name:?} matches no \
+                         OTHER lane in this proposal by name — blocking rather than guessing",
+                        names.get(own_index).map(String::as_str).unwrap_or("")
+                    );
+                    None
+                }
+                _ => {
+                    eprintln!(
+                        "[weft][planner] lane {own_index} ({:?}): depends_on {name:?} matches {} \
+                         other lanes in this proposal ambiguously — blocking rather than guessing",
+                        names.get(own_index).map(String::as_str).unwrap_or(""),
+                        matches.len()
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
+    let Some(directions) = value.get_mut("directions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (index, direction) in directions.iter_mut().enumerate() {
+        let Some(object) = direction.as_object_mut() else {
+            continue;
+        };
+        let index_value = match resolved.get(index).copied().flatten() {
+            Some(i) => Value::Number(i.into()),
+            None => Value::Null,
+        };
+        object.insert("depends_on_index".to_string(), index_value);
+    }
+}
+
 fn proposal_json_with_hints(proposal: &Proposal, baseline: &str) -> Result<String> {
     let mut value = serde_json::to_value(proposal)?;
     let baseline = serde_json::from_str::<Value>(baseline).ok();
     preserve_hints_from_baseline(&mut value, baseline.as_ref());
+    preserve_depends_on_from_baseline(&mut value, baseline.as_ref());
+    resolve_depends_on_indices(&mut value);
     Ok(serde_json::to_string(&value)?)
 }
 
@@ -568,6 +768,8 @@ async fn resolved_from_plan(
         .collect();
     for (index, direction) in directions.iter_mut().enumerate() {
         direction.hint = hint_from_value(&raw, index);
+        direction.depends_on = depends_on_from_value(&raw, index);
+        direction.depends_on_index = depends_on_index_from_value(&raw, index);
     }
     Ok(ResolvedProposal {
         thread_id,
@@ -1007,6 +1209,31 @@ async fn confirm_with_manual_tool_with_session_liveness(
                 recreated_fastpath.push(id);
             }
         }
+        // THE FIX (Codex review, PR #159 planner.rs:1549): `record_upstream_edges` runs AFTER
+        // the plan-confirmation CAS commits (see the main path below), as a separate, best-
+        // effort step — never inside the same transaction (see that function's own doc on why:
+        // it is metadata layered on top of already-durable state, not part of what makes any
+        // SINGLE decision atomic). If the process exits between that CAS committing and
+        // `record_upstream_edges` finishing — a hard crash, not just the in-process transient
+        // errors `set_upstream_edge_if_changed` now falls back safely from — a newly
+        // materialized consumer can be left with `depends_on_direction_id` still at its schema
+        // default `0`, reading as dependency-free forever: THIS fast path only re-dispatches by
+        // recorded id, it never repairs edges, so restart alone could never heal it before this
+        // fix. Closed by re-running the SAME resolution + write here, every time this fast path
+        // is taken (every redispatch, not only the one right after a crash) — cheap and safe
+        // because it is exactly as idempotent as the main path's own call: `resolved` (built
+        // above via `resolved_from_plan`) already carries each lane's save-time-resolved
+        // `depends_on_index`, so no new resolution logic is needed, and
+        // `set_upstream_edge_if_changed`'s own early return (`dir.depends_on_direction_id ==
+        // target`) makes every already-correct edge a no-op — only a genuinely missing/stale one
+        // is actually rewritten.
+        let fastpath_proposal: Proposal = serde_json::from_str(&start_plan.proposal).unwrap_or_default();
+        record_upstream_edges(
+            db,
+            thread_id,
+            &upstream_lanes_from_resolved(&resolved, &fastpath_proposal),
+        )
+        .await;
         return Ok(matching);
     }
     let existing_dirs = repo::list_directions(db, thread_id).await?;
@@ -1339,7 +1566,409 @@ async fn confirm_with_manual_tool_with_session_liveness(
         )
         .await;
     }
+    record_upstream_edges(
+        db,
+        thread_id,
+        &upstream_lanes_from_resolved(&resolved, &proposal),
+    )
+    .await;
     Ok(dispatch_ids)
+}
+
+/// One lane's identity for resolving `depends_on` names to ids — the minimal
+/// view [`record_upstream_edges`] needs, independent of which of the TWO
+/// call sites that can transition a plan to "confirmed" supplies it:
+/// `confirm`'s main body (which has a full `ResolvedProposal`) and
+/// `auto_settle_if_fully_decided` (the per-lane-approval settle path, issue
+/// #104's "plan approve → per-lane approve → batch confirm is the same
+/// decision" — which only has the typed `Proposal` plus the just-persisted
+/// raw JSON, never a `ResolvedProposal`). Owns its strings rather than
+/// borrowing so both call sites can build it without lifetime gymnastics —
+/// this runs at most once per confirm/settle, so the extra allocations are
+/// immaterial.
+/// How a lane's `depends_on` resolves, as already decided by [`resolve_depends_on_indices`] at
+/// proposal-save time — `record_upstream_edges` never re-derives this by name. A discriminated
+/// value (CLAUDE.md "discriminated state, exhaustive map"), not a name string plus a
+/// separately-searched candidate list, so every caller maps it with one exhaustive `match`
+/// instead of re-deriving "is this ambiguous / self-referential / just not decided yet" at each
+/// use site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DependsOnTarget {
+    /// No `depends_on` was declared — this lane has no upstream.
+    None,
+    /// Resolved to exactly one OTHER lane in this SAME proposal, by its stable index.
+    Index(usize),
+    /// A `depends_on` name was declared but did not resolve to exactly one OTHER lane at
+    /// proposal-save time — empty match, ambiguous duplicate match, or a self-reference (Codex
+    /// review, PR #159 planner.rs:1554 / planner.rs:1557). Always blocking.
+    Unresolved,
+}
+
+/// Combine a lane's raw `depends_on` name with its already-resolved `depends_on_index` into one
+/// [`DependsOnTarget`] — the single place that decides "no dependency" (empty name) apart from
+/// "declared but unresolved" (non-empty name, no index), shared by both `UpstreamLane` builders
+/// below so they can't drift on this distinction.
+fn depends_on_target_of(name: &str, index: Option<usize>) -> DependsOnTarget {
+    if name.trim().is_empty() {
+        DependsOnTarget::None
+    } else {
+        match index {
+            Some(i) => DependsOnTarget::Index(i),
+            None => DependsOnTarget::Unresolved,
+        }
+    }
+}
+
+struct UpstreamLane {
+    direction_id: i32,
+    /// This lane's OWN decision ("" | "approved" | "denied") — needed to tell
+    /// "not decided / referenced by typo" apart from "explicitly denied" when
+    /// this lane is the TARGET of another lane's `depends_on` (Codex review,
+    /// PR #159 planner.rs:1534): a denied producer never materializes
+    /// (`direction_id` stays 0 forever, same as an undecided one), but it is
+    /// a permanent, decided fact — not a "maybe later" — and a consumer
+    /// naming it must be actively blocked, not silently left as "no upstream".
+    decision: String,
+    depends_on: DependsOnTarget,
+}
+
+/// Build [`UpstreamLane`]s from a `ResolvedProposal` (confirm's main body,
+/// which already resolved `depends_on`/`depends_on_index` via `resolved_from_plan`) zipped with
+/// the `Proposal`'s per-lane materialized ids. Indices align 1:1 — both
+/// derive from the same stored proposal snapshot (see `resolved_from_plan`'s
+/// doc), which is also what makes a resolved `DependsOnTarget::Index` a valid index into THIS
+/// SAME `lanes` vec.
+fn upstream_lanes_from_resolved(resolved: &ResolvedProposal, proposal: &Proposal) -> Vec<UpstreamLane> {
+    resolved
+        .directions
+        .iter()
+        .zip(proposal.directions.iter())
+        .map(|(r, p)| UpstreamLane {
+            direction_id: p.direction_id,
+            decision: p.decision.clone(),
+            depends_on: depends_on_target_of(&r.depends_on, r.depends_on_index),
+        })
+        .collect()
+}
+
+/// Build [`UpstreamLane`]s from a typed `Proposal` (has `direction_id`/
+/// `decision` but never `depends_on`/`depends_on_index` — see those fields' docs) plus the raw
+/// JSON `Value` of the SAME proposal. Used by `auto_settle_if_fully_decided`, which
+/// persists via `proposal_json_with_hints` rather than `resolved_from_plan`
+/// and so never builds a full `ResolvedProposal` (that additionally needs a
+/// live workspace-repo lookup this settle path has no reason to pay for).
+fn upstream_lanes_from_raw(proposal: &Proposal, raw: &Value) -> Vec<UpstreamLane> {
+    proposal
+        .directions
+        .iter()
+        .enumerate()
+        .map(|(idx, p)| UpstreamLane {
+            direction_id: p.direction_id,
+            decision: p.decision.clone(),
+            depends_on: depends_on_target_of(&depends_on_from_value(raw, idx), depends_on_index_from_value(raw, idx)),
+        })
+        .collect()
+}
+
+/// Resolve every lane's `depends_on` (the `name` of ANOTHER direction in this
+/// SAME proposal it must merge after — issue #110 T4) to that direction's
+/// materialized id, and record the edge via `set_direction_upstream`. Called
+/// from EVERY production place a lane's `depends_on` needs (re-)resolving:
+/// after each INDIVIDUAL `approve_direction`/`deny_direction` decision (via
+/// `resolve_and_record_upstream_edges`), and after `confirm`'s main body
+/// materializes a batch. Previously this ran only once a proposal's LAST lane
+/// was decided or once a whole batch materialized (Codex review, PR #159
+/// planner.rs:1420 — the per-lane settle path used to skip this entirely) —
+/// but `approve_direction` DISPATCHES the lane it just approved on return, so
+/// even THAT fix left a window: a consumer approved before its producer is
+/// even decided got dispatched with `depends_on_direction_id` still `0` (Codex
+/// review, PR #159 planner.rs:1776 — found on the round-3 push). Running this
+/// after every individual decision, not only the settling one, closes that
+/// window; see `UNRESOLVED_UPSTREAM_SENTINEL`'s doc for how a not-yet-
+/// resolvable reference stays actively blocked (never silently `0`) until a
+/// LATER call — triggered by the referenced lane's own decision — resolves it
+/// for real.
+///
+/// Runs AFTER its caller's own persist/CAS/materialize has committed: the
+/// ordering edge is metadata layered on top of already-durable state, not
+/// part of what makes any SINGLE decision atomic, so it is intentionally
+/// best-effort here — see `notify_upstream_edge_write_failed` for why a write
+/// failure escalates to a Needs-you notice instead of failing the causing
+/// operation outright (Codex review, planner.rs:1470).
+///
+/// Per lane: `DependsOnTarget::None` clears any STALE edge a previous proposal
+/// left behind (Codex review, planner.rs:1447 — a re-proposal that drops
+/// `depends_on` must not leave the old upstream blocking forever).
+/// `DependsOnTarget::Index(i)` was ALREADY resolved unambiguously against sibling NAMES at
+/// proposal-save time (`resolve_depends_on_indices`) — the only thing still dynamic here is
+/// lane `i`'s CURRENT decision: not yet materialized (may still resolve on a later decision),
+/// explicitly DENIED (Codex review, planner.rs:1534 — a permanent, decided fact, not a "maybe
+/// later"), or materialized (its real id). `DependsOnTarget::Unresolved` (an empty match, an
+/// AMBIGUOUS match — this codebase explicitly supports duplicate same-name lanes elsewhere — or
+/// a self-reference, ALL decided once at save time, never re-derived here) is unconditionally
+/// blocking. Every blocking case records `DENIED_UPSTREAM_SENTINEL` / `UNRESOLVED_UPSTREAM_
+/// SENTINEL` rather than leaving the edge at `0`, which would read as "no upstream, free to
+/// merge."
+///
+/// Resolves EVERY lane's target before writing any of them, then applies in two passes
+/// (release-stale, then apply-real) rather than one straight-through pass (Codex review, PR
+/// #159 planner.rs:1570): a re-proposal that REVERSES a reused dependency (A depended on B; B
+/// should now depend on A instead) can list the lanes in either order, and a single pass that
+/// happens to process the new dependent before the old one tries to write the reversed edge
+/// while the stale original is still in the DB — `set_direction_upstream`'s cycle check
+/// correctly (if unhelpfully, for a same-batch artifact) rejects that as a cycle, silently
+/// stranding the new edge at `0`. See the two-pass loop's own comments for why clearing first
+/// is unconditionally cycle-safe and stays a no-op for every lane that isn't actually changing.
+async fn record_upstream_edges(db: &Db, thread_id: i32, lanes: &[UpstreamLane]) {
+    let mut targets: Vec<(i32, i32)> = Vec::with_capacity(lanes.len());
+    for lane in lanes {
+        if lane.direction_id == 0 {
+            continue; // this lane never materialized — nothing to record an edge ON.
+        }
+        let target = match lane.depends_on {
+            DependsOnTarget::None => 0,
+            DependsOnTarget::Unresolved => repo::UNRESOLVED_UPSTREAM_SENTINEL,
+            DependsOnTarget::Index(i) => match lanes.get(i) {
+                // The named lane is a decided, permanent dead end — block, don't guess it might
+                // still work out (Codex review, planner.rs:1534).
+                Some(target_lane) if target_lane.decision == "denied" => repo::DENIED_UPSTREAM_SENTINEL,
+                // Materialized: its real id.
+                Some(target_lane) if target_lane.direction_id != 0 => target_lane.direction_id,
+                // Named lane exists (the index was resolved against THIS SAME proposal) but
+                // hasn't been decided/materialized yet — may still resolve once it is; block in
+                // the meantime, never silently 0.
+                Some(_) => repo::UNRESOLVED_UPSTREAM_SENTINEL,
+                // Defensive: `resolve_depends_on_indices` only ever produces an index into THIS
+                // SAME proposal's directions, so `lanes` (built 1:1 from that same snapshot —
+                // see `upstream_lanes_from_resolved`/`upstream_lanes_from_raw`'s docs) should
+                // never actually miss it. Fail closed if it somehow does anyway.
+                None => repo::UNRESOLVED_UPSTREAM_SENTINEL,
+            },
+        };
+        targets.push((lane.direction_id, target));
+    }
+
+    // PASS 1 — release every STALE edge that this call is about to REPLACE, before pass 2
+    // writes any real (possibly non-zero) target. Without this, a re-proposal that REVERSES a
+    // reused dependency (A depended on B; the new shape has B depend on A instead) processed in
+    // the "wrong" lane order would try to write B→A while the old A→B edge is still in the DB:
+    // `set_direction_upstream`'s cycle walk correctly (if unhelpfully, for a same-batch
+    // artifact) sees that as a genuine cycle and rejects the write, silently leaving B's real
+    // new dependency stuck at 0 — allowing it to merge before A (Codex review, PR #159
+    // planner.rs:1570).
+    //
+    // Clears to `UNRESOLVED_UPSTREAM_SENTINEL`, NOT `0` (Codex review, PR #159
+    // planner.rs:1600, a follow-up round on this same fix): this function's two passes are two
+    // SEPARATE, non-transactional awaited writes, with no lock held across the gap between
+    // them — `host::automerge`/`host::monitor` run on their own independent sweep loop and can
+    // read this row at any point, including exactly between pass 1 and pass 2. A REPLACED
+    // dependency (a reused direction whose old real edge is swapped for a different real one,
+    // not merely cleared to empty) is the one case pass 1 actually writes something for; if
+    // that write were `0`, a sweep landing in the gap would read `UpstreamStatus::None` — "no
+    // upstream, free to merge" — genuinely true of the DB row at that instant, and could
+    // release a PR whose stored other-axis state was already cached `Ready`, before pass 2 has
+    // installed the real new producer. The sentinel closes that: `creates_cycle`'s walk
+    // dead-ends on it exactly like it does on `0` (a sentinel is never a real row's id — see
+    // `set_direction_upstream`'s doc), so it is EQUALLY safe against a false cycle rejection in
+    // pass 2, but a sweep reading it mid-transition sees `UpstreamStatus::Unknown` (blocking),
+    // never `None` (releasing) — the same fail-closed answer `UNRESOLVED_UPSTREAM_SENTINEL`
+    // already gives for "not resolved yet" everywhere else in this function. Only touching
+    // lanes whose target is ACTUALLY different from their current value (not every lane in the
+    // batch) keeps the common case — most decisions touch no `depends_on` at all, and most
+    // existing edges aren't changing — at zero extra writes, and avoids a lane that ISN'T
+    // changing ever transiently reading anything but its own already-correct value.
+    for &(direction_id, target) in &targets {
+        if let Ok(Some(dir)) = repo::get_direction(db, direction_id).await {
+            if dir.depends_on_direction_id != 0 && dir.depends_on_direction_id != target {
+                set_upstream_edge_if_changed(db, thread_id, direction_id, repo::UNRESOLVED_UPSTREAM_SENTINEL).await;
+            }
+        }
+    }
+
+    // Test-only seam: let a test pause HERE — exactly the window a concurrently running
+    // automerge/monitor sweep could land in — read DB state from a separate task, then release
+    // it. See `tests::between_upstream_passes_probe`.
+    #[cfg(test)]
+    tests::between_upstream_passes_probe(thread_id).await;
+
+    // PASS 2 — apply every real target now that no stale edge from this same batch can still
+    // be in the way of a legitimate reversal.
+    for (direction_id, target) in targets {
+        set_upstream_edge_if_changed(db, thread_id, direction_id, target).await;
+    }
+}
+
+/// Write `target` as `direction_id`'s upstream edge — but only if it isn't
+/// ALREADY `target`. `record_upstream_edges` now re-processes every lane on
+/// every individual approve/deny (not only once, at the end — see its doc),
+/// so the SAME still-unresolved lane can be visited many times before its
+/// dependency actually resolves; reading first keeps the overwhelmingly
+/// common case (a lane whose edge isn't changing THIS call — including every
+/// plan that never uses `depends_on` at all) to one read and zero writes,
+/// rather than a redundant UPDATE on every single decision in the proposal.
+async fn set_upstream_edge_if_changed(db: &Db, thread_id: i32, direction_id: i32, target: i32) {
+    match repo::get_direction(db, direction_id).await {
+        Ok(Some(dir)) if dir.depends_on_direction_id == target => return,
+        Ok(Some(_)) => {}
+        Ok(None) => return, // the direction is gone — nothing to write.
+        Err(e) => {
+            // THE FIX (Codex review, PR #159 planner.rs:1797): a read failure here is JUST AS
+            // REAL a reason a stale/missing edge might survive undetected as the write-failure
+            // branch below, and until this fix it was treated differently — logged, but never
+            // falling back to the sentinel. That asymmetry mattered concretely: a direction that
+            // has NEVER had a successful upstream write (its column still at the schema default
+            // `0`) reads as "no dependency" exactly like a genuinely dependency-free lane, and
+            // this function's caller (`approve_direction`/`confirm`) does not gate its own
+            // success on this call — see this function's own doc: "intentionally best-effort,"
+            // never a hard failure of the causing operation — so the newly materialized
+            // consumer is dispatched, and a later healthy auto-merge read sees `None` and can
+            // merge it before its producer. `set_direction_upstream` does its OWN read
+            // internally before writing (see that function), so a transient failure in THIS
+            // read does not imply the fallback write below will also fail.
+            eprintln!(
+                "[weft][planner] direction {direction_id}: could not read current state before \
+                 recording upstream {target}: {e}"
+            );
+            notify_upstream_edge_write_failed(thread_id, direction_id, target, &e);
+            fall_back_to_unresolved_sentinel(db, direction_id, "the read failure above").await;
+            return;
+        }
+    }
+    if let Err(e) = repo::set_direction_upstream(db, direction_id, target).await {
+        eprintln!("[weft][planner] direction {direction_id}: could not record upstream {target}: {e}");
+        notify_upstream_edge_write_failed(thread_id, direction_id, target, &e);
+        // A REJECTED/FAILED write must never leave the edge at whatever it happened to be
+        // BEFORE this call — if that prior value is `0` ("no dependency"), the direction would
+        // read as free to merge despite a prerequisite that was just rejected, not satisfied
+        // (Codex review, PR #159 planner.rs:1772: a mutual 2-cycle's SECOND edge is correctly
+        // rejected by `set_direction_upstream`'s cycle check — self-reference can no longer
+        // reach this point at all, excluded at resolve time, but a LONGER cycle only shows up
+        // graph-globally and still reaches this write-time check — and that rejection was
+        // silently swallowed here, leaving the rejected lane looking dependency-free). Falls
+        // back to the SAME blocking sentinel every other unresolvable case in this feature
+        // already uses (`UNRESOLVED_UPSTREAM_SENTINEL` — reused, not a new one): writing a
+        // sentinel can never itself be rejected as a cycle (it is never a real row's id — see
+        // `set_direction_upstream`'s doc), so this fallback write is unconditionally safe to
+        // attempt regardless of what the original `target` was.
+        fall_back_to_unresolved_sentinel(db, direction_id, "the rejected write above").await;
+    }
+}
+
+/// Shared tail of both `set_upstream_edge_if_changed` failure branches (a rejected write, or a
+/// read that failed before a write was even attempted): write the blocking sentinel so the edge
+/// is never left at whatever value it happened to have before this call — see the two call
+/// sites' own doc for why `0` surviving either failure is unsafe. `context` names which prior
+/// failure this is recovering from, for the log line only; the fallback write itself is
+/// unconditionally safe to attempt regardless of what failed above (`UNRESOLVED_UPSTREAM_
+/// SENTINEL` is never a real row's id, so `set_direction_upstream`'s cycle check can never
+/// reject it — see that function's doc).
+async fn fall_back_to_unresolved_sentinel(db: &Db, direction_id: i32, context: &str) {
+    if let Err(e2) = repo::set_direction_upstream(db, direction_id, repo::UNRESOLVED_UPSTREAM_SENTINEL).await {
+        eprintln!(
+            "[weft][planner] direction {direction_id}: ALSO could not fall back to the \
+             blocking sentinel after {context}: {e2} — this direction's upstream edge may \
+             still read as a stale, possibly-\"no dependency\" value"
+        );
+    }
+}
+
+/// Human-facing text for a failed `set_direction_upstream` write (Codex
+/// review, PR #159 planner.rs:1470). By the time this runs, the plan is
+/// ALREADY durably confirmed and its directions already dispatched — an
+/// eprintln alone would be the ONLY signal that the ordering safety edge
+/// silently did not land, invisible to anyone not tailing the process log.
+/// Kept as a PURE function (unit-tested without a Tauri runtime) mirroring
+/// `host::judge::give_up_text`'s split between content and the thin,
+/// runtime-dependent call site that posts it — see
+/// `notify_upstream_edge_write_failed`. `upstream_id == 0` means this was a
+/// stale-edge CLEAR that failed, not a fresh write.
+fn upstream_edge_write_failed_text(direction_id: i32, upstream_id: i32, err: &anyhow::Error) -> String {
+    // The recovery instruction deliberately does NOT say "just confirm/approve again": the
+    // confirmed-fast-path retry never re-calls record_upstream_edges (only the transition INTO
+    // "confirmed" does), so a bare retry cannot rescue this edge — only a fresh re-propose
+    // (which resets status back to "proposed") re-earns a pass through it.
+    if upstream_id == 0 {
+        format!(
+            "⚠️ 任务 #{direction_id} 清除过期的上游依赖失败:{err}。自动合并的排序保护可能仍卡在一个已经不存在的依赖上——单纯重新确认/批准不会重试这次写入,请让 agent 针对这个任务重新完整提一次案(re-propose)。"
+        )
+    } else {
+        format!(
+            "⚠️ 任务 #{direction_id} 的上游依赖(#{upstream_id})记录失败:{err}。跨仓合并排序保护可能未生效,这个任务有可能在它依赖的任务之前被自动合并——单纯重新确认/批准不会重试这次写入,请让 agent 针对这个任务重新完整提一次案(re-propose)。"
+        )
+    }
+}
+
+/// Best-effort Needs-you escalation for a failed upstream-edge write.
+///
+/// Deliberately NOT made transactional with (or a hard failure of) the
+/// confirm/settle call that reached this point, despite Codex's review
+/// suggesting exactly that (planner.rs:1470): by the time `record_upstream_
+/// edges` runs, the plan's directions are ALREADY durably created (materialize_
+/// direction already ran) and this call's own return is what the caller uses
+/// to dispatch workers against them — turning THIS failure into an `Err` this
+/// late would make `confirm`/`approve_direction` report failure for work that
+/// in fact succeeded. And a "just retry" recovery does not actually help: the
+/// confirmed-fast-path retry re-dispatches directions but never re-calls
+/// `record_upstream_edges` (that only runs on the transition INTO "confirmed",
+/// not on every re-entry), so neither path can rescue this specific edge —
+/// only a fresh `save_proposal`/re-propose can, since that resets status back
+/// to "proposed" and re-earns a pass through this function. A visible-but-
+/// non-blocking notice is the correct shape for a write that is supplementary
+/// safety metadata layered on top of already-real work, not a coin flip on
+/// whether that work happened at all.
+///
+/// Uses the same `crate::APP_HANDLE` global fallback `bus::server::
+/// emit_proposal_row` also reaches for from deep inside planner/bus logic
+/// that has no `BusRegistry` of its own to thread through — but NOT an exact
+/// mirror of that function's shape, and weaker: `emit_proposal_row` durably
+/// writes to `lead_message` FIRST and only gates the LIVE push notification on
+/// `APP_HANDLE`, so a restart before the live push is seen still leaves the
+/// row for the human to find. This function has no durable counterpart to
+/// fall back on — `BusRegistry`'s asks/notices are in-memory only (this
+/// codebase has no ask/notice DB table at all), so a restart between the
+/// write failure and a human seeing the notice loses BOTH silently, quietly
+/// reverting to the original "nobody can tell" problem with a narrower (but
+/// nonzero) window. This is an EXISTING tradeoff already made elsewhere in
+/// this codebase (issue #88's stall notice is the same shape: memory-only,
+/// no reboot re-scan), not a regression unique to this function — but it is a
+/// real limitation, not a fully-closed gap.
+///
+/// `APP_HANDLE` itself is not the weak link here: it is set once, synchronously,
+/// inside `.setup()`, and `confirm`/`approve_direction` are reachable only
+/// through Tauri IPC, which cannot fire before `.setup()` completes — so in
+/// every real (non-test) run this branch is live. The `None` branches below
+/// exist for the headless test harness, which is also why the notice TEXT is
+/// unit-tested separately above rather than through this call site.
+///
+/// FOLLOW-UP (Codex review, PR #159 planner.rs:1905), deliberately not done here: this
+/// notice is never retracted if a LATER re-propose successfully rewrites the same
+/// direction's edge — a human can be left staring at a stale warning after the underlying
+/// problem is already fixed. `BusRegistry::cancel_open_asks_by_id` (used by `host::monitor`
+/// for exactly this "supersede an earlier notice" purpose) could retract it, but
+/// `host::monitor`'s use of that primitive leans on a `HashMap<i32, (i32, u64, String)>` that
+/// its OWN long-lived sweep loop owns and threads as `&mut` across every iteration (see
+/// `host::monitor`'s `notices` parameter) — this call site has no equivalent: it is reached
+/// from one-shot confirm/re-propose IPC handlers, not a loop, with no natural owner for
+/// mutable state that must survive between two calls that can be minutes or hours apart.
+/// Wiring retraction in here would mean introducing a NEW global correlation map
+/// (direction_id -> last-posted ask id) purely to track that, plus its own tests (posted/
+/// retracted/no-cross-direction-cancel/no-double-post) — real but non-trivial new machinery
+/// for a UX polish concern, not a correctness one (the sentinel this notice warns about
+/// already blocks a free merge regardless of whether the notice itself is ever retracted).
+/// Left as a follow-up rather than bundled into this review response.
+fn notify_upstream_edge_write_failed(thread_id: i32, direction_id: i32, upstream_id: i32, err: &anyhow::Error) {
+    use tauri::Manager;
+    let Some(app) = crate::APP_HANDLE.get() else {
+        return;
+    };
+    let Some(bus) = app.try_state::<crate::bus::BusRegistry>() else {
+        return;
+    };
+    bus.notify_human_action_required(
+        thread_id,
+        &direction_id.to_string(),
+        &upstream_edge_write_failed_text(direction_id, upstream_id, err),
+    );
 }
 
 /// Tear down lanes created in the current confirm attempt (used on any failure to keep
@@ -1384,6 +2013,15 @@ fn fully_decided(p: &Proposal) -> bool {
 /// thread_gate hold), so this CAS is expected to always apply in production — kept
 /// defensive (like `confirm`'s final commit) rather than propagated as an error, because the
 /// caller's OWN action (the approve/deny that got us here) already succeeded regardless.
+///
+/// THIS is the other of the two places a plan can transition to "confirmed" (see
+/// `record_upstream_edges`'s doc for the exhaustive pair) — a plan resolved entirely through
+/// per-lane Needs-you cards never reaches `confirm`'s main body at all, and a LATER batch
+/// `confirm()` call on an already-"confirmed" plan exits through its idempotent fast path
+/// before reaching it either. Before this fix (Codex review, PR #159 planner.rs:1420) that
+/// meant `record_upstream_edges` never ran for this — the overwhelmingly common — approval
+/// flow, so `depends_on` reproduced the exact bug it was written to close for anyone who
+/// approves cards one at a time instead of clicking the batch Confirm button.
 async fn auto_settle_if_fully_decided(
     db: &Db,
     thread_id: i32,
@@ -1393,9 +2031,36 @@ async fn auto_settle_if_fully_decided(
     if !fully_decided(proposal) {
         return;
     }
-    if let Ok(json) = proposal_json_with_hints(proposal, baseline) {
-        let _ = repo::mark_plan_confirmed_cas(db, thread_id, &json, "proposed").await;
-    }
+    let Ok(json) = proposal_json_with_hints(proposal, baseline) else {
+        return;
+    };
+    let _ = repo::mark_plan_confirmed_cas(db, thread_id, &json, "proposed").await;
+    // Upstream edges are NOT resolved here (unlike before Codex review, PR #159
+    // planner.rs:1776 found the gap this closed): `approve_direction`/`deny_direction`
+    // now call `resolve_and_record_upstream_edges` themselves, right after every
+    // INDIVIDUAL decision — including ones that don't (yet) fully decide the
+    // proposal — because `approve_direction` dispatches the lane it just approved
+    // immediately on return, before this function would otherwise ever run. By the
+    // time this function is reached, the caller has already resolved edges for the
+    // exact `proposal` state this CAS just confirmed.
+}
+
+/// Resolve and record every lane's upstream edge for the CURRENT `proposal`
+/// state (see `record_upstream_edges`'s doc). Called after EVERY individual
+/// `approve_direction`/`deny_direction` decision — not only once a proposal
+/// is fully decided — because a lane can be dispatched (by the caller, on
+/// return) the moment ITS OWN decision persists, regardless of whether
+/// siblings are still pending (Codex review, PR #159 planner.rs:1776).
+/// `baseline` is the plan row's proposal JSON as read at the START of the
+/// caller's operation — the same value `persist_decision`/`proposal_json_
+/// with_hints` already use to preserve extension fields through the typed
+/// `Proposal` round-trip.
+async fn resolve_and_record_upstream_edges(db: &Db, thread_id: i32, proposal: &Proposal, baseline: &str) {
+    let Ok(json) = proposal_json_with_hints(proposal, baseline) else {
+        return;
+    };
+    let raw = serde_json::from_str::<Value>(&json).unwrap_or(Value::Null);
+    record_upstream_edges(db, thread_id, &upstream_lanes_from_raw(proposal, &raw)).await;
 }
 
 /// Restore the disk-reclaim state when a reused-lane approval fails after a
@@ -1780,6 +2445,10 @@ async fn approve_direction_with_pin_with_session_liveness(
             )
             .await;
         }
+        // Resolve/record BEFORE returning: the caller dispatches this lane the moment
+        // this call returns, regardless of whether siblings are still pending (Codex
+        // review, PR #159 planner.rs:1776).
+        resolve_and_record_upstream_edges(db, thread_id, &proposal, &plan.proposal).await;
         auto_settle_if_fully_decided(db, thread_id, &proposal, &plan.proposal).await;
         return Ok(id);
     }
@@ -1846,6 +2515,9 @@ async fn approve_direction_with_pin_with_session_liveness(
         &route,
     )
     .await;
+    // Resolve/record BEFORE returning — see the reused-lane branch above for why (Codex
+    // review, PR #159 planner.rs:1776).
+    resolve_and_record_upstream_edges(db, thread_id, &proposal, &plan.proposal).await;
     auto_settle_if_fully_decided(db, thread_id, &proposal, &plan.proposal).await;
     Ok(dir.id)
 }
@@ -1868,6 +2540,10 @@ pub async fn deny_direction(db: &Db, thread_id: i32, index: usize) -> Result<(St
     pd.decision = "denied".to_string();
     let info = (pd.name.clone(), pd.repo.clone());
     persist_decision(db, thread_id, &proposal, &plan).await?;
+    // A deny can be the event that makes ANOTHER lane's depends_on resolve to the
+    // deny-sentinel (Codex review, PR #159 planner.rs:1534) — must run regardless of
+    // whether this is the proposal's last undecided lane.
+    resolve_and_record_upstream_edges(db, thread_id, &proposal, &plan.proposal).await;
     auto_settle_if_fully_decided(db, thread_id, &proposal, &plan.proposal).await;
     Ok(info)
 }
@@ -1977,6 +2653,13 @@ pub struct PendingWrite {
     pub base_branch: String,
     pub hint: crate::engine_routing::RoutingHint,
     pub route: Option<crate::engine_routing::RouteDecision>,
+    /// The `name` of ANOTHER direction in this SAME proposal this one must merge after (issue
+    /// #110 T4); `""` = no upstream. Carried through so the per-lane Needs-you card can show
+    /// the human WHICH producer gates this consumer at the moment they approve it — before
+    /// this field existed, the edge that decides whether the consumer's merge stays blocked
+    /// was invisible at exactly the point the human made the decision (Codex review, PR #159
+    /// planner.rs:109).
+    pub depends_on: String,
 }
 
 /// The pending write declarations for a thread (known repo + undecided).
@@ -2018,6 +2701,7 @@ async fn pending_writes_with_session_liveness(
                 base_branch: d.base_branch.clone(),
                 hint: d.hint,
                 route: d.route.clone(),
+                depends_on: d.depends_on.clone(),
             });
         }
     }
@@ -2095,6 +2779,49 @@ mod tests {
             .insert(thread_id, (new_proposal_json.to_string(), new_status.to_string()));
     }
 
+    /// Test-only seam (mirrors `approve_persist_gate`/`confirm_cas_gate`): lets a test PAUSE
+    /// `record_upstream_edges` exactly between its two passes — the same window a concurrently
+    /// running automerge/monitor sweep could land in (Codex review, PR #159 planner.rs:1600) —
+    /// read DB state from a SEPARATE task while paused, then release it. `arm_between_
+    /// upstream_passes_probe(thread_id)` returns `(reached_rx, resume_tx)`: `reached_rx`
+    /// resolves once the probe is hit, and sending on `resume_tx` lets `record_upstream_edges`
+    /// continue into pass 2. A no-op (never blocks) for any thread_id that wasn't armed — every
+    /// other test that reaches this function is unaffected.
+    #[allow(clippy::type_complexity)]
+    fn between_upstream_passes_map() -> &'static std::sync::Mutex<
+        std::collections::HashMap<i32, (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+    > {
+        static M: std::sync::OnceLock<
+            std::sync::Mutex<
+                std::collections::HashMap<i32, (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+            >,
+        > = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn arm_between_upstream_passes_probe(
+        thread_id: i32,
+    ) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        between_upstream_passes_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(thread_id, (reached_tx, resume_rx));
+        (reached_rx, resume_tx)
+    }
+
+    pub(super) async fn between_upstream_passes_probe(thread_id: i32) {
+        let armed = between_upstream_passes_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&thread_id);
+        if let Some((reached_tx, resume_rx)) = armed {
+            let _ = reached_tx.send(());
+            let _ = resume_rx.await;
+        }
+    }
+
     /// Fired by `confirm` (test build only) just before its CAS. If a race is armed for
     /// `thread_id`, apply it ONCE (replacing the stored plan) and disarm.
     pub(super) async fn confirm_cas_gate(db: &Db, thread_id: i32) {
@@ -2170,6 +2897,38 @@ mod tests {
                 known: true
             }
         );
+    }
+
+    /// The one PURELY-testable piece of `notify_upstream_edge_write_failed` (Codex review, PR
+    /// #159 planner.rs:1470): the notice text itself, unit-tested without a Tauri runtime —
+    /// mirrors `host::judge::give_up_text`'s split between content and its thin, untestable
+    /// call site. Must name the direction so a human knows WHICH task's ordering safety edge
+    /// is in question, and must name the recovery action (re-approve/re-confirm) since nothing
+    /// else in the system retries this write on its own.
+    #[test]
+    fn upstream_edge_write_failed_text_names_the_direction_and_the_recovery_path() {
+        let err = anyhow::anyhow!("database is locked");
+        let text = upstream_edge_write_failed_text(42, 7, &err);
+        assert!(text.contains("42"), "must name the direction whose edge failed to write: {text}");
+        assert!(text.contains("7"), "must name the upstream it was trying to point at: {text}");
+        assert!(text.contains("database is locked"), "must keep the underlying error: {text}");
+        assert!(
+            text.contains("审批") || text.contains("确认"),
+            "must name the recovery path (re-approve/re-confirm) — nothing else retries this \
+             write automatically: {text}"
+        );
+    }
+
+    /// The `upstream_id == 0` case (a STALE-edge CLEAR failed, not a fresh write) must read
+    /// distinctly — conflating the two would tell a human to look for a wrong-upstream problem
+    /// when the actual issue is a leftover one that failed to clear.
+    #[test]
+    fn upstream_edge_write_failed_text_distinguishes_a_failed_clear_from_a_failed_write() {
+        let err = anyhow::anyhow!("database is locked");
+        let clear_text = upstream_edge_write_failed_text(42, 0, &err);
+        let write_text = upstream_edge_write_failed_text(42, 7, &err);
+        assert_ne!(clear_text, write_text, "a failed clear and a failed write must not read identically");
+        assert!(clear_text.contains("42"), "must still name the direction: {clear_text}");
     }
 
     #[tokio::test]
@@ -4896,6 +5655,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
+    /// THE FIX (Codex review, PR #159 planner.rs:109): `depends_on` must flow all the way
+    /// through to `PendingWrite` — the per-lane Needs-you card's data source (via
+    /// `commands::WriteTrigger`) — not only into the batch `ScopeReview` dialog's
+    /// `ResolvedDirection`. Before this field existed on `PendingWrite`, the human approving a
+    /// single lane through the Needs-you card could not see which producer gates it, even
+    /// though the edge was already decided in the data. Mirrors
+    /// `pending_writes_carry_base_branch`'s pattern but exercises the RAW-JSON `depends_on`
+    /// path (`save_proposal_value`, not the typed `Proposal`/`ProposedDirection` — see that
+    /// field's doc on `ResolvedDirection`).
+    #[tokio::test]
+    async fn pending_writes_carry_depends_on() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-pwdeps-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+        let pending = pending_writes(&db, t.id).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].depends_on, "", "producer names no upstream");
+        assert_eq!(
+            pending[1].depends_on, "producer",
+            "depends_on must flow from the proposal into PendingWrite, not stay stuck at \
+             ResolvedDirection — this is what the per-lane Needs-you card renders"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn confirm_does_not_roll_back_a_reused_lane_when_a_later_lane_fails() {
         // Lane A: approved via Needs-you (pre-existing, materialized). Lane B: a NEW
@@ -5925,6 +6732,7 @@ mod tests {
             base_branch: "HEAD".to_string(),
             target_branch: "".to_string(),
             branch: "feat/a".to_string(),
+            depends_on_direction_id: 0,
             created_at: "0".to_string(),
         };
 
@@ -5967,6 +6775,7 @@ mod tests {
             base_branch: base.to_string(),
             target_branch: "".to_string(),
             branch: "feat/a".to_string(),
+            depends_on_direction_id: 0,
             created_at: "0".to_string(),
         };
         // Non-empty bases are normalized purely by string prefix-stripping — no repo
@@ -6029,6 +6838,7 @@ mod tests {
             base_branch: base.to_string(),
             target_branch: target.to_string(),
             branch: "feat/a".to_string(),
+            depends_on_direction_id: 0,
             created_at: "0".to_string(),
         };
 
@@ -6110,6 +6920,999 @@ mod tests {
         let dirs = repo::list_directions(&db, t.id).await.unwrap();
         for id in &ids {
             assert!(dirs.iter().any(|d| d.id == *id), "recorded id {id} is a real direction");
+        }
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE WIRING (issue #110 T4, Codex review on PR #159): before this test existed,
+    /// `repo::set_direction_upstream` was called ONLY by `repo.rs`'s own unit tests — no
+    /// production path (planner or command) ever wrote `depends_on_direction_id`, so
+    /// `upstream_merge_state` returned `None` for every production-created task and the
+    /// auto-merge gate could still merge a consumer before its producer. This drives the
+    /// REAL production entry point (`confirm`, exactly what a human's "confirm" click and
+    /// the lead's `propose_directions` tool ultimately reach) with a producer/consumer pair
+    /// proposed in ONE call, the consumer naming the producer by `name` via `depends_on` —
+    /// then asserts the edge landed on the REAL direction rows, not a parallel copy.
+    #[tokio::test]
+    async fn confirm_records_the_upstream_edge_from_depends_on() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-upstream-edge-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // `depends_on` is a JSON extension field (not on the typed `ProposedDirection` — see
+        // its doc), so it is exercised through the SAME raw-JSON boundary a real
+        // `propose_directions` tool call crosses (`save_proposal_value`), not the typed struct.
+        let raw = serde_json::json!({
+            "rationale": "cross-repo change set",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 2, "both known-repo lanes are dispatched");
+
+        let producer_dir = repo::get_direction(&db, ids[0]).await.unwrap().unwrap();
+        let consumer_dir = repo::get_direction(&db, ids[1]).await.unwrap().unwrap();
+        assert_eq!(producer_dir.name, "producer");
+        assert_eq!(consumer_dir.name, "consumer");
+        assert_eq!(
+            consumer_dir.depends_on_direction_id, producer_dir.id,
+            "confirm must resolve depends_on:\"producer\" to the producer's REAL materialized \
+             id and persist it on the consumer's OWN direction row — this is the write no \
+             production path used to reach"
+        );
+        assert_eq!(producer_dir.depends_on_direction_id, 0, "the producer itself has no upstream");
+
+        // The axis this edge exists to feed: with no PR registered yet, the consumer must read
+        // as genuinely blocked — proving the wired edge actually reaches merge_readiness's
+        // fourth axis end to end, not just the DB column.
+        assert!(
+            matches!(
+                repo::upstream_merge_state(&db, consumer_dir.id).await,
+                crate::host::UpstreamStatus::Pending { .. }
+            ),
+            "the wired edge must gate upstream_merge_state, which feeds judge::merge_readiness"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE DECISIVE GAP (Codex review, PR #159 planner.rs:1420, found on the round-2
+    /// adversarial re-review of the fix above): `confirm_records_the_upstream_edge_from_
+    /// depends_on` only proved the BATCH-confirm path writes the edge. But a proposal can
+    /// ALSO be settled entirely through the per-lane Needs-you cards (`approve_direction` /
+    /// `deny_direction`) — issue #104's "plan approve → per-lane approve → batch confirm is
+    /// the same decision" — which marks the plan confirmed via `auto_settle_if_fully_decided`
+    /// and NEVER reaches `confirm`'s main body at all. This drives THAT exact flow: both
+    /// lanes approved one at a time, never calling `confirm`, and proves the edge still
+    /// lands — then confirms a LATER `confirm()` call (idempotent fast path) doesn't disturb
+    /// it either.
+    #[tokio::test]
+    async fn approve_direction_records_the_upstream_edge_when_settled_lane_by_lane() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-upstream-edge-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "cross-repo change set",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+
+        // Approve EACH lane individually via the Needs-you per-card path — `confirm`'s main
+        // body is NEVER called in this test.
+        let producer_id = approve_direction(&db, t.id, 0, "claude").await.unwrap();
+        let consumer_id = approve_direction(&db, t.id, 1, "claude").await.unwrap();
+
+        // The second approve completed the LAST decision, so auto_settle_if_fully_decided
+        // must have flipped the plan to "confirmed" on its own.
+        let plan = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(plan.status, "confirmed", "the last per-lane approval settles the plan");
+
+        let producer_dir = repo::get_direction(&db, producer_id).await.unwrap().unwrap();
+        let consumer_dir = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            consumer_dir.depends_on_direction_id, producer_dir.id,
+            "per-lane approval must ALSO record the upstream edge — this is the exact bug the \
+             batch-confirm-only wiring reproduced for anyone using the supported card-by-card flow"
+        );
+        assert!(
+            matches!(
+                repo::upstream_merge_state(&db, consumer_dir.id).await,
+                crate::host::UpstreamStatus::Pending { .. }
+            ),
+            "the edge recorded via per-lane approval must gate upstream_merge_state too"
+        );
+
+        // A later confirm() (a human also clicking batch Confirm, or a redispatch retry) hits
+        // the idempotent fast path on an already-"confirmed" plan. Both lanes were already
+        // individually approved (not left pending), so the fast path — which only
+        // re-dispatches PENDING lanes, see its own doc — has nothing new to hand back; the
+        // point of this call is only that it must not ERROR and must not disturb the edge
+        // already recorded.
+        let redispatch = confirm(&db, t.id).await.unwrap();
+        assert!(redispatch.is_empty(), "both lanes were already individually approved, not pending");
+        let consumer_dir_after = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            consumer_dir_after.depends_on_direction_id, producer_dir.id,
+            "a later confirm() on an already-confirmed plan must not disturb the recorded edge"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE DECISIVE GAP, ROUND 2 (Codex review, PR #159 planner.rs:1776, found on the
+    /// round-3 adversarial re-review of the fix above): that test approved producer THEN
+    /// consumer — the ORDER a human is likely to follow, but not the only one the per-lane
+    /// Needs-you flow allows. `approve_direction` DISPATCHES the lane it just approved
+    /// immediately on return (the caller starts a worker against the returned id), so if the
+    /// CONSUMER is approved BEFORE the producer is even decided, the consumer was handed back
+    /// to its caller — worker potentially already starting — while `record_upstream_edges`
+    /// had never run for it at all (it only ran once the WHOLE proposal was fully decided).
+    /// This drives EXACTLY that order and asserts the edge is ALREADY blocking (not `0`) the
+    /// instant `approve_direction` returns for the consumer — before the producer is decided
+    /// at all — then that approving the producer afterward self-heals it to the real id.
+    #[tokio::test]
+    async fn approving_the_consumer_before_its_producer_blocks_immediately_not_after_settling() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-consumer-first-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "cross-repo change set",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+
+        // Approve the CONSUMER FIRST (index 1) — the producer (index 0) is still fully
+        // undecided at this point. `fully_decided` is false, so auto_settle does nothing;
+        // the fix under test is that `approve_direction` resolves this lane's edge itself,
+        // regardless.
+        let consumer_id = approve_direction(&db, t.id, 1, "claude").await.unwrap();
+
+        let consumer_dir = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            consumer_dir.depends_on_direction_id,
+            repo::UNRESOLVED_UPSTREAM_SENTINEL,
+            "the instant approve_direction returns the consumer for dispatch, its edge must \
+             ALREADY be blocking — not 0, which would read as \"no upstream, free to merge\" \
+             for the entire window until the producer is later decided"
+        );
+        match repo::upstream_merge_state(&db, consumer_id).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!(
+                "a consumer dispatched before its producer is even decided must never read as \
+                 free to merge: got {other:?}"
+            ),
+        }
+
+        // NOW approve the producer. The consumer's edge must self-heal to the real id.
+        let producer_id = approve_direction(&db, t.id, 0, "claude").await.unwrap();
+        let consumer_dir_after = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            consumer_dir_after.depends_on_direction_id, producer_id,
+            "once the producer materializes, the consumer's unresolved sentinel must upgrade \
+             to the producer's REAL id"
+        );
+        assert!(
+            matches!(
+                repo::upstream_merge_state(&db, consumer_id).await,
+                crate::host::UpstreamStatus::Pending { .. }
+            ),
+            "with a real producer now on record, the consumer reads as Pending (a fact), not \
+             merely Unknown (can't tell)"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1461 and, on the round-3 follow-up,
+    /// planner.rs:1776): this codebase explicitly supports duplicate same-name lanes in one
+    /// proposal (`confirm`'s consumed-set reconciliation exists BECAUSE of this). If a THIRD
+    /// lane's `depends_on` names one of two same-named lanes, silently binding to whichever
+    /// happens to be first could point at the WRONG producer — worse than no edge at all,
+    /// since it would look correctly wired while actually gating on an unrelated task. Must
+    /// neither guess NOR silently leave the edge at `0` (which would read as "no upstream,
+    /// free to merge") — it must actively BLOCK via `UNRESOLVED_UPSTREAM_SENTINEL` until the
+    /// lead disambiguates the names.
+    #[tokio::test]
+    async fn record_upstream_edges_blocks_an_ambiguous_duplicate_name_instead_of_guessing() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-ambiguous-name-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // TWO lanes named "producer" (a legitimate duplicate-name proposal) + a "consumer"
+        // that names "producer" — ambiguous, must resolve to NEITHER.
+        let raw = serde_json::json!({
+            "rationale": "cross-repo change set",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r1", "mandate": "impl-only"},
+                {"name": "producer", "repo": "api", "reason": "r2", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r3", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 3, "all three known-repo lanes are dispatched");
+
+        let consumer_dir = repo::get_direction(&db, ids[2]).await.unwrap().unwrap();
+        assert_eq!(
+            consumer_dir.depends_on_direction_id,
+            repo::UNRESOLVED_UPSTREAM_SENTINEL,
+            "an ambiguous depends_on (two lanes share the name) must actively BLOCK — never \
+             silently bind to whichever producer happened to be first, and never silently read \
+             as having no upstream at all either"
+        );
+        match repo::upstream_merge_state(&db, ids[2]).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!("an ambiguous depends_on must never read as free to merge: {other:?}"),
+        }
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (index-based redesign, Codex review PR #159 planner.rs:1557): a lane whose
+    /// `depends_on` names ITSELF must be rejected at PROPOSAL-SAVE time, not deferred to
+    /// `set_direction_upstream`'s best-effort write. Under the OLD name-search design, a
+    /// uniquely-named self-reference resolved via candidate search to a SINGLETON match — the
+    /// lane's own materialized id — attempted a self-edge write, `set_direction_upstream`
+    /// rejected it, and the rejection was invisible: `depends_on_direction_id` just stayed at
+    /// its prior value, `0`, reading as "no dependency" instead of blocked. Proves BOTH halves:
+    /// the rejection is a SAVE-TIME, structural fact (`depends_on_index` is `null` immediately
+    /// after `save_proposal_value`, before any confirm/materialize — no write is ever
+    /// attempted), and the end-to-end result is VISIBLY blocking, never silently free to merge.
+    #[tokio::test]
+    async fn a_self_referential_depends_on_is_rejected_at_proposal_save_time() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-self-ref-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "solo", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "solo"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+
+        // SAVE-TIME: the rejection is a structural fact in the stored JSON, before anything is
+        // confirmed or materialized — proving this is caught at resolution, not deferred to a
+        // write that then silently fails.
+        let stored = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let stored_json: Value = serde_json::from_str(&stored.proposal).unwrap();
+        assert_eq!(
+            stored_json["directions"][0]["depends_on_index"],
+            Value::Null,
+            "a self-reference must be flagged unresolvable at proposal-save time, not left \
+             looking like a valid pending reference to itself"
+        );
+
+        // END-TO-END: confirming it must read as VISIBLY blocked, never silently free to merge.
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 1);
+        let dir = repo::get_direction(&db, ids[0]).await.unwrap().unwrap();
+        assert_ne!(
+            dir.depends_on_direction_id, 0,
+            "a self-reference must never silently read as \"no dependency\" — the exact bug \
+             the old name-search-at-write-time design had (the self-edge write was rejected by \
+             set_direction_upstream, but the rejection left depends_on_direction_id at its \
+             prior value, 0)"
+        );
+        match repo::upstream_merge_state(&db, ids[0]).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!("a self-reference must read Unknown (blocking), never {other:?}"),
+        }
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (index-based redesign, Codex review PR #159 planner.rs:1554): two lanes share a
+    /// name, and a third names it via `depends_on`. Under the OLD design, `record_upstream_
+    /// edges`'s candidate search filtered by `direction_id != 0` ("materialized") on EVERY
+    /// approve/deny re-run — so once ONE of the two duplicates got individually approved (while
+    /// the other stayed pending), the filter saw only ONE candidate and silently bound the
+    /// consumer to WHICHEVER duplicate happened to materialize first, even though the name was
+    /// genuinely ambiguous. Proves resolution is now a FIXED, save-time fact that decision
+    /// state cannot retroactively change: approves ONE duplicate individually (materializing
+    /// it, leaving the other genuinely pending) and confirms the ambiguity is UNCHANGED by that.
+    #[tokio::test]
+    async fn a_duplicate_name_stays_ambiguous_regardless_of_which_sibling_materializes_first() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-dup-name-decision-state-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // TWO lanes named "producer" (index 0 and 1) + "consumer" naming "producer" (index 2).
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r1", "mandate": "impl-only"},
+                {"name": "producer", "repo": "api", "reason": "r2", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r3", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+
+        // Approve ONLY the first "producer" duplicate (index 0) — materializing it while the
+        // second duplicate (index 1) and "consumer" (index 2) stay pending, undecided.
+        let first_producer_id = approve_direction(&db, t.id, 0, "claude").await.unwrap();
+
+        // Now approve "consumer" — this re-resolves depends_on with ONE duplicate materialized
+        // and the OTHER still pending. Under the old design this is exactly where the false
+        // singleton bug fired.
+        let consumer_id = approve_direction(&db, t.id, 2, "claude").await.unwrap();
+
+        let consumer_dir = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_ne!(
+            consumer_dir.depends_on_direction_id, first_producer_id,
+            "the ambiguous name must NOT silently bind to whichever duplicate happened to \
+             materialize first — that is the exact bug this test guards against"
+        );
+        assert_eq!(
+            consumer_dir.depends_on_direction_id,
+            repo::UNRESOLVED_UPSTREAM_SENTINEL,
+            "an ambiguous name must actively block regardless of the duplicates' decision states"
+        );
+        match repo::upstream_merge_state(&db, consumer_id).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!(
+                "a consumer bound to an ambiguous name must never read as free to merge, even \
+                 with one duplicate materialized: {other:?}"
+            ),
+        }
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (index-based redesign): proves duplicate-name ambiguity is now a STRUCTURAL,
+    /// proposal-save-time fact (`depends_on_index` is `null` the instant `save_proposal_value`
+    /// returns), not something `record_upstream_edges` has to re-derive by searching sibling
+    /// lanes' names and materialization state on every decision — under the new design, there
+    /// is no more "ambiguity resolution" happening at write time at all, only a lookup of an
+    /// already-decided fact. Companion to `record_upstream_edges_blocks_an_ambiguous_
+    /// duplicate_name_instead_of_guessing` (below), which proves the END-TO-END behavior; this
+    /// one proves WHEN the decision is made.
+    #[tokio::test]
+    async fn duplicate_name_ambiguity_is_decided_at_save_time_before_any_decision_is_made() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", "/tmp/dup-ambiguity-save-time-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r1", "mandate": "impl-only"},
+                {"name": "producer", "repo": "api", "reason": "r2", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r3", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+
+        // No confirm, no approve, nothing materialized — just the raw stored proposal.
+        let stored = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let stored_json: Value = serde_json::from_str(&stored.proposal).unwrap();
+        assert_eq!(
+            stored_json["directions"][2]["depends_on_index"],
+            Value::Null,
+            "an ambiguous duplicate name must be flagged unresolvable the instant the proposal \
+             is saved — this is a structural fact about the proposal's own shape, decidable \
+             with zero knowledge of any decision that hasn't happened yet"
+        );
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1772): a mutual 2-cycle (`a` depends on `b`,
+    /// `b` depends on `a`) is NOT a self-reference (excluded at resolve time — see
+    /// `resolve_depends_on_indices`) and NOT an ambiguous name — each name resolves to exactly
+    /// ONE other lane, cleanly, at save time. The cycle only exists at the GRAPH level, which
+    /// per-lane index resolution cannot see; it only surfaces when `record_upstream_edges`'s
+    /// two-pass write actually tries to install both edges: whichever lane processes first
+    /// writes successfully, and the second write is correctly rejected by
+    /// `set_direction_upstream`'s `creates_cycle` check. Before this fix, that rejection was
+    /// swallowed by `set_upstream_edge_if_changed`, leaving the rejected lane's
+    /// `depends_on_direction_id` at its prior value (`0`) — reading as dependency-free and
+    /// free to auto-merge despite its declared (if cyclic) prerequisite never being satisfied.
+    #[tokio::test]
+    async fn a_mutual_cycle_leaves_the_rejected_lane_blocked_not_dependency_free() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-mutual-cycle-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "a", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "b"},
+                {"name": "b", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "a"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 2, "both lanes are dispatched — the cycle blocks EDGES, not materialization");
+        let (a_id, b_id) = (ids[0], ids[1]);
+
+        let a_dir = repo::get_direction(&db, a_id).await.unwrap().unwrap();
+        let b_dir = repo::get_direction(&db, b_id).await.unwrap().unwrap();
+        // `record_upstream_edges`'s two-pass write processes lanes in PROPOSAL ARRAY ORDER
+        // (`a` at index 0, `b` at index 1 — see `upstream_lanes_from_resolved`'s "indices
+        // align 1:1" doc): `a`'s write (a -> b) lands first, while b -> a does not exist yet,
+        // so it succeeds cleanly; `b`'s write (b -> a) then finds a -> b ALREADY in the DB and
+        // is correctly rejected as a cycle by `set_direction_upstream`.
+        assert_eq!(
+            a_dir.depends_on_direction_id, b_id,
+            "the FIRST half of the cycle to be written wins cleanly"
+        );
+        assert_eq!(
+            b_dir.depends_on_direction_id,
+            repo::UNRESOLVED_UPSTREAM_SENTINEL,
+            "the SECOND half — rejected by the cycle check — must land on the blocking \
+             sentinel, not silently stay at 0 (\"no dependency\") just because \
+             set_direction_upstream's write failed"
+        );
+        match repo::upstream_merge_state(&db, b_id).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!("the rejected half of a cycle must read Unknown (blocking), never {other:?}"),
+        }
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1797): a read failure in
+    /// `set_upstream_edge_if_changed`, BEFORE any write is even attempted, must fall back to
+    /// the blocking sentinel exactly like a rejected write does — otherwise a direction that
+    /// has never had a successful edge write stays at the schema default `0`, indistinguishable
+    /// from a genuinely dependency-free lane.
+    #[tokio::test]
+    async fn a_read_failure_before_the_write_falls_back_to_the_blocking_sentinel() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-read-fail-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 2);
+        let (producer_id, consumer_id) = (ids[0], ids[1]);
+        let before = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(before.depends_on_direction_id, producer_id, "precondition: the edge landed normally");
+
+        // Simulate a later re-check (the same call every confirm/approve makes internally)
+        // whose READ transiently fails, before it can even attempt a write.
+        repo::fail_write::while_failing("get_direction", async {
+            set_upstream_edge_if_changed(&db, t.id, consumer_id, producer_id).await;
+        })
+        .await;
+
+        let after = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.depends_on_direction_id,
+            repo::UNRESOLVED_UPSTREAM_SENTINEL,
+            "a read failure before the write must fall back to the blocking sentinel — a \
+             caller cannot tell 'the read failed, the prior value happened to already be \
+             right' from 'the read failed, and the prior value was 0 (unset)' without this \
+             signal, so the safe choice is to always land on the blocking sentinel"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1549): `record_upstream_edges` runs AFTER the
+    /// plan-confirmation CAS commits, as a separate best-effort step (see that function's own
+    /// doc). Simulates a crash in exactly that window: the edge is reset to the untouched
+    /// schema default `0`, precisely as it would read if `record_upstream_edges` had never run
+    /// at all after a real CAS commit. A restart's redispatch (the idempotent "already
+    /// confirmed" fast path `confirm()` takes on a second call) must REPAIR the edge, not just
+    /// re-dispatch workers against a permanently dependency-free-looking consumer forever.
+    #[tokio::test]
+    async fn the_confirmed_fast_path_repairs_an_upstream_edge_left_at_the_default_by_an_interrupted_record() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-fastpath-repair-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 2);
+        let (producer_id, consumer_id) = (ids[0], ids[1]);
+        let before = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(before.depends_on_direction_id, producer_id, "precondition: the normal path wrote the edge");
+
+        // Simulate the crash: reset the edge to the untouched schema default, exactly as if
+        // `record_upstream_edges` had never run after the CAS commit above.
+        repo::set_direction_upstream(&db, consumer_id, 0).await.unwrap();
+        let mid = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(mid.depends_on_direction_id, 0, "precondition: the edge now reads exactly like a crash-interrupted one");
+
+        // The plan is ALREADY "confirmed" (the first confirm() call above set that) — this
+        // second call takes the idempotent fast path, not the main materialize-and-CAS path.
+        let redispatched = confirm(&db, t.id).await.unwrap();
+        assert_eq!(redispatched.len(), 2, "the fast path still redispatches both lanes by their recorded ids");
+
+        let after = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.depends_on_direction_id, producer_id,
+            "the fast path must REPAIR a missing upstream edge on every redispatch, not just \
+             re-dispatch workers against a permanently dependency-free-looking consumer"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1447): a lead re-proposes a reusable
+    /// consumer lane WITHOUT its former `depends_on`. Confirmation must not leave the
+    /// direction row holding the STALE edge from the earlier proposal — the monitor/
+    /// auto-merge gate would otherwise keep blocking (or gating) it on an upstream the lead
+    /// no longer intends to declare.
+    #[tokio::test]
+    async fn confirm_clears_a_stale_upstream_edge_when_a_reproposal_drops_depends_on() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-stale-clear-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // First proposal: consumer depends on producer. Approve the producer lane so its
+        // direction exists, but leave the consumer PENDING so confirm() can still act on it.
+        let first = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &first).await.unwrap();
+        let producer_id = approve_direction(&db, t.id, 0, "claude").await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 1, "only the pending consumer lane is dispatched by this confirm");
+        let consumer_id = ids[0];
+        let consumer_dir = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            consumer_dir.depends_on_direction_id, producer_id,
+            "precondition: the first proposal's edge landed"
+        );
+
+        // Re-propose the SAME consumer lane (reused: same name+repo+base) WITHOUT
+        // `depends_on` this time — the lead has dropped the dependency.
+        let second = serde_json::json!({
+            "rationale": "r2",
+            "directions": [
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &second).await.unwrap();
+        let ids2 = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids2, vec![consumer_id], "the re-proposal reuses the SAME consumer direction");
+
+        let consumer_dir_after = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            consumer_dir_after.depends_on_direction_id, 0,
+            "dropping depends_on in a re-proposal must CLEAR the stale edge, not leave it \
+             pointing at a producer the lead no longer named"
+        );
+        assert_eq!(
+            repo::upstream_merge_state(&db, consumer_id).await,
+            crate::host::UpstreamStatus::None,
+            "with the edge cleared, the ordering axis must read as no-upstream again"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1570): a re-proposal that REVERSES a reused
+    /// dependency (round 1: "x" depends on "y"; round 2: "y" depends on "x" instead) must land
+    /// the reversed edge regardless of which lane the lead happens to list first. Lists the NEW
+    /// consumer ("y") BEFORE the new producer ("x") deliberately — the exact shape that, before
+    /// `record_upstream_edges`'s two-pass fix, hit `set_direction_upstream`'s cycle check while
+    /// the stale x→y edge was still in the DB (a single straight-through pass would try writing
+    /// y→x first, see x still pointing at y, and reject it as a cycle) and silently stranded
+    /// y's real new dependency at `0`.
+    #[tokio::test]
+    async fn confirm_applies_a_reversed_dependency_regardless_of_lane_order() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-reversed-edge-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Round 1: x depends on y.
+        let first = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "x", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "y"},
+                {"name": "y", "repo": "api", "reason": "r", "mandate": "impl-only"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &first).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 2, "both lanes are dispatched");
+        let x_id = ids[0];
+        let y_id = ids[1];
+        assert_eq!(
+            repo::get_direction(&db, x_id).await.unwrap().unwrap().depends_on_direction_id,
+            y_id,
+            "precondition: the first proposal's x→y edge landed"
+        );
+
+        // Round 2: SAME two lanes reused (same name+repo+base — matched by
+        // `reusable_direction_for_preview`'s identity, not array position), REVERSED: y now
+        // depends on x, x drops its dependency. "y" (the NEW consumer) is listed FIRST.
+        let second = serde_json::json!({
+            "rationale": "r2",
+            "directions": [
+                {"name": "y", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "x"},
+                {"name": "x", "repo": "api", "reason": "r", "mandate": "impl-only"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &second).await.unwrap();
+        let ids2 = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids2.len(), 2, "both reused lanes are re-dispatched");
+
+        let x_after = repo::get_direction(&db, x_id).await.unwrap().unwrap();
+        let y_after = repo::get_direction(&db, y_id).await.unwrap().unwrap();
+        assert_eq!(
+            x_after.depends_on_direction_id, 0,
+            "x no longer names a dependency — its stale edge must be cleared"
+        );
+        assert_eq!(
+            y_after.depends_on_direction_id, x_id,
+            "y must end up depending on x — the REVERSED edge — not stuck at 0 just because \
+             the stale x→y edge was still in the DB when y's lane was processed first"
+        );
+        assert_eq!(
+            repo::upstream_merge_state(&db, y_id).await,
+            crate::host::UpstreamStatus::Pending { what: "x".into() },
+            "the axis this edge feeds must see the REVERSED relationship: y now blocked on x"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1600, a follow-up round on planner.rs:1570's
+    /// own fix): `record_upstream_edges`'s two passes are two SEPARATE, non-transactional
+    /// awaited writes with no lock held across the gap — `host::automerge`/`host::monitor` run
+    /// on their own independent sweep loop and can read a direction's row at any point,
+    /// including exactly between pass 1 and pass 2. Re-proposes a reused consumer's dependency
+    /// from producer1 to producer2 (a REPLACEMENT: pass 1 must actually clear something,
+    /// unlike a fresh 0→X assignment) and pauses `record_upstream_edges` at that exact gap
+    /// (`between_upstream_passes_probe`) to drive a CONCURRENT read of `upstream_merge_state` —
+    /// the same call `host::automerge`/`host::monitor` make — from a separate task. Before the
+    /// sentinel fix, pass 1 cleared to `0`, which reads `UpstreamStatus::None` ("no upstream,
+    /// free to merge") — true of the DB row at that instant, and enough for a sweep to release
+    /// a PR whose other 3 axes were already cached `Ready`, before pass 2 installs producer2.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn record_upstream_edges_never_reads_free_to_merge_between_its_two_passes() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-between-passes-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        // File-backed (not :memory:) DB, same reason as `thread_gate_serializes_concurrent_
+        // confirms`: the cloned pool handle in the spawned task must see the SAME store as the
+        // test's own concurrent read, and an in-memory SQLite connection is private to itself.
+        let db_file = weft_home.join("between-passes.sqlite");
+        std::fs::create_dir_all(&weft_home).unwrap();
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", db_file.to_str().unwrap()))
+            .await
+            .unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Round 1: consumer depends on producer1.
+        let first = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer1", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "producer2", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer1"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &first).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 3, "all three lanes are dispatched");
+        let producer2_id = ids[1];
+        let consumer_id = ids[2];
+        assert_eq!(
+            repo::get_direction(&db, consumer_id).await.unwrap().unwrap().depends_on_direction_id,
+            ids[0],
+            "precondition: consumer depends on producer1"
+        );
+
+        // Round 2: SAME three lanes reused, consumer's dependency REPLACED with producer2 —
+        // pass 1 has a real, non-zero edge to actually clear (unlike a fresh 0→X assignment).
+        let second = serde_json::json!({
+            "rationale": "r2",
+            "directions": [
+                {"name": "producer1", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "producer2", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer2"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &second).await.unwrap();
+
+        let (reached_rx, resume_tx) = tests::arm_between_upstream_passes_probe(t.id);
+        let db2 = db.clone();
+        let tid = t.id;
+        let confirm_handle = tokio::spawn(async move { confirm(&db2, tid).await });
+
+        // Wait for record_upstream_edges to reach the gap between its two passes, then —
+        // WHILE it is still paused there — read exactly what a concurrent automerge/monitor
+        // sweep would read.
+        reached_rx.await.expect("record_upstream_edges reached the between-passes probe");
+        let mid_transition = repo::upstream_merge_state(&db, consumer_id).await;
+        // Release the pause so pass 2 (and the rest of confirm) can complete.
+        let _ = resume_tx.send(());
+        let ids2 = confirm_handle.await.unwrap().unwrap();
+        assert_eq!(ids2.len(), 3, "all three reused lanes are re-dispatched");
+
+        assert!(
+            !matches!(mid_transition, crate::host::UpstreamStatus::None),
+            "a concurrent sweep landing between record_upstream_edges's two passes must NEVER \
+             read None (\"no upstream, free to merge\") — got {mid_transition:?}, which would \
+             let automerge release this PR before pass 2 installs the real new producer"
+        );
+        assert!(
+            matches!(mid_transition, crate::host::UpstreamStatus::Unknown { .. }),
+            "mid-transition must read Unknown (blocking, fail-closed), not any other verdict — \
+             got {mid_transition:?}"
+        );
+
+        let consumer_after = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            consumer_after.depends_on_direction_id, producer2_id,
+            "after resuming, pass 2 must still land the real replacement edge"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1534): when the human DENIES the producer lane
+    /// (not merely leaves it undecided), a consumer naming it via `depends_on` must NOT read as
+    /// having no upstream — its declared prerequisite is a decided, permanent dead end. Denying
+    /// producer then confirming the still-pending consumer must record the deny-sentinel edge,
+    /// keeping `upstream_merge_state` (and therefore the auto-merge gate) blocked rather than
+    /// silently free.
+    #[tokio::test]
+    async fn confirm_blocks_a_consumer_whose_named_upstream_was_denied() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-denied-producer-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "cross-repo change set",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+
+        // Deny the producer lane — it never materializes (direction_id stays 0), but this is a
+        // DECIDED fact, not an undecided/typo'd reference.
+        deny_direction(&db, t.id, 0).await.unwrap();
+        // Batch-confirm the still-pending consumer.
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 1, "only the pending consumer lane is dispatched");
+        let consumer_id = ids[0];
+
+        let consumer_dir = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            consumer_dir.depends_on_direction_id,
+            repo::DENIED_UPSTREAM_SENTINEL,
+            "a denied producer must record the deny-sentinel, not 0 (no upstream)"
+        );
+        match repo::upstream_merge_state(&db, consumer_id).await {
+            crate::host::UpstreamStatus::Unknown { .. } => {}
+            other => panic!(
+                "a consumer whose named upstream was denied must NOT read as free to merge \
+                 (None) — its declared prerequisite can never land: got {other:?}"
+            ),
         }
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();

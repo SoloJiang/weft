@@ -1196,7 +1196,9 @@ fn planner_specs() -> Value {
                     "hint": { "type": "string", "enum": ["normal", "deep"],
                         "description": "Optional routing hint only: normal prefers Codex for cheap batches; deep prefers Claude for deeper reasoning. This is not a tool choice." },
                     "base_branch": { "type": "string",
-                        "description": "Branch in the target repo to branch the new work OFF. Leave empty to use the repo's default branch (main/master). Set it only when the repo merges into a non-default branch (develop/staging/a release branch)." }
+                        "description": "Branch in the target repo to branch the new work OFF. Leave empty to use the repo's default branch (main/master). Set it only when the repo merges into a non-default branch (develop/staging/a release branch)." },
+                    "depends_on": { "type": "string",
+                        "description": "Optional: the exact `name` of ANOTHER task in THIS SAME call's `directions` list that must be merged before this one is allowed to merge — use this for a cross-repo change set where this task consumes something the other task produces (e.g. a submodule SHA bump, a version bump). Leave empty when this task has no upstream. The name MUST resolve to exactly one task proposed in this SAME call: a typo, an ambiguous duplicate name, a name from another proposal, or a task that gets denied all BLOCK this task's merge (it is never released on a bad reference) until a later propose_directions call supplies a name that resolves cleanly." }
                 }, "required": ["name", "repo", "reason"] } }
             }, "required": ["directions"] }
         },
@@ -1291,8 +1293,8 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_weft_internal_tool, register_pr_tool, serve, session_servers_for_kind, summarize,
-        tool_specs, UNKNOWN_ENGINE,
+        is_weft_internal_tool, planner_specs, register_pr_tool, serve, session_servers_for_kind,
+        summarize, tool_specs, UNKNOWN_ENGINE,
     };
     use crate::ask::RiskLevel;
     use crate::store::Db;
@@ -1318,6 +1320,40 @@ mod tests {
         let (summary2, _detail2, _risk2, action_key2) = summarize("Bash", Some(&other));
         assert_eq!(summary2, summary, "both display as \"Run: npm test\"");
         assert_ne!(action_key2, action_key);
+    }
+
+    /// THE FIX (Codex review, PR #159 bus/server.rs:1201): this SPEC TEXT is the lead's only
+    /// source of truth for what `depends_on` actually does — it must never drift from the
+    /// real, fail-closed behavior `record_upstream_edges` implements (see planner.rs's
+    /// `record_upstream_edges_blocks_an_ambiguous_duplicate_name_instead_of_guessing` and
+    /// `confirm_blocks_a_consumer_whose_named_upstream_was_denied`: an unresolvable name
+    /// BLOCKS the task's merge, it is never silently ignored). An earlier version of this text
+    /// claimed the OPPOSITE ("a typo ... is silently ignored"), which could lead the lead to
+    /// believe a bad reference is harmless when it actually strands the task's readiness until
+    /// a fresh `propose_directions` call fixes the reference.
+    #[test]
+    fn depends_on_spec_text_describes_the_real_fail_closed_behavior() {
+        let specs = planner_specs();
+        let propose = specs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "propose_directions")
+            .expect("propose_directions tool spec exists");
+        let desc = propose["inputSchema"]["properties"]["directions"]["items"]["properties"]
+            ["depends_on"]["description"]
+            .as_str()
+            .expect("depends_on has a description");
+        assert!(
+            desc.contains("BLOCK"),
+            "must tell the lead an unresolvable name blocks the task, not just describe the \
+             happy path: {desc}"
+        );
+        assert!(
+            !desc.to_lowercase().contains("ignored"),
+            "must never claim (even in passing) that a bad reference is ignored — the real \
+             behavior is fail-closed, not a silent no-op: {desc}"
+        );
     }
 
     /// Issue #89: an MCP/fallback ask (no `command`/`file_path` field) shows only

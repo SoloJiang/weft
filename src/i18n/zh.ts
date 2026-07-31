@@ -266,6 +266,8 @@ export const zh = {
     confirming: "创建中…",
     baseBranch: "基线分支",
     baseBranchHint: "从该分支拉出工作分支（留空 = 仓库默认分支）",
+    dependsOn: "等待「{{name}}」先落地",
+    dependsOnHint: "「{{name}}」合并之前，这个任务无法合并",
     engine: "引擎",
     engineAutomatic: "自动 · {{tool}}",
     engineManual: "已 pin · {{tool}}",

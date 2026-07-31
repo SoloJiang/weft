@@ -6,6 +6,7 @@ import {
   ArrowUpRight,
   Check,
   GitBranch,
+  GitMerge,
   Layers,
   RefreshCw,
   Send,
@@ -22,6 +23,7 @@ import { routeLabelKey, routeReasonKey, routeToolName } from "../lib/engineRouti
 import { needsRoutingControlOf } from "./needsRoutingControl";
 import { noticeTokenKey } from "../lib/noticeTokens";
 import { ASK_CARD_TONE, ASK_DOT_TONE, NOTICE_FOOTER_VIEW } from "./needsCardView";
+import { dependsOnLabel } from "./dependsOnView";
 
 export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
   const { approveWriteTrigger, denyWriteTrigger, selectThread, defaultTool, installedTools } =
@@ -36,6 +38,7 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
     defaultTool,
   });
   const context = [item.thread_title, item.name].filter(Boolean).join(" · ");
+  const dependsOn = dependsOnLabel(item.depends_on);
 
   async function act(fn: () => Promise<void>) {
     if (busy) return;
@@ -87,15 +90,26 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
           {routingControl.showBlockedStatus && <span>{t("scope.engineRouteBlockedHint")}</span>}
         </div>
       )}
-      {item.base_branch && (
-        <div className="px-3.5 pb-2">
-          <span
-            title={t("scope.baseBranch")}
-            className="inline-flex items-center gap-1 rounded-full border border-border bg-bg px-2 py-0.5 text-[10.5px] font-mono text-ink-faint"
-          >
-            <GitBranch size={10} />
-            {item.base_branch}
-          </span>
+      {(item.base_branch || dependsOn) && (
+        <div className="flex flex-wrap items-center gap-1.5 px-3.5 pb-2">
+          {item.base_branch && (
+            <span
+              title={t("scope.baseBranch")}
+              className="inline-flex items-center gap-1 rounded-full border border-border bg-bg px-2 py-0.5 text-[10.5px] font-mono text-ink-faint"
+            >
+              <GitBranch size={10} />
+              {item.base_branch}
+            </span>
+          )}
+          {dependsOn && (
+            <span
+              title={t("scope.dependsOnHint", { name: dependsOn })}
+              className="inline-flex min-w-0 items-center gap-1 rounded-full border border-border bg-bg px-2 py-0.5 text-[10.5px] text-ink-faint"
+            >
+              <GitMerge size={10} className="shrink-0" />
+              <span className="truncate">{t("scope.dependsOn", { name: dependsOn })}</span>
+            </span>
+          )}
         </div>
       )}
       {/* Issue #103: approving this ALSO propagates a read-only auto-allow to

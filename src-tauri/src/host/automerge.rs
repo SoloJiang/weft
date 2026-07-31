@@ -367,6 +367,7 @@ async fn evaluate_row(
     // 5). Mirrors `host::monitor`'s own `check_one` exactly (same
     // `spawn_blocking` discipline).
     let target = PrTarget {
+        host_base: pr.host_base.clone(),
         owner: pr.host_owner.clone(),
         repo: pr.host_repo.clone(),
         number: pr.number,
@@ -388,7 +389,11 @@ async fn evaluate_row(
             return RowVerdict::Skip; // couldn't confirm live state — never merge on a guess
         }
     };
-    let fresh_readiness = judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict);
+    // Re-resolved here rather than trusting the swept row: this is the
+    // pre-merge confirmation, and an upstream can have moved since the sweep.
+    let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
+    let fresh_readiness =
+        judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict, &upstream);
     if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, &snapshot, &fresh_readiness).await {
         eprintln!(
             "[weft][automerge] pr #{}: could not save pre-merge confirmation snapshot: {e}",
@@ -415,6 +420,78 @@ async fn evaluate_row(
     if final_decision != AutoMergeDecision::Merge {
         return RowVerdict::Skip; // downgraded since the pre-filter — silent, like any other skip
     }
+
+    // Test-only seam: let a test pause HERE — between the upstream read this authorization
+    // was based on (above) and the re-check immediately below — to drive a genuinely
+    // concurrent write from a separate task. See `tests::between_upstream_authorization_probe`.
+    #[cfg(test)]
+    tests::between_upstream_authorization_probe(pr.direction_id).await;
+
+    // Step 5.5: re-check the upstream axis ONE more time, as close to the actual merge call as
+    // this function can get — Codex review, PR #159 automerge.rs:395. Unlike CI/review/
+    // conflict, GitHub has no concept of this product's own cross-repo dependency ordering to
+    // enforce server-side: `--match-head-commit` (step 6, in `maybe_merge_one`) only guards the
+    // PR's OWN head commit moving, never this LOCAL fact. Without this, a re-proposal that
+    // adds or replaces this consumer's dependency in the window between the read above and
+    // `run_gh_merge` actually executing would merge a consumer whose upstream just changed,
+    // with no backstop at all — CI/review/conflict staleness in that same window is at least
+    // partly covered by GitHub's OWN branch-protection enforcement, but this axis is purely a
+    // Weft-side invariant that only Weft can protect. This is INTENTIONALLY separate from (and
+    // does not touch) `record_upstream_edges`'s two-pass write-ordering mechanism (round 5+6):
+    // that solves DB write atomicity for a multi-edge write; this is a read-authorize-execute
+    // TOCTOU window on this file's OWN side, and re-reading the SAME already-atomic source of
+    // truth closer to the action is sufficient — no new lock or generation counter needed, and
+    // none of that machinery would help here anyway (it does not extend the window this file's
+    // own control flow takes to reach `run_gh_merge`).
+    //
+    // A sixth review round (Codex review, PR #159 automerge.rs:457) pressed on the word
+    // "narrows" above: this re-check does NOT close the window, it only moves it as late as
+    // this file's own control flow allows. The REMAINING window runs from the instant this
+    // read returns to the instant GitHub actually processes the `gh pr merge` call dispatched
+    // in `maybe_merge_one`'s step 6 — dominated by process-spawn + network round-trip time to
+    // GitHub's API (realistically ~100ms to a few seconds, NOT a negligible number of CPU
+    // cycles; the handful of synchronous Rust statements between this check and the
+    // `spawn_blocking` call in step 6 contribute microseconds, not the risk).
+    //
+    // Full closure was considered and rejected as disproportionate to the residual risk:
+    //   - A lock held from this re-check through `run_gh_merge`'s completion would need a NEW
+    //     coordination primitive between this module and every writer of
+    //     `depends_on_direction_id` (`planner::set_upstream_edge_if_changed`) — a module that
+    //     today has zero automerge awareness — plus its own stuck-lock recovery story for a
+    //     crashed/hung `gh` process, to gate a race this narrow.
+    //   - A generation counter checked just before dispatch does not actually help: unlike
+    //     `--match-head-commit` (enforced ATOMICALLY by GitHub itself, server-side, as part of
+    //     executing the merge), there is no GitHub-side hook for this Weft-only axis, so
+    //     "check-then-dispatch" has the identical TOCTOU shape no matter how late the check
+    //     runs, unless it is ITSELF paired with the same lock above — it does not remove the
+    //     cost, it only relocates it.
+    //   - A synthetic GitHub check run plus a required branch-protection rule could in
+    //     principle give this axis the same atomic, server-side enforcement
+    //     `--match-head-commit` gets for head-sha staleness — but that depends on external repo
+    //     configuration this codebase does not manage today, and would be a new integration
+    //     surface (Checks API, a setup burden on every target repo) rather than a
+    //     review-response-sized fix.
+    //
+    // The residual window is accepted, not ignored: reaching it requires a human or lead to
+    // CONFIRM a re-proposal that changes THIS SPECIFIC direction's upstream within a
+    // sub-few-second window that carries no visible "a merge is dispatching right now" cue —
+    // and even if hit, `maybe_merge_one`'s own step 7 re-reads and re-persists this exact row's
+    // true state, INCLUDING this axis, immediately after the merge attempt completes, so the
+    // consequence is bounded to one merge whose upstream had just changed (a recoverable,
+    // visible-on-CI outcome, the same class of risk as any other check-then-merge gap) and
+    // self-corrects in the DB rather than silently drifting.
+    match repo::upstream_merge_state(db, pr.direction_id).await {
+        super::UpstreamStatus::None | super::UpstreamStatus::Merged => {}
+        other => {
+            eprintln!(
+                "[weft][automerge] pr #{}: upstream changed to {other:?} after authorization — \
+                 aborting this merge attempt",
+                pr.id
+            );
+            return RowVerdict::Skip;
+        }
+    }
+
     RowVerdict::Merge { head_sha: snapshot.head_sha }
 }
 
@@ -469,7 +546,12 @@ async fn maybe_merge_one(
 
     // Step 7: regardless of outcome, one more fresh read (same injected
     // resolver as step 4) + persist + marker.
-    let target2 = PrTarget { owner: pr.host_owner.clone(), repo: pr.host_repo.clone(), number: pr.number };
+    let target2 = PrTarget {
+        host_base: pr.host_base.clone(),
+        owner: pr.host_owner.clone(),
+        repo: pr.host_repo.clone(),
+        number: pr.number,
+    };
     let confirmed = tokio::task::spawn_blocking(move || {
         resolver(host_kind).and_then(|h| h.fetch_status(&target2))
     })
@@ -482,7 +564,8 @@ async fn maybe_merge_one(
 
     let (state, state_error) = match &confirmed {
         Ok(s) => {
-            let r = judge::merge_readiness(&s.ci, &s.review, &s.conflict);
+            let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
+            let r = judge::merge_readiness(&s.ci, &s.review, &s.conflict, &upstream);
             if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, s, &r).await {
                 eprintln!(
                     "[weft][automerge] pr #{}: could not save confirmation snapshot: {e}",
@@ -558,22 +641,13 @@ fn lifecycle_state_tag(lifecycle: PrLifecycle) -> &'static str {
 ///
 /// `host_base` (the hostname recorded at registration — see `host/mod.rs`'s
 /// module doc on why GitHub Enterprise needs this recorded per row) is
-/// threaded into `--repo` as `HOST/OWNER/REPO` when non-empty, so this call
-/// targets the SAME host the row was registered against rather than
-/// whatever `gh`'s own configured default happens to be (review round 1
-/// Codex P1).
+/// threaded into `--repo` as `HOST/OWNER/REPO` when non-empty, via the SAME
+/// `super::qualified_repo_slug` `github::GitHubHost::fetch_status` uses, so this call and every
+/// status read of the same row can never independently drift on which host they each target
+/// (review round 1 Codex P1; Codex review, PR #159 repo.rs:3873 — the status-fetch path used
+/// to skip this entirely).
 fn run_gh_merge(host_base: &str, owner: &str, repo: &str, number: i32, head_sha: &str) -> Result<(), String> {
-    // Same defense-in-depth guard `github::GitHubHost::fetch_status` applies
-    // independently of `parse_pr_url`'s own validation, for the exact same
-    // reason: `--repo` here is built the same way (a joined argument), so it
-    // inherits the exact same confirmed SSRF risk (see `parse_pr_url`'s doc)
-    // and gets the exact same guard — extended to `host_base` too, since
-    // that is now ALSO folded into the same argument.
-    if host_base.contains('/') || owner.contains('/') || repo.contains('/') {
-        return Err(format!(
-            "refusing to merge a repo slug with an embedded '/' (host_base={host_base:?}, owner={owner:?}, repo={repo:?}) — this would be reinterpreted as a host override"
-        ));
-    }
+    let repo_arg = super::qualified_repo_slug(host_base, owner, repo)?;
     // A `Ready` verdict can only ever be produced from a SUCCESSFUL snapshot
     // (which always sets a real `head_sha`), so this should be unreachable
     // through the gate above — kept anyway as cheap, independent insurance
@@ -581,9 +655,8 @@ fn run_gh_merge(host_base: &str, owner: &str, repo: &str, number: i32, head_sha:
     if head_sha.is_empty() {
         return Err("refusing to merge: no confirmed head_sha on record".to_string());
     }
-    let repo_slug = format!("{owner}/{repo}");
     let out = Command::new("gh")
-        .args(build_merge_args(host_base, &repo_slug, number, head_sha))
+        .args(build_merge_args(&repo_arg, number, head_sha))
         // Checks run user tooling that a GUI launch's minimal PATH can't
         // resolve (Homebrew/local installs of `gh`) — same reasoning as
         // `github::GitHubHost::fetch_status` / `check::run_check`.
@@ -604,29 +677,22 @@ fn run_gh_merge(host_base: &str, owner: &str, repo: &str, number: i32, head_sha:
 }
 
 /// The exact `gh pr merge` argument vector, pulled out as its own pure
-/// function so both the presence of `--match-head-commit` (this feature's
+/// function so the presence of `--match-head-commit` (this feature's
 /// server-side head-consistency enforcement — the mechanism `gate`'s own doc
-/// points to instead of a second client-side sha comparison) AND the
-/// host-targeting `--repo` value are independently, directly unit-tested
-/// below without ever spawning a process. `run_gh_merge` is the only caller;
-/// nothing here talks to `gh`.
-fn build_merge_args(host_base: &str, repo_slug: &str, number: i32, head_sha: &str) -> Vec<String> {
-    // `gh`'s `-R/--repo` grammar is `[HOST/]OWNER/REPO` — an explicit host
-    // segment selects that host instead of `gh`'s own configured default.
-    // Empty `host_base` (a row from before this field existed) falls back to
-    // the plain two-segment form, preserving `gh`'s own default-host
-    // behavior exactly as before this fix.
-    let repo_arg = if host_base.is_empty() {
-        repo_slug.to_string()
-    } else {
-        format!("{host_base}/{repo_slug}")
-    };
+/// points to instead of a second client-side sha comparison) is
+/// independently, directly unit-tested below without ever spawning a
+/// process. `run_gh_merge` is the only caller; nothing here talks to `gh`.
+/// `repo_arg` arrives ALREADY host-qualified (`super::qualified_repo_slug`,
+/// called by `run_gh_merge` — see that function's doc for why the folding
+/// itself lives there, shared with `github::GitHubHost::fetch_status`,
+/// rather than duplicated in this formatter too).
+fn build_merge_args(repo_arg: &str, number: i32, head_sha: &str) -> Vec<String> {
     vec![
         "pr".to_string(),
         "merge".to_string(),
         number.to_string(),
         "--repo".to_string(),
-        repo_arg,
+        repo_arg.to_string(),
         "--squash".to_string(),
         "--match-head-commit".to_string(),
         head_sha.to_string(),
@@ -769,13 +835,15 @@ mod tests {
         }
     }
 
-    // --- build_merge_args: the head-consistency AND host-targeting
-    // enforcement must actually reach the `gh` invocation, not just exist in
-    // a doc comment --------------------------------------------------------
+    // --- build_merge_args: the head-consistency enforcement must actually
+    // reach the `gh` invocation, not just exist in a doc comment. Host-
+    // targeting (`[HOST/]OWNER/REPO` folding) is `super::qualified_repo_slug`'s
+    // job now — see `host::tests` for that coverage, shared with
+    // `github::GitHubHost::fetch_status` --------------------------------------
 
     #[test]
     fn build_merge_args_always_squashes_and_pins_match_head_commit_to_the_exact_sha() {
-        let args = build_merge_args("", "acme/widgets", 42, "deadbeef");
+        let args = build_merge_args("acme/widgets", 42, "deadbeef");
         assert_eq!(
             args,
             vec!["pr", "merge", "42", "--repo", "acme/widgets", "--squash", "--match-head-commit", "deadbeef"]
@@ -793,23 +861,14 @@ mod tests {
     }
 
     #[test]
-    fn build_merge_args_folds_a_non_empty_host_base_into_the_repo_argument() {
-        // Review round 1 Codex P1: a GitHub Enterprise row's recorded host
-        // must actually reach the invocation, not silently fall back to
-        // `gh`'s own default host.
-        let args = build_merge_args("github.acme-corp.com", "acme/widgets", 42, "deadbeef");
+    fn build_merge_args_passes_through_an_already_host_qualified_repo_arg_verbatim() {
+        // Review round 1 Codex P1 / Codex review PR #159 repo.rs:3873: a GitHub Enterprise
+        // row's recorded host must actually reach the invocation — folding now happens in
+        // `super::qualified_repo_slug` (`run_gh_merge`'s job to call), so this only needs to
+        // prove the ALREADY-qualified string reaches --repo verbatim, untouched.
+        let args = build_merge_args("github.acme-corp.com/acme/widgets", 42, "deadbeef");
         let idx = args.iter().position(|a| a == "--repo").unwrap();
         assert_eq!(args[idx + 1], "github.acme-corp.com/acme/widgets");
-    }
-
-    #[test]
-    fn build_merge_args_empty_host_base_preserves_the_plain_two_segment_form() {
-        // A row from before `host_base` was recorded (or a plain github.com
-        // one, if this crate ever stops populating it for that case) must
-        // not regress into passing a bare empty host segment.
-        let args = build_merge_args("", "acme/widgets", 42, "deadbeef");
-        let idx = args.iter().position(|a| a == "--repo").unwrap();
-        assert_eq!(args[idx + 1], "acme/widgets");
     }
 
     // --- lifecycle_state_tag: exhaustive, always distinguishable ----------
@@ -996,6 +1055,49 @@ mod tests {
         })))
     }
 
+    /// Test-only seam (mirrors `planner::tests::between_upstream_passes_probe`): lets a test
+    /// PAUSE `evaluate_row` exactly between its FIRST upstream read (step 4) and its re-check
+    /// (step 5.5) — the same window a concurrent re-proposal could land in (Codex review, PR
+    /// #159 automerge.rs:395) — write a NEW dependency onto `direction_id` from a SEPARATE
+    /// task, then release it. `arm_between_upstream_authorization_probe(direction_id)` returns
+    /// `(reached_rx, resume_tx)`: `reached_rx` resolves once the probe is hit, and sending on
+    /// `resume_tx` lets `evaluate_row` continue into its re-check. A no-op (never blocks) for
+    /// any direction_id that wasn't armed.
+    #[allow(clippy::type_complexity)]
+    fn between_upstream_authorization_map() -> &'static std::sync::Mutex<
+        std::collections::HashMap<i32, (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+    > {
+        static M: std::sync::OnceLock<
+            std::sync::Mutex<
+                std::collections::HashMap<i32, (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+            >,
+        > = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn arm_between_upstream_authorization_probe(
+        direction_id: i32,
+    ) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        between_upstream_authorization_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(direction_id, (reached_tx, resume_rx));
+        (reached_rx, resume_tx)
+    }
+
+    pub(super) async fn between_upstream_authorization_probe(direction_id: i32) {
+        let armed = between_upstream_authorization_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&direction_id);
+        if let Some((reached_tx, resume_rx)) = armed {
+            let _ = reached_tx.send(());
+            let _ = resume_rx.await;
+        }
+    }
+
     /// A tracked row whose STORED state is fully ready (`pre_decision` —
     /// step 1 — reads `Merge`) and the opt-in switch is on — the exact
     /// precondition every test above needs, isolated here once. Deliberately
@@ -1092,6 +1194,66 @@ mod tests {
         let verdict = evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_fully_ready).await;
 
         assert_eq!(verdict, RowVerdict::Merge { head_sha: "fresh_sha_fully_ready".to_string() });
+    }
+
+    /// THE FIX (Codex review, PR #159 automerge.rs:395): between `evaluate_row`'s upstream
+    /// read (step 4) and its FINAL authorization, a re-proposal could add or replace this
+    /// consumer's dependency — `--match-head-commit` (step 6, in `maybe_merge_one`) only
+    /// guards the PR's OWN head commit moving, never this LOCAL ordering fact, so an already-
+    /// authorized sweep would otherwise merge a consumer whose upstream just changed, with no
+    /// backstop at all. Pauses `evaluate_row` exactly in that window (`between_upstream_
+    /// authorization_probe`, mirroring `planner::tests::between_upstream_passes_probe`'s exact
+    /// pattern) and drives a genuinely concurrent write — `repo::set_direction_upstream`, the
+    /// same primitive `record_upstream_edges` itself calls — from a separately spawned task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evaluate_row_aborts_when_a_dependency_is_added_after_authorization_but_before_the_recheck() {
+        let tag = format!("weft-automerge-upstream-race-{}", std::process::id());
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&weft_home).unwrap();
+        // File-backed (not :memory:) DB, same reason as `planner::tests::thread_gate_
+        // serializes_concurrent_confirms`: the cloned pool handle in the spawned task must see
+        // the SAME store as the test's own concurrent write.
+        let db_file = weft_home.join("automerge-race.sqlite");
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", db_file.to_str().unwrap()))
+            .await
+            .unwrap();
+        let pr = seam_fixture(&db).await; // dependency-free, everything else Ready
+        let consumer_direction_id = pr.direction_id;
+        // A real, undecided producer to attach as the race's dependency.
+        let thread = repo::get_thread(&db, pr.thread_id).await.unwrap().unwrap();
+        let repo_ref = repo::get_repo(&db, pr.repo_id).await.unwrap().unwrap();
+        let producer = repo::create_direction(
+            &db, thread.id, "producer", "codex", repo_ref.id, "why", "impl-only", "",
+        )
+        .await
+        .unwrap();
+        let backoff = MergeBackoffState::default();
+
+        let (reached_rx, resume_tx) = tests::arm_between_upstream_authorization_probe(consumer_direction_id);
+        let db2 = db.clone();
+        let pr2 = pr.clone();
+        let backoff2 = backoff.clone();
+        let evaluate_handle = tokio::spawn(async move {
+            evaluate_row(&db2, &pr2, HostKind::GitHub, &backoff2, resolver_fresh_fully_ready).await
+        });
+
+        // Wait for evaluate_row to reach the gap between its upstream read and its re-check,
+        // then — WHILE it is still paused there — add a real dependency from a separate task,
+        // the same write `record_upstream_edges` itself performs.
+        reached_rx.await.expect("evaluate_row reached the between-authorization probe");
+        repo::set_direction_upstream(&db, consumer_direction_id, producer.id).await.unwrap();
+        let _ = resume_tx.send(());
+
+        let verdict = evaluate_handle.await.unwrap();
+        assert_eq!(
+            verdict,
+            RowVerdict::Skip,
+            "a dependency added between authorization and the re-check must abort this merge \
+             attempt, not silently proceed on the stale (dependency-free) read"
+        );
+
+        let _ = std::fs::remove_dir_all(&weft_home);
     }
 
     #[tokio::test]

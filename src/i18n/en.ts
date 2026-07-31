@@ -273,6 +273,8 @@ export const en = {
     confirming: "Creating…",
     baseBranch: "Base branch",
     baseBranchHint: "Branch the work off this (blank = the repo's default branch)",
+    dependsOn: 'Waits for "{{name}}"',
+    dependsOnHint: 'Blocked from merging until "{{name}}" lands',
     engine: "Engine",
     engineAutomatic: "Auto · {{tool}}",
     engineManual: "Pinned · {{tool}}",

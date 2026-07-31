@@ -5,12 +5,22 @@
 //! judgement; everything else here builds the human-facing Needs-you notice
 //! from its result.
 //!
+//! A FOURTH axis joins those three for cross-repo change sets: an upstream
+//! task's PR must be merged before this one is mergeable at all. It is an axis
+//! rather than a separate gate on purpose — [`merge_readiness`] is the single
+//! source of truth every consumer already reads (monitor notice, auto-merge
+//! gate, the UI), so ordering flows to all of them by construction instead of
+//! being re-derived per caller.
+//!
 //! This file is the primary target of this PR's mutation self-check (see the
 //! PR body): flip any arm of [`ci_verdict`] / [`review_verdict`] /
-//! [`conflict_verdict`] / the `has_unknown` / `has_blocking` branches in
-//! [`merge_readiness`], and a test below must go red.
+//! [`conflict_verdict`] / [`upstream_verdict`] / the `has_unknown` /
+//! `has_blocking` branches in [`merge_readiness`], and a test below must go
+//! red.
 
-use super::{CiStatus, ConflictStatus, HostError, HostKind, MergeReadiness, ReviewStatus};
+use super::{
+    CiStatus, ConflictStatus, HostError, HostKind, MergeReadiness, ReviewStatus, UpstreamStatus,
+};
 
 /// Each axis reduced to a 3-way verdict before combining — keeps
 /// `merge_readiness` a single small exhaustive match instead of a spelled-out
@@ -38,6 +48,22 @@ fn review_verdict(s: &ReviewStatus) -> AxisVerdict {
         // unresolved-discussions sub-signal — approval itself is the bar;
         // `unresolved_discussions` only adds detail to the REASON text below.
         ReviewStatus::ChangesRequested | ReviewStatus::AwaitingApproval { .. } => AxisVerdict::Blocking,
+    }
+}
+
+fn upstream_verdict(s: &UpstreamStatus) -> AxisVerdict {
+    match s {
+        UpstreamStatus::Unknown { .. } => AxisVerdict::Unknown,
+        UpstreamStatus::None | UpstreamStatus::Merged => AxisVerdict::Clear,
+        UpstreamStatus::Pending { .. } => AxisVerdict::Blocking,
+    }
+}
+
+fn upstream_reason(s: &UpstreamStatus) -> Option<String> {
+    match s {
+        UpstreamStatus::Unknown { reason } => Some(format!("上游任务状态未知({reason})")),
+        UpstreamStatus::Pending { what } => Some(format!("上游任务「{what}」还没合并")),
+        UpstreamStatus::None | UpstreamStatus::Merged => None,
     }
 }
 
@@ -93,22 +119,34 @@ fn conflict_reason(s: &ConflictStatus) -> Option<String> {
 /// as `Indeterminate` (we must never claim `Ready` OR `Blocked` when we can't
 /// actually tell); otherwise any `Blocking` axis makes it `Blocked`;
 /// otherwise `Ready`. `reasons` always lists every non-clear axis (not just
-/// the first found), in a fixed CI → review → conflict order so the same
+/// the first found), in a fixed CI → review → conflict → upstream order so
+/// the same
 /// input always renders identical text (no notice-flapping on wording order
 /// alone — see `plan_notice_action`).
 pub fn merge_readiness(
     ci: &CiStatus,
     review: &ReviewStatus,
     conflict: &ConflictStatus,
+    upstream: &UpstreamStatus,
 ) -> MergeReadiness {
-    let verdicts = [ci_verdict(ci), review_verdict(review), conflict_verdict(conflict)];
+    let verdicts = [
+        ci_verdict(ci),
+        review_verdict(review),
+        conflict_verdict(conflict),
+        upstream_verdict(upstream),
+    ];
     let has_unknown = verdicts.contains(&AxisVerdict::Unknown);
     let has_blocking = verdicts.contains(&AxisVerdict::Blocking);
 
-    let reasons: Vec<String> = [ci_reason(ci), review_reason(review), conflict_reason(conflict)]
-        .into_iter()
-        .flatten()
-        .collect();
+    let reasons: Vec<String> = [
+        ci_reason(ci),
+        review_reason(review),
+        conflict_reason(conflict),
+        upstream_reason(upstream),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
     if has_unknown {
         MergeReadiness::Indeterminate { reasons }
@@ -214,17 +252,116 @@ mod tests {
         (CiStatus::Passing, ReviewStatus::Approved, ConflictStatus::Clean)
     }
 
+    /// The ordering axis, on a change set whose other three axes are perfect.
+    /// This is the whole point: a consumer PR can be green, approved and
+    /// conflict-free and STILL not be mergeable, because merging it would land
+    /// a commit referencing a producer change that is not on any default
+    /// branch yet.
+    #[test]
+    fn a_pending_upstream_blocks_an_otherwise_perfect_pr() {
+        let (ci, review, conflict) = ready();
+        let readiness = merge_readiness(
+            &ci,
+            &review,
+            &conflict,
+            &UpstreamStatus::Pending { what: "chat-kit: expose send".into() },
+        );
+        match readiness {
+            MergeReadiness::Blocked { reasons } => {
+                assert_eq!(reasons.len(), 1, "only the ordering axis is unclear");
+                assert!(
+                    reasons[0].contains("chat-kit: expose send"),
+                    "the notice must name WHICH task is holding it: {reasons:?}"
+                );
+            }
+            other => panic!("a pending upstream must block, got {other:?}"),
+        }
+    }
+
+    /// Once the producer lands, the consumer is free — no residue.
+    #[test]
+    fn a_merged_upstream_clears_the_axis() {
+        let (ci, review, conflict) = ready();
+        assert_eq!(
+            merge_readiness(&ci, &review, &conflict, &UpstreamStatus::Merged),
+            MergeReadiness::Ready
+        );
+    }
+
+    /// An unresolvable upstream must never read as "no upstream". `None` would
+    /// release the merge; the honest answer to "can we tell?" is no, and this
+    /// axis obeys the same rule as the other three.
+    #[test]
+    fn an_unknown_upstream_is_indeterminate_not_ready() {
+        let (ci, review, conflict) = ready();
+        let readiness = merge_readiness(
+            &ci,
+            &review,
+            &conflict,
+            &UpstreamStatus::Unknown { reason: "上游任务 #7 不存在".into() },
+        );
+        match readiness {
+            MergeReadiness::Indeterminate { reasons } => {
+                assert!(reasons[0].contains("#7"), "reason keeps the diagnostic: {reasons:?}");
+            }
+            other => panic!("an unknown upstream must be indeterminate, got {other:?}"),
+        }
+    }
+
+    /// Ordering does not outrank the other axes — it joins them. A PR blocked
+    /// on BOTH a failing CI and a pending upstream reports both, in the fixed
+    /// order the notice depends on.
+    #[test]
+    fn upstream_joins_the_other_axes_rather_than_overriding_them() {
+        let readiness = merge_readiness(
+            &CiStatus::Failing,
+            &ReviewStatus::Approved,
+            &ConflictStatus::Clean,
+            &UpstreamStatus::Pending { what: "producer".into() },
+        );
+        match readiness {
+            MergeReadiness::Blocked { reasons } => {
+                assert_eq!(reasons.len(), 2, "both axes are named: {reasons:?}");
+                assert!(reasons[0].contains("CI"), "CI comes first: {reasons:?}");
+                assert!(reasons[1].contains("producer"), "upstream comes last: {reasons:?}");
+            }
+            other => panic!("expected blocked, got {other:?}"),
+        }
+    }
+
+    /// A task with no ordering edge behaves exactly as before this axis
+    /// existed — the overwhelmingly common case must be untouched.
+    #[test]
+    fn no_upstream_is_indistinguishable_from_the_three_axis_judgement() {
+        for (ci, review, conflict) in [
+            (CiStatus::Passing, ReviewStatus::Approved, ConflictStatus::Clean),
+            (CiStatus::Failing, ReviewStatus::Approved, ConflictStatus::Clean),
+            (
+                CiStatus::Unknown { reason: "x".into() },
+                ReviewStatus::Approved,
+                ConflictStatus::Clean,
+            ),
+        ] {
+            let with_none = merge_readiness(&ci, &review, &conflict, &UpstreamStatus::None);
+            let with_merged = merge_readiness(&ci, &review, &conflict, &UpstreamStatus::Merged);
+            assert_eq!(
+                with_none, with_merged,
+                "None and Merged are both Clear, so they must agree"
+            );
+        }
+    }
+
     #[test]
     fn all_three_axes_clear_is_ready() {
         let (ci, review, conflict) = ready();
-        assert_eq!(merge_readiness(&ci, &review, &conflict), MergeReadiness::Ready);
+        assert_eq!(merge_readiness(&ci, &review, &conflict, &UpstreamStatus::None), MergeReadiness::Ready);
     }
 
     #[test]
     fn ci_not_configured_counts_as_clear_not_blocking() {
         let (_, review, conflict) = ready();
         assert_eq!(
-            merge_readiness(&CiStatus::NotConfigured, &review, &conflict),
+            merge_readiness(&CiStatus::NotConfigured, &review, &conflict, &UpstreamStatus::None),
             MergeReadiness::Ready
         );
     }
@@ -232,7 +369,7 @@ mod tests {
     #[test]
     fn failing_ci_alone_blocks() {
         let (_, review, conflict) = ready();
-        match merge_readiness(&CiStatus::Failing, &review, &conflict) {
+        match merge_readiness(&CiStatus::Failing, &review, &conflict, &UpstreamStatus::None) {
             MergeReadiness::Blocked { reasons } => {
                 assert_eq!(reasons, vec!["CI 未通过".to_string()]);
             }
@@ -244,7 +381,7 @@ mod tests {
     fn pending_ci_alone_blocks() {
         let (_, review, conflict) = ready();
         assert!(matches!(
-            merge_readiness(&CiStatus::Pending, &review, &conflict),
+            merge_readiness(&CiStatus::Pending, &review, &conflict, &UpstreamStatus::None),
             MergeReadiness::Blocked { .. }
         ));
     }
@@ -253,7 +390,7 @@ mod tests {
     fn changes_requested_alone_blocks() {
         let (ci, _, conflict) = ready();
         assert!(matches!(
-            merge_readiness(&ci, &ReviewStatus::ChangesRequested, &conflict),
+            merge_readiness(&ci, &ReviewStatus::ChangesRequested, &conflict, &UpstreamStatus::None),
             MergeReadiness::Blocked { .. }
         ));
     }
@@ -268,7 +405,7 @@ mod tests {
                 &ci,
                 &ReviewStatus::AwaitingApproval { unresolved_discussions: None },
                 &conflict
-            ),
+            , &UpstreamStatus::None),
             MergeReadiness::Blocked { .. }
         ));
     }
@@ -286,7 +423,7 @@ mod tests {
                         &ci,
                         &ReviewStatus::AwaitingApproval { unresolved_discussions },
                         &conflict
-                    ),
+                    , &UpstreamStatus::None),
                     MergeReadiness::Blocked { .. }
                 ),
                 "unresolved_discussions={unresolved_discussions:?} must still block"
@@ -301,6 +438,7 @@ mod tests {
             &ci,
             &ReviewStatus::AwaitingApproval { unresolved_discussions: Some(true) },
             &conflict,
+            &UpstreamStatus::None,
         );
         match readiness {
             MergeReadiness::Blocked { reasons } => {
@@ -314,7 +452,7 @@ mod tests {
     fn conflicting_alone_blocks() {
         let (ci, review, _) = ready();
         assert!(matches!(
-            merge_readiness(&ci, &review, &ConflictStatus::Conflicting),
+            merge_readiness(&ci, &review, &ConflictStatus::Conflicting, &UpstreamStatus::None),
             MergeReadiness::Blocked { .. }
         ));
     }
@@ -327,6 +465,7 @@ mod tests {
             &CiStatus::Unknown { reason: "gh not authenticated".to_string() },
             &ReviewStatus::ChangesRequested,
             &ConflictStatus::Conflicting,
+            &UpstreamStatus::None,
         );
         match readiness {
             MergeReadiness::Indeterminate { reasons } => {
@@ -343,6 +482,7 @@ mod tests {
             &CiStatus::Failing,
             &ReviewStatus::ChangesRequested,
             &ConflictStatus::Conflicting,
+            &UpstreamStatus::None,
         );
         match readiness {
             MergeReadiness::Blocked { reasons } => {

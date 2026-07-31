@@ -99,11 +99,52 @@ impl HostKind {
 
 /// One PR/MR's identity + where to find it, host-agnostic. A `PrHost` maps
 /// this into its own CLI invocation.
+///
+/// `host_base` (the hostname recorded at registration — e.g. a GitHub Enterprise install; see
+/// [`qualified_repo_slug`]) must reach every `PrHost` invocation, not just the merge path
+/// (Codex review, PR #159 repo.rs:3873): `github::GitHubHost::fetch_status` used to build its
+/// `--repo` argument from `owner`/`repo` alone, with no way to carry a recorded host at all —
+/// so a GHE row's STATUS reads always queried `gh`'s own configured default host instead of the
+/// recorded install, while `automerge::run_gh_merge`'s MERGE call already folded `host_base` in
+/// correctly (since review round 1). Two paths inside the SAME feature disagreeing about which
+/// server to talk to for the SAME row is a strong signal on its own, and the consequence is
+/// real: a GHE user could have status read from (or silently fail against) the wrong server
+/// entirely, then have that status drive an irreversible merge decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrTarget {
+    pub host_base: String,
     pub owner: String,
     pub repo: String,
     pub number: i32,
+}
+
+/// Build the `[HOST/]OWNER/REPO` argument `gh`'s `--repo`/`-R` flag expects, or reject the call
+/// before it can ever shell out — the ONE place every `gh` invocation in this crate resolves
+/// which server to target, so no two call sites can independently drift on it (see
+/// [`PrTarget`]'s doc for why that drift was a real bug, not a hypothetical one).
+///
+/// GitHub Enterprise needs the host segment to target the recorded install instead of `gh`'s
+/// own configured default; `host_base` of `""` (a row from before this field existed, or a
+/// plain github.com one) falls back to the plain two-segment form, matching `gh`'s own
+/// default-host behavior exactly — a no-op for the overwhelming majority of checkouts.
+///
+/// Refuses an embedded `/` in ANY of the three inputs before ever building the argument: `gh`'s
+/// `[HOST/]OWNER/REPO` grammar treats an extra `/`-delimited segment as a HOST OVERRIDE — this
+/// crate's confirmed SSRF vector if an owner/repo/host string reaches a shell-out with an
+/// unexpected slash in it (see [`parse_pr_url`]'s doc). Centralizing the guard here, alongside
+/// the formatting it protects, means a future THIRD caller cannot forget it the way the
+/// status-fetch path once forgot to fold in `host_base` at all.
+pub fn qualified_repo_slug(host_base: &str, owner: &str, repo: &str) -> Result<String, String> {
+    if host_base.contains('/') || owner.contains('/') || repo.contains('/') {
+        return Err(format!(
+            "refusing to target a repo slug with an embedded '/' (host_base={host_base:?}, owner={owner:?}, repo={repo:?}) — this would be reinterpreted as a host override"
+        ));
+    }
+    Ok(if host_base.is_empty() {
+        format!("{owner}/{repo}")
+    } else {
+        format!("{host_base}/{owner}/{repo}")
+    })
 }
 
 /// Lifecycle of the change unit itself — distinct from merge READINESS, which
@@ -199,6 +240,28 @@ pub enum ConflictStatus {
     Unknown { reason: String },
     Clean,
     Conflicting,
+}
+
+/// Whether the task this PR belongs to is waiting on ANOTHER task's PR.
+///
+/// Ordering exists because a consumer repo pinned to a producer (a submodule
+/// SHA, a version bump) cannot be green until the producer's change is on its
+/// default branch. Merging the consumer first does not merely reorder work —
+/// it lands a commit referencing something nobody else can resolve.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum UpstreamStatus {
+    /// No ordering edge recorded — the overwhelmingly common case, and the
+    /// only one that existed before cross-repo change sets.
+    None,
+    /// Every upstream task's PR is merged; this one is free to go.
+    Merged,
+    /// An upstream is still outstanding. `what` names it for the human.
+    Pending { what: String },
+    /// An upstream edge exists but its state could not be established (the
+    /// task row is gone, its PR was never registered). Deliberately NOT
+    /// treated as "no upstream": the honest answer to "can we tell?" is no.
+    Unknown { reason: String },
 }
 
 /// The `truly mergeable` bar (this repo's CLAUDE.md "GitHub Remote Review
@@ -425,6 +488,45 @@ mod tests {
         assert_eq!(HostKind::parse("bitbucket"), None, "unknown text must not guess a default");
         assert_eq!(HostKind::GitHub.as_str(), "github");
         assert_eq!(HostKind::GitLab.as_str(), "gitlab");
+    }
+
+    // --- qualified_repo_slug: the ONE shared source both `github::GitHubHost::
+    // fetch_status` and `automerge::run_gh_merge` resolve a `gh --repo` target
+    // through — Codex review, PR #159 repo.rs:3873 ---------------------------
+
+    #[test]
+    fn qualified_repo_slug_folds_a_non_empty_host_base_in() {
+        // Review round 1 Codex P1 (originally caught on the merge path only):
+        // a GitHub Enterprise row's recorded host must actually reach the
+        // invocation, not silently fall back to `gh`'s own default host.
+        assert_eq!(
+            qualified_repo_slug("github.acme-corp.com", "acme", "widgets").unwrap(),
+            "github.acme-corp.com/acme/widgets"
+        );
+    }
+
+    #[test]
+    fn qualified_repo_slug_empty_host_base_preserves_the_plain_two_segment_form() {
+        // A row from before `host_base` was recorded (or a plain github.com
+        // one) must not regress into passing a bare empty host segment.
+        assert_eq!(qualified_repo_slug("", "acme", "widgets").unwrap(), "acme/widgets");
+    }
+
+    #[test]
+    fn qualified_repo_slug_refuses_an_embedded_slash_in_any_of_the_three_inputs() {
+        for (host_base, owner, repo) in [
+            ("evil.example.org/extra", "acme", "widgets"),
+            ("", "evil.example.org/acme", "widgets"),
+            ("", "acme", "evil.example.org/widgets"),
+        ] {
+            match qualified_repo_slug(host_base, owner, repo) {
+                Err(message) => assert!(message.contains("host override"), "got: {message}"),
+                Ok(slug) => panic!(
+                    "expected the embedded-slash guard to fire for host_base={host_base:?} \
+                     owner={owner:?} repo={repo:?}, got a slug instead: {slug:?}"
+                ),
+            }
+        }
     }
 
     #[test]

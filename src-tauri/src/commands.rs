@@ -1739,6 +1739,10 @@ pub struct WriteTrigger {
     pub base_branch: String,
     pub hint: crate::engine_routing::RoutingHint,
     pub route: Option<crate::engine_routing::RouteDecision>,
+    /// See `planner::PendingWrite::depends_on` — surfaced here so the per-lane Needs-you card
+    /// can show which producer gates this consumer's merge (Codex review, PR #159
+    /// planner.rs:109).
+    pub depends_on: String,
 }
 
 /// Every pending write declaration across the workspace's threads — the
@@ -1776,6 +1780,7 @@ pub async fn write_triggers(
                 base_branch: p.base_branch,
                 hint: p.hint,
                 route: p.route,
+                depends_on: p.depends_on,
             });
         }
     }

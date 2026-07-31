@@ -670,6 +670,9 @@ export interface ResolvedDirection {
   decision: string;
   hint: "normal" | "deep";
   route?: EngineRouteDecision | null;
+  /** the `name` of ANOTHER direction in this SAME proposal that must merge before this one can
+   *  (issue #110 T4); "" = no upstream. */
+  depends_on: string;
 }
 export interface ResolvedProposal {
   thread_id: number;
@@ -823,6 +826,9 @@ export interface WriteTrigger {
   base_branch: string;
   hint: "normal" | "deep";
   route?: EngineRouteDecision | null;
+  /** the `name` of ANOTHER direction in this SAME proposal that must merge before this one can
+   *  (issue #110 T4); "" = no upstream. */
+  depends_on: string;
 }
 
 /** Discriminates what a `NeedItem` represents and how the Needs-you card
