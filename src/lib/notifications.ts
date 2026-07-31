@@ -264,7 +264,7 @@ export async function handleNotifyOpen(
     workspaceLoadReady?: boolean;
     needsHydrated?: boolean;
   },
-): Promise<void> {
+): Promise<boolean> {
   await focusMainWindow();
   const intents = planNotifyOpen(payload);
   const workspaceIntent = intents.find((i) => i.type === "workspace");
@@ -280,7 +280,7 @@ export async function handleNotifyOpen(
         expectedLoadSeq: deps.workspaceLoadSeq + 1,
       });
       await deps.selectWorkspace(workspaceIntent.workspaceId);
-      return;
+      return false;
     }
     // Same workspace id, but a load may still be in flight (cold-start restore
     // or manual switch). Defer until that load finishes so its reset cannot
@@ -289,7 +289,7 @@ export async function handleNotifyOpen(
       stashPendingNav(payload, {
         expectedLoadSeq: deps.workspaceLoadSeq + 1,
       });
-      return;
+      return false;
     }
   }
   if (
@@ -304,25 +304,26 @@ export async function handleNotifyOpen(
     } catch {
       /* Keep the deferred route; a later successful load can apply it. */
     }
-    return;
+    return false;
   }
   if (deps.workspaceRestoring) {
     stashPendingNav(payload);
-    return;
+    return false;
   }
   const needsIntent = intents.some((intent) => intent.type === "needs");
   if (needsIntent && deps.needsHydrated === false) {
     stashPendingNav(payload);
-    return;
+    return false;
   }
   // Global routes (quota and ownership-unknown Needs-you entries) also mutate
   // the current surface. A workspace reset that is already in flight would
   // otherwise erase Resources/Needs immediately after this handler opens it.
   if (deps.workspaceLoading) {
     stashPendingNav(payload);
-    return;
+    return false;
   }
   await applyNotifyIntents(payload, deps);
+  return true;
 }
 
 async function sendOsNotification(
@@ -370,6 +371,7 @@ export function useSystemNotifications() {
     activeWorkspaceId,
     needsByWorkspace,
     threadWorkspaceById,
+    threadKindById,
     workspaceLoadSeq,
     workspaceLoading,
     workspaceRestoring,
@@ -396,6 +398,11 @@ export function useSystemNotifications() {
   const liveWorkersReadyPrevious = useRef(false);
   const asksReadyPrevious = useRef(false);
   const workspaceNeedsReadyPrevious = useRef(false);
+  const globalBaselineReady = useRef({
+    asks: false,
+    stalled: false,
+    quota: false,
+  });
   const [permissionState, setPermissionState] = useState<NotifyPermission>("prompt");
   const [windowFocused, setWindowFocused] = useState<boolean | null>(null);
   const lastBadge = useRef<number | null>(null);
@@ -416,7 +423,7 @@ export function useSystemNotifications() {
       m[id] = {
         title: prevMeta?.title ?? `#${id}`,
         workspaceId: ws,
-        kind: prevMeta?.kind,
+        kind: threadKindById[id] ?? prevMeta?.kind,
       };
     }
     for (const th of threads) {
@@ -427,7 +434,7 @@ export function useSystemNotifications() {
       };
     }
     threadsById.current = m;
-  }, [threads, threadWorkspaceById]);
+  }, [threads, threadWorkspaceById, threadKindById]);
 
   // OS permission, settled once per enable.
   useEffect(() => {
@@ -530,14 +537,15 @@ export function useSystemNotifications() {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     let takenPending: OsNotifyOpenEvent | null = null;
-    const openInFlight = new Map<string, Promise<void>>();
+    const openInFlight = new Map<string, Promise<boolean>>();
 
-    const handleOpen = (payload: OsNotifyOpenEvent): Promise<void> => {
+    const handleOpen = (payload: OsNotifyOpenEvent): Promise<boolean> => {
       const key = notifyOpenKey(payload);
       const existing = openInFlight.get(key);
       if (existing) return existing;
       const task = navigationTailRef.current.then(async () => {
-        await handleNotifyOpen(payload, navDepsRef.current);
+        const appliedImmediately = await handleNotifyOpen(payload, navDepsRef.current);
+        if (!appliedImmediately) return false;
         // Native delivery retains the payload until the frontend confirms it was
         // handled. This also prevents a live event from being drained again by
         // the ordered cold-start check below.
@@ -546,8 +554,12 @@ export function useSystemNotifications() {
         } catch {
           /* pure-vite */
         }
+        return true;
       });
-      navigationTailRef.current = task.catch(() => undefined);
+      navigationTailRef.current = task.then(
+        () => undefined,
+        () => undefined,
+      );
       openInFlight.set(key, task);
       void task.then(
         () => {
@@ -580,8 +592,15 @@ export function useSystemNotifications() {
           takenPending = null;
           return;
         }
-        await handleOpen(pending);
-        takenPending = null;
+        const appliedImmediately = await handleOpen(pending);
+        if (appliedImmediately) {
+          takenPending = null;
+        } else {
+          // `take` removes the native slot. Keep the payload there as well as in
+          // sessionStorage while deferred navigation waits for workspace state.
+          await api.osNotifyRestorePendingOpen(pending);
+          takenPending = null;
+        }
       } catch {
         if (takenPending) {
           try {
@@ -805,19 +824,39 @@ export function useSystemNotifications() {
     const sameWorkspace =
       baselineWs.current === activeWorkspaceId && prev.current != null;
     const needsSourceBecameUnready =
-      (asksReadyPrevious.current && !asksReady) ||
-      (workspaceNeedsReadyPrevious.current && !workspaceNeedsReady);
+      notifyCategories.needs &&
+      ((asksReadyPrevious.current && !asksReady) ||
+        (workspaceNeedsReadyPrevious.current && !workspaceNeedsReady));
     const liveWorkersBecameReady =
       liveWorkersReady && !liveWorkersReadyPrevious.current;
     const sourceBecameUnready =
       needsSourceBecameUnready ||
       NOTIFY_CATEGORIES.some(
-        (kind) => sourceReadyPrevious.current[kind] && !sourceReady[kind],
+        (kind) =>
+          notifyCategories[kind] &&
+          sourceReadyPrevious.current[kind] &&
+          !sourceReady[kind],
       );
     if (!sameWorkspace || sourceBecameUnready) {
+      const previous = prev.current;
+      const preserveGlobal = { ...globalBaselineReady.current };
       baselineWs.current = activeWorkspaceId;
       prev.current = emptyNotifySnapshot();
+      if (previous) {
+        if (preserveGlobal.asks) {
+          prev.current.needs = new Map(
+            [...previous.needs].filter(([key]) => key.startsWith("ask:")),
+          );
+        }
+        if (preserveGlobal.stalled) {
+          prev.current.stalled = new Map(previous.stalled);
+        }
+        if (preserveGlobal.quota) {
+          prev.current.quota = new Map(previous.quota);
+        }
+      }
       baselineReady.current.clear();
+      globalBaselineReady.current = preserveGlobal;
       liveWorkersReadyPrevious.current = false;
       asksReadyPrevious.current = false;
       workspaceNeedsReadyPrevious.current = false;
@@ -838,19 +877,42 @@ export function useSystemNotifications() {
     for (const kind of NOTIFY_CATEGORIES) {
       if (sourceReady[kind] && !baselineReady.current.has(kind)) {
         if (kind === "needs") {
-          base.needs = new Map(
-            [...next.needs].filter(([key]) => isNeedsKeyReady(key)),
-          );
+          const initialNeeds = [...next.needs].filter(([key]) => {
+            if (key.startsWith("ask:")) {
+              return asksReady && !globalBaselineReady.current.asks;
+            }
+            return workspaceNeedsReady;
+          });
+          base.needs = new Map([
+            ...base.needs,
+            ...initialNeeds,
+          ]);
+          if (asksReady) {
+            globalBaselineReady.current.asks = true;
+          }
+        } else if (
+          kind === "stalled" && globalBaselineReady.current.stalled
+        ) {
+          // Keep the global stalled baseline across a workspace reset.
+        } else if (kind === "quota" && globalBaselineReady.current.quota) {
+          // Keep the global quota baseline across a workspace reset.
         } else {
           base[kind] = new Map(next[kind]);
+          if (kind === "stalled") {
+            globalBaselineReady.current.stalled = true;
+          }
+          if (kind === "quota") {
+            globalBaselineReady.current.quota = true;
+          }
         }
         baselineReady.current.add(kind);
       }
     }
-    if (asksBecameReady) {
+    if (asksBecameReady && !globalBaselineReady.current.asks) {
       for (const [key, entry] of next.needs) {
         if (key.startsWith("ask:")) base.needs.set(key, entry);
       }
+      globalBaselineReady.current.asks = true;
     }
     if (workspaceNeedsBecameReady) {
       for (const [key, entry] of next.needs) {
@@ -864,10 +926,10 @@ export function useSystemNotifications() {
         if (!eventStalledKeys.has(key)) base.stalled.set(key, entry);
       }
     }
-    const allSourcesHydrated = NOTIFY_CATEGORIES.every(
-      (kind) => sourceReady[kind],
+    const allEnabledSourcesHydrated = NOTIFY_CATEGORIES.every(
+      (kind) => !notifyCategories[kind] || sourceReady[kind],
     );
-    if (!allSourcesHydrated) {
+    if (!allEnabledSourcesHydrated) {
       // Keep ready categories' old baselines; newly arrived entries will be
       // compared once the unrelated source also becomes authoritative.
       return;
@@ -935,5 +997,8 @@ export function useSystemNotifications() {
     windowFocused,
     t,
     permissionState,
+    threads,
+    threadWorkspaceById,
+    threadKindById,
   ]);
 }

@@ -225,6 +225,8 @@ interface Store {
   threads: Thread[];
   /** Cumulative thread_id → workspace_id map across visited workspaces. */
   threadWorkspaceById: Record<number, number>;
+  /** Cumulative thread_id → kind map, including background workspace indexes. */
+  threadKindById: Record<number, string>;
   /** Bumps after each selectWorkspace finishes loading repos/threads. */
   workspaceLoadSeq: number;
   /** True while selectWorkspace is mid-fetch/reset for the active workspace. */
@@ -628,6 +630,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [repos, setRepos] = useState<RepoRef[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadWorkspaceById, setThreadWorkspaceById] = useState<Record<number, number>>({});
+  const [threadKindById, setThreadKindById] = useState<Record<number, string>>({});
   const [workspaceLoadSeq, setWorkspaceLoadSeq] = useState(0);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceRestoring, setWorkspaceRestoring] = useState(true);
@@ -644,6 +647,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       for (const th of list) {
         if (next[th.id] !== th.workspace_id) {
           next[th.id] = th.workspace_id;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    setThreadKindById((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const th of list) {
+        if (next[th.id] !== th.kind) {
+          next[th.id] = th.kind;
           changed = true;
         }
       }
@@ -1025,6 +1039,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             if (next[thread.id] === thread.workspace_id) continue;
             next[thread.id] = thread.workspace_id;
             changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+      setThreadKindById((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const list of threadLists) {
+          for (const thread of list) {
+            if (next[thread.id] !== thread.kind) {
+              next[thread.id] = thread.kind;
+              changed = true;
+            }
           }
         }
         return changed ? next : prev;
@@ -3503,6 +3530,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     repos,
     threads,
     threadWorkspaceById,
+    threadKindById,
     workspaceLoadSeq,
     workspaceLoading,
     workspaceRestoring,
