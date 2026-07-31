@@ -222,6 +222,8 @@ interface Store {
   workspaceLoadSeq: number;
   /** True while selectWorkspace is mid-fetch/reset for the active workspace. */
   workspaceLoading: boolean;
+  /** True only after the latest workspace selection committed repos and threads. */
+  workspaceLoadReady: boolean;
   directionsByThread: Record<number, Direction[]>;
   worktreesByDirection: Record<number, Worktree[]>;
 
@@ -619,6 +621,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [threadWorkspaceById, setThreadWorkspaceById] = useState<Record<number, number>>({});
   const [workspaceLoadSeq, setWorkspaceLoadSeq] = useState(0);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceLoadReady, setWorkspaceLoadReady] = useState(false);
   const workspaceLoadCountRef = useRef(0);
   const workspaceSelectionGenerationRef = useRef(0);
   const rememberThreads = useCallback((list: Thread[]) => {
@@ -678,6 +681,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const needsRefreshSeqRef = useRef(0);
   const needsRefreshInFlightRef = useRef<Promise<void> | null>(null);
   const needsRefreshPendingRef = useRef(false);
+  const needsRefreshTrailingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshNeedsRef = useRef<() => Promise<void>>(() => Promise.resolve());
   const [showNeeds, setShowNeeds] = useState(false);
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
@@ -997,6 +1002,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     workspaceLoadCountRef.current += 1;
     setActiveWorkspaceId(id);
     setWorkspaceLoading(true);
+    setWorkspaceLoadReady(false);
+    // Do not render the previous workspace's actionable rows under the new
+    // workspace while its authoritative Needs refresh is still pending.
+    setNeeds([]);
+    setWriteTriggers([]);
     setNotificationHydration((current) => ({
       ...current,
       workspaceId: id,
@@ -1038,10 +1048,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (current.workspaceId !== id) return current;
         return { ...current, overview: false };
       });
+      setWorkspaceLoadReady(true);
     } finally {
-      // Deep-link markers count every settled load, including a rejected
-      // listRepos/listThreads request, so a failed sibling cannot leave a
-      // pending click waiting for an impossible sequence number.
+      // Deep-link markers count every settled load. Route application separately
+      // checks workspaceLoadReady so a rejected load can never satisfy a route
+      // prerequisite with stale repos/threads.
       setWorkspaceLoadSeq((n) => n + 1);
       workspaceLoadCountRef.current -= 1;
       if (workspaceLoadCountRef.current === 0) setWorkspaceLoading(false);
@@ -1205,6 +1216,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
 
       setActiveWorkspaceId(null);
+      setWorkspaceLoadReady(false);
       setRepos([]);
       setThreads([]);
       setDirections({});
@@ -2461,29 +2473,40 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const scheduleTrailingNeedsRefresh = useCallback(() => {
+    if (needsRefreshTrailingTimerRef.current != null) return;
+    needsRefreshTrailingTimerRef.current = setTimeout(() => {
+      needsRefreshTrailingTimerRef.current = null;
+      // A caller may have started the trailing pass before this timer fired;
+      // that pass already represents the pending refresh.
+      if (needsRefreshInFlightRef.current != null) return;
+      void refreshNeedsRef.current().catch((error) => console.error(error));
+    }, 0);
+  }, []);
+
   const refreshNeeds = useCallback(async () => {
     const inFlight = needsRefreshInFlightRef.current;
     if (inFlight) {
+      // Coalesce callers onto the current pass, but let each waiter resolve
+      // when that bounded pass ends. A trailing pass is scheduled separately.
       needsRefreshPendingRef.current = true;
       await inFlight;
       return;
     }
-    const run = async () => {
-      do {
-        needsRefreshPendingRef.current = false;
-        await refreshNeedsOnce();
-      } while (needsRefreshPendingRef.current);
-    };
-    const current = run();
+    const current = refreshNeedsOnce();
     needsRefreshInFlightRef.current = current;
     try {
       await current;
     } finally {
-      if (needsRefreshInFlightRef.current === current) {
-        needsRefreshInFlightRef.current = null;
+      if (needsRefreshInFlightRef.current !== current) return;
+      needsRefreshInFlightRef.current = null;
+      if (needsRefreshPendingRef.current) {
+        needsRefreshPendingRef.current = false;
+        scheduleTrailingNeedsRefresh();
       }
     }
-  }, [refreshNeedsOnce]);
+  }, [refreshNeedsOnce, scheduleTrailingNeedsRefresh]);
+  refreshNeedsRef.current = refreshNeeds;
 
   const openNeeds = useCallback(() => {
     setViewing(null);
@@ -3135,6 +3158,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
   }, [activeWorkspaceId, refreshNeeds]);
 
+  useEffect(() => {
+    return () => {
+      if (needsRefreshTrailingTimerRef.current != null) {
+        clearTimeout(needsRefreshTrailingTimerRef.current);
+        needsRefreshTrailingTimerRef.current = null;
+      }
+    };
+  }, []);
+
   // Board overview poll: review transitions (and any status drift) stay fresh
   // even when the kanban is unmounted. 10s matches the previous notify hook.
   useEffect(() => {
@@ -3296,6 +3328,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     threadWorkspaceById,
     workspaceLoadSeq,
     workspaceLoading,
+    workspaceLoadReady,
     directionsByThread,
     worktreesByDirection,
     activeThreadId,

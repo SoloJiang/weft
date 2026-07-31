@@ -175,6 +175,20 @@ function putPendingNav(pending: PendingNav): void {
   }
 }
 
+/** Restore a deferred route only when a newer click has not replaced it. */
+function putPendingNavIfUnchanged(pending: PendingNav): void {
+  try {
+    const raw = sessionStorage.getItem(PENDING_NAV_KEY);
+    if (raw) {
+      const current = JSON.parse(raw) as PendingNav;
+      if (notifyOpenKey(current) !== notifyOpenKey(pending)) return;
+    }
+    sessionStorage.setItem(PENDING_NAV_KEY, JSON.stringify(pending));
+  } catch {
+    /* ignore malformed storage / private mode */
+  }
+}
+
 export async function applyNotifyIntents(
   payload: OsNotifyOpenEvent,
   deps: {
@@ -227,6 +241,8 @@ export async function handleNotifyOpen(
     activeWorkspaceId: number | null;
     workspaceLoadSeq: number;
     workspaceLoading?: boolean;
+    workspaceLoadReady?: boolean;
+    needsHydrated?: boolean;
   },
 ): Promise<void> {
   await focusMainWindow();
@@ -255,6 +271,25 @@ export async function handleNotifyOpen(
       });
       return;
     }
+  }
+  if (
+    deps.activeWorkspaceId != null &&
+    deps.workspaceLoadReady === false
+  ) {
+    stashPendingNav(payload, {
+      expectedLoadSeq: deps.workspaceLoadSeq + 1,
+    });
+    try {
+      await deps.selectWorkspace(deps.activeWorkspaceId);
+    } catch {
+      /* Keep the deferred route; a later successful load can apply it. */
+    }
+    return;
+  }
+  const needsIntent = intents.some((intent) => intent.type === "needs");
+  if (needsIntent && deps.needsHydrated === false) {
+    stashPendingNav(payload);
+    return;
   }
   // Global routes (quota and ownership-unknown Needs-you entries) also mutate
   // the current surface. A workspace reset that is already in flight would
@@ -313,12 +348,16 @@ export function useSystemNotifications() {
     threadWorkspaceById,
     workspaceLoadSeq,
     workspaceLoading,
+    workspaceLoadReady,
     selectWorkspace,
     goToDirectionRef,
     openNeeds,
     openSettings,
     openCurator,
   } = useStore();
+  const needsHydrated =
+    notificationHydration.workspaceId === activeWorkspaceId &&
+    notificationHydration.needs;
   const { t } = useTranslation();
   const prev = useRef<NotifySnapshot | null>(null);
   const baselineWs = useRef<number | null>(null);
@@ -406,6 +445,8 @@ export function useSystemNotifications() {
     activeWorkspaceId,
     workspaceLoadSeq,
     workspaceLoading,
+    workspaceLoadReady,
+    needsHydrated,
   });
   useEffect(() => {
     navDepsRef.current = {
@@ -417,6 +458,8 @@ export function useSystemNotifications() {
       activeWorkspaceId,
       workspaceLoadSeq,
       workspaceLoading,
+      workspaceLoadReady,
+      needsHydrated,
     };
   }, [
     selectWorkspace,
@@ -427,6 +470,8 @@ export function useSystemNotifications() {
     activeWorkspaceId,
     workspaceLoadSeq,
     workspaceLoading,
+    workspaceLoadReady,
+    needsHydrated,
   ]);
 
   useEffect(() => {
@@ -542,6 +587,12 @@ export function useSystemNotifications() {
       putPendingNav(pending);
       return;
     }
+    if (activeWorkspaceId != null && !workspaceLoadReady) {
+      // A failed workspace load must never be treated as a route prerequisite;
+      // leave the click pending until a later selection commits successfully.
+      putPendingNav(pending);
+      return;
+    }
     if (
       pending.expectedLoadSeq != null &&
       workspaceLoadSeq < pending.expectedLoadSeq
@@ -562,6 +613,15 @@ export function useSystemNotifications() {
       putPendingNav(pending);
       return;
     }
+    const needsIntent = planNotifyOpen(pending).some(
+      (intent) => intent.type === "needs",
+    );
+    if (needsIntent && !needsHydrated) {
+      // selectWorkspace clears the old workspace's Needs rows; wait until the
+      // target workspace has completed its authoritative Needs refresh.
+      putPendingNav(pending);
+      return;
+    }
     pendingApplyingKey.current = applicationKey;
     void applyNotifyIntents(pending, {
       goToDirectionRef,
@@ -575,7 +635,7 @@ export function useSystemNotifications() {
       },
       () => {
         pendingApplyingKey.current = null;
-        putPendingNav(pending);
+        putPendingNavIfUnchanged(pending);
         if (pendingNavRetryTimer.current == null) {
           pendingNavRetryTimer.current = setTimeout(() => {
             pendingNavRetryTimer.current = null;
@@ -588,6 +648,8 @@ export function useSystemNotifications() {
     activeWorkspaceId,
     workspaceLoadSeq,
     workspaceLoading,
+    workspaceLoadReady,
+    needsHydrated,
     goToDirectionRef,
     openNeeds,
     openSettings,
