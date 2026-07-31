@@ -15,6 +15,7 @@ import {
   planNotifyOpen,
   snapshotOf,
   type NotifyCategory,
+  type NotifyCategoryFlags,
   type NotifyRoute,
   type NotifySnapshot,
 } from "./notificationsCore";
@@ -806,7 +807,7 @@ export function useSystemNotifications() {
     if (workspaceLoading) return;
     const sourceReady: Record<NotifyCategory, boolean> = {
       needs: asksReady || workspaceNeedsReady,
-      review: notificationHydration.overview,
+      review: sourceWorkspaceMatches && notificationHydration.overview,
       // Lead-turn pushes and locally observed sessions are authoritative even
       // while the adopted-worker snapshot is retrying.
       stalled: sourceWorkspaceMatches,
@@ -939,30 +940,40 @@ export function useSystemNotifications() {
         if (!eventStalledKeys.has(key)) base.stalled.set(key, entry);
       }
     }
-    const allEnabledSourcesHydrated = NOTIFY_CATEGORIES.every(
-      (kind) => !notifyCategories[kind] || sourceReady[kind],
-    );
-    if (!allEnabledSourcesHydrated) {
-      // Keep ready categories' old baselines; newly arrived entries will be
-      // compared once the unrelated source also becomes authoritative.
-      return;
-    }
     const nextForDiff = {
       ...next,
       needs: new Map(
         [...next.needs].filter(([key]) => isNeedsKeyReady(key)),
       ),
     };
-    const events = diffForNotifications(base, nextForDiff, notifyCategories);
-    // Advance every category before the foreground/quiet-hours gate, preserving
-    // the existing behavior that suppressed events are not replayed later.
+    // Diff each authoritative source independently. A slow or failed overview
+    // request must not suppress Needs, stalled, or quota notifications whose
+    // sources are already ready. Unready categories keep their previous
+    // snapshot until their own source becomes authoritative.
+    const diffCategories: NotifyCategoryFlags = {
+      needs: notifyCategories.needs && sourceReady.needs,
+      review: notifyCategories.review && sourceReady.review,
+      stalled: notifyCategories.stalled && sourceReady.stalled,
+      quota: notifyCategories.quota && sourceReady.quota,
+    };
+    const events = diffForNotifications(base, nextForDiff, diffCategories);
+    // Advance ready categories before the foreground/quiet-hours gate,
+    // preserving the existing behavior that suppressed events are not replayed
+    // later while leaving unready categories untouched.
     const baselineNeeds = new Map(
       [...base.needs].filter(([key]) => !isNeedsKeyReady(key)),
     );
     for (const [key, entry] of next.needs) {
       if (isNeedsKeyReady(key)) baselineNeeds.set(key, entry);
     }
-    prev.current = { ...next, needs: baselineNeeds };
+    const advanced: NotifySnapshot = { ...base };
+    for (const kind of NOTIFY_CATEGORIES) {
+      if (!sourceReady[kind]) continue;
+      advanced[kind] = kind === "needs"
+        ? baselineNeeds
+        : new Map(next[kind]);
+    }
+    prev.current = advanced;
     if (!notifyEnabled || permissionState !== "granted") return;
     if (
       isAppInForeground({

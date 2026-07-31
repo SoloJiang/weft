@@ -672,6 +672,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [directionsByThread, setDirections] = useState<Record<number, Direction[]>>({});
   const [worktreesByDirection, setWorktrees] = useState<Record<number, Worktree[]>>({});
   const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
+  // Invalidates proposal loads started by an older selection. Notification
+  // navigation can await getProposal while a user manually selects another
+  // thread; the late response must not overwrite the new thread's proposal.
+  const threadSelectionGenerationRef = useRef(0);
   // Live mirror so async tasks can check the CURRENT active thread instead of
   // the stale one captured when they started (mirrors activeWorkspaceIdRef).
   const activeThreadIdRef = useRef(activeThreadId);
@@ -1182,6 +1186,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const selectThread = useCallback(
     async (threadId: number) => {
+      const selectionGeneration = ++threadSelectionGenerationRef.current;
       setActiveThreadId(threadId);
       setViewing(null);
       setShowNeeds(false);
@@ -1190,9 +1195,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setShowBus(false);
       setReviewingProposal(false);
       try {
-        setProposal(await api.getProposal(threadId));
+        const nextProposal = await api.getProposal(threadId);
+        if (selectionGeneration !== threadSelectionGenerationRef.current) return;
+        setProposal(nextProposal);
       } catch (e) {
-        setProposal(null);
+        if (selectionGeneration === threadSelectionGenerationRef.current) {
+          setProposal(null);
+        }
       }
       await loadThreadChildren(threadId);
     },
@@ -3400,7 +3409,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Board overview poll: review transitions (and any status drift) stay fresh
   // even when the kanban is unmounted. 10s matches the previous notify hook.
   useEffect(() => {
-    if (activeWorkspaceId == null) return;
+    if (activeWorkspaceId == null || !notifyEnabled || !notifyCategories.review) {
+      return;
+    }
     let alive = true;
     const tick = () => {
       if (alive) void refreshOverview();
@@ -3411,7 +3422,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       alive = false;
       clearInterval(h);
     };
-  }, [activeWorkspaceId, refreshOverview]);
+  }, [activeWorkspaceId, notifyEnabled, notifyCategories.review, refreshOverview]);
 
 
   // Live-refresh the repo map when the curator calibrates an edge (or the auto
