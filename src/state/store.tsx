@@ -832,6 +832,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [processQuota, setProcessQuota] = useState<ProcessQuotaStatus | null>(null);
   const processQuotaRef = useRef<ProcessQuotaStatus | null>(null);
   const processQuotaObservedRef = useRef<ProcessQuotaStatus | null>(null);
+  const processQuotaFirstPushRef = useRef<ProcessQuotaStatus | null>(null);
   const processQuotaHydratedRef = useRef(false);
   const applyProcessQuota = useCallback((next: ProcessQuotaStatus) => {
     const previous = processQuotaRef.current;
@@ -848,13 +849,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const refreshProcessQuota = useCallback(async () => {
     try {
       const next = await api.processQuotaStatus();
+      const firstPush = processQuotaFirstPushRef.current;
+      const firstPushAdvancedBeyondRead =
+        firstPush !== null &&
+        (firstPush.transitionSeq > next.transitionSeq ||
+          (firstPush.transitionSeq === next.transitionSeq &&
+            firstPush.status !== next.status));
       applyProcessQuota(next);
       const observed = processQuotaObservedRef.current;
       if (observed === null || shouldApplyProcessQuotaStatus(observed, next)) {
         processQuotaObservedRef.current = next;
       }
+      processQuotaFirstPushRef.current = null;
       processQuotaHydratedRef.current = true;
-      setNotificationHydration((current) => ({ ...current, quota: true }));
+      setNotificationHydration((current) => ({
+        ...current,
+        quota: true,
+        quotaPushPending: current.quotaPushPending || firstPushAdvancedBeyondRead,
+      }));
     } catch (error) {
       // Pure Vite dev and an older backend do not expose the governor command.
       if (import.meta.env.DEV) console.error(error);
@@ -865,6 +877,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const previous = processQuotaObservedRef.current;
       const isNewTransition =
         previous !== null && event.payload.transitionSeq > previous.transitionSeq;
+      if (previous === null) {
+        processQuotaFirstPushRef.current ??= event.payload;
+      }
       if (
         previous === null ||
         shouldApplyProcessQuotaStatus(previous, event.payload)
