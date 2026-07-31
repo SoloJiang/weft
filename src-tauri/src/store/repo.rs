@@ -3901,8 +3901,22 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
     }
 }
 
+/// A [`parse_remote_host_and_path`] result.
+struct RemoteHostPath {
+    host: String,
+    path: String,
+    /// The remote's OWN explicit port, but ONLY when it came from a web transport scheme
+    /// (`https://`/`http://`) — the ONE case where it is meaningfully comparable to
+    /// `host_base`'s own port (see [`remote_matches_pr_host`]'s doc). `None` for `ssh://`,
+    /// scp-style (`user@host:path`), and bare `host:path` (no `://` at all) — a port on any
+    /// of those is (or would be) an SSH port, unrelated to the API's own port — and `None`
+    /// when no port was written at all, web transport or not.
+    comparable_port: Option<String>,
+}
+
 /// Split a git remote URL into (bare lowercase host, lowercase repo path —
-/// leading/trailing slashes and a trailing `.git` stripped), or `None` when
+/// leading/trailing slashes and a trailing `.git` stripped, plus a comparable port when
+/// the transport is one where that's meaningful), or `None` when
 /// the shape isn't one of the three this codebase's remotes actually take:
 /// `scheme://[user@]host[:port]/path` (https/ssh), `[user@]host:path`
 /// (scp-style, e.g. `git@github.com:owner/repo.git`), or a bare `host:path`.
@@ -3911,28 +3925,39 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
 /// against a SEPARATELY-recorded host/owner/repo triple) and not a
 /// substring/suffix scan (see [`remote_matches_pr_host`]'s doc for why the
 /// latter is unsafe here).
-fn parse_remote_host_and_path(remote_url: &str) -> Option<(String, String)> {
+fn parse_remote_host_and_path(remote_url: &str) -> Option<RemoteHostPath> {
     let no_slash = remote_url.trim().trim_end_matches('/');
     let without_git = no_slash.strip_suffix(".git").unwrap_or(no_slash);
-    let (authority, path) = if let Some(pos) = without_git.find("://") {
+    let (scheme, authority, path) = if let Some(pos) = without_git.find("://") {
         let rest = &without_git[pos + 3..];
-        match rest.find('/') {
+        let (authority, path) = match rest.find('/') {
             Some(s) => (&rest[..s], &rest[s + 1..]),
             None => (rest, ""),
-        }
+        };
+        (Some(&without_git[..pos]), authority, path)
     } else if let Some(colon) = without_git.find(':') {
-        (&without_git[..colon], &without_git[colon + 1..])
+        (None, &without_git[..colon], &without_git[colon + 1..])
     } else {
         return None;
     };
-    // Strip `user@` (userinfo) then `:port`, in that order, to reach the bare host.
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.split(':').next().unwrap_or(host);
+    // Strip `user@` (userinfo) to reach the bare host[:port].
+    let host_maybe_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host_maybe_port.split(':').next().unwrap_or(host_maybe_port);
     let path = path.trim_matches('/');
     if host.is_empty() || path.is_empty() {
         return None;
     }
-    Some((host.to_lowercase(), path.to_lowercase()))
+    let comparable_port = match scheme.map(str::to_lowercase).as_deref() {
+        Some("https") | Some("http") => {
+            host_maybe_port.rsplit_once(':').map(|(_, port)| port.to_string())
+        }
+        _ => None,
+    };
+    Some(RemoteHostPath {
+        host: host.to_lowercase(),
+        path: path.to_lowercase(),
+        comparable_port,
+    })
 }
 
 /// Does `remote_url` (any git remote URL string — `live_default_branch_for_repo`
@@ -3964,17 +3989,31 @@ fn parse_remote_host_and_path(remote_url: &str) -> Option<(String, String)> {
 /// unreachable — `HostKind::parse`/`resolve_host` have no GitLab backend yet —
 /// but fixed here alongside the GitHub case since the root cause is shared).
 ///
-/// Both sides compare WITHOUT a port (a third review round caught the
+/// Host and path compare WITHOUT a port (a third review round caught the
 /// asymmetry: `parse_remote_host_and_path` already strips the remote's port,
 /// but `host_base` — which for a self-hosted install can read like
 /// `git.internal:8443` — was compared as-is, so even a genuinely matching
 /// host on a non-standard port always failed). Stripping it from BOTH sides
-/// rather than requiring an exact port match on either is deliberate: SSH and
-/// HTTPS remotes for the SAME repo commonly use DIFFERENT ports (22 vs. a
-/// custom HTTPS port), and `host_base` names the API host, not any one
-/// transport's port — the hostname alone is the repo identity this check
-/// exists to verify; a port mismatch between two legitimate access paths to
-/// the same host must not read as "different repo."
+/// rather than requiring an exact port match on either is deliberate there:
+/// SSH and HTTPS remotes for the SAME repo commonly use DIFFERENT ports (22
+/// vs. a custom HTTPS port), and an ssh:// port is unrelated to `host_base`'s
+/// own API port — the hostname alone is enough for THAT comparison.
+///
+/// But an unconditional strip went too far (a fourth review round, Codex
+/// review PR #159 repo.rs:3990): TWO DIFFERENT web-facing forge instances on
+/// the SAME hostname but DIFFERENT HTTPS ports would also match, since both
+/// sides' ports were discarded entirely rather than compared. The port DOES
+/// matter when it is unambiguously comparable — an `https://`/`http://`
+/// remote's own port against `host_base`'s (see [`parse_remote_host_and_path`]'s
+/// `comparable_port` — `None` for ssh:///scp-style/bare, exactly the shapes the
+/// third round's fix was protecting). So: reject ONLY when BOTH sides carry an
+/// EXPLICIT web-transport port and they DIFFER; an unspecified port on either
+/// side is not itself a rejection signal (a plain `https://host/path` with no
+/// port and a `host_base` of `host:8443` are not distinguishable from "the
+/// same install, the git remote just didn't spell out the standard-looking
+/// port" — forcing an exact match there would trade a narrow false-accept for
+/// a broader false-reject, the wrong direction for a check whose job is to
+/// FREE a merge determination, not to gate one).
 fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, host_repo: &str) -> bool {
     let host_base = host_base.trim();
     let host_owner = host_owner.trim();
@@ -3982,12 +4021,19 @@ fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, h
     if host_base.is_empty() || host_owner.is_empty() || host_repo.is_empty() {
         return false;
     }
-    let Some((host, path)) = parse_remote_host_and_path(remote_url) else {
+    let Some(remote) = parse_remote_host_and_path(remote_url) else {
         return false;
     };
     let expected_host = host_base.split(':').next().unwrap_or(host_base).to_lowercase();
     let expected_path = format!("{}/{}", host_owner.to_lowercase(), host_repo.to_lowercase());
-    host == expected_host && path == expected_path
+    if remote.host != expected_host || remote.path != expected_path {
+        return false;
+    }
+    let expected_port = host_base.split(':').nth(1);
+    match (&remote.comparable_port, expected_port) {
+        (Some(remote_port), Some(expected_port)) => remote_port == expected_port,
+        _ => true,
+    }
 }
 
 /// Whether EVERY given `prs` genuinely reached the live default branch of the repo behind
@@ -4008,19 +4054,29 @@ fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, h
 /// SAME `spawn_blocking` closure closes the gap: both operations see the
 /// identical state, with no window for it to change in between.
 ///
-/// A PR counts as landed when its recorded `base_ref` equals the live default branch's NAME
-/// (the common, fast case) OR — Codex review, PR #159 repo.rs:3892 — when its `head_sha` is an
-/// ANCESTOR of the live default branch's current tip. The name check alone breaks the moment a
-/// repo renames its default branch AFTER a producer's PR already merged into the OLD name: the
-/// PR's `base_ref` is a historical snapshot that correctly never gets rewritten, so it would
-/// stay e.g. "main" forever even once the SAME commits are reachable from the renamed "trunk" —
-/// blocking every consumer indefinitely on a name that no longer exists, even though the work
-/// genuinely landed. The ancestry fallback uses ONLY what this checkout already has locally
-/// cached (`git merge-base --is-ancestor`, a purely local operation, never a new fetch on this
-/// hot per-sweep path) — best-effort, not a new required network dependency: whenever the
-/// checkout hasn't fetched the renamed branch since the rename, this simply can't confirm it
-/// and the PR falls back to the name check (unresolved either way, same honest `Pending` as
-/// before this fallback existed) rather than erroring or blocking the whole function.
+/// A PR counts as landed when its recorded `base_ref` equals the live default branch's NAME —
+/// nothing more clever than that. A prior round (Codex review, PR #159 repo.rs:3892) added a
+/// commit-ancestry fallback here (`head_sha` an ANCESTOR of the live default branch's tip) to
+/// close a real liveness gap: a repo renaming its default branch AFTER a producer's PR already
+/// merged into the OLD name would otherwise block every consumer on a name that no longer
+/// exists, forever. That fallback was REMOVED again one round later (Codex review, PR #159
+/// repo.rs:4088) once it turned out to be dead weight for this product's OWN dominant merge
+/// path: `host::automerge::run_gh_merge` always squash-merges (see its doc — matches this
+/// repo's own convention), and a squash merge's resulting commit on the default branch is a
+/// NEW commit GitHub creates, not a descendant of `head_sha` at all — so for any producer PR
+/// landed by Weft's own auto-merge (plausibly the single most common way an in-flight T4
+/// producer actually merges), the ancestry check could NEVER succeed, rename or not. What was
+/// left after that was a mechanism that only theoretically helps the narrowing intersection of
+/// "the repo was renamed" AND "the producer was merged by something other than this product's
+/// own auto-merge" — real but doubly rare, and NOT worth the schema/API surface a genuine fix
+/// would need (GitHub's actual merge-commit OID is a different field than `head_sha`, not
+/// currently fetched or stored anywhere in this codebase — tracking it would mean a new
+/// migration and a new GraphQL field for a shrinking payoff). Removing this only ever makes
+/// MORE cases correctly fall through to `Pending` (never fewer) — a human who hits the
+/// (rare, now-again-unclosed) renamed-branch case still sees the same honest "hasn't merged
+/// yet" notice as any other Pending upstream, and can investigate; that is a visible, human-
+/// recoverable liveness gap, not a silent one, and strictly safer than the alternative of
+/// deepening this mechanism to chase an increasingly narrow edge case.
 ///
 /// Every `prs` row must share the SAME host identity as `prs[0]` (Codex review, PR #159,
 /// post-round-6 pass: "verify every PR's target repository separately"): `register_pr_tool`
@@ -4081,12 +4137,7 @@ async fn all_prs_landed_on_live_default_branch(
             return None;
         }
         let default_branch = crate::git::live_default_branch(&path)?;
-        let origin_default = format!("origin/{default_branch}");
-        Some(prs.iter().all(|p| {
-            p.base_ref.trim() == default_branch
-                || (!p.head_sha.trim().is_empty()
-                    && crate::git::is_ancestor(&path, p.head_sha.trim(), &origin_default))
-        }))
+        Some(prs.iter().all(|p| p.base_ref.trim() == default_branch))
     })
     .await
     .ok()
@@ -8152,17 +8203,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// THE FIX (Codex review, PR #159 repo.rs:3892): a repo can rename its default branch
-    /// (`main` → `trunk`) AFTER a producer's PR already merged into the OLD name. The PR's
-    /// recorded `base_ref` is a historical snapshot that correctly never gets rewritten, so a
-    /// bare NAME comparison against the NEW live default branch would block the consumer
-    /// FOREVER even though the exact same commit is still reachable from the renamed default
-    /// branch's current tip. Falls back to a commit-ancestry check using whatever the local
-    /// clone already has cached (here, after a real `git fetch`, mirroring what an actively-
-    /// used Weft repo routinely does elsewhere for other directions) — no new network
-    /// dependency added to this path by the fix itself.
+    /// A repo can rename its default branch (`main` → `trunk`) AFTER a producer's PR already
+    /// merged into the OLD name. A prior round (Codex review, PR #159 repo.rs:3892) added a
+    /// commit-ancestry fallback specifically to still release the consumer in this situation —
+    /// and a LATER round (Codex review, PR #159 repo.rs:4088) removed it again: this product's
+    /// own `host::automerge::run_gh_merge` always squash-merges, so for any producer PR landed
+    /// by Weft's own auto-merge the ancestry check could never succeed anyway (a squash's
+    /// resulting commit is a NEW one GitHub creates, not a descendant of `head_sha`) — the
+    /// fallback was dead weight for this product's dominant merge path, not worth the
+    /// migration a real fix would need for a shrinking payoff (see `all_prs_landed_on_live_
+    /// default_branch`'s doc for the full reasoning). This test pins the CURRENT, reverted
+    /// behavior: even when the underlying commit genuinely IS reachable from the renamed
+    /// branch's tip (a TRUE rename via `git branch -m`, preserving history, not a fixture
+    /// trick), a bare NAME comparison against the new name must NOT optimistically read
+    /// `Merged` — this is now a plain, visible, human-recoverable `Pending`, same as any other
+    /// base_ref mismatch.
     #[tokio::test]
-    async fn a_merged_pr_whose_base_branch_was_later_renamed_still_releases_the_consumer() {
+    async fn a_merged_pr_whose_base_branch_was_later_renamed_stays_pending_not_merged() {
         let db = mem().await;
         let root = std::env::temp_dir()
             .join(format!("weft-upstream-renamed-default-{}", std::process::id()));
@@ -8176,8 +8233,8 @@ mod tests {
         let merged_sha = sh_out(&clone_path, &["git", "rev-parse", "HEAD"]);
 
         // The origin repo renames its default branch AFTER the PR above already merged into
-        // "main". The local checkout fetches — as an actively-used Weft repo routinely would
-        // for OTHER directions sharing this same repo_ref — and now has `origin/trunk` cached.
+        // "main". The local checkout fetches — proving this stays Pending even when the
+        // renamed branch's ancestry IS resolvable locally, not merely when it isn't.
         sh(&origin_abs, &["git", "branch", "-m", "main", "trunk"]);
         sh(&clone_path, &["git", "fetch", "-q", "origin"]);
 
@@ -8197,62 +8254,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            upstream_merge_state(&db, consumer).await,
-            crate::host::UpstreamStatus::Merged,
-            "the PR's commit is still reachable from the renamed default branch's tip — a bare \
-             base_ref NAME comparison against the NEW name (\"trunk\") must not block this \
-             forever just because the repo renamed its default branch after the PR merged"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A repo that renamed its default branch, where the local checkout has NOT fetched since
-    /// (so it has no way to confirm ancestry) must still fail closed to `Pending`, not crash
-    /// and not optimistically guess `Merged` — the ancestry fallback is best-effort, never a
-    /// hard requirement this function could get stuck on.
-    #[tokio::test]
-    async fn a_renamed_default_branch_the_local_clone_has_not_fetched_stays_pending_not_merged() {
-        let db = mem().await;
-        let root = std::env::temp_dir()
-            .join(format!("weft-upstream-renamed-unfetched-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let (origin_abs, host_owner, host_repo) = make_bare_repo(&root, "origin", "main");
-        let clone_path = root.join("clone");
-        sh(&root, &["git", "clone", "-q", &file_url(&origin_abs), clone_path.to_str().unwrap()]);
-        sh(&clone_path, &["git", "config", "user.email", "t@t.t"]);
-        sh(&clone_path, &["git", "config", "user.name", "t"]);
-        let merged_sha = sh_out(&clone_path, &["git", "rev-parse", "HEAD"]);
-
-        // Rename, but DELIBERATELY skip the fetch this time — the clone has no local knowledge
-        // of "trunk" (or that "main" is gone) at all.
-        sh(&origin_abs, &["git", "branch", "-m", "main", "trunk"]);
-
-        let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
-        let pr = register_open_pr_at(&db, producer, 1, "localhost", &host_owner, &host_repo).await;
-        let snapshot = crate::host::PrSnapshot {
-            head_sha: merged_sha,
-            base_ref: "main".into(),
-            url: String::new(),
-            title: String::new(),
-            lifecycle: crate::host::PrLifecycle::Merged,
-            ci: crate::host::CiStatus::Passing,
-            review: crate::host::ReviewStatus::Approved,
-            conflict: crate::host::ConflictStatus::Clean,
-        };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
-            .await
-            .unwrap();
-
         assert!(
             matches!(
                 upstream_merge_state(&db, consumer).await,
                 crate::host::UpstreamStatus::Pending { .. }
             ),
-            "without a local `origin/trunk` to check ancestry against, this must stay the same \
-             honest Pending it already was — never crash, and never guess Merged"
+            "a renamed default branch is a plain base_ref mismatch now — no ancestry fallback \
+             to optimistically rescue it, even though the commit genuinely is reachable from \
+             the renamed branch's tip"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -8591,6 +8600,37 @@ mod tests {
             assert!(!remote_matches_pr_host(
                 "https://evil.example:8443/acme/api.git",
                 "git.internal:8443",
+                "acme",
+                "api"
+            ));
+        }
+
+        /// THE FIX (Codex review, PR #159 repo.rs:3990): the round-3 port fix above stripped
+        /// BOTH sides' ports UNCONDITIONALLY to let a legitimate ssh-vs-https port difference
+        /// through — but that also let two DIFFERENT https forge instances on the SAME
+        /// hostname match each other just because their ports both got discarded. A near-miss
+        /// on purpose, matching this test module's own convention: same host, same owner/repo
+        /// path — only the HTTPS port differs — not two unrelated hosts (already covered by
+        /// `rejects_a_different_host_that_happens_to_share_a_port`, a different axis).
+        #[test]
+        fn rejects_a_different_https_port_on_the_same_hostname_even_with_matching_owner_and_repo() {
+            assert!(!remote_matches_pr_host(
+                "https://gitlab.corp:9443/acme/api.git",
+                "gitlab.corp:8443",
+                "acme",
+                "api"
+            ));
+        }
+
+        /// The port fix above must not overcorrect into rejecting a remote that simply omits
+        /// an explicit port — only a port that IS written down and DISAGREES is a rejection
+        /// signal; an absent one is not distinguishable from "the same install, this remote
+        /// just didn't spell out the port."
+        #[test]
+        fn accepts_an_https_remote_with_no_explicit_port_even_when_host_base_records_one() {
+            assert!(remote_matches_pr_host(
+                "https://gitlab.corp/acme/api.git",
+                "gitlab.corp:8443",
                 "acme",
                 "api"
             ));

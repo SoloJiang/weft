@@ -419,6 +419,41 @@ async fn evaluate_row(
     if final_decision != AutoMergeDecision::Merge {
         return RowVerdict::Skip; // downgraded since the pre-filter — silent, like any other skip
     }
+
+    // Test-only seam: let a test pause HERE — between the upstream read this authorization
+    // was based on (above) and the re-check immediately below — to drive a genuinely
+    // concurrent write from a separate task. See `tests::between_upstream_authorization_probe`.
+    #[cfg(test)]
+    tests::between_upstream_authorization_probe(pr.direction_id).await;
+
+    // Step 5.5: re-check the upstream axis ONE more time, as close to the actual merge call as
+    // this function can get — Codex review, PR #159 automerge.rs:395. Unlike CI/review/
+    // conflict, GitHub has no concept of this product's own cross-repo dependency ordering to
+    // enforce server-side: `--match-head-commit` (step 6, in `maybe_merge_one`) only guards the
+    // PR's OWN head commit moving, never this LOCAL fact. Without this, a re-proposal that
+    // adds or replaces this consumer's dependency in the window between the read above and
+    // `run_gh_merge` actually executing would merge a consumer whose upstream just changed,
+    // with no backstop at all — CI/review/conflict staleness in that same window is at least
+    // partly covered by GitHub's OWN branch-protection enforcement, but this axis is purely a
+    // Weft-side invariant that only Weft can protect. This is INTENTIONALLY separate from (and
+    // does not touch) `record_upstream_edges`'s two-pass write-ordering mechanism (round 5+6):
+    // that solves DB write atomicity for a multi-edge write; this is a read-authorize-execute
+    // TOCTOU window on this file's OWN side, and re-reading the SAME already-atomic source of
+    // truth closer to the action is sufficient — no new lock or generation counter needed, and
+    // none of that machinery would help here anyway (it does not extend the window this file's
+    // own control flow takes to reach `run_gh_merge`).
+    match repo::upstream_merge_state(db, pr.direction_id).await {
+        super::UpstreamStatus::None | super::UpstreamStatus::Merged => {}
+        other => {
+            eprintln!(
+                "[weft][automerge] pr #{}: upstream changed to {other:?} after authorization — \
+                 aborting this merge attempt",
+                pr.id
+            );
+            return RowVerdict::Skip;
+        }
+    }
+
     RowVerdict::Merge { head_sha: snapshot.head_sha }
 }
 
@@ -1001,6 +1036,49 @@ mod tests {
         })))
     }
 
+    /// Test-only seam (mirrors `planner::tests::between_upstream_passes_probe`): lets a test
+    /// PAUSE `evaluate_row` exactly between its FIRST upstream read (step 4) and its re-check
+    /// (step 5.5) — the same window a concurrent re-proposal could land in (Codex review, PR
+    /// #159 automerge.rs:395) — write a NEW dependency onto `direction_id` from a SEPARATE
+    /// task, then release it. `arm_between_upstream_authorization_probe(direction_id)` returns
+    /// `(reached_rx, resume_tx)`: `reached_rx` resolves once the probe is hit, and sending on
+    /// `resume_tx` lets `evaluate_row` continue into its re-check. A no-op (never blocks) for
+    /// any direction_id that wasn't armed.
+    #[allow(clippy::type_complexity)]
+    fn between_upstream_authorization_map() -> &'static std::sync::Mutex<
+        std::collections::HashMap<i32, (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+    > {
+        static M: std::sync::OnceLock<
+            std::sync::Mutex<
+                std::collections::HashMap<i32, (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+            >,
+        > = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn arm_between_upstream_authorization_probe(
+        direction_id: i32,
+    ) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        between_upstream_authorization_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(direction_id, (reached_tx, resume_rx));
+        (reached_rx, resume_tx)
+    }
+
+    pub(super) async fn between_upstream_authorization_probe(direction_id: i32) {
+        let armed = between_upstream_authorization_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&direction_id);
+        if let Some((reached_tx, resume_rx)) = armed {
+            let _ = reached_tx.send(());
+            let _ = resume_rx.await;
+        }
+    }
+
     /// A tracked row whose STORED state is fully ready (`pre_decision` —
     /// step 1 — reads `Merge`) and the opt-in switch is on — the exact
     /// precondition every test above needs, isolated here once. Deliberately
@@ -1097,6 +1175,66 @@ mod tests {
         let verdict = evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_fully_ready).await;
 
         assert_eq!(verdict, RowVerdict::Merge { head_sha: "fresh_sha_fully_ready".to_string() });
+    }
+
+    /// THE FIX (Codex review, PR #159 automerge.rs:395): between `evaluate_row`'s upstream
+    /// read (step 4) and its FINAL authorization, a re-proposal could add or replace this
+    /// consumer's dependency — `--match-head-commit` (step 6, in `maybe_merge_one`) only
+    /// guards the PR's OWN head commit moving, never this LOCAL ordering fact, so an already-
+    /// authorized sweep would otherwise merge a consumer whose upstream just changed, with no
+    /// backstop at all. Pauses `evaluate_row` exactly in that window (`between_upstream_
+    /// authorization_probe`, mirroring `planner::tests::between_upstream_passes_probe`'s exact
+    /// pattern) and drives a genuinely concurrent write — `repo::set_direction_upstream`, the
+    /// same primitive `record_upstream_edges` itself calls — from a separately spawned task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evaluate_row_aborts_when_a_dependency_is_added_after_authorization_but_before_the_recheck() {
+        let tag = format!("weft-automerge-upstream-race-{}", std::process::id());
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&weft_home).unwrap();
+        // File-backed (not :memory:) DB, same reason as `planner::tests::thread_gate_
+        // serializes_concurrent_confirms`: the cloned pool handle in the spawned task must see
+        // the SAME store as the test's own concurrent write.
+        let db_file = weft_home.join("automerge-race.sqlite");
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", db_file.to_str().unwrap()))
+            .await
+            .unwrap();
+        let pr = seam_fixture(&db).await; // dependency-free, everything else Ready
+        let consumer_direction_id = pr.direction_id;
+        // A real, undecided producer to attach as the race's dependency.
+        let thread = repo::get_thread(&db, pr.thread_id).await.unwrap().unwrap();
+        let repo_ref = repo::get_repo(&db, pr.repo_id).await.unwrap().unwrap();
+        let producer = repo::create_direction(
+            &db, thread.id, "producer", "codex", repo_ref.id, "why", "impl-only", "",
+        )
+        .await
+        .unwrap();
+        let backoff = MergeBackoffState::default();
+
+        let (reached_rx, resume_tx) = tests::arm_between_upstream_authorization_probe(consumer_direction_id);
+        let db2 = db.clone();
+        let pr2 = pr.clone();
+        let backoff2 = backoff.clone();
+        let evaluate_handle = tokio::spawn(async move {
+            evaluate_row(&db2, &pr2, HostKind::GitHub, &backoff2, resolver_fresh_fully_ready).await
+        });
+
+        // Wait for evaluate_row to reach the gap between its upstream read and its re-check,
+        // then — WHILE it is still paused there — add a real dependency from a separate task,
+        // the same write `record_upstream_edges` itself performs.
+        reached_rx.await.expect("evaluate_row reached the between-authorization probe");
+        repo::set_direction_upstream(&db, consumer_direction_id, producer.id).await.unwrap();
+        let _ = resume_tx.send(());
+
+        let verdict = evaluate_handle.await.unwrap();
+        assert_eq!(
+            verdict,
+            RowVerdict::Skip,
+            "a dependency added between authorization and the re-check must abort this merge \
+             attempt, not silently proceed on the stale (dependency-free) read"
+        );
+
+        let _ = std::fs::remove_dir_all(&weft_home);
     }
 
     #[tokio::test]
