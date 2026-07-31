@@ -1588,19 +1588,41 @@ async fn record_upstream_edges(db: &Db, thread_id: i32, lanes: &[UpstreamLane]) 
     // `set_direction_upstream`'s cycle walk correctly (if unhelpfully, for a same-batch
     // artifact) sees that as a genuine cycle and rejects the write, silently leaving B's real
     // new dependency stuck at 0 — allowing it to merge before A (Codex review, PR #159
-    // planner.rs:1570). Clearing to 0 can never itself trip the cycle check (`creates_cycle`
-    // dead-ends at 0 immediately), so this pass is unconditionally safe; only touching lanes
-    // whose target is ACTUALLY different from their current value (not every lane in the
+    // planner.rs:1570).
+    //
+    // Clears to `UNRESOLVED_UPSTREAM_SENTINEL`, NOT `0` (Codex review, PR #159
+    // planner.rs:1600, a follow-up round on this same fix): this function's two passes are two
+    // SEPARATE, non-transactional awaited writes, with no lock held across the gap between
+    // them — `host::automerge`/`host::monitor` run on their own independent sweep loop and can
+    // read this row at any point, including exactly between pass 1 and pass 2. A REPLACED
+    // dependency (a reused direction whose old real edge is swapped for a different real one,
+    // not merely cleared to empty) is the one case pass 1 actually writes something for; if
+    // that write were `0`, a sweep landing in the gap would read `UpstreamStatus::None` — "no
+    // upstream, free to merge" — genuinely true of the DB row at that instant, and could
+    // release a PR whose stored other-axis state was already cached `Ready`, before pass 2 has
+    // installed the real new producer. The sentinel closes that: `creates_cycle`'s walk
+    // dead-ends on it exactly like it does on `0` (a sentinel is never a real row's id — see
+    // `set_direction_upstream`'s doc), so it is EQUALLY safe against a false cycle rejection in
+    // pass 2, but a sweep reading it mid-transition sees `UpstreamStatus::Unknown` (blocking),
+    // never `None` (releasing) — the same fail-closed answer `UNRESOLVED_UPSTREAM_SENTINEL`
+    // already gives for "not resolved yet" everywhere else in this function. Only touching
+    // lanes whose target is ACTUALLY different from their current value (not every lane in the
     // batch) keeps the common case — most decisions touch no `depends_on` at all, and most
     // existing edges aren't changing — at zero extra writes, and avoids a lane that ISN'T
-    // changing ever transiently reading 0 ("no upstream, free to merge") between the passes.
+    // changing ever transiently reading anything but its own already-correct value.
     for &(direction_id, target) in &targets {
         if let Ok(Some(dir)) = repo::get_direction(db, direction_id).await {
             if dir.depends_on_direction_id != 0 && dir.depends_on_direction_id != target {
-                set_upstream_edge_if_changed(db, thread_id, direction_id, 0).await;
+                set_upstream_edge_if_changed(db, thread_id, direction_id, repo::UNRESOLVED_UPSTREAM_SENTINEL).await;
             }
         }
     }
+
+    // Test-only seam: let a test pause HERE — exactly the window a concurrently running
+    // automerge/monitor sweep could land in — read DB state from a separate task, then release
+    // it. See `tests::between_upstream_passes_probe`.
+    #[cfg(test)]
+    tests::between_upstream_passes_probe(thread_id).await;
 
     // PASS 2 — apply every real target now that no stale edge from this same batch can still
     // be in the way of a legitimate reversal.
@@ -2527,6 +2549,49 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(thread_id, (new_proposal_json.to_string(), new_status.to_string()));
+    }
+
+    /// Test-only seam (mirrors `approve_persist_gate`/`confirm_cas_gate`): lets a test PAUSE
+    /// `record_upstream_edges` exactly between its two passes — the same window a concurrently
+    /// running automerge/monitor sweep could land in (Codex review, PR #159 planner.rs:1600) —
+    /// read DB state from a SEPARATE task while paused, then release it. `arm_between_
+    /// upstream_passes_probe(thread_id)` returns `(reached_rx, resume_tx)`: `reached_rx`
+    /// resolves once the probe is hit, and sending on `resume_tx` lets `record_upstream_edges`
+    /// continue into pass 2. A no-op (never blocks) for any thread_id that wasn't armed — every
+    /// other test that reaches this function is unaffected.
+    #[allow(clippy::type_complexity)]
+    fn between_upstream_passes_map() -> &'static std::sync::Mutex<
+        std::collections::HashMap<i32, (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+    > {
+        static M: std::sync::OnceLock<
+            std::sync::Mutex<
+                std::collections::HashMap<i32, (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+            >,
+        > = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn arm_between_upstream_passes_probe(
+        thread_id: i32,
+    ) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        between_upstream_passes_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(thread_id, (reached_tx, resume_rx));
+        (reached_rx, resume_tx)
+    }
+
+    pub(super) async fn between_upstream_passes_probe(thread_id: i32) {
+        let armed = between_upstream_passes_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&thread_id);
+        if let Some((reached_tx, resume_rx)) = armed {
+            let _ = reached_tx.send(());
+            let _ = resume_rx.await;
+        }
     }
 
     /// Fired by `confirm` (test build only) just before its CAS. If a race is armed for
@@ -7077,6 +7142,114 @@ mod tests {
             repo::upstream_merge_state(&db, y_id).await,
             crate::host::UpstreamStatus::Pending { what: "x".into() },
             "the axis this edge feeds must see the REVERSED relationship: y now blocked on x"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// THE FIX (Codex review, PR #159 planner.rs:1600, a follow-up round on planner.rs:1570's
+    /// own fix): `record_upstream_edges`'s two passes are two SEPARATE, non-transactional
+    /// awaited writes with no lock held across the gap — `host::automerge`/`host::monitor` run
+    /// on their own independent sweep loop and can read a direction's row at any point,
+    /// including exactly between pass 1 and pass 2. Re-proposes a reused consumer's dependency
+    /// from producer1 to producer2 (a REPLACEMENT: pass 1 must actually clear something,
+    /// unlike a fresh 0→X assignment) and pauses `record_upstream_edges` at that exact gap
+    /// (`between_upstream_passes_probe`) to drive a CONCURRENT read of `upstream_merge_state` —
+    /// the same call `host::automerge`/`host::monitor` make — from a separate task. Before the
+    /// sentinel fix, pass 1 cleared to `0`, which reads `UpstreamStatus::None` ("no upstream,
+    /// free to merge") — true of the DB row at that instant, and enough for a sweep to release
+    /// a PR whose other 3 axes were already cached `Ready`, before pass 2 installs producer2.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn record_upstream_edges_never_reads_free_to_merge_between_its_two_passes() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-upstream-between-passes-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        // File-backed (not :memory:) DB, same reason as `thread_gate_serializes_concurrent_
+        // confirms`: the cloned pool handle in the spawned task must see the SAME store as the
+        // test's own concurrent read, and an in-memory SQLite connection is private to itself.
+        let db_file = weft_home.join("between-passes.sqlite");
+        std::fs::create_dir_all(&weft_home).unwrap();
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", db_file.to_str().unwrap()))
+            .await
+            .unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Round 1: consumer depends on producer1.
+        let first = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer1", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "producer2", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer1"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &first).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 3, "all three lanes are dispatched");
+        let producer2_id = ids[1];
+        let consumer_id = ids[2];
+        assert_eq!(
+            repo::get_direction(&db, consumer_id).await.unwrap().unwrap().depends_on_direction_id,
+            ids[0],
+            "precondition: consumer depends on producer1"
+        );
+
+        // Round 2: SAME three lanes reused, consumer's dependency REPLACED with producer2 —
+        // pass 1 has a real, non-zero edge to actually clear (unlike a fresh 0→X assignment).
+        let second = serde_json::json!({
+            "rationale": "r2",
+            "directions": [
+                {"name": "producer1", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "producer2", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer2"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &second).await.unwrap();
+
+        let (reached_rx, resume_tx) = tests::arm_between_upstream_passes_probe(t.id);
+        let db2 = db.clone();
+        let tid = t.id;
+        let confirm_handle = tokio::spawn(async move { confirm(&db2, tid).await });
+
+        // Wait for record_upstream_edges to reach the gap between its two passes, then —
+        // WHILE it is still paused there — read exactly what a concurrent automerge/monitor
+        // sweep would read.
+        reached_rx.await.expect("record_upstream_edges reached the between-passes probe");
+        let mid_transition = repo::upstream_merge_state(&db, consumer_id).await;
+        // Release the pause so pass 2 (and the rest of confirm) can complete.
+        let _ = resume_tx.send(());
+        let ids2 = confirm_handle.await.unwrap().unwrap();
+        assert_eq!(ids2.len(), 3, "all three reused lanes are re-dispatched");
+
+        assert!(
+            !matches!(mid_transition, crate::host::UpstreamStatus::None),
+            "a concurrent sweep landing between record_upstream_edges's two passes must NEVER \
+             read None (\"no upstream, free to merge\") — got {mid_transition:?}, which would \
+             let automerge release this PR before pass 2 installs the real new producer"
+        );
+        assert!(
+            matches!(mid_transition, crate::host::UpstreamStatus::Unknown { .. }),
+            "mid-transition must read Unknown (blocking, fail-closed), not any other verdict — \
+             got {mid_transition:?}"
+        );
+
+        let consumer_after = repo::get_direction(&db, consumer_id).await.unwrap().unwrap();
+        assert_eq!(
+            consumer_after.depends_on_direction_id, producer2_id,
+            "after resuming, pass 2 must still land the real replacement edge"
         );
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();

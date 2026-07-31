@@ -3872,24 +3872,28 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
     // when) — real scope beyond this review round; flagged as a follow-up.
     if !prs.is_empty() && prs.iter().all(|p| p.lifecycle == "merged") {
         // Every PR on one task normally targets the same host repo; use the FIRST one as the
-        // identity `live_default_branch_for_repo` must see reflected in the local clone's
-        // recorded remote before it trusts that clone to answer "what is the default branch"
-        // (a fork/mirror checkout's `origin` need not be the repo this PR actually targets).
+        // identity `all_prs_landed_on_live_default_branch` must see reflected in the local
+        // clone's recorded remote before it trusts that clone to answer "what is the default
+        // branch" (a fork/mirror checkout's `origin` need not be the repo this PR actually
+        // targets).
         let pr0 = &prs[0];
-        let Some(default_branch) =
-            live_default_branch_for_repo(db, upstream.repo_id, &pr0.host_base, &pr0.host_owner, &pr0.host_repo)
-                .await
-        else {
-            // Never optimistically release the merge on an unresolvable default
-            // branch (offline, repo row gone, local clone doesn't provably match
-            // the PR's own recorded host repo) — the honest answer is "can't
-            // tell", the same rule every other failure branch above follows.
-            return host::UpstreamStatus::Unknown {
-                reason: "无法确认上游仓库的默认分支".into(),
-            };
-        };
-        if prs.iter().all(|p| p.base_ref.trim() == default_branch) {
-            return host::UpstreamStatus::Merged;
+        let host_base = pr0.host_base.clone();
+        let host_owner = pr0.host_owner.clone();
+        let host_repo = pr0.host_repo.clone();
+        match all_prs_landed_on_live_default_branch(db, upstream.repo_id, &host_base, &host_owner, &host_repo, prs)
+            .await
+        {
+            None => {
+                // Never optimistically release the merge on an unresolvable default
+                // branch (offline, repo row gone, local clone doesn't provably match
+                // the PR's own recorded host repo) — the honest answer is "can't
+                // tell", the same rule every other failure branch above follows.
+                return host::UpstreamStatus::Unknown {
+                    reason: "无法确认上游仓库的默认分支".into(),
+                };
+            }
+            Some(true) => return host::UpstreamStatus::Merged,
+            Some(false) => {} // fall through to Pending below
         }
     }
     host::UpstreamStatus::Pending {
@@ -3986,13 +3990,12 @@ fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, h
     host == expected_host && path == expected_path
 }
 
-/// The live default branch of the repo behind `repo_id`, for vetting whether a
-/// merged upstream PR actually reached it (see `upstream_merge_state`). Only
-/// trusts the local clone when its CURRENT, LIVE `origin` remote
-/// (`git remote get-url origin`, via `crate::git::remote_url`) matches the
-/// PR's OWN recorded host identity ([`remote_matches_pr_host`]) — never for a
-/// repo whose checkout could belong to a different repo than the PR being
-/// vetted.
+/// Whether EVERY given `prs` genuinely reached the live default branch of the repo behind
+/// `repo_id` (see `upstream_merge_state`) — `None` when the default branch itself can't even
+/// be resolved, `Some(bool)` once it can. Only trusts the local clone when its CURRENT, LIVE
+/// `origin` remote (`git remote get-url origin`, via `crate::git::remote_url`) matches the
+/// PR's OWN recorded host identity ([`remote_matches_pr_host`]) — never for a repo whose
+/// checkout could belong to a different repo than the PR being vetted.
 ///
 /// Checks the LIVE remote, not `repo_ref.remote_url` (a third independent
 /// review round on PR #159 caught a TOCTOU gap in an earlier version that
@@ -4004,6 +4007,20 @@ fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, h
 /// exactly this). Reading the live remote and calling `ls-remote` inside the
 /// SAME `spawn_blocking` closure closes the gap: both operations see the
 /// identical state, with no window for it to change in between.
+///
+/// A PR counts as landed when its recorded `base_ref` equals the live default branch's NAME
+/// (the common, fast case) OR — Codex review, PR #159 repo.rs:3892 — when its `head_sha` is an
+/// ANCESTOR of the live default branch's current tip. The name check alone breaks the moment a
+/// repo renames its default branch AFTER a producer's PR already merged into the OLD name: the
+/// PR's `base_ref` is a historical snapshot that correctly never gets rewritten, so it would
+/// stay e.g. "main" forever even once the SAME commits are reachable from the renamed "trunk" —
+/// blocking every consumer indefinitely on a name that no longer exists, even though the work
+/// genuinely landed. The ancestry fallback uses ONLY what this checkout already has locally
+/// cached (`git merge-base --is-ancestor`, a purely local operation, never a new fetch on this
+/// hot per-sweep path) — best-effort, not a new required network dependency: whenever the
+/// checkout hasn't fetched the renamed branch since the rename, this simply can't confirm it
+/// and the PR falls back to the name check (unresolved either way, same honest `Pending` as
+/// before this fallback existed) rather than erroring or blocking the whole function.
 ///
 /// Deliberately does NOT fall back to `git::recorded_base_or_default`'s
 /// offline "best guess" the way materializing a worktree does — that fallback
@@ -4017,14 +4034,17 @@ fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, h
 /// this is reached from the monitor's per-sweep-tick probe and both of
 /// automerge's confirmation reads, so a slow/unreachable remote must not tie
 /// up a Tokio worker the way `host::monitor::check_one`'s host probe already
-/// avoids doing (same `spawn_blocking` discipline, no new pattern).
-async fn live_default_branch_for_repo(
+/// avoids doing (same `spawn_blocking` discipline, no new pattern) — the
+/// per-PR ancestry checks run inside the SAME blocking closure for the same
+/// reason, rather than back on the async caller.
+async fn all_prs_landed_on_live_default_branch(
     db: &Db,
     repo_id: i32,
     host_base: &str,
     host_owner: &str,
     host_repo: &str,
-) -> Option<String> {
+    prs: Vec<pull_request::Model>,
+) -> Option<bool> {
     let repo_ref = get_repo(db, repo_id).await.ok().flatten()?;
     let path = std::path::PathBuf::from(repo_ref.local_git_path);
     let host_base = host_base.to_string();
@@ -4035,7 +4055,13 @@ async fn live_default_branch_for_repo(
         if !remote_matches_pr_host(&live_remote, &host_base, &host_owner, &host_repo) {
             return None;
         }
-        crate::git::live_default_branch(&path)
+        let default_branch = crate::git::live_default_branch(&path)?;
+        let origin_default = format!("origin/{default_branch}");
+        Some(prs.iter().all(|p| {
+            p.base_ref.trim() == default_branch
+                || (!p.head_sha.trim().is_empty()
+                    && crate::git::is_ancestor(&path, p.head_sha.trim(), &origin_default))
+        }))
     })
     .await
     .ok()
@@ -7847,6 +7873,18 @@ mod tests {
         assert!(st.success(), "cmd {:?} failed", args);
     }
 
+    /// [`sh`], but captures and returns trimmed stdout — for the handful of setup steps that
+    /// need the command's OUTPUT (e.g. `git rev-parse HEAD`), not just its exit status.
+    fn sh_out(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "cmd {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     /// A real, bare LOCAL git repo, at `<root>/<name>/acme/api` so its
     /// absolute path always ends in a clean two-segment "owner/repo" tail.
     /// Returns (absolute repo path, host_owner, host_repo) — the identity
@@ -8084,6 +8122,112 @@ mod tests {
             ),
             "a PR merged into a non-default branch must NOT release the consumer — the producer \
              change has not reached main, which is what a cross-repo consumer actually needs"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE FIX (Codex review, PR #159 repo.rs:3892): a repo can rename its default branch
+    /// (`main` → `trunk`) AFTER a producer's PR already merged into the OLD name. The PR's
+    /// recorded `base_ref` is a historical snapshot that correctly never gets rewritten, so a
+    /// bare NAME comparison against the NEW live default branch would block the consumer
+    /// FOREVER even though the exact same commit is still reachable from the renamed default
+    /// branch's current tip. Falls back to a commit-ancestry check using whatever the local
+    /// clone already has cached (here, after a real `git fetch`, mirroring what an actively-
+    /// used Weft repo routinely does elsewhere for other directions) — no new network
+    /// dependency added to this path by the fix itself.
+    #[tokio::test]
+    async fn a_merged_pr_whose_base_branch_was_later_renamed_still_releases_the_consumer() {
+        let db = mem().await;
+        let root = std::env::temp_dir()
+            .join(format!("weft-upstream-renamed-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (origin_abs, host_owner, host_repo) = make_bare_repo(&root, "origin", "main");
+        let clone_path = root.join("clone");
+        sh(&root, &["git", "clone", "-q", &file_url(&origin_abs), clone_path.to_str().unwrap()]);
+        sh(&clone_path, &["git", "config", "user.email", "t@t.t"]);
+        sh(&clone_path, &["git", "config", "user.name", "t"]);
+        let merged_sha = sh_out(&clone_path, &["git", "rev-parse", "HEAD"]);
+
+        // The origin repo renames its default branch AFTER the PR above already merged into
+        // "main". The local checkout fetches — as an actively-used Weft repo routinely would
+        // for OTHER directions sharing this same repo_ref — and now has `origin/trunk` cached.
+        sh(&origin_abs, &["git", "branch", "-m", "main", "trunk"]);
+        sh(&clone_path, &["git", "fetch", "-q", "origin"]);
+
+        let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
+        let pr = register_open_pr_at(&db, producer, 1, "localhost", &host_owner, &host_repo).await;
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: merged_sha,
+            base_ref: "main".into(), // the OLD name — a real, historical snapshot, never rewritten
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Merged,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            upstream_merge_state(&db, consumer).await,
+            crate::host::UpstreamStatus::Merged,
+            "the PR's commit is still reachable from the renamed default branch's tip — a bare \
+             base_ref NAME comparison against the NEW name (\"trunk\") must not block this \
+             forever just because the repo renamed its default branch after the PR merged"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A repo that renamed its default branch, where the local checkout has NOT fetched since
+    /// (so it has no way to confirm ancestry) must still fail closed to `Pending`, not crash
+    /// and not optimistically guess `Merged` — the ancestry fallback is best-effort, never a
+    /// hard requirement this function could get stuck on.
+    #[tokio::test]
+    async fn a_renamed_default_branch_the_local_clone_has_not_fetched_stays_pending_not_merged() {
+        let db = mem().await;
+        let root = std::env::temp_dir()
+            .join(format!("weft-upstream-renamed-unfetched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (origin_abs, host_owner, host_repo) = make_bare_repo(&root, "origin", "main");
+        let clone_path = root.join("clone");
+        sh(&root, &["git", "clone", "-q", &file_url(&origin_abs), clone_path.to_str().unwrap()]);
+        sh(&clone_path, &["git", "config", "user.email", "t@t.t"]);
+        sh(&clone_path, &["git", "config", "user.name", "t"]);
+        let merged_sha = sh_out(&clone_path, &["git", "rev-parse", "HEAD"]);
+
+        // Rename, but DELIBERATELY skip the fetch this time — the clone has no local knowledge
+        // of "trunk" (or that "main" is gone) at all.
+        sh(&origin_abs, &["git", "branch", "-m", "main", "trunk"]);
+
+        let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
+        let pr = register_open_pr_at(&db, producer, 1, "localhost", &host_owner, &host_repo).await;
+        let snapshot = crate::host::PrSnapshot {
+            head_sha: merged_sha,
+            base_ref: "main".into(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Merged,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                upstream_merge_state(&db, consumer).await,
+                crate::host::UpstreamStatus::Pending { .. }
+            ),
+            "without a local `origin/trunk` to check ancestry against, this must stay the same \
+             honest Pending it already was — never crash, and never guess Merged"
         );
 
         let _ = std::fs::remove_dir_all(&root);
