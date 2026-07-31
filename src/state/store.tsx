@@ -84,6 +84,8 @@ export interface NotificationHydration {
   needs: boolean;
   overview: boolean;
   quota: boolean;
+  /** A quota push arrived before the initial status snapshot was ready. */
+  quotaPushPending: boolean;
   liveWorkers: boolean;
 }
 
@@ -688,6 +690,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     needs: false,
     overview: false,
     quota: false,
+    quotaPushPending: false,
     liveWorkers: false,
   });
   const [checksByDirection, setChecksByDirection] = useState<Record<number, RepoChecks[]>>({});
@@ -855,8 +858,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const unlisten = listen<ProcessQuotaStatus>("process-quota://changed", (event) => {
       applyProcessQuota(event.payload);
-      processQuotaHydratedRef.current = true;
-      setNotificationHydration((current) => ({ ...current, quota: true }));
+      setNotificationHydration((current) => ({
+        ...current,
+        quota: processQuotaHydratedRef.current,
+        quotaPushPending: true,
+      }));
     });
     void refreshProcessQuota();
     const retryId = setInterval(() => {

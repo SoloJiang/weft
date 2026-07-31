@@ -822,6 +822,7 @@ export function useSystemNotifications() {
       // A muted review source must be rebaselined when it returns; transitions
       // that happened while muted are not notification events.
       globalBaselineReady.current.review = false;
+      baselineReady.current.delete("review");
     }
     const sourceReady: Record<NotifyCategory, boolean> = {
       needs: asksReady || workspaceNeedsReady,
@@ -906,6 +907,14 @@ export function useSystemNotifications() {
     };
     for (const kind of NOTIFY_CATEGORIES) {
       if (sourceReady[kind] && !baselineReady.current.has(kind)) {
+        if (kind === "quota" && notificationHydration.quotaPushPending) {
+          // A push arrived before the initial quota snapshot. Keep the empty
+          // (or preserved global) baseline so the first degraded transition is
+          // diffed instead of being mistaken for initial state.
+          globalBaselineReady.current.quota = true;
+          baselineReady.current.add(kind);
+          continue;
+        }
         if (kind === "needs") {
           const initialNeeds = [...next.needs].filter(([key]) => {
             if (key.startsWith("ask:")) {
