@@ -482,6 +482,8 @@ interface Store {
 
   /** Workspace board: per-thread roll-ups for the portfolio view. */
   overview: ThreadOverview[];
+  /** All-workspace roll-ups used by background review notifications. */
+  notificationOverview: ThreadOverview[];
   refreshOverview: () => Promise<void>;
 
   selectWorkspace: (id: number) => Promise<void>;
@@ -627,6 +629,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // workspace instead of the stale one captured when they started.
   const activeWorkspaceIdRef = useRef(activeWorkspaceId);
   activeWorkspaceIdRef.current = activeWorkspaceId;
+  const workspacesRef = useRef(workspaces);
+  workspacesRef.current = workspaces;
   const [repos, setRepos] = useState<RepoRef[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadWorkspaceById, setThreadWorkspaceById] = useState<Record<number, number>>({});
@@ -743,6 +747,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   } | null>(null);
   const [proposal, setProposal] = useState<ResolvedProposal | null>(null);
   const [overview, setOverview] = useState<ThreadOverview[]>([]);
+  const [notificationOverview, setNotificationOverview] = useState<ThreadOverview[]>([]);
   // Monotonic request token so an older, slower-resolving workspace_overview
   // fetch (e.g. the WorkspaceKanban mount fetch racing a just-issued
   // post-create refresh) can never clobber a fresher one that already landed —
@@ -750,7 +755,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const overviewReqRef = useRef(0);
   const overviewInFlightRef = useRef<Promise<void> | null>(null);
   const overviewPendingRef = useRef(false);
-  const overviewTrailingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const refreshOverviewRef = useRef<() => Promise<void>>(() => Promise.resolve());
   // Thread-bus drawer + proposal-review state.
   const [showBus, setShowBus] = useState(false);
@@ -1193,26 +1197,37 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 
   const refreshOverviewOnce = useCallback(async () => {
-    const workspaceId = activeWorkspaceIdRef.current;
-    if (workspaceId == null) {
+    const activeId = activeWorkspaceIdRef.current;
+    if (activeId == null) {
       overviewReqRef.current += 1;
       setOverview([]);
+      setNotificationOverview([]);
       return;
     }
+    const workspaceIds = new Set(workspacesRef.current.map((workspace) => workspace.id));
+    workspaceIds.add(activeId);
     const reqId = ++overviewReqRef.current;
     try {
-      const data = await api.workspaceOverview(workspaceId);
+      const entries = await Promise.all(
+        [...workspaceIds].map(async (workspaceId) => [
+          workspaceId,
+          await api.workspaceOverview(workspaceId),
+        ] as const),
+      );
       // A newer refreshOverviewOnce() was issued while this one was in flight —
       // drop this stale response instead of overwriting the fresher state.
       if (
         reqId !== overviewReqRef.current ||
-        activeWorkspaceIdRef.current !== workspaceId
+        activeWorkspaceIdRef.current !== activeId
       ) {
         return;
       }
-      setOverview(data);
+      const allOverview = entries.flatMap(([, data]) => data);
+      const activeOverview = entries.find(([workspaceId]) => workspaceId === activeId)?.[1] ?? [];
+      setOverview(activeOverview);
+      setNotificationOverview(allOverview);
       setNotificationHydration((current) => {
-        if (current.workspaceId !== workspaceId) return current;
+        if (current.workspaceId !== activeId) return current;
         return { ...current, overview: true };
       });
     } catch (e) {
@@ -1221,24 +1236,25 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const scheduleTrailingOverviewRefresh = useCallback(() => {
-    if (overviewTrailingTimerRef.current != null) return;
-    overviewTrailingTimerRef.current = setTimeout(() => {
-      overviewTrailingTimerRef.current = null;
-      if (overviewInFlightRef.current != null) return;
-      void refreshOverviewRef.current().catch((error) => console.error(error));
-    }, 0);
-  }, []);
-
   const refreshOverview = useCallback(async () => {
     const inFlight = overviewInFlightRef.current;
     if (inFlight) {
-      // Let the current waiter resolve with the current pass; a slow poll gets
-      // one independent trailing refresh instead of an unbounded wait chain.
+      // A mutation caller must observe a pass issued AFTER the in-flight poll,
+      // not merely the stale pass that started before its backend mutation.
       overviewPendingRef.current = true;
       await inFlight;
+      const trailing = overviewInFlightRef.current;
+      if (trailing && trailing !== inFlight) {
+        await trailing;
+        return;
+      }
+      if (overviewPendingRef.current) {
+        overviewPendingRef.current = false;
+        await refreshOverviewRef.current();
+      }
       return;
     }
+    overviewPendingRef.current = false;
     const current = refreshOverviewOnce();
     overviewInFlightRef.current = current;
     try {
@@ -1246,12 +1262,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } finally {
       if (overviewInFlightRef.current !== current) return;
       overviewInFlightRef.current = null;
-      if (overviewPendingRef.current) {
-        overviewPendingRef.current = false;
-        scheduleTrailingOverviewRefresh();
-      }
     }
-  }, [refreshOverviewOnce, scheduleTrailingOverviewRefresh]);
+  }, [refreshOverviewOnce]);
   refreshOverviewRef.current = refreshOverview;
 
   const backToWorkspace = useCallback(() => {
@@ -1375,6 +1387,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setSelectedRepoId(null);
       setProposal(null);
       setOverview([]);
+      setNotificationOverview([]);
     },
     [selectWorkspace],
   );
@@ -3364,10 +3377,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         clearTimeout(needsRefreshTrailingTimerRef.current);
         needsRefreshTrailingTimerRef.current = null;
       }
-      if (overviewTrailingTimerRef.current != null) {
-        clearTimeout(overviewTrailingTimerRef.current);
-        overviewTrailingTimerRef.current = null;
-      }
     };
   }, []);
 
@@ -3648,6 +3657,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setProposalDirectionBase,
     approvePlanCard,
     overview,
+    notificationOverview,
     refreshOverview,
     selectWorkspace,
     refreshWorkspaces,

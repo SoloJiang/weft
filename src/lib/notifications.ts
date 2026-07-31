@@ -359,7 +359,7 @@ export function useSystemNotifications() {
     needs,
     asks,
     writeTriggers,
-    overview,
+    notificationOverview,
     sessions,
     leadTurn,
     processQuota,
@@ -400,6 +400,7 @@ export function useSystemNotifications() {
   const workspaceNeedsReadyPrevious = useRef(false);
   const globalBaselineReady = useRef({
     asks: false,
+    review: false,
     stalled: false,
     quota: false,
   });
@@ -792,20 +793,24 @@ export function useSystemNotifications() {
       needs,
       asks,
       writeTriggers,
-      overview,
+      notificationOverview,
       sessionRefs,
       leadTurn,
       processQuota,
       threadsById.current,
       activeWorkspaceId,
     );
+    // Do not advance any baseline while the current workspace selection is
+    // resetting. Global asks/stalls/quota/review transitions must survive until
+    // the settled snapshot can be compared.
+    if (workspaceLoading) return;
     const sourceReady: Record<NotifyCategory, boolean> = {
       needs: asksReady || workspaceNeedsReady,
-      review: sourceWorkspaceMatches && notificationHydration.overview,
+      review: notificationHydration.overview,
       // Lead-turn pushes and locally observed sessions are authoritative even
       // while the adopted-worker snapshot is retrying.
       stalled: sourceWorkspaceMatches,
-      quota: sourceWorkspaceMatches && notificationHydration.quota,
+      quota: notificationHydration.quota,
     };
     const eventStalledKeys = new Set<string>();
     for (const s of Object.values(sessionRefs)) {
@@ -851,6 +856,9 @@ export function useSystemNotifications() {
         if (preserveGlobal.stalled) {
           prev.current.stalled = new Map(previous.stalled);
         }
+        if (preserveGlobal.review) {
+          prev.current.review = new Map(previous.review);
+        }
         if (preserveGlobal.quota) {
           prev.current.quota = new Map(previous.quota);
         }
@@ -890,6 +898,8 @@ export function useSystemNotifications() {
           if (asksReady) {
             globalBaselineReady.current.asks = true;
           }
+        } else if (kind === "review" && globalBaselineReady.current.review) {
+          // Keep the all-workspace review baseline across a workspace reset.
         } else if (
           kind === "stalled" && globalBaselineReady.current.stalled
         ) {
@@ -900,6 +910,9 @@ export function useSystemNotifications() {
           base[kind] = new Map(next[kind]);
           if (kind === "stalled") {
             globalBaselineReady.current.stalled = true;
+          }
+          if (kind === "review") {
+            globalBaselineReady.current.review = true;
           }
           if (kind === "quota") {
             globalBaselineReady.current.quota = true;
@@ -950,7 +963,6 @@ export function useSystemNotifications() {
       if (isNeedsKeyReady(key)) baselineNeeds.set(key, entry);
     }
     prev.current = { ...next, needs: baselineNeeds };
-    if (workspaceLoading) return;
     if (!notifyEnabled || permissionState !== "granted") return;
     if (
       isAppInForeground({
@@ -984,7 +996,7 @@ export function useSystemNotifications() {
     needs,
     asks,
     writeTriggers,
-    overview,
+    notificationOverview,
     sessions,
     leadTurn,
     processQuota,
