@@ -762,6 +762,184 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     )
     .await;
     assert!(out.to_lowercase().contains("focus"), "{out}");
+
+    // —— round-3 P1 §1: an Interactive approval must reclaim OS focus ——
+    //
+    // The real hazard: click target window (focus -> target) -> `approve`
+    // cards the FOLLOWING `type`/`key` -> a human answers it by clicking
+    // Weft's own UI (focus -> Weft) -> without a fix, the keystrokes go to
+    // Weft, not the target. A brand-new, deliberately UNGRANTED (thread,
+    // dir) so both the click and the first `type` each surface a REAL card
+    // (an `Interactive` approval); a THIRD call pre-seeds an Always grant so
+    // `auto_decision` decides it silently (an `Auto` approval, no card, focus
+    // never moves) and must NOT replay a click.
+
+    let (refocus_thread, refocus_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
+    let refocus_dir_s = refocus_dir.to_string();
+    computer::clear_control();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // 13a. left_click on "notes" — no standing grant, so a real card
+    // appears; a plain Allow (not Always) is an ordinary Interactive
+    // approval, exactly like any other first-time click.
+    let call = spawn_computer_call(&base, refocus_thread, refocus_dir_s.clone(), "left_click", "notes");
+    let card = wait_for_card(&asks_handle, "refocus scenario: initial left_click").await;
+    assert!(asks_handle.answer(card.id, Answer::Allow));
+    let out = call.await.unwrap();
+    assert!(out.contains("left_click") && out.contains("done"), "{out}");
+    let baseline = mock.actions.lock().unwrap().len();
+    assert_eq!(
+        mock.actions.lock().unwrap()[baseline - 1],
+        "click 1,1 Left x1",
+        "{:?}",
+        mock.actions.lock().unwrap()
+    );
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // 13b. `type` into the SAME window — also ungranted, so a NEW card
+    // appears (a different action_key than the click's). Answering Allow
+    // here is an Interactive approval: the card itself dragged OS focus to
+    // Weft, so the fix must replay the (1, 1) click from 13a BEFORE the
+    // actual keystrokes reach the backend.
+    let text_interactive = "hi-refocus".to_string();
+    let call = {
+        let base = base.clone();
+        let dir = refocus_dir_s.clone();
+        let text = text_interactive.clone();
+        tokio::spawn(async move {
+            rpc(
+                &base,
+                refocus_thread,
+                &dir,
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"computer","arguments":{"action":"type","window":"notes","text":text}}}),
+            )
+            .await
+        })
+    };
+    let card = wait_for_card(&asks_handle, "refocus scenario: type").await;
+    assert!(asks_handle.answer(card.id, Answer::Allow));
+    let out = call.await.unwrap();
+    assert!(out.contains("typed") && out.contains("done"), "{out}");
+
+    {
+        let actions = mock.actions.lock().unwrap();
+        assert_eq!(
+            actions.len(),
+            baseline + 2,
+            "an Interactive approval must replay the click BEFORE typing — expected \
+             [..., refocus click, type]: {actions:?}"
+        );
+        assert_eq!(
+            actions[baseline], "click 1,1 Left x1",
+            "the refocus click must replay the SAME (px, py) as the last recorded click: {actions:?}"
+        );
+        assert_eq!(actions[baseline + 1], format!("type {text_interactive}"), "{actions:?}");
+    }
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // 13c. Auto path: pre-seed an Always grant for a SECOND `type` call (a
+    // DIFFERENT `text`, hence a DIFFERENT action_key from 13b's) so
+    // `auto_decision` decides Allow WITHOUT a card ever appearing — OS focus
+    // never leaves the target window in this path, so no refocus click
+    // should be recorded.
+    let text_auto = "auto-no-refocus".to_string();
+    let type_always_key = weft::ask::action_key(&[
+        "gui",
+        "type",
+        "notes",
+        &weft::bus::computer_srv::args_digest(&json!({"action":"type","window":"notes","text":text_auto})),
+    ]);
+    asks_handle.seed_grants(GrantSnapshot {
+        full: Vec::new(),
+        always: vec![weft::ask::AlwaysGrant {
+            thread: refocus_thread,
+            dir: refocus_dir_s.clone(),
+            action_key: type_always_key,
+        }],
+    });
+
+    // A fresh click first (re-establishing freshness) — itself ungranted, so
+    // it surfaces its own card; its OWN action_key is unrelated to the
+    // Always grant just seeded for `type`.
+    let call = spawn_computer_call(&base, refocus_thread, refocus_dir_s.clone(), "left_click", "notes");
+    let card = wait_for_card(&asks_handle, "refocus scenario: pre-auto click").await;
+    assert!(asks_handle.answer(card.id, Answer::Allow));
+    call.await.unwrap();
+    let baseline_auto = mock.actions.lock().unwrap().len();
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let out = rpc(
+        &base,
+        refocus_thread,
+        &refocus_dir_s,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"type","window":"notes","text":text_auto}}}),
+    )
+    .await;
+    assert!(out.contains("typed") && out.contains("done"), "{out}");
+    assert!(asks_handle.open().is_empty(), "an Always-covered type must never surface a card");
+
+    {
+        let actions = mock.actions.lock().unwrap();
+        assert_eq!(
+            actions.len(),
+            baseline_auto + 1,
+            "an Auto approval must NOT replay a refocus click — expected exactly ONE new action \
+             (the type itself): {actions:?}"
+        );
+        assert_eq!(actions[baseline_auto], format!("type {text_auto}"), "{actions:?}");
+    }
+
+    // —— round-3 P1 §2: recheck_after_guard ——
+    //
+    // A second input call that queues on `computer::input_flight_guard`
+    // behind a long-held first call must re-check BOTH the kill switch and
+    // the control-lease ownership AFTER it finally acquires the guard — not
+    // just once, back when it first queued. Simulated by the TEST ITSELF
+    // holding the flight guard (standing in for another call's in-flight
+    // backend round trip) while a REAL RPC call queues behind it, disabling
+    // the setting while it's queued, then releasing the guard.
+
+    let (recheck_thread, recheck_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
+    let recheck_dir_s = recheck_dir.to_string();
+    asks_handle.seed_grants(GrantSnapshot {
+        full: vec![FullGrant { thread: recheck_thread, dir: recheck_dir_s.clone() }],
+        always: Vec::new(),
+    });
+    computer::clear_control();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let clicks_before_recheck = mock.actions.lock().unwrap().len();
+
+    let held_guard = computer::input_flight_guard().await;
+    let call = spawn_computer_call(&base, recheck_thread, recheck_dir_s.clone(), "left_click", "notes");
+    // Give the spawned call time to clear `approve`/`acquire_and_throttle`
+    // and start queuing on the (held) flight guard.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    repo::set_setting(&db_handle, computer::K_COMPUTER_USE_ENABLED, "false")
+        .await
+        .unwrap();
+    drop(held_guard);
+    let out = call.await.unwrap();
+    assert!(
+        out.to_lowercase().contains("disabled"),
+        "the queued call must recheck after the guard and see the disable: {out}"
+    );
+    assert_eq!(
+        mock.actions.lock().unwrap().len(),
+        clicks_before_recheck,
+        "a recheck-denied call must never reach the backend"
+    );
+
+    // Restore the setting — disciplined cleanup even though this is the
+    // last thing this test does.
+    repo::set_setting(&db_handle, computer::K_COMPUTER_USE_ENABLED, "true")
+        .await
+        .unwrap();
+    computer::clear_control();
 }
 
 /// issue #160 round-2 P1: with no standing grant, an input action surfaces a

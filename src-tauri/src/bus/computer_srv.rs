@@ -155,13 +155,13 @@ fn computer_tool_specs() -> Value {
     json!([
         {
             "name": "computer",
-            "description": format!("Observe AND control the human's screen — OS-level window listing/screenshot plus mouse/keyboard input injection. `action=list_windows` lists visible on-screen windows (Weft's own window and terminal-emulator apps are excluded, so you can never see yourself or the terminal you're running inside). `action=screenshot` captures ONE window — never the whole desktop — and returns a PNG FILE PATH (not image data): open it with your own image-viewing tool. Every other action but `cursor_position`/`wait` needs `window` (same id/substring rule as screenshot) and drives that window's input: `left_click`/`right_click`/`double_click`/`triple_click`/`mouse_move` need `coordinate` [x, y]; `left_click_drag` needs `start_coordinate` AND `coordinate` (end point); `scroll` needs `coordinate` plus `scroll_direction`; `type`/`key` need `text` (literal text to type, or a combo like \"cmd+s\"/\"ctrl+shift+t\"/\"Return\"/\"f5\" for `key`). ALL coordinates are in the pixel space of the MOST RECENT screenshot of that window — take a screenshot first (or again after the window resizes) to get coordinates that still line up, since the mapping is recomputed from the window's CURRENT size on every call and an out-of-range coordinate is rejected rather than guessed at. `type`/`key` additionally require a `left_click`/`right_click`/`double_click`/`triple_click` on that SAME window within the last {FOCUS_FRESHNESS_SECS}s — click inside the target window first to focus it, then type/key within {FOCUS_FRESHNESS_SECS}s, or the call is rejected. Every call — observation or input — may pause for a human's permission card (Needs-you) before it runs; an input action can additionally come back `Busy` (another session currently has it) or fail while a DIFFERENT permission card is still waiting on the human — retry after a moment. Input actions are also rate-limited to roughly 2 per second."),
+            "description": format!("Observe AND control the human's screen — OS-level window listing/screenshot plus mouse/keyboard input injection. `action=list_windows` lists visible on-screen windows (Weft's own window and terminal-emulator apps are excluded, so you can never see yourself or the terminal you're running inside). `action=screenshot` captures ONE window — never the whole desktop — and returns a PNG FILE PATH (not image data): open it with your own image-viewing tool. Every action except `list_windows`, `cursor_position`, and `wait` needs `window` (same id/substring rule as screenshot) and drives that window's input: `left_click`/`right_click`/`double_click`/`triple_click`/`mouse_move` need `coordinate` [x, y]; `left_click_drag` needs `start_coordinate` AND `coordinate` (end point); `scroll` needs `coordinate` plus `scroll_direction`; `type`/`key` need `text` (literal text to type, or a combo like \"cmd+s\"/\"ctrl+shift+t\"/\"Return\"/\"f5\" for `key`). ALL coordinates are in the pixel space of the MOST RECENT screenshot of that window — take a screenshot first (or again after the window resizes) to get coordinates that still line up, since the mapping is recomputed from the window's CURRENT size on every call and an out-of-range coordinate is rejected rather than guessed at. `type`/`key` additionally require a `left_click`/`right_click`/`double_click`/`triple_click` on that SAME window within the last {FOCUS_FRESHNESS_SECS}s — click inside the target window first to focus it, then type/key within {FOCUS_FRESHNESS_SECS}s, or the call is rejected. Every call — observation or input — may pause for a human's permission card (Needs-you) before it runs; an input action can additionally come back `Busy` (another session currently has it) or fail while a DIFFERENT permission card is still waiting on the human — retry after a moment. Input actions are also rate-limited to roughly 2 per second."),
             "inputSchema": { "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": VALID_ACTIONS,
                         "description": "screenshot | list_windows | left_click | right_click | double_click | triple_click | type | key | scroll | left_click_drag | mouse_move | cursor_position | wait" },
                     "window": { "type": "string",
-                        "description": "Required (non-empty) for every action except cursor_position and wait: a window id from action=list_windows, or a case-insensitive substring of its app name or title." },
+                        "description": "Required (non-empty) for every action except list_windows, cursor_position, and wait: a window id from action=list_windows, or a case-insensitive substring of its app name or title." },
                     "coordinate": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2,
                         "description": "[x, y] in the pixel space of the most recent screenshot of `window`. Required for left_click/right_click/double_click/triple_click/mouse_move/scroll, and as the drag END point for left_click_drag." },
                     "start_coordinate": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2,
@@ -284,7 +284,7 @@ async fn run_action(
     // looked at: a standing grant decides silently, otherwise this blocks on
     // a Needs-you card exactly like `bus::server::handle_ask` does for every
     // other tool call in this crate.
-    approve(asks, thread, dir, action, args).await?;
+    let approval = approve(asks, thread, dir, action, args).await?;
     // issue #160 round-2 P1 §1: re-check the kill switch AFTER the approval
     // await returns — NOT just once, up top, before that (potentially very
     // long, up to `bus::server::ASK_WAIT`) wait began. A human can hit Stop
@@ -385,6 +385,7 @@ async fn run_action(
             // own click on the human's real desktop (issue #160 review R1
             // P2).
             let _flight = computer::input_flight_guard().await;
+            recheck_after_guard(db, thread, dir).await?;
             backend::backend()
                 .click(px, py, button, count)
                 .map_err(|e| e.to_string())?;
@@ -392,8 +393,11 @@ async fn run_action(
             // handed this window OS focus — see `recent_clicks`'s doc. Only
             // AFTER the backend call succeeds: a rejected/failed click never
             // touched the real window and must not seed a false freshness
-            // record for a later `type`/`key`.
-            record_click_focus(thread, dir, window_id);
+            // record for a later `type`/`key`. Records `(px, py)` too (issue
+            // #160 round-3 P1 §1) — the SAME physical point a later
+            // `type`/`key`'s Interactive-approval refocus replay clicks back
+            // to, see that section's own doc.
+            record_click_focus(thread, dir, window_id, px, py);
             Ok(format!(
                 "{action} at ({px}, {py}) in window {window_id} done — take a screenshot to verify"
             ))
@@ -408,6 +412,7 @@ async fn run_action(
             // See the click-family arm above for why this guard is held
             // across the backend call itself.
             let _flight = computer::input_flight_guard().await;
+            recheck_after_guard(db, thread, dir).await?;
             backend::backend()
                 .move_cursor(px, py)
                 .map_err(|e| e.to_string())?;
@@ -427,6 +432,7 @@ async fn run_action(
             let to = computer::map_to_physical(&w, ex, ey).map_err(|e| e.to_string())?;
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
+            recheck_after_guard(db, thread, dir).await?;
             b.drag(from, to).map_err(|e| e.to_string())?;
             Ok(format!(
                 "left_click_drag from ({}, {}) to ({}, {}) in window {} done — take a screenshot to verify",
@@ -442,6 +448,7 @@ async fn run_action(
             *window_id_out = Some(window_id);
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
+            recheck_after_guard(db, thread, dir).await?;
             backend::backend()
                 .scroll(px, py, dx, dy)
                 .map_err(|e| e.to_string())?;
@@ -464,6 +471,8 @@ async fn run_action(
             require_recent_focus(thread, dir, window_id)?;
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
+            recheck_after_guard(db, thread, dir).await?;
+            reclaim_focus_if_interactive(thread, dir, window_id, approval)?;
             backend::backend()
                 .type_text(text)
                 .map_err(|e| e.to_string())?;
@@ -482,6 +491,8 @@ async fn run_action(
             require_recent_focus(thread, dir, window_id)?;
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
+            recheck_after_guard(db, thread, dir).await?;
+            reclaim_focus_if_interactive(thread, dir, window_id, approval)?;
             backend::backend().key(combo).map_err(|e| e.to_string())?;
             Ok(format!(
                 "key {combo} in window {window_id} done — take a screenshot to verify"
@@ -546,7 +557,31 @@ async fn run_action(
 /// the desktop right now — AFTER this gate returns `Ok`; those are a
 /// completely separate concern (issue #160 M2) from "is this call
 /// authorized at all".
-async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args: &Value) -> Result<(), String> {
+/// How [`approve`] reached its `Ok` — the ONE thing [`run_action`]'s `type`/
+/// `key` arms need out of it (issue #160 round-3 P1 §1): whether a Needs-you
+/// card actually appeared and a human clicked Weft's own UI to answer it.
+///
+///  - [`Approval::Auto`]: a standing grant (`Decision::Allow` from
+///    [`AskRegistry::auto_decision`]) decided this silently — no card ever
+///    rendered, so OS focus never moved off whatever window last had it.
+///  - [`Approval::Interactive`]: a card actually rendered and a human
+///    answered Allow through it — which means the human just clicked
+///    somewhere in Weft's own window to do so, dragging OS focus there and
+///    away from whatever `require_recent_focus`'s last recorded click had
+///    focused. See the `type`/`key` arms of [`run_action`] for what this
+///    drives: only `Interactive` needs a replay click to hand focus back
+///    before the backend ever sees a keystroke.
+///
+/// Never constructed for a `Deny`/timeout/cancel outcome — those return
+/// `Err` instead, so this only ever distinguishes the two ways an `Ok`
+/// happened, exactly like the doc comment on [`approve`] itself says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Approval {
+    Auto,
+    Interactive,
+}
+
+async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args: &Value) -> Result<Approval, String> {
     let window_query = window_arg(args);
     let risk = crate::ask::classify_gui_action(action);
     let summary = if window_query.is_empty() {
@@ -566,7 +601,7 @@ async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args:
     let detail = args.to_string();
 
     match asks.auto_decision(thread, dir, risk, &action_key) {
-        Some(Decision::Allow) => return Ok(()),
+        Some(Decision::Allow) => return Ok(Approval::Auto),
         // `auto_decision` never actually returns `Deny` today (only Allow-
         // only standing grants exist) — this arm keeps the gate correct
         // regardless, mirroring `handle_ask`'s own defensive shape, rather
@@ -581,7 +616,7 @@ async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args:
     );
 
     match tokio::time::timeout(crate::bus::server::ASK_WAIT, rx).await {
-        Ok(Ok(Decision::Allow)) => Ok(()),
+        Ok(Ok(Decision::Allow)) => Ok(Approval::Interactive),
         Ok(Ok(Decision::Deny)) => Err("denied in weft".to_string()),
         // Timed out, or the sender was dropped (`AskRegistry::cancel`/
         // `cancel_for` — e.g. an engine/model switch tearing this session
@@ -789,30 +824,56 @@ fn redact_audit_args(action: &str, args: &Value) -> Value {
 // substitute for real focus verification — it is a floor, not a ceiling —
 // but it closes the main accident surface: typing into a target window that
 // was never clicked at all, this session, ever.
+//
+// issue #160 round-3 P1 §1: that presumption has a second hole, INSIDE one
+// session's own `type`/`key` call, that the freshness window alone can't
+// close. The real sequence is: agent clicks the target window (OS focus ->
+// target) -> [`approve`] may block on a Needs-you card -> if a human answers
+// it INTERACTIVELY, answering itself means clicking somewhere in WEFT's own
+// window, which drags OS focus to Weft, not back to the target. The
+// freshness check above still passes (it only looks at the click's
+// timestamp/window id, not what happened to focus afterward), so without a
+// further fix `type`/`key` would go on to inject keystrokes into Weft
+// instead of the window the agent actually meant. There is still no
+// cross-platform "query current focus" API to detect this directly, so the
+// fix is the same KIND of substitute as the freshness check itself: replay
+// the exact click that last established freshness — same window, same
+// physical `(px, py)` — immediately before the backend ever sees a
+// keystroke, but ONLY when [`Approval::Interactive`] says a card actually
+// interrupted this call (an [`Approval::Auto`] standing-grant decision never
+// shows a card, so focus never left the target window in the first place —
+// see [`reclaim_focus_if_interactive`]). `recent_clicks`'s value grew the
+// physical `(px, py)` alongside the window id/timestamp it already carried,
+// so this replay can be built from the SAME record `require_recent_focus`
+// already validated, instead of threading a second, parallel table through.
 
 /// How long a click on a window is trusted to still hold that window's OS
 /// focus for a subsequent `type`/`key` — see this section's own doc comment.
 const FOCUS_FRESHNESS_MS: u64 = 15_000;
 const FOCUS_FRESHNESS_SECS: u64 = FOCUS_FRESHNESS_MS / 1000;
 
-/// Process-level "last window this `(thread, dir)` actually clicked, and
-/// when" registry — see this section's own doc comment. `now_ms()`-based
-/// (wall clock), consistent with every other timestamp this module already
-/// records (the audit log's own `ts_ms`); a system clock adjustment
-/// mid-session is not a hazard this heuristic needs to defend against.
-fn recent_clicks() -> &'static Mutex<HashMap<(i32, String), (u32, u64)>> {
-    static CLICKS: OnceLock<Mutex<HashMap<(i32, String), (u32, u64)>>> = OnceLock::new();
+/// Process-level "last window this `(thread, dir)` actually clicked, its
+/// physical `(px, py)`, and when" registry — see this section's own doc
+/// comment. `now_ms()`-based (wall clock), consistent with every other
+/// timestamp this module already records (the audit log's own `ts_ms`); a
+/// system clock adjustment mid-session is not a hazard this heuristic needs
+/// to defend against. The `(px, py)` fields (issue #160 round-3 P1 §1) are
+/// the SAME physical point the click-family arm of [`run_action`] just sent
+/// to the backend — [`reclaim_focus_if_interactive`]'s only source for what
+/// to replay.
+fn recent_clicks() -> &'static Mutex<HashMap<(i32, String), (u32, i32, i32, u64)>> {
+    static CLICKS: OnceLock<Mutex<HashMap<(i32, String), (u32, i32, i32, u64)>>> = OnceLock::new();
     CLICKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Record a SUCCESSFUL click on `window_id` for `(thread, dir)` — called
-/// ONLY from the click-family arm of [`run_action`], and ONLY after the
-/// backend call itself returned `Ok`: a rejected/failed click never actually
-/// touched the real window, so it must not seed a false freshness record for
-/// a later `type`/`key`.
-fn record_click_focus(thread: i32, dir: &str, window_id: u32) {
+/// Record a SUCCESSFUL click on `window_id` at physical `(px, py)` for
+/// `(thread, dir)` — called ONLY from the click-family arm of [`run_action`],
+/// and ONLY after the backend call itself returned `Ok`: a rejected/failed
+/// click never actually touched the real window, so it must not seed a false
+/// freshness record for a later `type`/`key`.
+fn record_click_focus(thread: i32, dir: &str, window_id: u32, px: i32, py: i32) {
     let mut g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
-    g.insert((thread, dir.to_string()), (window_id, now_ms()));
+    g.insert((thread, dir.to_string()), (window_id, px, py, now_ms()));
 }
 
 /// `type`/`key`'s pre-execution gate: reject unless a click on THIS EXACT
@@ -823,7 +884,7 @@ fn require_recent_focus(thread: i32, dir: &str, window_id: u32) -> Result<(), St
     let g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
     let fresh = matches!(
         g.get(&(thread, dir.to_string())),
-        Some((clicked, ts)) if *clicked == window_id && now_ms().saturating_sub(*ts) <= FOCUS_FRESHNESS_MS
+        Some((clicked, _px, _py, ts)) if *clicked == window_id && now_ms().saturating_sub(*ts) <= FOCUS_FRESHNESS_MS
     );
     if fresh {
         return Ok(());
@@ -832,6 +893,70 @@ fn require_recent_focus(thread: i32, dir: &str, window_id: u32) -> Result<(), St
         "window {window_id} doesn't appear to have OS focus yet — click inside the target window \
          first to focus it, then type/key within {FOCUS_FRESHNESS_SECS}s"
     ))
+}
+
+/// The physical `(px, py)` [`require_recent_focus`] just accepted for
+/// `window_id` under `(thread, dir)`, if it's STILL within
+/// [`FOCUS_FRESHNESS_MS`] right now — a SEPARATE lookup from
+/// `require_recent_focus` (rather than folding the coordinates into that
+/// function's own `Result`) so the freshness gate itself stays a pure
+/// boolean-shaped check, reusable by any future caller that only cares
+/// whether focus is fresh, not where to click if it needs replaying.
+/// [`reclaim_focus_if_interactive`]'s only caller.
+fn recent_click_position(thread: i32, dir: &str, window_id: u32) -> Option<(i32, i32)> {
+    let g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
+    match g.get(&(thread, dir.to_string())) {
+        Some((clicked, px, py, ts))
+            if *clicked == window_id && now_ms().saturating_sub(*ts) <= FOCUS_FRESHNESS_MS =>
+        {
+            Some((*px, *py))
+        }
+        _ => None,
+    }
+}
+
+/// `type`/`key`'s LAST gate before the backend ever sees a keystroke (issue
+/// #160 round-3 P1 §1) — see this section's own doc comment for the full
+/// rationale. Called AFTER [`require_recent_focus`] already passed, AFTER
+/// [`recheck_after_guard`], and while `input_flight_guard` is still held:
+///
+///  - [`Approval::Auto`]: no-op. A standing grant decided this call silently
+///    — no card ever rendered, so OS focus never left the target window.
+///  - [`Approval::Interactive`]: a human just answered a Needs-you card by
+///    clicking Weft's own UI, dragging OS focus there. Replays the EXACT
+///    physical point [`require_recent_focus`] validated — the same
+///    `backend.click(px, py, Left, 1)` shape the click-family arm of
+///    [`run_action`] itself uses — to hand focus back to the target window
+///    before the real keystrokes go out.
+///
+/// Fails closed rather than blindly typing: a failed replay click
+/// ([`backend::ComputerBackend::click`] itself erroring) propagates as this
+/// function's own `Err` instead of falling through to `type_text`/`key`.
+/// The defensive `None` branch (no fresh coordinate on file) should be
+/// unreachable in practice — `require_recent_focus` already required one to
+/// even get this far — but is handled as an explicit, actionable error
+/// rather than an `unwrap`/`expect`/panic, per this module's own fail-closed
+/// discipline: a record that was evicted or raced out from under this call
+/// between the two lookups must re-prompt a fresh click, never proceed on a
+/// guess.
+fn reclaim_focus_if_interactive(
+    thread: i32,
+    dir: &str,
+    window_id: u32,
+    approval: Approval,
+) -> Result<(), String> {
+    if approval != Approval::Interactive {
+        return Ok(());
+    }
+    let Some((px, py)) = recent_click_position(thread, dir, window_id) else {
+        return Err(format!(
+            "the approval card took focus and no recent click position is on file for window \
+             {window_id} — click inside the target window again, then retry"
+        ));
+    };
+    backend::backend()
+        .click(px, py, MouseButton::Left, 1)
+        .map_err(|e| format!("failed to reclaim focus for window {window_id} before typing: {e}"))
 }
 
 // —— screenshot → MCP image content + Ask-card preview registry (issue #160 M3-B) ——
@@ -1063,6 +1188,48 @@ fn acquire_and_throttle(thread: i32, dir: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The LAST gate every input branch of [`run_action`] clears, immediately
+/// after acquiring `computer::input_flight_guard()` and before it touches the
+/// backend at all (issue #160 round-3 P1 §2): re-verify the kill switch AND
+/// that the control lease this call took in [`acquire_and_throttle`] is
+/// STILL held by THIS EXACT `(thread, dir)`.
+///
+/// Why this is needed on top of every earlier check: `input_flight_guard` is
+/// a single process-wide mutex a SECOND `tools/call` for the SAME session
+/// can queue on for as long as the FIRST call's own backend round trip takes
+/// (see that function's own doc comment on why it's held for the whole
+/// backend call). While a caller sits in that queue, a human can hit Stop —
+/// disabling the setting and clearing the control lease
+/// (`computer::emergency_stop`) — or, once the lease self-heals on expiry, a
+/// completely different `(thread, dir)` could acquire it first. Neither
+/// `approve`'s own post-await recheck (issue #160 round-2 P1 §1, which only
+/// re-runs once, right after the approval gate, long before the guard is
+/// even requested) nor `acquire_and_throttle`'s own `acquire_control` call
+/// (which already ran, successfully, before this caller ever started
+/// queuing) catch either of those — this is the ONE checkpoint positioned
+/// AFTER the queue itself, so a call that waited behind someone else's long
+/// hold sees the world as it is NOW, not as it was when it first queued.
+///
+/// `Ok` requires BOTH: [`computer::enabled`] still true, AND
+/// [`computer::control_state`] naming this EXACT `(thread, dir)` as the
+/// current holder — a DIFFERENT holder, or no holder at all (an expired or
+/// force-cleared lease), both fail closed rather than let a call that no
+/// longer holds the lease it thinks it does reach the backend anyway.
+async fn recheck_after_guard(db: &Db, thread: i32, dir: &str) -> Result<(), String> {
+    if !computer::enabled(db).await {
+        return Err(ComputerError::Disabled.to_string());
+    }
+    match computer::control_state() {
+        Some(holder) if holder.thread == thread && holder.dir == dir => Ok(()),
+        Some(holder) => Err(ComputerError::Busy { thread: holder.thread, dir: holder.dir }.to_string()),
+        None => Err(
+            "the control lease was lost while this call was queued (it may have expired, or been \
+             cleared by a kill switch) — retry"
+                .to_string(),
+        ),
+    }
+}
+
 /// Resolve `window_query` to exactly one window and map `(cx, cy)` — a
 /// screenshot-space coordinate — to that window's current physical position.
 /// Re-resolves the window FRESH every call (this turn's `list_windows`, not
@@ -1084,6 +1251,16 @@ fn resolve_window_id(window_query: &str) -> Result<u32, String> {
         .map_err(|e| e.to_string())
 }
 
+/// `arr[0]`/`arr[1]` must each fit `u32` — issue #160 round-3 P2 §3: this
+/// used to read each as `i64` then cast `as u32`, which silently WRAPS an
+/// in-range-for-i64-but->u32::MAX value (e.g. `4294967296` — `2^32` — casts
+/// straight to `0`), letting an absurd JSON integer sail past the "must be
+/// non-negative" filter and land on a real, in-bounds-looking coordinate
+/// instead of being rejected. `u32::try_from` fails (rather than wrapping)
+/// for anything outside `0..=u32::MAX`, including negatives, so the single
+/// `.and_then` below both replaces the old separate `>= 0` filter and closes
+/// the overflow hole with the SAME existing error text — no behavior change
+/// for any value that was already being accepted or rejected correctly.
 fn parse_coordinate(args: &Value, key: &str) -> Result<(u32, u32), String> {
     let Some(arr) = args.get(key).and_then(|v| v.as_array()) else {
         return Err(format!("missing required '{key}': [x, y]"));
@@ -1091,10 +1268,10 @@ fn parse_coordinate(args: &Value, key: &str) -> Result<(u32, u32), String> {
     if arr.len() != 2 {
         return Err(format!("'{key}' must be exactly [x, y]"));
     }
-    let x = arr[0].as_i64().filter(|v| *v >= 0);
-    let y = arr[1].as_i64().filter(|v| *v >= 0);
+    let x = arr[0].as_i64().and_then(|v| u32::try_from(v).ok());
+    let y = arr[1].as_i64().and_then(|v| u32::try_from(v).ok());
     match (x, y) {
-        (Some(x), Some(y)) => Ok((x as u32, y as u32)),
+        (Some(x), Some(y)) => Ok((x, y)),
         _ => Err(format!("'{key}' must be two non-negative integers [x, y]")),
     }
 }
@@ -1399,6 +1576,29 @@ mod tests {
         assert!(parse_coordinate(&json!({"coordinate": [-1, 20]}), "coordinate").is_err());
     }
 
+    /// issue #160 round-3 P2 §3: a JSON integer that fits `i64` but overflows
+    /// `u32` (here `2^32` exactly) used to wrap `as u32` straight to `0` —
+    /// silently passing the "non-negative" check and landing on a real,
+    /// in-bounds-looking coordinate instead of being rejected. Covers both
+    /// `x` and `y`, and both `coordinate` and `start_coordinate` share this
+    /// same helper (`key` is just a label), so one fix covers both call
+    /// sites in `run_action`.
+    #[test]
+    fn parse_coordinate_rejects_values_above_u32_max_without_wrapping() {
+        let err = parse_coordinate(&json!({"coordinate": [4_294_967_296i64, 0]}), "coordinate").unwrap_err();
+        assert!(err.contains("non-negative"), "{err}");
+        let err_y = parse_coordinate(&json!({"coordinate": [0, 4_294_967_296i64]}), "coordinate").unwrap_err();
+        assert!(err_y.contains("non-negative"), "{err_y}");
+        let err_start = parse_coordinate(&json!({"start_coordinate": [4_294_967_296i64, 0]}), "start_coordinate")
+            .unwrap_err();
+        assert!(err_start.contains("non-negative"), "{err_start}");
+        // The last value that DOES fit must still be accepted.
+        assert_eq!(
+            parse_coordinate(&json!({"coordinate": [u32::MAX as i64, 0]}), "coordinate").unwrap(),
+            (u32::MAX, 0)
+        );
+    }
+
     // —— issue #160 round-2 P2: `required_window` ——
 
     #[test]
@@ -1471,7 +1671,7 @@ mod tests {
     #[test]
     fn require_recent_focus_passes_right_after_a_click_on_the_same_window() {
         let thread = 900_001;
-        record_click_focus(thread, "lead", 7);
+        record_click_focus(thread, "lead", 7, 1, 1);
         assert!(require_recent_focus(thread, "lead", 7).is_ok());
     }
 
@@ -1486,7 +1686,7 @@ mod tests {
     #[test]
     fn require_recent_focus_rejects_a_click_on_a_different_window() {
         let thread = 900_003;
-        record_click_focus(thread, "lead", 7); // clicked window A (id 7)
+        record_click_focus(thread, "lead", 7, 1, 1); // clicked window A (id 7)
         let err = require_recent_focus(thread, "lead", 8).unwrap_err(); // typing into B (id 8)
         assert!(err.contains("8"), "error should name the window that lacks focus: {err}");
     }
@@ -1495,7 +1695,7 @@ mod tests {
     fn require_recent_focus_is_scoped_per_thread_dir() {
         let thread_a = 900_004;
         let thread_b = 900_005;
-        record_click_focus(thread_a, "lead", 7);
+        record_click_focus(thread_a, "lead", 7, 1, 1);
         // A click recorded for a DIFFERENT (thread, dir) must not satisfy
         // this one's focus check — the registry is per-session, not global.
         assert!(require_recent_focus(thread_b, "lead", 7).is_err());
@@ -1511,9 +1711,102 @@ mod tests {
         // pre-expired timestamp instead of a real-time wait.
         {
             let mut g = recent_clicks().lock().unwrap();
-            g.insert((thread, "lead".to_string()), (7, now_ms() - FOCUS_FRESHNESS_MS - 1));
+            g.insert((thread, "lead".to_string()), (7, 1, 1, now_ms() - FOCUS_FRESHNESS_MS - 1));
         }
         assert!(require_recent_focus(thread, "lead", 7).is_err());
+    }
+
+    // —— issue #160 round-3 P1 §1: reclaim_focus_if_interactive ——
+
+    /// The end-to-end property the round-3 P1 §1 fix exists for: an
+    /// `Interactive` approval (a card that ACTUALLY appeared and a human
+    /// clicked Weft's own UI to answer) must replay the exact last-click
+    /// coordinate before `type`/`key` proceeds; an `Auto` approval (a
+    /// standing grant, no card, focus never moved) must be a complete no-op
+    /// — no backend call at all, regardless of what's on file.
+    #[test]
+    fn reclaim_focus_if_interactive_replays_the_last_click_only_for_an_interactive_approval() {
+        let mock = std::sync::Arc::new(computer::mock::MockBackend::default());
+        backend::_set_backend_override(mock.clone());
+
+        let thread = 902_001;
+        let dir = "lead";
+        record_click_focus(thread, dir, 7, 111, 222);
+
+        // Auto: no card ever appeared, so focus never left — must never
+        // touch the backend.
+        assert!(reclaim_focus_if_interactive(thread, dir, 7, Approval::Auto).is_ok());
+        assert!(
+            mock.actions.lock().unwrap().is_empty(),
+            "an Auto approval must never replay a click"
+        );
+
+        // Interactive: a human just answered a real card — must replay the
+        // EXACT (px, py) the last click recorded, as a single left click.
+        assert!(reclaim_focus_if_interactive(thread, dir, 7, Approval::Interactive).is_ok());
+        let actions = mock.actions.lock().unwrap();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0], "click 111,222 Left x1", "{actions:?}");
+    }
+
+    /// Defensive branch: `require_recent_focus` should already have blocked
+    /// any `type`/`key` call that reaches here without a fresh click on
+    /// file, but this function must fail closed (an actionable error, never
+    /// an `unwrap`/panic/silent guess) rather than assume some default
+    /// coordinate if that invariant is ever violated. `Auto` never looks at
+    /// the recorded click at all, so it stays `Ok` regardless.
+    #[test]
+    fn reclaim_focus_if_interactive_fails_closed_without_a_fresh_click_on_file() {
+        let thread = 902_002;
+        let dir = "lead";
+        let err = reclaim_focus_if_interactive(thread, dir, 7, Approval::Interactive).unwrap_err();
+        assert!(err.contains("click"), "{err}");
+        assert!(reclaim_focus_if_interactive(thread, dir, 7, Approval::Auto).is_ok());
+    }
+
+    // —— issue #160 round-3 P1 §2: recheck_after_guard ——
+
+    /// One test exercises `recheck_after_guard`'s whole matrix sequentially,
+    /// mirroring `computer::tests::control_lock_busy_expiry_release_and_clear`'s
+    /// own reasoning: this touches the SAME process-wide control-lease
+    /// static as every other `computer::acquire_control`-touching test in
+    /// this binary, so splitting these scenarios across separate `#[test]`s
+    /// would let `cargo test`'s default parallel threads race each other's
+    /// lease state.
+    #[tokio::test]
+    async fn recheck_after_guard_covers_disabled_foreign_lease_missing_lease_and_the_happy_path() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let thread = 905_001;
+        let dir = "lead";
+
+        // Disabled setting denies regardless of the lease.
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "false").await.unwrap();
+        computer::clear_control();
+        let err = recheck_after_guard(&db, thread, dir).await.unwrap_err();
+        assert!(err.to_lowercase().contains("disabled"), "{err}");
+
+        // Enabled, but nobody holds the lease at all (it expired, or was
+        // cleared by an emergency stop while this call was queued) — denied,
+        // not silently allowed just because the setting itself reads true.
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        computer::clear_control();
+        let err = recheck_after_guard(&db, thread, dir).await.unwrap_err();
+        assert!(!err.to_lowercase().contains("disabled"), "{err}");
+
+        // Enabled, but a DIFFERENT (thread, dir) now holds the lease
+        // (preempted while this call was queued behind the flight guard) —
+        // denied.
+        computer::acquire_control(999_999, "someone-else").unwrap();
+        let err = recheck_after_guard(&db, thread, dir).await.unwrap_err();
+        assert!(err.contains("999999") || err.contains("someone-else"), "{err}");
+        computer::clear_control();
+
+        // Enabled AND this exact (thread, dir) still holds the lease —
+        // passes.
+        computer::acquire_control(thread, dir).unwrap();
+        assert!(recheck_after_guard(&db, thread, dir).await.is_ok());
+
+        computer::clear_control();
     }
 
     // —— issue #160 round-2 P1 §1: re-check the kill switch AFTER approval ——

@@ -26,7 +26,7 @@ pub mod mock;
 mod os;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -387,9 +387,23 @@ pub fn map_to_physical(w: &WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), C
     Ok((px, py))
 }
 
+/// Process-level nonce appended to every screenshot's filename (issue #160
+/// round-3 P2 §4): two `screenshot` calls for the SAME window landing in the
+/// SAME millisecond used to compute the IDENTICAL `<unix_ms>-<window_id>.png`
+/// path and race each other's `image::save` — whichever call's write lands
+/// second silently overwrites the first call's own PNG at that exact path,
+/// even though both calls reported a successful save. `fetch_add` is
+/// monotonically increasing for the life of the process (never reset, never
+/// reused, and atomic across any number of concurrent callers), so no two
+/// `screenshot_window` calls can ever collide on a filename again, no matter
+/// how close together in time.
+static SHOT_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Match `query` against the backend's visible windows, capture the ONE hit,
 /// downscale it (see [`scale_capture`]/[`display_scale`]), and write it to
-/// `out_dir/<unix_ms>-<id>.png` (`out_dir` is created if missing).
+/// `out_dir/<unix_ms>-<id>-<seq>.png` (`out_dir` is created if missing) — the
+/// trailing `<seq>` is [`SHOT_SEQ`]'s own collision-proofing nonce (issue
+/// #160 round-3 P2 §4), not derived from anything about the capture itself.
 pub fn screenshot_window(
     backend: &dyn backend::ComputerBackend,
     query: &str,
@@ -405,7 +419,8 @@ pub fn screenshot_window(
         .duration_since(UNIX_EPOCH)
         .map_err(|e| ComputerError::Io(e.to_string()))?
         .as_millis();
-    let path = out_dir.join(format!("{unix_ms}-{}.png", matched.id));
+    let seq = SHOT_SEQ.fetch_add(1, Ordering::SeqCst);
+    let path = out_dir.join(format!("{unix_ms}-{}-{seq}.png", matched.id));
     image.save(&path).map_err(|e| ComputerError::Io(e.to_string()))?;
 
     Ok(Screenshot {
@@ -1068,6 +1083,29 @@ mod tests {
         assert_eq!(shot.scale, 0.5);
         let opened = image::open(&shot.path).unwrap();
         assert_eq!((opened.width(), opened.height()), (1280, 720));
+    }
+
+    /// issue #160 round-3 P2 §4: two `screenshot_window` calls for the SAME
+    /// window with the SAME args (so a naive `<unix_ms>-<id>.png` filename
+    /// scheme could genuinely collide if both land in the same millisecond)
+    /// must never overwrite each other — each gets its own path, and both
+    /// files must actually exist afterward.
+    #[test]
+    fn screenshot_window_gives_each_call_a_unique_path_even_in_the_same_millisecond() {
+        let backend = mock::MockBackend {
+            windows: vec![window_sized(9, "Notes", "Untitled", 800, 600)],
+            image: Some(solid_image(800, 600, 5)),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let shot1 = screenshot_window(&backend, "9", tmp.path()).unwrap();
+        let shot2 = screenshot_window(&backend, "9", tmp.path()).unwrap();
+        assert_ne!(
+            shot1.path, shot2.path,
+            "two calls with identical args must never collide on the same filename"
+        );
+        assert!(shot1.path.exists());
+        assert!(shot2.path.exists());
     }
 
     // —— encode_jpeg_data_uri (issue #160 M3-B) ——
