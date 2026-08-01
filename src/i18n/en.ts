@@ -841,6 +841,8 @@ export const en = {
     computerControlActive:
       "An agent is controlling the desktop (task {{dir}} in thread {{thread}}). Press Esc or click Stop to cut it off.",
     computerControlStop: "Stop",
+    computerControlStopFailed:
+      "Emergency stop is active for this session but couldn't be saved — computer use may re-enable after restart. Retry, or check disk space.",
     detecting: "Detecting…",
     installed: "installed",
     installedVersion: "v{{version}}",

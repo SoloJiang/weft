@@ -51,6 +51,21 @@ pub trait ComputerBackend: Send + Sync {
     /// (there is exactly one system cursor), so this never needs a window
     /// query.
     fn cursor_position(&self) -> Result<(i32, i32), ComputerError>;
+    /// Bring window `id` to the foreground and give it OS keyboard/mouse
+    /// focus (issue #160 round-4 P1 §2) — the ONLY mechanism
+    /// `bus::computer_srv::activate_if_interactive` uses to hand focus back
+    /// to a target window after a Needs-you approval card took the
+    /// foreground away from it. Replaces the earlier "replay the last click"
+    /// hack: an absolute-coordinate replay risks landing on whatever now
+    /// covers that physical point (Weft's own card, if it's still up), and
+    /// has its own side effects (collapsing a text selection, re-toggling a
+    /// button) a pure window-raise does not. `Err(ComputerError::Unsupported)`
+    /// when the backend has no way to do this at all (`StubBackend`'s
+    /// permanent case; a real backend that couldn't find any activation API
+    /// on this platform) — callers fail closed on that, never falling
+    /// through to drive input into a window that may not actually have the
+    /// foreground.
+    fn activate_window(&self, id: u32) -> Result<(), ComputerError>;
 }
 
 /// Test-only override, set at most once per process (see
@@ -139,6 +154,12 @@ impl ComputerBackend for StubBackend {
     fn cursor_position(&self) -> Result<(i32, i32), ComputerError> {
         Err(ComputerError::Unsupported(
             "built without computer-os feature".into(),
+        ))
+    }
+
+    fn activate_window(&self, _id: u32) -> Result<(), ComputerError> {
+        Err(ComputerError::Unsupported(
+            "window activation needs the computer-os backend".into(),
         ))
     }
 }

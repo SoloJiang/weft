@@ -149,6 +149,158 @@ impl ComputerBackend for OsBackend {
             .location()
             .map_err(|e| ComputerError::Unsupported(e.to_string()))
     }
+
+    fn activate_window(&self, id: u32) -> Result<(), ComputerError> {
+        activate_window_impl(id)
+    }
+}
+
+// —— window activation (issue #160 round-4 P1 §2) ——
+//
+// Neither `xcap` (window enumeration/capture) nor `enigo` (input injection —
+// this module's other dependency) exposes a "raise/focus this window" API,
+// and this crate cannot add a new Cargo dependency just for this (see the
+// allow-list this fix was scoped against), so each platform below reaches
+// for whatever ALREADY-available system mechanism can do it: an OS binary
+// every real install of that OS ships (macOS/Linux), or a direct FFI call
+// into a system DLL that is always present and linkable without a new crate
+// (Windows' own `user32.dll`). `id` is always the SAME value this module's
+// own `list_windows`/`resolve_window` already hand back for this window (see
+// `window_info` below and `xcap`'s own per-platform `Window::id()`), so
+// every platform's own implementation reconstructs whatever it needs FROM
+// that id rather than threading a second identifier through.
+
+#[cfg(target_os = "macos")]
+fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
+    // macOS has no public API to raise a SPECIFIC window within a
+    // multi-window app without the Accessibility (AX) API's own window
+    // handle, which `xcap` does not expose — so this activates at the APP
+    // level instead (`NSRunningApplication`/System Events process
+    // activation), the best-effort approximation the round-4 review's own
+    // "NSRunningApplication ... 或 CGWindow 层激活" guidance calls for.
+    // Resolves `id`'s owning pid via `xcap` (the SAME window list this
+    // module's own `list_windows`/`capture_window` already re-fetch on every
+    // call — see those methods above), then shells out to `osascript`
+    // (System Events) rather than raw `NSRunningApplication` Objective-C
+    // runtime FFI: `osascript` ships on every real macOS install, needs no
+    // new Cargo dependency, and needs no hand-rolled `objc_msgSend` calls
+    // this crate cannot verify compile *or* run in this container (see this
+    // module's own build-time note).
+    let windows = xcap::Window::all().map_err(|e| ComputerError::Unsupported(e.to_string()))?;
+    let target = windows
+        .iter()
+        .find(|w| matches!(w.id(), Ok(wid) if wid == id))
+        .ok_or_else(|| ComputerError::CaptureFailed(format!("window {id} is no longer visible")))?;
+    let pid = target.pid().map_err(|e| ComputerError::Unsupported(e.to_string()))?;
+
+    let script = format!(
+        "tell application \"System Events\" to set frontmost of (first process whose unix id is {pid}) to true"
+    );
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| ComputerError::Unsupported(format!("osascript: {e}")))?;
+    if !output.status.success() {
+        return Err(ComputerError::Unsupported(format!(
+            "osascript activation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
+    // Direct `user32.dll` FFI rather than a new Cargo dependency on the
+    // `windows` crate `xcap` itself uses internally but does not re-export
+    // (see `xcap::lib`'s own `pub use` list) — `user32.dll` ships on every
+    // Windows install and is always linkable without adding anything to
+    // `Cargo.toml`. `id` is the SAME truncated-to-`u32` `HWND` value `xcap`'s
+    // own Windows backend already hands back as `Window::id()` (it does
+    // `self.hwnd.0 as u32` — see `xcap::windows::impl_window`), so widening
+    // it back to a pointer-sized value here reconstructs the real handle for
+    // every window this module can already resolve by id in the first place
+    // — the SAME assumption every other action in this file already makes
+    // (there is no OTHER id this crate's own window list could hand back).
+    #[allow(non_snake_case)]
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetForegroundWindow(hwnd: isize) -> i32;
+        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+        fn IsIconic(hwnd: isize) -> i32;
+    }
+    const SW_RESTORE: i32 = 9;
+    let hwnd = id as isize;
+    // Safety: `SetForegroundWindow`/`ShowWindow`/`IsIconic` are ordinary
+    // `user32.dll` calls taking a plain window handle and returning a status
+    // code — no raw pointers are dereferenced on the Rust side, and passing
+    // a stale/invalid handle is defined by Win32 to fail the call (returning
+    // 0/`FALSE`), never undefined behavior.
+    unsafe {
+        // A minimized window can't become the foreground window until it's
+        // restored first — best-effort: ignore `ShowWindow`'s own result,
+        // the `SetForegroundWindow` call right after is the one whose
+        // success actually matters here.
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        if SetForegroundWindow(hwnd) == 0 {
+            return Err(ComputerError::Unsupported(
+                "SetForegroundWindow failed — the window may no longer exist, or Windows refused \
+                 the foreground request (it enforces its own focus-stealing rules)"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
+    // Shells out to whichever of `wmctrl`/`xdotool` is actually installed,
+    // rather than linking `libX11` directly: `xcap`'s own Linux backend
+    // talks to the X server via the pure-Rust `xcb` crate (see
+    // `xcap::linux::impl_window`), not `libX11.so`, so there is no guarantee
+    // that shared library is even linkable on every machine this runs on.
+    // These two command-line tools are the standard, widely-packaged way
+    // desktop scripts already raise/focus an X11 window by id — `wmctrl -i
+    // -a` sends the exact `_NET_ACTIVE_WINDOW` client message the round-4
+    // review names; `xdotool windowactivate` is the fallback when it isn't
+    // installed. Neither is guaranteed present (a hard requirement no NEW
+    // Cargo dependency could fix anyway on a Wayland desktop with neither
+    // tool packaged), so any failure here is `Unsupported`, never a panic or
+    // a silent no-op. `id` is the raw X11 window id `xcap`'s own Linux
+    // backend already hands back unchanged as `Window::id()` (see
+    // `xcap::linux::impl_window`), so both tools can address it directly —
+    // `wmctrl -i` wants it as a `0x`-prefixed hex string.
+    let hex_id = format!("0x{id:08x}");
+    if let Ok(output) = std::process::Command::new("wmctrl").args(["-i", "-a", &hex_id]).output() {
+        if output.status.success() {
+            return Ok(());
+        }
+    }
+    if let Ok(output) = std::process::Command::new("xdotool")
+        .args(["windowactivate", "--sync", &id.to_string()])
+        .output()
+    {
+        if output.status.success() {
+            return Ok(());
+        }
+    }
+    Err(ComputerError::Unsupported(
+        "couldn't activate the window — neither `wmctrl` nor `xdotool` is available/succeeded \
+         (install one of them, or grant this window an Always approval to avoid needing focus \
+         reclaim at all)"
+            .into(),
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn activate_window_impl(_id: u32) -> Result<(), ComputerError> {
+    Err(ComputerError::Unsupported(
+        "window activation isn't implemented for this platform".into(),
+    ))
 }
 
 fn new_enigo() -> Result<Enigo, ComputerError> {

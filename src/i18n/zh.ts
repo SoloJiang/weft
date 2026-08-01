@@ -811,6 +811,8 @@ export const zh = {
     computerControlActive:
       "有 agent 正在控制桌面（任务 {{dir}}，线程 {{thread}}）。按 Esc 或点击「立即停止」即可中断。",
     computerControlStop: "立即停止",
+    computerControlStopFailed:
+      "本次运行的急停已生效，但设置未能保存——重启后 computer use 可能重新启用。请重试，或检查磁盘空间是否充足。",
     detecting: "检测中…",
     installed: "已安装",
     installedVersion: "v{{version}}",

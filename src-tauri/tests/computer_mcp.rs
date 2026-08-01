@@ -604,6 +604,11 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     let card = wait_for_card(&asks_handle, "left_click with no standing grant").await;
     assert_eq!(card.tool, "computer", "the gate's own card must self-identify as \"computer\", not an engine name");
     assert_eq!(card.summary, "computer: left_click @ notes");
+    // issue #160 round-4 P1 §1: only `action == "type"` ever carries a
+    // `detail_redacted` — a `left_click`'s detail (a coordinate) has nothing
+    // this module considers secret, so the IM bridge falls back to the full
+    // `detail` unchanged.
+    assert!(card.detail_redacted.is_none(), "{card:?}");
     assert!(asks_handle.answer(card.id, Answer::Deny));
     let out = call.await.unwrap();
     assert!(out.contains("denied"), "a Denied gate card must reject the call: {out}");
@@ -622,8 +627,13 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert!(out.contains("left_click") && out.contains("done"), "{out}");
     assert_eq!(
         mock.actions.lock().unwrap().len(),
-        clicks_before + 1,
-        "the Allowed call must reach the backend exactly once"
+        // issue #160 round-4 P1 §2: this Allow is an Interactive approval (a
+        // real card just appeared) — the click family now activates the
+        // target window first, so this call records TWO backend actions
+        // (`activate`, then `click`), not one.
+        clicks_before + 2,
+        "the Allowed call must reach the backend exactly once (activate + click): {:?}",
+        mock.actions.lock().unwrap()
     );
 
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -631,7 +641,8 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // The THIRD, identical action_key (same action + same window) must skip
     // the card entirely now — the Always grant from the previous answer
     // auto-decides it, mirroring `bus::server::handle_ask`'s own Always
-    // semantics for every other tool.
+    // semantics for every other tool. An Auto approval never activates, so
+    // this adds exactly ONE more action (the click itself).
     let out = rpc(
         &base,
         gate_thread,
@@ -644,8 +655,9 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert!(asks_handle.open().is_empty(), "an Always-covered action must never surface a card");
     assert_eq!(
         mock.actions.lock().unwrap().len(),
-        clicks_before + 2,
-        "the Always-covered call must still reach the backend"
+        clicks_before + 3,
+        "the Always-covered call must still reach the backend, with no activate call: {:?}",
+        mock.actions.lock().unwrap()
     );
 
     // 11. §4: a missing/blank `window` on a window-scoped action is rejected
@@ -763,16 +775,23 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     .await;
     assert!(out.to_lowercase().contains("focus"), "{out}");
 
-    // —— round-3 P1 §1: an Interactive approval must reclaim OS focus ——
+    // —— round-4 P1 §2: an Interactive approval must reactivate the target window ——
     //
-    // The real hazard: click target window (focus -> target) -> `approve`
-    // cards the FOLLOWING `type`/`key` -> a human answers it by clicking
-    // Weft's own UI (focus -> Weft) -> without a fix, the keystrokes go to
-    // Weft, not the target. A brand-new, deliberately UNGRANTED (thread,
-    // dir) so both the click and the first `type` each surface a REAL card
-    // (an `Interactive` approval); a THIRD call pre-seeds an Always grant so
-    // `auto_decision` decides it silently (an `Auto` approval, no card, focus
-    // never moves) and must NOT replay a click.
+    // The real hazard: click target window (foreground -> target) -> `approve`
+    // cards the FOLLOWING input action -> a human answers it by clicking
+    // Weft's own UI (foreground -> Weft) -> without a fix, the action goes to
+    // Weft, not the target (or an absolute-coordinate click lands on Weft's
+    // own card). A brand-new, deliberately UNGRANTED (thread, dir) so both
+    // the click and the first `type` each surface a REAL card (an
+    // `Interactive` approval); a THIRD call pre-seeds an Always grant so
+    // `auto_decision` decides it silently (an `Auto` approval, no card, the
+    // foreground never moves) and must NOT call `activate_window`; a FOURTH
+    // simulates the backend having no activation API at all (`Unsupported`)
+    // and must fail closed, never letting the real action through.
+    //
+    // "notes" always resolves to window id 1 (see the `WindowInfo` list this
+    // whole test installed above) — every `activate N` assertion below names
+    // that id.
 
     let (refocus_thread, refocus_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
     let refocus_dir_s = refocus_dir.to_string();
@@ -781,17 +800,21 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
 
     // 13a. left_click on "notes" — no standing grant, so a real card
     // appears; a plain Allow (not Always) is an ordinary Interactive
-    // approval, exactly like any other first-time click.
+    // approval, exactly like any other first-time click. The click family
+    // itself is now activate-gated too (issue #160 round-4 P1 §2: an
+    // absolute-coordinate click can land on Weft's own card if it now covers
+    // the target's on-screen position), so `activate 1` must appear
+    // immediately before the click.
     let call = spawn_computer_call(&base, refocus_thread, refocus_dir_s.clone(), "left_click", "notes");
-    let card = wait_for_card(&asks_handle, "refocus scenario: initial left_click").await;
+    let card = wait_for_card(&asks_handle, "activate scenario: initial left_click").await;
     assert!(asks_handle.answer(card.id, Answer::Allow));
     let out = call.await.unwrap();
     assert!(out.contains("left_click") && out.contains("done"), "{out}");
     let baseline = mock.actions.lock().unwrap().len();
     assert_eq!(
-        mock.actions.lock().unwrap()[baseline - 1],
-        "click 1,1 Left x1",
-        "{:?}",
+        mock.actions.lock().unwrap()[baseline - 2..],
+        ["activate 1".to_string(), "click 1,1 Left x1".to_string()],
+        "an Interactive approval must activate the target window BEFORE the click: {:?}",
         mock.actions.lock().unwrap()
     );
 
@@ -799,9 +822,9 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
 
     // 13b. `type` into the SAME window — also ungranted, so a NEW card
     // appears (a different action_key than the click's). Answering Allow
-    // here is an Interactive approval: the card itself dragged OS focus to
-    // Weft, so the fix must replay the (1, 1) click from 13a BEFORE the
-    // actual keystrokes reach the backend.
+    // here is an Interactive approval: the card itself took the foreground,
+    // so the fix must reactivate window 1 BEFORE the actual keystrokes reach
+    // the backend.
     let text_interactive = "hi-refocus".to_string();
     let call = {
         let base = base.clone();
@@ -818,7 +841,21 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
             .await
         })
     };
-    let card = wait_for_card(&asks_handle, "refocus scenario: type").await;
+    let card = wait_for_card(&asks_handle, "activate scenario: type").await;
+    // issue #160 round-4 P1 §1: the LOCAL card still carries the raw typed
+    // text (the human deciding must see it), but its `detail_redacted` must
+    // never carry it — this is the exact leak the fix closes, since this
+    // very `Ask` is what an IM bridge (if one were installed) would render
+    // into an outbound card before the human ever answers.
+    assert!(card.detail.contains(&text_interactive), "the local card must show the raw text: {card:?}");
+    let redacted = card
+        .detail_redacted
+        .as_deref()
+        .expect("a type action's Ask must carry detail_redacted");
+    assert!(
+        !redacted.contains(&text_interactive),
+        "detail_redacted must never contain the raw typed text: {redacted}"
+    );
     assert!(asks_handle.answer(card.id, Answer::Allow));
     let out = call.await.unwrap();
     assert!(out.contains("typed") && out.contains("done"), "{out}");
@@ -828,13 +865,10 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         assert_eq!(
             actions.len(),
             baseline + 2,
-            "an Interactive approval must replay the click BEFORE typing — expected \
-             [..., refocus click, type]: {actions:?}"
+            "an Interactive approval must activate the window BEFORE typing — expected \
+             [..., activate, type]: {actions:?}"
         );
-        assert_eq!(
-            actions[baseline], "click 1,1 Left x1",
-            "the refocus click must replay the SAME (px, py) as the last recorded click: {actions:?}"
-        );
+        assert_eq!(actions[baseline], "activate 1", "{actions:?}");
         assert_eq!(actions[baseline + 1], format!("type {text_interactive}"), "{actions:?}");
     }
 
@@ -842,9 +876,9 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
 
     // 13c. Auto path: pre-seed an Always grant for a SECOND `type` call (a
     // DIFFERENT `text`, hence a DIFFERENT action_key from 13b's) so
-    // `auto_decision` decides Allow WITHOUT a card ever appearing — OS focus
-    // never leaves the target window in this path, so no refocus click
-    // should be recorded.
+    // `auto_decision` decides Allow WITHOUT a card ever appearing — the
+    // foreground never leaves the target window in this path, so no
+    // `activate` call should be recorded.
     let text_auto = "auto-no-refocus".to_string();
     let type_always_key = weft::ask::action_key(&[
         "gui",
@@ -862,10 +896,10 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     });
 
     // A fresh click first (re-establishing freshness) — itself ungranted, so
-    // it surfaces its own card; its OWN action_key is unrelated to the
-    // Always grant just seeded for `type`.
+    // it surfaces its own card (and its own `activate` call); its OWN
+    // action_key is unrelated to the Always grant just seeded for `type`.
     let call = spawn_computer_call(&base, refocus_thread, refocus_dir_s.clone(), "left_click", "notes");
-    let card = wait_for_card(&asks_handle, "refocus scenario: pre-auto click").await;
+    let card = wait_for_card(&asks_handle, "activate scenario: pre-auto click").await;
     assert!(asks_handle.answer(card.id, Answer::Allow));
     call.await.unwrap();
     let baseline_auto = mock.actions.lock().unwrap().len();
@@ -888,11 +922,36 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         assert_eq!(
             actions.len(),
             baseline_auto + 1,
-            "an Auto approval must NOT replay a refocus click — expected exactly ONE new action \
+            "an Auto approval must NOT activate the window — expected exactly ONE new action \
              (the type itself): {actions:?}"
         );
         assert_eq!(actions[baseline_auto], format!("type {text_auto}"), "{actions:?}");
     }
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // 13d. Fail-closed: the backend can't activate the window at all
+    // (simulated via `MockBackend::fail_activate`, standing in for
+    // `Unsupported` — `StubBackend`'s permanent case, or a real backend that
+    // found no activation API). An Interactive approval must reject the
+    // call outright — neither an `activate` NOR the real click may ever
+    // reach the backend.
+    mock.fail_activate.store(true, std::sync::atomic::Ordering::SeqCst);
+    let before_fail_closed = mock.actions.lock().unwrap().len();
+    let call = spawn_computer_call(&base, refocus_thread, refocus_dir_s.clone(), "left_click", "notes");
+    let card = wait_for_card(&asks_handle, "activate scenario: fail-closed on Unsupported activation").await;
+    assert!(asks_handle.answer(card.id, Answer::Allow));
+    let out = call.await.unwrap();
+    assert!(
+        !out.contains("done"),
+        "a broken activation must fail closed, never let the click reach the backend: {out}"
+    );
+    assert_eq!(
+        mock.actions.lock().unwrap().len(),
+        before_fail_closed,
+        "a fail-closed activation must record NEITHER an activate NOR the real click"
+    );
+    mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
 
     // —— round-3 P1 §2: recheck_after_guard ——
     //

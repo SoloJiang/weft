@@ -547,12 +547,12 @@ fn now_ms() -> u64 {
 ///
 /// issue #160 review R1 #5: the FIRST successful hold of an otherwise-unheld
 /// lease (nobody held it, or the previous lease had expired) — as opposed to
-/// a LIVE same-holder renewal — registers the OS-level global Escape
-/// shortcut ([`register_global_escape`]), so it exists only while a lease is
+/// a LIVE same-holder renewal — syncs the OS-level global Escape shortcut
+/// (see [`sync_shortcut_state`]), so it exists only while a lease is
 /// genuinely live.
 pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
     let now = now_ms();
-    let register_needed;
+    let sync_needed;
     {
         let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
@@ -566,16 +566,15 @@ pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
                     });
                 }
                 // A LIVE same-holder re-acquire is a renewal: the shortcut
-                // from the earlier acquire is still registered, so this
-                // skips re-registering it. Every other path that reaches
-                // here (nobody held it live, or the previous lease already
-                // expired) is a FRESH hold as far as the shortcut is
-                // concerned, even when `(thread, dir)` happens to match the
-                // previous holder — see `register_global_escape`'s doc for
-                // why a redundant registration attempt there is harmless.
-                register_needed = !(is_live && is_same_holder);
+                // from the earlier acquire is already registered and stays
+                // that way, so this skips syncing it again. Every other path
+                // that reaches here (nobody held it live, or the previous
+                // lease already expired) is a FRESH hold as far as the
+                // shortcut is concerned, even when `(thread, dir)` happens to
+                // match the previous holder.
+                sync_needed = !(is_live && is_same_holder);
             }
-            None => register_needed = true,
+            None => sync_needed = true,
         }
         *guard = Some(ControlHolderState {
             thread,
@@ -583,13 +582,17 @@ pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
             expires_at_ms: now + CONTROL_LEASE_MS,
         });
     }
-    // Registered OUTSIDE the mutex guard (issue #160 review R1 #5): the
-    // Escape callback spawns a task that eventually calls `clear_control`,
-    // which takes this SAME mutex — registering while still holding the
-    // lock here would risk a reentrant deadlock if that path ever collapsed
-    // onto this call synchronously.
-    if register_needed {
-        register_global_escape();
+    // Synced OUTSIDE the mutex guard (issue #160 review R1 #5): the Escape
+    // callback spawns a task that eventually calls `clear_control`, which
+    // takes this SAME mutex — acting while still holding the lock here would
+    // risk a reentrant deadlock if that path ever collapsed onto this call
+    // synchronously. issue #160 round-4 P2 §4: this is why the DECISION
+    // ("does the shortcut need to change") is taken inside the lock above,
+    // but the ACTUAL register/unregister call is [`sync_shortcut_state`] —
+    // see that function's own doc for how it closes the race a bare
+    // `register_global_escape()` call here would reopen.
+    if sync_needed {
+        sync_shortcut_state();
     }
     Ok(())
 }
@@ -607,36 +610,47 @@ pub fn release_control(thread: i32, dir: &str) {
     }
 }
 
+/// The state-mutation half of [`control_state`]'s lazy-expiry cleanup,
+/// split out purely so a unit test can drive it and [`sync_shortcut_state`]
+/// as two SEPARATE steps with another caller's own full acquire/sync cycle
+/// injected in between — deterministically reproducing the exact
+/// interleaving issue #160 round-4 P2 §4 fixes (see this section's own top
+/// doc comment) without depending on real thread scheduling. Not `pub`:
+/// [`control_state`] is still the only production entry point.
+fn control_state_detect_and_clear_if_expired() -> (Option<ControlHolder>, bool) {
+    let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let now = now_ms();
+    match guard.as_ref() {
+        Some(h) if h.expires_at_ms > now => (
+            Some(ControlHolder {
+                thread: h.thread,
+                dir: h.dir.clone(),
+                expires_at_ms: h.expires_at_ms,
+            }),
+            false,
+        ),
+        Some(_) => {
+            *guard = None;
+            (None, true)
+        }
+        None => (None, false),
+    }
+}
+
 /// The current holder, or `None` when nobody holds it OR the lease expired.
 /// An expired lease is cleaned up right here (lazily, on read) rather than
 /// left for the next [`acquire_control`] to notice — issue #160 review R1
-/// #5: that lazy cleanup is also this module's other unregister trigger for
-/// the OS-level global Escape shortcut ([`unregister_global_escape`]), since
-/// an expired lease means nobody is actually driving the desktop anymore.
+/// #5: that lazy cleanup is also this module's other sync trigger for the
+/// OS-level global Escape shortcut (see [`sync_shortcut_state`]), since an
+/// expired lease means nobody is actually driving the desktop anymore.
 pub fn control_state() -> Option<ControlHolder> {
-    let (result, expired) = {
-        let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-        let now = now_ms();
-        match guard.as_ref() {
-            Some(h) if h.expires_at_ms > now => (
-                Some(ControlHolder {
-                    thread: h.thread,
-                    dir: h.dir.clone(),
-                    expires_at_ms: h.expires_at_ms,
-                }),
-                false,
-            ),
-            Some(_) => {
-                *guard = None;
-                (None, true)
-            }
-            None => (None, false),
-        }
-    };
-    // Unregistered OUTSIDE the mutex guard — same reentrancy concern as
-    // `acquire_control`'s registration call.
+    let (result, expired) = control_state_detect_and_clear_if_expired();
+    // Synced OUTSIDE the mutex guard — same reentrancy concern as
+    // `acquire_control`'s own sync call. issue #160 round-4 P2 §4: this is
+    // the exact call site the race lived in — see [`sync_shortcut_state`]'s
+    // own doc for how re-reading `control_mutex` fresh, right here, closes it.
     if expired {
-        unregister_global_escape();
+        sync_shortcut_state();
     }
     result
 }
@@ -644,9 +658,14 @@ pub fn control_state() -> Option<ControlHolder> {
 /// Unconditionally drop the lease, regardless of who (if anyone) holds it —
 /// the emergency-stop escape hatch (see [`emergency_stop`]), which must win
 /// even over a session that still believes it's mid-lease. issue #160 review
-/// R1 #5: also unregisters the OS-level global Escape shortcut when there
-/// WAS a holder to clear (a no-op call when there wasn't one is skipped
-/// rather than attempted and swallowed).
+/// R1 #5: also syncs the OS-level global Escape shortcut when there WAS a
+/// holder to clear (a no-op call when there wasn't one is skipped rather than
+/// attempted and swallowed) — issue #160 round-4 P2 §4: this call site has
+/// the EXACT SAME "decide, unlock, then act" shape `control_state`'s own
+/// lazy-expiry path does (and the OS-level Escape callback itself reaches
+/// this via `emergency_stop`), so it goes through the SAME serialized
+/// [`sync_shortcut_state`] rather than a bare `unregister_global_escape()`
+/// call, for the identical race-closing reason.
 pub fn clear_control() {
     let had_holder = {
         let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
@@ -655,7 +674,7 @@ pub fn clear_control() {
         had_holder
     };
     if had_holder {
-        unregister_global_escape();
+        sync_shortcut_state();
     }
 }
 
@@ -694,6 +713,24 @@ pub async fn emergency_stop(db: &crate::store::Db) -> Result<(), String> {
 // `acquire_control`/`clear_control`/`control_state`'s hooks above) — never
 // for the whole app lifetime — so it doesn't permanently steal the system
 // Escape key from every other app on the human's desktop.
+//
+// issue #160 round-4 P2 §4: `control_state`'s lazy-expiry cleanup used to
+// decide "expired, nobody holds it anymore" INSIDE the `control_mutex`
+// guard, then call `unregister_global_escape()` AFTER releasing it. Between
+// that release and the unregister call actually running, a brand-new
+// `acquire_control` for a DIFFERENT `(thread, dir)` could acquire the
+// now-vacant lease and register its OWN shortcut — and the first caller's
+// now-STALE unregister call, still in flight, would then tear down the
+// brand-new holder's registration, leaving the new session's global
+// emergency-stop key silently gone. `sync_shortcut_state` below closes this:
+// every caller that might have changed "is anybody holding the lease"
+// (`acquire_control`, `control_state`'s expiry path, `clear_control`) goes
+// through this ONE serialized choke point instead of calling
+// `register_global_escape`/`unregister_global_escape` directly, and it
+// re-reads `control_mutex` FRESH the instant it gets its turn — so whichever
+// call actually executes LAST always leaves the OS-level shortcut matching
+// the CURRENT truth, never undoing a newer holder's registration with a
+// decision that was already stale by the time it ran.
 
 /// The Tauri app handle this module needs to register/unregister the
 /// OS-level global Escape shortcut. Set once, from `lib.rs`'s `setup()`
@@ -763,6 +800,66 @@ fn unregister_global_escape() {
     let Some(app) = APP_HANDLE.get() else { return };
     if let Err(err) = app.global_shortcut().unregister(escape_shortcut()) {
         eprintln!("[weft] unregister global Escape shortcut: {err}");
+    }
+}
+
+/// Serializes EVERY register/unregister decision+call for the OS-level
+/// global Escape shortcut (issue #160 round-4 P2 §4 — see this section's own
+/// top doc comment for the race this closes). A mutex of its OWN, SEPARATE
+/// from `control_mutex` — never held at the same time as it (only ever
+/// locked from inside [`sync_shortcut_state`], which takes and releases
+/// `control_mutex` for a quick read before touching this one) and never
+/// re-entered from within `register_global_escape`/`unregister_global_escape`
+/// themselves: the Escape callback that could reach back into this module
+/// runs on a LATER, independent task (`tauri::async_runtime::spawn`), never
+/// synchronously during `on_shortcut`/`unregister` itself, so holding this
+/// mutex across the OS call is safe.
+fn shortcut_mutex() -> &'static Mutex<()> {
+    static SHORTCUT: OnceLock<Mutex<()>> = OnceLock::new();
+    SHORTCUT.get_or_init(|| Mutex::new(()))
+}
+
+/// Test-only observability for [`sync_shortcut_state`]'s own decisions
+/// (issue #160 round-4 P2 §4) — `register_global_escape`/
+/// `unregister_global_escape` both silently no-op without a
+/// `tauri::AppHandle` (see their own doc comments), which `cargo test --lib`
+/// never installs, so a test can't observe the real OS-level call directly.
+/// These count every time `sync_shortcut_state` DECIDES to attempt one,
+/// regardless of what the underlying (no-op-in-tests) OS call itself did —
+/// enough to prove the SEQUENCING this fix cares about (did a stale cleanup
+/// try to undo a live registration) without a real desktop shortcut manager.
+#[cfg(test)]
+static SHORTCUT_REGISTER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static SHORTCUT_UNREGISTER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Bring the OS-level global Escape shortcut's registration in line with the
+/// control lease's CURRENT truth (issue #160 round-4 P2 §4) — the ONE choke
+/// point [`acquire_control`], [`control_state`], and [`clear_control`] all
+/// go through instead of calling `register_global_escape`/
+/// `unregister_global_escape` directly. [`shortcut_mutex`] ensures at most
+/// one of these runs at a time; each invocation re-reads `control_mutex`
+/// FRESH the instant it gets its turn, rather than trusting whatever
+/// "expired"/"had a holder" boolean its caller computed further up the call
+/// stack (which may already be stale by the time this runs) — so whichever
+/// call actually executes LAST always converges the OS-level shortcut to
+/// match the truth AT THAT MOMENT, regardless of how many earlier callers
+/// raced in with now-outdated decisions.
+fn sync_shortcut_state() {
+    let _serialize = shortcut_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let now = now_ms();
+    let holder_live = {
+        let guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        matches!(guard.as_ref(), Some(h) if h.expires_at_ms > now)
+    };
+    if holder_live {
+        #[cfg(test)]
+        SHORTCUT_REGISTER_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        register_global_escape();
+    } else {
+        #[cfg(test)]
+        SHORTCUT_UNREGISTER_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        unregister_global_escape();
     }
 }
 
@@ -1282,6 +1379,82 @@ mod tests {
         assert!(control_state().is_some());
         clear_control();
         assert!(control_state().is_none());
+    }
+
+    // —— issue #160 round-4 P2 §4: the Escape-shortcut unregister race ——
+    //
+    // Shares the SAME process-wide `control_mutex`/`shortcut_mutex` statics
+    // as every other control-lock test in this file — kept as its own
+    // sequential test(s) rather than splitting scenarios across parallel
+    // `#[test]`s, for the identical reason `control_lock_busy_expiry_
+    // release_and_clear` above already documents.
+
+    /// The end-to-end property the fix exists for, reproduced deterministically
+    /// via [`control_state_detect_and_clear_if_expired`] (the SAME two-phase
+    /// split `control_state` itself uses internally): a caller detects an
+    /// expired lease and clears the holder, but — before its OWN belated
+    /// `sync_shortcut_state` call actually runs — a DIFFERENT `(thread, dir)`
+    /// races in, acquires the now-vacant lease, and runs its OWN full
+    /// register cycle. The first caller's belated sync must NOT unregister
+    /// the new holder's shortcut: `sync_shortcut_state` re-reads
+    /// `control_mutex` fresh at the instant it actually runs, rather than
+    /// trusting the stale `expired = true` it was handed.
+    #[test]
+    fn escape_shortcut_sync_survives_a_new_acquire_racing_in_before_a_belated_cleanup_runs() {
+        clear_control();
+        SHORTCUT_REGISTER_ATTEMPTS.store(0, Ordering::SeqCst);
+        SHORTCUT_UNREGISTER_ATTEMPTS.store(0, Ordering::SeqCst);
+
+        acquire_control(950_001, "a").unwrap();
+        assert_eq!(SHORTCUT_REGISTER_ATTEMPTS.load(Ordering::SeqCst), 1, "the first hold must register");
+
+        // Force the lease to look expired, exactly like
+        // `control_lock_busy_expiry_release_and_clear` does above.
+        {
+            let mut guard = control_mutex().lock().unwrap();
+            if let Some(h) = guard.as_mut() {
+                h.expires_at_ms = now_ms().saturating_sub(1);
+            }
+        }
+
+        // Phase 1 ONLY: detect the expiry and clear the holder — mirrors
+        // exactly what `control_state` does internally BEFORE it calls
+        // `sync_shortcut_state`. Its own belated sync call is deliberately
+        // NOT made yet.
+        let (_, expired) = control_state_detect_and_clear_if_expired();
+        assert!(expired, "the manually-expired lease must be detected as expired");
+        assert_eq!(
+            SHORTCUT_UNREGISTER_ATTEMPTS.load(Ordering::SeqCst), 0,
+            "detecting expiry alone must not itself sync anything yet"
+        );
+
+        // *** THE RACE ***: a DIFFERENT (thread, dir) acquires the now-vacant
+        // lease and runs its OWN full register cycle BEFORE the first
+        // caller's belated sync (below) ever runs.
+        acquire_control(950_002, "b").unwrap();
+        assert_eq!(SHORTCUT_REGISTER_ATTEMPTS.load(Ordering::SeqCst), 2, "the new holder must register too");
+
+        // Phase 2, NOW (late): the ORIGINAL caller's belated sync finally
+        // runs. Naive code that trusted the STALE `expired = true` it
+        // computed above would unregister here and tear down thread 2's
+        // brand-new shortcut; this implementation re-reads `control_mutex`
+        // fresh instead, sees thread 2 is live, and (harmlessly) registers
+        // again — it must NEVER unregister.
+        sync_shortcut_state();
+
+        assert_eq!(
+            SHORTCUT_UNREGISTER_ATTEMPTS.load(Ordering::SeqCst), 0,
+            "a belated cleanup must never unregister a NEW holder's live shortcut"
+        );
+        let held = control_state().unwrap();
+        assert_eq!((held.thread, held.dir.as_str()), (950_002, "b"), "thread 2 must still hold the lease");
+
+        // Cleanup: an actual clear (nobody live) must still unregister.
+        clear_control();
+        assert_eq!(
+            SHORTCUT_UNREGISTER_ATTEMPTS.load(Ordering::SeqCst), 1,
+            "clear_control on a real holder must actually unregister"
+        );
     }
 
     #[tokio::test]

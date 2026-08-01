@@ -51,7 +51,14 @@ pub fn perm_card(ask: &crate::ask::Ask, lang: &str) -> Value {
         // detail 必须 plain_text：lark_md 会渲染 **/~~/<a>，权限卡显示与
         // 实际命令不忠实是欺骗面（且 lark_md 不支持 ``` 代码块——那是
         // markdown 组件独有），原样直出才可信。
-        json!({"tag": "div", "text": {"tag": "plain_text", "content": clamp(&ask.detail, 3000)}}),
+        //
+        // issue #160 round-4 P1 §1: 出站到 IM 的这一处必须优先读
+        // `detail_redacted`（本地桌面卡才用完整 `ask.detail`）——否则
+        // `weft_computer` 的 `type` 原文键入内容在人审批之前就随这张卡
+        // 发到了第三方（Lark）。`unwrap_or(&ask.detail)` 兜底：没有脱敏版
+        // 本（绝大多数非 `type` 的 ask）行为不变。
+        json!({"tag": "div", "text": {"tag": "plain_text",
+            "content": clamp(ask.detail_redacted.as_deref().unwrap_or(&ask.detail), 3000)}}),
         // 1/2/3/4 数字映射是与 inbound::parse_verdict 的共享协议，改序必须同步。
         json!({"tag": "div", "text": {"tag": "lark_md", "content": t(lang,
             "回复本条消息作答：**允许** / **拒绝** / **总是** / **放行**（或 1/2/3/4）",
@@ -217,6 +224,7 @@ mod tests {
             tool: "claude".into(),
             summary: "Run: npm test".into(),
             detail: "npm test".into(),
+            detail_redacted: None,
             risk: crate::ask::RiskLevel::Unknown,
             ts: 0,
             thread_title: "登录超时修复".into(),
@@ -259,6 +267,32 @@ mod tests {
             c["elements"][1]["text"]["content"],
             "**bold** ~~x~~ <a href='e'>y</a>"
         );
+    }
+
+    /// issue #160 round-4 P1 §1: when `detail_redacted` is set, the outbound
+    /// IM card must render THAT, never the raw `detail` — this is the exact
+    /// leak the fix closes (a `weft_computer` `type` action's literal
+    /// keystrokes must never reach the Lark bridge, even though the LOCAL
+    /// desktop card is meant to keep showing the human the real text).
+    #[test]
+    fn perm_card_uses_detail_redacted_over_detail_when_present() {
+        let mut a = ask();
+        a.detail = "hunter2".into();
+        a.detail_redacted = Some("{\"text_redacted\":true,\"text_chars\":7}".into());
+        let s = perm_card(&a, "zh").to_string();
+        assert!(!s.contains("hunter2"), "the raw detail must never reach the outbound card: {s}");
+        assert!(s.contains("text_redacted"), "{s}");
+    }
+
+    /// The common case (no redaction needed) is untouched: `detail_redacted`
+    /// absent falls back to the full `detail`, exactly like every ask before
+    /// this field existed.
+    #[test]
+    fn perm_card_falls_back_to_detail_when_no_redaction_is_set() {
+        let a = ask();
+        assert!(a.detail_redacted.is_none());
+        let s = perm_card(&a, "zh").to_string();
+        assert!(s.contains("npm test"));
     }
 
     #[test]

@@ -386,6 +386,13 @@ async fn run_action(
             // P2).
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, thread, dir).await?;
+            // issue #160 round-4 P1 §2: reclaim the foreground BEFORE this
+            // click reaches the OS, not after — see `activate_if_interactive`'s
+            // own doc for why even the click family (not just type/key) needs
+            // this: an Interactive approval card can cover the target
+            // window's real on-screen position, so an ABSOLUTE-coordinate
+            // click risks landing on Weft's own card instead of the target.
+            activate_if_interactive(window_id, approval)?;
             backend::backend()
                 .click(px, py, button, count)
                 .map_err(|e| e.to_string())?;
@@ -393,11 +400,8 @@ async fn run_action(
             // handed this window OS focus — see `recent_clicks`'s doc. Only
             // AFTER the backend call succeeds: a rejected/failed click never
             // touched the real window and must not seed a false freshness
-            // record for a later `type`/`key`. Records `(px, py)` too (issue
-            // #160 round-3 P1 §1) — the SAME physical point a later
-            // `type`/`key`'s Interactive-approval refocus replay clicks back
-            // to, see that section's own doc.
-            record_click_focus(thread, dir, window_id, px, py);
+            // record for a later `type`/`key`.
+            record_click_focus(thread, dir, window_id);
             Ok(format!(
                 "{action} at ({px}, {py}) in window {window_id} done — take a screenshot to verify"
             ))
@@ -413,6 +417,7 @@ async fn run_action(
             // across the backend call itself.
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, thread, dir).await?;
+            activate_if_interactive(window_id, approval)?;
             backend::backend()
                 .move_cursor(px, py)
                 .map_err(|e| e.to_string())?;
@@ -433,6 +438,7 @@ async fn run_action(
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, thread, dir).await?;
+            activate_if_interactive(w.id, approval)?;
             b.drag(from, to).map_err(|e| e.to_string())?;
             Ok(format!(
                 "left_click_drag from ({}, {}) to ({}, {}) in window {} done — take a screenshot to verify",
@@ -449,6 +455,7 @@ async fn run_action(
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, thread, dir).await?;
+            activate_if_interactive(window_id, approval)?;
             backend::backend()
                 .scroll(px, py, dx, dy)
                 .map_err(|e| e.to_string())?;
@@ -472,7 +479,7 @@ async fn run_action(
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, thread, dir).await?;
-            reclaim_focus_if_interactive(thread, dir, window_id, approval)?;
+            activate_if_interactive(window_id, approval)?;
             backend::backend()
                 .type_text(text)
                 .map_err(|e| e.to_string())?;
@@ -492,7 +499,7 @@ async fn run_action(
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, thread, dir).await?;
-            reclaim_focus_if_interactive(thread, dir, window_id, approval)?;
+            activate_if_interactive(window_id, approval)?;
             backend::backend().key(combo).map_err(|e| e.to_string())?;
             Ok(format!(
                 "key {combo} in window {window_id} done — take a screenshot to verify"
@@ -557,20 +564,25 @@ async fn run_action(
 /// the desktop right now — AFTER this gate returns `Ok`; those are a
 /// completely separate concern (issue #160 M2) from "is this call
 /// authorized at all".
-/// How [`approve`] reached its `Ok` — the ONE thing [`run_action`]'s `type`/
-/// `key` arms need out of it (issue #160 round-3 P1 §1): whether a Needs-you
-/// card actually appeared and a human clicked Weft's own UI to answer it.
+/// How [`approve`] reached its `Ok` — the ONE thing every input arm of
+/// [`run_action`] needs out of it (issue #160 round-4 P1 §2): whether a
+/// Needs-you card actually appeared and a human clicked Weft's own UI to
+/// answer it.
 ///
 ///  - [`Approval::Auto`]: a standing grant (`Decision::Allow` from
 ///    [`AskRegistry::auto_decision`]) decided this silently — no card ever
-///    rendered, so OS focus never moved off whatever window last had it.
+///    rendered, so OS focus/foreground never moved off whatever window last
+///    had it.
 ///  - [`Approval::Interactive`]: a card actually rendered and a human
 ///    answered Allow through it — which means the human just clicked
-///    somewhere in Weft's own window to do so, dragging OS focus there and
-///    away from whatever `require_recent_focus`'s last recorded click had
-///    focused. See the `type`/`key` arms of [`run_action`] for what this
-///    drives: only `Interactive` needs a replay click to hand focus back
-///    before the backend ever sees a keystroke.
+///    somewhere in Weft's own window to do so, taking the foreground (and
+///    likely OS focus) away from whatever window the action targets. See
+///    [`activate_if_interactive`] for what this drives: every input action
+///    (click family / mouse_move / left_click_drag / scroll / type / key)
+///    reactivates the target window through
+///    [`backend::ComputerBackend::activate_window`] before it ever touches
+///    the OS, but ONLY for `Interactive` — an `Auto` decision never showed a
+///    card, so there is nothing to hand back.
 ///
 /// Never constructed for a `Deny`/timeout/cancel outcome — those return
 /// `Err` instead, so this only ever distinguishes the two ways an `Ok`
@@ -597,8 +609,31 @@ async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args:
     // ask for a decision without the information the decision depends on.
     // Only the PERSISTED audit line redacts it, after the fact, once the
     // human has already made that call — see `redact_audit_args`'s doc for
-    // the full symmetric point.
+    // the full symmetric point. This is the LOCAL desktop card's own detail —
+    // see `detail_redacted`'s doc comment immediately below for the DIFFERENT,
+    // EARLIER leak this alone does not close.
     let detail = args.to_string();
+    // issue #160 round-4 P1 §1: `AskEvent::Opened` (fired inside
+    // `request_with_preview` below) hands this ENTIRE `Ask` — `detail`
+    // included — straight to the IM bridge, which renders it into an
+    // outbound Lark card BEFORE the human ever answers anything (see
+    // `im::outbound::perm_card`). For `action == "type"`, `detail` carries
+    // the literal keystrokes about to be typed — a secret typed into a
+    // password field would otherwise reach a third party the instant this
+    // card opens, regardless of whether the human ever approves it. Reuses
+    // the EXACT SAME redaction `redact_audit_args` already applies to the
+    // durable audit line (`text` → `{"text_redacted":true,"text_chars":N}`)
+    // rather than inventing a second shape — the IM-facing view and the
+    // audit-log view have the identical "not the raw text, just its length"
+    // requirement, so one function serves both. Every other action's detail
+    // carries nothing this module considers secret (a coordinate, a window
+    // name, a key combo LABEL like "cmd+s" — never what was typed), so this
+    // is `None` for everything except `type`; `im::outbound::perm_card` falls
+    // back to the unredacted `detail` in that case (see its own doc). Passed
+    // to the ONLY production caller of `request_with_preview` — see that
+    // method's own doc on why it grew this parameter directly rather than a
+    // separate `_redacted` variant.
+    let detail_redacted = (action == "type").then(|| redact_audit_args(action, args).to_string());
 
     match asks.auto_decision(thread, dir, risk, &action_key) {
         Some(Decision::Allow) => return Ok(Approval::Auto),
@@ -612,7 +647,7 @@ async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args:
 
     let preview = preview_for_action(thread, dir, risk, &window_query);
     let (id, rx) = asks.request_with_preview(
-        thread, dir, "computer", &summary, &detail, risk, &action_key, preview,
+        thread, dir, "computer", &summary, &detail, detail_redacted.as_deref(), risk, &action_key, preview,
     );
 
     match tokio::time::timeout(crate::bus::server::ASK_WAIT, rx).await {
@@ -825,55 +860,49 @@ fn redact_audit_args(action: &str, args: &Value) -> Value {
 // but it closes the main accident surface: typing into a target window that
 // was never clicked at all, this session, ever.
 //
-// issue #160 round-3 P1 §1: that presumption has a second hole, INSIDE one
-// session's own `type`/`key` call, that the freshness window alone can't
-// close. The real sequence is: agent clicks the target window (OS focus ->
-// target) -> [`approve`] may block on a Needs-you card -> if a human answers
-// it INTERACTIVELY, answering itself means clicking somewhere in WEFT's own
-// window, which drags OS focus to Weft, not back to the target. The
-// freshness check above still passes (it only looks at the click's
-// timestamp/window id, not what happened to focus afterward), so without a
-// further fix `type`/`key` would go on to inject keystrokes into Weft
-// instead of the window the agent actually meant. There is still no
-// cross-platform "query current focus" API to detect this directly, so the
-// fix is the same KIND of substitute as the freshness check itself: replay
-// the exact click that last established freshness — same window, same
-// physical `(px, py)` — immediately before the backend ever sees a
-// keystroke, but ONLY when [`Approval::Interactive`] says a card actually
-// interrupted this call (an [`Approval::Auto`] standing-grant decision never
-// shows a card, so focus never left the target window in the first place —
-// see [`reclaim_focus_if_interactive`]). `recent_clicks`'s value grew the
-// physical `(px, py)` alongside the window id/timestamp it already carried,
-// so this replay can be built from the SAME record `require_recent_focus`
-// already validated, instead of threading a second, parallel table through.
+// issue #160 round-3 P1 §1 previously patched a SECOND hole here — an
+// Interactive approval card dragging OS focus to Weft between the click and
+// the keystrokes — by replaying the exact last-click coordinate right before
+// `type`/`key`. Round-4 P1 §2 REMOVES that replay hack: it only ever helped
+// `type`/`key` (a `left_click`/`scroll`/`drag`/`mouse_move` itself was still
+// exposed — an absolute-coordinate action can land on Weft's own card if the
+// card now covers the target window's on-screen position, not just a stale
+// focus target), and replaying a synthetic click is itself not side-effect-
+// free (it can collapse a double-click text selection, or re-toggle a
+// checkbox/button the agent never asked to click again). See
+// `activate_if_interactive`'s own doc, right below the [`Approval`] enum's
+// declaration further up this file, for the actual fix: reactivating the
+// TARGET window through `backend::ComputerBackend::activate_window` before
+// ANY input action reaches the OS, not just `type`/`key`.
 
 /// How long a click on a window is trusted to still hold that window's OS
 /// focus for a subsequent `type`/`key` — see this section's own doc comment.
 const FOCUS_FRESHNESS_MS: u64 = 15_000;
 const FOCUS_FRESHNESS_SECS: u64 = FOCUS_FRESHNESS_MS / 1000;
 
-/// Process-level "last window this `(thread, dir)` actually clicked, its
-/// physical `(px, py)`, and when" registry — see this section's own doc
-/// comment. `now_ms()`-based (wall clock), consistent with every other
-/// timestamp this module already records (the audit log's own `ts_ms`); a
-/// system clock adjustment mid-session is not a hazard this heuristic needs
-/// to defend against. The `(px, py)` fields (issue #160 round-3 P1 §1) are
-/// the SAME physical point the click-family arm of [`run_action`] just sent
-/// to the backend — [`reclaim_focus_if_interactive`]'s only source for what
-/// to replay.
-fn recent_clicks() -> &'static Mutex<HashMap<(i32, String), (u32, i32, i32, u64)>> {
-    static CLICKS: OnceLock<Mutex<HashMap<(i32, String), (u32, i32, i32, u64)>>> = OnceLock::new();
+/// Process-level "last window this `(thread, dir)` actually clicked, and
+/// when" registry — see this section's own doc comment. `now_ms()`-based
+/// (wall clock), consistent with every other timestamp this module already
+/// records (the audit log's own `ts_ms`); a system clock adjustment
+/// mid-session is not a hazard this heuristic needs to defend against.
+/// issue #160 round-4 P1 §2: no longer carries the click's physical
+/// `(px, py)` — that existed ONLY to feed the round-3 P1 §1 replay-click
+/// hack this round removes (see this section's own top doc comment); the
+/// window id + timestamp pair is all [`require_recent_focus`] itself has
+/// ever needed.
+fn recent_clicks() -> &'static Mutex<HashMap<(i32, String), (u32, u64)>> {
+    static CLICKS: OnceLock<Mutex<HashMap<(i32, String), (u32, u64)>>> = OnceLock::new();
     CLICKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Record a SUCCESSFUL click on `window_id` at physical `(px, py)` for
-/// `(thread, dir)` — called ONLY from the click-family arm of [`run_action`],
-/// and ONLY after the backend call itself returned `Ok`: a rejected/failed
-/// click never actually touched the real window, so it must not seed a false
-/// freshness record for a later `type`/`key`.
-fn record_click_focus(thread: i32, dir: &str, window_id: u32, px: i32, py: i32) {
+/// Record a SUCCESSFUL click on `window_id` for `(thread, dir)` — called
+/// ONLY from the click-family arm of [`run_action`], and ONLY after the
+/// backend call itself returned `Ok`: a rejected/failed click never actually
+/// touched the real window, so it must not seed a false freshness record for
+/// a later `type`/`key`.
+fn record_click_focus(thread: i32, dir: &str, window_id: u32) {
     let mut g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
-    g.insert((thread, dir.to_string()), (window_id, px, py, now_ms()));
+    g.insert((thread, dir.to_string()), (window_id, now_ms()));
 }
 
 /// `type`/`key`'s pre-execution gate: reject unless a click on THIS EXACT
@@ -884,7 +913,7 @@ fn require_recent_focus(thread: i32, dir: &str, window_id: u32) -> Result<(), St
     let g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
     let fresh = matches!(
         g.get(&(thread, dir.to_string())),
-        Some((clicked, _px, _py, ts)) if *clicked == window_id && now_ms().saturating_sub(*ts) <= FOCUS_FRESHNESS_MS
+        Some((clicked, ts)) if *clicked == window_id && now_ms().saturating_sub(*ts) <= FOCUS_FRESHNESS_MS
     );
     if fresh {
         return Ok(());
@@ -895,68 +924,47 @@ fn require_recent_focus(thread: i32, dir: &str, window_id: u32) -> Result<(), St
     ))
 }
 
-/// The physical `(px, py)` [`require_recent_focus`] just accepted for
-/// `window_id` under `(thread, dir)`, if it's STILL within
-/// [`FOCUS_FRESHNESS_MS`] right now — a SEPARATE lookup from
-/// `require_recent_focus` (rather than folding the coordinates into that
-/// function's own `Result`) so the freshness gate itself stays a pure
-/// boolean-shaped check, reusable by any future caller that only cares
-/// whether focus is fresh, not where to click if it needs replaying.
-/// [`reclaim_focus_if_interactive`]'s only caller.
-fn recent_click_position(thread: i32, dir: &str, window_id: u32) -> Option<(i32, i32)> {
-    let g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
-    match g.get(&(thread, dir.to_string())) {
-        Some((clicked, px, py, ts))
-            if *clicked == window_id && now_ms().saturating_sub(*ts) <= FOCUS_FRESHNESS_MS =>
-        {
-            Some((*px, *py))
-        }
-        _ => None,
-    }
-}
+// —— reclaiming the foreground after an Interactive approval card (issue #160 round-4 P1 §2) ——
 
-/// `type`/`key`'s LAST gate before the backend ever sees a keystroke (issue
-/// #160 round-3 P1 §1) — see this section's own doc comment for the full
-/// rationale. Called AFTER [`require_recent_focus`] already passed, AFTER
-/// [`recheck_after_guard`], and while `input_flight_guard` is still held:
+/// The LAST gate every input arm of [`run_action`] clears before the backend
+/// ever touches the OS — click family, `mouse_move`, `left_click_drag`,
+/// `scroll`, `type`, `key` (issue #160 round-4 P1 §2, replacing round-3 P1
+/// §1's own click-replay hack — see the focus-freshness section's own doc
+/// comment above for why that hack was unsafe and insufficient). Called
+/// AFTER [`recheck_after_guard`], while `input_flight_guard` is still held,
+/// right before the action-specific backend call itself:
 ///
 ///  - [`Approval::Auto`]: no-op. A standing grant decided this call silently
-///    — no card ever rendered, so OS focus never left the target window.
+///    — no card ever rendered, so the target window never lost the
+///    foreground/focus in the first place.
 ///  - [`Approval::Interactive`]: a human just answered a Needs-you card by
-///    clicking Weft's own UI, dragging OS focus there. Replays the EXACT
-///    physical point [`require_recent_focus`] validated — the same
-///    `backend.click(px, py, Left, 1)` shape the click-family arm of
-///    [`run_action`] itself uses — to hand focus back to the target window
-///    before the real keystrokes go out.
+///    clicking Weft's own UI, taking the foreground. Calls
+///    `backend::ComputerBackend::activate_window(target_id)` to raise+focus
+///    the TARGET window back to the front BEFORE the real action reaches the
+///    OS — unlike a replayed click, this can't misfire into whatever
+///    happens to be at some stale `(px, py)` and has no side effect on the
+///    target window's own contents (no accidental double-click-collapse, no
+///    re-toggled checkbox).
 ///
-/// Fails closed rather than blindly typing: a failed replay click
-/// ([`backend::ComputerBackend::click`] itself erroring) propagates as this
-/// function's own `Err` instead of falling through to `type_text`/`key`.
-/// The defensive `None` branch (no fresh coordinate on file) should be
-/// unreachable in practice — `require_recent_focus` already required one to
-/// even get this far — but is handled as an explicit, actionable error
-/// rather than an `unwrap`/`expect`/panic, per this module's own fail-closed
-/// discipline: a record that was evicted or raced out from under this call
-/// between the two lookups must re-prompt a fresh click, never proceed on a
-/// guess.
-fn reclaim_focus_if_interactive(
-    thread: i32,
-    dir: &str,
-    window_id: u32,
-    approval: Approval,
-) -> Result<(), String> {
+/// FAILS CLOSED, never falls through to the real action: `Unsupported` (no
+/// `computer-os` feature, or a real backend that couldn't find a window-
+/// activation API at all — see `backend::ComputerBackend::activate_window`'s
+/// own doc) or any other backend error both propagate as this function's own
+/// `Err`, naming why (the approval card took the foreground and this window
+/// couldn't be reactivated) and the two ways around it: grant this window an
+/// Always approval so future calls never card at all, or answer from weft's
+/// own desktop UI, where the foreground never has anywhere else to go.
+fn activate_if_interactive(target_id: u32, approval: Approval) -> Result<(), String> {
     if approval != Approval::Interactive {
         return Ok(());
     }
-    let Some((px, py)) = recent_click_position(thread, dir, window_id) else {
-        return Err(format!(
-            "the approval card took focus and no recent click position is on file for window \
-             {window_id} — click inside the target window again, then retry"
-        ));
-    };
-    backend::backend()
-        .click(px, py, MouseButton::Left, 1)
-        .map_err(|e| format!("failed to reclaim focus for window {window_id} before typing: {e}"))
+    backend::backend().activate_window(target_id).map_err(|e| {
+        format!(
+            "the approval card took the foreground and window {target_id} couldn't be reactivated \
+             ({e}) — grant this window an Always approval to skip the card next time, or approve \
+             from weft's own desktop UI instead"
+        )
+    })
 }
 
 // —— screenshot → MCP image content + Ask-card preview registry (issue #160 M3-B) ——
@@ -1347,8 +1355,9 @@ fn audit_line(entry: &AuditEntry<'_>) -> Result<String, serde_json::Error> {
 /// Append one audit line for EVERY `tools/call` (every action, success or
 /// failure) to the session's own `.weft/computer-audit.jsonl` — best-effort:
 /// a resolution or write failure here (including a refused symlink — see
-/// [`refuse_symlinks`]) never affects the actual tool result, it just means
-/// this one call goes unlogged.
+/// [`refuse_symlinks`], or an `O_NOFOLLOW`-refused leaf — see
+/// [`open_audit_file_for_append`]) never affects the actual tool result, it
+/// just means this one call goes unlogged.
 async fn append_audit(db: &Db, thread: i32, dir: &str, wt: Option<i32>, entry: &AuditEntry<'_>) {
     use tokio::io::AsyncWriteExt;
     let Some(path) = audit_log_path(db, thread, dir, wt).await else {
@@ -1359,10 +1368,47 @@ async fn append_audit(db: &Db, thread: i32, dir: &str, wt: Option<i32>, entry: &
         return;
     }
     let Ok(line) = audit_line(entry) else { return };
-    let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await else {
+    let Ok(mut file) = open_audit_file_for_append(&path).await else {
         return;
     };
     let _ = file.write_all(line.as_bytes()).await;
+}
+
+/// The actual `open(2)` call [`append_audit`] makes — factored out so its own
+/// `O_NOFOLLOW` defense (issue #160 round-4 P2 §3) is unit-testable in
+/// isolation from [`refuse_symlinks`]'s EARLIER, per-component check.
+///
+/// [`refuse_symlinks`] (via [`audit_log_path`]) already refuses a symlink
+/// that's ALREADY sitting at any path component — including the leaf file
+/// itself — by the time it runs its `symlink_metadata` check. What it can
+/// NOT close is the window AFTER that check returns and BEFORE this exact
+/// `open` call executes: a worktree is repository-controlled content, so
+/// anything with write access to the checkout (an agent's own earlier
+/// approved write, or a background process) can swap the leaf
+/// `computer-audit.jsonl` for a symlink to an arbitrary path in that
+/// instant, and a plain `open` would silently follow it — this weft
+/// PROCESS, not the sandboxed agent, would then be the one creating/
+/// appending to a file outside the worktree.
+///
+/// `#[cfg(unix)]` adds `O_NOFOLLOW`: when the FINAL path component is a
+/// symlink, the kernel's own `open(2)` fails outright (`ELOOP`) instead of
+/// following it — this closes the TOCTOU window at the exact leaf
+/// component, atomically, with no separate stat call of our own to race
+/// against. It complements (does not replace) `refuse_symlinks`'s own
+/// per-component walk, which still guards every PARENT directory
+/// (`.weft` itself) — `O_NOFOLLOW` only ever inspects the LAST component of
+/// the path being opened, never the ones leading up to it.
+///
+/// Windows keeps the pre-existing `refuse_symlinks`-only behavior for now —
+/// a real per-component atomic open (an `openat`-style walk with
+/// `FILE_FLAG_OPEN_REPARSE_POINT` at each step) is a follow-up, not required
+/// to close THIS specific leaf race, which is what this flag targets.
+async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(path).await
 }
 
 /// The session's own working directory for `(thread, dir)`, before any
@@ -1662,6 +1708,78 @@ mod tests {
         assert!(redacted.get("text").is_none());
     }
 
+    // —— issue #160 round-4 P1 §1: detail_redacted (the IM-bridge leak) ——
+
+    /// The end-to-end property the fix exists for: a `type` action's Ask
+    /// keeps the RAW text in `detail` (the LOCAL desktop card still needs it
+    /// to judge the approval) but ALSO carries a `detail_redacted` (what
+    /// `im::outbound::perm_card` must show instead) that never contains the
+    /// raw text — the same shape `redact_audit_args` already gives the
+    /// durable audit line.
+    #[tokio::test]
+    async fn approve_sets_detail_redacted_for_type_but_keeps_the_local_detail_raw() {
+        let asks = AskRegistry::new();
+        let thread = 907_001;
+        let dir = "lead";
+        let args = json!({"action": "type", "window": "notes", "text": "hunter2"});
+
+        let asks_bg = asks.clone();
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "type", &args).await });
+
+        let mut card = None;
+        for _ in 0..200 {
+            if let Some(a) = asks.open().into_iter().find(|a| a.thread == thread && a.dir == dir) {
+                card = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let card = card.expect("a Needs-you card must appear for a type action");
+
+        assert!(card.detail.contains("hunter2"), "the LOCAL card must keep the raw text: {card:?}");
+        let redacted = card
+            .detail_redacted
+            .as_deref()
+            .expect("a type action's Ask must carry detail_redacted");
+        assert!(
+            !redacted.contains("hunter2"),
+            "detail_redacted must never contain the raw typed text: {redacted}"
+        );
+        assert!(redacted.contains("text_redacted"), "{redacted}");
+
+        assert!(asks.answer(card.id, crate::ask::Answer::Deny));
+        let _ = handle.await.unwrap();
+    }
+
+    /// Every action other than `type` must carry NO `detail_redacted` at
+    /// all — nothing else this server's schema defines is treated as secret
+    /// content, so `im::outbound::perm_card` falls back to the (already
+    /// harmless) full `detail` for these.
+    #[tokio::test]
+    async fn approve_leaves_detail_redacted_none_for_a_non_type_action() {
+        let asks = AskRegistry::new();
+        let thread = 907_002;
+        let dir = "lead";
+        let args = json!({"action": "left_click", "window": "notes", "coordinate": [1, 1]});
+
+        let asks_bg = asks.clone();
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "left_click", &args).await });
+
+        let mut card = None;
+        for _ in 0..200 {
+            if let Some(a) = asks.open().into_iter().find(|a| a.thread == thread && a.dir == dir) {
+                card = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let card = card.expect("a Needs-you card must appear for a left_click action");
+        assert!(card.detail_redacted.is_none(), "{card:?}");
+
+        assert!(asks.answer(card.id, crate::ask::Answer::Deny));
+        let _ = handle.await.unwrap();
+    }
+
     // —— issue #160 round-2 P1 addendum: type/key focus-freshness gate ——
     //
     // Each test below uses a UNIQUE synthetic thread id so they can run in
@@ -1671,7 +1789,7 @@ mod tests {
     #[test]
     fn require_recent_focus_passes_right_after_a_click_on_the_same_window() {
         let thread = 900_001;
-        record_click_focus(thread, "lead", 7, 1, 1);
+        record_click_focus(thread, "lead", 7);
         assert!(require_recent_focus(thread, "lead", 7).is_ok());
     }
 
@@ -1686,7 +1804,7 @@ mod tests {
     #[test]
     fn require_recent_focus_rejects_a_click_on_a_different_window() {
         let thread = 900_003;
-        record_click_focus(thread, "lead", 7, 1, 1); // clicked window A (id 7)
+        record_click_focus(thread, "lead", 7); // clicked window A (id 7)
         let err = require_recent_focus(thread, "lead", 8).unwrap_err(); // typing into B (id 8)
         assert!(err.contains("8"), "error should name the window that lacks focus: {err}");
     }
@@ -1695,7 +1813,7 @@ mod tests {
     fn require_recent_focus_is_scoped_per_thread_dir() {
         let thread_a = 900_004;
         let thread_b = 900_005;
-        record_click_focus(thread_a, "lead", 7, 1, 1);
+        record_click_focus(thread_a, "lead", 7);
         // A click recorded for a DIFFERENT (thread, dir) must not satisfy
         // this one's focus check — the registry is per-session, not global.
         assert!(require_recent_focus(thread_b, "lead", 7).is_err());
@@ -1711,57 +1829,66 @@ mod tests {
         // pre-expired timestamp instead of a real-time wait.
         {
             let mut g = recent_clicks().lock().unwrap();
-            g.insert((thread, "lead".to_string()), (7, 1, 1, now_ms() - FOCUS_FRESHNESS_MS - 1));
+            g.insert((thread, "lead".to_string()), (7, now_ms() - FOCUS_FRESHNESS_MS - 1));
         }
         assert!(require_recent_focus(thread, "lead", 7).is_err());
     }
 
-    // —— issue #160 round-3 P1 §1: reclaim_focus_if_interactive ——
+    // —— issue #160 round-4 P1 §2: activate_if_interactive ——
 
-    /// The end-to-end property the round-3 P1 §1 fix exists for: an
+    /// The end-to-end property the round-4 P1 §2 fix exists for: an
     /// `Interactive` approval (a card that ACTUALLY appeared and a human
-    /// clicked Weft's own UI to answer) must replay the exact last-click
-    /// coordinate before `type`/`key` proceeds; an `Auto` approval (a
-    /// standing grant, no card, focus never moved) must be a complete no-op
-    /// — no backend call at all, regardless of what's on file.
+    /// clicked Weft's own UI to answer) must reactivate the target window
+    /// (`backend.activate_window`) before the real action proceeds; an
+    /// `Auto` approval (a standing grant, no card, the foreground never
+    /// moved) must be a complete no-op. Also covers the fail-closed path:
+    /// when activation itself is broken (`Unsupported`), an `Interactive`
+    /// approval must propagate an `Err` naming the window, never fall
+    /// through and let the real action reach the OS anyway.
+    ///
+    /// ONE test, not several: `backend::_set_backend_override` is a
+    /// set-ONCE-per-process `OnceLock` (see its own doc comment) — a second
+    /// test calling it with a DIFFERENT `MockBackend` instance would just
+    /// silently keep using whichever one happened to install first, so every
+    /// scenario that needs to flip `MockBackend::fail_activate` shares this
+    /// SAME installed instance instead of trying to install a second one.
     #[test]
-    fn reclaim_focus_if_interactive_replays_the_last_click_only_for_an_interactive_approval() {
+    fn activate_if_interactive_activates_only_when_interactive_and_fails_closed_when_unsupported() {
         let mock = std::sync::Arc::new(computer::mock::MockBackend::default());
         backend::_set_backend_override(mock.clone());
 
-        let thread = 902_001;
-        let dir = "lead";
-        record_click_focus(thread, dir, 7, 111, 222);
-
-        // Auto: no card ever appeared, so focus never left — must never
-        // touch the backend.
-        assert!(reclaim_focus_if_interactive(thread, dir, 7, Approval::Auto).is_ok());
+        // Auto: no card ever appeared, so the foreground never left — must
+        // never touch the backend.
+        assert!(activate_if_interactive(7, Approval::Auto).is_ok());
         assert!(
             mock.actions.lock().unwrap().is_empty(),
-            "an Auto approval must never replay a click"
+            "an Auto approval must never activate a window"
         );
 
-        // Interactive: a human just answered a real card — must replay the
-        // EXACT (px, py) the last click recorded, as a single left click.
-        assert!(reclaim_focus_if_interactive(thread, dir, 7, Approval::Interactive).is_ok());
-        let actions = mock.actions.lock().unwrap();
-        assert_eq!(actions.len(), 1, "{actions:?}");
-        assert_eq!(actions[0], "click 111,222 Left x1", "{actions:?}");
-    }
+        // Interactive: a human just answered a real card — must activate the
+        // EXACT target window id, before anything else.
+        assert!(activate_if_interactive(7, Approval::Interactive).is_ok());
+        {
+            let actions = mock.actions.lock().unwrap();
+            assert_eq!(actions.len(), 1, "{actions:?}");
+            assert_eq!(actions[0], "activate 7", "{actions:?}");
+        }
 
-    /// Defensive branch: `require_recent_focus` should already have blocked
-    /// any `type`/`key` call that reaches here without a fresh click on
-    /// file, but this function must fail closed (an actionable error, never
-    /// an `unwrap`/panic/silent guess) rather than assume some default
-    /// coordinate if that invariant is ever violated. `Auto` never looks at
-    /// the recorded click at all, so it stays `Ok` regardless.
-    #[test]
-    fn reclaim_focus_if_interactive_fails_closed_without_a_fresh_click_on_file() {
-        let thread = 902_002;
-        let dir = "lead";
-        let err = reclaim_focus_if_interactive(thread, dir, 7, Approval::Interactive).unwrap_err();
-        assert!(err.contains("click"), "{err}");
-        assert!(reclaim_focus_if_interactive(thread, dir, 7, Approval::Auto).is_ok());
+        // Fail-closed: the backend can't activate the window at all
+        // (`Unsupported`) — must propagate an `Err` naming the window,
+        // never silently proceed. No NEW action is recorded (the count
+        // stays at 1, from the successful activation above).
+        mock.fail_activate.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = activate_if_interactive(7, Approval::Interactive).unwrap_err();
+        assert!(err.contains('7'), "{err}");
+        assert_eq!(
+            mock.actions.lock().unwrap().len(),
+            1,
+            "a failed activation must never itself be recorded as a successful action"
+        );
+
+        // Auto stays a no-op even with activation broken.
+        assert!(activate_if_interactive(7, Approval::Auto).is_ok());
     }
 
     // —— issue #160 round-3 P1 §2: recheck_after_guard ——
@@ -1971,6 +2098,56 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_file(&secret);
+    }
+
+    // —— issue #160 round-4 P2 §3: O_NOFOLLOW closes the leaf open TOCTOU ——
+
+    /// Proves the NEW defense in isolation from `refuse_symlinks`'s own,
+    /// EARLIER check: the leaf path is ALREADY a symlink to an outside file
+    /// by the time this open call runs (standing in for a symlink planted in
+    /// the TOCTOU window between `refuse_symlinks`'s check and the real
+    /// `open` — a window `refuse_symlinks` alone cannot close, since it only
+    /// ever runs once, before that call). Calling
+    /// [`open_audit_file_for_append`] DIRECTLY (bypassing `audit_log_path`/
+    /// `refuse_symlinks` entirely) isolates that this specific open call
+    /// refuses the symlink on its own — without `O_NOFOLLOW`, this exact
+    /// call would silently succeed and write into `outside`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_audit_file_for_append_refuses_a_symlinked_leaf() {
+        let base = std::env::temp_dir().join(format!("weft-audit-nofollow-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("weft-audit-nofollow-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&outside);
+        std::fs::create_dir_all(&base).unwrap();
+        let leaf = base.join("computer-audit.jsonl");
+        std::os::unix::fs::symlink(&outside, &leaf).unwrap();
+
+        let result = open_audit_file_for_append(&leaf).await;
+        assert!(result.is_err(), "O_NOFOLLOW must refuse to open a symlinked leaf");
+        assert!(
+            !outside.exists(),
+            "a refused open must never create/write the symlink's target"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    /// The ordinary, non-symlinked case is unaffected: `O_NOFOLLOW` only
+    /// rejects a symlinked LAST component, never a plain file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_audit_file_for_append_succeeds_for_an_ordinary_file() {
+        let base = std::env::temp_dir().join(format!("weft-audit-nofollow-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let leaf = base.join("computer-audit.jsonl");
+
+        assert!(open_audit_file_for_append(&leaf).await.is_ok());
+        assert!(leaf.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// End-to-end through the async path a real worker's `screenshot`/audit

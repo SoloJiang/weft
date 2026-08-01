@@ -6,6 +6,7 @@
 
 use super::backend::{ComputerBackend, MouseButton};
 use super::{CapturedImage, ComputerError, WindowInfo};
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 #[doc(hidden)]
@@ -24,6 +25,15 @@ pub struct MockBackend {
     /// backend, and updated by `move_cursor` the same way a real backend's
     /// cursor would move.
     pub cursor: Mutex<(i32, i32)>,
+    /// When `true`, `activate_window` fails with `Unsupported` instead of
+    /// recording an `"activate {id}"` action (issue #160 round-4 P1 §2) — a
+    /// test-controlled switch simulating a real backend that couldn't find
+    /// any window-activation API at all (`StubBackend`'s own permanent
+    /// case), so a test can exercise `bus::computer_srv::
+    /// activate_if_interactive`'s fail-closed path without a second
+    /// `ComputerBackend` impl. `false` (the `Default` value) behaves exactly
+    /// like every other successful mock action.
+    pub fail_activate: AtomicBool,
 }
 
 impl MockBackend {
@@ -82,5 +92,15 @@ impl ComputerBackend for MockBackend {
 
     fn cursor_position(&self) -> Result<(i32, i32), ComputerError> {
         Ok(*self.cursor.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn activate_window(&self, id: u32) -> Result<(), ComputerError> {
+        if self.fail_activate.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ComputerError::Unsupported(
+                "mock backend: activate_window forced to fail".into(),
+            ));
+        }
+        self.record(format!("activate {id}"));
+        Ok(())
     }
 }

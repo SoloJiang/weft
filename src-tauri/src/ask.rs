@@ -1353,6 +1353,27 @@ pub struct Ask {
     pub summary: String,
     /// the raw action detail (command / file path / full input).
     pub detail: String,
+    /// A REDACTED stand-in for `detail`, for the remote/IM presentation
+    /// surface ONLY (issue #160 round-4 P1 §1) — `None` for every ask whose
+    /// `detail` carries nothing that needs redacting (everything except a
+    /// `weft_computer` `type` action today; see `bus::computer_srv::approve`,
+    /// the only production setter). The LOCAL desktop Needs-you card always
+    /// renders full `detail` regardless of this field: the human sitting at
+    /// the machine, about to allow/deny an action ON THAT SAME MACHINE, is
+    /// not a party this redaction protects against — they need the real text
+    /// to judge whether to approve it (see `approve`'s own doc comment on
+    /// why the card itself stays unredacted). What this field closes is a
+    /// DIFFERENT leak: `AskEvent::Opened` hands the WHOLE `Ask` to the IM
+    /// bridge, which serializes it into an outbound Lark card BEFORE the
+    /// human ever approves anything — `im::outbound::perm_card` must read
+    /// THIS field (falling back to `detail` only when it's absent) rather
+    /// than `detail` directly, or a typed secret reaches a third party the
+    /// instant the card is opened, independent of what the human decides.
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` keeps every
+    /// existing consumer's serialized shape byte-identical when there's
+    /// nothing to redact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail_redacted: Option<String>,
     /// This ask's danger tier for the human's one-glance triage — see
     /// `classify_risk` (issue #101). Computed once at ask-creation time, not
     /// re-derived by the frontend.
@@ -1761,7 +1782,7 @@ impl AskRegistry {
         risk: RiskLevel,
         action_key: &str,
     ) -> (u64, oneshot::Receiver<Decision>) {
-        self.request_with_preview(thread, dir, tool, summary, detail, risk, action_key, None)
+        self.request_with_preview(thread, dir, tool, summary, detail, None, risk, action_key, None)
     }
 
     /// [`Self::request`], plus an optional screenshot thumbnail (see
@@ -1773,6 +1794,16 @@ impl AskRegistry {
     /// `weft_computer` GUI input ask, with a prior screenshot on file for this
     /// (thread, dir) — see that function's attach rule); every other call site
     /// goes through the plain [`Self::request`] wrapper instead.
+    ///
+    /// `detail_redacted` (issue #160 round-4 P1 §1): see `Ask::detail_redacted`'s
+    /// own doc for the full rationale. Added as a parameter here (rather than a
+    /// new `request_with_preview_redacted` variant) since this method has
+    /// exactly ONE production call site today (`bus::computer_srv::approve` —
+    /// `bus::server::handle_ask` calls plain `request`), so widening this one
+    /// signature is the smallest-blast-radius fix; [`Self::request`] above
+    /// passes `None` for every one of ITS many call sites, none of which have
+    /// anything that needs redacting.
+    #[allow(clippy::too_many_arguments)]
     pub fn request_with_preview(
         &self,
         thread: i32,
@@ -1780,6 +1811,7 @@ impl AskRegistry {
         tool: &str,
         summary: &str,
         detail: &str,
+        detail_redacted: Option<&str>,
         risk: RiskLevel,
         action_key: &str,
         preview: Option<String>,
@@ -1796,6 +1828,7 @@ impl AskRegistry {
             tool: tool.to_string(),
             summary: summary.to_string(),
             detail: detail.to_string(),
+            detail_redacted: detail_redacted.map(str::to_string),
             risk,
             ts: now(),
             thread_title: String::new(),
