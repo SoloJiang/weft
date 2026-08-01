@@ -9,7 +9,7 @@
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use weft::ask::{AskRegistry, RiskLevel};
+use weft::ask::{Answer, AskRegistry, RiskLevel};
 use weft::bus::{server, BusRegistry};
 use weft::computer::{self, backend, mock::MockBackend, CapturedImage, WindowInfo};
 use weft::store::{repo, Db};
@@ -39,6 +39,47 @@ fn sse_json(sse_text: &str) -> serde_json::Value {
         .find(|l| l.starts_with("data: "))
         .unwrap_or_else(|| panic!("no SSE data line in: {sse_text}"));
     serde_json::from_str(&data_line["data: ".len()..]).unwrap()
+}
+
+/// POST a PreToolUse payload to the Ask Bridge, exactly as an injected hook
+/// script does (issue #160 M3-B's `bus::server::handle_ask` preview-attach
+/// tests) — mirrors `tests/ask_builtin_allow.rs`'s own `ask` helper.
+async fn ask_post(
+    base: &str,
+    thread: i32,
+    dir: &str,
+    engine: &str,
+    tool_name: &str,
+    tool_input: serde_json::Value,
+) -> String {
+    let url = format!("{base}/ask/{thread}/{dir}?tool={engine}");
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(url)
+        .json(&json!({ "tool_name": tool_name, "tool_input": tool_input }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+/// Wait for the Ask Bridge to surface a card and return it — the handler's
+/// POST blocks until answered, so the caller spawns it, waits here, inspects/
+/// answers the card, then awaits the spawned call. Mirrors `tests/
+/// ask_builtin_allow.rs`'s own `wait_for_card`, but returns the full `Ask`
+/// (not just its id) since M3-B's assertions need `Ask::preview`.
+async fn wait_for_card(asks: &AskRegistry, what: &str) -> weft::ask::Ask {
+    for _ in 0..200 {
+        if let Some(a) = asks.open().first() {
+            return a.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("{what} must surface a Needs-you card, but none appeared");
 }
 
 #[tokio::test]
@@ -122,6 +163,10 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // can open an Ask directly (scenario 6) against the SAME registry the
     // handler reads from.
     let asks_handle = asks.clone();
+    // Kept alongside the moved-into-`serve` connection so the M3-B section
+    // below can insert its own workspace/thread/direction/worktree rows
+    // against the SAME db `server::serve` is reading from.
+    let db_handle = db.clone();
     let (base, _h) = server::serve(reg, db, asks).await.unwrap();
 
     // A 1:1 (scale 1.0) window keeps the M2 section's physical-coordinate
@@ -282,7 +327,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // 6. Suspended: an open permission Ask for this EXACT (thread, dir)
     // blocks input actions — checked before the control lock/throttle are
     // even touched (see `bus::computer_srv::input_gate`'s ordering).
-    let (_ask_id, _rx) = asks_handle.request(thread, dir, "some_tool", "summary", "detail", RiskLevel::Unknown, "[]");
+    let (ask_id, _rx) = asks_handle.request(thread, dir, "some_tool", "summary", "detail", RiskLevel::Unknown, "[]");
     let out = rpc(
         &base,
         thread,
@@ -293,6 +338,156 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     .await;
     assert!(out.contains("permission card"), "{out}");
     assert_eq!(mock.actions.lock().unwrap().len(), 1, "a suspended call must never reach the backend");
+    // Clean up this section's manually-opened ask so it can't leak into the
+    // M3-B sections below, which poll `asks.open().first()` and assume the
+    // registry starts empty each time.
+    assert!(asks_handle.answer(ask_id, Answer::Deny));
+
+    // —— M3-B: engine-gated MCP image content + Ask-card preview (issue #160) ——
+    //
+    // Reuses the SAME MockBackend/"Notes" window as M1/M2 above — a NEW
+    // `MockBackend` would silently no-op (`backend::_set_backend_override` is
+    // a `OnceLock`, settable once per process) and a NEW `WEFT_HOME` would
+    // race this file's own single-setter rule (see this function's own doc
+    // comment) — so every M3-B scenario lives in THIS test too, continuing
+    // the M1/M2 sections' numbering. What varies per scenario is the
+    // `direction.tool` / `thread.lead_tool` driving each (thread, dir), which
+    // is all `engine_accepts_mcp_image` actually looks at.
+
+    // 7. Worker-lane engine gating: `claude` and an ACP backend (`omp`) both
+    // get an MCP `image` content block on top of the text confirmation;
+    // `codex` gets text only.
+    let ws = repo::create_workspace(&db_handle, "ws").await.unwrap();
+    let repo_tmp = tempfile::tempdir().unwrap();
+    let r = repo::add_repo_ref(&db_handle, ws.id, "r", &repo_tmp.path().to_string_lossy(), "main", "", true)
+        .await
+        .unwrap();
+
+    async fn worker_dir(db: &Db, ws_id: i32, repo_id: i32, tool: &str) -> (i32, i32) {
+        let t = repo::create_thread(db, ws_id, &format!("{tool} issue"), "issue", tool)
+            .await
+            .unwrap();
+        let d = repo::create_direction(db, t.id, "task", tool, repo_id, "why", "impl-only", "main")
+            .await
+            .unwrap();
+        // A plain path (not `tempfile::tempdir()`, whose `TempDir` guard would
+        // delete this the instant `worker_dir` returns — the screenshot write
+        // this path is FOR happens later, via a separate RPC call) — mirrors
+        // this file's own `WEFT_HOME` setup above (unique-per-process-id,
+        // wiped first in case a prior run left it behind).
+        let wt_path = std::env::temp_dir().join(format!(
+            "weft-computer-mcp-wt-{tool}-{}-{}",
+            std::process::id(),
+            d.id
+        ));
+        let _ = std::fs::remove_dir_all(&wt_path);
+        std::fs::create_dir_all(&wt_path).unwrap();
+        repo::record_worktree(db, repo_id, d.id, "wt-branch", &wt_path.to_string_lossy(), true, true, "")
+            .await
+            .unwrap();
+        (t.id, d.id)
+    }
+
+    async fn assert_screenshot_content(
+        base: &str,
+        thread: i32,
+        dir: &str,
+        rpc_id: i64,
+        wants_image: bool,
+        what: &str,
+    ) {
+        let out = rpc(
+            base,
+            thread,
+            dir,
+            json!({"jsonrpc":"2.0","id":rpc_id,"method":"tools/call",
+                "params":{"name":"computer","arguments":{"action":"screenshot","window":"notes"}}}),
+        )
+        .await;
+        let body = sse_json(&out);
+        let content = body["result"]["content"].as_array().unwrap_or_else(|| panic!("{what}: {out}"));
+        assert_eq!(content[0]["type"], "text", "{what}: text block must always be first — {content:?}");
+        if wants_image {
+            assert_eq!(content.len(), 2, "{what}: expected text + image — {content:?}");
+            assert_eq!(content[1]["type"], "image");
+            assert_eq!(content[1]["mimeType"], "image/jpeg");
+            let data = content[1]["data"].as_str().unwrap();
+            assert!(!data.starts_with("data:"), "{what}: MCP image content must be raw base64, no data: prefix");
+            use base64::Engine as _;
+            assert!(
+                base64::engine::general_purpose::STANDARD.decode(data).is_ok(),
+                "{what}: image data must be valid base64"
+            );
+        } else {
+            assert_eq!(content.len(), 1, "{what}: expected text-only — {content:?}");
+        }
+    }
+
+    let (claude_thread, claude_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
+    assert_screenshot_content(&base, claude_thread, &claude_dir.to_string(), 20, true, "claude worker").await;
+
+    let (omp_thread, omp_dir) = worker_dir(&db_handle, ws.id, r.id, "omp").await;
+    assert_screenshot_content(&base, omp_thread, &omp_dir.to_string(), 21, true, "omp (ACP) worker").await;
+
+    let (codex_thread, codex_dir) = worker_dir(&db_handle, ws.id, r.id, "codex").await;
+    assert_screenshot_content(&base, codex_thread, &codex_dir.to_string(), 22, false, "codex worker").await;
+
+    // 8. Lead-lane engine gating: the SAME rule, driven by `thread.lead_tool`
+    // instead of `direction.tool` (a lead has no direction row at all).
+    let claude_lead = repo::create_thread(&db_handle, ws.id, "claude lead", "issue", "claude").await.unwrap();
+    assert_screenshot_content(&base, claude_lead.id, "lead", 23, true, "claude lead").await;
+    let codex_lead = repo::create_thread(&db_handle, ws.id, "codex lead", "issue", "codex").await.unwrap();
+    assert_screenshot_content(&base, codex_lead.id, "lead", 24, false, "codex lead").await;
+
+    // 9. Ask-card preview attach rule (`bus::server::handle_ask`): a GUI
+    // INPUT ask for a (thread, dir) that just screenshotted carries
+    // `Ask::preview`; the SAME (thread, dir)'s OBSERVE ask does not, even
+    // though the registry has something for it; a (thread, dir) that never
+    // screenshotted gets no preview either (isolation).
+    let gui_ask = |ask_thread: i32, ask_dir: i32, action: &'static str| {
+        let base = base.clone();
+        let ask_dir = ask_dir.to_string();
+        tokio::spawn(async move {
+            ask_post(
+                &base,
+                ask_thread,
+                &ask_dir,
+                "claude",
+                "mcp__weft_computer__computer",
+                json!({"action": action, "window": "notes", "coordinate": [1, 1]}),
+            )
+            .await
+        })
+    };
+
+    let call = gui_ask(claude_thread, claude_dir, "left_click");
+    let card = wait_for_card(&asks_handle, "weft_computer left_click (claude worker)").await;
+    assert!(card.preview.is_some(), "a GUI INPUT ask must carry the screenshot preview: {card:?}");
+    assert!(
+        card.preview.as_deref().unwrap().starts_with("data:image/jpeg;base64,"),
+        "{card:?}"
+    );
+    assert!(asks_handle.answer(card.id, Answer::Deny));
+    call.await.unwrap();
+
+    let call = gui_ask(claude_thread, claude_dir, "screenshot");
+    let card = wait_for_card(&asks_handle, "weft_computer screenshot (observe, claude worker)").await;
+    assert!(
+        card.preview.is_none(),
+        "an OBSERVE-only GUI ask must never carry a preview, even with one on file: {card:?}"
+    );
+    assert!(asks_handle.answer(card.id, Answer::Deny));
+    call.await.unwrap();
+
+    let (never_thread, never_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
+    let call = gui_ask(never_thread, never_dir, "left_click");
+    let card = wait_for_card(&asks_handle, "weft_computer left_click (never screenshotted)").await;
+    assert!(
+        card.preview.is_none(),
+        "a (thread, dir) with no prior screenshot must get no preview (isolation): {card:?}"
+    );
+    assert!(asks_handle.answer(card.id, Answer::Deny));
+    call.await.unwrap();
 }
 
 /// Exercises the REAL platform backend end-to-end (window enumeration +

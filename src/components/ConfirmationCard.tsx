@@ -192,6 +192,24 @@ function formatDetail(detail: string): { text: string; omittedChars: number } {
   };
 }
 
+/** A GUI-input-style ask's latest screenshot (issue: tool row / ask preview
+ *  images) — rendered above the raw-detail area, same "visible by default,
+ *  not opt-in" stance as `DetailPreview` (round-2 review, issue #101):
+ *  whether or not the raw JSON detail also expands is orthogonal to whether
+ *  there's a screenshot to show. `object-contain` (not `cover`, unlike the
+ *  cropped `Attachment` thumbnail) — a GUI screenshot's aspect ratio and full
+ *  frame are the point, not a cropped preview tile. */
+function AskScreenshotPreview({ src }: { readonly src: string }) {
+  const { t } = useTranslation();
+  return (
+    <img
+      src={src}
+      alt={t("needs.screenshotPreview")}
+      className="mt-1 max-h-40 w-full rounded-[var(--radius-md)] border border-border/60 bg-bg object-contain"
+    />
+  );
+}
+
 /** issue #101: a permission ask's danger tier, mapped to the project's
  *  existing semantic colors (never a bespoke palette) — mirrors
  *  `StatusChip`'s `Record<Status, style>` shape: exhaustive by construction,
@@ -375,6 +393,7 @@ export function PermissionConfirmationCard({
               </span>
             )}
           </ConfirmationTitle>
+          {!isBlockSummary && ask.preview && <AskScreenshotPreview src={ask.preview} />}
           {!isBlockSummary && hasHiddenDetail && (
             <DetailPreview detail={ask.detail} />
           )}
@@ -392,6 +411,7 @@ export function PermissionConfirmationCard({
             : ask.summary}
         </p>
       )}
+      {isBlockSummary && ask.preview && <AskScreenshotPreview src={ask.preview} />}
       {isBlockSummary && hasHiddenDetail && <DetailPreview detail={ask.detail} />}
       <ConfirmationActions className={actionsClassName}>
         <ConfirmationAction

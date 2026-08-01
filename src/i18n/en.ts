@@ -375,6 +375,7 @@ export const en = {
     riskNetworkOrCredentialTitle: "Leaves this machine or touches a credential — review closely",
     riskUnknown: "Unknown risk",
     riskUnknownTitle: "Couldn't classify this call — review the arguments before approving",
+    screenshotPreview: "Latest screenshot",
     detailTruncated: "… {{n}} more characters truncated",
     actionRequired: "This needs your action — it won't clear itself.",
     retryTracking: "Retry",
@@ -388,6 +389,7 @@ export const en = {
     output: "Output",
     showMore: "Show {{n}} more lines",
     showLess: "Show less",
+    screenshot: "Screenshot {{count}}",
   },
   session: {
     back: "Back to board",

@@ -104,6 +104,30 @@ pub fn turn_start_params(thread_id: &str, text: &str) -> Value {
     })
 }
 
+/// turn/start with one `localImage` input item per path, appended after the
+/// text item — the app-server counterpart to exec's plain-text image-path
+/// listing (engine.rs's per-turn image spill only lists paths in the message
+/// body for exec; the app-server transport ALSO hands them over as proper
+/// input items here, in addition to that same text listing).
+///
+/// Wire shape verified live against source: openai/codex
+/// `codex-rs/app-server-protocol/src/protocol/v2/turn.rs`, `UserInput` enum —
+/// `#[serde(tag = "type", rename_all = "camelCase")]` with a
+/// `LocalImage { detail: Option<ImageDetail>, path: PathBuf }` variant. The tag
+/// transform turns the variant name into `"localImage"`; `path` serializes as
+/// a plain string. `detail` carries `#[serde(default)]` with NO
+/// `skip_serializing_if`, so the server tolerates it being entirely absent on
+/// deserialize (missing → `None`) — omitted here, matching this function's own
+/// sibling above, which likewise omits `text`'s equally-defaulted
+/// `textElements` field rather than emit a value the server will supply itself.
+pub fn turn_start_params_with_images(thread_id: &str, text: &str, image_paths: &[String]) -> Value {
+    let mut input = vec![json!({ "type": "text", "text": text })];
+    for p in image_paths {
+        input.push(json!({ "type": "localImage", "path": p }));
+    }
+    json!({ "threadId": thread_id, "input": input })
+}
+
 /// turn/interrupt requires BOTH threadId and turnId (turnId is load-bearing —
 /// omitting it fails to deserialize server-side).
 pub fn turn_interrupt_params(thread_id: &str, turn_id: &str) -> Value {
@@ -445,6 +469,9 @@ fn appserver_tool_call(item: &Value) -> crate::lead_chat::proto::ToolCall {
         output: None,
         is_error: false,
         collab_threads: appserver_collab_threads(item),
+        // A call's own start never carries a result yet — see
+        // `proto::ToolCall::images`.
+        images: Vec::new(),
     }
 }
 
@@ -477,6 +504,9 @@ fn appserver_tool_result(item: &Value) -> crate::lead_chat::proto::ToolResultIte
         output: appserver_tool_output(item),
         is_error: appserver_tool_is_error(item),
         collab_threads: appserver_collab_threads(item),
+        // app-server's item.completed inbound image content isn't parsed yet
+        // (only claude's tool_result and the ACP dialect are, so far).
+        images: Vec::new(),
     }
 }
 
@@ -1150,6 +1180,25 @@ impl Client {
             .await?;
         turn_id_of(&r).ok_or_else(|| anyhow::anyhow!("turn/start: no turn.id"))
     }
+    /// Like [`start_turn`](Self::start_turn) but also hands over `image_paths`
+    /// as `localImage` input items (engine.rs's codex attachment spill, for
+    /// the app-server transport only — exec keeps its plain-text path listing).
+    /// An empty slice is identical to `start_turn` (plain params, no images key
+    /// churn on the wire for the common no-attachment turn).
+    pub async fn start_turn_with_images(
+        &self,
+        thread_id: &str,
+        text: &str,
+        image_paths: &[String],
+    ) -> anyhow::Result<String> {
+        let params = if image_paths.is_empty() {
+            turn_start_params(thread_id, text)
+        } else {
+            turn_start_params_with_images(thread_id, text, image_paths)
+        };
+        let r = self.request("turn/start", params).await?;
+        turn_id_of(&r).ok_or_else(|| anyhow::anyhow!("turn/start: no turn.id"))
+    }
     pub async fn interrupt(&self, thread_id: &str, turn_id: &str) -> anyhow::Result<()> {
         self.request("turn/interrupt", turn_interrupt_params(thread_id, turn_id))
             .await
@@ -1242,6 +1291,40 @@ mod tests {
         assert_eq!(v["params"]["input"][0]["type"], "text");
         assert_eq!(v["params"]["input"][0]["text"], "hello");
         assert!(v.get("jsonrpc").is_none()); // codex envelope has no jsonrpc field
+    }
+
+    /// turn_start_params_with_images: the text item stays first (unchanged
+    /// shape from the plain `turn_start_params`), followed by one `localImage`
+    /// item per path, `path` riding as a plain string with no `detail` key
+    /// (see the function's own doc for the source-verified wire shape).
+    #[test]
+    fn encodes_turn_start_with_local_image_input_items() {
+        let params = turn_start_params_with_images(
+            "t_1",
+            "look at this",
+            &["/tmp/weft-attachments/msg1-0.png".to_string(), "/tmp/weft-attachments/msg1-1.jpg".to_string()],
+        );
+        let line = encode_request(7, "turn/start", params);
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["params"]["threadId"], "t_1");
+        let input = v["params"]["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[0]["text"], "look at this");
+        assert_eq!(input[1]["type"], "localImage");
+        assert_eq!(input[1]["path"], "/tmp/weft-attachments/msg1-0.png");
+        // No `detail` key at all — the server's field is `#[serde(default)]`
+        // (no `skip_serializing_if`), so omitting it entirely is valid on the
+        // wire and matches this function's existing `text`/`textElements`
+        // convention of not emitting server-defaultable fields.
+        assert!(input[1].get("detail").is_none());
+        assert_eq!(input[2]["type"], "localImage");
+        assert_eq!(input[2]["path"], "/tmp/weft-attachments/msg1-1.jpg");
+
+        // An empty path list degenerates to exactly the plain params (no
+        // `localImage` items, no dangling empty array quirks).
+        let plain = turn_start_params_with_images("t_1", "hi", &[]);
+        assert_eq!(plain, turn_start_params("t_1", "hi"));
     }
 
     #[test]

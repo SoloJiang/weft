@@ -362,6 +362,7 @@ export const zh = {
     riskNetworkOrCredentialTitle: "会离开本机或接触凭证 —— 请仔细核对",
     riskUnknown: "风险未知",
     riskUnknownTitle: "无法判定风险，批准前请仔细查看参数",
+    screenshotPreview: "最新截图",
     detailTruncated: "……已截断 {{n}} 个字符",
     actionRequired: "需要你处理 —— 不会自动消失。",
     retryTracking: "重试",
@@ -375,6 +376,7 @@ export const zh = {
     output: "输出",
     showMore: "展开剩余 {{n}} 行",
     showLess: "收起",
+    screenshot: "截图 {{count}}",
   },
   session: {
     back: "返回看板",

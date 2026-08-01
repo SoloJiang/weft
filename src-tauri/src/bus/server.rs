@@ -205,7 +205,28 @@ async fn handle_ask(
         return hook_decision("allow", "Auto-approved by a weft rule");
     }
 
-    let (id, rx) = asks.request(thread, &dir, tool, &summary, &detail, risk, &action_key);
+    // Attach the most recent `weft_computer` screenshot's small preview
+    // (issue #160 M3-B) to a GUI ask card, but ONLY when it's an INPUT action
+    // (`risk == Write` — `summarize`'s own `RiskSignal::Gui` branch already
+    // classified it via `classify_gui_action`/`GUI_WRITE_ACTIONS`, the same
+    // partition this reuses rather than re-deriving a second one that could
+    // drift) — an observe-only action (screenshot/list_windows/
+    // cursor_position, `risk == ReadOnly`) skips it: the agent that just took
+    // that screenshot already has it, so attaching it again is pure payload
+    // with no new context for the human. `split_internal_tool` narrows to the
+    // SAME `weft_computer`'s `computer` tool `summarize`'s dedicated GUI
+    // branch recognizes — a Write-classified ask from a DIFFERENT tool (an
+    // ordinary Bash/file write) must never pick up a stale screenshot.
+    let preview = if split_internal_tool(tool_name) == Some(("weft_computer", "computer"))
+        && risk == crate::ask::RiskLevel::Write
+    {
+        crate::bus::computer_srv::last_screenshot_preview(thread, &dir)
+    } else {
+        None
+    };
+
+    let (id, rx) =
+        asks.request_with_preview(thread, &dir, tool, &summary, &detail, risk, &action_key, preview);
 
     match tokio::time::timeout(ASK_WAIT, rx).await {
         Ok(Ok(decision)) => {

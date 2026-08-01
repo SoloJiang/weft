@@ -1375,6 +1375,21 @@ pub struct Ask {
     /// matching key, not display data (see issue #89).
     #[serde(skip_serializing)]
     pub action_key: String,
+    /// A small `data:image/jpeg;base64,...` thumbnail of this session's most
+    /// recent `weft_computer` screenshot (issue #160 M3-B) — GUI-ask-only
+    /// context so the human can see roughly what's on screen before
+    /// allowing/denying an input action, without opening a file. `None` for
+    /// every non-GUI ask, and for a GUI ask with no prior screenshot in this
+    /// (thread, dir) — see `bus::computer_srv::last_screenshot_preview` and
+    /// `bus::server::handle_ask`'s attach rule. NEVER participates in
+    /// `action_key`/Always-grant matching: it's purely visual context, not
+    /// part of the action's identity, and two asks with an identical
+    /// `action_key` but a different (or absent) preview must still be
+    /// treated as the SAME action. `skip_serializing_if` keeps every existing
+    /// consumer's serialized shape byte-identical when there's nothing to show
+    /// (an old IM card render, a snapshot test, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 /// A persisted "full access" grant: every ask from this (thread, dir) auto-allows.
@@ -1727,6 +1742,15 @@ impl AskRegistry {
     /// when the human (or a timeout) answers. The caller awaits the receiver.
     /// `action_key` is the canonical EXACT action identity (see `Ask::action_key`)
     /// — distinct from `summary`, used only for Always-matching (issue #89).
+    ///
+    /// Thin `preview: None` wrapper over [`Self::request_with_preview`] — kept
+    /// as its OWN method (not folded into one signature with an added
+    /// parameter) so issue #160 M3-B's GUI-ask screenshot preview didn't have
+    /// to touch every one of this method's many call sites across the crate
+    /// (`lead_chat::engine`, `commands.rs`, `bus::global`, `auth_persist.rs`,
+    /// …) just to pass `None` — see `Self::request_with_preview`'s own doc for
+    /// the one caller (`bus::server::handle_ask`) that actually has a preview
+    /// to attach.
     pub fn request(
         &self,
         thread: i32,
@@ -1736,6 +1760,29 @@ impl AskRegistry {
         detail: &str,
         risk: RiskLevel,
         action_key: &str,
+    ) -> (u64, oneshot::Receiver<Decision>) {
+        self.request_with_preview(thread, dir, tool, summary, detail, risk, action_key, None)
+    }
+
+    /// [`Self::request`], plus an optional screenshot thumbnail (see
+    /// `Ask::preview`) attached to the Ask AT CREATION time — never patched
+    /// onto an already-open Ask afterward, so every consumer that reads
+    /// `open`/`AskEvent::Opened` sees the SAME Ask either way and doesn't need
+    /// a second update path to stay in sync. `bus::server::handle_ask` is the
+    /// only production caller that ever passes `Some(..)` today (a
+    /// `weft_computer` GUI input ask, with a prior screenshot on file for this
+    /// (thread, dir) — see that function's attach rule); every other call site
+    /// goes through the plain [`Self::request`] wrapper instead.
+    pub fn request_with_preview(
+        &self,
+        thread: i32,
+        dir: &str,
+        tool: &str,
+        summary: &str,
+        detail: &str,
+        risk: RiskLevel,
+        action_key: &str,
+        preview: Option<String>,
     ) -> (u64, oneshot::Receiver<Decision>) {
         let (tx, rx) = oneshot::channel();
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1755,6 +1802,7 @@ impl AskRegistry {
             dir_name: String::new(),
             workspace_id: None,
             action_key: action_key.to_string(),
+            preview,
         };
         g.open.push(ask.clone());
         g.emit(AskEvent::Opened(ask));

@@ -371,6 +371,60 @@ pub fn screenshot_window(
     })
 }
 
+/// Downscale `captured` to at most `max_long_edge` px on its long edge (the
+/// SAME triangle-filter rule [`scale_capture`] uses for the on-disk PNG, but
+/// parameterized so a caller can target a DIFFERENT size than the
+/// screenshot's own display scale — issue #160 M3-B's MCP `image` content
+/// block wants 1280px, the Ask-card thumbnail registry wants a smaller
+/// 640px), drop the alpha channel (JPEG has none — `to_rgb8` does this),
+/// encode at `quality` (1-100, [`image::codecs::jpeg::JpegEncoder`]'s own
+/// range — the caller picks a lower one for the throwaway thumbnail than for
+/// the model-facing image), and wrap the bytes as a
+/// `data:image/jpeg;base64,...` URI ready to embed inline anywhere a data URI
+/// is valid.
+///
+/// An MCP `image` content block wants the base64 payload WITHOUT this
+/// `data:` prefix — `bus::computer_srv` strips it back off rather than this
+/// helper never adding it, so every OTHER caller (an Ask card preview, or any
+/// future `<img src>` use) gets a ready-to-use URI without having to
+/// remember to add the prefix back themselves.
+///
+/// Requires the `image` crate's `jpeg` feature (see `Cargo.toml`) — enabled
+/// unconditionally alongside `png`, not gated behind `computer-os`, since
+/// this helper (like [`scale_capture`]) runs against `mock::MockBackend`'s
+/// pixels in tests too, not just the real OS backend.
+pub fn encode_jpeg_data_uri(
+    captured: &CapturedImage,
+    max_long_edge: u32,
+    quality: u8,
+) -> Result<String, ComputerError> {
+    let buf = image::RgbaImage::from_raw(captured.width, captured.height, captured.rgba.clone())
+        .ok_or_else(|| {
+            ComputerError::CaptureFailed("captured pixel buffer doesn't match its reported size".into())
+        })?;
+    let long_edge = captured.width.max(captured.height);
+    let scale = if long_edge > max_long_edge {
+        f64::from(max_long_edge) / f64::from(long_edge)
+    } else {
+        1.0
+    };
+    let rgba = if scale >= 1.0 {
+        buf
+    } else {
+        let new_width = ((f64::from(captured.width) * scale).round() as u32).max(1);
+        let new_height = ((f64::from(captured.height) * scale).round() as u32).max(1);
+        image::imageops::resize(&buf, new_width, new_height, image::imageops::FilterType::Triangle)
+    };
+    let rgb = image::DynamicImage::ImageRgba8(rgba).to_rgb8();
+    let mut bytes: Vec<u8> = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality)
+        .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+        .map_err(|e| ComputerError::Io(e.to_string()))?;
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:image/jpeg;base64,{b64}"))
+}
+
 // —— control lock / input throttle / emergency stop (issue #160 M2) ——
 //
 // Process-level, not per-thread/dir: the whole point is that exactly ONE
@@ -798,6 +852,45 @@ mod tests {
         assert_eq!(shot.scale, 0.5);
         let opened = image::open(&shot.path).unwrap();
         assert_eq!((opened.width(), opened.height()), (1280, 720));
+    }
+
+    // —— encode_jpeg_data_uri (issue #160 M3-B) ——
+
+    #[test]
+    fn encode_jpeg_data_uri_produces_a_decodable_jpeg_with_the_right_prefix() {
+        let captured = solid_image(800, 600, 128);
+        let uri = encode_jpeg_data_uri(&captured, 1280, 75).unwrap();
+        assert!(uri.starts_with("data:image/jpeg;base64,"), "{uri}");
+        let b64 = uri.strip_prefix("data:image/jpeg;base64,").unwrap();
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg).unwrap();
+        // No downscale needed (800x600's long edge is under max_long_edge), so
+        // the decoded JPEG keeps the source's exact dimensions.
+        assert_eq!((decoded.width(), decoded.height()), (800, 600));
+    }
+
+    #[test]
+    fn encode_jpeg_data_uri_downscales_to_the_requested_long_edge() {
+        let captured = solid_image(2560, 1440, 50);
+        let uri = encode_jpeg_data_uri(&captured, 640, 60).unwrap();
+        let b64 = uri.strip_prefix("data:image/jpeg;base64,").unwrap();
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg).unwrap();
+        // 2560x1440 downscaled to a 640px long edge preserves the aspect ratio.
+        assert_eq!((decoded.width(), decoded.height()), (640, 360));
+    }
+
+    #[test]
+    fn encode_jpeg_data_uri_rejects_a_mismatched_buffer() {
+        let bad = CapturedImage {
+            rgba: vec![0u8; 4], // way too short for 800x600
+            width: 800,
+            height: 600,
+        };
+        let err = encode_jpeg_data_uri(&bad, 1280, 75).unwrap_err();
+        assert!(matches!(err, ComputerError::CaptureFailed(_)));
     }
 
     // —— map_to_physical (issue #160 M2) ——

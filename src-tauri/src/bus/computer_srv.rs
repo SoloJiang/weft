@@ -33,9 +33,27 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 fn text_result(s: String) -> Value {
     json!({ "content": [{ "type": "text", "text": s }] })
+}
+
+/// A `screenshot` result whose owning session's engine is known to accept an
+/// inline MCP `image` content block (see [`engine_accepts_mcp_image`]) —
+/// `s` is the SAME confirmation text [`text_result`] alone would carry,
+/// `image_b64` is the screenshot re-encoded as JPEG (no `data:` prefix — raw
+/// base64, the shape the MCP `image` content type wants) via
+/// [`computer::encode_jpeg_data_uri`]. The text path is NEVER dropped even
+/// when the image is attached (issue #160 M3-B spec): every engine, image-
+/// capable or not, still gets the file path as a fallback for its own
+/// image-viewing tool.
+fn text_and_image_result(s: String, image_b64: String) -> Value {
+    json!({ "content": [
+        { "type": "text", "text": s },
+        { "type": "image", "data": image_b64, "mimeType": "image/jpeg" },
+    ] })
 }
 
 fn sse(value: Value) -> Response {
@@ -141,8 +159,23 @@ async fn call_computer(db: &Db, asks: &AskRegistry, thread: i32, dir: &str, name
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let window_query = args.get("window").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let mut window_id: Option<u32> = None;
+    // Set ONLY by the "screenshot" arm of `run_action`, and ONLY when the
+    // engine driving `(thread, dir)` is one `engine_accepts_mcp_image` allows
+    // — see that function's doc table (issue #160 M3-B).
+    let mut screenshot_image_b64: Option<String> = None;
 
-    let outcome = run_action(db, asks, thread, dir, name, &action, args, &mut window_id).await;
+    let outcome = run_action(
+        db,
+        asks,
+        thread,
+        dir,
+        name,
+        &action,
+        args,
+        &mut window_id,
+        &mut screenshot_image_b64,
+    )
+    .await;
     let outcome_text = match &outcome {
         Ok(text) => text.clone(),
         Err(text) => text.clone(),
@@ -165,7 +198,15 @@ async fn call_computer(db: &Db, asks: &AskRegistry, thread: i32, dir: &str, name
     )
     .await;
 
-    text_result(outcome_text)
+    // The image block only ever gets set on the Ok path of a "screenshot"
+    // call (see the out-param's own doc above), so `outcome.is_ok()` is
+    // implied whenever `screenshot_image_b64` is `Some` — but checking both
+    // here rather than relying on that invariant keeps this call site correct
+    // even if that ever stops being true.
+    match (outcome.is_ok(), screenshot_image_b64) {
+        (true, Some(image_b64)) => text_and_image_result(outcome_text, image_b64),
+        _ => text_result(outcome_text),
+    }
 }
 
 /// Every action's dispatch, `Ok(confirmation text)` or `Err(error text)` —
@@ -182,6 +223,7 @@ async fn run_action(
     action: &str,
     args: &Value,
     window_id_out: &mut Option<u32>,
+    screenshot_image_b64_out: &mut Option<String>,
 ) -> Result<String, String> {
     // Fail-closed gate BEFORE touching any backend or even validating the
     // tool/action names: every call here either observes or drives the
@@ -205,17 +247,44 @@ async fn run_action(
                 return Err("no worktree for this session".into());
             };
             let b = backend::backend();
-            computer::screenshot_window(b.as_ref(), &window_arg(args), &out_dir)
-                .map(|shot| {
-                    format!(
-                        "screenshot saved: {} ({}x{}, scale {:.2}) — open it with your image viewing tool",
-                        shot.path.display(),
-                        shot.width,
-                        shot.height,
-                        shot.scale
-                    )
-                })
-                .map_err(|e| e.to_string())
+            let shot = computer::screenshot_window(b.as_ref(), &window_arg(args), &out_dir)
+                .map_err(|e| e.to_string())?;
+            let text = format!(
+                "screenshot saved: {} ({}x{}, scale {:.2}) — open it with your image viewing tool",
+                shot.path.display(),
+                shot.width,
+                shot.height,
+                shot.scale
+            );
+            // Both the preview registry and the MCP image block need the raw
+            // pixels; `screenshot_window` only hands back a `Screenshot`
+            // (path + dims), so this re-reads the PNG it just wrote — see
+            // `read_captured_image`'s doc for why (M3-B is scoped to add
+            // exactly one new function to `computer/mod.rs`, not to change
+            // `screenshot_window`'s own return shape). Best-effort: a read/
+            // decode failure here must not fail a screenshot that already
+            // saved successfully — it just means no preview/image this call.
+            if let Some(captured) = read_captured_image(&shot.path) {
+                // ALWAYS refresh the Ask-card preview, regardless of engine —
+                // see `store_screenshot_preview`'s doc.
+                if let Ok(preview) =
+                    computer::encode_jpeg_data_uri(&captured, PREVIEW_LONG_EDGE, PREVIEW_QUALITY)
+                {
+                    store_screenshot_preview(thread, dir, preview);
+                }
+                // The MCP `image` content block is engine-gated — see
+                // `engine_accepts_mcp_image`'s doc table.
+                if engine_accepts_mcp_image(db, thread, dir).await {
+                    if let Ok(uri) = computer::encode_jpeg_data_uri(
+                        &captured,
+                        MCP_IMAGE_LONG_EDGE,
+                        MCP_IMAGE_QUALITY,
+                    ) {
+                        *screenshot_image_b64_out = strip_data_uri_prefix(&uri).map(str::to_string);
+                    }
+                }
+            }
+            Ok(text)
         }
         "left_click" | "right_click" | "double_click" | "triple_click" => {
             input_gate(asks, thread, dir)?;
@@ -318,6 +387,130 @@ async fn run_action(
             VALID_ACTIONS.join(", ")
         )),
     }
+}
+
+// —— screenshot → MCP image content + Ask-card preview registry (issue #160 M3-B) ——
+
+/// Long edge / JPEG quality for the MCP `image` content block a `screenshot`
+/// result gets, for the engines [`engine_accepts_mcp_image`] allows — a full
+/// working-context image for the MODEL to reason over, so it stays at the
+/// SAME long edge `screenshot_window`'s own on-disk downscale already caps
+/// at (`computer::display_scale`'s `MAX_LONG_EDGE`) — this only ever shrinks
+/// further on a window that somehow still exceeds it after that.
+const MCP_IMAGE_LONG_EDGE: u32 = 1280;
+const MCP_IMAGE_QUALITY: u8 = 75;
+
+/// Long edge / JPEG quality for the Ask-card preview registry's thumbnail —
+/// deliberately smaller and lower-quality than the MCP image block above:
+/// this one is glance-level visual context for a HUMAN triaging a permission
+/// card, not something a model reasons over pixel-by-pixel, so a smaller
+/// payload is the right tradeoff.
+const PREVIEW_LONG_EDGE: u32 = 640;
+const PREVIEW_QUALITY: u8 = 60;
+
+/// Read a just-saved screenshot PNG back into raw RGBA pixels, for
+/// [`computer::encode_jpeg_data_uri`] (both the preview registry and,
+/// engine-permitting, the MCP image content block) — `screenshot_window`
+/// only returns a [`computer::Screenshot`] (path + dims), not the pixels it
+/// already wrote to disk, and this milestone is scoped to add exactly ONE
+/// new function to `computer/mod.rs` (`encode_jpeg_data_uri` itself, not a
+/// change to `screenshot_window`'s own return shape) — so this decodes the
+/// file back rather than plumbing the raw capture out a second way.
+/// `None` on any read/decode failure: best-effort, since a screenshot that
+/// already saved successfully must not fail the whole call just because this
+/// second, purely-additive step couldn't re-read its own output.
+fn read_captured_image(path: &std::path::Path) -> Option<computer::CapturedImage> {
+    let img = image::open(path).ok()?.to_rgba8();
+    let (width, height) = (img.width(), img.height());
+    Some(computer::CapturedImage {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
+
+/// Strip the `data:image/jpeg;base64,` prefix `encode_jpeg_data_uri` always
+/// adds — the MCP `image` content type wants the RAW base64 payload with no
+/// prefix (`{"type":"image","data":"<base64>","mimeType":"image/jpeg"}`),
+/// unlike a `data:` URI meant to sit directly in something like `<img src>`.
+fn strip_data_uri_prefix(uri: &str) -> Option<&str> {
+    uri.strip_prefix("data:image/jpeg;base64,")
+}
+
+/// The `tool` currently driving `(thread, dir)` — the SAME durable field
+/// `commands::session_meta` reads (`direction.tool`; see that entity field's
+/// own doc comment on why it — not `session.tool` — is the per-task engine
+/// choice of record), so a worker mid-engine-switch reports the tool that
+/// will actually see this screenshot. `dir == bus::LEAD` has no direction row
+/// at all (a lead joins the bus under the `LEAD` sentinel, not a numeric
+/// direction id — mirrors [`session_root`]'s own dir=="lead"-vs-numeric
+/// split), so it reads the thread's `lead_tool` instead. `None` on any lookup
+/// failure — a `dir` that fails to parse, a numeric `dir` that doesn't
+/// resolve to a direction belonging to THIS thread (a stale/forged route,
+/// same check [`session_root`] makes), a missing row, or a DB error — never a
+/// guess.
+async fn session_tool(db: &Db, thread: i32, dir: &str) -> Option<String> {
+    if dir == crate::bus::LEAD {
+        return repo::get_thread(db, thread).await.ok().flatten().map(|t| t.lead_tool);
+    }
+    let direction_id = dir.parse::<i32>().ok()?;
+    match repo::get_direction(db, direction_id).await {
+        Ok(Some(d)) if d.thread_id == thread => Some(d.tool),
+        _ => None,
+    }
+}
+
+/// Which weft_computer callers get a screenshot's pixels as an inline MCP
+/// `image` content block (issue #160 M3-B), on top of the text confirmation
+/// EVERY caller always gets regardless (this module's own doc comment: the
+/// agent's own image-viewing tool is the universal fallback):
+///
+/// | `session_tool` result           | MCP image block? |
+/// |----------------------------------|-------------------|
+/// | `"claude"`                       | yes — claude feeds an MCP `image` content block straight to the model |
+/// | any ACP backend (`acp::backend_for(tool).is_some()`, today just `"omp"`) | yes — same reasoning as claude |
+/// | `"codex"` / `"opencode"`         | no — MCP image-content support isn't confirmed from this repo's own code for either, so this stays fail-safe |
+/// | lookup failure (`None`)          | no — same fail-safe default |
+///
+/// The text path is NEVER dropped for the "no" rows — see
+/// [`text_and_image_result`]'s doc.
+async fn engine_accepts_mcp_image(db: &Db, thread: i32, dir: &str) -> bool {
+    match session_tool(db, thread, dir).await {
+        Some(tool) => tool == "claude" || crate::acp::backend_for(&tool).is_some(),
+        None => false,
+    }
+}
+
+/// Process-level "most recent screenshot" registry (issue #160 M3-B): one
+/// small preview thumbnail per (thread, dir), refreshed on EVERY successful
+/// `screenshot` action regardless of which engine is asking (unlike the MCP
+/// image content block above, which is engine-gated) — `bus::server::
+/// handle_ask` attaches it to a `weft_computer` GUI INPUT Ask card (never an
+/// observe-only one) so the human has some visual context before allowing/
+/// denying a click/type/key/etc without opening the saved PNG themselves. A
+/// process-wide `OnceLock`, not per-request state, so it survives across the
+/// many separate MCP calls a session makes — mirrors `computer::control_
+/// mutex`'s own process-level-static shape for the same reason (issue #160
+/// M2). In-memory only: a stale/missing preview is harmless (the Ask card
+/// just renders without one), so a restart starting empty is fine — no
+/// durability needed.
+fn screenshot_previews() -> &'static Mutex<HashMap<(i32, String), String>> {
+    static PREVIEWS: OnceLock<Mutex<HashMap<(i32, String), String>>> = OnceLock::new();
+    PREVIEWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_screenshot_preview(thread: i32, dir: &str, preview: String) {
+    let mut g = screenshot_previews().lock().unwrap_or_else(|e| e.into_inner());
+    g.insert((thread, dir.to_string()), preview);
+}
+
+/// The most recent screenshot preview for `(thread, dir)`, if any — see
+/// [`screenshot_previews`]'s doc. `pub(crate)`: read by `bus::server::
+/// handle_ask` (a sibling module) when attaching a GUI input Ask's
+/// `Ask::preview`.
+pub(crate) fn last_screenshot_preview(thread: i32, dir: &str) -> Option<String> {
+    let g = screenshot_previews().lock().unwrap_or_else(|e| e.into_inner());
+    g.get(&(thread, dir.to_string())).cloned()
 }
 
 fn window_arg(args: &Value) -> String {

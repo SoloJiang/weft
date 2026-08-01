@@ -223,6 +223,7 @@ mod tests {
             dir_name: "backend".into(),
             workspace_id: None,
             action_key: "claude:npm test".into(),
+            preview: None,
         }
     }
 

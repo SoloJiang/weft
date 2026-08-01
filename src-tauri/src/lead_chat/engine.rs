@@ -218,6 +218,14 @@ pub struct Outgoing {
     /// True when the original send carried files or images (computed from the
     /// ORIGINAL inputs before per-turn image-spill clears out.images).
     pub has_attachments: bool,
+    /// Absolute paths of images already spilled to `$TMP/weft-attachments` by
+    /// the per-turn image-spill step (see `send()`), populated ONLY for the
+    /// codex app-server transport — exec keeps to its plain-text path listing
+    /// appended into `text` and never reads this field. `spawn_codex_turn`/
+    /// `codex_consumer`'s queue flush hand these to `Client::
+    /// start_turn_with_images` as `localImage` input items alongside the text.
+    /// Always empty for every other tool/transport.
+    pub local_image_paths: Vec<String>,
 }
 
 /// Busy/queue bookkeeping for one engine. Mirrors the TUI's own semantics:
@@ -287,6 +295,7 @@ impl TurnState {
                     origin_tag: None,
                     queue_id: None,
                     has_attachments: false,
+                    local_image_paths: Vec::new(),
                 })
             }
             // A message queued before the wake goes first; the wake slides up one.
@@ -932,6 +941,10 @@ fn tool_row_status(has_output: bool, trackable: bool, is_error: bool) -> &'stati
 /// knows about, so the frontend can anchor that thread's branch here. Neither
 /// key is present at all when empty/None, so an ordinary tool call's content
 /// is byte-identical to pre-#99 output — same contract as `text_row_content`.
+/// `images` (screenshot data URIs, if the call itself already carries any —
+/// see `proto::ToolCall::images`) follows the identical "present only when
+/// non-empty" rule, so an old persisted row with no `images` key and a fresh
+/// image-less row parse identically on the frontend (default empty array).
 /// Pure and DB-free by design: `persist_tool_calls` is the only caller in the
 /// live path, but keeping this separate lets it be unit-tested directly.
 fn tool_row_content(call: &super::proto::ToolCall, agent_thread: Option<&str>) -> serde_json::Value {
@@ -948,6 +961,9 @@ fn tool_row_content(call: &super::proto::ToolCall, agent_thread: Option<&str>) -
         }
         if !call.collab_threads.is_empty() {
             obj.insert("collabThreads".into(), call.collab_threads.clone().into());
+        }
+        if !call.images.is_empty() {
+            obj.insert("images".into(), call.images.clone().into());
         }
     }
     content
@@ -1005,6 +1021,47 @@ async fn persist_tool_calls(
     }
 }
 
+/// Merge a `ToolResultItem` into its running row's already-persisted content —
+/// pure and DB-free by the same split as `tool_row_content` (its sibling
+/// assembly point), so it's unit-testable directly. `output`/`is_error` are
+/// UNCONDITIONALLY overwritten: the call-side row only ever held a running
+/// placeholder for them (empty string / false), so the result is the first and
+/// only authoritative value either field gets. `images` follows that SAME
+/// "result overrides the call side" rule — written (replacing whatever the
+/// call-side JSON held, if anything) when the result carries any, and the key
+/// removed otherwise, so a call-side stub can never survive stale into the
+/// terminal row. `collabThreads` is intentionally NOT symmetric with that: it
+/// keeps its own "merge when non-empty, otherwise leave whatever's already
+/// there untouched" rule (see the comment below) because a `spawnAgent`
+/// call's `receiverThreadIds` becoming known here is filling in a value the
+/// call side legitimately hadn't resolved yet — not a terminal result
+/// superseding the call's own claim, so an empty item-side list must never
+/// erase a real thread id the call side already recorded.
+fn merge_tool_result_content(content: &mut serde_json::Value, item: &super::proto::ToolResultItem) {
+    let Some(obj) = content.as_object_mut() else {
+        return;
+    };
+    obj.insert("output".into(), item.output.clone().into());
+    obj.insert("is_error".into(), item.is_error.into());
+    // issue #99: a `spawnAgent` collab call's `receiverThreadIds` is empty at
+    // item/started (captured — emptily — into this row's content by
+    // persist_tool_calls) and only becomes known HERE, at item/completed.
+    // Merge it in now so the frontend can still anchor that thread's branch to
+    // this row once it re-renders — until then, the child's own rows (already
+    // tagged with agentThread) have no known anchor yet and correctly render
+    // top-level/flat (collabBranches.ts's groupTimeline is a stateless
+    // whole-array recompute, so this is an honest "not resolved yet", not a
+    // wrong guess: nothing is hidden, it just hasn't grouped yet).
+    if !item.collab_threads.is_empty() {
+        obj.insert("collabThreads".into(), item.collab_threads.clone().into());
+    }
+    if item.images.is_empty() {
+        obj.remove("images");
+    } else {
+        obj.insert("images".into(), item.images.clone().into());
+    }
+}
+
 /// Merge tool results into their running rows (claude tool_result / codex
 /// item.completed); a result for an untracked row is dropped.
 async fn merge_tool_results(
@@ -1018,23 +1075,7 @@ async fn merge_tool_results(
         let Some((row_id, mut content)) = inner.tool_rows.remove(&item.id) else {
             continue;
         };
-        if let Some(obj) = content.as_object_mut() {
-            obj.insert("output".into(), item.output.into());
-            obj.insert("is_error".into(), item.is_error.into());
-            // issue #99: a `spawnAgent` collab call's `receiverThreadIds` is
-            // empty at item/started (captured — emptily — into this row's
-            // content by persist_tool_calls) and only becomes known HERE, at
-            // item/completed. Merge it in now so the frontend can still anchor
-            // that thread's branch to this row once it re-renders — until
-            // then, the child's own rows (already tagged with agentThread)
-            // have no known anchor yet and correctly render top-level/flat
-            // (collabBranches.ts's groupTimeline is a stateless whole-array
-            // recompute, so this is an honest "not resolved yet", not a wrong
-            // guess: nothing is hidden, it just hasn't grouped yet).
-            if !item.collab_threads.is_empty() {
-                obj.insert("collabThreads".into(), item.collab_threads.clone().into());
-            }
-        }
+        merge_tool_result_content(&mut content, &item);
         let status = if item.is_error { "error" } else { "complete" };
         let content_str = content.to_string();
         let _ = repo::update_lead_message(db, row_id, &content_str, status).await;
@@ -1183,6 +1224,7 @@ async fn apply_lead_sentinels(
                         origin_tag: None,
                         queue_id: None,
                         has_attachments: false,
+                        local_image_paths: Vec::new(),
                     };
                     queue_hidden_delivery(app, inner, out);
                 }
@@ -2759,8 +2801,13 @@ pub async fn send(
             outbound.push_str(&format!("- {f}\n"));
         }
     }
+    // Hoisted above the spill loop (rather than computed only at Phase 3 below,
+    // as it used to be) so the loop can tell app-server codex apart from every
+    // other per-turn dialect/transport while it's spilling.
+    let is_codex_appserver = ctx.tool == "codex" && codex_appserver_enabled();
     // Per-turn dialects take no inline image blocks: spill pasted images to
     // temp files and hand over paths — every agent can read those itself.
+    let mut local_image_paths: Vec<String> = Vec::new();
     let images = if per_turn(&ctx.tool) && !images.is_empty() {
         use base64::Engine as _;
         let dir = std::env::temp_dir().join("weft-attachments");
@@ -2772,6 +2819,13 @@ pub async fn send(
             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
                 if std::fs::write(&p, bytes).is_ok() {
                     outbound.push_str(&format!("- {}\n", p.display()));
+                    // app-server transport ALSO gets these as first-class
+                    // `localImage` input items on turn/start (codex_app_server::
+                    // turn_start_params_with_images) — not just a path listed in
+                    // the text. exec has no such channel, so it stays text-only.
+                    if is_codex_appserver {
+                        local_image_paths.push(p.display().to_string());
+                    }
                 }
             }
         }
@@ -2812,13 +2866,13 @@ pub async fn send(
         origin_tag: ctx.origin_tag.clone(),
         queue_id: if ctx.direct { None } else { Some(row_id) },
         has_attachments,
+        local_image_paths,
     };
 
     // Phase 3: re-acquire the lock and COMMIT against CURRENT state — deliver,
     // enqueue, promote, or abort is decided here, not enforced from the Phase-1
     // snapshot (which only decided the row's optimistic status). The lock drops
     // before any turn-spawning awaits.
-    let is_codex_appserver = ctx.tool == "codex" && codex_appserver_enabled();
     let is_acp = is_acp_tool(&ctx.tool);
     let is_connection = is_codex_appserver || is_acp;
     let spawn_now = ctx.direct && per_turn(&ctx.tool) && !is_connection;
@@ -3206,7 +3260,9 @@ async fn spawn_codex_turn(
     // the prompt is prepended to the FIRST turn of a brand-new thread; a resumed
     // thread already carries it in conversation history.
     let first_text = codex_first_turn_text(&system_prompt, &out.text, had_native);
-    let turn = client.start_turn(&thread, &first_text).await?;
+    let turn = client
+        .start_turn_with_images(&thread, &first_text, &out.local_image_paths)
+        .await?;
     client.set_active_turn(&thread, &turn).await;
     // The turn is in flight, so the thread is real and carries the system prompt:
     // now it's safe to persist the native id (a later resume reuses this rollout).
@@ -4872,7 +4928,10 @@ async fn codex_consumer(
                     if let Some(qid) = n.queue_id {
                         snapshot_turn_checkpoint(&app, &db, session_id, turn_id, qid).await;
                     }
-                    match client.start_turn(&thread, &n.text).await {
+                    match client
+                        .start_turn_with_images(&thread, &n.text, &n.local_image_paths)
+                        .await
+                    {
                         Ok(t) => {
                             mark_queued_delivered(&app, &db, thread_id, session_id, &n).await;
                             client.set_active_turn(&thread, &t).await;
@@ -5690,6 +5749,7 @@ async fn send_hidden_inner(
         origin_tag: None,
         queue_id: None,
         has_attachments: false,
+        local_image_paths: Vec::new(),
     };
 
     match hidden_delivery(
@@ -9135,6 +9195,7 @@ mod tests {
             output: None,
             is_error: false,
             collab_threads,
+            images: Vec::new(),
         }
     }
 
@@ -9149,6 +9210,23 @@ mod tests {
         assert_eq!(v["name"], "read_file");
         assert!(v.get("agentThread").is_none());
         assert!(v.get("collabThreads").is_none());
+        // Same "present only when non-empty" contract for images.
+        assert!(v.get("images").is_none());
+    }
+
+    /// A call that already carries images (no current dialect populates
+    /// `ToolCall::images`, but `tool_row_content` must still honor it — the
+    /// symmetric counterpart to `merge_tool_result_content_*` below) gets an
+    /// `images` key; an image-less call gets none at all, matching
+    /// `collabThreads`'s own "present only when non-empty" contract.
+    #[test]
+    fn tool_row_content_carries_images_when_the_call_has_any() {
+        let call = super::super::proto::ToolCall {
+            images: vec!["data:image/png;base64,QUJD".to_string()],
+            ..test_tool_call("read_file", Vec::new())
+        };
+        let v = tool_row_content(&call, None);
+        assert_eq!(v["images"], serde_json::json!(["data:image/png;base64,QUJD"]));
     }
 
     #[test]
@@ -9171,6 +9249,78 @@ mod tests {
         let v = tool_row_content(&call, None);
         assert!(v.get("agentThread").is_none());
         assert_eq!(v["collabThreads"], serde_json::json!(["sub-1", "sub-2"]));
+    }
+
+    fn test_tool_result(images: Vec<String>) -> super::super::proto::ToolResultItem {
+        super::super::proto::ToolResultItem {
+            id: "call_1".into(),
+            output: "the output".into(),
+            is_error: false,
+            collab_threads: Vec::new(),
+            images,
+        }
+    }
+
+    /// `merge_tool_result_content`'s images half: a result carrying images
+    /// writes the `images` key (present-only-when-non-empty, same contract as
+    /// `tool_row_content`'s own images/collabThreads keys).
+    #[test]
+    fn merge_tool_result_content_writes_images_when_the_result_has_any() {
+        let mut content = tool_row_content(&test_tool_call("Bash", Vec::new()), None);
+        assert!(content.get("images").is_none(), "no images before merge");
+        let item = test_tool_result(vec!["data:image/png;base64,QUJD".to_string()]);
+        merge_tool_result_content(&mut content, &item);
+        assert_eq!(content["output"], "the output");
+        assert_eq!(content["images"], serde_json::json!(["data:image/png;base64,QUJD"]));
+    }
+
+    /// The result's images OVERRIDE the call side, exactly like `output` does
+    /// — never appended/merged, and an empty result REMOVES whatever the call
+    /// side had, so a stale call-side stub can't survive into the terminal
+    /// row. This is the deliberately asymmetric choice vs. `collabThreads`
+    /// (see `merge_tool_result_content`'s doc for why the two differ).
+    #[test]
+    fn merge_tool_result_content_images_override_not_append_and_clear_when_empty() {
+        // The call side already had an image (hypothetical — no current dialect
+        // populates ToolCall::images, but the row's content JSON can still carry
+        // a stale key from some other source).
+        let mut content = serde_json::json!({
+            "name": "Bash",
+            "output": "",
+            "is_error": false,
+            "images": ["data:image/png;base64,STALE"],
+        });
+        // A result with a DIFFERENT image replaces it — not appends.
+        let replaced = test_tool_result(vec!["data:image/png;base64,NEW".to_string()]);
+        merge_tool_result_content(&mut content, &replaced);
+        assert_eq!(content["images"], serde_json::json!(["data:image/png;base64,NEW"]));
+
+        // A subsequent empty-images result (e.g. a different call id's row that
+        // never had a real screenshot) clears the key entirely rather than
+        // leaving the previous result's images stranded on it.
+        let empty = test_tool_result(Vec::new());
+        merge_tool_result_content(&mut content, &empty);
+        assert!(content.get("images").is_none());
+    }
+
+    /// Pre-existing merge behavior (output/is_error/collabThreads) must be
+    /// unchanged by the images work — regression guard for the refactor into
+    /// `merge_tool_result_content`.
+    #[test]
+    fn merge_tool_result_content_keeps_existing_output_and_collab_threads_behavior() {
+        let mut content = tool_row_content(&test_tool_call("collabAgentToolCall", Vec::new()), None);
+        let item = super::super::proto::ToolResultItem {
+            id: "call_1".into(),
+            output: "done".into(),
+            is_error: true,
+            collab_threads: vec!["sub-1".into()],
+            images: Vec::new(),
+        };
+        merge_tool_result_content(&mut content, &item);
+        assert_eq!(content["output"], "done");
+        assert_eq!(content["is_error"], true);
+        assert_eq!(content["collabThreads"], serde_json::json!(["sub-1"]));
+        assert!(content.get("images").is_none());
     }
 
     /// PersistedMeta roundtrip + tolerance: apply restores every last_* field,
@@ -9294,6 +9444,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         };
         let mut turn = TurnState::default();
         assert!(!has_pending_user_test_update(&turn));
@@ -9316,6 +9467,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         let next = t.on_turn_end();
         assert_eq!(next.map(|o| o.text).as_deref(), Some("second"));
@@ -9397,6 +9549,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         t.request_bus_read(); // wake lands AFTER "earlier" was queued
                               // "earlier" preceded the wake, so it drains first, then the read.
@@ -9420,6 +9573,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         // The wake arrived before "later", so the inbox read comes first — the
         // agent can't answer the newer prompt without seeing the bus message.
@@ -10129,6 +10283,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         let turn_id = mark_hidden_turn_started(&mut inner);
 
@@ -10190,6 +10345,7 @@ mod tests {
             origin_tag: None,
             queue_id: Some(99),
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
 
         let drain = reset_frozen_appserver_turn(&mut inner, 5).expect("same turn, still busy");
@@ -10285,6 +10441,7 @@ mod tests {
             origin_tag: None,
             queue_id: Some(42),
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
 
@@ -10616,6 +10773,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         };
 
         let err = write_user(&mut inner, &out).await.unwrap_err();

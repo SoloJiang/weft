@@ -118,6 +118,9 @@ fn tool_call_start(update: &Value) -> UpdateOut {
             output: None,
             is_error: false,
             collab_threads: Vec::new(),
+            // A call's own start never carries a result yet — see
+            // `proto::ToolCall::images`.
+            images: Vec::new(),
         }],
         uuid: None,
         agent_thread: None,
@@ -164,7 +167,14 @@ fn tool_call_update(update: &Value) -> UpdateOut {
     if id.is_empty() {
         return UpdateOut::Ignore;
     }
-    let output = crate::lead_chat::proto::cap_output(extract_tool_output(update));
+    // Images run through the shared `cap_images` gate (single source with the
+    // claude dialect, proto.rs); any it drops are announced in `output`, the
+    // SAME place the equivalent claude-side note lands.
+    let (images, dropped) = crate::lead_chat::proto::cap_images(extract_tool_images(update));
+    let output = crate::lead_chat::proto::note_omitted_images(
+        crate::lead_chat::proto::cap_output(extract_tool_output(update)),
+        dropped,
+    );
     let is_error = status == "failed";
     UpdateOut::Chat(ChatEvent::ToolResults {
         items: vec![ToolResultItem {
@@ -172,6 +182,7 @@ fn tool_call_update(update: &Value) -> UpdateOut {
             output,
             is_error,
             collab_threads: Vec::new(),
+            images,
         }],
     })
 }
@@ -210,6 +221,51 @@ fn extract_tool_output(update: &Value) -> String {
         }
     }
     String::new()
+}
+
+/// Image content blocks in a `tool_call_update` — the counterpart to
+/// `extract_tool_output`'s text extraction, scanning the exact same two
+/// sources it does (`rawOutput.content` array items directly, and the
+/// update's own `content[]` — trying both a flat block and content[]'s
+/// nested `.content` wrapper, mirroring how `extract_tool_output` tries both
+/// `item.text` and `item.content.text`) so an image sitting in either shape
+/// is found. `{"type":"image","data":d,"mimeType":m}` → `data:<m>;base64,<d>`.
+///
+/// This closes a real gap: before this function existed, an omp screenshot
+/// tool's image block was silently dropped — `extract_tool_output` only ever
+/// read the text half of a `tool_call_update`'s content.
+fn extract_tool_images(update: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(arr) = update.pointer("/rawOutput/content").and_then(|c| c.as_array()) {
+        for item in arr {
+            if let Some(uri) = image_block_data_uri(item) {
+                out.push(uri);
+            }
+        }
+    }
+    if let Some(arr) = update.get("content").and_then(|c| c.as_array()) {
+        for item in arr {
+            let uri = item
+                .get("content")
+                .and_then(image_block_data_uri)
+                .or_else(|| image_block_data_uri(item));
+            if let Some(uri) = uri {
+                out.push(uri);
+            }
+        }
+    }
+    out
+}
+
+/// One content block → `data:<mime>;base64,<data>` if it's an
+/// `{"type":"image",…}` block carrying both `data` and `mimeType`, else `None`.
+fn image_block_data_uri(block: &Value) -> Option<String> {
+    if block.get("type").and_then(|t| t.as_str()) != Some("image") {
+        return None;
+    }
+    let mime = block.get("mimeType").and_then(|m| m.as_str())?;
+    let data = block.get("data").and_then(|d| d.as_str())?;
+    Some(format!("data:{mime};base64,{data}"))
 }
 
 fn commands(update: &Value) -> UpdateOut {
@@ -387,6 +443,8 @@ mod tests {
                 assert_eq!(items[0].id, "call-1");
                 assert!(items[0].output.contains("TOOL_OK"));
                 assert!(!items[0].is_error);
+                // A text-only completion carries no images at all.
+                assert!(items[0].images.is_empty());
             }
             o => panic!("{o:?}"),
         }
@@ -397,6 +455,72 @@ mod tests {
             "status": "in_progress"
         });
         assert!(matches!(update_to_out(&inflight), UpdateOut::ToolProgress { .. }));
+    }
+
+    /// A tool_call_update carrying an image block (e.g. an omp screenshot
+    /// tool) must land it in `items[0].images` — this was the real gap: before
+    /// `extract_tool_images` existed, `extract_tool_output` only ever read the
+    /// text half of `rawOutput.content`/`content[]`, so the image block was
+    /// silently dropped.
+    #[test]
+    fn tool_call_update_with_image_block_populates_images() {
+        let done = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-2",
+            "status": "completed",
+            "rawOutput": {
+                "content": [
+                    { "type": "text", "text": "screenshot taken" },
+                    { "type": "image", "data": "QUJD", "mimeType": "image/png" }
+                ]
+            }
+        });
+        match update_to_out(&done) {
+            UpdateOut::Chat(ChatEvent::ToolResults { items }) => {
+                assert_eq!(items[0].output, "screenshot taken");
+                assert_eq!(items[0].images, vec!["data:image/png;base64,QUJD".to_string()]);
+            }
+            o => panic!("{o:?}"),
+        }
+
+        // The nested `content[].content` wrapper variant (the shape
+        // `extract_tool_output`'s text half already accommodates for text
+        // blocks) must be recognized for images too.
+        let nested = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-3",
+            "status": "completed",
+            "content": [
+                { "type": "content", "content": { "type": "image", "data": "WFla", "mimeType": "image/jpeg" } }
+            ]
+        });
+        match update_to_out(&nested) {
+            UpdateOut::Chat(ChatEvent::ToolResults { items }) => {
+                assert_eq!(items[0].images, vec!["data:image/jpeg;base64,WFla".to_string()]);
+            }
+            o => panic!("{o:?}"),
+        }
+
+        // A failed call with more than 4 images: only the first 4 survive and
+        // the rest are announced as omitted in the output text (cap_images,
+        // shared with the claude dialect).
+        let overflow_images: Vec<Value> = (0..5)
+            .map(|i| json!({ "type": "image", "data": format!("img{i}"), "mimeType": "image/png" }))
+            .collect();
+        let overflow = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-4",
+            "status": "failed",
+            "rawOutput": { "content": overflow_images }
+        });
+        match update_to_out(&overflow) {
+            UpdateOut::Chat(ChatEvent::ToolResults { items }) => {
+                assert_eq!(items[0].images.len(), 4);
+                assert!(items[0].is_error);
+                assert!(items[0].output.ends_with("(1 image(s) omitted: too large)"));
+            }
+            o => panic!("{o:?}"),
+        }
     }
 
     #[test]
