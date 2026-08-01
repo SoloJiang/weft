@@ -1593,7 +1593,16 @@ pub async fn set_computer_use_enabled(db: State<'_, Db>, enabled: bool) -> R<()>
         if enabled { "true" } else { "false" },
     )
     .await
-    .map_err(e)
+    .map_err(e)?;
+    // issue #160 review R1 #1: this is the ONLY place that clears the
+    // emergency-stop latch — a human explicitly re-enabling computer use
+    // from Settings after a kill switch trip. See
+    // `computer::clear_emergency_stop`'s doc comment for why nothing else
+    // (in particular, not `enabled == false`) may call it.
+    if enabled {
+        crate::computer::clear_emergency_stop();
+    }
+    Ok(())
 }
 
 /// issue #160 M2: the current computer-use control holder, if any — the
@@ -1608,10 +1617,15 @@ pub async fn get_computer_control_state() -> R<Option<crate::computer::ControlHo
 /// `computer_use_enabled` setting off and clears the control mutex, so every
 /// subsequent computer tool call fails closed. Recovery is manual: a human
 /// has to go back into Settings and turn computer use on again.
+///
+/// issue #160 review R1 #1: the in-memory latch `computer::emergency_stop`
+/// flips is set BEFORE it attempts to persist the setting, so this stays
+/// fail-closed even when the DB write below fails — but that write error is
+/// still surfaced to the frontend (not swallowed) so a human sees the
+/// half-persisted state instead of believing the kill switch fully landed.
 #[tauri::command]
 pub async fn computer_emergency_stop(db: State<'_, Db>) -> R<()> {
-    crate::computer::emergency_stop(&db).await;
-    Ok(())
+    crate::computer::emergency_stop(&db).await
 }
 
 /// issue #97: whether Weft should auto-switch a thread/session to its

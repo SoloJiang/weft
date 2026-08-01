@@ -2,14 +2,15 @@
 //! would, mirroring `bus_http.rs`'s server-spinup style. Issue #160: M1
 //! shipped observation only (window listing + screenshot); M2 adds input
 //! injection (click/type/key/scroll/drag/move), the control lock, the input
-//! throttle, and the audit log.
+//! throttle, and the audit log; round-2 P1 adds a server-side approval gate
+//! in front of every `tools/call` — see `bus::computer_srv::approve`'s doc.
 //!
 //! ONE tool named `computer`, dispatched by an `action` argument — see
 //! `bus::computer_srv`'s module doc for why.
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-use weft::ask::{Answer, AskRegistry, RiskLevel};
+use weft::ask::{Answer, AskRegistry, FullGrant, GrantSnapshot, RiskLevel};
 use weft::bus::{server, BusRegistry};
 use weft::computer::{self, backend, mock::MockBackend, CapturedImage, WindowInfo};
 use weft::store::{repo, Db};
@@ -41,32 +42,6 @@ fn sse_json(sse_text: &str) -> serde_json::Value {
     serde_json::from_str(&data_line["data: ".len()..]).unwrap()
 }
 
-/// POST a PreToolUse payload to the Ask Bridge, exactly as an injected hook
-/// script does (issue #160 M3-B's `bus::server::handle_ask` preview-attach
-/// tests) — mirrors `tests/ask_builtin_allow.rs`'s own `ask` helper.
-async fn ask_post(
-    base: &str,
-    thread: i32,
-    dir: &str,
-    engine: &str,
-    tool_name: &str,
-    tool_input: serde_json::Value,
-) -> String {
-    let url = format!("{base}/ask/{thread}/{dir}?tool={engine}");
-    reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap()
-        .post(url)
-        .json(&json!({ "tool_name": tool_name, "tool_input": tool_input }))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap()
-}
-
 /// Wait for the Ask Bridge to surface a card and return it — the handler's
 /// POST blocks until answered, so the caller spawns it, waits here, inspects/
 /// answers the card, then awaits the spawned call. Mirrors `tests/
@@ -80,6 +55,34 @@ async fn wait_for_card(asks: &AskRegistry, what: &str) -> weft::ask::Ask {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("{what} must surface a Needs-you card, but none appeared");
+}
+
+/// Spawn a `tools/call` POST to the `weft_computer` MCP endpoint in the
+/// background and return its `JoinHandle` — issue #160 round-2 P1's
+/// server-side approval gate blocks the handler until a card is answered
+/// (or a standing grant auto-decides it), so the caller spawns this,
+/// `wait_for_card`s, inspects/answers the card, then `.await`s the handle
+/// for the final response text. `coordinate` is always included (harmless
+/// for `screenshot`/`list_windows`, which ignore it) so one helper covers
+/// every action this file's gate scenarios need.
+fn spawn_computer_call(
+    base: &str,
+    thread: i32,
+    dir: String,
+    action: &'static str,
+    window: &'static str,
+) -> tokio::task::JoinHandle<String> {
+    let base = base.to_string();
+    tokio::spawn(async move {
+        rpc(
+            &base,
+            thread,
+            &dir,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"computer","arguments":{"action":action,"window":window,"coordinate":[1,1]}}}),
+        )
+        .await
+    })
 }
 
 #[tokio::test]
@@ -167,22 +170,52 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // below can insert its own workspace/thread/direction/worktree rows
     // against the SAME db `server::serve` is reading from.
     let db_handle = db.clone();
+
+    // issue #160 round-2 P1: EVERY `tools/call` now passes through a
+    // server-side approval gate (`bus::computer_srv::approve`) before it can
+    // reach the backend — including every M1/M2 scenario below, which
+    // predate that gate and were never written to answer a card. A Full
+    // grant for the primary (thread=1, dir="lead") session used throughout
+    // M1/M2 keeps all of that pre-existing coverage focused on what it was
+    // actually testing (the screenshot pipeline, the control lock, the
+    // throttle, the suspended-ask check) rather than on the gate itself —
+    // the gate has its OWN dedicated scenarios further down, on sessions
+    // that deliberately start UNGRANTED.
+    asks_handle.seed_grants(GrantSnapshot {
+        full: vec![FullGrant { thread: 1, dir: "lead".to_string() }],
+        always: Vec::new(),
+    });
+
     let (base, _h) = server::serve(reg, db, asks).await.unwrap();
 
     // A 1:1 (scale 1.0) window keeps the M2 section's physical-coordinate
     // math trivial to assert on: screenshot-space (100, 50) maps straight
     // through to physical (100, 50) since the window's own origin is (0, 0).
+    // A second window ("Other", id 2) exists purely for the round-2 P1 §2
+    // window-match preview scenario further down — nothing in M1/M2 ever
+    // targets it, so its presence doesn't change any existing assertion.
     let (width, height) = (640u32, 480u32);
     let mock = Arc::new(MockBackend {
-        windows: vec![WindowInfo {
-            id: 1,
-            app: "Notes".into(),
-            title: "Untitled".into(),
-            x: 0,
-            y: 0,
-            width,
-            height,
-        }],
+        windows: vec![
+            WindowInfo {
+                id: 1,
+                app: "Notes".into(),
+                title: "Untitled".into(),
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            WindowInfo {
+                id: 2,
+                app: "Other".into(),
+                title: "Untitled".into(),
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        ],
         image: Some(CapturedImage {
             rgba: vec![9u8; (width * height * 4) as usize],
             width,
@@ -423,46 +456,65 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         }
     }
 
+    // issue #160 round-2 P1: `screenshot` now passes through the same
+    // approval gate as every other action, so `assert_screenshot_content`
+    // below (which awaits its RPC call synchronously, with nobody spawned to
+    // answer a card) needs a standing grant for the EXACT `screenshot @
+    // notes` action to keep behaving the way it did before the gate existed.
+    // Deliberately an Always grant scoped to that ONE action_key — NOT a
+    // blanket `read_only_session` grant — so section 9 below can still
+    // exercise a REAL card for a DIFFERENT action (a click) or a DIFFERENT
+    // window (`screenshot @ other`) on these SAME sessions.
+    let screenshot_notes_key = weft::ask::action_key(&["gui", "screenshot", "notes"]);
+    let grant_screenshot_notes = |thread: i32, dir: &str| {
+        asks_handle.seed_grants(GrantSnapshot {
+            full: Vec::new(),
+            always: vec![weft::ask::AlwaysGrant {
+                thread,
+                dir: dir.to_string(),
+                action_key: screenshot_notes_key.clone(),
+            }],
+        });
+    };
+
     let (claude_thread, claude_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
+    grant_screenshot_notes(claude_thread, &claude_dir.to_string());
     assert_screenshot_content(&base, claude_thread, &claude_dir.to_string(), 20, true, "claude worker").await;
 
     let (omp_thread, omp_dir) = worker_dir(&db_handle, ws.id, r.id, "omp").await;
+    grant_screenshot_notes(omp_thread, &omp_dir.to_string());
     assert_screenshot_content(&base, omp_thread, &omp_dir.to_string(), 21, true, "omp (ACP) worker").await;
 
     let (codex_thread, codex_dir) = worker_dir(&db_handle, ws.id, r.id, "codex").await;
+    grant_screenshot_notes(codex_thread, &codex_dir.to_string());
     assert_screenshot_content(&base, codex_thread, &codex_dir.to_string(), 22, false, "codex worker").await;
 
     // 8. Lead-lane engine gating: the SAME rule, driven by `thread.lead_tool`
     // instead of `direction.tool` (a lead has no direction row at all).
     let claude_lead = repo::create_thread(&db_handle, ws.id, "claude lead", "issue", "claude").await.unwrap();
+    grant_screenshot_notes(claude_lead.id, "lead");
     assert_screenshot_content(&base, claude_lead.id, "lead", 23, true, "claude lead").await;
     let codex_lead = repo::create_thread(&db_handle, ws.id, "codex lead", "issue", "codex").await.unwrap();
+    grant_screenshot_notes(codex_lead.id, "lead");
     assert_screenshot_content(&base, codex_lead.id, "lead", 24, false, "codex lead").await;
 
-    // 9. Ask-card preview attach rule (`bus::server::handle_ask`): a GUI
-    // INPUT ask for a (thread, dir) that just screenshotted carries
-    // `Ask::preview`; the SAME (thread, dir)'s OBSERVE ask does not, even
-    // though the registry has something for it; a (thread, dir) that never
-    // screenshotted gets no preview either (isolation).
-    let gui_ask = |ask_thread: i32, ask_dir: i32, action: &'static str| {
-        let base = base.clone();
-        let ask_dir = ask_dir.to_string();
-        tokio::spawn(async move {
-            ask_post(
-                &base,
-                ask_thread,
-                &ask_dir,
-                "claude",
-                "mcp__weft_computer__computer",
-                json!({"action": action, "window": "notes", "coordinate": [1, 1]}),
-            )
-            .await
-        })
-    };
-
-    let call = gui_ask(claude_thread, claude_dir, "left_click");
-    let card = wait_for_card(&asks_handle, "weft_computer left_click (claude worker)").await;
-    assert!(card.preview.is_some(), "a GUI INPUT ask must carry the screenshot preview: {card:?}");
+    // 9. Ask-card preview attach rule, now owned by the server-side gate
+    // itself (`bus::computer_srv::preview_for_action`, issue #160 round-2
+    // P1 §2 — relocated from `bus::server::handle_ask`, which no longer
+    // attaches previews at all): a GUI INPUT ask targeting the SAME window
+    // id as the most recent screenshot for this (thread, dir) carries
+    // `Ask::preview`; the SAME (thread, dir) targeting a DIFFERENT window
+    // does not (§2's new window-match requirement); an observe-only ask
+    // never carries one regardless; a (thread, dir) that never screenshotted
+    // gets no preview either (isolation). Drives the REAL `tools/call`
+    // endpoint directly (not a simulated hook POST) — this behavior is no
+    // longer reachable through the hook path at all post-round-2.
+    //
+    // 9a. left_click on "notes" (id 1) — the SAME window `claude_thread`
+    // just screenshotted in scenario 7 above — carries the preview.
+    let call = spawn_computer_call(&base, claude_thread, claude_dir.to_string(), "left_click", "notes");
+    let card = wait_for_card(&asks_handle, "left_click on the just-screenshotted window").await;
+    assert!(card.preview.is_some(), "a GUI INPUT ask targeting the screenshotted window must carry the preview: {card:?}");
     assert!(
         card.preview.as_deref().unwrap().starts_with("data:image/jpeg;base64,"),
         "{card:?}"
@@ -470,8 +522,22 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert!(asks_handle.answer(card.id, Answer::Deny));
     call.await.unwrap();
 
-    let call = gui_ask(claude_thread, claude_dir, "screenshot");
-    let card = wait_for_card(&asks_handle, "weft_computer screenshot (observe, claude worker)").await;
+    // 9b. §2: left_click on "other" (id 2) — a DIFFERENT window than the one
+    // screenshotted — must NOT inherit that unrelated preview.
+    let call = spawn_computer_call(&base, claude_thread, claude_dir.to_string(), "left_click", "other");
+    let card = wait_for_card(&asks_handle, "left_click on a DIFFERENT window than the one screenshotted").await;
+    assert!(
+        card.preview.is_none(),
+        "a click on a window OTHER than the one last screenshotted must not carry a stale preview: {card:?}"
+    );
+    assert!(asks_handle.answer(card.id, Answer::Deny));
+    call.await.unwrap();
+
+    // 9c. An observe-only ask (a screenshot of "other" — a DIFFERENT
+    // action_key than the narrow grant above, so it surfaces a real card)
+    // never carries a preview, even though one is on file for this session.
+    let call = spawn_computer_call(&base, claude_thread, claude_dir.to_string(), "screenshot", "other");
+    let card = wait_for_card(&asks_handle, "an observe-only screenshot ask").await;
     assert!(
         card.preview.is_none(),
         "an OBSERVE-only GUI ask must never carry a preview, even with one on file: {card:?}"
@@ -479,21 +545,273 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert!(asks_handle.answer(card.id, Answer::Deny));
     call.await.unwrap();
 
+    // 9d. Isolation: a (thread, dir) that never screenshotted at all gets no
+    // preview either.
     let (never_thread, never_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
-    let call = gui_ask(never_thread, never_dir, "left_click");
-    let card = wait_for_card(&asks_handle, "weft_computer left_click (never screenshotted)").await;
+    let call = spawn_computer_call(&base, never_thread, never_dir.to_string(), "left_click", "notes");
+    let card = wait_for_card(&asks_handle, "left_click (never screenshotted)").await;
     assert!(
         card.preview.is_none(),
         "a (thread, dir) with no prior screenshot must get no preview (isolation): {card:?}"
     );
     assert!(asks_handle.answer(card.id, Answer::Deny));
     call.await.unwrap();
+
+    // —— round-2 P1: the server-side approval gate itself ——
+    //
+    // Everything above exercised OTHER behavior (screenshot pipeline, input
+    // gates, engine-gated images, preview attach) against sessions the gate
+    // was made to stay out of the way of (a Full or narrow Always grant).
+    // These scenarios exercise the GATE'S OWN behavior instead: standing
+    // grants, Always-grant reuse across two calls, and the round-2 P2
+    // window-argument validation — on sessions that start UNGRANTED.
+    //
+    // The control lease is a SINGLE process-wide slot, not one per (thread,
+    // dir) — section 9's clicks above left `claude_thread` holding it, so
+    // each section below that expects to actually reach the backend starts
+    // by clearing it, the same defensive reset the top of this test does.
+    computer::clear_control();
+
+    // 10. No standing grant: a card appears; Deny rejects the call and the
+    // backend is never touched; a SECOND identical action after an Always
+    // answer skips the card entirely and reaches the backend directly.
+    let (gate_thread, gate_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
+    let gate_dir_s = gate_dir.to_string();
+    let clicks_before = mock.actions.lock().unwrap().len();
+
+    let call = spawn_computer_call(&base, gate_thread, gate_dir_s.clone(), "left_click", "notes");
+    let card = wait_for_card(&asks_handle, "left_click with no standing grant").await;
+    assert_eq!(card.tool, "computer", "the gate's own card must self-identify as \"computer\", not an engine name");
+    assert_eq!(card.summary, "computer: left_click @ notes");
+    assert!(asks_handle.answer(card.id, Answer::Deny));
+    let out = call.await.unwrap();
+    assert!(out.contains("denied"), "a Denied gate card must reject the call: {out}");
+    assert_eq!(
+        mock.actions.lock().unwrap().len(),
+        clicks_before,
+        "a Denied call must never reach the backend"
+    );
+
+    tokio::time::sleep(Duration::from_millis(600)).await; // clear the throttle window
+
+    let call = spawn_computer_call(&base, gate_thread, gate_dir_s.clone(), "left_click", "notes");
+    let card = wait_for_card(&asks_handle, "left_click, second time, to grant Always").await;
+    assert!(asks_handle.answer(card.id, Answer::Always));
+    let out = call.await.unwrap();
+    assert!(out.contains("left_click") && out.contains("done"), "{out}");
+    assert_eq!(
+        mock.actions.lock().unwrap().len(),
+        clicks_before + 1,
+        "the Allowed call must reach the backend exactly once"
+    );
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // The THIRD, identical action_key (same action + same window) must skip
+    // the card entirely now — the Always grant from the previous answer
+    // auto-decides it, mirroring `bus::server::handle_ask`'s own Always
+    // semantics for every other tool.
+    let out = rpc(
+        &base,
+        gate_thread,
+        &gate_dir_s,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"left_click","window":"notes","coordinate":[1,1]}}}),
+    )
+    .await;
+    assert!(out.contains("left_click") && out.contains("done"), "{out}");
+    assert!(asks_handle.open().is_empty(), "an Always-covered action must never surface a card");
+    assert_eq!(
+        mock.actions.lock().unwrap().len(),
+        clicks_before + 2,
+        "the Always-covered call must still reach the backend"
+    );
+
+    // 11. §4: a missing/blank `window` on a window-scoped action is rejected
+    // as a missing-argument error, before ever resolving against the
+    // backend's window list — never silently swallowed into matching the
+    // sole visible window. Exercised on the Full-granted primary session
+    // (thread=1) so this is purely about the window-argument validation,
+    // not the approval gate (already covered above). `clear_control` first:
+    // `gate_thread` above still holds the single process-wide control lease.
+    computer::clear_control();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let clicks_before = mock.actions.lock().unwrap().len();
+    // `input_gate`'s throttle check runs BEFORE `required_window` — even a
+    // call that's about to be rejected for a missing window still consumes
+    // the throttle window on its way there, so each iteration below waits
+    // out `computer::THROTTLE_MS` first (matching this file's own
+    // discipline before every other input action).
+    for window_arg in [Value::Null, json!(""), json!("   ")] {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let mut args = json!({"action":"left_click","coordinate":[1,1]});
+        args["window"] = window_arg.clone();
+        let out = rpc(
+            &base,
+            1,
+            "lead",
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"computer","arguments": args}}),
+        )
+        .await;
+        assert!(out.contains("missing required 'window'"), "window={window_arg:?}: {out}");
+    }
+    // A request that OMITS `window` entirely must be rejected the same way.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let out = rpc(
+        &base,
+        1,
+        "lead",
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"left_click","coordinate":[1,1]}}}),
+    )
+    .await;
+    assert!(out.contains("missing required 'window'"), "{out}");
+    assert_eq!(
+        mock.actions.lock().unwrap().len(),
+        clicks_before,
+        "a rejected missing-window call must never reach the backend"
+    );
+
+    // 12. Focus-freshness gate (issue #160 round-2 P1 addendum): `type`
+    // rejects with no prior click on the target window; succeeds within 15s
+    // of a click on that SAME window; rejects again for a DIFFERENT window
+    // even with a fresh click on file (for the OTHER one). A brand-new
+    // (thread, dir), Full-granted so this section is purely about the focus
+    // gate, not the approval gate.
+    let (focus_thread, focus_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
+    let focus_dir_s = focus_dir.to_string();
+    asks_handle.seed_grants(GrantSnapshot {
+        full: vec![FullGrant { thread: focus_thread, dir: focus_dir_s.clone() }],
+        always: Vec::new(),
+    });
+    // `clear_control` first: thread=1 (section 11) still holds the single
+    // process-wide control lease; the sleep clears the throttle window.
+    computer::clear_control();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // 12a. No click at all yet on this (thread, dir) — `type` is rejected.
+    let out = rpc(
+        &base,
+        focus_thread,
+        &focus_dir_s,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"type","window":"notes","text":"hi"}}}),
+    )
+    .await;
+    assert!(out.to_lowercase().contains("focus"), "{out}");
+    assert_eq!(
+        mock.actions.lock().unwrap().iter().filter(|a| a.starts_with("type")).count(),
+        0,
+        "a focus-rejected type must never reach the backend"
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // 12b. Click "notes" (id 1), then `type` into "notes" within 15s — passes.
+    let out = rpc(
+        &base,
+        focus_thread,
+        &focus_dir_s,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"left_click","window":"notes","coordinate":[1,1]}}}),
+    )
+    .await;
+    assert!(out.contains("done"), "{out}");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let out = rpc(
+        &base,
+        focus_thread,
+        &focus_dir_s,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"type","window":"notes","text":"hi"}}}),
+    )
+    .await;
+    assert!(out.contains("typed") && out.contains("done"), "{out}");
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // 12c. That SAME click does NOT satisfy a `type` into "other" (id 2) —
+    // the freshness record is scoped to the exact window that was clicked.
+    let out = rpc(
+        &base,
+        focus_thread,
+        &focus_dir_s,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"type","window":"other","text":"hi"}}}),
+    )
+    .await;
+    assert!(out.to_lowercase().contains("focus"), "{out}");
+}
+
+/// issue #160 round-2 P1: with no standing grant, an input action surfaces a
+/// Needs-you card via the server-side gate — a Deny rejects the call, and
+/// (unlike the giant test above, which routes every scenario through a
+/// MockBackend) this never even reaches far enough to need one: `approve`
+/// returning `Err` short-circuits `run_action` before any backend call. A
+/// bare thread/dir with no worktree/DB rows at all is enough.
+#[tokio::test]
+async fn gate_denies_an_input_action_with_no_standing_grant() {
+    let reg = BusRegistry::new();
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true")
+        .await
+        .unwrap();
+    let asks = AskRegistry::new();
+    let asks_handle = asks.clone();
+    let (base, _h) = server::serve(reg, db, asks).await.unwrap();
+
+    let call = spawn_computer_call(&base, 1, "10".to_string(), "left_click", "notes");
+    let card = wait_for_card(&asks_handle, "left_click with no standing grant").await;
+    assert_eq!(card.tool, "computer", "the gate's own card self-identifies as \"computer\": {card:?}");
+    assert_eq!(card.risk, RiskLevel::Write);
+    assert!(asks_handle.answer(card.id, Answer::Deny));
+    let out = call.await.unwrap();
+    assert!(out.contains("denied"), "a Denied gate card must reject the call: {out}");
+}
+
+/// The fail-closed twin of the test above: the ask's sender is dropped
+/// instead of answered (`AskRegistry::cancel_for` — the SAME mechanism an
+/// engine/model switch uses to tear down a stale ask, issue #96, and the
+/// SAME simulation `tests/bus_http.rs::ask_bridge_cancel_returns_explicit_
+/// deny` uses for the hook endpoint's own timeout/cancel path). The gate
+/// must return an EXPLICIT deny — never hang, and never silently allow.
+#[tokio::test]
+async fn gate_denies_when_the_ask_is_cancelled_instead_of_answered() {
+    let reg = BusRegistry::new();
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true")
+        .await
+        .unwrap();
+    let asks = AskRegistry::new();
+    let asks_handle = asks.clone();
+    let (base, _h) = server::serve(reg, db, asks).await.unwrap();
+
+    let call = spawn_computer_call(&base, 2, "20".to_string(), "left_click", "notes");
+    let _card = wait_for_card(&asks_handle, "left_click awaiting cancellation").await;
+    asks_handle.cancel_for(2, "20");
+    let out = call.await.unwrap();
+    assert!(
+        out.contains("denied") || out.contains("no answer"),
+        "a cancelled/timed-out gate ask must resolve to an EXPLICIT deny, never hang or silently allow: {out}"
+    );
+    assert!(asks_handle.open().is_empty());
 }
 
 /// Exercises the REAL platform backend end-to-end (window enumeration +
 /// screenshot via `xcap`). Headless CI has no display server, so this stays
 /// `#[ignore]`d — run it by hand locally, e.g.
 /// `cargo test --test computer_mcp --features computer-os -- --ignored`.
+///
+/// Issue #160 round-2 §6: turned from a shape-only smoke check (did the text
+/// merely contain `"id"` anywhere — which an ERROR string could too, e.g.
+/// `ComputerError::Unsupported`'s message doesn't, but nothing enforced
+/// that) into real assertions: the window list must actually be non-empty
+/// and each entry must carry the fields a REAL window (not an error
+/// sentence) would, then a genuine `screenshot` of the first one must
+/// actually save. A Full grant stands in for the human who isn't present to
+/// answer a card when this runs by hand from the command line — the
+/// approval gate itself already has extensive coverage in the mock-backend
+/// test above; this test exists to exercise the REAL backend, not the gate.
 #[ignore]
 #[tokio::test]
 async fn real_backend_lists_and_screenshots_a_real_window() {
@@ -503,6 +821,10 @@ async fn real_backend_lists_and_screenshots_a_real_window() {
         .await
         .unwrap();
     let asks = AskRegistry::new();
+    asks.seed_grants(GrantSnapshot {
+        full: vec![FullGrant { thread: 1, dir: "10".to_string() }],
+        always: Vec::new(),
+    });
     let (base, _h) = server::serve(reg, db, asks).await.unwrap();
 
     let out = rpc(
@@ -513,5 +835,33 @@ async fn real_backend_lists_and_screenshots_a_real_window() {
             "params":{"name":"computer","arguments":{"action":"list_windows"}}}),
     )
     .await;
-    assert!(out.contains("\"id\""), "expected at least the JSON shape of a window list: {out}");
+    let body = sse_json(&out);
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text content in list_windows result: {out}"));
+    let windows: Vec<serde_json::Value> = serde_json::from_str(text).unwrap_or_else(|e| {
+        panic!("list_windows text isn't a JSON window array — looks like error text instead? {e}: {text}")
+    });
+    assert!(
+        !windows.is_empty(),
+        "expected at least one real, visible, non-excluded window on this machine: {text}"
+    );
+    let first = &windows[0];
+    assert!(first.get("id").and_then(|v| v.as_u64()).is_some(), "each window must carry a numeric id: {first}");
+    assert!(
+        first.get("app").and_then(|v| v.as_str()).is_some(),
+        "each window must carry an app name: {first}"
+    );
+
+    // A real screenshot of that SAME first window, by its id.
+    let window_query = first["id"].as_u64().unwrap().to_string();
+    let out = rpc(
+        &base,
+        1,
+        "10",
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"screenshot","window": window_query}}}),
+    )
+    .await;
+    assert!(out.contains("screenshot saved"), "expected a real screenshot to actually save: {out}");
 }

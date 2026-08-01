@@ -75,7 +75,13 @@ pub fn router(bus: BusRegistry, db: Db, asks: AskRegistry) -> Router {
 // (automation-first): a permission decision is the human's to make, so we wait
 // rather than time out into the tool's own hidden TUI prompt. Falls back only if
 // truly abandoned. Kept just under the hook/curl ceilings in inject.rs.
-const ASK_WAIT: Duration = Duration::from_secs(3600);
+//
+// `pub(crate)` (issue #160 round-2 P1): `bus::computer_srv`'s own server-side
+// approval gate reuses this SAME constant for its own `tokio::time::timeout`,
+// so the two independent Ask-bridge entry points (this hook endpoint, and the
+// `weft_computer` MCP tool call itself) can never silently drift onto two
+// different wait ceilings.
+pub(crate) const ASK_WAIT: Duration = Duration::from_secs(3600);
 
 /// The `?tool=` query parameter's fallback when a request omits it. Every
 /// hook consumer this repo controls hard-codes its own literal
@@ -205,28 +211,18 @@ async fn handle_ask(
         return hook_decision("allow", "Auto-approved by a weft rule");
     }
 
-    // Attach the most recent `weft_computer` screenshot's small preview
-    // (issue #160 M3-B) to a GUI ask card, but ONLY when it's an INPUT action
-    // (`risk == Write` — `summarize`'s own `RiskSignal::Gui` branch already
-    // classified it via `classify_gui_action`/`GUI_WRITE_ACTIONS`, the same
-    // partition this reuses rather than re-deriving a second one that could
-    // drift) — an observe-only action (screenshot/list_windows/
-    // cursor_position, `risk == ReadOnly`) skips it: the agent that just took
-    // that screenshot already has it, so attaching it again is pure payload
-    // with no new context for the human. `split_internal_tool` narrows to the
-    // SAME `weft_computer`'s `computer` tool `summarize`'s dedicated GUI
-    // branch recognizes — a Write-classified ask from a DIFFERENT tool (an
-    // ordinary Bash/file write) must never pick up a stale screenshot.
-    let preview = if split_internal_tool(tool_name) == Some(("weft_computer", "computer"))
-        && risk == crate::ask::RiskLevel::Write
-    {
-        crate::bus::computer_srv::last_screenshot_preview(thread, &dir)
-    } else {
-        None
-    };
-
-    let (id, rx) =
-        asks.request_with_preview(thread, &dir, tool, &summary, &detail, risk, &action_key, preview);
+    // The screenshot-preview attach for a `weft_computer` GUI input ask (issue
+    // #160 M3-B) used to live HERE. It moved to `bus::computer_srv`'s own
+    // server-side approval gate (issue #160 round-2 P1): that gate is now the
+    // ONE place a `weft_computer` call is actually approved (see
+    // `AUTO_APPROVED_INTERNAL_TOOLS`'s `weft_computer` entry — this hook path
+    // auto-approves the SAME call rather than asking a second time), so this
+    // endpoint only ever builds a `weft_computer` card for a fallback/
+    // unrecognized shape (e.g. codex's still-unconfirmed hook tool-name
+    // convention) — a rare path with no fresh screenshot context worth
+    // attaching. Every OTHER ask (the overwhelming majority this endpoint
+    // still serves) never had a preview anyway.
+    let (id, rx) = asks.request(thread, &dir, tool, &summary, &detail, risk, &action_key);
 
     match tokio::time::timeout(ASK_WAIT, rx).await {
         Ok(Ok(decision)) => {
@@ -261,6 +257,21 @@ async fn handle_ask(
 /// The included writes (bus posts, task status, proposals, edge calibration) are
 /// governed by weft's own surfaces (Needs-you, the board, the direction-confirm
 /// flow), so a per-call prompt for them is pure interruption.
+///
+/// `weft_computer`'s `computer` entry is a DIFFERENT rationale from every
+/// other row here (issue #160 round-2 P1): it is not weft-governed the way a
+/// bus post or a board status is — it drives the human's real mouse/keyboard.
+/// It is included because that call is no longer approved by this hook path
+/// AT ALL: `bus::computer_srv::run_action` gates every `tools/call` itself,
+/// server-side, before it can reach the backend — a card there is created,
+/// awaited, and answered the SAME way this endpoint's card is, just on a
+/// different HTTP route the engine can't skip (unlike a PreToolUse hook,
+/// which an agent — or any local process — can simply not invoke). This
+/// entry exists ONLY so an engine's hook, still firing on its own PreToolUse
+/// schedule for a call already decided at the MCP layer, doesn't ask the
+/// human a SECOND time for the exact same action (a "double card"). It is
+/// therefore safe to auto-approve unconditionally here: this hook answer no
+/// longer controls whether the action actually runs.
 const AUTO_APPROVED_INTERNAL_TOOLS: &[(&str, &str)] = &[
     // weft_bus — thread bus: reads, weft-governed posts, and ask_human (which
     // itself surfaces to the human).
@@ -296,6 +307,10 @@ const AUTO_APPROVED_INTERNAL_TOOLS: &[(&str, &str)] = &[
     ("weft_global", "list_workspaces"),
     ("weft_global", "message_lead"),
     ("weft_global", "pending_needs_you"),
+    // weft_computer — see this const's own doc comment above for why this ONE
+    // entry auto-approves unconditionally instead of being weft-governed like
+    // every row above it.
+    ("weft_computer", "computer"),
 ];
 
 /// Extract `(server, tool)` from an agent-reported MCP tool name. ONLY the
@@ -307,7 +322,29 @@ const AUTO_APPROVED_INTERNAL_TOOLS: &[(&str, &str)] = &[
 /// So opencode-form names are NOT matched here — they surface the Needs-you card
 /// (fail-safe). Auto-approving opencode internals would need an unambiguous
 /// server-identity signal, which the flat tool name alone doesn't carry.
+///
+/// ONE named exception (issue #160 round-2 P1): the literal string
+/// `weft_computer_computer` — opencode's flattened form of `weft_computer`'s
+/// `computer` tool — IS recognized, unlike every other opencode-flattened
+/// name. This is safe specifically because it is unambiguous: there is no
+/// server literally named `weft` with a tool named `computer_computer`
+/// (weft never injects a bare `weft` server), and no OTHER weft server name
+/// is a prefix of `weft_computer` that could also split this string into a
+/// real `(server, tool)` pair. It is the one literal this repo can vouch for
+/// by construction, not a general relaxation of the ambiguity rule above —
+/// see `AUTO_APPROVED_INTERNAL_TOOLS`'s own doc for WHY recognizing it here
+/// matters (avoiding a double card once the server-side gate owns approval).
+/// codex's own MCP tool-naming convention for a hook payload is NOT
+/// independently confirmed from this repo's code (unlike claude's and
+/// opencode's, both verified against real hook/plugin output) — if its shape
+/// differs from both of the above, a codex-driven `weft_computer` call may
+/// still double-card until that shape is confirmed and given its own case
+/// here. That is a known, currently-tolerated limitation, not a correctness
+/// bug: the server-side gate still owns the actual approval either way.
 fn split_internal_tool(tool_name: &str) -> Option<(&str, &str)> {
+    if tool_name == "weft_computer_computer" {
+        return Some(("weft_computer", "computer"));
+    }
     tool_name
         .strip_prefix("mcp__")
         .and_then(|rest| rest.split_once("__"))
@@ -340,7 +377,24 @@ fn session_servers_for_kind(kind: &str) -> &'static [&'static str] {
 /// bus. The lead family keys off the thread kind and FAILS CLOSED: if the thread
 /// can't be resolved — a deleted thread, a DB error, an engine/hook outliving its
 /// thread — nothing is auto-approved and the tool surfaces the Needs-you card.
+///
+/// `weft_computer` is a THIRD, independent case, checked before the worker/
+/// lead split: every `include_computer` call site (`lead_chat::engine`,
+/// `lead_chat::commands`) injects it purely off the GLOBAL `computer::
+/// enabled` setting, for either lane, never keyed by thread kind or direction
+/// ownership the way the other servers are — so mirroring THAT exact
+/// condition here (not thread/dir membership) is what "was this server
+/// actually injected for this session" means for `weft_computer`. As
+/// explained on `AUTO_APPROVED_INTERNAL_TOOLS`'s own doc, this check no
+/// longer gates whether the action runs (the server-side gate in
+/// `bus::computer_srv` owns that); it only decides whether THIS hook path
+/// double-asks. `computer::enabled` itself fails closed (DB error/missing
+/// row/anything but the literal "true" reads disabled), so an unreadable
+/// setting still surfaces the card here too.
 async fn session_injected(db: &Db, thread: i32, dir: &str, server: &str) -> bool {
+    if server == "weft_computer" {
+        return crate::computer::enabled(db).await;
+    }
     if dir != crate::bus::LEAD {
         // Worker lane: only the bus, and only when `dir` is a REAL direction of
         // this thread. Fail closed for a stale/deleted direction or a forged
@@ -456,11 +510,20 @@ fn hook_decision(decision: &str, reason: &str) -> Response {
 /// "computer: <action>" (M2-B) — see the dedicated branch below.
 ///
 /// KNOWN LIMITATION shared with the rest of this function's MCP recognition:
-/// the `computer` branch keys off `split_internal_tool`, which ONLY parses
-/// the claude-style `mcp__<server>__<tool>` name (see that function's doc).
-/// A codex/opencode-flattened name for the same tool is not recognized here
-/// and falls through to the generic MCP branch below, surfacing as
-/// `Unknown` risk rather than the GUI-specific tier.
+/// the `computer` branch keys off `split_internal_tool`, which parses the
+/// claude-style `mcp__<server>__<tool>` name AND the one opencode-flattened
+/// literal `weft_computer_computer` it special-cases (see that function's
+/// doc for why that ONE literal is safe to recognize). A codex-flattened
+/// name for the same tool — shape not confirmed from this repo's own code —
+/// is NOT recognized here and falls through to the generic MCP branch below,
+/// surfacing as `Unknown` risk rather than the GUI-specific tier. In
+/// practice this branch rarely fires at all post-issue-#160-round-2: the
+/// server-side gate in `bus::computer_srv` now owns real approval for every
+/// `weft_computer` call, and `AUTO_APPROVED_INTERNAL_TOOLS` short-circuits
+/// this endpoint before `summarize` is even called for the two recognized
+/// name shapes — this branch is the fallback for everything else (an
+/// unconfirmed codex shape, or a session weft didn't actually inject
+/// `weft_computer` for).
 ///
 /// Returns `(summary, detail, risk, action_key)`: `summary` is a compact
 /// DISPLAY label that MAY truncate (a multi-line command's first line, a bare
@@ -1502,18 +1565,27 @@ mod tests {
     }
 
     /// The `computer` recognition is keyed on the EXACT `(server, tool)` pair
-    /// via `split_internal_tool` (claude-style `mcp__<server>__<tool>` only)
-    /// — an unrelated tool sharing the bare name `computer` under a
-    /// different server, or a non-claude-shaped name, must fall through to
-    /// the generic MCP branch instead of being misread as GUI input.
+    /// via `split_internal_tool` — an unrelated tool sharing the bare name
+    /// `computer` under a different server must fall through to the generic
+    /// MCP branch instead of being misread as GUI input, even though its
+    /// flattened suffix looks the same.
     #[test]
-    fn summarize_does_not_misfire_on_unrelated_or_non_claude_shaped_names() {
+    fn summarize_does_not_misfire_on_an_unrelated_server_sharing_the_bare_tool_name() {
         let input = json!({"action": "left_click"});
         let (summary, ..) = summarize("mcp__some_other_server__computer", Some(&input));
         assert_ne!(summary, "computer: left_click");
+    }
 
-        let (summary2, ..) = summarize("weft_computer_computer", Some(&input));
-        assert_ne!(summary2, "computer: left_click");
+    /// Issue #160 round-2 P1: `weft_computer_computer` (opencode's flattened
+    /// form) is the ONE opencode-shaped name `split_internal_tool` special-
+    /// cases as unambiguous — so `summarize`'s Gui branch, which delegates to
+    /// it, now recognizes this literal too, not just the claude-style name.
+    #[test]
+    fn summarize_recognizes_the_opencode_flattened_weft_computer_literal() {
+        let input = json!({"action": "left_click"});
+        let (summary, _detail, risk, _action_key) = summarize("weft_computer_computer", Some(&input));
+        assert_eq!(summary, "computer: left_click");
+        assert_eq!(risk, RiskLevel::Write);
     }
 
     #[test]
@@ -1558,6 +1630,17 @@ mod tests {
         assert!(is_weft_internal_tool("mcp__weft_bus__set_task_status"));
         assert!(is_weft_internal_tool("mcp__weft_curator__get_repo_map"));
         assert!(is_weft_internal_tool("mcp__weft_global__list_workspaces"));
+    }
+
+    /// Issue #160 round-2 P1: both name shapes `split_internal_tool`
+    /// recognizes for `weft_computer` — claude's `mcp__<server>__<tool>` and
+    /// the one opencode-flattened literal — auto-approve at this hook layer
+    /// (see `AUTO_APPROVED_INTERNAL_TOOLS`'s doc: the server-side gate owns
+    /// real approval now, this only avoids a double card).
+    #[test]
+    fn weft_internal_recognizes_both_weft_computer_name_shapes() {
+        assert!(is_weft_internal_tool("mcp__weft_computer__computer"));
+        assert!(is_weft_internal_tool("weft_computer_computer"));
     }
 
     /// Issue #110: `register_pr` is a pure metadata/bookkeeping write (same
@@ -1843,5 +1926,82 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #160 round-2 P1: while computer_use is enabled, a `weft_computer`
+    /// PreToolUse hook ask (the SAME shape `mcp__weft_computer__computer`
+    /// carries) auto-approves at this endpoint WITHOUT ever surfacing a
+    /// card — the server-side gate in `bus::computer_srv` is the one that
+    /// actually approved (or will approve) this call; a second card here
+    /// would double-ask the human for nothing.
+    #[tokio::test]
+    async fn weft_computer_hook_ask_auto_approves_without_a_card_while_enabled() {
+        use crate::ask::AskRegistry;
+        use crate::bus::BusRegistry;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED, "true")
+            .await
+            .unwrap();
+        let asks = AskRegistry::new();
+        let (base, _h) = serve(BusRegistry::new(), db, asks.clone()).await.unwrap();
+
+        let url = format!("{base}/ask/1/{}?tool=claude", crate::bus::LEAD);
+        let body = json!({
+            "tool_name": "mcp__weft_computer__computer",
+            "tool_input": { "action": "left_click", "window": "notes" }
+        });
+        let out: Value = reqwest::Client::new()
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            out["hookSpecificOutput"]["permissionDecision"], "allow",
+            "got: {out}"
+        );
+        assert!(
+            asks.open().is_empty(),
+            "must never ALSO surface a card here — the server-side gate already owns approval"
+        );
+    }
+
+    /// The fail-closed twin of the test above: computer_use is OFF (the
+    /// default), so `session_injected`'s `weft_computer` branch — which
+    /// mirrors the SAME `computer::enabled` check the server-side gate
+    /// itself relies on — reports "not injected" and this endpoint falls
+    /// through to a real card instead of trusting the hook payload.
+    #[tokio::test]
+    async fn weft_computer_hook_ask_surfaces_a_card_while_disabled() {
+        use crate::ask::{Answer, AskRegistry};
+        use crate::bus::BusRegistry;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        // Deliberately never enables computer_use.
+        let asks = AskRegistry::new();
+        let (base, _h) = serve(BusRegistry::new(), db, asks.clone()).await.unwrap();
+
+        let url = format!("{base}/ask/1/{}?tool=claude", crate::bus::LEAD);
+        let body = json!({
+            "tool_name": "mcp__weft_computer__computer",
+            "tool_input": { "action": "left_click", "window": "notes" }
+        });
+        let (resp, ()) = tokio::join!(
+            async {
+                reqwest::Client::new()
+                    .post(url.as_str())
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+            },
+            crate::hook_test_support::answer_first_ask(&asks, Answer::Deny),
+        );
+        let out: Value = resp.json().await.unwrap();
+        assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny", "got: {out}");
     }
 }

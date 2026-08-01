@@ -96,7 +96,12 @@ jobs:
           releaseBody: 'See the assets to download and install this version.'
           releaseDraft: false
           prerelease: false
-          args: ${{ matrix.args }}
+          # computer-os enables the real screen-capture/input backend (xcap +
+          # enigo) — without it every published build ships the stub and the
+          # Computer Use setting can only ever answer "Unsupported". Appended
+          # here rather than inside matrix.args because the Install Rust step
+          # string-compares matrix.args to pick the darwin target.
+          args: ${{ matrix.args }} --features computer-os
 
       # Tauri's DMG bundler can't add extra files to the disk image, so rebuild
       # it with create-dmg to drop in the "damaged" un-quarantine helper next to

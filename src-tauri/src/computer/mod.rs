@@ -26,6 +26,7 @@ pub mod mock;
 mod os;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,11 +40,46 @@ pub const K_COMPUTER_USE_ENABLED: &str = "computer_use_enabled";
 /// Whether computer use is turned on. Fails CLOSED: a DB error, a missing
 /// row, or any value other than the literal "true" all read as disabled —
 /// this gate gets no benefit of the doubt, unlike most weft settings.
+///
+/// issue #160 review R1 #1: the emergency-stop latch ([`EMERGENCY_STOPPED`])
+/// is checked FIRST, before the DB is even touched — once tripped, this
+/// returns `false` unconditionally, so a `set_setting` write failure inside
+/// [`emergency_stop`] (which the latch does NOT depend on — see that
+/// function's doc) can never leave the kill switch silently fail-open
+/// because the setting row still reads "true".
 pub async fn enabled(db: &crate::store::Db) -> bool {
+    if EMERGENCY_STOPPED.load(Ordering::SeqCst) {
+        return false;
+    }
     matches!(
         crate::store::repo::get_setting(db, K_COMPUTER_USE_ENABLED).await,
         Ok(Some(v)) if v == "true"
     )
+}
+
+/// Process-level emergency-stop latch (issue #160 review R1 #1). Once
+/// tripped by [`emergency_stop`], [`enabled`] returns `false`
+/// UNCONDITIONALLY, before it even reads the `computer_use_enabled` DB
+/// setting — so this is the actual fail-closed mechanism the kill switch
+/// relies on, and the DB write in [`emergency_stop`] is best-effort
+/// persistence for the NEXT launch, not something [`enabled`] depends on
+/// within THIS process's life. The ONLY function allowed to clear it is
+/// [`clear_emergency_stop`], itself called from exactly one place —
+/// `commands::set_computer_use_enabled` when a human explicitly re-enables
+/// computer use from Settings. `Ordering::SeqCst` throughout: this gates
+/// every input action process-wide, so the extra fence cost over a looser
+/// ordering is nothing next to a kill switch that could otherwise be
+/// reordered into fail-open.
+static EMERGENCY_STOPPED: AtomicBool = AtomicBool::new(false);
+
+/// Clear the emergency-stop latch (issue #160 review R1 #1). The ONLY
+/// legitimate caller is `commands::set_computer_use_enabled` when `enabled
+/// == true` — a human explicitly turning computer use back on from Settings
+/// after a kill switch trip. Nothing else in this codebase may call this:
+/// there is deliberately no other path back to "computer use may run again"
+/// once the latch is tripped.
+pub fn clear_emergency_stop() {
+    EMERGENCY_STOPPED.store(false, Ordering::SeqCst);
 }
 
 /// One discriminated error value for the whole module (CLAUDE.md: derive ONE
@@ -74,7 +110,11 @@ pub enum ComputerError {
     Io(String),
     /// An input action's coordinate falls outside the most recent
     /// screenshot's range for this window (issue #160 M2) — see
-    /// [`map_to_physical`].
+    /// [`map_to_physical`]. `max_x`/`max_y` are the LAST valid coordinate
+    /// (inclusive) — the valid range is `0..=max_x` / `0..=max_y`, NOT the
+    /// screenshot's width/height (issue #160 review R1 #2: the upper bound
+    /// is exclusive, so `x == width` is one past the last real pixel column
+    /// and is itself out of bounds).
     OutOfBounds { x: u32, y: u32, max_x: u32, max_y: u32 },
     /// Someone else's session currently holds the control lease (issue #160
     /// M2) — see [`acquire_control`].
@@ -110,7 +150,7 @@ impl std::fmt::Display for ComputerError {
             ComputerError::Io(msg) => write!(f, "couldn't save the screenshot: {msg}"),
             ComputerError::OutOfBounds { x, y, max_x, max_y } => write!(
                 f,
-                "coordinate ({x}, {y}) is out of bounds — it must fall within the most recent screenshot of this window, 0..{max_x} x 0..{max_y}"
+                "coordinate ({x}, {y}) is out of bounds — it must fall within the most recent screenshot of this window, 0..={max_x} x 0..={max_y}"
             ),
             ComputerError::Busy { thread, dir } => write!(
                 f,
@@ -329,12 +369,17 @@ pub fn map_to_physical(w: &WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), C
     let scale = display_scale(w);
     let scaled_w = (f64::from(w.width) * scale).round() as u32;
     let scaled_h = (f64::from(w.height) * scale).round() as u32;
-    if cx > scaled_w || cy > scaled_h {
+    // Exclusive upper bound (issue #160 review R1 #2): a screenshot saved at
+    // `scaled_w` x `scaled_h` px has valid pixel columns/rows `0..=scaled_w-1`
+    // / `0..=scaled_h-1` — `cx == scaled_w` is one past the last real pixel,
+    // not a valid click target, and must be rejected exactly like any larger
+    // value rather than silently accepted at the edge.
+    if cx >= scaled_w || cy >= scaled_h {
         return Err(ComputerError::OutOfBounds {
             x: cx,
             y: cy,
-            max_x: scaled_w,
-            max_y: scaled_h,
+            max_x: scaled_w.saturating_sub(1),
+            max_y: scaled_h.saturating_sub(1),
         });
     }
     let px = w.x + (f64::from(cx) / scale).round() as i32;
@@ -484,23 +529,53 @@ fn now_ms() -> u64 {
 /// self-heals within `CONTROL_LEASE_MS` instead of wedging the desktop
 /// forever. Callers are not required to pair this with
 /// [`release_control`].
+///
+/// issue #160 review R1 #5: the FIRST successful hold of an otherwise-unheld
+/// lease (nobody held it, or the previous lease had expired) — as opposed to
+/// a LIVE same-holder renewal — registers the OS-level global Escape
+/// shortcut ([`register_global_escape`]), so it exists only while a lease is
+/// genuinely live.
 pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
-    let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
     let now = now_ms();
-    if let Some(holder) = guard.as_ref() {
-        let is_same_holder = holder.thread == thread && holder.dir == dir;
-        if holder.expires_at_ms > now && !is_same_holder {
-            return Err(ComputerError::Busy {
-                thread: holder.thread,
-                dir: holder.dir.clone(),
-            });
+    let register_needed;
+    {
+        let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(holder) => {
+                let is_same_holder = holder.thread == thread && holder.dir == dir;
+                let is_live = holder.expires_at_ms > now;
+                if is_live && !is_same_holder {
+                    return Err(ComputerError::Busy {
+                        thread: holder.thread,
+                        dir: holder.dir.clone(),
+                    });
+                }
+                // A LIVE same-holder re-acquire is a renewal: the shortcut
+                // from the earlier acquire is still registered, so this
+                // skips re-registering it. Every other path that reaches
+                // here (nobody held it live, or the previous lease already
+                // expired) is a FRESH hold as far as the shortcut is
+                // concerned, even when `(thread, dir)` happens to match the
+                // previous holder — see `register_global_escape`'s doc for
+                // why a redundant registration attempt there is harmless.
+                register_needed = !(is_live && is_same_holder);
+            }
+            None => register_needed = true,
         }
+        *guard = Some(ControlHolderState {
+            thread,
+            dir: dir.to_string(),
+            expires_at_ms: now + CONTROL_LEASE_MS,
+        });
     }
-    *guard = Some(ControlHolderState {
-        thread,
-        dir: dir.to_string(),
-        expires_at_ms: now + CONTROL_LEASE_MS,
-    });
+    // Registered OUTSIDE the mutex guard (issue #160 review R1 #5): the
+    // Escape callback spawns a task that eventually calls `clear_control`,
+    // which takes this SAME mutex — registering while still holding the
+    // lock here would risk a reentrant deadlock if that path ever collapsed
+    // onto this call synchronously.
+    if register_needed {
+        register_global_escape();
+    }
     Ok(())
 }
 
@@ -519,40 +594,161 @@ pub fn release_control(thread: i32, dir: &str) {
 
 /// The current holder, or `None` when nobody holds it OR the lease expired.
 /// An expired lease is cleaned up right here (lazily, on read) rather than
-/// left for the next [`acquire_control`] to notice.
+/// left for the next [`acquire_control`] to notice — issue #160 review R1
+/// #5: that lazy cleanup is also this module's other unregister trigger for
+/// the OS-level global Escape shortcut ([`unregister_global_escape`]), since
+/// an expired lease means nobody is actually driving the desktop anymore.
 pub fn control_state() -> Option<ControlHolder> {
-    let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-    let now = now_ms();
-    match guard.as_ref() {
-        Some(h) if h.expires_at_ms > now => Some(ControlHolder {
-            thread: h.thread,
-            dir: h.dir.clone(),
-            expires_at_ms: h.expires_at_ms,
-        }),
-        Some(_) => {
-            *guard = None;
-            None
+    let (result, expired) = {
+        let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_ms();
+        match guard.as_ref() {
+            Some(h) if h.expires_at_ms > now => (
+                Some(ControlHolder {
+                    thread: h.thread,
+                    dir: h.dir.clone(),
+                    expires_at_ms: h.expires_at_ms,
+                }),
+                false,
+            ),
+            Some(_) => {
+                *guard = None;
+                (None, true)
+            }
+            None => (None, false),
         }
-        None => None,
+    };
+    // Unregistered OUTSIDE the mutex guard — same reentrancy concern as
+    // `acquire_control`'s registration call.
+    if expired {
+        unregister_global_escape();
     }
+    result
 }
 
 /// Unconditionally drop the lease, regardless of who (if anyone) holds it —
 /// the emergency-stop escape hatch (see [`emergency_stop`]), which must win
-/// even over a session that still believes it's mid-lease.
+/// even over a session that still believes it's mid-lease. issue #160 review
+/// R1 #5: also unregisters the OS-level global Escape shortcut when there
+/// WAS a holder to clear (a no-op call when there wasn't one is skipped
+/// rather than attempted and swallowed).
 pub fn clear_control() {
-    *control_mutex().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let had_holder = {
+        let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let had_holder = guard.is_some();
+        *guard = None;
+        had_holder
+    };
+    if had_holder {
+        unregister_global_escape();
+    }
 }
 
-/// issue #160 M2 kill switch: turn `computer_use_enabled` off (so every
-/// subsequent call fails closed via [`enabled`]) AND clear the control lease
-/// (in case a call is already mid-flight against the old value). The lease
-/// clear always runs, even if the setting write fails — a stuck lease with
-/// computer use still nominally enabled is the worse of the two half-failure
-/// states, so this does not stop early on a DB error.
-pub async fn emergency_stop(db: &crate::store::Db) {
-    let _ = crate::store::repo::set_setting(db, K_COMPUTER_USE_ENABLED, "false").await;
+/// issue #160 M2 kill switch: trip the in-memory latch (so every subsequent
+/// [`enabled`] call fails closed) AND clear the control lease (in case a
+/// call is already mid-flight against the old value), THEN best-effort
+/// persist `computer_use_enabled = false` to the DB for next launch.
+///
+/// issue #160 review R1 #1: latch first, persist second — the latch flip and
+/// the lease clear below happen BEFORE the DB write, and [`enabled`] only
+/// ever consults the latch first, so a `set_setting` failure (disk full, DB
+/// locked, ...) can never leave the kill switch fail-open for the rest of
+/// this process's life; it only means the disabled state won't survive a
+/// restart until the human retries. That write failure is still surfaced to
+/// the caller (`Err`) rather than silently dropped, since a UI that thinks
+/// the setting persisted when it didn't is its own kind of foot-gun — it is
+/// just not the FAIL-CLOSED mechanism itself anymore.
+pub async fn emergency_stop(db: &crate::store::Db) -> Result<(), String> {
+    EMERGENCY_STOPPED.store(true, Ordering::SeqCst);
     clear_control();
+    crate::store::repo::set_setting(db, K_COMPUTER_USE_ENABLED, "false")
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// —— OS-level global Escape (issue #160 review R1 #5) ——
+//
+// The WebView's own keydown Esc handler only fires while WEFT ITSELF has
+// keyboard focus — but the normal shape of a computer-use session is that
+// focus is on the CONTROLLED app, not weft, so that handler alone can miss
+// the one moment a human most needs the kill switch to work. This is a
+// SECOND, redundant layer on top of it (the WebView listener stays in
+// place), driven by `tauri_plugin_global_shortcut`, which grabs Escape at
+// the OS level regardless of which window has focus. It is only ever
+// registered while a control lease is actually held (see
+// `acquire_control`/`clear_control`/`control_state`'s hooks above) — never
+// for the whole app lifetime — so it doesn't permanently steal the system
+// Escape key from every other app on the human's desktop.
+
+/// The Tauri app handle this module needs to register/unregister the
+/// OS-level global Escape shortcut. Set once, from `lib.rs`'s `setup()`
+/// closure (see [`set_app_handle`]) — kept as this module's OWN `OnceLock`
+/// (rather than reading the crate-level `crate::APP_HANDLE` directly) so
+/// this module stays the single owner of the shortcut's registration
+/// lifecycle, with no back-reference into `lib.rs` internals.
+static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+/// Wire the app handle [`register_global_escape`]/[`unregister_global_escape`]
+/// need. Called exactly once, from `lib.rs`'s `setup()` closure, AFTER the
+/// `tauri_plugin_global_shortcut` plugin has already run its own setup (Tauri
+/// initializes plugins during `.build()`, which completes before `.setup()`
+/// ever runs — see that call site's comment) — so by the time this is
+/// called, `AppHandle::global_shortcut()` is always safe to use. Before this
+/// runs (a unit test; a build that never reaches `setup()`), both
+/// register/unregister calls silently no-op instead of touching a `None`
+/// handle — see their own doc comments.
+pub fn set_app_handle(h: tauri::AppHandle) {
+    let _ = APP_HANDLE.set(h);
+}
+
+/// The single shortcut this module ever registers: bare `Escape`, no
+/// modifiers.
+fn escape_shortcut() -> tauri_plugin_global_shortcut::Shortcut {
+    tauri_plugin_global_shortcut::Shortcut::new(None, tauri_plugin_global_shortcut::Code::Escape)
+}
+
+/// Best-effort: register the OS-level global Escape shortcut. Silently
+/// no-ops when [`set_app_handle`] hasn't run yet (`APP_HANDLE` still `None`
+/// — the common case in `cargo test --lib`, which never builds a real Tauri
+/// app) — this function's whole contract is "try to add the redundant OS
+/// layer if we can", never "the kill switch depends on this". A registration
+/// failure (already grabbed by another app, unsupported platform/desktop
+/// environment, ...) is logged and swallowed the same way, for the same
+/// reason: the WebView's own Esc listener and the in-memory
+/// [`EMERGENCY_STOPPED`] latch are the mechanisms that actually have to
+/// work; this is upside only.
+fn register_global_escape() {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let Some(app) = APP_HANDLE.get() else { return };
+    let result = app.global_shortcut().on_shortcut(escape_shortcut(), |app, _shortcut, event| {
+        if event.state != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+            return;
+        }
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            use tauri::Manager as _;
+            let db = app.state::<crate::store::Db>().inner().clone();
+            // Error ignored: `emergency_stop` sets the in-memory
+            // `EMERGENCY_STOPPED` latch BEFORE its own fallible DB write, so
+            // the kill switch has already taken effect even on an `Err` here
+            // — see that function's doc comment.
+            let _ = emergency_stop(&db).await;
+        });
+    });
+    if let Err(err) = result {
+        eprintln!("[weft] register global Escape shortcut: {err}");
+    }
+}
+
+/// Best-effort unregister — the [`register_global_escape`] counterpart,
+/// same no-op-without-a-handle and log-and-swallow-on-error behavior, for
+/// the same reasons.
+fn unregister_global_escape() {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let Some(app) = APP_HANDLE.get() else { return };
+    if let Err(err) = app.global_shortcut().unregister(escape_shortcut()) {
+        eprintln!("[weft] unregister global Escape shortcut: {err}");
+    }
 }
 
 fn throttle_mutex() -> &'static Mutex<Option<Instant>> {
@@ -586,6 +782,26 @@ pub fn throttle_input() -> Result<(), ComputerError> {
     }
     *guard = Some(now);
     Ok(())
+}
+
+/// Process-wide input mutex serializing input-action calls END TO END
+/// (issue #160 review R1 #3). [`acquire_control`] only blocks a DIFFERENT
+/// `(thread, dir)` from taking over the lease — it does nothing to stop the
+/// SAME session from issuing two concurrent `tools/call`s, which would
+/// otherwise race each other straight into the OS backend and interleave
+/// their clicks/keystrokes on the human's real desktop.
+///
+/// Contract with `bus::computer_srv` (the sole caller — DO NOT rename this
+/// function, its signature is a cross-module contract): the caller MUST
+/// `.await` this and hold the returned guard for the FULL duration of one
+/// input action's actual backend call — acquire it immediately before
+/// invoking `backend::backend()`'s click/type/key/scroll/drag/move method
+/// and let it drop only after that call returns (not just around the gate
+/// checks that precede it). Two `tools/call`s racing for the SAME
+/// `(thread, dir)` then serialize on this mutex instead of interleaving.
+pub async fn input_flight_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static FLIGHT: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    FLIGHT.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
 }
 
 // —— key combo grammar (issue #160 M2) ——
@@ -924,11 +1140,44 @@ mod tests {
             width: 2560,
             height: 1440,
         };
+        // scale = 0.5 -> scaled_w=1280, scaled_h=720; the last VALID
+        // coordinate is (1279, 719) — see the next test — so `max_x`/`max_y`
+        // report that inclusive last-valid value, not the width/height.
         let err = map_to_physical(&w, 1281, 0).unwrap_err();
         assert!(matches!(
             err,
-            ComputerError::OutOfBounds { x: 1281, y: 0, max_x: 1280, max_y: 720 }
+            ComputerError::OutOfBounds { x: 1281, y: 0, max_x: 1279, max_y: 719 }
         ));
+    }
+
+    #[test]
+    fn map_to_physical_rejects_the_exclusive_upper_bound_and_accepts_the_last_valid_coordinate() {
+        // issue #160 review R1 #2: `cx == scaled_w` (here 1280) must be
+        // rejected — it's one past the last real pixel column — while
+        // `cx == scaled_w - 1` (1279), the actual last valid column, is
+        // accepted.
+        let w = WindowInfo {
+            id: 1,
+            app: "x".into(),
+            title: "x".into(),
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        let err = map_to_physical(&w, 1280, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            ComputerError::OutOfBounds { x: 1280, y: 0, max_x: 1279, max_y: 719 }
+        ));
+        assert!(map_to_physical(&w, 1279, 0).is_ok());
+        // Same rule on the y axis.
+        let err_y = map_to_physical(&w, 0, 720).unwrap_err();
+        assert!(matches!(
+            err_y,
+            ComputerError::OutOfBounds { x: 0, y: 720, max_x: 1279, max_y: 719 }
+        ));
+        assert!(map_to_physical(&w, 0, 719).is_ok());
     }
 
     #[test]
@@ -1005,10 +1254,50 @@ mod tests {
             .unwrap();
         acquire_control(9, "90").unwrap();
 
-        emergency_stop(&db).await;
+        let result = emergency_stop(&db).await;
 
+        assert!(result.is_ok(), "emergency_stop must succeed against a healthy in-memory db");
         assert!(!enabled(&db).await);
         assert!(control_state().is_none());
+        // Leave the shared process-wide latch cleared for every other test
+        // in this binary — see `emergency_stop_latch_wins_over_a_true_setting_until_explicitly_cleared`'s
+        // own note on why every latch-touching test must clean up after
+        // itself.
+        clear_emergency_stop();
+    }
+
+    // —— emergency-stop latch (issue #160 review R1 #1) ——
+
+    #[tokio::test]
+    async fn emergency_stop_latch_wins_over_a_true_setting_until_explicitly_cleared() {
+        // `EMERGENCY_STOPPED` is a process-wide static shared by every test
+        // in this binary (same category of shared state as `control_mutex`/
+        // `throttle_mutex` above) — kept as ONE test exercising the whole
+        // latch lifecycle sequentially, ending with the latch cleared again,
+        // rather than splitting it across tests that could interleave with
+        // each other (or with `enabled_reads_true_false_and_missing` below)
+        // under `cargo test`'s default parallel test threads.
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        clear_emergency_stop();
+        crate::store::repo::set_setting(&db, K_COMPUTER_USE_ENABLED, "true")
+            .await
+            .unwrap();
+        assert!(enabled(&db).await, "baseline: latch clear, setting true -> enabled");
+
+        EMERGENCY_STOPPED.store(true, Ordering::SeqCst);
+        assert!(
+            !enabled(&db).await,
+            "the latch must win even though the underlying setting is still \"true\""
+        );
+
+        clear_emergency_stop();
+        assert!(
+            enabled(&db).await,
+            "clearing the latch restores the underlying setting's value"
+        );
+
+        // Leave it cleared for any other test in this binary.
+        clear_emergency_stop();
     }
 
     // —— input throttle (issue #160 M2) ——
@@ -1021,6 +1310,55 @@ mod tests {
         throttle_input().ok();
         let err = throttle_input().unwrap_err();
         assert!(matches!(err, ComputerError::RateLimited { wait_ms } if wait_ms > 0 && wait_ms <= THROTTLE_MS));
+    }
+
+    // —— input flight guard (issue #160 review R1 #3) ——
+
+    #[tokio::test]
+    async fn input_flight_guard_serializes_concurrent_acquires() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        let concurrent = Arc::new(AtomicU32::new(0));
+        let max_concurrent = Arc::new(AtomicU32::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let concurrent = concurrent.clone();
+            let max_concurrent = max_concurrent.clone();
+            handles.push(tokio::spawn(async move {
+                let _guard = input_flight_guard().await;
+                let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                max_concurrent.fetch_max(now, Ordering::SeqCst);
+                // Yield/sleep WHILE holding the guard so the second task, if
+                // it were (incorrectly) able to acquire concurrently, would
+                // have a window to observe `concurrent == 2`.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                concurrent.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "the two tasks must never hold the guard at the same time — later one waits for the first to drop it"
+        );
+    }
+
+    // —— OS-level global Escape (issue #160 review R1 #5) ——
+
+    #[test]
+    fn register_and_unregister_global_escape_noop_without_an_app_handle() {
+        // `cargo test --lib` never builds a real Tauri app, so
+        // `set_app_handle` is never called in this binary and `APP_HANDLE`
+        // stays `None` for the whole process — both calls must silently
+        // no-op rather than panic (there is no live runtime-behavior test
+        // possible here; see the task's own verification-scope note).
+        register_global_escape();
+        unregister_global_escape();
     }
 
     // —— key combo parsing (issue #160 M2) ——

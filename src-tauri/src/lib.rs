@@ -167,7 +167,14 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build());
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // issue #160 review R1 #5: OS-level global Escape, so the kill
+        // switch reaches Weft even while keyboard focus is on the
+        // computer-use-controlled app, not Weft's own WebView — see
+        // `computer::acquire_control`/`clear_control` for the
+        // register/unregister lifecycle hook (only live while a control
+        // lease is actually held).
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
     #[cfg(debug_assertions)]
     if mcp_bridge_enabled() {
@@ -217,6 +224,14 @@ pub fn run() {
         })
         .setup(move |app| {
             let _ = APP_HANDLE.set(app.handle().clone());
+            // issue #160 review R1 #5: wire the app handle `computer::mod.rs`
+            // needs to register/unregister the OS-level global Escape
+            // shortcut. Safe to call here — the `tauri_plugin_global_shortcut`
+            // plugin registered above already ran its own `setup()` (and thus
+            // `app.manage(GlobalShortcut { .. })`) during `.build()`, which
+            // completes before this closure runs (it fires on the runtime's
+            // `Ready` event, inside `.run()`).
+            computer::set_app_handle(app.handle().clone());
             coordinator::run(app.handle().clone(), wake_rx);
             lead_chat::engine::spawn_watchdog(app.handle().clone());
             // Install the grant-persist consumer BEFORE revive re-drives tasks, so

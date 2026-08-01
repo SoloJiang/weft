@@ -234,27 +234,51 @@ fn extract_tool_output(update: &Value) -> String {
 /// This closes a real gap: before this function existed, an omp screenshot
 /// tool's image block was silently dropped — `extract_tool_output` only ever
 /// read the text half of a `tool_call_update`'s content.
+///
+/// Issue #160 round-2 §5: this used to scan BOTH sources and concatenate
+/// whatever each one found — but a single tool result that mirrors the same
+/// image into both `rawOutput.content` AND `content[]` (a real shape at
+/// least one ACP backend produces) would then carry it TWICE, doubling the
+/// payload for no new information. Now PRIORITIZED exactly like
+/// `extract_tool_output`'s own text extraction: `rawOutput.content` wins
+/// outright when it carries at least one image; `content[]` is only
+/// consulted as a fallback when `rawOutput.content` carried none at all —
+/// never merged. As a second, independent safety net (in case some OTHER
+/// backend shape still manages to repeat the identical image within ONE of
+/// those two sources), the final list is deduplicated by its exact data URI
+/// string, keeping the first occurrence's position.
 fn extract_tool_images(update: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Some(arr) = update.pointer("/rawOutput/content").and_then(|c| c.as_array()) {
-        for item in arr {
-            if let Some(uri) = image_block_data_uri(item) {
-                out.push(uri);
-            }
-        }
-    }
-    if let Some(arr) = update.get("content").and_then(|c| c.as_array()) {
-        for item in arr {
-            let uri = item
-                .get("content")
-                .and_then(image_block_data_uri)
-                .or_else(|| image_block_data_uri(item));
-            if let Some(uri) = uri {
-                out.push(uri);
-            }
-        }
-    }
-    out
+    let raw_images: Vec<String> = update
+        .pointer("/rawOutput/content")
+        .and_then(|c| c.as_array())
+        .map(|arr| arr.iter().filter_map(image_block_data_uri).collect())
+        .unwrap_or_default();
+    let images = if !raw_images.is_empty() {
+        raw_images
+    } else {
+        update
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| {
+                        item.get("content")
+                            .and_then(image_block_data_uri)
+                            .or_else(|| image_block_data_uri(item))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    dedup_data_uris(images)
+}
+
+/// Drop repeats of the exact same data URI, keeping each survivor's FIRST
+/// position — the second, independent safety net [`extract_tool_images`]'s
+/// own doc comment describes.
+fn dedup_data_uris(images: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    images.into_iter().filter(|uri| seen.insert(uri.clone())).collect()
 }
 
 /// One content block → `data:<mime>;base64,<data>` if it's an
@@ -518,6 +542,73 @@ mod tests {
                 assert_eq!(items[0].images.len(), 4);
                 assert!(items[0].is_error);
                 assert!(items[0].output.ends_with("(1 image(s) omitted: too large)"));
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    /// Issue #160 round-2 §5: a tool result that mirrors the SAME image into
+    /// BOTH `rawOutput.content` and `content[]` (a real shape at least one
+    /// ACP backend produces) must land ONE image, not two — `rawOutput.
+    /// content` wins outright (mirroring `extract_tool_output`'s own text
+    /// priority) and `content[]` is never even consulted once it carried at
+    /// least one image, so this is not just a dedup of equal strings but a
+    /// genuine "only scan one source" priority rule.
+    #[test]
+    fn tool_call_update_mirrored_into_both_sources_yields_one_image() {
+        let mirrored = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-5",
+            "status": "completed",
+            "rawOutput": {
+                "content": [
+                    { "type": "image", "data": "AAAA", "mimeType": "image/png" }
+                ]
+            },
+            "content": [
+                { "type": "content", "content": { "type": "image", "data": "AAAA", "mimeType": "image/png" } }
+            ]
+        });
+        match update_to_out(&mirrored) {
+            UpdateOut::Chat(ChatEvent::ToolResults { items }) => {
+                assert_eq!(
+                    items[0].images,
+                    vec!["data:image/png;base64,AAAA".to_string()],
+                    "the SAME image mirrored into both sources must appear exactly once"
+                );
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    /// The second, independent safety net: even ONE source repeating the
+    /// identical image twice (a backend quirk, not the two-source mirroring
+    /// case above) must still collapse to one — `extract_tool_images`'s own
+    /// dedup runs on the final list regardless of which source it came from.
+    #[test]
+    fn tool_call_update_repeats_within_one_source_still_dedup() {
+        let repeated = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-6",
+            "status": "completed",
+            "rawOutput": {
+                "content": [
+                    { "type": "image", "data": "BBBB", "mimeType": "image/png" },
+                    { "type": "image", "data": "BBBB", "mimeType": "image/png" },
+                    { "type": "image", "data": "CCCC", "mimeType": "image/png" }
+                ]
+            }
+        });
+        match update_to_out(&repeated) {
+            UpdateOut::Chat(ChatEvent::ToolResults { items }) => {
+                assert_eq!(
+                    items[0].images,
+                    vec![
+                        "data:image/png;base64,BBBB".to_string(),
+                        "data:image/png;base64,CCCC".to_string(),
+                    ],
+                    "a repeated data URI within one source collapses; distinct ones are kept, in order"
+                );
             }
             o => panic!("{o:?}"),
         }

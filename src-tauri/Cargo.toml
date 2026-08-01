@@ -18,6 +18,13 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-notification = "2"
+# OS-level Escape (issue #160 review R1 #5): computer use's control lease can
+# put keyboard focus on the CONTROLLED app, not weft's own WebView, so the
+# WebView-only Esc keydown handler never sees it — this plugin's global
+# shortcut fires regardless of which app has focus. Registered only while a
+# control lease is actually held (see `computer::acquire_control`/
+# `clear_control`), not app-wide for the whole process lifetime.
+tauri-plugin-global-shortcut = "2.3.2"
 user-notify = "0.4.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

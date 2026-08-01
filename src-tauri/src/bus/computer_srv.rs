@@ -13,17 +13,27 @@
 //! copied here instead, matching `bus::global`'s existing precedent for a
 //! new MCP server module.
 //!
-//! Every `computer` call result comes back as plain text (a Needs-you card
-//! per call — these are intentionally NOT in
-//! `server::AUTO_APPROVED_INTERNAL_TOOLS`; this stays conservative and
-//! relies on the human's own "Always grant" to converge instead of a
-//! hand-picked auto-approve list).
+//! Every `computer` call result comes back as plain text.
+//!
+//! Issue #160 round-2 P1 (architecture fix): `/computer/:thread/:dir/mcp`'s
+//! identity comes from the URL path alone (same guarantee `bus::server::
+//! handle` relies on) — but unlike the OTHER bus MCP servers, this one used
+//! to have NO approval gate of its own at all: authorization lived entirely
+//! in the calling engine's PreToolUse hook, a layer ANY local process
+//! (including the agent itself, e.g. a raw `curl` straight into this
+//! endpoint) can simply skip. [`run_action`]'s new [`approve`] step closes
+//! that gap: it gates EVERY `tools/call` here, server-side, before it can
+//! reach a backend — a Needs-you card the human answers through the exact
+//! same `AskRegistry` the hook path uses, just via a route the calling
+//! engine cannot route around. `bus::server::AUTO_APPROVED_INTERNAL_TOOLS`
+//! now auto-approves `weft_computer`'s hook ask (see its own doc) so a
+//! well-behaved engine's hook doesn't ALSO card the same call a second time.
 //!
 //! ONE tool, `computer`, dispatched by an `action` argument — the same shape
 //! as Anthropic's `computer_20251124`, OpenAI's Responses `computer`, and
 //! omp's `computer` tool, which models are already trained against.
 
-use crate::ask::AskRegistry;
+use crate::ask::{AskRegistry, Decision};
 use crate::computer::{self, backend, backend::MouseButton, ComputerError};
 use crate::store::{repo, Db};
 use axum::{
@@ -130,19 +140,19 @@ fn computer_tool_specs() -> Value {
     json!([
         {
             "name": "computer",
-            "description": "Observe AND control the human's screen — OS-level window listing/screenshot plus mouse/keyboard input injection. `action=list_windows` lists visible on-screen windows (Weft's own window and terminal-emulator apps are excluded, so you can never see yourself or the terminal you're running inside). `action=screenshot` captures ONE window — never the whole desktop — and returns a PNG FILE PATH (not image data): open it with your own image-viewing tool. Every other action but `cursor_position`/`wait` needs `window` (same id/substring rule as screenshot) and drives that window's input: `left_click`/`right_click`/`double_click`/`triple_click`/`mouse_move` need `coordinate` [x, y]; `left_click_drag` needs `start_coordinate` AND `coordinate` (end point); `scroll` needs `coordinate` plus `scroll_direction`; `type`/`key` need `text` (literal text to type, or a combo like \"cmd+s\"/\"ctrl+shift+t\"/\"Return\"/\"f5\" for `key`). ALL coordinates are in the pixel space of the MOST RECENT screenshot of that window — take a screenshot first (or again after the window resizes) to get coordinates that still line up, since the mapping is recomputed from the window's CURRENT size on every call and an out-of-range coordinate is rejected rather than guessed at. Only one session drives the desktop at a time: an input action can come back `Busy` (another session currently has it) or fail while a permission card is still waiting on the human — retry after a moment. Input actions are also rate-limited to roughly 2 per second.",
+            "description": format!("Observe AND control the human's screen — OS-level window listing/screenshot plus mouse/keyboard input injection. `action=list_windows` lists visible on-screen windows (Weft's own window and terminal-emulator apps are excluded, so you can never see yourself or the terminal you're running inside). `action=screenshot` captures ONE window — never the whole desktop — and returns a PNG FILE PATH (not image data): open it with your own image-viewing tool. Every other action but `cursor_position`/`wait` needs `window` (same id/substring rule as screenshot) and drives that window's input: `left_click`/`right_click`/`double_click`/`triple_click`/`mouse_move` need `coordinate` [x, y]; `left_click_drag` needs `start_coordinate` AND `coordinate` (end point); `scroll` needs `coordinate` plus `scroll_direction`; `type`/`key` need `text` (literal text to type, or a combo like \"cmd+s\"/\"ctrl+shift+t\"/\"Return\"/\"f5\" for `key`). ALL coordinates are in the pixel space of the MOST RECENT screenshot of that window — take a screenshot first (or again after the window resizes) to get coordinates that still line up, since the mapping is recomputed from the window's CURRENT size on every call and an out-of-range coordinate is rejected rather than guessed at. `type`/`key` additionally require a `left_click`/`right_click`/`double_click`/`triple_click` on that SAME window within the last {FOCUS_FRESHNESS_SECS}s — click inside the target window first to focus it, then type/key within {FOCUS_FRESHNESS_SECS}s, or the call is rejected. Every call — observation or input — may pause for a human's permission card (Needs-you) before it runs; an input action can additionally come back `Busy` (another session currently has it) or fail while a DIFFERENT permission card is still waiting on the human — retry after a moment. Input actions are also rate-limited to roughly 2 per second."),
             "inputSchema": { "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": VALID_ACTIONS,
                         "description": "screenshot | list_windows | left_click | right_click | double_click | triple_click | type | key | scroll | left_click_drag | mouse_move | cursor_position | wait" },
                     "window": { "type": "string",
-                        "description": "Required for every action except cursor_position and wait: a window id from action=list_windows, or a case-insensitive substring of its app name or title." },
+                        "description": "Required (non-empty) for every action except cursor_position and wait: a window id from action=list_windows, or a case-insensitive substring of its app name or title." },
                     "coordinate": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2,
                         "description": "[x, y] in the pixel space of the most recent screenshot of `window`. Required for left_click/right_click/double_click/triple_click/mouse_move/scroll, and as the drag END point for left_click_drag." },
                     "start_coordinate": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2,
                         "description": "[x, y] drag START point, same pixel space as `coordinate`. Required for left_click_drag." },
                     "text": { "type": "string",
-                        "description": "Literal text to type (action=type), or a key combo like \"cmd+s\" / \"ctrl+shift+t\" / \"Return\" / \"f5\" (action=key)." },
+                        "description": format!("Literal text to type (action=type), or a key combo like \"cmd+s\" / \"ctrl+shift+t\" / \"Return\" / \"f5\" (action=key). Both actions require a click on the SAME `window` within the last {FOCUS_FRESHNESS_SECS}s first — see this tool's own description.") },
                     "scroll_direction": { "type": "string", "enum": ["up", "down", "left", "right"],
                         "description": "Required for action=scroll." },
                     "scroll_amount": { "type": "integer",
@@ -181,6 +191,13 @@ async fn call_computer(db: &Db, asks: &AskRegistry, thread: i32, dir: &str, name
         Err(text) => text.clone(),
     };
 
+    // The DURABLE audit line's own args payload — NOT the same `args` the
+    // approval card in `approve` showed the human — see `redact_audit_args`'s
+    // doc for why `action == "type"`'s literal keystrokes are redacted here
+    // (issue #160 round-2 P2) but never on the card the human approved BEFORE
+    // this call ran.
+    let audit_args = redact_audit_args(&action, args);
+
     append_audit(
         db,
         thread,
@@ -192,7 +209,7 @@ async fn call_computer(db: &Db, asks: &AskRegistry, thread: i32, dir: &str, name
             action: &action,
             window_query: &window_query,
             window_id,
-            args,
+            args: &audit_args,
             outcome: if outcome.is_ok() { "ok" } else { &outcome_text },
         },
     )
@@ -235,6 +252,13 @@ async fn run_action(
     if name != "computer" {
         return Err(format!("unknown tool: {name}"));
     }
+    // The server-side approval gate (issue #160 round-2 P1) — see this
+    // module's own doc comment and `approve`'s. Runs for EVERY action,
+    // observation or input, before any action-specific argument is even
+    // looked at: a standing grant decides silently, otherwise this blocks on
+    // a Needs-you card exactly like `bus::server::handle_ask` does for every
+    // other tool call in this crate.
+    approve(asks, thread, dir, action, args).await?;
     match action {
         "list_windows" => {
             let b = backend::backend();
@@ -243,11 +267,12 @@ async fn run_action(
                 .map_err(|e| e.to_string())
         }
         "screenshot" => {
+            let window_query = required_window(args)?;
             let Some(out_dir) = screenshot_out_dir(db, thread, dir).await else {
                 return Err("no worktree for this session".into());
             };
             let b = backend::backend();
-            let shot = computer::screenshot_window(b.as_ref(), &window_arg(args), &out_dir)
+            let shot = computer::screenshot_window(b.as_ref(), window_query, &out_dir)
                 .map_err(|e| e.to_string())?;
             let text = format!(
                 "screenshot saved: {} ({}x{}, scale {:.2}) — open it with your image viewing tool",
@@ -266,11 +291,21 @@ async fn run_action(
             // saved successfully — it just means no preview/image this call.
             if let Some(captured) = read_captured_image(&shot.path) {
                 // ALWAYS refresh the Ask-card preview, regardless of engine —
-                // see `store_screenshot_preview`'s doc.
+                // see `store_screenshot_preview`'s doc. Keyed to the window
+                // it actually came from (issue #160 round-2 P1 §2) — re-
+                // resolve `window_query` (cheap, no capture; the same kind of
+                // fresh re-resolve every OTHER action makes) rather than
+                // threading `screenshot_window`'s own internal resolution
+                // out a second way. Best-effort: if the window vanished in
+                // the instant since `screenshot_window` captured it, just
+                // skip storing this preview rather than fail an already-
+                // successful screenshot.
                 if let Ok(preview) =
                     computer::encode_jpeg_data_uri(&captured, PREVIEW_LONG_EDGE, PREVIEW_QUALITY)
                 {
-                    store_screenshot_preview(thread, dir, preview);
+                    if let Ok(w) = computer::resolve_window(b.as_ref(), window_query) {
+                        store_screenshot_preview(thread, dir, preview, w.id);
+                    }
                 }
                 // The MCP `image` content block is engine-gated — see
                 // `engine_accepts_mcp_image`'s doc table.
@@ -288,8 +323,9 @@ async fn run_action(
         }
         "left_click" | "right_click" | "double_click" | "triple_click" => {
             input_gate(asks, thread, dir)?;
+            let window_query = required_window(args)?;
             let (cx, cy) = parse_coordinate(args, "coordinate")?;
-            let (window_id, px, py) = resolve_and_map(&window_arg(args), cx, cy)?;
+            let (window_id, px, py) = resolve_and_map(window_query, cx, cy)?;
             *window_id_out = Some(window_id);
             let button = if action == "right_click" { MouseButton::Right } else { MouseButton::Left };
             let count: u32 = match action {
@@ -297,18 +333,35 @@ async fn run_action(
                 "triple_click" => 3,
                 _ => 1,
             };
+            // Held for the FULL duration of the backend call, per the
+            // cross-module contract on `computer::input_flight_guard`'s own
+            // doc — a second `tools/call` for the SAME (thread, dir) racing
+            // in concurrently must serialize here rather than interleave its
+            // own click on the human's real desktop (issue #160 review R1
+            // P2).
+            let _flight = computer::input_flight_guard().await;
             backend::backend()
                 .click(px, py, button, count)
                 .map_err(|e| e.to_string())?;
+            // A click that actually reached the OS is presumed to have
+            // handed this window OS focus — see `recent_clicks`'s doc. Only
+            // AFTER the backend call succeeds: a rejected/failed click never
+            // touched the real window and must not seed a false freshness
+            // record for a later `type`/`key`.
+            record_click_focus(thread, dir, window_id);
             Ok(format!(
                 "{action} at ({px}, {py}) in window {window_id} done — take a screenshot to verify"
             ))
         }
         "mouse_move" => {
             input_gate(asks, thread, dir)?;
+            let window_query = required_window(args)?;
             let (cx, cy) = parse_coordinate(args, "coordinate")?;
-            let (window_id, px, py) = resolve_and_map(&window_arg(args), cx, cy)?;
+            let (window_id, px, py) = resolve_and_map(window_query, cx, cy)?;
             *window_id_out = Some(window_id);
+            // See the click-family arm above for why this guard is held
+            // across the backend call itself.
+            let _flight = computer::input_flight_guard().await;
             backend::backend()
                 .move_cursor(px, py)
                 .map_err(|e| e.to_string())?;
@@ -318,13 +371,15 @@ async fn run_action(
         }
         "left_click_drag" => {
             input_gate(asks, thread, dir)?;
+            let window_query = required_window(args)?;
             let (sx, sy) = parse_coordinate(args, "start_coordinate")?;
             let (ex, ey) = parse_coordinate(args, "coordinate")?;
             let b = backend::backend();
-            let w = computer::resolve_window(b.as_ref(), &window_arg(args)).map_err(|e| e.to_string())?;
+            let w = computer::resolve_window(b.as_ref(), window_query).map_err(|e| e.to_string())?;
             *window_id_out = Some(w.id);
             let from = computer::map_to_physical(&w, sx, sy).map_err(|e| e.to_string())?;
             let to = computer::map_to_physical(&w, ex, ey).map_err(|e| e.to_string())?;
+            let _flight = computer::input_flight_guard().await;
             b.drag(from, to).map_err(|e| e.to_string())?;
             Ok(format!(
                 "left_click_drag from ({}, {}) to ({}, {}) in window {} done — take a screenshot to verify",
@@ -333,10 +388,12 @@ async fn run_action(
         }
         "scroll" => {
             input_gate(asks, thread, dir)?;
+            let window_query = required_window(args)?;
             let (cx, cy) = parse_coordinate(args, "coordinate")?;
             let (dx, dy) = parse_scroll(args)?;
-            let (window_id, px, py) = resolve_and_map(&window_arg(args), cx, cy)?;
+            let (window_id, px, py) = resolve_and_map(window_query, cx, cy)?;
             *window_id_out = Some(window_id);
+            let _flight = computer::input_flight_guard().await;
             backend::backend()
                 .scroll(px, py, dx, dy)
                 .map_err(|e| e.to_string())?;
@@ -346,9 +403,17 @@ async fn run_action(
         }
         "type" => {
             input_gate(asks, thread, dir)?;
+            let window_query = required_window(args)?;
             let text = required_text(args)?;
-            let window_id = resolve_window_id(&window_arg(args))?;
+            let window_id = resolve_window_id(window_query)?;
             *window_id_out = Some(window_id);
+            // Focus-freshness gate (issue #160 round-2 P1 addendum) — see
+            // `require_recent_focus`'s doc. Checked AFTER resolving the
+            // window (so the error names the SAME window id every other
+            // error/confirmation for this call names) but BEFORE the backend
+            // ever sees the keystrokes.
+            require_recent_focus(thread, dir, window_id)?;
+            let _flight = computer::input_flight_guard().await;
             backend::backend()
                 .type_text(text)
                 .map_err(|e| e.to_string())?;
@@ -359,9 +424,13 @@ async fn run_action(
         }
         "key" => {
             input_gate(asks, thread, dir)?;
+            let window_query = required_window(args)?;
             let combo = required_text(args)?;
-            let window_id = resolve_window_id(&window_arg(args))?;
+            let window_id = resolve_window_id(window_query)?;
             *window_id_out = Some(window_id);
+            // See the matching comment in the "type" arm above.
+            require_recent_focus(thread, dir, window_id)?;
+            let _flight = computer::input_flight_guard().await;
             backend::backend().key(combo).map_err(|e| e.to_string())?;
             Ok(format!(
                 "key {combo} in window {window_id} done — take a screenshot to verify"
@@ -387,6 +456,253 @@ async fn run_action(
             VALID_ACTIONS.join(", ")
         )),
     }
+}
+
+// —— server-side approval gate (issue #160 round-2 P1) ——
+
+/// Gate EVERY `tools/call` here, server-side, before [`run_action`]'s dispatch
+/// looks at any action-specific argument — see this module's own top doc
+/// comment for the full architecture rationale (this closes the "any local
+/// process can just POST past the engine's hook" gap the round-1 review
+/// found).
+///
+/// Mirrors `bus::server::handle_ask`'s own shape closely on purpose, so the
+/// two Ask-bridge entry points behave identically wherever they overlap:
+///  1. Classify (`risk` via [`crate::ask::classify_gui_action`]), build the
+///     display `summary` and the canonical `action_key` — `["gui", action,
+///     window]`, a namespace of its own (distinct from `bus::server::
+///     summarize`'s `["mcp", tool_name, args]` for the SAME tool, since this
+///     is a different, more precise identity: it never depends on which
+///     engine-specific tool-name shape happened to reach this endpoint).
+///     `detail` is the FULL, unredacted params JSON — see the inline comment
+///     below for why that must never be redacted here even though the
+///     PERSISTED audit line (`redact_audit_args`) is.
+///  2. A standing grant (Full / Always for this EXACT `action_key` / a
+///     read-only batch-or-issue grant, gated on `risk` exactly like every
+///     other tool) decides silently via [`crate::ask::AskRegistry::
+///     auto_decision`] — the SAME method/semantics `handle_ask` uses.
+///  3. Otherwise, a Needs-you card ([`crate::ask::AskRegistry::
+///     request_with_preview`], `tool` = the literal `"computer"` — this
+///     endpoint has no engine identity of its own the way a hook's `?tool=`
+///     query does) blocks until answered, with `bus::server::ASK_WAIT`'s own
+///     ceiling and the SAME fail-closed deny `handle_ask` returns on a
+///     timeout or a cancelled ask (never an ambiguous default).
+///
+/// [`run_action`] only proceeds to `has_open`/the control lease/the throttle
+/// — checks for a DIFFERENT, unrelated open ask, or for someone else driving
+/// the desktop right now — AFTER this gate returns `Ok`; those are a
+/// completely separate concern (issue #160 M2) from "is this call
+/// authorized at all".
+async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args: &Value) -> Result<(), String> {
+    let window_query = window_arg(args);
+    let risk = crate::ask::classify_gui_action(action);
+    let summary = if window_query.is_empty() {
+        format!("computer: {action}")
+    } else {
+        format!("computer: {action} @ {window_query}")
+    };
+    let action_key = crate::ask::action_key(&["gui", action, &window_query]);
+    // UNREDACTED, even for `action == "type"`: the human approving THIS card
+    // needs to see exactly what is about to be typed to judge whether to
+    // allow it — a card that hid the text and only said "N characters" would
+    // ask for a decision without the information the decision depends on.
+    // Only the PERSISTED audit line redacts it, after the fact, once the
+    // human has already made that call — see `redact_audit_args`'s doc for
+    // the full symmetric point.
+    let detail = args.to_string();
+
+    match asks.auto_decision(thread, dir, risk, &action_key) {
+        Some(Decision::Allow) => return Ok(()),
+        // `auto_decision` never actually returns `Deny` today (only Allow-
+        // only standing grants exist) — this arm keeps the gate correct
+        // regardless, mirroring `handle_ask`'s own defensive shape, rather
+        // than silently falling through to a redundant card for it.
+        Some(Decision::Deny) => return Err("denied by a standing weft rule".to_string()),
+        None => {}
+    }
+
+    let preview = preview_for_action(thread, dir, risk, &window_query);
+    let (id, rx) = asks.request_with_preview(
+        thread, dir, "computer", &summary, &detail, risk, &action_key, preview,
+    );
+
+    match tokio::time::timeout(crate::bus::server::ASK_WAIT, rx).await {
+        Ok(Ok(Decision::Allow)) => Ok(()),
+        Ok(Ok(Decision::Deny)) => Err("denied in weft".to_string()),
+        // Timed out, or the sender was dropped (`AskRegistry::cancel`/
+        // `cancel_for` — e.g. an engine/model switch tearing this session
+        // down mid-ask): the SAME explicit, fail-closed deny `bus::server::
+        // handle_ask` returns for either case, never an ambiguous default.
+        _ => {
+            asks.cancel(id);
+            Err("no answer in time — denied by default (weft ask bridge)".to_string())
+        }
+    }
+}
+
+/// The screenshot preview to attach to a NEW Ask card for `action` targeting
+/// `window_query`, if any (issue #160 round-2 P1 §2). Observe-only actions
+/// (`risk != Write`) never attach one, unchanged from the M3-B rule this
+/// replaces (relocated here from `bus::server::handle_ask` — see this
+/// module's own doc comment): the agent that just took a screenshot already
+/// has it, attaching it again is pure payload with no new context for the
+/// human. For a Write-classified action, the preview registry now carries
+/// the window id the LAST screenshot for this `(thread, dir)` actually
+/// resolved to (see [`store_screenshot_preview`] / [`last_screenshot_
+/// preview`]) — this only attaches it when THIS action's own target window
+/// resolves to that SAME id, so an input action on a DIFFERENT window than
+/// the one last screenshotted never shows a stale, unrelated preview.
+/// Resolution failure (an empty/missing query, no match, an ambiguous
+/// match) is silently treated as "no preview to attach" — the real error for
+/// a malformed/unresolvable window surfaces later, at dispatch time
+/// ([`required_window`] / `resolve_window`), once the human has already
+/// answered this card.
+fn preview_for_action(
+    thread: i32,
+    dir: &str,
+    risk: crate::ask::RiskLevel,
+    window_query: &str,
+) -> Option<String> {
+    if risk != crate::ask::RiskLevel::Write {
+        return None;
+    }
+    let target = resolve_target_window_id(window_query)?;
+    let (data_uri, preview_window_id) = last_screenshot_preview(thread, dir)?;
+    (preview_window_id == target).then_some(data_uri)
+}
+
+/// Best-effort window resolution for [`preview_for_action`]'s id match ONLY
+/// — `None` for an empty/blank query or anything `resolve_window` itself
+/// can't resolve to exactly one window, never an error: this is purely a
+/// "should we attach a preview" decision, not the real validation
+/// ([`required_window`] / the per-action dispatch) that actually rejects a
+/// malformed call.
+fn resolve_target_window_id(window_query: &str) -> Option<u32> {
+    if window_query.trim().is_empty() {
+        return None;
+    }
+    let b = backend::backend();
+    computer::resolve_window(b.as_ref(), window_query).ok().map(|w| w.id)
+}
+
+/// A window-scoped action's `window` argument, validated BEFORE it ever
+/// reaches [`computer::resolve_window`] (issue #160 round-2 P2): missing,
+/// non-string, empty, or all-whitespace all fail here with an explicit
+/// missing-argument error instead of falling through to resolution. Without
+/// this check, an empty string would still reach `resolve_window`'s
+/// substring match, where an empty needle's `str::contains("")` is trivially
+/// true for every window — silently resolving to whichever ONE window
+/// happens to be visible (rather than reporting the missing argument, or
+/// erroring honestly as `ComputerError::AmbiguousWindow` would whenever more
+/// than one window is visible). Applies to every window-scoped action —
+/// `screenshot` and every input action except `cursor_position`/`wait`,
+/// which take no `window` at all and never call this.
+fn required_window(args: &Value) -> Result<&str, String> {
+    match args.get("window").and_then(|v| v.as_str()) {
+        Some(w) if !w.trim().is_empty() => Ok(w),
+        _ => Err(
+            "missing required 'window': a window id from list_windows, or a case-insensitive \
+             substring of its app name or title"
+                .to_string(),
+        ),
+    }
+}
+
+/// The audit log's OWN args payload for this call — identical to the raw
+/// call args for every action except `type`, whose literal keystrokes must
+/// NEVER be written to `.weft/computer-audit.jsonl` (issue #160 round-2 P2):
+/// that file persists on disk indefinitely and is readable by anyone with
+/// filesystem access to the worktree, unlike the Ask card's `detail` (built
+/// in [`approve`], from this SAME raw `args`) — which is ephemeral, shown
+/// only to the human deciding whether to allow it, and gone the moment the
+/// card resolves. The SAME raw text serves two different purposes with two
+/// different retention needs, so it gets two different treatments: the card
+/// needs it to let the human judge WHAT is about to be typed; the durable
+/// log does not need to carry it forward forever just to record THAT a type
+/// action happened, how many characters, and whether it succeeded. `text`
+/// becomes `{"text_redacted": true, "text_chars": N}` in place of the
+/// literal string; every other key (`action`, `window`, …) is untouched.
+fn redact_audit_args(action: &str, args: &Value) -> Value {
+    if action != "type" {
+        return args.clone();
+    }
+    let mut redacted = args.clone();
+    if let Some(obj) = redacted.as_object_mut() {
+        // Only redact when `text` is ACTUALLY present as a string — a
+        // malformed call missing it entirely (rejected by `required_text`
+        // before it ever reaches the backend, see the "type" arm of
+        // `run_action`) must not have a synthetic `text` key manufactured
+        // into its audit record that was never in the real request.
+        if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+            let chars = text.chars().count();
+            obj.insert("text".to_string(), json!({ "text_redacted": true, "text_chars": chars }));
+        }
+    }
+    redacted
+}
+
+// —— type/key focus-freshness gate (issue #160 round-2 P1 addendum) ——
+//
+// Neither backend this module drives exposes a real "which window currently
+// holds OS keyboard focus" query (`xcap` has none; a genuine focus API is a
+// real-machine follow-up, issue #160 §9), so `type`/`key` cannot verify focus
+// directly. Without SOME check here, they would blindly inject keystrokes
+// into whatever happens to be focused — which could be a credential prompt,
+// or any other window the agent never intended, if it never actually clicked
+// its target first. This substitutes a WEFT-tracked freshness heuristic
+// instead of real focus verification: a `left_click`/`right_click`/
+// `double_click`/`triple_click` that actually reached the OS is PRESUMED to
+// have handed that window OS focus (an OS-level guarantee this module does
+// not itself re-verify — a third party can still steal focus back after the
+// click, and this module would have no way to know), and `type`/`key`
+// require ONE such click, on the SAME resolved window, for the SAME
+// `(thread, dir)`, within the last `FOCUS_FRESHNESS_MS`. This is not a
+// substitute for real focus verification — it is a floor, not a ceiling —
+// but it closes the main accident surface: typing into a target window that
+// was never clicked at all, this session, ever.
+
+/// How long a click on a window is trusted to still hold that window's OS
+/// focus for a subsequent `type`/`key` — see this section's own doc comment.
+const FOCUS_FRESHNESS_MS: u64 = 15_000;
+const FOCUS_FRESHNESS_SECS: u64 = FOCUS_FRESHNESS_MS / 1000;
+
+/// Process-level "last window this `(thread, dir)` actually clicked, and
+/// when" registry — see this section's own doc comment. `now_ms()`-based
+/// (wall clock), consistent with every other timestamp this module already
+/// records (the audit log's own `ts_ms`); a system clock adjustment
+/// mid-session is not a hazard this heuristic needs to defend against.
+fn recent_clicks() -> &'static Mutex<HashMap<(i32, String), (u32, u64)>> {
+    static CLICKS: OnceLock<Mutex<HashMap<(i32, String), (u32, u64)>>> = OnceLock::new();
+    CLICKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record a SUCCESSFUL click on `window_id` for `(thread, dir)` — called
+/// ONLY from the click-family arm of [`run_action`], and ONLY after the
+/// backend call itself returned `Ok`: a rejected/failed click never actually
+/// touched the real window, so it must not seed a false freshness record for
+/// a later `type`/`key`.
+fn record_click_focus(thread: i32, dir: &str, window_id: u32) {
+    let mut g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
+    g.insert((thread, dir.to_string()), (window_id, now_ms()));
+}
+
+/// `type`/`key`'s pre-execution gate: reject unless a click on THIS EXACT
+/// resolved `window_id`, for THIS `(thread, dir)`, landed within the last
+/// [`FOCUS_FRESHNESS_MS`] — see this section's own doc comment for what this
+/// is (and is not) verifying.
+fn require_recent_focus(thread: i32, dir: &str, window_id: u32) -> Result<(), String> {
+    let g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = matches!(
+        g.get(&(thread, dir.to_string())),
+        Some((clicked, ts)) if *clicked == window_id && now_ms().saturating_sub(*ts) <= FOCUS_FRESHNESS_MS
+    );
+    if fresh {
+        return Ok(());
+    }
+    Err(format!(
+        "window {window_id} doesn't appear to have OS focus yet — click inside the target window \
+         first to focus it, then type/key within {FOCUS_FRESHNESS_SECS}s"
+    ))
 }
 
 // —— screenshot → MCP image content + Ask-card preview registry (issue #160 M3-B) ——
@@ -481,34 +797,38 @@ async fn engine_accepts_mcp_image(db: &Db, thread: i32, dir: &str) -> bool {
     }
 }
 
-/// Process-level "most recent screenshot" registry (issue #160 M3-B): one
-/// small preview thumbnail per (thread, dir), refreshed on EVERY successful
-/// `screenshot` action regardless of which engine is asking (unlike the MCP
-/// image content block above, which is engine-gated) — `bus::server::
-/// handle_ask` attaches it to a `weft_computer` GUI INPUT Ask card (never an
-/// observe-only one) so the human has some visual context before allowing/
-/// denying a click/type/key/etc without opening the saved PNG themselves. A
-/// process-wide `OnceLock`, not per-request state, so it survives across the
-/// many separate MCP calls a session makes — mirrors `computer::control_
-/// mutex`'s own process-level-static shape for the same reason (issue #160
-/// M2). In-memory only: a stale/missing preview is harmless (the Ask card
-/// just renders without one), so a restart starting empty is fine — no
+/// Process-level "most recent screenshot" registry (issue #160 M3-B, value
+/// shape extended in round-2 P1 §2): one small preview thumbnail PLUS the
+/// window id it actually came from, per (thread, dir), refreshed on EVERY
+/// successful `screenshot` action regardless of which engine is asking
+/// (unlike the MCP image content block above, which is engine-gated) —
+/// [`preview_for_action`] attaches it to a `weft_computer` GUI INPUT Ask
+/// card ONLY when that action's own target window resolves to the SAME id
+/// (never an observe-only ask, and never a DIFFERENT window's stale preview)
+/// so the human has visual context before allowing/denying a click/type/
+/// key/etc without opening the saved PNG themselves. A process-wide
+/// `OnceLock`, not per-request state, so it survives across the many
+/// separate MCP calls a session makes — mirrors `computer::control_mutex`'s
+/// own process-level-static shape for the same reason (issue #160 M2).
+/// In-memory only: a stale/missing preview is harmless (the Ask card just
+/// renders without one), so a restart starting empty is fine — no
 /// durability needed.
-fn screenshot_previews() -> &'static Mutex<HashMap<(i32, String), String>> {
-    static PREVIEWS: OnceLock<Mutex<HashMap<(i32, String), String>>> = OnceLock::new();
+fn screenshot_previews() -> &'static Mutex<HashMap<(i32, String), (String, u32)>> {
+    static PREVIEWS: OnceLock<Mutex<HashMap<(i32, String), (String, u32)>>> = OnceLock::new();
     PREVIEWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn store_screenshot_preview(thread: i32, dir: &str, preview: String) {
+fn store_screenshot_preview(thread: i32, dir: &str, preview: String, window_id: u32) {
     let mut g = screenshot_previews().lock().unwrap_or_else(|e| e.into_inner());
-    g.insert((thread, dir.to_string()), preview);
+    g.insert((thread, dir.to_string()), (preview, window_id));
 }
 
-/// The most recent screenshot preview for `(thread, dir)`, if any — see
-/// [`screenshot_previews`]'s doc. `pub(crate)`: read by `bus::server::
-/// handle_ask` (a sibling module) when attaching a GUI input Ask's
-/// `Ask::preview`.
-pub(crate) fn last_screenshot_preview(thread: i32, dir: &str) -> Option<String> {
+/// The most recent screenshot preview (and the window id it came from) for
+/// `(thread, dir)`, if any — see [`screenshot_previews`]'s doc. Read only
+/// from [`preview_for_action`] within this same module now (the round-2 P1
+/// server-side gate owns preview attachment; `bus::server::handle_ask` no
+/// longer does — see this module's own top doc comment).
+fn last_screenshot_preview(thread: i32, dir: &str) -> Option<(String, u32)> {
     let g = screenshot_previews().lock().unwrap_or_else(|e| e.into_inner());
     g.get(&(thread, dir.to_string())).cloned()
 }
@@ -528,6 +848,14 @@ fn window_arg(args: &Value) -> String {
 /// 2. does someone else hold the control lease — [`ComputerError::Busy`];
 /// 3. are we going faster than the global input throttle allows —
 ///    [`ComputerError::RateLimited`].
+///
+/// Runs AFTER [`approve`] in [`run_action`]'s dispatch, never before: THIS
+/// gate's `has_open` check is about a DIFFERENT, unrelated ask still waiting
+/// on the human (so an agent can't click through/at the permission UI while
+/// it's up) — a completely separate concern from "is THIS call authorized at
+/// all", which `approve` alone decides. Checking them in the other order
+/// would mean an action already suspended behind someone else's card could
+/// still open (and block on) its OWN card underneath it.
 fn input_gate(asks: &AskRegistry, thread: i32, dir: &str) -> Result<(), String> {
     if asks.has_open(thread, dir) {
         return Err(ComputerError::SuspendedPendingAsk.to_string());
@@ -804,5 +1132,122 @@ mod tests {
         assert!(parse_coordinate(&json!({}), "coordinate").is_err());
         assert!(parse_coordinate(&json!({"coordinate": [10]}), "coordinate").is_err());
         assert!(parse_coordinate(&json!({"coordinate": [-1, 20]}), "coordinate").is_err());
+    }
+
+    // —— issue #160 round-2 P2: `required_window` ——
+
+    #[test]
+    fn required_window_accepts_a_non_blank_string() {
+        assert_eq!(required_window(&json!({"window": "notes"})).unwrap(), "notes");
+        // Leading/trailing whitespace around otherwise-real content is fine —
+        // only ALL-whitespace (or absence) is rejected.
+        assert_eq!(required_window(&json!({"window": " notes "})).unwrap(), " notes ");
+    }
+
+    #[test]
+    fn required_window_rejects_missing_non_string_empty_and_blank() {
+        assert!(required_window(&json!({})).is_err(), "missing key");
+        assert!(required_window(&json!({"window": 5})).is_err(), "non-string");
+        assert!(required_window(&json!({"window": ""})).is_err(), "empty string");
+        assert!(required_window(&json!({"window": "   "})).is_err(), "all-whitespace string");
+        assert!(required_window(&json!({"window": null})).is_err(), "null");
+    }
+
+    // —— issue #160 round-2 P3 (audit redaction) ——
+
+    #[test]
+    fn redact_audit_args_replaces_type_text_with_a_char_count_only() {
+        let args = json!({"action": "type", "window": "notes", "text": "hunter2"});
+        let redacted = redact_audit_args("type", &args);
+        assert_eq!(redacted["window"], "notes", "non-text keys pass through untouched");
+        assert_eq!(redacted["text"]["text_redacted"], true);
+        assert_eq!(redacted["text"]["text_chars"], 7);
+        assert!(
+            redacted.to_string().contains("hunter2") == false,
+            "the raw text must never appear anywhere in the redacted payload: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_audit_args_counts_unicode_scalars_not_bytes() {
+        // "héllo" — the "é" is 2 bytes in UTF-8 but 1 char; the redacted count
+        // must match what a human reading "N characters" would expect, not
+        // the raw byte length.
+        let args = json!({"action": "type", "text": "héllo"});
+        let redacted = redact_audit_args("type", &args);
+        assert_eq!(redacted["text"]["text_chars"], 5);
+    }
+
+    #[test]
+    fn redact_audit_args_leaves_every_other_action_untouched() {
+        let args = json!({"action": "key", "window": "notes", "text": "cmd+s"});
+        let redacted = redact_audit_args("key", &args);
+        assert_eq!(redacted, args, "only action==\"type\" redacts — key's text is a combo, not content");
+    }
+
+    #[test]
+    fn redact_audit_args_leaves_a_missing_text_key_missing() {
+        // A malformed `type` call missing `text` entirely never reaches the
+        // backend (`required_text` rejects it first) — its audit record must
+        // reflect the REAL request, not manufacture a `text` key that was
+        // never actually sent.
+        let args = json!({"action": "type", "window": "notes"});
+        let redacted = redact_audit_args("type", &args);
+        assert_eq!(redacted, args);
+        assert!(redacted.get("text").is_none());
+    }
+
+    // —— issue #160 round-2 P1 addendum: type/key focus-freshness gate ——
+    //
+    // Each test below uses a UNIQUE synthetic thread id so they can run in
+    // parallel (the default for `cargo test`) without racing each other on
+    // the shared process-level `recent_clicks()` registry.
+
+    #[test]
+    fn require_recent_focus_passes_right_after_a_click_on_the_same_window() {
+        let thread = 900_001;
+        record_click_focus(thread, "lead", 7);
+        assert!(require_recent_focus(thread, "lead", 7).is_ok());
+    }
+
+    #[test]
+    fn require_recent_focus_rejects_with_no_prior_click_at_all() {
+        let thread = 900_002;
+        let err = require_recent_focus(thread, "lead", 7).unwrap_err();
+        assert!(err.contains("focus"), "{err}");
+        assert!(err.contains("click"), "{err}");
+    }
+
+    #[test]
+    fn require_recent_focus_rejects_a_click_on_a_different_window() {
+        let thread = 900_003;
+        record_click_focus(thread, "lead", 7); // clicked window A (id 7)
+        let err = require_recent_focus(thread, "lead", 8).unwrap_err(); // typing into B (id 8)
+        assert!(err.contains("8"), "error should name the window that lacks focus: {err}");
+    }
+
+    #[test]
+    fn require_recent_focus_is_scoped_per_thread_dir() {
+        let thread_a = 900_004;
+        let thread_b = 900_005;
+        record_click_focus(thread_a, "lead", 7);
+        // A click recorded for a DIFFERENT (thread, dir) must not satisfy
+        // this one's focus check — the registry is per-session, not global.
+        assert!(require_recent_focus(thread_b, "lead", 7).is_err());
+        assert!(require_recent_focus(thread_a, "10", 7).is_err());
+    }
+
+    #[test]
+    fn require_recent_focus_rejects_once_the_freshness_window_has_expired() {
+        let thread = 900_006;
+        // Seed a click stamped older than `FOCUS_FRESHNESS_MS` directly,
+        // rather than sleeping 15s in a test — same "no fake clock needed"
+        // approach the coordinator's spec calls for, just expressed as a
+        // pre-expired timestamp instead of a real-time wait.
+        {
+            let mut g = recent_clicks().lock().unwrap();
+            g.insert((thread, "lead".to_string()), (7, now_ms() - FOCUS_FRESHNESS_MS - 1));
+        }
+        assert!(require_recent_focus(thread, "lead", 7).is_err());
     }
 }

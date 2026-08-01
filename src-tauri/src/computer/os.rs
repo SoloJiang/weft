@@ -72,24 +72,38 @@ impl ComputerBackend for OsBackend {
             return Err(ComputerError::Unsupported("empty key combo".into()));
         };
         let mut enigo = new_enigo()?;
-        // Press every modifier, click the trailing (real) key, then release
-        // the modifiers in reverse order — a combo with no modifiers at all
-        // (e.g. "f5") is just `modifiers == []` and this clicks the single
-        // key, same as any other key press.
+        // Press each modifier in order, but track exactly how many
+        // succeeded (`pressed`) instead of using `?` to bail out on the
+        // first failure (issue #160 review R1 #4): a `?` on a LATER
+        // modifier's press would abandon every EARLIER modifier physically
+        // held on the real keyboard with nothing left to release it. Every
+        // failure path below — a modifier press failing partway through, OR
+        // the trailing (real) key's own click failing — releases every
+        // modifier that's actually held, in reverse press order,
+        // best-effort (a release call's own error is swallowed: a
+        // doubly-stuck key can't get any worse, and bailing out on one
+        // release would abandon releasing the rest). Mirrors `drag`'s
+        // press-move-release-regardless discipline below.
+        let mut pressed: Vec<&Key> = Vec::with_capacity(modifiers.len());
+        let mut result: Result<(), ComputerError> = Ok(());
         for m in modifiers {
-            enigo
-                .key(*m, Direction::Press)
-                .map_err(|e| ComputerError::Unsupported(e.to_string()))?;
+            match enigo.key(*m, Direction::Press) {
+                Ok(()) => pressed.push(m),
+                Err(e) => {
+                    result = Err(ComputerError::Unsupported(e.to_string()));
+                    break;
+                }
+            }
         }
-        let click_result = enigo.key(*last, Direction::Click);
-        for m in modifiers.iter().rev() {
-            // Best-effort release even if the click itself failed midway —
-            // leaving a modifier physically "held" on the real keyboard
-            // because we bailed out early would be a worse failure mode
-            // than a masked release error.
-            let _ = enigo.key(*m, Direction::Release);
+        if result.is_ok() {
+            result = enigo
+                .key(*last, Direction::Click)
+                .map_err(|e| ComputerError::Unsupported(e.to_string()));
         }
-        click_result.map_err(|e| ComputerError::Unsupported(e.to_string()))
+        for m in pressed.iter().rev() {
+            let _ = enigo.key(**m, Direction::Release);
+        }
+        result
     }
 
     fn scroll(&self, x: i32, y: i32, dx: i32, dy: i32) -> Result<(), ComputerError> {
