@@ -431,7 +431,15 @@ fn hook_decision(decision: &str, reason: &str) -> Response {
 /// A short human label + raw detail + danger tier + canonical action key for a
 /// tool action. Tool-agnostic across claude (Bash / file_path) and opencode
 /// (bash / filePath, lowercase names): a command reads as "Run: …", a file op
-/// as "<tool> <file>".
+/// as "<tool> <file>". `weft_computer`'s single `computer` MCP tool reads as
+/// "computer: <action>" (M2-B) — see the dedicated branch below.
+///
+/// KNOWN LIMITATION shared with the rest of this function's MCP recognition:
+/// the `computer` branch keys off `split_internal_tool`, which ONLY parses
+/// the claude-style `mcp__<server>__<tool>` name (see that function's doc).
+/// A codex/opencode-flattened name for the same tool is not recognized here
+/// and falls through to the generic MCP branch below, surfacing as
+/// `Unknown` risk rather than the GUI-specific tier.
 ///
 /// Returns `(summary, detail, risk, action_key)`: `summary` is a compact
 /// DISPLAY label that MAY truncate (a multi-line command's first line, a bare
@@ -466,6 +474,35 @@ pub(crate) fn summarize(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     };
+    // weft_computer's single `computer` MCP tool (M2-A/M2-B): its args carry
+    // an `action` (and an optional `window`), a shape neither the `command`
+    // nor `file_path` branch below recognizes, so it needs its own
+    // tool-name-keyed branch ahead of them. ONLY the claude-style
+    // `mcp__weft_computer__computer` name is recognized here —
+    // `split_internal_tool`'s doc explains why a codex/opencode-flattened
+    // name (`weft_computer_computer`) is NOT: it falls through to the
+    // generic MCP branch below and surfaces as `Unknown` risk, a known
+    // limitation this function shares with the rest of its MCP recognition.
+    if split_internal_tool(tool_name) == Some(("weft_computer", "computer")) {
+        let action = s("action").unwrap_or_default();
+        let window = s("window").unwrap_or_default();
+        let detail = input.map(|v| v.to_string()).unwrap_or_default();
+        // Same MCP-fallback construction as the generic branch below — a
+        // fixed "mcp" kind tag, then tool_name, then the full args — so an
+        // Always grant on this action can never collide with an unrelated
+        // MCP call that happens to share a tool_name/content pair.
+        let action_key = crate::ask::action_key(&["mcp", tool_name, &detail]);
+        let risk = crate::ask::classify_risk(crate::ask::RiskSignal::Gui {
+            action: &action,
+            window: &window,
+        });
+        let summary = if window.is_empty() {
+            format!("computer: {action}")
+        } else {
+            format!("computer: {action} @ {window}")
+        };
+        return (summary, detail, risk, action_key);
+    }
     if let Some(cmd) = s("command") {
         let first = cmd.lines().next().unwrap_or("").to_string();
         // action_key = the full, untruncated command — a later line differing
@@ -1405,6 +1442,57 @@ mod tests {
         let (_sc, _dc, _rc, cmd_key) = summarize("SameTool", Some(&cmd_input));
         let (_sf, _df, _rf, file_key) = summarize("SameTool", Some(&file_input));
         assert_ne!(cmd_key, file_key);
+    }
+
+    /// M2-B: `weft_computer`'s single `computer` MCP tool routes through its
+    /// own `RiskSignal::Gui` branch, not the generic MCP fallback — an
+    /// observe-only action reads as `ReadOnly`, an input-injecting one as
+    /// `Write` (issue #101: never guessed low), and the summary names the
+    /// window when one was given.
+    #[test]
+    fn summarize_recognizes_weft_computer_screenshot_as_read_only() {
+        let input = json!({"action": "screenshot", "window": "Safari"});
+        let (summary, detail, risk, action_key) =
+            summarize("mcp__weft_computer__computer", Some(&input));
+        assert_eq!(summary, "computer: screenshot @ Safari");
+        assert_eq!(risk, RiskLevel::ReadOnly);
+        assert!(detail.contains("screenshot"));
+        assert!(action_key.contains("screenshot"));
+    }
+
+    #[test]
+    fn summarize_recognizes_weft_computer_left_click_as_write() {
+        let input = json!({"action": "left_click", "window": "Safari"});
+        let (summary, _detail, risk, _action_key) =
+            summarize("mcp__weft_computer__computer", Some(&input));
+        assert_eq!(summary, "computer: left_click @ Safari");
+        assert_eq!(risk, RiskLevel::Write);
+    }
+
+    /// An empty/absent `window` omits the `@` segment entirely rather than
+    /// showing a dangling separator.
+    #[test]
+    fn summarize_weft_computer_omits_at_segment_when_window_is_empty() {
+        let input = json!({"action": "list_windows"});
+        let (summary, _detail, risk, _action_key) =
+            summarize("mcp__weft_computer__computer", Some(&input));
+        assert_eq!(summary, "computer: list_windows");
+        assert_eq!(risk, RiskLevel::ReadOnly);
+    }
+
+    /// The `computer` recognition is keyed on the EXACT `(server, tool)` pair
+    /// via `split_internal_tool` (claude-style `mcp__<server>__<tool>` only)
+    /// — an unrelated tool sharing the bare name `computer` under a
+    /// different server, or a non-claude-shaped name, must fall through to
+    /// the generic MCP branch instead of being misread as GUI input.
+    #[test]
+    fn summarize_does_not_misfire_on_unrelated_or_non_claude_shaped_names() {
+        let input = json!({"action": "left_click"});
+        let (summary, ..) = summarize("mcp__some_other_server__computer", Some(&input));
+        assert_ne!(summary, "computer: left_click");
+
+        let (summary2, ..) = summarize("weft_computer_computer", Some(&input));
+        assert_ne!(summary2, "computer: left_click");
     }
 
     #[test]

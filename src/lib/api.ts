@@ -337,6 +337,13 @@ export const api = {
   getComputerUseEnabled: () => invoke<boolean>("get_computer_use_enabled"),
   setComputerUseEnabled: (enabled: boolean) =>
     invoke<void>("set_computer_use_enabled", { enabled }),
+  // issue #160 M2: who (if anyone) currently holds the computer-use control
+  // mutex, for the global control banner + kill switch.
+  getComputerControlState: () =>
+    invoke<{ thread: number; dir: string; expires_at_ms: number } | null>(
+      "get_computer_control_state",
+    ),
+  computerEmergencyStop: () => invoke<void>("computer_emergency_stop"),
   // issue #97: auto fail-over to the fallback engine on a quota-exceeded turn.
   // Opt-in — off by default, since switching engines mid-task ships that
   // engine's own history digest to a DIFFERENT provider.

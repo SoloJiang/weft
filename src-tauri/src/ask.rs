@@ -154,6 +154,13 @@ pub enum RiskSignal<'a> {
     /// MCP tools, `WebFetch`/`WebSearch`/`TodoWrite`, a Codex permission-
     /// scope escalation, …
     Other { tool_name: &'a str, args_text: &'a str },
+    /// A GUI/computer-use action about to run (`weft_computer`'s single
+    /// `computer` MCP tool — see `bus::server::summarize`'s dedicated branch
+    /// for it — or omp's built-in `computer`/`browser` tool via ACP — see
+    /// `acp::permission::PermissionIntent::Gui`). `window` is the target
+    /// window title, empty when the action isn't window-scoped. See
+    /// `classify_gui_action`.
+    Gui { action: &'a str, window: &'a str },
 }
 
 /// Substrings that mark network access or a credential, checked case-
@@ -1230,6 +1237,60 @@ fn classify_other(tool_name: &str, args_text: &str) -> RiskLevel {
     RiskLevel::Unknown
 }
 
+/// GUI/computer-use actions that only OBSERVE screen state — never inject
+/// input — so they cannot drive the UI or click through/at a permission card.
+/// A CLOSED set, kept in sync BY HAND with `computer_srv`'s action enum (the
+/// MCP tool's own dispatch) — see `classify_gui_action`'s doc for why this
+/// pairing can't be enforced by the type system.
+const GUI_READ_ONLY_ACTIONS: &[&str] = &["screenshot", "list_windows", "cursor_position"];
+
+/// GUI/computer-use actions that inject input — a click, keystrokes, a
+/// scroll, a drag, a cursor move, or a deliberate pause in an input sequence
+/// — any of which is capable of driving the UI, including clicking through
+/// (or at) an on-screen permission card (see `AskRegistry::has_open`, the
+/// input gate this classification feeds). Same closed-set caveat as
+/// `GUI_READ_ONLY_ACTIONS`.
+const GUI_WRITE_ACTIONS: &[&str] = &[
+    "left_click",
+    "right_click",
+    "double_click",
+    "triple_click",
+    "type",
+    "key",
+    "scroll",
+    "left_click_drag",
+    "mouse_move",
+    "wait",
+];
+
+/// A GUI/computer-use action's tier: an observe-only action
+/// (`GUI_READ_ONLY_ACTIONS`) is `ReadOnly`; anything that injects input
+/// (`GUI_WRITE_ACTIONS`) is `Write`; an unrecognized action is `Unknown` —
+/// the same honest-default rule `classify_risk` follows everywhere else in
+/// this file, never guessed low (issue #101).
+///
+/// `GUI_READ_ONLY_ACTIONS`/`GUI_WRITE_ACTIONS` and `computer_srv`'s own
+/// action enum are two INDEPENDENT closed sets — the MCP tool's dispatch on
+/// one side, this classifier's tiering on the other — with no shared type
+/// linking them, so they can silently drift. A new action added to
+/// `computer_srv` MUST be added to one of these two lists in the SAME
+/// change, or it falls through to `Unknown` here (safe, but surfaces an
+/// otherwise-familiar action as "needs a closer look" every time).
+///
+/// `pub(crate)`, not private: `acp::permission`'s own Gui risk mapping
+/// reuses this SAME word list rather than copying it, so a `left_click`
+/// reads as the same tier whether it arrived via `weft_computer`'s MCP tool
+/// or omp's built-in ACP `computer`/`browser` tool.
+pub(crate) fn classify_gui_action(action: &str) -> RiskLevel {
+    if GUI_READ_ONLY_ACTIONS.contains(&action) {
+        return RiskLevel::ReadOnly;
+    }
+    if GUI_WRITE_ACTIONS.contains(&action) {
+        return RiskLevel::Write;
+    }
+    RiskLevel::Unknown
+}
+
 /// Classify a permission ask's danger tier — the single judgment call every
 /// engine's ask-creation path routes through (see `RiskLevel`). Pure and
 /// deterministic: the same signal always yields the same tier.
@@ -1239,6 +1300,7 @@ pub fn classify_risk(signal: RiskSignal) -> RiskLevel {
         RiskSignal::Command(cmd) => classify_command(cmd),
         RiskSignal::File { tool_name, path } => classify_file(tool_name, path),
         RiskSignal::Other { tool_name, args_text } => classify_other(tool_name, args_text),
+        RiskSignal::Gui { action, .. } => classify_gui_action(action),
     }
 }
 
@@ -2164,6 +2226,18 @@ impl AskRegistry {
             .cloned()
             .collect()
     }
+
+    /// Any open (unanswered) ask for this (thread, dir)? Used by the computer-use
+    /// input gate: while a permission card is on screen, injected input is
+    /// suspended so the agent cannot click "through" (or at) the approval UI.
+    pub fn has_open(&self, thread: i32, dir: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open
+            .iter()
+            .any(|a| a.thread == thread && a.dir == dir)
+    }
 }
 
 #[cfg(test)]
@@ -2234,6 +2308,51 @@ mod tests {
     #[test]
     fn network_signal_is_always_the_top_tier() {
         assert_eq!(classify_risk(RiskSignal::Network), RiskLevel::NetworkOrCredential);
+    }
+
+    // ---- classify_gui_action (M2-B: GUI/computer-use risk signal) --------------
+
+    #[test]
+    fn gui_observe_only_actions_are_read_only() {
+        for action in ["screenshot", "list_windows", "cursor_position"] {
+            assert_eq!(
+                classify_risk(RiskSignal::Gui { action, window: "" }),
+                RiskLevel::ReadOnly,
+                "{action:?} should be read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn gui_input_injecting_actions_are_write() {
+        for action in [
+            "left_click",
+            "right_click",
+            "double_click",
+            "triple_click",
+            "type",
+            "key",
+            "scroll",
+            "left_click_drag",
+            "mouse_move",
+            "wait",
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Gui { action, window: "Safari" }),
+                RiskLevel::Write,
+                "{action:?} should be write"
+            );
+        }
+    }
+
+    /// Issue #101: an unrecognized GUI action is never waved through as
+    /// read-only — same honest-default rule as every other `classify_*`.
+    #[test]
+    fn gui_unrecognized_action_is_unknown_never_read_only() {
+        assert_eq!(
+            classify_risk(RiskSignal::Gui { action: "teleport", window: "" }),
+            RiskLevel::Unknown
+        );
     }
 
     #[test]
@@ -4016,6 +4135,35 @@ mod tests {
         assert_eq!(r.open_in(1).len(), 1);
         assert_eq!(r.open_in(2).len(), 1);
         assert_eq!(r.open_in(1)[0].thread, 1);
+    }
+
+    // ---- has_open (M2-B: computer-use input gate) ------------------------------
+
+    #[test]
+    fn has_open_is_false_for_a_thread_dir_with_no_ask() {
+        let r = AskRegistry::new();
+        assert!(!r.has_open(1, "10"));
+    }
+
+    #[test]
+    fn has_open_is_true_while_an_ask_is_pending_for_that_thread_dir() {
+        let r = AskRegistry::new();
+        let _ = r.request(1, "10", "claude", "a", "a", RiskLevel::Unknown, "a");
+        assert!(r.has_open(1, "10"));
+        // A different dir on the same thread, or the same dir on a different
+        // thread, must not read as open — this is a (thread, dir) match, not
+        // either half alone.
+        assert!(!r.has_open(1, "20"));
+        assert!(!r.has_open(2, "10"));
+    }
+
+    #[test]
+    fn has_open_goes_false_once_the_ask_is_answered() {
+        let r = AskRegistry::new();
+        let (id, _rx) = r.request(1, "10", "claude", "a", "a", RiskLevel::Unknown, "a");
+        assert!(r.has_open(1, "10"));
+        assert!(r.answer(id, Answer::Allow));
+        assert!(!r.has_open(1, "10"));
     }
 
     // ---- authorization persistence ------------------------------------------

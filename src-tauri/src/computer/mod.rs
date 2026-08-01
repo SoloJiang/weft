@@ -1,16 +1,22 @@
-//! OS-level "computer use" core (issue #160, M1: observation only — window
-//! enumeration + screenshot, NO input injection). Input injection is a
-//! separate, later task (`inject.rs` / `commands.rs` / `engine.rs` stay
-//! untouched by this module); everything here is read-only w.r.t. the user's
-//! screen.
+//! OS-level "computer use" core (issue #160). M1 shipped observation only
+//! (window enumeration + screenshot); M2 adds input injection — click/type/
+//! key/scroll/drag/move — behind the SAME setting gate, plus a process-wide
+//! control lock, an input throttle, and a coordinate-mapping layer so an
+//! agent's screenshot-space clicks land on the right physical pixel. This
+//! module (and `bus/computer_srv.rs`, which drives it) never touches
+//! `inject.rs` / `commands.rs` / `engine.rs` — those back a DIFFERENT
+//! feature (an engine's own PTY input), not this one.
 //!
 //! Layout:
 //! - This file: the setting gate, the shared error/data types, the
-//!   self-exclusion table, and the platform-independent list/match/capture
-//!   logic that drives a [`backend::ComputerBackend`].
+//!   self-exclusion table, the platform-independent list/match/capture/
+//!   coordinate-mapping logic that drives a [`backend::ComputerBackend`],
+//!   the key-combo grammar ([`parse_key_combo`]), and the process-level
+//!   control lock / input throttle / emergency-stop API.
 //! - `backend`: the process-level backend singleton + trait.
-//! - `os`: the real platform backend (via the `xcap` crate), feature-gated —
-//!   see the `computer-os` feature comment in `Cargo.toml`.
+//! - `os`: the real platform backend (via the `xcap` crate for windows and
+//!   the `enigo` crate for input), feature-gated — see the `computer-os`
+//!   feature comment in `Cargo.toml`.
 //! - `mock`: a test-only backend (`#[doc(hidden)] pub` so integration tests
 //!   under `tests/`, a separate crate, can see it).
 
@@ -20,7 +26,8 @@ pub mod mock;
 mod os;
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// app_setting key gating the whole feature. Value is the literal string
 /// "true"/"false"; anything else (including absent) is treated as disabled —
@@ -65,6 +72,20 @@ pub enum ComputerError {
     Unsupported(String),
     /// Reading/writing the screenshot file itself failed.
     Io(String),
+    /// An input action's coordinate falls outside the most recent
+    /// screenshot's range for this window (issue #160 M2) — see
+    /// [`map_to_physical`].
+    OutOfBounds { x: u32, y: u32, max_x: u32, max_y: u32 },
+    /// Someone else's session currently holds the control lease (issue #160
+    /// M2) — see [`acquire_control`].
+    Busy { thread: i32, dir: String },
+    /// The global input throttle rejected this call (issue #160 M2) — see
+    /// [`throttle_input`].
+    RateLimited { wait_ms: u64 },
+    /// An open permission Ask is blocking this (thread, dir) from driving
+    /// the desktop (issue #160 M2) — checked in `bus::computer_srv` before
+    /// any input action runs.
+    SuspendedPendingAsk,
 }
 
 impl std::fmt::Display for ComputerError {
@@ -87,6 +108,22 @@ impl std::fmt::Display for ComputerError {
                 write!(f, "computer use isn't supported here: {msg}")
             }
             ComputerError::Io(msg) => write!(f, "couldn't save the screenshot: {msg}"),
+            ComputerError::OutOfBounds { x, y, max_x, max_y } => write!(
+                f,
+                "coordinate ({x}, {y}) is out of bounds — it must fall within the most recent screenshot of this window, 0..{max_x} x 0..{max_y}"
+            ),
+            ComputerError::Busy { thread, dir } => write!(
+                f,
+                "another session is controlling the desktop (thread {thread}, dir {dir}) — wait for its control lease to expire and try again"
+            ),
+            ComputerError::RateLimited { wait_ms } => write!(
+                f,
+                "computer input is rate-limited — wait {wait_ms}ms and try again"
+            ),
+            ComputerError::SuspendedPendingAsk => write!(
+                f,
+                "a permission card is waiting for the human — input is suspended until it is answered"
+            ),
         }
     }
 }
@@ -221,56 +258,102 @@ fn match_windows<'a>(windows: &'a [WindowInfo], query: &str) -> Vec<&'a WindowIn
         .collect()
 }
 
-/// Downscale `rgba`/`width`/`height` so the long edge is at most 1280px
-/// (`FilterType::Triangle` — cheap and good enough for a viewer, not a
-/// pixel-perfect archival need). Returns the (possibly unchanged) image plus
-/// the scale factor applied (`1.0` when no downscale was needed).
-fn scale_capture(
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
-) -> Result<(image::RgbaImage, f64), ComputerError> {
+/// Match `query` against the backend's visible windows down to exactly ONE
+/// hit — the same rule [`screenshot_window`] and every window-scoped M2
+/// input action share, so a `screenshot`/`left_click`/`type`/... call all
+/// report the identical `WindowNotFound`/`AmbiguousWindow` wording for the
+/// same query (single source, per this module's exclusion-table precedent).
+pub fn resolve_window(backend: &dyn backend::ComputerBackend, query: &str) -> Result<WindowInfo, ComputerError> {
+    let windows = visible_windows(backend)?;
+    match match_windows(&windows, query).as_slice() {
+        [] => Err(ComputerError::WindowNotFound {
+            query: query.to_string(),
+        }),
+        [one] => Ok((*one).clone()),
+        many => Err(ComputerError::AmbiguousWindow {
+            query: query.to_string(),
+            candidates: many.iter().map(|&w| candidate_label(w)).collect(),
+        }),
+    }
+}
+
+/// The downscale factor a screenshot of `w` is saved at, and — because
+/// [`map_to_physical`] recomputes the SAME formula from the SAME window
+/// fields — the exact factor an agent-given coordinate against that
+/// screenshot must be divided by to recover a real screen position. Pulled
+/// out as its own function (issue #160 M2) specifically so those two call
+/// sites can never drift onto two different formulas: long edge > 1280px
+/// gets scaled down to fit (matching [`scale_capture`]'s pre-M2 rule
+/// exactly), everything else is 1:1.
+pub fn display_scale(w: &WindowInfo) -> f64 {
+    const MAX_LONG_EDGE: u32 = 1280;
+    let long_edge = w.width.max(w.height);
+    if long_edge <= MAX_LONG_EDGE {
+        return 1.0;
+    }
+    f64::from(MAX_LONG_EDGE) / f64::from(long_edge)
+}
+
+/// Downscale `rgba`/`width`/`height` by `scale` (`1.0` is a no-op —
+/// `FilterType::Triangle`, cheap and good enough for a viewer, not a
+/// pixel-perfect archival need). `scale` MUST be [`display_scale`] applied
+/// to the window this capture came from — see that function's doc comment
+/// for why this takes the scale as an input instead of deriving its own.
+fn scale_capture(rgba: Vec<u8>, width: u32, height: u32, scale: f64) -> Result<image::RgbaImage, ComputerError> {
     let buf = image::RgbaImage::from_raw(width, height, rgba).ok_or_else(|| {
         ComputerError::CaptureFailed("captured pixel buffer doesn't match its reported size".into())
     })?;
-    const MAX_LONG_EDGE: u32 = 1280;
-    let long_edge = width.max(height);
-    if long_edge <= MAX_LONG_EDGE {
-        return Ok((buf, 1.0));
+    if scale >= 1.0 {
+        return Ok(buf);
     }
-    let scale = f64::from(MAX_LONG_EDGE) / f64::from(long_edge);
     let new_width = ((f64::from(width) * scale).round() as u32).max(1);
     let new_height = ((f64::from(height) * scale).round() as u32).max(1);
-    let resized = image::imageops::resize(&buf, new_width, new_height, image::imageops::FilterType::Triangle);
-    Ok((resized, scale))
+    Ok(image::imageops::resize(&buf, new_width, new_height, image::imageops::FilterType::Triangle))
+}
+
+/// Map `(cx, cy)` — a coordinate an agent read off the MOST RECENT
+/// screenshot of `w` — back to a physical on-screen coordinate an input
+/// backend can click/move to.
+///
+/// `w` must be a FRESHLY resolved [`WindowInfo`] (this call's own
+/// [`resolve_window`], not one cached from screenshot time): the scale is
+/// recomputed from `w`'s CURRENT `width`/`height` via [`display_scale`]
+/// every single call, so if the window resized between the screenshot and
+/// this click the math still reflects the window as it is NOW — and a
+/// coordinate that's out of range for that current (rescaled) size is
+/// rejected as [`ComputerError::OutOfBounds`] rather than silently landing
+/// somewhere the agent never saw. That bounds check is the fallback for
+/// resize drift; there is no other reconciliation between screenshot time
+/// and click time.
+pub fn map_to_physical(w: &WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), ComputerError> {
+    let scale = display_scale(w);
+    let scaled_w = (f64::from(w.width) * scale).round() as u32;
+    let scaled_h = (f64::from(w.height) * scale).round() as u32;
+    if cx > scaled_w || cy > scaled_h {
+        return Err(ComputerError::OutOfBounds {
+            x: cx,
+            y: cy,
+            max_x: scaled_w,
+            max_y: scaled_h,
+        });
+    }
+    let px = w.x + (f64::from(cx) / scale).round() as i32;
+    let py = w.y + (f64::from(cy) / scale).round() as i32;
+    Ok((px, py))
 }
 
 /// Match `query` against the backend's visible windows, capture the ONE hit,
-/// downscale it (see [`scale_capture`]), and write it to
+/// downscale it (see [`scale_capture`]/[`display_scale`]), and write it to
 /// `out_dir/<unix_ms>-<id>.png` (`out_dir` is created if missing).
 pub fn screenshot_window(
     backend: &dyn backend::ComputerBackend,
     query: &str,
     out_dir: &Path,
 ) -> Result<Screenshot, ComputerError> {
-    let windows = visible_windows(backend)?;
-    let matched = match match_windows(&windows, query).as_slice() {
-        [] => {
-            return Err(ComputerError::WindowNotFound {
-                query: query.to_string(),
-            })
-        }
-        [one] => *one,
-        many => {
-            return Err(ComputerError::AmbiguousWindow {
-                query: query.to_string(),
-                candidates: many.iter().map(|&w| candidate_label(w)).collect(),
-            })
-        }
-    };
-
+    let matched = resolve_window(backend, query)?;
+    let scale = display_scale(&matched);
     let captured = backend.capture_window(matched.id)?;
-    let (image, scale) = scale_capture(captured.rgba, captured.width, captured.height)?;
+    let image = scale_capture(captured.rgba, captured.width, captured.height, scale)?;
 
     std::fs::create_dir_all(out_dir).map_err(|e| ComputerError::Io(e.to_string()))?;
     let unix_ms = SystemTime::now()
@@ -288,6 +371,285 @@ pub fn screenshot_window(
     })
 }
 
+// —— control lock / input throttle / emergency stop (issue #160 M2) ——
+//
+// Process-level, not per-thread/dir: the whole point is that exactly ONE
+// session drives the ONE real mouse/keyboard weft has access to, so both the
+// control lease and the throttle timer are single global statics rather than
+// keyed maps.
+
+/// Internal lease record. Not `pub` — [`control_state`] returns the
+/// decoupled, `Serialize`-able [`ControlHolder`] instead, so this struct can
+/// grow bookkeeping fields later without changing the wire shape the
+/// Settings UI's `get_computer_control_state` command returns.
+struct ControlHolderState {
+    thread: i32,
+    dir: String,
+    expires_at_ms: u64,
+}
+
+/// A snapshot of who currently holds the computer-use control lease, for
+/// display (the Settings UI's kill-switch banner) — see [`control_state`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ControlHolder {
+    pub thread: i32,
+    pub dir: String,
+    pub expires_at_ms: u64,
+}
+
+/// How long a control lease lasts before it's treated as abandoned. Chosen
+/// to comfortably cover one input action's round trip (gate checks + a
+/// backend call) while still self-healing quickly if a session crashes or
+/// hangs mid-lease — there is no turn-boundary hook to release it
+/// explicitly (see [`acquire_control`]'s doc comment).
+const CONTROL_LEASE_MS: u64 = 30_000;
+
+fn control_mutex() -> &'static Mutex<Option<ControlHolderState>> {
+    static CONTROL: OnceLock<Mutex<Option<ControlHolderState>>> = OnceLock::new();
+    CONTROL.get_or_init(|| Mutex::new(None))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Take (or renew) the control lease for `(thread, dir)` — a 30s SLIDING
+/// window: every successful acquire (including a same-holder re-acquire on
+/// its NEXT input action) pushes `expires_at_ms` forward, so a session
+/// mid-task never loses the lock to its own next call. Succeeds immediately
+/// when nobody holds it, the previous lease already expired, or the SAME
+/// `(thread, dir)` is re-acquiring; fails [`ComputerError::Busy`] when a
+/// DIFFERENT, still-live holder has it.
+///
+/// There is no turn-boundary hook to release this automatically when a
+/// session finishes (weft has none available here), so the lease's own
+/// expiry IS the cleanup mechanism — a crashed/hung session's lock
+/// self-heals within `CONTROL_LEASE_MS` instead of wedging the desktop
+/// forever. Callers are not required to pair this with
+/// [`release_control`].
+pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
+    let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let now = now_ms();
+    if let Some(holder) = guard.as_ref() {
+        let is_same_holder = holder.thread == thread && holder.dir == dir;
+        if holder.expires_at_ms > now && !is_same_holder {
+            return Err(ComputerError::Busy {
+                thread: holder.thread,
+                dir: holder.dir.clone(),
+            });
+        }
+    }
+    *guard = Some(ControlHolderState {
+        thread,
+        dir: dir.to_string(),
+        expires_at_ms: now + CONTROL_LEASE_MS,
+    });
+    Ok(())
+}
+
+/// Release the lease early — a no-op unless `(thread, dir)` is the CURRENT
+/// holder (an already-expired/released lease, or one some other session
+/// since took over, is left alone rather than clobbered). Not required
+/// anywhere today (see [`acquire_control`]'s doc comment on why expiry alone
+/// is sufficient); this exists for a caller that knows it's done and wants
+/// the next session unblocked sooner than the full 30s lease.
+pub fn release_control(thread: i32, dir: &str) {
+    let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(guard.as_ref(), Some(h) if h.thread == thread && h.dir == dir) {
+        *guard = None;
+    }
+}
+
+/// The current holder, or `None` when nobody holds it OR the lease expired.
+/// An expired lease is cleaned up right here (lazily, on read) rather than
+/// left for the next [`acquire_control`] to notice.
+pub fn control_state() -> Option<ControlHolder> {
+    let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let now = now_ms();
+    match guard.as_ref() {
+        Some(h) if h.expires_at_ms > now => Some(ControlHolder {
+            thread: h.thread,
+            dir: h.dir.clone(),
+            expires_at_ms: h.expires_at_ms,
+        }),
+        Some(_) => {
+            *guard = None;
+            None
+        }
+        None => None,
+    }
+}
+
+/// Unconditionally drop the lease, regardless of who (if anyone) holds it —
+/// the emergency-stop escape hatch (see [`emergency_stop`]), which must win
+/// even over a session that still believes it's mid-lease.
+pub fn clear_control() {
+    *control_mutex().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// issue #160 M2 kill switch: turn `computer_use_enabled` off (so every
+/// subsequent call fails closed via [`enabled`]) AND clear the control lease
+/// (in case a call is already mid-flight against the old value). The lease
+/// clear always runs, even if the setting write fails — a stuck lease with
+/// computer use still nominally enabled is the worse of the two half-failure
+/// states, so this does not stop early on a DB error.
+pub async fn emergency_stop(db: &crate::store::Db) {
+    let _ = crate::store::repo::set_setting(db, K_COMPUTER_USE_ENABLED, "false").await;
+    clear_control();
+}
+
+fn throttle_mutex() -> &'static Mutex<Option<Instant>> {
+    static LAST_INPUT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    LAST_INPUT.get_or_init(|| Mutex::new(None))
+}
+
+/// Minimum gap enforced between two input actions, process-wide.
+const THROTTLE_MS: u64 = 500;
+
+/// Global input rate limit: at most one input action roughly every
+/// [`THROTTLE_MS`], across the WHOLE process (not per-thread/dir — the point
+/// is protecting the one physical input device weft drives, and
+/// [`acquire_control`] already keeps two different sessions from racing each
+/// other here regardless). Only input actions call this — screenshot,
+/// list_windows, and cursor_position never touch the input devices, so they
+/// are never throttled. On success this also STARTS the next window (i.e.
+/// records `now`), so a rapid run of calls is naturally paced rather than
+/// bursting once the gap has elapsed.
+pub fn throttle_input() -> Result<(), ComputerError> {
+    let mut guard = throttle_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let min_gap = Duration::from_millis(THROTTLE_MS);
+    if let Some(last) = *guard {
+        let elapsed = now.duration_since(last);
+        if elapsed < min_gap {
+            return Err(ComputerError::RateLimited {
+                wait_ms: (min_gap - elapsed).as_millis() as u64,
+            });
+        }
+    }
+    *guard = Some(now);
+    Ok(())
+}
+
+// —— key combo grammar (issue #160 M2) ——
+
+/// One token out of a `"cmd+s"`-shaped key combo string, parsed by
+/// [`parse_key_combo`]. Kept as its own pure enum/function — no `enigo`
+/// dependency at all — so the parsing itself is unit-testable without the
+/// `computer-os` feature; only `os.rs` (behind that feature) ever maps a
+/// `KeyToken` to a real platform key type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyToken {
+    /// `cmd` AND `win` both parse to this (see [`parse_key_combo`]) — the
+    /// per-platform "which modifier is this really" distinction is left
+    /// entirely to `os.rs`/`enigo`, never branched on here.
+    Meta,
+    Control,
+    Alt,
+    Shift,
+    Named(NamedKey),
+    /// A single printable character — anything that isn't a recognized
+    /// modifier or named key falls here, ONLY when it's exactly one
+    /// character (a multi-character unrecognized word is a typo, not a key,
+    /// and is rejected instead — see [`parse_key_combo`]).
+    Unicode(char),
+}
+
+/// The closed set of named (non-modifier, non-printable) keys this module
+/// recognizes in a combo string — exactly the keys issue #160 M2's spec
+/// calls out, not an attempt to cover every key `enigo` itself knows about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedKey {
+    Return,
+    Tab,
+    Escape,
+    Space,
+    Backspace,
+    Delete,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+}
+
+/// Parse a combo like `"cmd+s"` / `"ctrl+shift+t"` / `"Return"` / `"f5"` into
+/// an ordered list of [`KeyToken`]s: lower-cased first (combos are case-
+/// insensitive), then split on `+`. Every part must resolve to SOMETHING —
+/// an empty part (`"cmd+"`, `"+s"`, `"cmd++s"`) or an unrecognized
+/// multi-character word (`"bogus_key"`) is [`ComputerError::Unsupported`]
+/// with a reason, never silently dropped.
+pub fn parse_key_combo(combo: &str) -> Result<Vec<KeyToken>, ComputerError> {
+    let lower = combo.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return Err(ComputerError::Unsupported("empty key combo".into()));
+    }
+    lower.split('+').map(key_token).collect()
+}
+
+fn key_token(part: &str) -> Result<KeyToken, ComputerError> {
+    use NamedKey::*;
+    match part {
+        "cmd" | "win" => Ok(KeyToken::Meta),
+        "ctrl" => Ok(KeyToken::Control),
+        "alt" => Ok(KeyToken::Alt),
+        "shift" => Ok(KeyToken::Shift),
+        "return" | "enter" => Ok(KeyToken::Named(Return)),
+        "tab" => Ok(KeyToken::Named(Tab)),
+        "escape" | "esc" => Ok(KeyToken::Named(Escape)),
+        "space" => Ok(KeyToken::Named(Space)),
+        "backspace" => Ok(KeyToken::Named(Backspace)),
+        "delete" => Ok(KeyToken::Named(Delete)),
+        "up" => Ok(KeyToken::Named(Up)),
+        "down" => Ok(KeyToken::Named(Down)),
+        "left" => Ok(KeyToken::Named(Left)),
+        "right" => Ok(KeyToken::Named(Right)),
+        "home" => Ok(KeyToken::Named(Home)),
+        "end" => Ok(KeyToken::Named(End)),
+        "pageup" => Ok(KeyToken::Named(PageUp)),
+        "pagedown" => Ok(KeyToken::Named(PageDown)),
+        "f1" => Ok(KeyToken::Named(F1)),
+        "f2" => Ok(KeyToken::Named(F2)),
+        "f3" => Ok(KeyToken::Named(F3)),
+        "f4" => Ok(KeyToken::Named(F4)),
+        "f5" => Ok(KeyToken::Named(F5)),
+        "f6" => Ok(KeyToken::Named(F6)),
+        "f7" => Ok(KeyToken::Named(F7)),
+        "f8" => Ok(KeyToken::Named(F8)),
+        "f9" => Ok(KeyToken::Named(F9)),
+        "f10" => Ok(KeyToken::Named(F10)),
+        "f11" => Ok(KeyToken::Named(F11)),
+        "f12" => Ok(KeyToken::Named(F12)),
+        _ => {
+            let mut chars = part.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Ok(KeyToken::Unicode(c)),
+                _ => Err(ComputerError::Unsupported(format!(
+                    "unrecognized key \"{part}\" in combo"
+                ))),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +664,18 @@ mod tests {
             y: 0,
             width: 800,
             height: 600,
+        }
+    }
+
+    fn window_sized(id: u32, app: &str, title: &str, width: u32, height: u32) -> WindowInfo {
+        WindowInfo {
+            id,
+            app: app.to_string(),
+            title: title.to_string(),
+            x: 0,
+            y: 0,
+            width,
+            height,
         }
     }
 
@@ -352,7 +726,7 @@ mod tests {
     fn zero_hits_is_window_not_found() {
         let backend = mock::MockBackend {
             windows: vec![window(1, "Safari", "Apple")],
-            image: None,
+            ..Default::default()
         };
         let dir = std::env::temp_dir().join("weft-computer-test-zero-hits");
         let err = screenshot_window(&backend, "nonexistent", &dir).unwrap_err();
@@ -363,7 +737,7 @@ mod tests {
     fn multiple_hits_is_ambiguous_with_candidates() {
         let backend = mock::MockBackend {
             windows: vec![window(1, "Notes", "Untitled 1"), window(2, "Notes", "Untitled 2")],
-            image: None,
+            ..Default::default()
         };
         let dir = std::env::temp_dir().join("weft-computer-test-ambiguous");
         let err = screenshot_window(&backend, "notes", &dir).unwrap_err();
@@ -381,26 +755,40 @@ mod tests {
     // —— scaling ——
 
     #[test]
-    fn oversized_capture_downscales_to_1280_long_edge() {
-        let (img, scale) = scale_capture(vec![7u8; 2560 * 1440 * 4], 2560, 1440).unwrap();
-        assert_eq!((img.width(), img.height()), (1280, 720));
-        assert_eq!(scale, 0.5);
+    fn display_scale_matches_long_edge_threshold() {
+        let big = window_sized(1, "x", "x", 2560, 1440);
+        assert_eq!(display_scale(&big), 0.5);
+        let small = window_sized(2, "x", "x", 800, 600);
+        assert_eq!(display_scale(&small), 1.0);
+        // Exactly at the threshold stays 1.0 (the rule is "> 1280", not ">=").
+        let at_threshold = window_sized(3, "x", "x", 1280, 720);
+        assert_eq!(display_scale(&at_threshold), 1.0);
     }
 
     #[test]
-    fn small_capture_is_not_scaled() {
-        let (img, scale) = scale_capture(vec![7u8; 800 * 600 * 4], 800, 600).unwrap();
+    fn scale_capture_downscales_by_the_given_scale() {
+        let img = scale_capture(vec![7u8; 2560 * 1440 * 4], 2560, 1440, 0.5).unwrap();
+        assert_eq!((img.width(), img.height()), (1280, 720));
+    }
+
+    #[test]
+    fn scale_capture_is_noop_at_scale_one() {
+        let img = scale_capture(vec![7u8; 800 * 600 * 4], 800, 600, 1.0).unwrap();
         assert_eq!((img.width(), img.height()), (800, 600));
-        assert_eq!(scale, 1.0);
     }
 
     // —— file write ——
 
     #[test]
     fn screenshot_window_writes_a_real_png() {
+        // Window dims match the captured image's actual pixel dims (the
+        // realistic case — see `display_scale`'s doc comment: the SAME
+        // window fields drive both the screenshot's downscale and, later,
+        // `map_to_physical`'s coordinate mapping).
         let backend = mock::MockBackend {
-            windows: vec![window(9, "Notes", "Untitled")],
+            windows: vec![window_sized(9, "Notes", "Untitled", 2560, 1440)],
             image: Some(solid_image(2560, 1440, 200)),
+            ..Default::default()
         };
         let tmp = tempfile::tempdir().unwrap();
         let shot = screenshot_window(&backend, "9", tmp.path()).unwrap();
@@ -410,6 +798,158 @@ mod tests {
         assert_eq!(shot.scale, 0.5);
         let opened = image::open(&shot.path).unwrap();
         assert_eq!((opened.width(), opened.height()), (1280, 720));
+    }
+
+    // —— map_to_physical (issue #160 M2) ——
+
+    #[test]
+    fn map_to_physical_scales_and_offsets_a_screenshot_coordinate() {
+        let w = WindowInfo {
+            id: 1,
+            app: "x".into(),
+            title: "x".into(),
+            x: 100,
+            y: 50,
+            width: 2560,
+            height: 1440,
+        };
+        // scale = 0.5; coordinate (640, 360) in the DOWNSCALED screenshot
+        // maps to (1280, 720) in the window's own space, plus the window's
+        // origin.
+        let (px, py) = map_to_physical(&w, 640, 360).unwrap();
+        assert_eq!((px, py), (100 + 1280, 50 + 720));
+    }
+
+    #[test]
+    fn map_to_physical_rejects_an_out_of_bounds_coordinate() {
+        let w = WindowInfo {
+            id: 1,
+            app: "x".into(),
+            title: "x".into(),
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        let err = map_to_physical(&w, 1281, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            ComputerError::OutOfBounds { x: 1281, y: 0, max_x: 1280, max_y: 720 }
+        ));
+    }
+
+    #[test]
+    fn map_to_physical_passes_through_unscaled_for_a_small_window() {
+        let w = WindowInfo {
+            id: 1,
+            app: "x".into(),
+            title: "x".into(),
+            x: 10,
+            y: 20,
+            width: 800,
+            height: 600,
+        };
+        let (px, py) = map_to_physical(&w, 100, 50).unwrap();
+        assert_eq!((px, py), (110, 70));
+    }
+
+    // —— control lock (issue #160 M2) ——
+
+    #[test]
+    fn control_lock_busy_expiry_release_and_clear() {
+        // Every test in this crate shares the SAME process-wide statics
+        // (`control_mutex`), so this one test exercises the whole lifecycle
+        // sequentially rather than each phase getting its own `#[test]` —
+        // splitting them would let `cargo test`'s parallel test threads
+        // stomp on each other's lock state.
+        clear_control();
+        assert!(control_state().is_none());
+
+        acquire_control(1, "10").unwrap();
+        let held = control_state().unwrap();
+        assert_eq!((held.thread, held.dir.as_str()), (1, "10"));
+
+        // A different (thread, dir) is blocked while the lease is live.
+        let err = acquire_control(2, "20").unwrap_err();
+        assert!(matches!(err, ComputerError::Busy { thread: 1, dir } if dir == "10"));
+
+        // The SAME holder re-acquiring (renewing) still succeeds.
+        acquire_control(1, "10").unwrap();
+
+        // Releasing a lease you do NOT hold is a no-op.
+        release_control(2, "20");
+        assert!(control_state().is_some());
+
+        // The real holder releasing frees it up immediately.
+        release_control(1, "10");
+        assert!(control_state().is_none());
+
+        // A manually-expired lease reads as absent (and is cleaned up) —
+        // simulated by acquiring, then reaching into the internal state to
+        // force `expires_at_ms` into the past instead of sleeping 30s.
+        acquire_control(1, "10").unwrap();
+        {
+            let mut guard = control_mutex().lock().unwrap();
+            if let Some(h) = guard.as_mut() {
+                h.expires_at_ms = now_ms().saturating_sub(1);
+            }
+        }
+        assert!(control_state().is_none(), "expired lease must read as absent");
+        // ... and once expired, someone else CAN acquire it.
+        acquire_control(2, "20").unwrap();
+
+        // clear_control wipes it unconditionally, even mid-lease.
+        assert!(control_state().is_some());
+        clear_control();
+        assert!(control_state().is_none());
+    }
+
+    #[tokio::test]
+    async fn emergency_stop_disables_the_setting_and_clears_control() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_COMPUTER_USE_ENABLED, "true")
+            .await
+            .unwrap();
+        acquire_control(9, "90").unwrap();
+
+        emergency_stop(&db).await;
+
+        assert!(!enabled(&db).await);
+        assert!(control_state().is_none());
+    }
+
+    // —— input throttle (issue #160 M2) ——
+
+    #[test]
+    fn throttle_input_rejects_a_second_call_inside_the_window() {
+        // Shares the same process-wide static as every other throttle test —
+        // reset by consuming the current window with a first call before
+        // asserting on the second.
+        throttle_input().ok();
+        let err = throttle_input().unwrap_err();
+        assert!(matches!(err, ComputerError::RateLimited { wait_ms } if wait_ms > 0 && wait_ms <= THROTTLE_MS));
+    }
+
+    // —— key combo parsing (issue #160 M2) ——
+
+    #[test]
+    fn parse_key_combo_recognizes_modifiers_named_keys_and_single_chars() {
+        assert_eq!(
+            parse_key_combo("cmd+s").unwrap(),
+            vec![KeyToken::Meta, KeyToken::Unicode('s')]
+        );
+        assert_eq!(
+            parse_key_combo("ctrl+shift+t").unwrap(),
+            vec![KeyToken::Control, KeyToken::Shift, KeyToken::Unicode('t')]
+        );
+        assert_eq!(parse_key_combo("Return").unwrap(), vec![KeyToken::Named(NamedKey::Return)]);
+        assert_eq!(parse_key_combo("f5").unwrap(), vec![KeyToken::Named(NamedKey::F5)]);
+    }
+
+    #[test]
+    fn parse_key_combo_rejects_empty_and_unrecognized_tokens() {
+        assert!(parse_key_combo("cmd+").is_err());
+        assert!(parse_key_combo("bogus_key").is_err());
     }
 
     // —— enabled() ——

@@ -111,8 +111,53 @@ pub enum PermissionIntent {
     /// same "the engine already identified it" case `RiskSignal::Network`
     /// exists for, so it needs no further scanning.
     Network,
+    /// A GUI/computer-use action via omp's built-in `computer`/`browser`
+    /// tool (see `is_gui_tool_call`'s doc for how this is detected, and the
+    /// `available_commands_update` listing in
+    /// `tests/fixtures/acp/omp-spike-transcript.json` for where those two
+    /// tool names come from) — M2-B. Carries the action name so the risk
+    /// mapping can defer to `ask::classify_gui_action`, the SAME word list
+    /// `weft_computer`'s MCP path (`bus::server::summarize`) uses, so a
+    /// `left_click` reads as the same tier from either route.
+    Gui { action: String },
     /// Anything else; carries the ACP tool kind so the card can name it.
     Other { kind: String },
+}
+
+/// omp's own built-in GUI tools (`/computer`, `/browser` — see their entries
+/// in the `available_commands_update` listing,
+/// `tests/fixtures/acp/omp-spike-transcript.json`) reach the permission
+/// layer as an ordinary `toolCall`, not routed through weft's
+/// `weft_computer` MCP server (that path is `bus::server::summarize`'s job
+/// — see its doc for the analogous, MCP-side recognition).
+///
+/// `title` is this file's most reliable available signal for the underlying
+/// tool's identity: ACP's own `kind` is a small, protocol-defined
+/// vocabulary (`read`/`edit`/`delete`/`move`/`search`/`execute`/`fetch`/
+/// `think`/`other`) with no `computer`/`browser` member, and no `toolCall`
+/// this file has ever seen carries a `name` field — only `toolCallId`/
+/// `title`/`kind`/`rawInput`/`content`/`locations` (see `tool_paths`/
+/// `summary_from_params`).
+fn is_gui_tool_call(tc: &Value) -> bool {
+    matches!(
+        tc.get("title").and_then(|t| t.as_str()),
+        Some("computer") | Some("browser")
+    )
+}
+
+/// The GUI/computer-use action name for a `computer`/`browser` toolCall: the
+/// structured `rawInput.action` weft's own `weft_computer` MCP tool uses
+/// (`screenshot`, `left_click`, …) when the backend sends it, else the ACP
+/// `kind` as a fallback label — `classify_gui_action` (`ask.rs`) honestly
+/// defaults an unrecognized action to `Unknown` rather than guessing, so a
+/// fallback label that happens not to match its word list is safe, not a
+/// silent misclassification.
+fn gui_action(raw_input: &Value, kind: &str) -> String {
+    raw_input
+        .get("action")
+        .and_then(|a| a.as_str())
+        .unwrap_or(kind)
+        .to_string()
 }
 
 /// Every path a file-shaped request names: ACP's own structured `locations`
@@ -170,6 +215,16 @@ pub fn intent_from_params(params: &Value) -> PermissionIntent {
         .and_then(|c| c.as_str())
     {
         return PermissionIntent::Command(cmd.to_string());
+    }
+    // omp's built-in computer/browser tool (M2-B, see `is_gui_tool_call`'s
+    // doc): its rawInput carries an `action`, a shape none of the `kind`
+    // branches below recognize, so — like the command check just above — it
+    // needs to be pulled out ahead of that match rather than folded into it.
+    if is_gui_tool_call(tc) {
+        let raw = tc.get("rawInput").cloned().unwrap_or(Value::Null);
+        return PermissionIntent::Gui {
+            action: gui_action(&raw, kind),
+        };
     }
     match kind {
         "read" | "search" => PermissionIntent::Read {
@@ -234,6 +289,14 @@ pub fn intent_key_from_params(params: &Value) -> String {
         .and_then(|k| k.as_str())
         .unwrap_or("tool");
     let raw = tc.get("rawInput").cloned().unwrap_or(Value::Null);
+    // Mirrors `intent_from_params`'s own Gui carve-out: an Always grant for a
+    // GUI action is scoped to the ACTION (`gui:screenshot`, `gui:left_click`,
+    // …), not lumped into one coarse `tool`/`other` bucket the way `intent_key`
+    // groups everything else — a `left_click` "always allow" must not also
+    // silently cover an unrelated `type` action.
+    if is_gui_tool_call(tc) {
+        return format!("gui:{}", gui_action(&raw, kind));
+    }
     intent_key(kind, &raw)
 }
 
@@ -293,6 +356,18 @@ pub fn summary_from_params(params: &Value) -> (String, String) {
     } else {
         parts.join("\n")
     };
+    // M2-B: a GUI/computer-use toolCall gets its own summary format
+    // (`computer: <action>`) rather than the bare "computer"/"browser"
+    // title — naming the ACTION is what the human needs to triage at a
+    // glance, the same reason `bus::server::summarize` does the same thing
+    // for `weft_computer`'s MCP path. `detail` is unaffected — the generic
+    // construction above already names whatever `rawInput`/`locations` this
+    // toolCall carries.
+    if is_gui_tool_call(tc) {
+        let kind = tc.get("kind").and_then(|k| k.as_str()).unwrap_or("tool");
+        let raw_value = tc.get("rawInput").cloned().unwrap_or(Value::Null);
+        return (format!("computer: {}", gui_action(&raw_value, kind)), detail);
+    }
     // Stable machine token — frontend i18n maps `acp.permission_required`.
     let summary = if title.is_empty() {
         "acp.permission_required".into()
@@ -678,5 +753,143 @@ mod tests {
             intent_from_params(&params),
             PermissionIntent::Command("rm -rf /tmp/x".into())
         );
+    }
+
+    // ---- Gui intent (M2-B: omp's built-in computer/browser tool) ---------------
+
+    /// `title` is this file's most reliable tool-identity signal for the two
+    /// omp-built-in GUI tools: ACP's own `kind` vocabulary has no
+    /// computer/browser member (see `is_gui_tool_call`'s doc), and their
+    /// names are pinned to what the omp transcript's own
+    /// `available_commands_update` listing calls them.
+    #[test]
+    fn computer_and_browser_titles_classify_as_gui_intent() {
+        for title in ["computer", "browser"] {
+            let params = json!({
+                "toolCall": {
+                    "title": title,
+                    "kind": "other",
+                    "rawInput": { "action": "screenshot", "window": "Safari" }
+                }
+            });
+            assert_eq!(
+                intent_from_params(&params),
+                PermissionIntent::Gui {
+                    action: "screenshot".into()
+                },
+                "{title:?} toolCall should classify as Gui"
+            );
+        }
+    }
+
+    /// A GUI toolCall whose `rawInput` carries no `action` falls back to the
+    /// ACP `kind` as a label — never invented, and `classify_gui_action`
+    /// (`ask.rs`) honestly defaults an unrecognized label to `Unknown`
+    /// rather than silently mapping it to a tier.
+    #[test]
+    fn gui_action_falls_back_to_kind_when_raw_input_has_no_action() {
+        let params = json!({
+            "toolCall": { "title": "computer", "kind": "other" }
+        });
+        assert_eq!(
+            intent_from_params(&params),
+            PermissionIntent::Gui {
+                action: "other".into()
+            }
+        );
+    }
+
+    /// A `command`-shaped rawInput still wins over a `computer`-titled tool
+    /// call — the same "a command line is a command whatever kind it's
+    /// declared under" precedence `intent_from_params` already gives
+    /// `PermissionIntent::Command`.
+    #[test]
+    fn a_command_under_a_computer_titled_tool_call_is_still_a_command() {
+        let params = json!({
+            "toolCall": {
+                "title": "computer",
+                "kind": "execute",
+                "rawInput": { "command": "echo hi" }
+            }
+        });
+        assert_eq!(
+            intent_from_params(&params),
+            PermissionIntent::Command("echo hi".into())
+        );
+    }
+
+    /// An exact-name check, not a substring/prefix one — a title that merely
+    /// contains "computer" must not misfire.
+    #[test]
+    fn a_title_that_merely_contains_computer_does_not_classify_as_gui() {
+        let params = json!({
+            "toolCall": { "title": "computer_science_notes.md", "kind": "read" }
+        });
+        assert_eq!(
+            intent_from_params(&params),
+            PermissionIntent::Read { paths: Vec::new() }
+        );
+    }
+
+    /// Always-grant is scoped to the ACTION for a GUI intent, not lumped
+    /// into one coarse bucket the way `intent_key` groups everything else —
+    /// approving `left_click` forever must not also silently cover `type`.
+    #[test]
+    fn gui_intent_key_is_scoped_to_the_action() {
+        let click = json!({
+            "toolCall": { "title": "computer", "rawInput": { "action": "left_click" } }
+        });
+        let type_action = json!({
+            "toolCall": { "title": "computer", "rawInput": { "action": "type" } }
+        });
+        assert_eq!(intent_key_from_params(&click), "gui:left_click");
+        assert_eq!(intent_key_from_params(&type_action), "gui:type");
+        assert_ne!(
+            intent_key_from_params(&click),
+            intent_key_from_params(&type_action),
+            "an Always grant for left_click must not also cover type"
+        );
+    }
+
+    #[test]
+    fn gui_summary_names_the_action_not_the_bare_tool_title() {
+        let params = json!({
+            "toolCall": {
+                "title": "computer",
+                "kind": "other",
+                "rawInput": { "action": "left_click", "window": "Safari" }
+            }
+        });
+        let (summary, _detail) = summary_from_params(&params);
+        assert_eq!(summary, "computer: left_click");
+    }
+
+    /// The real risk verdict (`lead_chat::engine::acp_permission_risk`)
+    /// defers every `Gui` intent to `ask::classify_gui_action` — this pins
+    /// that an observe-only action reads `ReadOnly` and an input-injecting
+    /// one reads `Write`, the SAME word list `bus::server::summarize`'s
+    /// `weft_computer` branch uses, so the two routes never disagree.
+    #[test]
+    fn gui_action_risk_mapping_matches_classify_gui_action() {
+        let screenshot = json!({
+            "toolCall": { "title": "computer", "rawInput": { "action": "screenshot" } }
+        });
+        let click = json!({
+            "toolCall": { "title": "computer", "rawInput": { "action": "left_click" } }
+        });
+        match intent_from_params(&screenshot) {
+            PermissionIntent::Gui { action } => assert_eq!(
+                crate::ask::classify_gui_action(&action),
+                crate::ask::RiskLevel::ReadOnly
+            ),
+            other => panic!("expected Gui intent, got {other:?}"),
+        }
+        match intent_from_params(&click) {
+            PermissionIntent::Gui { action } => assert_eq!(
+                crate::ask::classify_gui_action(&action),
+                crate::ask::RiskLevel::Write
+            ),
+            other => panic!("expected Gui intent, got {other:?}"),
+        }
     }
 }

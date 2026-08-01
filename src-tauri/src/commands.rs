@@ -1596,6 +1596,24 @@ pub async fn set_computer_use_enabled(db: State<'_, Db>, enabled: bool) -> R<()>
     .map_err(e)
 }
 
+/// issue #160 M2: the current computer-use control holder, if any — the
+/// single mutex a computer-use tool call takes out while it's driving the
+/// desktop. `None` means no agent currently has control.
+#[tauri::command]
+pub async fn get_computer_control_state() -> R<Option<crate::computer::ControlHolder>> {
+    Ok(crate::computer::control_state())
+}
+
+/// issue #160 M2: kill switch for computer use — turns the
+/// `computer_use_enabled` setting off and clears the control mutex, so every
+/// subsequent computer tool call fails closed. Recovery is manual: a human
+/// has to go back into Settings and turn computer use on again.
+#[tauri::command]
+pub async fn computer_emergency_stop(db: State<'_, Db>) -> R<()> {
+    crate::computer::emergency_stop(&db).await;
+    Ok(())
+}
+
 /// issue #97: whether Weft should auto-switch a thread/session to its
 /// fallback engine when the current one reports its usage limit as exceeded
 /// (`crate::lead_chat::commands::maybe_failover_on_quota`). Opt-in, default

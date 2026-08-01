@@ -3985,6 +3985,11 @@ fn acp_permission_risk(
             file_risk("Edit", paths, crate::ask::RiskLevel::Write)
         }
         PermissionIntent::Network => crate::ask::classify_risk(crate::ask::RiskSignal::Network),
+        // GUI computer-use requests (omp's native `computer`/`browser` tools):
+        // the action word alone decides the tier — observation actions are
+        // ReadOnly, injected input is Write, anything unrecognized stays
+        // Unknown. Same closed word list the weft_computer MCP path uses.
+        PermissionIntent::Gui { action } => crate::ask::classify_gui_action(action),
         PermissionIntent::Other { kind } => {
             crate::ask::classify_risk(crate::ask::RiskSignal::Other {
                 tool_name: kind,

@@ -836,6 +836,9 @@ export const en = {
     computerUseTitle: "Allow computer use",
     computerUseHint:
       "Lets an agent enumerate on-screen windows and take a screenshot of one named application window for visual verification. Off by default. Screenshots always exclude Weft's own window and any terminal window. Every call still needs your approval in Needs you.",
+    computerControlActive:
+      "An agent is controlling the desktop (task {{dir}} in thread {{thread}}). Press Esc or click Stop to cut it off.",
+    computerControlStop: "Stop",
     detecting: "Detecting…",
     installed: "installed",
     installedVersion: "v{{version}}",

@@ -806,6 +806,9 @@ export const zh = {
     computerUseTitle: "允许 computer use",
     computerUseHint:
       "允许 agent 枚举当前屏幕上的窗口，并对指定的某个应用窗口截图，用于视觉验证。默认关闭。截图始终排除 Weft 自身窗口和任何终端窗口。每次调用仍需在「待你处理」中经你批准。",
+    computerControlActive:
+      "有 agent 正在控制桌面（任务 {{dir}}，线程 {{thread}}）。按 Esc 或点击「立即停止」即可中断。",
+    computerControlStop: "立即停止",
     detecting: "检测中…",
     installed: "已安装",
     installedVersion: "v{{version}}",
