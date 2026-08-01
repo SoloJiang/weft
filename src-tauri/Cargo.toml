@@ -94,6 +94,7 @@ xcap = { version = "0.9.7", optional = true }
 # 鼠标/键盘输入注入(issue #160 M2)。同上 xcap 的容器编译问题:Linux 下走 X11,
 # 传递依赖系统库本机同样缺失。同挂 `computer-os` feature(默认关),不影响默认构建。
 enigo = { version = "0.6", optional = true }
+sha2 = "0.10"
 
 [features]
 # 见上面 xcap/enigo 依赖注释。默认关闭,不影响任何现有构建/CI。

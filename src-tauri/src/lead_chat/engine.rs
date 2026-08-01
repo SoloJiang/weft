@@ -3365,7 +3365,7 @@ async fn spawn_acp_turn(
     out: Outgoing,
     expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
-    let (native, cwd, sid, thread_id_i, system_prompt, tool, command, ask_dir) = {
+    let (native, cwd, sid, thread_id_i, system_prompt, tool, command, ask_dir, worktree_id) = {
         let i = eng.lock().await;
         // `tearing_down` included as defence in depth: the hidden path already
         // refuses, but this is the one gate every ACP turn passes through.
@@ -3385,6 +3385,12 @@ async fn spawn_acp_turn(
             i.tool.clone(),
             i.command.clone(),
             i.ask_dir.clone(),
+            // issue #160 round-2 P2 §5: this worker's own worktree id, already
+            // resolved at engine-build time (`EngineInner::worktree_id`'s own
+            // doc) — reused here to pin `weft_computer`'s `?wt=` query param
+            // instead of the multi-repo-direction "first worktree" fallback.
+            // `None` for the lead lane (a lead has no worktree at all).
+            i.worktree_id,
         )
     };
     let backend = crate::acp::backend_for(&tool)
@@ -3415,21 +3421,23 @@ async fn spawn_acp_turn(
         match kind.as_str() {
             // Concierge: weft_global only (never bus, never computer).
             "concierge" => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, "lead", false, false, true, false, false,
+                &base, thread_id_i, "lead", false, false, true, false, false, None,
             ),
             // Curator: curator MCP + bus under LEAD identity (never computer).
             "curator" => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, crate::bus::LEAD, true, false, false, true, false,
+                &base, thread_id_i, crate::bus::LEAD, true, false, false, true, false, None,
             ),
-            // Issue lead: planner + bus (+ computer when enabled).
+            // Issue lead: planner + bus (+ computer when enabled). No
+            // worktree of its own (issue #160 round-2 P2 §5) — always `None`.
             _ => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, crate::bus::LEAD, true, true, false, false, computer,
+                &base, thread_id_i, crate::bus::LEAD, true, true, false, false, computer, None,
             ),
         }
     } else {
-        // Worker: bus only under direction id (+ computer when enabled).
+        // Worker: bus only under direction id (+ computer, pinned to this
+        // worker's OWN worktree, when enabled — issue #160 round-2 P2 §5).
         crate::bus::inject::acp_mcp_servers(
-            &base, thread_id_i, &ask_dir, true, false, false, false, computer,
+            &base, thread_id_i, &ask_dir, true, false, false, false, computer, worktree_id,
         )
     };
 

@@ -275,6 +275,10 @@ pub async fn lead_engine(
                     crate::bus::LEAD,
                     &t.lead_tool,
                     &cwd,
+                    // issue #160 round-2 P2 §5: the lead lane has no
+                    // worktree at all (it runs out of its own scratch cwd),
+                    // so it never has a `wt` to pin — always `None`.
+                    None,
                 )
                 .args,
             );
@@ -1496,6 +1500,11 @@ pub(crate) async fn chat_open_worker_impl(
                 &direction_id.to_string(),
                 &session_tool,
                 &cwd,
+                // issue #160 round-2 P2 §5: this worker's OWN worktree
+                // (`wt`, resolved above for this EXACT direction+repo pair)
+                // — not "the first worktree of this direction" a
+                // multi-repo direction would otherwise fall back to.
+                Some(wt.id),
             )
             .args,
         );
@@ -1644,6 +1653,15 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     }
     let mut extra = ask.args;
     extra.extend(inj.args);
+    // This worker's OWN worktree (issue #160 round-2 P2 §5) — resolved ONCE
+    // here and reused both for `inject_computer`'s `wt` pin below and for
+    // `EngineInner::worktree_id` further down, instead of two separate DB
+    // lookups for the same (direction, repo) pair.
+    let worktree_id = repo::worktree_for(db, sess.direction_id, sess.repo_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|w| w.id);
     // issue #160: opt-in computer-use MCP, same fail-closed gate as the
     // first-spawn path above — this is the worker resume/rebuild path.
     if crate::computer::enabled(db).await {
@@ -1654,6 +1672,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
                 &sess.direction_id.to_string(),
                 &sess.tool,
                 &cwd,
+                worktree_id,
             )
             .args,
         );
@@ -1705,13 +1724,11 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         rewinding: false,
         quota_failover_committing: false,
         tearing_down: false,
-        // One cheap lookup at engine build so send's admission can honor a
-        // worktree-level restore reservation without a per-send DB query.
-        worktree_id: repo::worktree_for(db, sess.direction_id, sess.repo_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|w| w.id),
+        // Reuses the SAME lookup `inject_computer`'s `wt` pin used above —
+        // one cheap DB round trip, not two, for this one (direction, repo)
+        // pair — so send's admission can honor a worktree-level restore
+        // reservation without a per-send DB query.
+        worktree_id,
     };
     // Same persisted-meta restore as chat_open_worker_impl: this constructor
     // also races a fresh relaunch (slash discovery / direct chat_send), and an

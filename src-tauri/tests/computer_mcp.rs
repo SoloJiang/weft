@@ -17,6 +17,13 @@ use weft::store::{repo, Db};
 
 async fn rpc(base: &str, thread: i32, dir: &str, body: serde_json::Value) -> String {
     let url = format!("{base}/computer/{thread}/{dir}/mcp");
+    rpc_url(&url, body).await
+}
+
+/// Same POST as [`rpc`], against a caller-built URL — lets the round-2 P2 §5
+/// `?wt=` query-param tests below attach a worktree id without `rpc`'s own
+/// `dir`-only URL shape getting in the way.
+async fn rpc_url(url: &str, body: serde_json::Value) -> String {
     let resp = reqwest::Client::builder()
         // This test talks to a loopback listener it just created. Do not let a
         // machine-level proxy reroute that request (mirrors bus_http.rs).
@@ -465,7 +472,21 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // blanket `read_only_session` grant — so section 9 below can still
     // exercise a REAL card for a DIFFERENT action (a click) or a DIFFERENT
     // window (`screenshot @ other`) on these SAME sessions.
-    let screenshot_notes_key = weft::ask::action_key(&["gui", "screenshot", "notes"]);
+    //
+    // issue #160 round-2 P2 §2: `action_key` grew a trailing `args_digest`
+    // element (a sha256 over the call's consequential params — see that
+    // function's own doc), so this pre-seeded key must be built the EXACT
+    // same way `approve` itself would for `{"action":"screenshot","window":
+    // "notes"}` — via the real `args_digest` helper (exposed
+    // `#[doc(hidden)] pub` for exactly this) — or this grant would silently
+    // stop matching and every `assert_screenshot_content` call below would
+    // hang for up to an hour waiting on a card nobody is spawned to answer.
+    let screenshot_notes_key = weft::ask::action_key(&[
+        "gui",
+        "screenshot",
+        "notes",
+        &weft::bus::computer_srv::args_digest(&json!({"action": "screenshot", "window": "notes"})),
+    ]);
     let grant_screenshot_notes = |thread: i32, dir: &str| {
         asks_handle.seed_grants(GrantSnapshot {
             full: Vec::new(),
@@ -795,6 +816,116 @@ async fn gate_denies_when_the_ask_is_cancelled_instead_of_answered() {
         "a cancelled/timed-out gate ask must resolve to an EXPLICIT deny, never hang or silently allow: {out}"
     );
     assert!(asks_handle.open().is_empty());
+}
+
+/// issue #160 round-2 P2 §5: a direction with MORE THAN ONE worktree (a
+/// multi-repo direction) routes computer-use output (here, the audit log —
+/// simplest to observe without a MockBackend/WEFT_HOME setup, which this
+/// binary's OTHER giant test owns exclusively per its own doc comment) to
+/// the EXACT worktree the calling worker resolved, via the `?wt=` query
+/// param — instead of always falling back to whichever worktree happens to
+/// be first. A forged `wt` naming a worktree of a DIFFERENT direction is
+/// rejected (closed-set validation) and falls back to the pre-existing
+/// "first worktree of this direction" behavior, never writing into the
+/// foreign worktree.
+#[tokio::test]
+async fn wt_query_param_routes_output_to_the_exact_worktree_in_a_multi_repo_direction() {
+    let reg = BusRegistry::new();
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true")
+        .await
+        .unwrap();
+    let asks = AskRegistry::new();
+    let asks_handle = asks.clone();
+    let (base, _h) = server::serve(reg, db.clone(), asks).await.unwrap();
+
+    let ws = repo::create_workspace(&db, "ws").await.unwrap();
+    let repo_tmp_a = tempfile::tempdir().unwrap();
+    let repo_tmp_b = tempfile::tempdir().unwrap();
+    let repo_a = repo::add_repo_ref(&db, ws.id, "a", &repo_tmp_a.path().to_string_lossy(), "main", "", true)
+        .await
+        .unwrap();
+    let repo_b = repo::add_repo_ref(&db, ws.id, "b", &repo_tmp_b.path().to_string_lossy(), "main", "", true)
+        .await
+        .unwrap();
+    let thread = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+    let direction = repo::create_direction(
+        &db, thread.id, "task", "claude", repo_a.id, "why", "impl-only", "main",
+    )
+    .await
+    .unwrap();
+
+    let wt_a_path = std::env::temp_dir().join(format!("weft-computer-mcp-wt5-a-{}", std::process::id()));
+    let wt_b_path = std::env::temp_dir().join(format!("weft-computer-mcp-wt5-b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&wt_a_path);
+    let _ = std::fs::remove_dir_all(&wt_b_path);
+    std::fs::create_dir_all(&wt_a_path).unwrap();
+    std::fs::create_dir_all(&wt_b_path).unwrap();
+    // Worktree A is recorded FIRST — the pre-existing "first worktree"
+    // fallback would always resolve here without an explicit `wt`.
+    let _wt_a = repo::record_worktree(&db, repo_a.id, direction.id, "ba", &wt_a_path.to_string_lossy(), true, true, "")
+        .await
+        .unwrap();
+    let wt_b = repo::record_worktree(&db, repo_b.id, direction.id, "bb", &wt_b_path.to_string_lossy(), true, true, "")
+        .await
+        .unwrap();
+
+    asks_handle.seed_grants(GrantSnapshot {
+        full: vec![FullGrant { thread: thread.id, dir: direction.id.to_string() }],
+        always: Vec::new(),
+    });
+    let dir_s = direction.id.to_string();
+    let audit_a = wt_a_path.join(".weft").join("computer-audit.jsonl");
+    let audit_b = wt_b_path.join(".weft").join("computer-audit.jsonl");
+
+    // 1. An explicit `?wt=` naming worktree B lands its audit line in B, NOT A.
+    let url = format!("{base}/computer/{}/{}/mcp?wt={}", thread.id, dir_s, wt_b.id);
+    let out = rpc_url(
+        &url,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"wait","duration_ms":1}}}),
+    )
+    .await;
+    assert!(out.contains("waited"), "{out}");
+    assert!(!audit_a.exists(), "wt=B must never write into worktree A: {out}");
+    assert!(audit_b.exists(), "wt=B must write its audit line into worktree B");
+
+    // 2. A forged `wt` naming a worktree of a DIFFERENT direction falls back
+    // to the pre-existing "first worktree of THIS direction" (A) — never
+    // resolving into the foreign direction's own worktree.
+    let other_direction = repo::create_direction(
+        &db, thread.id, "task2", "claude", repo_a.id, "why", "impl-only", "main",
+    )
+    .await
+    .unwrap();
+    let foreign_path = std::env::temp_dir().join(format!("weft-computer-mcp-wt5-foreign-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&foreign_path);
+    std::fs::create_dir_all(&foreign_path).unwrap();
+    let foreign = repo::record_worktree(&db, repo_a.id, other_direction.id, "bf", &foreign_path.to_string_lossy(), true, true, "")
+        .await
+        .unwrap();
+
+    let url = format!("{base}/computer/{}/{}/mcp?wt={}", thread.id, dir_s, foreign.id);
+    let out = rpc_url(
+        &url,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"wait","duration_ms":1}}}),
+    )
+    .await;
+    assert!(out.contains("waited"), "{out}");
+    assert!(
+        audit_a.exists(),
+        "a forged wt from a different direction must fall back to worktree A \
+         (the first worktree of THIS direction): {out}"
+    );
+    assert!(
+        !foreign_path.join(".weft").join("computer-audit.jsonl").exists(),
+        "must never write into the foreign direction's worktree"
+    );
+
+    let _ = std::fs::remove_dir_all(&wt_a_path);
+    let _ = std::fs::remove_dir_all(&wt_b_path);
+    let _ = std::fs::remove_dir_all(&foreign_path);
 }
 
 /// Exercises the REAL platform backend end-to-end (window enumeration +

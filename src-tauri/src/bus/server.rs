@@ -379,21 +379,57 @@ fn session_servers_for_kind(kind: &str) -> &'static [&'static str] {
 /// thread — nothing is auto-approved and the tool surfaces the Needs-you card.
 ///
 /// `weft_computer` is a THIRD, independent case, checked before the worker/
-/// lead split: every `include_computer` call site (`lead_chat::engine`,
-/// `lead_chat::commands`) injects it purely off the GLOBAL `computer::
-/// enabled` setting, for either lane, never keyed by thread kind or direction
-/// ownership the way the other servers are — so mirroring THAT exact
-/// condition here (not thread/dir membership) is what "was this server
-/// actually injected for this session" means for `weft_computer`. As
-/// explained on `AUTO_APPROVED_INTERNAL_TOOLS`'s own doc, this check no
-/// longer gates whether the action runs (the server-side gate in
-/// `bus::computer_srv` owns that); it only decides whether THIS hook path
-/// double-asks. `computer::enabled` itself fails closed (DB error/missing
-/// row/anything but the literal "true" reads disabled), so an unreadable
-/// setting still surfaces the card here too.
+/// lead split. Issue #160 round-2 P2 §6 (this branch used to just be
+/// `crate::computer::enabled(db).await` — see the git history for the prior
+/// text): a bare "is the setting on" check does NOT actually mirror
+/// injection, because `include_computer` is NOT unconditional for every lead
+/// — `lead_chat::commands::lead_engine` and `lead_chat::engine::
+/// spawn_acp_turn` both hard-code it OFF for `concierge`/`curator` threads
+/// regardless of the setting (only a per-issue lead, or a worker, ever gets
+/// it). The old check auto-approved a `weft_computer` hook ask in EVERY
+/// session while the setting was on — including a concierge/curator lead
+/// that never actually had this server injected — which would wave through
+/// any same-named shadow MCP server (a repo's own `weft_computer`) a
+/// concierge/curator session happened to load, with no card at all. Fixed to
+/// mirror the REAL injection rule:
+///  - the setting must be on (unchanged — `computer::enabled` itself fails
+///    closed: a DB error/missing row/anything but the literal "true" reads
+///    disabled);
+///  - a WORKER lane (`dir` parses as a direction id) always qualifies once
+///    the setting is on — `include_computer` gates every worker call site
+///    purely on `computer::enabled`, for ANY direction, so — unlike
+///    `weft_bus` above — no direction-ownership DB lookup is needed here
+///    either;
+///  - the LEAD lane needs the thread's `kind`: `concierge`/`curator` never
+///    qualify (mirrors the hard-coded `false` those two kinds get at every
+///    real injection call site); any other kind (an issue lead) does.
+///
+/// As explained on `AUTO_APPROVED_INTERNAL_TOOLS`'s own doc, this check does
+/// not itself gate whether the `computer` action actually runs — the
+/// server-side gate in `bus::computer_srv::approve` is the ONE place that
+/// really authorizes a `weft_computer` call, independent of this hook path
+/// entirely (it re-derives identity from the `/computer/:thread/:dir/mcp`
+/// URL, not from this function's verdict). This function only decides
+/// whether THAT already-independently-gated call ALSO gets a second,
+/// redundant card here. Residual surface: a WORKER session that loads its
+/// own repo-configured MCP server literally named `weft_computer` can still
+/// reuse this exact auto-approve — but claude (and every other engine this
+/// repo drives) already requires the user to explicitly enable a
+/// project-scope MCP server before it can run at all, so that surface is
+/// something the user already authorized by installing/enabling that
+/// server, not something this hook silently grants on its own.
 async fn session_injected(db: &Db, thread: i32, dir: &str, server: &str) -> bool {
     if server == "weft_computer" {
-        return crate::computer::enabled(db).await;
+        if !crate::computer::enabled(db).await {
+            return false;
+        }
+        if dir != crate::bus::LEAD {
+            return dir.parse::<i32>().is_ok();
+        }
+        return match crate::store::repo::get_thread(db, thread).await {
+            Ok(Some(t)) => !matches!(t.kind.as_str(), "concierge" | "curator"),
+            _ => false,
+        };
     }
     if dir != crate::bus::LEAD {
         // Worker lane: only the bus, and only when `dir` is a REAL direction of
@@ -1933,7 +1969,10 @@ mod tests {
     /// carries) auto-approves at this endpoint WITHOUT ever surfacing a
     /// card — the server-side gate in `bus::computer_srv` is the one that
     /// actually approved (or will approve) this call; a second card here
-    /// would double-ask the human for nothing.
+    /// would double-ask the human for nothing. Round-2 P2 §6: the lead lane
+    /// now needs an actual thread row of a QUALIFYING kind (an issue lead,
+    /// "feature" here — see `session_injected`'s own doc) since the fix no
+    /// longer auto-approves off the setting alone.
     #[tokio::test]
     async fn weft_computer_hook_ask_auto_approves_without_a_card_while_enabled() {
         use crate::ask::AskRegistry;
@@ -1943,10 +1982,14 @@ mod tests {
         crate::store::repo::set_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED, "true")
             .await
             .unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
         let asks = AskRegistry::new();
         let (base, _h) = serve(BusRegistry::new(), db, asks.clone()).await.unwrap();
 
-        let url = format!("{base}/ask/1/{}?tool=claude", crate::bus::LEAD);
+        let url = format!("{base}/ask/{}/{}?tool=claude", thread.id, crate::bus::LEAD);
         let body = json!({
             "tool_name": "mcp__weft_computer__computer",
             "tool_input": { "action": "left_click", "window": "notes" }
@@ -1967,6 +2010,85 @@ mod tests {
         assert!(
             asks.open().is_empty(),
             "must never ALSO surface a card here — the server-side gate already owns approval"
+        );
+    }
+
+    /// Issue #160 round-2 P2 §6: a WORKER dir (any real, parseable direction
+    /// id) auto-approves purely off the setting — no thread-kind lookup, no
+    /// direction-ownership DB check, matching `include_computer`'s own
+    /// unconditional-per-direction injection rule for workers.
+    #[tokio::test]
+    async fn weft_computer_hook_ask_auto_approves_for_a_worker_dir_while_enabled() {
+        use crate::ask::AskRegistry;
+        use crate::bus::BusRegistry;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED, "true")
+            .await
+            .unwrap();
+        let asks = AskRegistry::new();
+        let (base, _h) = serve(BusRegistry::new(), db, asks.clone()).await.unwrap();
+
+        let url = format!("{base}/ask/1/42?tool=claude");
+        let body = json!({
+            "tool_name": "mcp__weft_computer__computer",
+            "tool_input": { "action": "left_click", "window": "notes" }
+        });
+        let out: Value = reqwest::Client::new()
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "allow", "got: {out}");
+        assert!(asks.open().is_empty(), "must never ALSO surface a card here: {out}");
+    }
+
+    /// Issue #160 round-2 P2 §6: the actual bug this fix closes — a
+    /// concierge (or curator) lead thread NEVER gets `weft_computer` injected
+    /// (see `session_servers_for_kind`), so this hook path must NOT
+    /// auto-approve a `weft_computer` ask for one even while the setting is
+    /// on — that would silently wave through a same-named shadow MCP server
+    /// with no card at all. This surfaces a real card instead.
+    #[tokio::test]
+    async fn weft_computer_hook_ask_does_not_auto_approve_for_a_concierge_thread() {
+        use crate::ask::{Answer, AskRegistry};
+        use crate::bus::BusRegistry;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED, "true")
+            .await
+            .unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = crate::store::repo::create_thread(&db, ws.id, "concierge", "concierge", "claude")
+            .await
+            .unwrap();
+        let asks = AskRegistry::new();
+        let (base, _h) = serve(BusRegistry::new(), db, asks.clone()).await.unwrap();
+
+        let url = format!("{base}/ask/{}/{}?tool=claude", thread.id, crate::bus::LEAD);
+        let body = json!({
+            "tool_name": "mcp__weft_computer__computer",
+            "tool_input": { "action": "left_click", "window": "notes" }
+        });
+        let (resp, ()) = tokio::join!(
+            async {
+                reqwest::Client::new()
+                    .post(url.as_str())
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+            },
+            crate::hook_test_support::answer_first_ask(&asks, Answer::Deny),
+        );
+        let out: Value = resp.json().await.unwrap();
+        assert_eq!(
+            out["hookSpecificOutput"]["permissionDecision"], "deny",
+            "a concierge thread must surface a real card, never auto-approve: {out}"
         );
     }
 

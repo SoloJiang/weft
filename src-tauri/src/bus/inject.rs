@@ -31,13 +31,33 @@ fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
     format!("{base}/ask/{thread}/{dir}?tool={tool}")
 }
 
-fn computer_url(base: &str, thread: i32, dir: &str) -> String {
-    format!("{base}/computer/{thread}/{dir}/mcp")
+/// `wt` (issue #160 round-2 P2 §5): the caller's own worktree id, when it
+/// could resolve one — appended as `?wt=<id>` so `bus::computer_srv::
+/// handle_computer` can pin screenshots/audit to THIS EXACT worktree instead
+/// of falling back to "the first worktree of this direction" on a multi-repo
+/// direction (see `bus::computer_srv::session_root`'s own doc for the
+/// closed-set validation this query param goes through server-side). `None`
+/// omits the query param entirely — an absent `wt` behaves EXACTLY like the
+/// pre-existing URL shape, so every caller that can't resolve a worktree id
+/// (the lead lane, which has no worktree at all; an ACP branch that hasn't
+/// wired one through yet) is unaffected.
+fn computer_url(base: &str, thread: i32, dir: &str, wt: Option<i32>) -> String {
+    match wt {
+        Some(id) => format!("{base}/computer/{thread}/{dir}/mcp?wt={id}"),
+        None => format!("{base}/computer/{thread}/{dir}/mcp"),
+    }
 }
 
 /// HTTP MCP servers Weft should pass on ACP `session/new|resume` for this
 /// engine role. Workers get `weft_bus`; lead also gets planner when `dir` is
 /// the lead lane; concierge/global callers pass `include_global`.
+///
+/// `computer_wt` (issue #160 round-2 P2 §5): the worker's own worktree id,
+/// forwarded into [`computer_url`] when `include_computer` is set — see that
+/// function's own doc. Ignored (harmlessly) when `include_computer` is
+/// `false`. `None` for the lead lane (a lead has no worktree at all) and for
+/// any worker caller that couldn't resolve one — both fall back to the
+/// pre-existing unpinned URL shape.
 pub fn acp_mcp_servers(
     base: &str,
     thread: i32,
@@ -47,6 +67,7 @@ pub fn acp_mcp_servers(
     include_global: bool,
     include_curator: bool,
     include_computer: bool,
+    computer_wt: Option<i32>,
 ) -> Vec<crate::acp::McpServerSpec> {
     let mut out = Vec::new();
     // Concierge is global-only (no per-thread bus) — same as inject_global path.
@@ -77,7 +98,7 @@ pub fn acp_mcp_servers(
     if include_computer {
         out.push(crate::acp::McpServerSpec {
             name: "weft_computer".into(),
-            url: computer_url(base, thread, dir),
+            url: computer_url(base, thread, dir, computer_wt),
         });
     }
     out
@@ -289,11 +310,17 @@ pub fn inject_curator(base: &str, thread: i32, tool: &str, cwd: &Path) -> Inject
 /// override, opencode a deep-merge, ACP tools nothing (see `acp_mcp_servers`).
 /// Callers MUST gate this on `crate::computer::enabled(db)` themselves — this
 /// function injects unconditionally.
-pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Injection {
+///
+/// `wt` (issue #160 round-2 P2 §5): the calling worker's own worktree id —
+/// see [`computer_url`]'s doc. Every worker call site can resolve this (its
+/// own materialized worktree row is already in scope where it calls this
+/// function); the lead call site always passes `None` (a lead has no
+/// worktree — it runs out of its own scratch cwd).
+pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path, wt: Option<i32>) -> Injection {
     inject_mcp(
         "weft_computer",
         "computer",
-        &computer_url(base, thread, dir),
+        &computer_url(base, thread, dir, wt),
         tool,
         cwd,
     )
@@ -422,7 +449,7 @@ mod tests {
     fn computer_claude_writes_its_own_config() {
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", &dir);
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", &dir, None);
         assert_eq!(inj.args[0], "--mcp-config");
         let cfg = std::fs::read_to_string(dir.join(".weft-computer.mcp.json")).unwrap();
         assert!(cfg.contains("weft_computer") && cfg.contains("/computer/1/10/mcp"));
@@ -431,12 +458,35 @@ mod tests {
 
     #[test]
     fn computer_codex_uses_config_override() {
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Path::new("/tmp"));
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Path::new("/tmp"), None);
         assert_eq!(
             inj.args,
             vec![
                 "-c".to_string(),
                 "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp".to_string()
+            ]
+        );
+    }
+
+    /// issue #160 round-2 P2 §5: a resolved `wt` appends `?wt=<id>` to the
+    /// injected URL, for both the claude file-based injection and codex's
+    /// config-override flag.
+    #[test]
+    fn computer_wt_appends_the_query_param_for_claude_and_codex() {
+        let dir = std::env::temp_dir().join(format!("weft-inj-comp-wt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", &dir, Some(42));
+        assert_eq!(inj.args[0], "--mcp-config");
+        let cfg = std::fs::read_to_string(dir.join(".weft-computer.mcp.json")).unwrap();
+        assert!(cfg.contains("/computer/1/10/mcp?wt=42"), "{cfg}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Path::new("/tmp"), Some(42));
+        assert_eq!(
+            inj.args,
+            vec![
+                "-c".to_string(),
+                "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp?wt=42".to_string()
             ]
         );
     }
@@ -452,6 +502,7 @@ mod tests {
             false,
             false,
             true,
+            None,
         );
         assert!(with_computer.iter().any(|s| s.name == "weft_computer"
             && s.url == "http://127.0.0.1:9/computer/1/10/mcp"));
@@ -465,8 +516,28 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
         assert!(!without_computer.iter().any(|s| s.name == "weft_computer"));
+    }
+
+    /// issue #160 round-2 P2 §5: `computer_wt` forwards into the injected
+    /// `weft_computer` URL's `?wt=` query param for an ACP worker.
+    #[test]
+    fn acp_mcp_servers_computer_wt_pins_the_worktree_query_param() {
+        let with_wt = acp_mcp_servers(
+            "http://127.0.0.1:9",
+            1,
+            "10",
+            true,
+            false,
+            false,
+            false,
+            true,
+            Some(7),
+        );
+        assert!(with_wt.iter().any(|s| s.name == "weft_computer"
+            && s.url == "http://127.0.0.1:9/computer/1/10/mcp?wt=7"));
     }
 
     #[test]
