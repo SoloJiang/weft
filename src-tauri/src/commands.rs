@@ -2572,6 +2572,7 @@ pub fn bus_post_human(
 /// IM 设置视图：secret 只回是否已设置，不回明文（与 ImSettings::Debug 同纪律）。
 #[derive(serde::Serialize)]
 pub struct ImSettingsView {
+    pub provider: String,
     pub app_id: String,
     pub has_secret: bool,
     pub bound: bool,
@@ -2584,12 +2585,40 @@ pub struct ImSettingsView {
 pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
     let s = crate::im::ImSettings::load(&db).await.map_err(e)?;
     Ok(ImSettingsView {
+        provider: s.provider.as_str().to_string(),
         app_id: s.app_id,
         has_secret: !s.app_secret.is_empty(),
         bound: !s.allow_open_ids.is_empty(),
         enabled: s.enabled,
         remote_standby: s.remote_standby,
     })
+}
+
+async fn apply_im_credentials(
+    app: &tauri::AppHandle,
+    db: &Db,
+    provider: crate::im::ImProvider,
+    app_id: &str,
+    app_secret: &str,
+    enable: bool,
+    owner_id: Option<&str>,
+) -> anyhow::Result<()> {
+    repo::set_setting(db, crate::im::K_PROVIDER, provider.as_str()).await?;
+    repo::set_setting(db, provider.app_id_key(), app_id.trim()).await?;
+    if !app_secret.is_empty() {
+        repo::set_setting(db, provider.app_secret_key(), app_secret.trim()).await?;
+    }
+    if let Some(owner_id) = owner_id {
+        let owner_id = owner_id.trim();
+        if !owner_id.is_empty() {
+            repo::set_setting(db, provider.allow_key(), owner_id).await?;
+        }
+    }
+    if enable {
+        repo::set_setting(db, provider.enabled_key(), "1").await?;
+    }
+    crate::im::spawn(app.clone());
+    Ok(())
 }
 
 /// 写飞书凭证并重启桥。secret 空 = 保持原值(不覆盖已存密钥)。`enable=true` 时同时置
@@ -2606,20 +2635,29 @@ async fn apply_feishu_credentials(
     enable: bool,
     owner_open_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    repo::set_setting(db, crate::im::K_APP_ID, app_id.trim()).await?;
-    if !app_secret.is_empty() {
-        repo::set_setting(db, crate::im::K_APP_SECRET, app_secret.trim()).await?;
-    }
-    if let Some(oid) = owner_open_id {
-        let oid = oid.trim();
-        if !oid.is_empty() {
-            repo::set_setting(db, crate::im::K_ALLOW, oid).await?;
-        }
-    }
-    if enable {
-        repo::set_setting(db, crate::im::K_ENABLED, "1").await?;
-    }
-    crate::im::spawn(app.clone());
+    apply_im_credentials(
+        app,
+        db,
+        crate::im::ImProvider::Feishu,
+        app_id,
+        app_secret,
+        enable,
+        owner_open_id,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn im_set_provider(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    provider: String,
+) -> R<()> {
+    let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    repo::set_setting(&db, crate::im::K_PROVIDER, provider.as_str())
+        .await
+        .map_err(e)?;
+    crate::im::spawn(app);
     Ok(())
 }
 
@@ -2629,10 +2667,20 @@ async fn apply_feishu_credentials(
 pub async fn im_set_settings(
     app: tauri::AppHandle,
     db: State<'_, Db>,
+    provider: String,
     app_id: String,
     app_secret: String,
 ) -> R<()> {
-    apply_feishu_credentials(&app, &db, &app_id, &app_secret, false, None)
+    let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    apply_im_credentials(
+        &app,
+        &db,
+        provider,
+        &app_id,
+        &app_secret,
+        false,
+        None,
+    )
         .await
         .map_err(e)
 }
@@ -2640,8 +2688,21 @@ pub async fn im_set_settings(
 /// 开关桥：写 enabled 标志并重启。off = 断开但保留凭证；on = 凭证齐全则连接
 /// （缺凭证时置 disabled，等用户在已展开的表单里补齐再保存）。
 #[tauri::command]
-pub async fn im_set_enabled(app: tauri::AppHandle, db: State<'_, Db>, enabled: bool) -> R<()> {
-    repo::set_setting(&db, crate::im::K_ENABLED, if enabled { "1" } else { "0" })
+pub async fn im_set_enabled(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    provider: String,
+    enabled: bool,
+) -> R<()> {
+    let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    repo::set_setting(&db, crate::im::K_PROVIDER, provider.as_str())
+        .await
+        .map_err(e)?;
+    repo::set_setting(
+        &db,
+        provider.enabled_key(),
+        if enabled { "1" } else { "0" },
+    )
         .await
         .map_err(e)?;
     crate::im::spawn(app);

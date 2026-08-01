@@ -153,6 +153,93 @@ pub fn human_cancelled_card(lang: &str) -> Value {
     })
 }
 
+/// 钉钉基础机器人消息没有飞书 reply-parent / 可 patch 卡片的稳定等价物。
+/// 因此权限与提问都携带完整、显式、可复制的命令；detail 用纯文本拼接，避免
+/// markdown 把真实命令渲染成另一种含义。
+pub fn dingtalk_permission_text(ask: &crate::ask::Ask, lang: &str) -> String {
+    let title = if ask.thread_title.is_empty() {
+        "weft"
+    } else {
+        &ask.thread_title
+    };
+    let who = if ask.dir_name.is_empty() {
+        ask.tool.clone()
+    } else {
+        format!("{} · {}", ask.dir_name, ask.tool)
+    };
+    format!(
+        "{} · {title}\n{}\n{who}\n\n{}\n\n{}\n/allow {}\n/deny {}\n/always {}\n/full {}",
+        t(lang, "权限请求", "Permission ask"),
+        clamp(&ask.summary, 200),
+        clamp(&ask.detail, 3000),
+        t(lang, "复制一条命令回复：", "Reply with one command:",),
+        ask.id,
+        ask.id,
+        ask.id,
+        ask.id,
+    )
+}
+
+pub fn dingtalk_permission_resolved_text(summary: &str, verdict: &str, lang: &str) -> String {
+    let label = match verdict {
+        "allow" => t(lang, "已允许 ✓", "Allowed ✓"),
+        "always" => t(lang, "已允许（总是）✓", "Always-allowed ✓"),
+        "full" => t(lang, "已放行（任务全权）✓", "Full access ✓"),
+        "deny" => t(lang, "已拒绝 ✕", "Denied ✕"),
+        "cancelled" => t(lang, "已过期（回落工具自答）", "Expired (tool fallback)"),
+        _ => t(lang, "已处理", "Resolved"),
+    };
+    if summary.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label}\n{}", clamp(summary, 200))
+    }
+}
+
+pub fn dingtalk_human_question_text(
+    thread_id: i32,
+    ask_id: u64,
+    thread_title: &str,
+    from: &str,
+    text: &str,
+    lang: &str,
+) -> String {
+    format!(
+        "{} · {}\n{}\n{}\n\n{}\n/answer {thread_id} {ask_id} {}",
+        t(lang, "agent 提问", "Agent question"),
+        thread_title,
+        from,
+        clamp(text, 3000),
+        t(
+            lang,
+            "把末尾的 <回答> 替换成你的答复：",
+            "Replace <answer> with your reply:",
+        ),
+        t(lang, "<回答>", "<answer>"),
+    )
+}
+
+pub fn dingtalk_human_resolved_text(answer: &str, lang: &str) -> String {
+    if answer.is_empty() {
+        t(lang, "提问已回答 ✓", "Question answered ✓").to_string()
+    } else {
+        format!(
+            "{}\n{}{}",
+            t(lang, "提问已回答 ✓", "Question answered ✓"),
+            t(lang, "答：", "Answer: "),
+            clamp(answer, 1000)
+        )
+    }
+}
+
+pub fn dingtalk_human_cancelled_text(lang: &str) -> &'static str {
+    t(
+        lang,
+        "提问已取消：对应 workspace 已删除。",
+        "Question cancelled: its workspace was deleted.",
+    )
+}
+
 /// M2-4：lead/Concierge 回流飞书话题的纯文本渲染。前缀「Lead：/Lead: 」
 /// 让人在话题里一眼区分「自己说的」vs「agent 说的」（飞书话题里不显示
 /// 发送方的角色徽章——bot 名字默认折叠成应用名）。空 body 不上桥，由
@@ -325,6 +412,31 @@ mod tests {
         assert!(s.contains("答：major"));
         let s = human_resolved_card("major", "en").to_string();
         assert!(s.contains("Answer: major"));
+    }
+
+    #[test]
+    fn dingtalk_prompts_use_explicit_deterministic_commands() {
+        let permission = dingtalk_permission_text(&ask(), "zh");
+        assert!(permission.contains("/allow 42"));
+        assert!(permission.contains("/deny 42"));
+        assert!(permission.contains("/always 42"));
+        assert!(permission.contains("/full 42"));
+
+        let human =
+            dingtalk_human_question_text(7, 9, "登录超时修复", "backend", "major or minor?", "en");
+        assert!(human.contains("/answer 7 9 <answer>"));
+        assert!(human.contains("major or minor?"));
+    }
+
+    #[test]
+    fn dingtalk_resolution_copy_matches_answer_protocol() {
+        use crate::ask::Answer;
+        assert!(
+            dingtalk_permission_resolved_text("x", Answer::Always.as_str(), "zh")
+                .contains("已允许（总是）")
+        );
+        assert!(dingtalk_human_resolved_text("minor", "en").contains("Answer: minor"));
+        assert!(dingtalk_human_cancelled_text("zh").contains("已取消"));
     }
 
     #[test]

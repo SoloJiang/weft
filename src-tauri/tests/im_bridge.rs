@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 use weft::ask::{Answer, AskRegistry, Decision, RiskLevel};
 use weft::bus::BusRegistry;
-use weft::im::{self, inbound::Route, Channel};
+use weft::im::{self, inbound::Route, Channel, ImProvider};
 use weft::store::repo;
 use weft::store::Db;
 
@@ -172,6 +172,51 @@ async fn answer_human_route_lands_in_asker_inbox() {
     assert_eq!(inbox.len(), 1);
     assert_eq!(inbox[0].text, "minor");
     assert_eq!(inbox[0].from, "you");
+}
+
+#[tokio::test]
+async fn dingtalk_bind_route_persists_native_thread_channel() {
+    let db = mem_db().await;
+    let (asks, bus, ch) = (
+        AskRegistry::new(),
+        BusRegistry::new(),
+        FakeChannel::default(),
+    );
+    let workspace = repo::create_workspace(&db, "product").await.unwrap();
+    let issue = repo::create_thread(&db, workspace.id, "ship it", "feature", "codex")
+        .await
+        .unwrap();
+    let route = Route::BindIssueThread {
+        thread_id: issue.id,
+        chat_id: "cid_group".into(),
+        im_thread_ref: "convThreadEncrypted".into(),
+        seed_message_id: "msg_bind".into(),
+    };
+
+    im::execute_for_provider(
+        route,
+        &db,
+        &asks,
+        &bus,
+        &ch,
+        ImProvider::DingTalk,
+        "staff_owner",
+        "zh",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let bound = repo::im_route_of_thread(&db, issue.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bound.channel, "dingtalk");
+    assert_eq!(bound.chat_id, "cid_group");
+    assert_eq!(bound.im_thread_ref, "convThreadEncrypted");
+    assert_eq!(ch.replies.lock().unwrap()[0].0, "msg_bind");
+    assert!(ch.replies.lock().unwrap()[0].1.contains("钉钉 thread"));
 }
 
 #[tokio::test]

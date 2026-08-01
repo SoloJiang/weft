@@ -385,6 +385,7 @@ pub fn run() {
             commands::set_skill_enabled,
             commands::workspace_skills,
             commands::im_get_settings,
+            commands::im_set_provider,
             commands::im_set_settings,
             commands::im_set_enabled,
             commands::im_set_remote_standby,

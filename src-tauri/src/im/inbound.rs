@@ -1,8 +1,8 @@
 //! 入站路由（spec §4 顺序判定）：归一化事件 → Route。纯函数、无 IO、无 LLM。
-//! 当前覆盖 owner 绑定、卡片回复/按钮路由、issue 话题绑定、话题消息与 Concierge 私聊。
+//! 当前覆盖 owner 绑定、卡片回复/按钮路由、provider thread 绑定、thread 消息与 Concierge 私聊。
 
 use crate::ask::Answer;
-use crate::im::{CardIndex, ReplyTarget};
+use crate::im::{CardIndex, ImProvider, ReplyTarget};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Inbound {
@@ -15,8 +15,8 @@ pub enum Inbound {
     Text {
         sender_open_id: String,
         chat_type: String,         // "p2p" | "group"
-        chat_id: String,           // 飞书群/单聊 id（群路由用，M2-3）
-        thread_id: Option<String>, // 飞书话题 id（群里 issue 话题用，M2-3）
+        chat_id: String,           // provider 群/单聊 id（群路由用，M2-3）
+        thread_id: Option<String>, // provider 原生 thread/topic id
         message_id: String,
         parent_id: Option<String>,
         text: String,
@@ -36,9 +36,9 @@ pub enum Route {
         chat_id: String,
         text: String,
     },
-    /// 已绑定 owner 在飞书群话题里发送 `/bind <thread_id>`，把当前飞书
-    /// 话题绑定到指定 Weft issue。群消息仍不能绑定 owner；只有 allowlist
-    /// 中的 sender 可以改 issue↔话题路由。
+    /// 已绑定 owner 在 provider thread 里发送 `/bind <thread_id>`，把当前
+    /// thread 绑定到指定 Weft issue。群消息仍不能绑定 owner；只有 allowlist
+    /// 中的 sender 可以改 issue↔thread 路由。
     BindIssueThread {
         thread_id: i32,
         chat_id: String,
@@ -66,7 +66,12 @@ pub enum Route {
     },
     /// 回复了权限卡但动词解析不出 → 回用法提示。
     BadVerdict,
-    /// 飞书话题里给已绑定 issue 的自由文本 → 灌进 lead engine。
+    /// 显式 `/answer <issue-id> <ask-id> <text>` 缺参数或 id 非法。
+    BadHumanAnswer,
+    /// 当前消息不在可绑定的 provider thread 中，或 provider 的机器人 API
+    /// 不能可靠创建并返回新 thread id；引导用户先进入原生 thread 再绑定。
+    IssueThreadRequired,
+    /// provider thread 里给已绑定 issue 的自由文本 → 灌进 lead engine。
     /// 解析路径在 inbound 之外：执行侧用 (chat_id, im_thread_ref) 查 im_route。
     IssueMessage {
         chat_id: String,
@@ -105,21 +110,82 @@ fn as_ask_id(v: &serde_json::Value) -> Option<u64> {
 
 fn parse_bind_issue(text: &str) -> Option<i32> {
     let mut parts = text.split_whitespace();
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some("/bind"), Some(id), None) => id.parse::<i32>().ok().filter(|n| *n > 0),
+    let command = parts.next()?.to_ascii_lowercase();
+    match (command.as_str(), parts.next(), parts.next()) {
+        ("/bind", Some(id), None) => id.parse::<i32>().ok().filter(|n| *n > 0),
         _ => None,
     }
 }
 
 fn parse_topic_issue(text: &str) -> Option<i32> {
     let mut parts = text.split_whitespace();
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some("/topic" | "/issue"), Some(id), None) => id.parse::<i32>().ok().filter(|n| *n > 0),
+    let command = parts.next()?.to_ascii_lowercase();
+    match (command.as_str(), parts.next(), parts.next()) {
+        ("/topic" | "/issue", Some(id), None) => id.parse::<i32>().ok().filter(|n| *n > 0),
         _ => None,
     }
 }
 
+fn first_command(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .next()
+        .map(|part| part.to_ascii_lowercase())
+}
+
+fn parse_permission_command(text: &str) -> Option<(u64, Answer)> {
+    let mut parts = text.split_whitespace();
+    let answer = match parts.next()?.to_ascii_lowercase().as_str() {
+        "/allow" => Answer::Allow,
+        "/deny" => Answer::Deny,
+        "/always" => Answer::Always,
+        "/full" => Answer::Full,
+        _ => return None,
+    };
+    let ask_id = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((ask_id, answer))
+}
+
+fn is_permission_command(text: &str) -> bool {
+    matches!(
+        text.split_whitespace()
+            .next()
+            .map(|part| part.to_ascii_lowercase()),
+        Some(command)
+            if matches!(command.as_str(), "/allow" | "/deny" | "/always" | "/full")
+    )
+}
+
+fn parse_human_answer_command(text: &str) -> Option<(i32, u64, String)> {
+    let mut parts = text.split_whitespace();
+    if parts.next()?.to_ascii_lowercase() != "/answer" {
+        return None;
+    }
+    let thread = parts.next()?.parse::<i32>().ok().filter(|id| *id > 0)?;
+    let ask_id = parts.next()?.parse::<u64>().ok()?;
+    let answer = parts.collect::<Vec<_>>().join(" ");
+    if answer.is_empty() {
+        return None;
+    }
+    Some((thread, ask_id, answer))
+}
+
+fn is_human_answer_command(text: &str) -> bool {
+    first_command(text).as_deref() == Some("/answer")
+}
+
 pub fn route(inb: &Inbound, allow: &[String], cards: &CardIndex) -> Route {
+    route_for_provider(inb, allow, cards, ImProvider::Feishu)
+}
+
+pub fn route_for_provider(
+    inb: &Inbound,
+    allow: &[String],
+    cards: &CardIndex,
+    provider: ImProvider,
+) -> Route {
     match inb {
         Inbound::Action {
             operator_open_id,
@@ -155,14 +221,42 @@ pub fn route(inb: &Inbound, allow: &[String], cards: &CardIndex) -> Route {
             parent_id,
             text,
         } => {
-            // 群消息：不能绑定 owner。话题内 `/bind <thread_id>` 只有已绑定
-            // owner 可用；其余话题消息由执行侧用 (chat_id, thread_id) 查
-            // im_route 决定路由。话题外群消息一律忽略（避免引入「机器人 @」
-            // 触发这种不在 spec 内的入口）。
+            let sender_allowed = allow.iter().any(|a| a == sender_open_id);
+            if sender_allowed {
+                if let Some((ask_id, answer)) = parse_permission_command(text) {
+                    return Route::AnswerPerm { ask_id, answer };
+                }
+                if is_permission_command(text) {
+                    return Route::BadVerdict;
+                }
+                if let Some((thread, ask_id, text)) = parse_human_answer_command(text) {
+                    return Route::AnswerHuman {
+                        thread,
+                        ask_id,
+                        text,
+                    };
+                }
+                if is_human_answer_command(text) {
+                    return Route::BadHumanAnswer;
+                }
+            }
+            // 群消息：不能绑定 owner。原生 thread 内 `/bind <thread_id>` 只有
+            // 已绑定 owner 可用；其余 thread 消息由执行侧用 (chat_id,
+            // thread_id) 查 im_route 决定路由。
             if chat_type != "p2p" {
+                let command = first_command(text);
+                // 钉钉支持话题圈/串聊，但企业机器人的发送接口不能可靠返回
+                // 新建 thread 的 openConvThreadId。不要把普通 conversationId
+                // 伪装成 thread；要求用户先在钉钉进入真实 thread 再 `/bind`。
+                if provider == ImProvider::DingTalk
+                    && sender_allowed
+                    && matches!(command.as_deref(), Some("/topic" | "/issue"))
+                {
+                    return Route::IssueThreadRequired;
+                }
                 return match thread_id {
                     Some(tref) => {
-                        if text.split_whitespace().next() == Some("/bind") {
+                        if command.as_deref() == Some("/bind") {
                             if allow.iter().any(|a| a == sender_open_id) {
                                 if let Some(thread_id) = parse_bind_issue(text) {
                                     return Route::BindIssueThread {
@@ -193,8 +287,12 @@ pub fn route(inb: &Inbound, allow: &[String], cards: &CardIndex) -> Route {
                                     reply_to: message_id.clone(),
                                 };
                             }
-                            if text.split_whitespace().next() == Some("/bind") {
-                                return Route::Ignore;
+                            if command.as_deref() == Some("/bind") {
+                                return if provider == ImProvider::DingTalk {
+                                    Route::IssueThreadRequired
+                                } else {
+                                    Route::Ignore
+                                };
                             }
                             Route::FreeText {
                                 sender_open_id: sender_open_id.clone(),
@@ -216,7 +314,7 @@ pub fn route(inb: &Inbound, allow: &[String], cards: &CardIndex) -> Route {
                     text: text.clone(),
                 };
             }
-            if !allow.iter().any(|a| a == sender_open_id) {
+            if !sender_allowed {
                 return Route::Ignore;
             }
             if let Some(pid) = parent_id {
@@ -330,6 +428,59 @@ mod tests {
                 &cards()
             ),
             Route::BadVerdict
+        );
+    }
+
+    #[test]
+    fn explicit_permission_commands_work_without_reply_parent() {
+        let allow = vec!["ou_me".to_string()];
+        assert_eq!(
+            route_for_provider(
+                &text("ou_me", None, "/allow 42"),
+                &allow,
+                &cards(),
+                ImProvider::DingTalk,
+            ),
+            Route::AnswerPerm {
+                ask_id: 42,
+                answer: Answer::Allow,
+            }
+        );
+        assert_eq!(
+            route_for_provider(
+                &text("ou_me", None, "/full nope"),
+                &allow,
+                &cards(),
+                ImProvider::DingTalk,
+            ),
+            Route::BadVerdict
+        );
+    }
+
+    #[test]
+    fn explicit_human_answer_command_carries_thread_and_text() {
+        let allow = vec!["ou_me".to_string()];
+        assert_eq!(
+            route_for_provider(
+                &text("ou_me", None, "/answer 7 9 ship minor"),
+                &allow,
+                &cards(),
+                ImProvider::DingTalk,
+            ),
+            Route::AnswerHuman {
+                thread: 7,
+                ask_id: 9,
+                text: "ship minor".into(),
+            }
+        );
+        assert_eq!(
+            route_for_provider(
+                &text("ou_me", None, "/answer 7 9"),
+                &allow,
+                &cards(),
+                ImProvider::DingTalk,
+            ),
+            Route::BadHumanAnswer
         );
     }
 
@@ -451,6 +602,57 @@ mod tests {
             text: "/bind 7".into(),
         };
         assert_eq!(route(&stranger, &allow, &cards()), Route::Ignore);
+    }
+
+    #[test]
+    fn dingtalk_real_thread_can_bind_but_plain_group_cannot_fake_one() {
+        let allow = vec!["staff_owner".to_string()];
+        let bind = Inbound::Text {
+            sender_open_id: "staff_owner".into(),
+            chat_type: "group".into(),
+            chat_id: "cid_group".into(),
+            thread_id: Some("convThreadEncrypted".into()),
+            message_id: "msg_bind".into(),
+            parent_id: None,
+            text: "/bind 7".into(),
+        };
+        assert_eq!(
+            route_for_provider(&bind, &allow, &cards(), ImProvider::DingTalk),
+            Route::BindIssueThread {
+                thread_id: 7,
+                chat_id: "cid_group".into(),
+                im_thread_ref: "convThreadEncrypted".into(),
+                seed_message_id: "msg_bind".into(),
+            }
+        );
+
+        let topic = Inbound::Text {
+            sender_open_id: "staff_owner".into(),
+            chat_type: "group".into(),
+            chat_id: "cid_group".into(),
+            thread_id: None,
+            message_id: "msg_topic".into(),
+            parent_id: None,
+            text: "/topic 7".into(),
+        };
+        assert_eq!(
+            route_for_provider(&topic, &allow, &cards(), ImProvider::DingTalk),
+            Route::IssueThreadRequired
+        );
+
+        let plain_group_bind = Inbound::Text {
+            sender_open_id: "staff_owner".into(),
+            chat_type: "group".into(),
+            chat_id: "cid_group".into(),
+            thread_id: None,
+            message_id: "msg_bind".into(),
+            parent_id: None,
+            text: "/bind 7".into(),
+        };
+        assert_eq!(
+            route_for_provider(&plain_group_bind, &allow, &cards(), ImProvider::DingTalk),
+            Route::IssueThreadRequired
+        );
     }
 
     #[test]

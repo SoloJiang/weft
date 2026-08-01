@@ -435,16 +435,19 @@ export const api = {
     invoke<void>("flag_lead_skill_refresh", { threadId }),
   imGetSettings: () =>
     invoke<{
+      provider: "feishu" | "dingtalk";
       app_id: string;
       has_secret: boolean;
       bound: boolean;
       enabled: boolean;
       remote_standby: boolean;
     }>("im_get_settings"),
-  imSetSettings: (appId: string, appSecret: string) =>
-    invoke<void>("im_set_settings", { appId, appSecret }),
-  imSetEnabled: (enabled: boolean) =>
-    invoke<void>("im_set_enabled", { enabled }),
+  imSetProvider: (provider: "feishu" | "dingtalk") =>
+    invoke<void>("im_set_provider", { provider }),
+  imSetSettings: (provider: "feishu" | "dingtalk", appId: string, appSecret: string) =>
+    invoke<void>("im_set_settings", { provider, appId, appSecret }),
+  imSetEnabled: (provider: "feishu" | "dingtalk", enabled: boolean) =>
+    invoke<void>("im_set_enabled", { provider, enabled }),
   imSetRemoteStandby: (enabled: boolean) =>
     invoke<void>("im_set_remote_standby", { enabled }),
   imStatus: () => invoke<string>("im_status"),
