@@ -10,6 +10,7 @@ use crate::store::entities::lead_message;
 use crate::store::{repo, Db};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -2531,6 +2532,67 @@ fn advance_dequeued_turn(inner: &mut EngineInner, next: &Option<Outgoing>) {
     inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
 }
 
+/// issue #160 round-8 P1 #2: a process-local, unpredictable nonce appended to
+/// the codex app-server attachment spill's own file name (`send`'s image-spill
+/// loop, below) — mirrors round-7 P1's identical fix for the per-hook-call
+/// attachment path. `AtomicU64`, not per-call randomness: cheap, monotonic,
+/// and unique for the life of this process, which is all "a co-resident
+/// process can't pre-place a same-named symlink before this write runs"
+/// needs — the write itself also goes through `create_new` (O_EXCL), so even
+/// a GUESSED name would still be refused; the nonce just makes guessing
+/// itself infeasible in the first place.
+static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// issue #160 round-8 P1 #2: write a codex app-server image attachment to `p`
+/// guarded against a pre-placed symlink/existing file at that exact path —
+/// mirrors `computer::screenshot_window`'s own no-follow/exclusive/owner-only
+/// write for the identical "a background process on this account swaps the
+/// target the instant before Weft writes it" hazard (round-7 P1 fixed the
+/// analogous per-hook-call attachment path the same way). `create_new`
+/// (O_EXCL) refuses to write through anything already at `p` (the caller's
+/// own `ATTACH_SEQ` nonce means this never spuriously collides with a prior,
+/// legitimate attachment of this process's own); `O_NOFOLLOW` refuses to
+/// follow a symlink leaf even if one raced into place after `create_dir_all`
+/// but before this call. `mode(0o600)` keeps the file owner-only from the
+/// moment of creation. Returns `false` (never panics) on ANY failure —
+/// best-effort, mirroring the plain `std::fs::write(...).is_ok()` this
+/// replaces for the codex app-server branch: a skipped image must never fail
+/// the whole chat turn, it just means that one attachment doesn't make it
+/// into this turn.
+///
+/// RESIDUAL (documented, not closed here — mirrors round-7 P1's own note, and
+/// issue #160 §9's broader TOCTOU tracking): after this call returns and the
+/// file handle closes, a SAME-UID process can still `readdir` the (shared)
+/// spill directory, discover the real (nonce-bearing) file name, and swap it
+/// for a symlink before the codex app-server PROCESS ITSELF later opens
+/// `local_image_paths` to build its own `turn/start` payload — this closes
+/// the window up through THIS write, not the separate one between this write
+/// and codex's own later read. Fully closing that needs codex itself to
+/// either accept raw bytes (never a path at all) or open with its own
+/// `O_NOFOLLOW` — neither is in this codebase's control.
+#[cfg(unix)]
+fn write_attachment_no_follow(p: &std::path::Path, bytes: &[u8]) -> bool {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opt = std::fs::OpenOptions::new();
+    opt.write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    match opt.open(p) {
+        Ok(mut f) => f.write_all(bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Non-unix fallback: the pre-existing plain write — owner-only/no-follow
+/// hardening is a unix-only concept this crate can portably act on (see this
+/// function's own `#[cfg(unix)]` sibling above).
+#[cfg(not(unix))]
+fn write_attachment_no_follow(p: &std::path::Path, bytes: &[u8]) -> bool {
+    std::fs::write(p, bytes).is_ok()
+}
+
 /// Send a human message: optimistic-persist + either write through or queue.
 /// `images` ride the outbound message as base64 blocks; `files` are appended
 /// as plain paths (the agent reads them with its own tools).
@@ -2812,12 +2874,41 @@ pub async fn send(
         use base64::Engine as _;
         let dir = std::env::temp_dir().join("weft-attachments");
         let _ = std::fs::create_dir_all(&dir);
+        // issue #160 round-8 P1 #2: best-effort tighten the shared spill
+        // directory to owner-only — defense in depth alongside the per-file
+        // hardening below, for the identical "shared tmp dir, permissive
+        // process umask" hazard `computer::screenshot_window` also closes.
+        // Best-effort: a failure here (already-wrong ownership, a read-only
+        // mount, non-unix) never blocks the spill itself.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
         outbound.push_str("\n\nAttached images (read them as needed):\n");
         for (i, (mt, data)) in images.iter().enumerate() {
             let ext = mt.rsplit('/').next().unwrap_or("png");
-            let p = dir.join(format!("msg{row_id}-{i}.{ext}"));
+            // issue #160 round-8 P1 #2: ONLY the codex app-server branch gets
+            // the hardened name+write below — that's the ONLY transport that
+            // later hands this exact path to the agent as a first-class
+            // `localImage` turn/start input (`is_codex_appserver` branch just
+            // below); every OTHER per-turn dialect only ever lists the path
+            // in TEXT for the agent to read itself with its own tools, a
+            // materially different (and lower-severity) exposure this round
+            // leaves as-is, mirroring round-7 P1's own scoping.
+            let p = if is_codex_appserver {
+                let seq = ATTACH_SEQ.fetch_add(1, Ordering::SeqCst);
+                dir.join(format!("msg{row_id}-{i}-{seq}.{ext}"))
+            } else {
+                dir.join(format!("msg{row_id}-{i}.{ext}"))
+            };
             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
-                if std::fs::write(&p, bytes).is_ok() {
+                let written = if is_codex_appserver {
+                    write_attachment_no_follow(&p, &bytes)
+                } else {
+                    std::fs::write(&p, &bytes).is_ok()
+                };
+                if written {
                     outbound.push_str(&format!("- {}\n", p.display()));
                     // app-server transport ALSO gets these as first-class
                     // `localImage` input items on turn/start (codex_app_server::
@@ -8871,6 +8962,62 @@ fn emit_lead_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // —— issue #160 round-8 P1 #2: hardened codex app-server attachment write ——
+
+    /// The happy path: a brand-new path (nothing there yet) writes normally.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_writes_a_fresh_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("msg1-0-123.png");
+        assert!(write_attachment_no_follow(&p, b"hello"));
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::symlink_metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "must be created owner-only");
+    }
+
+    /// The exact race this fix exists to close: something (a co-resident
+    /// process, standing in for an attacker) has ALREADY placed a symlink at
+    /// the exact path this function is about to write to, pointing at an
+    /// unrelated file elsewhere. `create_new` + `O_NOFOLLOW` must refuse to
+    /// write through it — the call must fail closed (return `false`) and the
+    /// symlink's target must be left untouched, never overwritten with the
+    /// attacker's chosen bytes appearing to have been "written by weft".
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_refuses_a_preexisting_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("victim.png");
+        std::fs::write(&target, b"original").unwrap();
+        let p = tmp.path().join("msg1-0-456.png");
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+
+        let ok = write_attachment_no_follow(&p, b"attacker-controlled");
+        assert!(!ok, "a pre-placed symlink must make this fail, not follow it");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"original",
+            "the symlink's target must never be overwritten"
+        );
+    }
+
+    /// A plain, pre-existing (non-symlink) file at the target path must also
+    /// be refused — `create_new` (O_EXCL) is what closes this, distinct from
+    /// the symlink case above but the same "never write through something
+    /// already there" discipline.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_refuses_an_existing_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("msg1-0-789.png");
+        std::fs::write(&p, b"already here").unwrap();
+
+        let ok = write_attachment_no_follow(&p, b"new bytes");
+        assert!(!ok, "an already-existing file must make this fail, not overwrite it");
+        assert_eq!(std::fs::read(&p).unwrap(), b"already here");
+    }
 
     /// Stop must actually stop. `interrupt()` sets `interrupting` without
     /// bumping the epoch, so a Stop landing between `on_turn_end` promoting a

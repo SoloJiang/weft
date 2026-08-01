@@ -1593,11 +1593,14 @@ pub async fn get_computer_use_enabled(db: State<'_, Db>) -> R<bool> {
 /// would still (wrongly) clear the latch using a now-stale expectation, and
 /// a more-recent, explicit Stop would be silently undone by an
 /// earlier-issued enable request that only just now finished its own I/O.
-#[tauri::command]
-pub async fn set_computer_use_enabled(db: State<'_, Db>, enabled: bool) -> R<()> {
+///
+/// Kept as a free function taking `&Db` (rather than `State<'_, Db>`) so a
+/// test can drive it without a Tauri runtime — same pattern as
+/// `ensure_default_workspace_inner`.
+pub async fn set_computer_use_enabled_inner(db: &Db, enabled: bool) -> R<()> {
     let gen = enabled.then(crate::computer::stop_generation);
     repo::set_setting(
-        &db,
+        db,
         crate::computer::K_COMPUTER_USE_ENABLED,
         if enabled { "true" } else { "false" },
     )
@@ -1617,9 +1620,41 @@ pub async fn set_computer_use_enabled(db: State<'_, Db>, enabled: bool) -> R<()>
     // reads `gen` as `None` and never calls this at all, unchanged from
     // before.
     if let Some(g) = gen {
-        crate::computer::clear_emergency_stop(g);
+        reconcile_enable_after_write(db, g).await?;
     }
     Ok(())
+}
+
+/// issue #160 round-8 P1 #1: `clear_emergency_stop` returning `false` means a
+/// LATER `emergency_stop` raced in while `set_computer_use_enabled_inner`'s
+/// own write (above) was still in flight — the in-memory latch (correctly)
+/// stays tripped, but the DB row this function's caller just wrote is now
+/// stuck at `"true"`. Left alone, that is a ticking time bomb: the latch is
+/// only process-lifetime state, so the NEXT launch resets it to "clear" and
+/// reads that stale `"true"` straight back off disk, silently reviving
+/// computer use and undoing a Stop that was explicitly more recent than this
+/// enable request. Compensating by writing `"false"` back here closes that
+/// gap — this enable request simply never takes effect (the same outcome a
+/// human watching the toggle would want: the later, explicit Stop wins), and
+/// `computer::enabled` already reads the in-memory latch first regardless, so
+/// nothing observes the DB's momentary `"true"` in between.
+///
+/// Split out from `set_computer_use_enabled_inner` purely so a test can drive
+/// this reconciliation step directly against a manufactured stale/current
+/// generation pair — reproducing the actual race with genuine concurrency
+/// against an in-memory sqlite connection is not reliable to assert on.
+async fn reconcile_enable_after_write(db: &Db, gen: u64) -> R<()> {
+    if !crate::computer::clear_emergency_stop(gen) {
+        repo::set_setting(db, crate::computer::K_COMPUTER_USE_ENABLED, "false")
+            .await
+            .map_err(e)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_computer_use_enabled(db: State<'_, Db>, enabled: bool) -> R<()> {
+    set_computer_use_enabled_inner(&db, enabled).await
 }
 
 /// issue #160 M2: the current computer-use control holder, if any — the
@@ -4027,5 +4062,84 @@ mod tests {
             !merge_backoff.is_exhausted(pr.id, &pr.head_sha),
             "Retry must also clear host::automerge's OWN merge-attempt backoff, not just host::monitor's probe_fail_count"
         );
+    }
+
+    // —— issue #160 round-8 P1 #1: stale enable vs. a later Stop ——
+
+    /// The no-race baseline: `set_computer_use_enabled_inner(true)` persists
+    /// `"true"` and clears the latch when nothing else touched the
+    /// stop-generation in between.
+    #[tokio::test]
+    async fn set_computer_use_enabled_inner_persists_and_clears_the_latch_with_no_race() {
+        let _guard = crate::computer::process_state_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        set_computer_use_enabled_inner(&db, true).await.unwrap();
+
+        assert_eq!(
+            repo::get_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED).await.unwrap().as_deref(),
+            Some("true")
+        );
+        assert!(crate::computer::enabled(&db).await);
+
+        // Leave the shared process-wide latch clean for every other test.
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+    }
+
+    /// issue #160 round-8 P1 #1: reproduces the exact race the compensating
+    /// write exists to close. `set_computer_use_enabled_inner` reads the
+    /// stop-generation BEFORE its own `set_setting` write starts — here,
+    /// `stale_gen` stands in for that read. A real `emergency_stop` then
+    /// lands WHILE that write is (conceptually) still in flight, persisting
+    /// `"false"` and bumping the generation; the enable's own write then
+    /// finishes and overwrites the row back to `"true"`. When the enable
+    /// request now tries to reconcile with its (now stale) generation,
+    /// `clear_emergency_stop` must refuse (the later Stop wins) — and per
+    /// round-8 P1 #1, `reconcile_enable_after_write` must compensate by
+    /// writing `"false"` back, so a restart (which resets the in-memory
+    /// latch) doesn't read the stale `"true"` and silently revive computer
+    /// use, undoing the more recent, explicit Stop.
+    #[tokio::test]
+    async fn reconcile_enable_after_write_compensates_when_a_later_stop_wins_the_race() {
+        let _guard = crate::computer::process_state_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        // The enable request reads the generation BEFORE its own write starts.
+        let stale_gen = crate::computer::stop_generation();
+
+        // A real Stop lands WHILE that write is "in flight" — bumps the
+        // generation and persists "false".
+        crate::computer::emergency_stop(&db).await.unwrap();
+        assert!(!crate::computer::enabled(&db).await, "the stop must win immediately");
+
+        // The enable's own (slow) write now finishes, overwriting the row
+        // back to "true" — exactly what `set_computer_use_enabled_inner`'s
+        // `set_setting` call does, unconditionally, before it ever looks at
+        // `clear_emergency_stop`'s result.
+        repo::set_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED, "true")
+            .await
+            .unwrap();
+
+        // The enable now tries to reconcile with its STALE generation.
+        reconcile_enable_after_write(&db, stale_gen).await.unwrap();
+
+        assert_eq!(
+            repo::get_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED).await.unwrap().as_deref(),
+            Some("false"),
+            "the compensating write must land \"false\" back, not leave the stale \"true\" on disk"
+        );
+        assert!(
+            !crate::computer::enabled(&db).await,
+            "both the latch AND the persisted setting must agree the later Stop won"
+        );
+
+        // Leave the shared process-wide latch clean for every other test.
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
     }
 }

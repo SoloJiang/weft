@@ -284,7 +284,16 @@ async fn run_action(
     // looked at: a standing grant decides silently, otherwise this blocks on
     // a Needs-you card exactly like `bus::server::handle_ask` does for every
     // other tool call in this crate.
-    approve(asks, thread, dir, action, args).await?;
+    //
+    // issue #160 round-8 P1 #4: `approved` is the window identity `approve`
+    // itself resolved AUTHORITATIVELY at the moment it authorized this call,
+    // for a Write (input) action with a window argument — `None` for every
+    // observe action and for `wait`. Every input arm below threads this
+    // through its OWN later, fresh `resolve_window` via
+    // `verify_approved_target`, right before it activates/injects — see that
+    // function's own doc for the "approve one window, dispatch to a
+    // different one" gap this closes.
+    let approved = approve(asks, thread, dir, action, args).await?;
     // issue #160 round-2 P1 §1: re-check the kill switch AFTER the approval
     // await returns — NOT just once, up top, before that (potentially very
     // long, up to `bus::server::ASK_WAIT`) wait began. A human can hit Stop
@@ -409,6 +418,11 @@ async fn run_action(
             let w = computer::resolve_window(backend::backend().as_ref(), window_query)
                 .map_err(|e| e.to_string())?;
             *window_id_out = Some(w.id);
+            // issue #160 round-8 P1 #4: this window must still be the EXACT
+            // one `approve` bound at authorization time — see
+            // `verify_approved_target`'s own doc. Checked BEFORE this window
+            // is ever activated or clicked.
+            verify_approved_target(&approved, &w)?;
             let (px, py) = computer::map_to_physical(&w, cx, cy).map_err(|e| e.to_string())?;
             // issue #160 round-4 P1 §2 (broadened round-5 review P1 §6): reclaim
             // the foreground BEFORE this click reaches the OS, not after — see
@@ -448,6 +462,8 @@ async fn run_action(
             let w = computer::resolve_window(backend::backend().as_ref(), window_query)
                 .map_err(|e| e.to_string())?;
             *window_id_out = Some(w.id);
+            // issue #160 round-8 P1 #4: see the click-family arm above.
+            verify_approved_target(&approved, &w)?;
             let (px, py) = computer::map_to_physical(&w, cx, cy).map_err(|e| e.to_string())?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
             backend::backend()
@@ -472,6 +488,8 @@ async fn run_action(
             let b = backend::backend();
             let w = computer::resolve_window(b.as_ref(), window_query).map_err(|e| e.to_string())?;
             *window_id_out = Some(w.id);
+            // issue #160 round-8 P1 #4: see the click-family arm above.
+            verify_approved_target(&approved, &w)?;
             let from = computer::map_to_physical(&w, sx, sy).map_err(|e| e.to_string())?;
             let to = computer::map_to_physical(&w, ex, ey).map_err(|e| e.to_string())?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
@@ -492,6 +510,8 @@ async fn run_action(
             let w = computer::resolve_window(backend::backend().as_ref(), window_query)
                 .map_err(|e| e.to_string())?;
             *window_id_out = Some(w.id);
+            // issue #160 round-8 P1 #4: see the click-family arm above.
+            verify_approved_target(&approved, &w)?;
             let (px, py) = computer::map_to_physical(&w, cx, cy).map_err(|e| e.to_string())?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
             backend::backend()
@@ -525,6 +545,8 @@ async fn run_action(
             let w = computer::resolve_window(backend::backend().as_ref(), window_query)
                 .map_err(|e| e.to_string())?;
             *window_id_out = Some(w.id);
+            // issue #160 round-8 P1 #4: see the click-family arm above.
+            verify_approved_target(&approved, &w)?;
             require_recent_focus(thread, dir, w.id)?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
             backend::backend()
@@ -547,6 +569,8 @@ async fn run_action(
             let w = computer::resolve_window(backend::backend().as_ref(), window_query)
                 .map_err(|e| e.to_string())?;
             *window_id_out = Some(w.id);
+            // issue #160 round-8 P1 #4: see the click-family arm above.
+            verify_approved_target(&approved, &w)?;
             require_recent_focus(thread, dir, w.id)?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
             backend::backend().key(combo).map_err(|e| e.to_string())?;
@@ -620,20 +644,40 @@ async fn run_action(
 /// completely separate concern (issue #160 M2) from "is this call
 /// authorized at all".
 ///
-/// Returns `()`, not a distinction between how the `Ok` was reached: issue
-/// #160 round-4 P1 §2 originally returned an `Approval::{Auto,Interactive}`
-/// value here so every input arm of [`run_action`] could call
-/// `activate_target` ONLY for an Interactive approval (a card that actually
-/// rendered — a human clicking Weft's own UI to answer it takes the
-/// foreground away from the target). Round-5 review P1 §6 (issue #160 #3)
-/// removed that distinction: `activate_target` is now called
-/// UNCONDITIONALLY by every input arm regardless of how this call approved —
-/// see that function's own doc for why an Auto approval needs the SAME
-/// reactivation an Interactive one does. With no caller left that needs to
-/// tell the two apart, the `Approval` enum this used to return was deleted
-/// entirely rather than kept as unused plumbing.
-
-async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args: &Value) -> Result<(), String> {
+/// Used to return `()` alone, not a distinction between how the `Ok` was
+/// reached: issue #160 round-4 P1 §2 originally returned an
+/// `Approval::{Auto,Interactive}` value here so every input arm of
+/// [`run_action`] could call `activate_target` ONLY for an Interactive
+/// approval (a card that actually rendered — a human clicking Weft's own UI
+/// to answer it takes the foreground away from the target). Round-5 review
+/// P1 §6 (issue #160 #3) removed that distinction: `activate_target` is now
+/// called UNCONDITIONALLY by every input arm regardless of how this call
+/// approved — see that function's own doc for why an Auto approval needs the
+/// SAME reactivation an Interactive one does. With no caller left that
+/// needed to tell the two apart, the `Approval` enum this used to return was
+/// deleted entirely rather than kept as unused plumbing.
+///
+/// issue #160 round-8 P1 #4: now returns `Result<Option<ApprovedWindow>,
+/// String>` instead — see [`ApprovedWindow`]'s own doc for the identity-
+/// binding problem this closes. `Ok(None)` for every OBSERVE action
+/// (`screenshot`/`list_windows`/`cursor_position`) and for any Write action
+/// with no window argument at all (`wait`) — nothing to bind. For a Write
+/// (input) action WITH a window argument, this now resolves `window_query`
+/// AUTHORITATIVELY, right here, the INSTANT authorization actually lands
+/// (whether via a standing grant or a human's card) — `Ok(Some(w))` on
+/// success, or `Err` (fail-closed, never `Ok(None)`) if THAT resolution
+/// itself fails: an input action must never be allowed to proceed at all
+/// once its own approval step couldn't even pin down a window identity.
+/// [`run_action`] threads the `Some(w)` through to its own later, FRESH
+/// `resolve_window` call for that same action and refuses to inject if the
+/// two disagree — see [`verify_approved_target`].
+async fn approve(
+    asks: &AskRegistry,
+    thread: i32,
+    dir: &str,
+    action: &str,
+    args: &Value,
+) -> Result<Option<ApprovedWindow>, String> {
     let window_query = window_arg(args);
     let risk = crate::ask::classify_gui_action(action);
     let summary = if window_query.is_empty() {
@@ -695,7 +739,11 @@ async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args:
     // those same three cases; it just never falls through to the read-only
     // batch/issue grant underneath them.
     match asks.auto_decision_exact(thread, dir, &action_key) {
-        Some(Decision::Allow) => return Ok(()),
+        // round-8 P1 #4: bind the window identity HERE, the instant this
+        // standing grant authorizes the call — not left for `run_action`'s
+        // OWN later resolution to discover on its own, which is exactly the
+        // "approve one window, dispatch to a different one" gap this closes.
+        Some(Decision::Allow) => return bind_approved_window(risk, &window_query),
         // `auto_decision_exact` never actually returns `Deny` today (only
         // Allow-only standing grants exist) — this arm keeps the gate
         // correct regardless, mirroring `handle_ask`'s own defensive shape,
@@ -710,7 +758,12 @@ async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args:
     );
 
     match tokio::time::timeout(crate::bus::server::ASK_WAIT, rx).await {
-        Ok(Ok(Decision::Allow)) => Ok(()),
+        // round-8 P1 #4: same binding, taken the instant the human's card
+        // itself resolves Allow — the window the card's own preview showed
+        // may since have closed/been replaced by the time this returns, so
+        // this resolves FRESH, right here, rather than trusting whatever
+        // `preview_for_action` looked at when the card was first built.
+        Ok(Ok(Decision::Allow)) => bind_approved_window(risk, &window_query),
         Ok(Ok(Decision::Deny)) => Err("denied in weft".to_string()),
         // Timed out, or the sender was dropped (`AskRegistry::cancel`/
         // `cancel_for` — e.g. an engine/model switch tearing this session
@@ -721,6 +774,79 @@ async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args:
             Err("no answer in time — denied by default (weft ask bridge)".to_string())
         }
     }
+}
+
+/// The window identity [`approve`] itself resolved AUTHORITATIVELY, at the
+/// instant it authorized ONE particular input (Write-classified) action —
+/// issue #160 round-8 P1 #4. Threaded through to [`run_action`]'s own later,
+/// FRESH `resolve_window` call for that SAME action (via
+/// [`verify_approved_target`]) so a window that closed, was renamed, or got
+/// its id reused by ANOTHER window in the gap between approval and dispatch
+/// can never let that action land on the wrong target: the human's card (or
+/// standing grant) showed/covered ONE window, so only that exact window may
+/// receive the actual click/type/key/etc.
+///
+/// All three fields are checked (not just `id`): a closed window's id CAN be
+/// reused by the OS/window manager for an entirely unrelated window, so `id`
+/// alone is not sufficient to prove "this is still the window that was
+/// approved" — `app`+`title` must also still match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApprovedWindow {
+    id: u32,
+    app: String,
+    title: String,
+}
+
+/// issue #160 round-8 P1 #4: resolve `window_query` into an [`ApprovedWindow`]
+/// binding, for an action `approve` just authorized — called from BOTH places
+/// `approve` can return `Ok` (a standing grant, or a human's card). Observe
+/// actions (`risk != Write`) and any Write action with no window argument at
+/// all (`wait`) have no target to bind — `Ok(None)`, unchanged behavior. A
+/// Write action WITH a window argument resolves it right here,
+/// AUTHORITATIVELY: success binds `Some(ApprovedWindow)`; failure (not
+/// found, or ambiguous) is `Err` — fail-CLOSED, never `Ok(None)` — since an
+/// input action must not be allowed to proceed at all once even the approval
+/// step's own resolution couldn't pin down a single window.
+fn bind_approved_window(
+    risk: crate::ask::RiskLevel,
+    window_query: &str,
+) -> Result<Option<ApprovedWindow>, String> {
+    if risk != crate::ask::RiskLevel::Write || window_query.trim().is_empty() {
+        return Ok(None);
+    }
+    let b = backend::backend();
+    computer::resolve_window(b.as_ref(), window_query)
+        .map(|w| Some(ApprovedWindow { id: w.id, app: w.app, title: w.title }))
+        .map_err(|e| e.to_string())
+}
+
+/// issue #160 round-8 P1 #4: the execution-time check every input arm of
+/// [`run_action`] runs right after its OWN fresh `resolve_window` (and right
+/// BEFORE `activate_and_recheck`/the actual backend injection) — the target
+/// this call is about to drive must be BYTE-FOR-BYTE the same window
+/// [`approve`] itself bound at authorization time (`id`+`app`+`title` all
+/// three — see [`ApprovedWindow`]'s own doc for why `id` alone isn't
+/// sufficient). `approved: &None` (an observe action, or a Write action with
+/// no window arg at all) always passes — nothing was bound, so there's
+/// nothing to verify. A mismatch fails CLOSED with a message aimed at the
+/// calling AGENT (MCP result text, not an i18n-routed UI string) telling it
+/// to re-run so the human re-approves whatever the CURRENT target actually
+/// is, rather than silently proceeding against a replaced window.
+fn verify_approved_target(
+    approved: &Option<ApprovedWindow>,
+    w: &computer::WindowInfo,
+) -> Result<(), String> {
+    let Some(ap) = approved else {
+        return Ok(());
+    };
+    if w.id != ap.id || w.app != ap.app || w.title != ap.title {
+        return Err(
+            "the target window changed since this action was approved — re-run so the human \
+             re-approves the current target"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Fixed key order for the "consequential parameters" digest folded into the
@@ -1594,14 +1720,27 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
 /// here: `Some(id)` is only honored when `id` names a worktree that actually
 /// belongs to THIS direction (which is itself already confirmed to belong to
 /// THIS thread, below) — a forged/foreign worktree id can never redirect
-/// output into another direction's (or another thread's) worktree; it just
-/// falls back to the pre-existing behavior as if `wt` had been absent.
-/// `None`, or a `wt` that fails this check, keeps the ORIGINAL "first
-/// worktree for this direction" fallback unchanged.
+/// output into another direction's (or another thread's) worktree.
+///
+/// issue #160 round-8 P2 #7: an EXPLICIT `wt` that fails that check is now
+/// FAIL-CLOSED — `None` — rather than silently falling back to "the first
+/// worktree of this direction" as it used to. That old fallback was fine for
+/// an ABSENT `wt` (there was never a specific worktree pinned to begin with),
+/// but for an EXPLICIT-but-invalid one (deleted, or naming a worktree of a
+/// DIFFERENT direction/repo) it actively misdirected output: in a multi-repo
+/// direction, a worker session that explicitly pinned worktree B and lost the
+/// race against a deletion (or was handed a forged/stale id) would have had
+/// its screenshots and audit log silently written into worktree A's checkout
+/// instead — exposing that OTHER repo's on-screen pixels and activity to the
+/// wrong worker. Only a genuinely ABSENT `wt` (`None`) still falls back to
+/// "first worktree for this direction"; an explicit id that doesn't resolve
+/// now fails the whole call closed instead of picking a different worktree
+/// on its own.
 ///
 /// `None` on any failure (DB error, unresolvable path, deleted worktree row,
 /// a numeric `dir` that doesn't resolve to a direction belonging to THIS
-/// thread — a stale/forged route) — callers turn that into their own
+/// thread, or — per round-8 P2 #7 above — an EXPLICIT `wt` that doesn't name
+/// a worktree of this direction) — callers turn that into their own
 /// soft-failure text rather than a 500.
 async fn session_root(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Option<std::path::PathBuf> {
     if dir == crate::bus::LEAD {
@@ -1614,16 +1753,14 @@ async fn session_root(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Optio
         _ => return None,
     }
     let worktrees = repo::list_worktrees(db, Some(direction_id)).await.ok()?;
-    if let Some(id) = wt {
-        if let Some(w) = worktrees.iter().find(|w| w.id == id) {
-            return Some(std::path::PathBuf::from(&w.path));
-        }
-        // `wt` was supplied but doesn't name a worktree of THIS direction —
-        // falls through to the pre-existing "first worktree" fallback below,
-        // exactly as if `wt` had been `None`.
+    match wt {
+        // round-8 P2 #7: an EXPLICIT pin must hit an actual worktree of THIS
+        // direction, or the whole call fails closed — silently falling back
+        // to the first worktree would write this session's screenshots/audit
+        // into a DIFFERENT repo's checkout in a multi-repo direction.
+        Some(id) => worktrees.iter().find(|w| w.id == id).map(|w| std::path::PathBuf::from(&w.path)),
+        None => worktrees.into_iter().next().map(|w| std::path::PathBuf::from(w.path)),
     }
-    let first = worktrees.into_iter().next()?;
-    Some(std::path::PathBuf::from(first.path))
 }
 
 /// Build `base/components[0]/components[1]/...`, refusing if ANY existing
@@ -2353,6 +2490,200 @@ mod tests {
         computer::clear_control();
     }
 
+    // —— issue #160 round-8 P1 #4: approval bound to the resolved window identity ——
+
+    /// The end-to-end property this fix exists for: `approve` resolves the
+    /// target window (query "shifty", matching by title substring) and binds
+    /// THAT window's identity at authorization time. If the SAME query
+    /// resolves to a DIFFERENT window (different id AND app — simulating the
+    /// original window closing and an unrelated one since taking the same
+    /// title) by the time `run_action`'s own "left_click" arm reaches its OWN
+    /// fresh resolve, the call must be rejected — fail-closed — and the
+    /// backend must NEVER receive the click. Reproduced deterministically via
+    /// the same "hold the flight guard ourselves" technique
+    /// `left_click_uses_the_windows_geometry_as_of_after_the_flight_guard_not_before`
+    /// uses: the window swap lands in the gap between `approve`'s own bind
+    /// and the arm's later re-resolve.
+    #[tokio::test]
+    async fn input_action_fails_closed_when_the_approved_window_is_replaced_before_dispatch() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 907_401,
+            app: "Shifty".into(),
+            title: "shifty window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        let asks = AskRegistry::new();
+        let thread = 907_401;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+
+        // Prime the global input throttle well ahead of time so the real
+        // click below isn't itself rejected as rate-limited.
+        let _ = computer::throttle_input();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        // Hold the flight guard OURSELVES — `approve`'s own bind runs
+        // (synchronously, no await point of its own) BEFORE the spawned call
+        // ever reaches this guard, so it captures the window as it is RIGHT
+        // NOW; the swap below then lands strictly after that bind.
+        let held = computer::input_flight_guard().await;
+
+        let db_bg = db.clone();
+        let asks_bg = asks.clone();
+        let handle = tokio::spawn(async move {
+            let mut window_id_out = None;
+            let mut image_out = None;
+            run_action(
+                &db_bg, &asks_bg, thread, dir, None, "computer", "left_click",
+                &json!({"window": "shifty", "coordinate": [10, 10]}),
+                &mut window_id_out, &mut image_out,
+            )
+            .await
+        });
+
+        // Give the spawned call a chance to run `approve` (which binds the
+        // CURRENT window) and its own pre-guard argument checks, then reach
+        // — and block on — the flight guard this test still holds.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The window is REPLACED: the SAME query still matches (same title
+        // substring), but a DIFFERENT id and app — standing in for the
+        // original window closing and an unrelated one happening to share
+        // its name.
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 907_402,
+            app: "Different App".into(),
+            title: "shifty window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        drop(held);
+
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(
+            err.contains("changed since this action was approved"),
+            "must fail closed with the re-approve message: {err}"
+        );
+        assert!(
+            mock.actions.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "the replaced window must never receive the click"
+        );
+
+        computer::clear_control();
+    }
+
+    /// The mirror image: the query resolves to the SAME window both at
+    /// approval time and at dispatch time (the common, no-race case) — the
+    /// action must still succeed exactly as it did before round-8 P1 #4.
+    #[tokio::test]
+    async fn input_action_succeeds_when_the_approved_window_is_unchanged() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 907_501,
+            app: "Steady".into(),
+            title: "steady window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        let asks = AskRegistry::new();
+        let thread = 907_501;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+
+        let _ = computer::throttle_input();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        let mut window_id_out = None;
+        let mut image_out = None;
+        let result = run_action(
+            &db, &asks, thread, dir, None, "computer", "left_click",
+            &json!({"window": "steady", "coordinate": [5, 5]}),
+            &mut window_id_out, &mut image_out,
+        )
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(window_id_out, Some(907_501));
+        assert!(
+            mock.actions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|a| a.starts_with("click")),
+            "the unchanged window must still receive the click"
+        );
+
+        computer::clear_control();
+    }
+
+    /// Observe-class actions (`screenshot`, `list_windows`) — and any
+    /// Write-classified action with NO window argument at all (`wait`) —
+    /// never bind a window at all: `approve` returns `Ok(None)` for them (see
+    /// `bind_approved_window`'s own doc), so they're entirely unaffected by
+    /// round-8 P1 #4 — there is nothing for `verify_approved_target` to ever
+    /// check against for these.
+    #[tokio::test]
+    async fn observe_and_windowless_actions_never_bind_a_window() {
+        let asks = AskRegistry::new();
+        let thread = 907_601;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+
+        let screenshot_args = json!({"action": "screenshot", "window": "anything"});
+        let approved = approve(&asks, thread, dir, "screenshot", &screenshot_args).await.unwrap();
+        assert!(
+            approved.is_none(),
+            "an observe action must never bind a window, even with a window arg present: {approved:?}"
+        );
+
+        let list_windows_args = json!({"action": "list_windows"});
+        let approved_lw = approve(&asks, thread, dir, "list_windows", &list_windows_args).await.unwrap();
+        assert!(approved_lw.is_none());
+
+        let wait_args = json!({"action": "wait", "duration_ms": 1});
+        let approved_wait = approve(&asks, thread, dir, "wait", &wait_args).await.unwrap();
+        assert!(
+            approved_wait.is_none(),
+            "wait is Write-classified but has no window argument to bind: {approved_wait:?}"
+        );
+    }
+
     // —— issue #160 round-3 P1 §2 (extended round-5 review P1 §2): recheck_after_guard ——
 
     /// One test exercises `recheck_after_guard`'s whole matrix sequentially,
@@ -2434,8 +2765,32 @@ mod tests {
     /// open; a stale Allow answers that SAME card anyway (e.g. a click that
     /// raced the Stop). The re-check inside `run_action`, right after
     /// `approve` returns, must still deny — and never reach dispatch.
+    ///
+    /// issue #160 round-8 P1 #4 note: `approve` itself now resolves the
+    /// target window authoritatively as soon as the human's Allow lands (see
+    /// `bind_approved_window`) — this needs a resolvable "notes" window
+    /// (`shared_mock`, under `process_state_test_lock`) so that resolve
+    /// itself succeeds and control actually reaches the kill-switch re-check
+    /// this test exists to exercise, rather than failing earlier on an
+    /// unrelated `WindowNotFound`/`Unsupported` from whatever backend state
+    /// another concurrently-running test happens to have left in place.
     #[tokio::test]
     async fn disabling_the_setting_while_a_card_is_open_still_denies_a_later_allow() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 901_101,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true")
             .await
@@ -2700,6 +3055,15 @@ mod tests {
     /// A `left_click` missing `coordinate`, already Full-granted (so `approve`
     /// decides silently), must be rejected on the missing argument WITHOUT
     /// ever touching the control lease.
+    ///
+    /// issue #160 round-8 P1 #4 note: `approve` itself now resolves the
+    /// target window authoritatively as part of authorizing this call (see
+    /// `bind_approved_window`), independent of whether `coordinate` is even
+    /// present — so this test installs `shared_mock` with a resolvable
+    /// "notes" window (under `process_state_test_lock`) to keep that
+    /// resolve itself from being the thing that fails, so the assertion
+    /// below still isolates the ACTUAL property under test: the missing-
+    /// `coordinate` rejection inside the "left_click" arm itself.
     #[tokio::test]
     async fn missing_coordinate_click_never_touches_the_control_lease() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
@@ -2724,6 +3088,19 @@ mod tests {
         // the same family of globals.
         let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 904_001,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
 
         let mut window_id_out = None;
         let mut image_out = None;
@@ -2769,22 +3146,43 @@ mod tests {
 
     /// End-to-end through `run_action`'s own "type" arm (Full-granted, so
     /// `approve` decides silently): an over-limit `type` is rejected before
-    /// EVER resolving the target window — proving the check runs ahead of
-    /// (and therefore ahead of everything downstream of) window resolution,
-    /// the focus-freshness gate, the control lease, and the backend call
-    /// itself. Deliberately does NOT install a `MockBackend` override (this
-    /// module's `backend::_set_backend_override` is a set-ONCE-per-process
-    /// `OnceLock` another test in this same binary may already have claimed
-    /// — see `shared_mock`'s own doc comment on that hazard) — `notes` is
-    /// never a real window in this test's grant/DB setup at all, so a pass
-    /// here can ONLY mean the
-    /// length check fired before window resolution ever got a chance to
-    /// reject it for a completely different reason (`WindowNotFound`). The
-    /// integration test in `tests/computer_mcp.rs` (its own separate process,
-    /// with its own dedicated `MockBackend`) covers the mock-never-sees-it
-    /// assertion this test can't safely make here.
+    /// EVER reaching the "type" arm's OWN window resolution — the one that
+    /// records `window_id_out` and would go on to touch the focus-freshness
+    /// gate, the control lease, and the backend call itself.
+    ///
+    /// issue #160 round-8 P1 #4 note: `approve` itself now ALSO resolves the
+    /// window authoritatively, unconditionally, for any Write action with a
+    /// non-blank window argument — including THIS one — to bind an
+    /// `ApprovedWindow` before this call ever reaches its own arm (see
+    /// `bind_approved_window`'s doc). That resolve happens regardless of
+    /// whether the LATER, action-specific arguments (like this call's
+    /// over-limit `text`) turn out to be invalid — so this test now installs
+    /// `shared_mock` with a resolvable "notes" window (unlike before round-8,
+    /// when this test deliberately used NO backend at all and relied on the
+    /// guaranteed-`Unsupported` `StubBackend` to prove ordering). What this
+    /// test still proves: `check_type_length` rejects before the ARM's own
+    /// resolve/backend call — `window_id_out` stays `None` and no INPUT
+    /// method (`click`/`type_text`/`key`/...) ever reaches the mock, even
+    /// though `approve`'s own (list-only, unrecorded) resolve already
+    /// succeeded. The integration test in `tests/computer_mcp.rs` covers the
+    /// same "never reaches the backend" property end-to-end.
     #[tokio::test]
     async fn run_action_rejects_an_over_limit_type_before_resolving_the_window() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 904_101,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true")
             .await
@@ -2811,14 +3209,18 @@ mod tests {
         assert!(err.contains("too long"), "{err}");
         assert!(
             window_id_out.is_none(),
-            "the call must fail before ever resolving (and recording) a window id: {window_id_out:?}"
+            "the call must fail before the arm's OWN resolve ever records a window id: {window_id_out:?}"
+        );
+        assert!(
+            mock.actions.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "an over-limit type must never reach the backend as an input action"
         );
     }
 
     // —— issue #160 round-2 P2 §5: multi-worktree `wt` routing ——
 
     #[tokio::test]
-    async fn session_root_wt_pins_the_exact_worktree_and_a_foreign_one_falls_back() {
+    async fn session_root_wt_pins_the_exact_worktree_and_a_foreign_one_fails_closed() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let tmp_a = tempfile::tempdir().unwrap();
@@ -2860,9 +3262,12 @@ mod tests {
         assert_eq!(no_wt, std::path::PathBuf::from(&wt_a.path));
 
         // A `wt` naming a worktree of a DIFFERENT direction is rejected
-        // (closed-set validation) and falls back to the pre-existing
-        // "first worktree of THIS direction" behavior instead of resolving
-        // to the foreign worktree.
+        // (closed-set validation) — round-8 P2 #7: this must now FAIL CLOSED
+        // (`None`), never silently fall back to "first worktree of THIS
+        // direction" as it used to. A worker session that explicitly pinned a
+        // worktree that's since become invalid must never have its
+        // screenshots/audit quietly redirected into a DIFFERENT repo's
+        // checkout in this multi-repo direction.
         let other_direction = repo::create_direction(
             &db, thread.id, "task2", "claude", repo_a.id, "why", "impl-only", "main",
         )
@@ -2874,13 +3279,17 @@ mod tests {
         .await
         .unwrap();
 
-        let fallback = session_root(&db, thread.id, &dir_s, Some(foreign.id)).await.unwrap();
+        let fails_closed = session_root(&db, thread.id, &dir_s, Some(foreign.id)).await;
         assert_eq!(
-            fallback,
-            std::path::PathBuf::from(&wt_a.path),
-            "a foreign wt id must fall back to the first worktree of THIS direction, \
-             never resolve to the foreign one"
+            fails_closed, None,
+            "an explicit wt naming a worktree of a DIFFERENT direction must fail closed, \
+             never silently resolve to (or fall back onto) any worktree at all"
         );
+
+        // A wt naming a worktree that's simply been deleted (never recorded
+        // at all, here) must fail closed the exact same way.
+        let deleted = session_root(&db, thread.id, &dir_s, Some(999_999)).await;
+        assert_eq!(deleted, None, "an explicit wt with no matching worktree row must fail closed");
     }
 
     // —— issue #160 round-2 P2 §7: bounded preview registry ——

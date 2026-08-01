@@ -1462,6 +1462,36 @@ impl GrantSnapshot {
     }
 }
 
+/// issue #160 round-8 P2 #5: whether an Always-grant's `action_key` is safe to
+/// WRITE TO DISK across a restart — `false` for exactly one key shape:
+/// `bus::computer_srv::approve` mints a GUI action's `action_key` as
+/// `["gui", action, window, digest]` (see that function's own doc for the
+/// full shape), and the ONLY action among those whose `digest` folds in
+/// something that can itself be a secret is `type` — `digest =
+/// sha256(text)`, via `computer_srv::args_digest`, so a human choosing
+/// "Always allow" on typing (say) a password or a PIN mints an Always-grant
+/// whose `action_key` is a PLAIN JSON array carrying that hash in the clear
+/// (`action_key` itself is never re-hashed — it's `serde_json::to_string`, see
+/// `action_key()`). Persisting that into the default-plaintext `auth_grants`
+/// row would let anyone with disk/DB access dictionary-attack a short
+/// secret/PIN/token against the digest at their leisure, long after the
+/// session that typed it is gone. Every OTHER GUI action's digest folds in a
+/// harmless coordinate/scroll-amount/duration/key-combo LABEL (never
+/// content), and every non-GUI tool's `action_key` has an entirely different
+/// shape — this only ever matches the EXACT `["gui", "type", ...]` shape;
+/// anything else (a different action, a non-GUI key, malformed/non-JSON text)
+/// returns `true` (persistable) rather than guessing — a narrow, closed-set
+/// carve-out, not a general content sniff that could misfire against a key
+/// shape it doesn't recognize.
+fn always_key_is_persistable(action_key: &str) -> bool {
+    let Ok(parts) = serde_json::from_str::<Vec<String>>(action_key) else {
+        return true;
+    };
+    let is_gui_type = parts.first().map(String::as_str) == Some("gui")
+        && parts.get(1).map(String::as_str) == Some("type");
+    !is_gui_type
+}
+
 /// One session's read-only auto-allow scope, for the frontend's revoke UI
 /// (`ReadOnlyGrants::session`). Distinct from `FullGrant`/`AlwaysGrant`: this is
 /// a QUERY snapshot only — it is never written into `GrantSnapshot` or the
@@ -1601,12 +1631,31 @@ impl Inner {
         GrantSnapshot { full, always }
     }
 
+    /// issue #160 round-8 P2 #5: the snapshot actually handed to a
+    /// [`PersistMsg`] — [`Self::grant_snapshot`] with any secret-bearing
+    /// `type` Always-grant key dropped (see [`always_key_is_persistable`]'s
+    /// own doc for exactly which shape and why). This is the ONE choke point
+    /// both [`Self::emit_persist`] (every real grant change) and
+    /// [`AskRegistry::request_persist_ack`] (an explicit flush) build their
+    /// `PersistMsg` from — neither ever calls `grant_snapshot()` directly.
+    /// Deliberately NOT used by [`AskRegistry::snapshot_grants`] (the
+    /// frontend's revoke-UI view) or anywhere else that just READS the
+    /// current grants: those still see (and can still revoke) a `type`
+    /// Always-grant for the rest of THIS session — only the disk copy drops
+    /// it, so the human-facing behavior is "session-only for `type`
+    /// Always", never "silently un-granted".
+    fn persistable_grant_snapshot(&self) -> GrantSnapshot {
+        let mut snap = self.grant_snapshot();
+        snap.always.retain(|ag| always_key_is_persistable(&ag.action_key));
+        snap
+    }
+
     /// Push the current grants to the persistence consumer as a fire-and-forget
     /// (no-ack) message (持锁内调用，仅在 grant 真正变更后调用). 未装消费者时零开销。
     fn emit_persist(&self) {
         if let Some(tx) = &self.persist {
             let _ = tx.send(PersistMsg {
-                snapshot: self.grant_snapshot(),
+                snapshot: self.persistable_grant_snapshot(),
                 ack: None,
             });
         }
@@ -2081,7 +2130,7 @@ impl AskRegistry {
         let (ack_tx, ack_rx) = oneshot::channel();
         if tx
             .send(PersistMsg {
-                snapshot: g.grant_snapshot(),
+                snapshot: g.persistable_grant_snapshot(),
                 ack: Some(ack_tx),
             })
             .is_err()
@@ -4518,6 +4567,91 @@ mod tests {
                 dir: "10".into()
             }]
         );
+    }
+
+    // —— issue #160 round-8 P2 #5: `type` Always-grants never reach persistence ——
+
+    #[test]
+    fn always_key_is_persistable_only_rejects_the_exact_gui_type_shape() {
+        assert!(
+            !always_key_is_persistable(&action_key(&["gui", "type", "notes", "deadbeef"])),
+            "a type GUI key must never be persistable"
+        );
+        assert!(
+            always_key_is_persistable(&action_key(&["gui", "left_click", "notes", "deadbeef"])),
+            "a non-type GUI key must stay persistable"
+        );
+        assert!(
+            always_key_is_persistable(&action_key(&["gui", "screenshot", "notes", "deadbeef"])),
+            "an observe-only GUI key must stay persistable too"
+        );
+        assert!(
+            always_key_is_persistable("Run: npm test"),
+            "a plain (non-JSON-array) tool key must stay persistable — never misfire against a shape it doesn't recognize"
+        );
+        assert!(
+            always_key_is_persistable("not json at all"),
+            "malformed input must fail OPEN to persistable, never silently drop an unrelated grant"
+        );
+        assert!(
+            always_key_is_persistable(&action_key(&["type"])),
+            "a single-element array (not the gui/type PAIR) must not match"
+        );
+    }
+
+    /// The end-to-end property this fix exists for: seed one `type` GUI
+    /// Always-grant, one non-`type` GUI Always-grant, and one ordinary tool
+    /// Always-grant, all in the SAME (thread, dir) — the snapshot actually
+    /// shipped to the persistence writer must drop ONLY the `type` key, while
+    /// the in-memory registry (`snapshot_grants`, and `auto_decision` itself)
+    /// keeps honoring all three for the rest of this session.
+    #[tokio::test]
+    async fn persisted_snapshot_drops_a_type_always_grant_but_keeps_it_in_memory() {
+        let r = AskRegistry::new();
+        let thread = 909_001;
+        let dir = "10";
+        let type_key = action_key(&["gui", "type", "notes", "deadbeef"]);
+        let click_key = action_key(&["gui", "left_click", "notes", "deadbeef"]);
+        let tool_key = "Run: npm test".to_string();
+
+        r.seed_grants(GrantSnapshot {
+            full: Vec::new(),
+            always: vec![
+                AlwaysGrant { thread, dir: dir.into(), action_key: type_key.clone() },
+                AlwaysGrant { thread, dir: dir.into(), action_key: click_key.clone() },
+                AlwaysGrant { thread, dir: dir.into(), action_key: tool_key.clone() },
+            ],
+        });
+
+        // In-memory behavior AND the frontend revoke-UI snapshot both still
+        // carry all three — persistence is the ONLY thing that narrows.
+        assert_eq!(r.auto_decision(thread, dir, RiskLevel::Unknown, &type_key), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(thread, dir, RiskLevel::Unknown, &click_key), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(thread, dir, RiskLevel::Unknown, &tool_key), Some(Decision::Allow));
+        let mem_keys: std::collections::HashSet<String> =
+            r.snapshot_grants().always.into_iter().map(|ag| ag.action_key).collect();
+        assert!(mem_keys.contains(&type_key), "snapshot_grants (revoke UI) must still carry the type key");
+        assert!(mem_keys.contains(&click_key));
+        assert!(mem_keys.contains(&tool_key));
+
+        // Now drive an explicit persist and inspect exactly what gets shipped
+        // to the single writer.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_persist_notifier(tx);
+        let PersistAck::Pending(ack_rx) = r.request_persist_ack() else {
+            panic!("a writer was just installed — this must be Pending");
+        };
+        let msg = rx.try_recv().expect("request_persist_ack must enqueue a PersistMsg");
+        let persisted_keys: std::collections::HashSet<String> =
+            msg.snapshot.always.iter().map(|ag| ag.action_key.clone()).collect();
+        assert!(
+            !persisted_keys.contains(&type_key),
+            "a type Always-grant must NEVER reach the persistence writer: {persisted_keys:?}"
+        );
+        assert!(persisted_keys.contains(&click_key), "a non-type GUI grant must still persist");
+        assert!(persisted_keys.contains(&tool_key), "an ordinary tool grant must still persist");
+        let _ = msg.ack.expect("request_persist_ack always attaches an ack sender").send(Ok(()));
+        ack_rx.await.unwrap().unwrap();
     }
 
     #[test]

@@ -143,8 +143,15 @@ pub fn clear_emergency_stop(expected_gen: u64) -> bool {
 /// dialog, AND the OS-level global Escape shortcut's own spawned call — see
 /// [`register_global_escape`]), since neither can otherwise tell a human
 /// "the kill switch tripped in-memory, but the setting may still read
-/// `true` on disk for the next launch". Reset to `false` only by a
-/// SUCCESSFUL [`clear_emergency_stop`] — see that function's own doc.
+/// `true` on disk for the next launch".
+///
+/// Cleared two ways: a SUCCESSFUL [`clear_emergency_stop`] (a human
+/// explicitly re-enabling computer use from Settings), OR — issue #160
+/// round-8 P2 #3 — a SUCCESSFUL, still-most-recent [`emergency_stop`] retry
+/// (a human clicking Stop again after an earlier attempt's persist failed,
+/// this time landing). Either way this always reflects the MOST RECENT
+/// call's own outcome, by generation — never an older, slower call's stale
+/// result racing in after a newer one already recorded its own.
 /// `bus::computer_srv`/the frontend never touch this directly; read it via
 /// [`stop_persist_failed`] / `commands::get_computer_stop_persist_failed`.
 static STOP_PERSIST_FAILED: AtomicBool = AtomicBool::new(false);
@@ -601,13 +608,29 @@ static SHOT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// symlink to a real directory, so skipping straight to `image.save` without
 /// this recheck would silently follow it) and BEFORE `image.save` ever
 /// touches the filesystem. This narrows, but does not fully close, the race:
-/// a swap landing in the still-open window between THIS check and the
-/// `image.save` call right below it remains — no crate this module already
-/// depends on exposes an `openat`/`O_NOFOLLOW`-guarded image writer the way
-/// `bus::computer_srv::open_audit_file_for_append`'s own `O_NOFOLLOW` open
-/// closes the analogous leaf race for the audit log. A full per-component,
-/// directory-handle-based walk (mirroring that same idea all the way down)
-/// is a larger follow-up, tracked rather than attempted here.
+/// a swap landing in the still-open window between THIS check and the actual
+/// write remains a residual — see below (round-8 P2 #8 closes THAT leaf).
+///
+/// issue #160 round-8 P2 #8: the actual on-disk write is no longer a bare
+/// `image.save(&path)`. On unix, the PNG is now encoded straight into a file
+/// handle opened with `create_new` (O_EXCL) + `O_NOFOLLOW` + mode `0o600` —
+/// closing TWO gaps `image.save` alone left open:
+///  1. the exact leaf race this function's own doc used to call out as an
+///     accepted residual — a swap of the leaf PATH itself (not `out_dir`) for
+///     a symlink/pre-existing file in the instant between the `out_dir`
+///     recheck above and the write. `O_NOFOLLOW` refuses to follow a symlink
+///     leaf; `create_new` (O_EXCL) refuses to write through/into anything
+///     already there at all. The per-call `<unix_ms>-<id>-<seq>.png` name is
+///     unique by construction (never reused), so `create_new` never spuriously
+///     fails against a screenshot's OWN prior, legitimate file.
+///  2. worktrees living in a shared/traversable directory with a permissive
+///     process umask: `image.save`'s default `0644` leaves screenshots — which
+///     can carry mail/browser/password-manager pixels — readable by every
+///     OTHER local account for as long as the file is retained. `mode(0o600)`
+///     makes them owner-only from the moment of creation, no window where a
+///     default-permissive create is later tightened.
+/// Non-unix keeps the pre-existing `image.save(&path)` (no owner-only concept
+/// there this crate can portably act on).
 pub fn screenshot_window(
     backend: &dyn backend::ComputerBackend,
     query: &str,
@@ -638,12 +661,29 @@ pub fn screenshot_window(
     let path = out_dir.join(format!("{unix_ms}-{}-{seq}.png", matched.id));
     let width = image.width();
     let height = image.height();
-    image.save(&path).map_err(|e| ComputerError::Io(e.to_string()))?; // save borrows &image
+    // round-8 P2 #8: owner-only, no-follow, exclusive-create write — see this
+    // function's own doc comment above for exactly which two gaps this closes
+    // over the plain `image.save(&path)` this replaces.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opt = std::fs::OpenOptions::new();
+        opt.write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let file = opt.open(&path).map_err(|e| ComputerError::Io(e.to_string()))?;
+        let mut w = std::io::BufWriter::new(file);
+        image
+            .write_to(&mut w, image::ImageFormat::Png)
+            .map_err(|e| ComputerError::Io(e.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        image.save(&path).map_err(|e| ComputerError::Io(e.to_string()))?;
+    }
     // round-7 P1: keep the just-saved pixels in memory instead of ever having
     // a caller re-open `path` to get them back — see `Screenshot::pixels`'s
     // own doc for the symlink/TOCTOU race that reopen would risk. `into_raw`
-    // consumes `image`, so this runs only after `save` (which only borrows
-    // it) has already finished.
+    // consumes `image`, so this runs only after the write above (which only
+    // borrows it) has already finished.
     let pixels = CapturedImage { rgba: image.into_raw(), width, height };
 
     // round-7 P1: best-effort retention cap — never fails a screenshot that
@@ -1038,18 +1078,39 @@ pub fn clear_control() {
 /// path AND the OS-level global Escape shortcut's own spawned call below),
 /// since round-4 only wired the frontend's error state to the command path's
 /// own local `.catch`, leaving the Escape path's failures silently dropped.
+///
+/// issue #160 round-8 P2 #3: also CLEARS [`STOP_PERSIST_FAILED`] on a
+/// successful persist — not just on an explicit [`clear_emergency_stop`], as
+/// before. Without this, a first `emergency_stop` call whose write failed
+/// (disk full, DB locked, …) would set the flag, and a human clicking Stop
+/// AGAIN — the natural "retry" action, whose write this time succeeds — would
+/// never see the banner clear: only `clear_emergency_stop` reset it, and
+/// nothing routes back through that from a plain Stop retry. The flag is
+/// recorded under a generation guard (mirroring [`StopState::generation`]'s
+/// own read-before-write, clear-only-if-still-current discipline) so a SLOW
+/// call's own (possibly late-arriving) success can never stomp a NEWER,
+/// still-failing `emergency_stop`'s `true` — only the MOST RECENT call, by
+/// generation, is allowed to record the flag's final value.
 pub async fn emergency_stop(db: &crate::store::Db) -> Result<(), String> {
-    {
+    let my_gen = {
         let mut guard = stop_state().lock().unwrap_or_else(|e| e.into_inner());
         guard.stopped = true;
         guard.generation = guard.generation.wrapping_add(1);
-    }
+        guard.generation
+    };
     clear_control();
     let result = crate::store::repo::set_setting(db, K_COMPUTER_USE_ENABLED, "false")
         .await
         .map_err(|e| e.to_string());
-    if result.is_err() {
-        STOP_PERSIST_FAILED.store(true, Ordering::SeqCst);
+    // round-8 P2 #3: only record THIS call's outcome if no NEWER
+    // `emergency_stop` has since bumped the generation again — otherwise that
+    // newer call owns writing the flag for its own outcome, and a slow
+    // success here must never clear a newer failure it knows nothing about.
+    {
+        let guard = stop_state().lock().unwrap_or_else(|e| e.into_inner());
+        if guard.generation == my_gen {
+            STOP_PERSIST_FAILED.store(result.is_err(), Ordering::SeqCst);
+        }
     }
     result
 }
@@ -1333,12 +1394,37 @@ pub enum NamedKey {
 /// an empty part (`"cmd+"`, `"+s"`, `"cmd++s"`) or an unrecognized
 /// multi-character word (`"bogus_key"`) is [`ComputerError::Unsupported`]
 /// with a reason, never silently dropped.
+///
+/// issue #160 round-8 P2 #6: every token EXCEPT THE LAST must itself be a
+/// modifier (`KeyToken::Meta`/`Control`/`Alt`/`Shift`) — `"a+b"` or
+/// `"ctrl+a+b"` used to pass this check (each individual token is a valid
+/// `KeyToken` on its own), but `os.rs`'s own `key()` then blindly treats
+/// every token but the last as a modifier to press-and-hold before pressing
+/// the final one — so `"a+b"` would silently hold `a` down and press `b`,
+/// producing input the caller never asked for instead of being rejected as
+/// the malformed shortcut it is. Checked once, here, at the single source
+/// every consumer (`os.rs`, any future one) parses through — a single-token
+/// combo (`"a"`, `"f5"`, `"return"`) has no non-final tokens to check at all
+/// and is unaffected.
 pub fn parse_key_combo(combo: &str) -> Result<Vec<KeyToken>, ComputerError> {
     let lower = combo.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return Err(ComputerError::Unsupported("empty key combo".into()));
     }
-    lower.split('+').map(key_token).collect()
+    let tokens: Vec<KeyToken> = lower.split('+').map(key_token).collect::<Result<_, _>>()?;
+    if let Some((_last, mods)) = tokens.split_last() {
+        if !mods
+            .iter()
+            .all(|t| matches!(t, KeyToken::Meta | KeyToken::Control | KeyToken::Alt | KeyToken::Shift))
+        {
+            return Err(ComputerError::Unsupported(
+                "a key combo's non-final tokens must all be modifiers (cmd/ctrl/alt/shift), e.g. \
+                 `ctrl+a`, not `a+b`"
+                    .into(),
+            ));
+        }
+    }
+    Ok(tokens)
 }
 
 fn key_token(part: &str) -> Result<KeyToken, ComputerError> {
@@ -1573,6 +1659,32 @@ mod tests {
         assert_eq!(shot.window_id, 9);
         let opened = image::open(&shot.path).unwrap();
         assert_eq!((opened.width(), opened.height()), (1280, 720));
+    }
+
+    /// issue #160 round-8 P2 #8: the saved PNG must be owner-only (`0600`),
+    /// never the `image.save` default (`0644`, world/group-readable modulo
+    /// umask) — a worktree in a shared/traversable directory must not leave
+    /// screenshots (which can carry mail/browser/password-manager pixels)
+    /// readable by any other local account for the retention window.
+    #[cfg(unix)]
+    #[test]
+    fn screenshot_window_writes_the_png_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let backend = mock::MockBackend {
+            windows: vec![window_sized(9, "Notes", "Untitled", 800, 600)],
+            image: Some(solid_image(800, 600, 5)),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let shot = screenshot_window(&backend, "9", tmp.path()).unwrap();
+
+        let mode = std::fs::symlink_metadata(&shot.path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the screenshot PNG must be created owner-only, not `image.save`'s default 0644"
+        );
     }
 
     /// issue #160 round-3 P2 §4: two `screenshot_window` calls for the SAME
@@ -2201,6 +2313,95 @@ mod tests {
         clear_emergency_stop(stop_generation());
     }
 
+    /// issue #160 round-8 P2 #3: a successful RETRY of `emergency_stop` (a
+    /// human clicking Stop again after an earlier attempt's own persist
+    /// failed) must clear `STOP_PERSIST_FAILED` on its own — the horizontal
+    /// case `clear_emergency_stop`'s own reset does NOT cover, since nothing
+    /// about clicking Stop again routes through that function at all.
+    #[tokio::test]
+    async fn emergency_stop_clears_stop_persist_failed_on_a_successful_retry_without_clear_emergency_stop() {
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_emergency_stop(stop_generation());
+        STOP_PERSIST_FAILED.store(false, Ordering::SeqCst);
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        use sea_orm::ConnectionTrait;
+        db.0.execute_unprepared("PRAGMA query_only = ON;").await.unwrap();
+
+        let first = emergency_stop(&db).await;
+        assert!(first.is_err(), "the first attempt's write must fail against a read-only connection");
+        assert!(stop_persist_failed(), "a failed persist must set the flag");
+
+        // The "retry": same call, now against a connection that can write —
+        // standing in for the human clicking Stop again once the transient
+        // condition (disk full, DB locked, ...) has cleared.
+        db.0.execute_unprepared("PRAGMA query_only = OFF;").await.unwrap();
+        let second = emergency_stop(&db).await;
+        assert!(second.is_ok(), "the retry's own write must succeed against a writable connection");
+        assert!(
+            !stop_persist_failed(),
+            "round-8 P2 #3: a successful retry must clear the flag on its own — the human's \
+             \"try again\" action must be able to make the warning go away without a SEPARATE \
+             re-enable-from-Settings round trip"
+        );
+
+        clear_emergency_stop(stop_generation());
+    }
+
+    /// issue #160 round-8 P2 #3: the generation guard around recording
+    /// `STOP_PERSIST_FAILED` — an OLDER, slower `emergency_stop` call finishing
+    /// AFTER a NEWER one already landed and recorded its own outcome must
+    /// never overwrite that newer outcome. Reproduced by hand (real
+    /// concurrent interleaving against an in-memory sqlite connection isn't
+    /// reliably schedulable in a test): the "older" call's own generation
+    /// bump is taken first, then a genuinely newer `emergency_stop` runs to
+    /// completion (failing, recording `true`) before the older call's own
+    /// tail (the same guarded store `emergency_stop` itself runs) executes.
+    #[tokio::test]
+    async fn emergency_stop_generation_guard_lets_a_newer_calls_outcome_win() {
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_emergency_stop(stop_generation());
+        STOP_PERSIST_FAILED.store(false, Ordering::SeqCst);
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        // The OLDER call's own generation bump — mirrors the first statement
+        // of `emergency_stop`'s body exactly.
+        let older_gen = {
+            let mut g = stop_state().lock().unwrap_or_else(|e| e.into_inner());
+            g.stopped = true;
+            g.generation = g.generation.wrapping_add(1);
+            g.generation
+        };
+
+        // A genuinely NEWER `emergency_stop` call lands and finishes
+        // completely (bumps the generation again, fails, records `true`).
+        use sea_orm::ConnectionTrait;
+        db.0.execute_unprepared("PRAGMA query_only = ON;").await.unwrap();
+        let newer_result = emergency_stop(&db).await;
+        assert!(newer_result.is_err());
+        assert!(stop_persist_failed(), "precondition: the newer call's own failure must be recorded");
+
+        // The OLDER call's own write now finishes (successfully) — but by
+        // the time it checks, the generation has moved on past `older_gen`,
+        // so its guarded store must be skipped entirely, exactly mirroring
+        // `emergency_stop`'s own tail.
+        db.0.execute_unprepared("PRAGMA query_only = OFF;").await.unwrap();
+        assert!(crate::store::repo::set_setting(&db, K_COMPUTER_USE_ENABLED, "false").await.is_ok());
+        {
+            let guard = stop_state().lock().unwrap_or_else(|e| e.into_inner());
+            if guard.generation == older_gen {
+                STOP_PERSIST_FAILED.store(false, Ordering::SeqCst);
+            }
+        }
+        assert!(
+            stop_persist_failed(),
+            "a stale, OLDER call's own success must never clear a NEWER call's already-recorded failure"
+        );
+
+        clear_emergency_stop(stop_generation());
+    }
+
     // —— input throttle (issue #160 M2) ——
 
     #[test]
@@ -2282,6 +2483,29 @@ mod tests {
     fn parse_key_combo_rejects_empty_and_unrecognized_tokens() {
         assert!(parse_key_combo("cmd+").is_err());
         assert!(parse_key_combo("bogus_key").is_err());
+    }
+
+    /// issue #160 round-8 P2 #6: a combo whose non-final token is NOT a
+    /// modifier must be rejected outright, rather than reaching `os.rs`'s
+    /// `key()`, which would otherwise press-and-hold that token as though it
+    /// were a modifier before pressing the final one.
+    #[test]
+    fn parse_key_combo_rejects_a_non_modifier_in_a_non_final_position() {
+        assert!(parse_key_combo("a+b").is_err(), "two plain chars — neither is a modifier");
+        assert!(parse_key_combo("ctrl+a+b").is_err(), "the middle token (\"a\") is not a modifier");
+        assert!(parse_key_combo("return+s").is_err(), "a named key is not a modifier either");
+    }
+
+    /// The mirror image: every non-final token IS a modifier, and/or there's
+    /// only one token total (nothing to check) — all still accepted exactly
+    /// as before.
+    #[test]
+    fn parse_key_combo_accepts_combos_whose_non_final_tokens_are_all_modifiers() {
+        assert!(parse_key_combo("ctrl+shift+t").is_ok());
+        assert!(parse_key_combo("cmd+s").is_ok());
+        assert!(parse_key_combo("a").is_ok(), "single token — nothing to check");
+        assert!(parse_key_combo("f5").is_ok());
+        assert!(parse_key_combo("return").is_ok());
     }
 
     // —— enabled() ——

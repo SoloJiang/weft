@@ -1221,9 +1221,14 @@ async fn wt_query_param_routes_output_to_the_exact_worktree_in_a_multi_repo_dire
     assert!(!audit_a.exists(), "wt=B must never write into worktree A: {out}");
     assert!(audit_b.exists(), "wt=B must write its audit line into worktree B");
 
-    // 2. A forged `wt` naming a worktree of a DIFFERENT direction falls back
-    // to the pre-existing "first worktree of THIS direction" (A) — never
-    // resolving into the foreign direction's own worktree.
+    // 2. A forged `wt` naming a worktree of a DIFFERENT direction must now
+    // FAIL CLOSED (issue #160 round-8 P2 #7) — it must NEVER silently fall
+    // back to "first worktree of THIS direction" (A) the way it used to: an
+    // explicit-but-invalid pin in a multi-repo direction must not have its
+    // audit line quietly redirected into a DIFFERENT repo's checkout. The
+    // "wait" action itself doesn't depend on a resolved worktree at all, so
+    // the call still succeeds — only its (best-effort) audit write is
+    // affected, and it must land NOWHERE, neither A nor the foreign worktree.
     let other_direction = repo::create_direction(
         &db, thread.id, "task2", "claude", repo_a.id, "why", "impl-only", "main",
     )
@@ -1236,6 +1241,11 @@ async fn wt_query_param_routes_output_to_the_exact_worktree_in_a_multi_repo_dire
         .await
         .unwrap();
 
+    // A fresh audit-a marker check needs a clean baseline: remove the file
+    // audit_a already picked up from step 1 above so this step's assertion
+    // is unambiguous about NOT writing a NEW line into it.
+    let _ = std::fs::remove_file(&audit_a);
+
     let url = format!("{base}/computer/{}/{}/mcp?wt={}", thread.id, dir_s, foreign.id);
     let out = rpc_url(
         &url,
@@ -1243,15 +1253,15 @@ async fn wt_query_param_routes_output_to_the_exact_worktree_in_a_multi_repo_dire
             "params":{"name":"computer","arguments":{"action":"wait","duration_ms":1}}}),
     )
     .await;
-    assert!(out.contains("waited"), "{out}");
+    assert!(out.contains("waited"), "the action itself doesn't depend on a resolved worktree: {out}");
     assert!(
-        audit_a.exists(),
-        "a forged wt from a different direction must fall back to worktree A \
-         (the first worktree of THIS direction): {out}"
+        !audit_a.exists(),
+        "round-8 P2 #7: a forged wt from a different direction must NOT fall back to worktree A \
+         — fail closed instead: {out}"
     );
     assert!(
         !foreign_path.join(".weft").join("computer-audit.jsonl").exists(),
-        "must never write into the foreign direction's worktree"
+        "must never write into the foreign direction's worktree either"
     );
 
     let _ = std::fs::remove_dir_all(&wt_a_path);
