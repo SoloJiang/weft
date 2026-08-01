@@ -60,6 +60,10 @@ pub fn router(bus: BusRegistry, db: Db, asks: AskRegistry) -> Router {
             "/global/mcp",
             post(crate::bus::global::handle_global).get(get_not_allowed),
         )
+        .route(
+            "/computer/:thread/:dir/mcp",
+            post(crate::bus::computer_srv::handle_computer).get(get_not_allowed),
+        )
         .route("/ask/:thread/:dir", post(handle_ask).get(get_not_allowed))
         .route("/health", get(|| async { "ok" }))
         .with_state(ServerState { bus, db, asks })

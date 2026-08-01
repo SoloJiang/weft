@@ -21,6 +21,9 @@ mod codex_app_server;
 mod codex_slash;
 pub mod commands;
 mod commands_backup;
+/// OS-level "computer use" core (issue #160 M1: observation only — window
+/// enumeration + screenshot, no input injection). See `computer/mod.rs`.
+pub mod computer;
 pub mod config;
 mod coordinator;
 mod curator;
