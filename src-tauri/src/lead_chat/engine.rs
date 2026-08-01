@@ -2593,6 +2593,72 @@ fn write_attachment_no_follow(p: &std::path::Path, bytes: &[u8]) -> bool {
     std::fs::write(p, bytes).is_ok()
 }
 
+/// issue #160 round-10 P1 #C: write a PER-TURN dialect's image attachment to
+/// `p` guarded against a pre-placed symlink, EXTENDING round-8 P1 #2's
+/// no-follow defense (see [`write_attachment_no_follow`]'s own doc) to every
+/// spill branch, not just codex app-server. Round-8 scoped the hardened
+/// write to app-server alone, reasoning that every OTHER per-turn dialect
+/// only ever lists the spilled path in TEXT for the agent to read itself —
+/// a materially lower-severity exposure than app-server's own first-class
+/// `localImage` turn/start input. Codex's round-9 review found that
+/// reasoning incomplete: the vulnerable step is this WRITE itself, not what
+/// happens to the path afterward — plain `std::fs::write` (what this
+/// replaces for every non-app-server branch) follows a symlink and
+/// TRUNCATES its target, so a same-UID process that predicts the next
+/// `msg<row_id>-<i>.<ext>` name and pre-plants a symlink to an arbitrary
+/// user-writable file gets it clobbered by Weft's own write the instant a
+/// human's next image attachment lands — regardless of whether any agent
+/// ever reads the resulting path.
+///
+/// Unlike [`write_attachment_no_follow`], this does NOT use `create_new`
+/// (O_EXCL): these branches use a PREDICTABLE name (`msg<row_id>-<i>.<ext>`,
+/// no `ATTACH_SEQ` nonce), and a rewind can re-dispatch the SAME user row —
+/// same `row_id`, same predictable path — a second time. `create_new` would
+/// then spuriously refuse Weft's own earlier, legitimate write sitting at
+/// that exact path, breaking replay (`rewind::dispatched_text`'s own
+/// persisted-`dispatched`-field fallback aside, this write must still be
+/// ABLE to happen a second time). `create(true).truncate(true)` instead
+/// permits overwriting an ordinary pre-existing file (our own prior write),
+/// while `O_NOFOLLOW` still refuses the kernel-level `open(2)` outright
+/// (`ELOOP`) the instant the leaf is a symlink — closing exactly the vector
+/// Codex's round-9 review named, without reopening round-8's own replay
+/// concern. `mode(0o600)` keeps this owner-only from creation, matching
+/// every other attachment/screenshot write this codebase already hardens
+/// this way.
+///
+/// RESIDUAL (documented, not closed here — same shape as
+/// [`write_attachment_no_follow`]'s own note): a same-UID process using a
+/// HARD LINK instead of a symlink at the predictable path is not caught by
+/// `O_NOFOLLOW` (which only ever refuses a symlink leaf) — `truncate(true)`
+/// would still write through a hard-linked file, corrupting whatever else
+/// it's linked to. Closing that fully needs either `create_new` (which
+/// breaks the replay case above) or moving spilled attachments into a
+/// directory no other account/process can write into at all; tracked as a
+/// follow-up (issue #160 §9), not required to close the SYMLINK vector this
+/// round's fix targets.
+#[cfg(unix)]
+fn write_attachment_no_follow_allow_overwrite(p: &std::path::Path, bytes: &[u8]) -> bool {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opt = std::fs::OpenOptions::new();
+    opt.write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    match opt.open(p) {
+        Ok(mut f) => f.write_all(bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Non-unix fallback — see [`write_attachment_no_follow`]'s own sibling for
+/// why owner-only/no-follow hardening is unix-only here.
+#[cfg(not(unix))]
+fn write_attachment_no_follow_allow_overwrite(p: &std::path::Path, bytes: &[u8]) -> bool {
+    std::fs::write(p, bytes).is_ok()
+}
+
 /// Send a human message: optimistic-persist + either write through or queue.
 /// `images` ride the outbound message as base64 blocks; `files` are appended
 /// as plain paths (the agent reads them with its own tools).
@@ -2889,13 +2955,23 @@ pub async fn send(
         for (i, (mt, data)) in images.iter().enumerate() {
             let ext = mt.rsplit('/').next().unwrap_or("png");
             // issue #160 round-8 P1 #2: ONLY the codex app-server branch gets
-            // the hardened name+write below — that's the ONLY transport that
-            // later hands this exact path to the agent as a first-class
+            // a NONCE-bearing name — that's the ONLY transport that later
+            // hands this exact path to the agent as a first-class
             // `localImage` turn/start input (`is_codex_appserver` branch just
-            // below); every OTHER per-turn dialect only ever lists the path
-            // in TEXT for the agent to read itself with its own tools, a
-            // materially different (and lower-severity) exposure this round
-            // leaves as-is, mirroring round-7 P1's own scoping.
+            // below); every OTHER per-turn dialect keeps the PREDICTABLE
+            // `msg<row_id>-<i>.<ext>` name `rewind::dispatched_text`'s own
+            // fallback reconstruction relies on for rows that predate its
+            // persisted-`dispatched`-field stamping (see this function's own
+            // "Persist the EXACT dispatched text" comment below).
+            //
+            // issue #160 round-10 P1 #C: EVERY branch now gets a no-follow
+            // guarded write, not just app-server — see
+            // `write_attachment_no_follow_allow_overwrite`'s own doc for why
+            // Codex's round-9 review found the OLD app-server-only scoping
+            // incomplete: a plain `std::fs::write` at a predictable name
+            // follows a symlink and truncates whatever it points at,
+            // regardless of whether any agent later reads the resulting
+            // path — the vulnerable step is THIS write, not the later read.
             let p = if is_codex_appserver {
                 let seq = ATTACH_SEQ.fetch_add(1, Ordering::SeqCst);
                 dir.join(format!("msg{row_id}-{i}-{seq}.{ext}"))
@@ -2904,9 +2980,16 @@ pub async fn send(
             };
             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
                 let written = if is_codex_appserver {
+                    // Nonce-named — never collides with a prior write of our
+                    // own, so `create_new` (O_EXCL) is both safe and stricter.
                     write_attachment_no_follow(&p, &bytes)
                 } else {
-                    std::fs::write(&p, &bytes).is_ok()
+                    // Predictable name — a rewind can re-dispatch the SAME
+                    // row a second time, landing on this SAME path, so this
+                    // must still allow overwriting our own prior write (see
+                    // `write_attachment_no_follow_allow_overwrite`'s own doc)
+                    // while still refusing a symlink leaf.
+                    write_attachment_no_follow_allow_overwrite(&p, &bytes)
                 };
                 if written {
                     outbound.push_str(&format!("- {}\n", p.display()));
@@ -4189,6 +4272,52 @@ fn gui_or_ordinary_auto_decision(
     }
 }
 
+/// issue #160 round-10 P1 #E: whether an ACP GUI intent (omp's native
+/// `computer`/`browser` tools — see `acp_permission_risk`'s own
+/// `PermissionIntent::Gui` arm) must be rejected because computer use's OWN
+/// kill-switch/setting says so. Before this fix, a native GUI request's
+/// permission decision went ONLY through [`gui_or_ordinary_auto_decision`] —
+/// never through `computer::enabled`, and never through weft executor's own
+/// control lease/latch (`bus::computer_srv`'s domain entirely). A human
+/// hitting Stop (tripping the emergency-stop latch) or simply flipping
+/// computer use off in Settings had NO effect on this path at all: with a
+/// Full or exact-Always grant already on file, the Settings banner and the
+/// kill-switch UI both said "disabled" while a native GUI request kept
+/// sailing through Allow regardless — screenshots/input kept flowing.
+///
+/// Pure, synchronous, and unit-testable in isolation — see
+/// [`computer_enabled_for_acp`] for the thin, `AppHandle`-taking wrapper this
+/// composes with at the one real call site (not itself unit-testable, per
+/// this module's own `post_stall_notice`-style split: this crate's concrete
+/// `AppHandle` has no path through `tauri::test::mock_app`, which only
+/// yields a `MockRuntime` one).
+///
+/// A NON-gui intent is completely unaffected: `is_gui == false` always
+/// returns `false` regardless of `computer_use_enabled`, since
+/// `computer::enabled` has nothing to do with (say) a file write or a shell
+/// command permission decision.
+fn gui_kill_switch_denies(is_gui: bool, computer_use_enabled: bool) -> bool {
+    is_gui && !computer_use_enabled
+}
+
+/// issue #160 round-10 P1 #E: `computer::enabled` for an ACP permission
+/// decision, from just the `AppHandle` this module already has in scope.
+/// Fail-CLOSED — `false` — when `crate::store::Db` isn't even mounted as
+/// managed state (a `tauri::test::mock_app` in a unit test, or — in
+/// principle — code reached before `lib.rs`'s `setup()` has finished
+/// `.manage()`-ing it): same fail-closed default `computer::enabled` itself
+/// applies to every other "can't prove enabled" case. This is the SAME
+/// setting+latch kill-switch `bus::computer_srv::run_action` already gates
+/// every `weft_computer` MCP call on — reusing it here means a native ACP
+/// GUI request and a `weft_computer` MCP call now answer to the identical
+/// kill switch instead of two independent ones.
+async fn computer_enabled_for_acp(app: &AppHandle) -> bool {
+    match app.try_state::<crate::store::Db>() {
+        Some(db) => crate::computer::enabled(db.inner()).await,
+        None => false,
+    }
+}
+
 /// How much of the reasoning stream the busy-line chip shows.
 const THOUGHT_TAIL_CHARS: usize = 160;
 
@@ -4530,7 +4659,24 @@ async fn acp_consumer(
                 // decides on; every non-GUI intent keeps the exact same
                 // `auto_decision` semantics it always had.
                 let is_gui = matches!(intent, crate::acp::permission::PermissionIntent::Gui { .. });
-                let want = if let Some(asks) = asks {
+                // issue #160 round-10 P1 #E: a GUI intent must answer to
+                // computer use's OWN kill-switch/setting BEFORE anything
+                // else decides — see `gui_kill_switch_denies`'s own doc for
+                // the gap this closes (a native ACP `computer`/`browser`
+                // request used to never consult `computer::enabled` at all,
+                // so a Full/exact-Always grant kept it working straight
+                // through a Stop or a disabled setting). `computer_enabled_
+                // for_acp` (an async DB read) is only ever awaited for a GUI
+                // intent — `true` for the non-GUI case is a don't-care value
+                // `gui_kill_switch_denies` never looks at once `is_gui` is
+                // `false`, just enough to give it a value without an
+                // unconditional async DB read on every non-GUI permission
+                // event too.
+                let computer_use_enabled = if is_gui { computer_enabled_for_acp(&app).await } else { true };
+                let gui_disabled = gui_kill_switch_denies(is_gui, computer_use_enabled);
+                let want = if gui_disabled {
+                    crate::acp::Want::RejectOnce
+                } else if let Some(asks) = asks {
                     match gui_or_ordinary_auto_decision(&asks, thread_id, &dir, risk, &action_key, is_gui) {
                         Some(crate::ask::Decision::Allow) => crate::acp::Want::AllowOnce,
                         Some(crate::ask::Decision::Deny) => crate::acp::Want::RejectOnce,
@@ -9019,6 +9165,62 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"already here");
     }
 
+    // —— issue #160 round-10 P1 #C: hardened write for EVERY OTHER per-turn
+    // dialect's predictable-name attachment spill ——
+
+    /// The happy path: a brand-new predictable path writes normally, owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_allow_overwrite_writes_a_fresh_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("msg7-0.png");
+        assert!(write_attachment_no_follow_allow_overwrite(&p, b"hello"));
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::symlink_metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "must be created owner-only");
+    }
+
+    /// The exact vector Codex's round-9 review named: a co-resident process
+    /// pre-places a symlink at the predictable `msg<row_id>-<i>.<ext>` path,
+    /// pointing at an arbitrary file elsewhere. `O_NOFOLLOW` must refuse to
+    /// follow it — the call fails closed and the symlink's target is left
+    /// untouched, never truncated/overwritten by Weft's own write.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_allow_overwrite_refuses_a_preexisting_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("victim.png");
+        std::fs::write(&target, b"original").unwrap();
+        let p = tmp.path().join("msg7-0.png");
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+
+        let ok = write_attachment_no_follow_allow_overwrite(&p, b"attacker-controlled");
+        assert!(!ok, "a pre-placed symlink must make this fail, not follow it");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"original",
+            "the symlink's target must never be overwritten"
+        );
+    }
+
+    /// UNLIKE the app-server helper: a plain, pre-existing (non-symlink) file
+    /// at the predictable path — standing in for a rewind re-dispatching the
+    /// SAME user row a second time — must be OVERWRITTEN, not refused. This is
+    /// the deliberate difference from `write_attachment_no_follow`'s own
+    /// `create_new` behavior: predictable names must survive replay.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_allow_overwrite_overwrites_an_existing_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("msg7-0.png");
+        std::fs::write(&p, b"already here").unwrap();
+
+        let ok = write_attachment_no_follow_allow_overwrite(&p, b"new bytes");
+        assert!(ok, "an ordinary pre-existing file (our own prior write) must be overwritable");
+        assert_eq!(std::fs::read(&p).unwrap(), b"new bytes");
+    }
+
     /// Stop must actually stop. `interrupt()` sets `interrupting` without
     /// bumping the epoch, so a Stop landing between `on_turn_end` promoting a
     /// queued item and its dispatch cancels nothing and leaves the epoch
@@ -9256,6 +9458,42 @@ mod tests {
             gui_or_ordinary_auto_decision(&asks, 3, "30", RiskLevel::Write, "different-key", true).is_none(),
             "a non-matching action_key must still card, even with a standing Always grant on file"
         );
+    }
+
+    // —— issue #160 round-10 P1 #E: ACP GUI intents answer to computer use's
+    // own kill-switch/setting ——
+
+    /// The end-to-end property this fix exists for: a GUI intent with
+    /// computer use DISABLED must be denied regardless of ANY grant — this is
+    /// checked before `gui_or_ordinary_auto_decision` (a Full/exact-Always
+    /// grant) is even consulted, so it can never be bypassed by one.
+    #[test]
+    fn gui_kill_switch_denies_a_gui_intent_when_computer_use_is_disabled() {
+        assert!(
+            gui_kill_switch_denies(true, false),
+            "a GUI intent must be denied while computer use is disabled"
+        );
+    }
+
+    /// The other half: a GUI intent with computer use ENABLED is unaffected —
+    /// this fix narrows nothing else about how a GUI intent is later decided
+    /// (still `gui_or_ordinary_auto_decision`/a human card), it only adds a
+    /// kill-switch check ahead of that.
+    #[test]
+    fn gui_kill_switch_allows_a_gui_intent_when_computer_use_is_enabled() {
+        assert!(
+            !gui_kill_switch_denies(true, true),
+            "a GUI intent must proceed to its ordinary decision when computer use is enabled"
+        );
+    }
+
+    /// A non-GUI intent is COMPLETELY unaffected by this check either way —
+    /// `computer::enabled` has nothing to do with a file write, a shell
+    /// command, or any other non-GUI ACP permission decision.
+    #[test]
+    fn gui_kill_switch_never_denies_a_non_gui_intent() {
+        assert!(!gui_kill_switch_denies(false, false), "a non-GUI intent must never be affected");
+        assert!(!gui_kill_switch_denies(false, true), "a non-GUI intent must never be affected");
     }
 
     /// An image-only message is addressable in ACP and not in claude, and the

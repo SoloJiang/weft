@@ -1585,6 +1585,35 @@ pub async fn get_computer_use_enabled(db: State<'_, Db>) -> R<bool> {
     Ok(crate::computer::enabled(&db).await)
 }
 
+/// issue #160 round-10 P2 #D: serializes every `set_computer_use_enabled_inner`
+/// call — see that function's own doc for the NEW compensating-write race two
+/// OVERLAPPING enable requests can hit on top of round-8 P1 #1's own fix
+/// (enable A loses to a Stop and starts its own compensating write of
+/// `"false"` at the same moment a LATER enable B writes `"true"` and clears
+/// the latch; A's slower compensating write then lands LAST, silently
+/// reverting B's explicit re-enable even though both commands reported
+/// success). Mirrors `computer::input_flight_guard`'s own
+/// `OnceLock<tokio::sync::Mutex<()>>` shape (a `tokio::sync::Mutex`, unlike
+/// `std::sync::Mutex`, can be held across an `.await` — required here, since
+/// the whole point is holding it across `set_computer_use_enabled_inner`'s
+/// own DB write and reconcile call). Serializing enable-vs-enable this way
+/// makes A run to COMPLETION (including its own compensating write) before B
+/// ever starts, so B's read of `stop_generation`/its own write/its own
+/// reconcile all see the world strictly AFTER A finished — B's `"true"`
+/// always lands last, never clobbered.
+///
+/// Deliberately NOT used by `computer::emergency_stop`/
+/// `computer_emergency_stop` (the kill switch/Stop button): a human's Stop
+/// must always be free to cut in immediately — queuing it behind an
+/// in-flight enable request would delay the ONE thing this whole feature's
+/// safety property depends on. Only enable-vs-enable is serialized here;
+/// Stop still races in and wins exactly as round-6/round-8's own fixes
+/// already guarantee.
+fn enable_serialize_mutex() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// issue #160 round-6 review P1 #1: an `enabled == true` request reads the
 /// current stop-generation via `computer::stop_generation` BEFORE its own
 /// `set_setting` write starts — see `computer::clear_emergency_stop`'s own
@@ -1598,6 +1627,12 @@ pub async fn get_computer_use_enabled(db: State<'_, Db>) -> R<bool> {
 /// test can drive it without a Tauri runtime — same pattern as
 /// `ensure_default_workspace_inner`.
 pub async fn set_computer_use_enabled_inner(db: &Db, enabled: bool) -> R<()> {
+    // issue #160 round-10 P2 #D: held for this ENTIRE function — read gen,
+    // write the setting, reconcile — so a second overlapping enable request
+    // can never interleave with this one's own (possibly compensating)
+    // write. See `enable_serialize_mutex`'s own doc for the race this closes
+    // and why `emergency_stop` is deliberately excluded from it.
+    let _serialize = enable_serialize_mutex().lock().await;
     let gen = enabled.then(crate::computer::stop_generation);
     repo::set_setting(
         db,
@@ -4140,6 +4175,93 @@ mod tests {
         );
 
         // Leave the shared process-wide latch clean for every other test.
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+    }
+
+    // —— issue #160 round-10 P2 #D: enable-vs-enable serialization ——
+
+    /// The composed end-to-end property `enable_serialize_mutex` exists to
+    /// guarantee: once A's own compensating write has FULLY landed (the exact
+    /// end-state `reconcile_enable_after_write_compensates_when_a_later_stop_wins_the_race`
+    /// proves above), a LATER B's `set_computer_use_enabled_inner(&db, true)`
+    /// must land cleanly on top of it — reading the CURRENT (post-A)
+    /// generation, persisting `"true"`, and clearing the latch, with nothing
+    /// left over from A to clobber it. Genuine concurrent interleaving isn't
+    /// reliably reproducible against an in-memory sqlite connection (see the
+    /// round-8 test's own doc comment) — this instead proves the two calls
+    /// compose correctly SEQUENTIALLY, which is exactly what
+    /// `enable_serialize_mutex` forces two genuinely-racing calls into: A
+    /// must run to full completion (through its own compensating write)
+    /// before B's own read/write/reconcile ever begin, so this sequential
+    /// composition IS the serialized outcome.
+    #[tokio::test]
+    async fn enable_after_a_compensated_stop_lands_cleanly_for_a_later_re_enable() {
+        let _guard = crate::computer::process_state_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        // A: reads its generation, loses the race to a Stop, its own write
+        // lands, then its compensation writes "false" back.
+        let stale_gen = crate::computer::stop_generation();
+        crate::computer::emergency_stop(&db).await.unwrap();
+        repo::set_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        reconcile_enable_after_write(&db, stale_gen).await.unwrap();
+        assert_eq!(
+            repo::get_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED).await.unwrap().as_deref(),
+            Some("false"),
+            "precondition: A's compensating write must have landed \"false\""
+        );
+
+        // B: a later, explicit re-enable through the REAL public entry point
+        // — must see the CURRENT (post-A) generation, persist "true", and
+        // clear the latch, with nothing from A left to override it.
+        set_computer_use_enabled_inner(&db, true).await.unwrap();
+
+        assert_eq!(
+            repo::get_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED).await.unwrap().as_deref(),
+            Some("true"),
+            "B's explicit re-enable must land \"true\", never overridden by A's earlier compensation"
+        );
+        assert!(crate::computer::enabled(&db).await, "B's re-enable must actually take effect");
+
+        // Leave the shared process-wide latch clean for every other test.
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+    }
+
+    /// A more direct, structural proof that the lock exists and is actually
+    /// acquired by `set_computer_use_enabled_inner`: holding it OURSELVES
+    /// must make a concurrent call block until we release it — proving the
+    /// function really does serialize on this lock, not just that two calls
+    /// happen to compose correctly when run back-to-back (the test above).
+    #[tokio::test]
+    async fn set_computer_use_enabled_inner_serializes_on_the_enable_lock() {
+        let _guard = crate::computer::process_state_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        let held = enable_serialize_mutex().lock().await;
+
+        let db_bg = db.clone();
+        let handle = tokio::spawn(async move { set_computer_use_enabled_inner(&db_bg, true).await });
+
+        // Give the spawned call a chance to run — if it did NOT serialize on
+        // this lock it would race ahead and finish; confirm it hasn't.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!handle.is_finished(), "the enable call must block while the enable lock is held");
+
+        drop(held);
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            repo::get_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED).await.unwrap().as_deref(),
+            Some("true"),
+            "once released, the call must proceed and persist normally"
+        );
+
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
     }
 }

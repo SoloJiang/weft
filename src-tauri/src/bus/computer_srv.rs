@@ -155,7 +155,7 @@ fn computer_tool_specs() -> Value {
     json!([
         {
             "name": "computer",
-            "description": format!("Observe AND control the human's screen — OS-level window listing/screenshot plus mouse/keyboard input injection. `action=list_windows` lists visible on-screen windows (Weft's own window and terminal-emulator apps are excluded, so you can never see yourself or the terminal you're running inside). `action=screenshot` captures ONE window — never the whole desktop — and returns a PNG FILE PATH (not image data): open it with your own image-viewing tool. Every action except `list_windows`, `cursor_position`, and `wait` needs `window` (same id/substring rule as screenshot) and drives that window's input: `left_click`/`right_click`/`double_click`/`triple_click`/`mouse_move` need `coordinate` [x, y]; `left_click_drag` needs `start_coordinate` AND `coordinate` (end point); `scroll` needs `coordinate` plus `scroll_direction`; `type`/`key` need `text` (literal text to type, or a combo like \"cmd+s\"/\"ctrl+shift+t\"/\"Return\"/\"f5\" for `key`). ALL coordinates are in the pixel space of the MOST RECENT screenshot of that window — take a screenshot first (or again after the window resizes) to get coordinates that still line up, since the mapping is recomputed from the window's CURRENT size on every call and an out-of-range coordinate is rejected rather than guessed at. `type`/`key` additionally require a `left_click`/`right_click`/`double_click`/`triple_click` on that SAME window within the last {FOCUS_FRESHNESS_SECS}s — click inside the target window first to focus it, then type/key within {FOCUS_FRESHNESS_SECS}s, or the call is rejected. Every call — observation or input — may pause for a human's permission card (Needs-you) before it runs; an input action can additionally come back `Busy` (another session currently has it) or fail while a DIFFERENT permission card is still waiting on the human — retry after a moment. Input actions are also rate-limited to roughly 2 per second."),
+            "description": format!("Observe AND control the human's screen — OS-level window listing/screenshot plus mouse/keyboard input injection. `action=list_windows` lists visible on-screen windows (Weft's own window and terminal-emulator apps are excluded, so you can never see yourself or the terminal you're running inside). `action=screenshot` captures ONE window — never the whole desktop — and returns a PNG FILE PATH; for clients that accept an inline MCP image (Claude, and ACP/omp sessions) the same result ALSO carries the screenshot inlined as an image block, so you can reason over it directly with no need to open the path yourself — other clients should open that file path with their own image-viewing tool. Every action except `list_windows`, `cursor_position`, and `wait` needs `window` (same id/substring rule as screenshot) and drives that window's input: `left_click`/`right_click`/`double_click`/`triple_click`/`mouse_move` need `coordinate` [x, y]; `left_click_drag` needs `start_coordinate` AND `coordinate` (end point); `scroll` needs `coordinate` plus `scroll_direction`; `type`/`key` need `text` (literal text to type, or a combo like \"cmd+s\"/\"ctrl+shift+t\"/\"Return\"/\"f5\" for `key`). ALL coordinates are in the pixel space of the MOST RECENT screenshot of that window — take a screenshot first (or again after the window resizes) to get coordinates that still line up, since the mapping is recomputed from the window's CURRENT size on every call and an out-of-range coordinate is rejected rather than guessed at. `type`/`key` additionally require a `left_click`/`right_click`/`double_click`/`triple_click` on that SAME window within the last {FOCUS_FRESHNESS_SECS}s — click inside the target window first to focus it, then type/key within {FOCUS_FRESHNESS_SECS}s, or the call is rejected. Every call — observation or input — may pause for a human's permission card (Needs-you) before it runs; an input action can additionally come back `Busy` (another session currently has it) or fail while a DIFFERENT permission card is still waiting on the human — retry after a moment. Input actions are also rate-limited to roughly 2 per second."),
             "inputSchema": { "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": VALID_ACTIONS,
@@ -321,8 +321,16 @@ async fn run_action(
             let b = backend::backend();
             let shot = computer::screenshot_window(b.as_ref(), window_query, &out_dir)
                 .map_err(|e| e.to_string())?;
+            // issue #160 round-10 P2 #H: this confirmation text is shared by
+            // BOTH the plain-text-only result and `text_and_image_result`'s
+            // own text block (see that function's doc) — worded so it holds
+            // for either: a capable client (Claude, ACP/omp) also gets this
+            // screenshot inlined as an image block in the SAME result and can
+            // reason over it directly; any other client opens the path.
             let text = format!(
-                "screenshot saved: {} ({}x{}, scale {:.2}) — open it with your image viewing tool",
+                "screenshot saved: {} ({}x{}, scale {:.2}) — inlined as an image in this result for \
+                 capable clients (Claude, ACP/omp), otherwise open the path with your own image \
+                 viewing tool",
                 shot.path.display(),
                 shot.width,
                 shot.height,
@@ -415,15 +423,13 @@ async fn run_action(
             // call actually gets to inject, landing the click outside the
             // (now stale) coordinates were computed against — or on an
             // entirely different window that reused the same id.
-            let w = computer::resolve_window(backend::backend().as_ref(), window_query)
-                .map_err(|e| e.to_string())?;
-            *window_id_out = Some(w.id);
+            //
             // issue #160 round-8 P1 #4: this window must still be the EXACT
             // one `approve` bound at authorization time — see
             // `verify_approved_target`'s own doc. Checked BEFORE this window
-            // is ever activated or clicked.
-            verify_approved_target(&approved, &w)?;
-            let (px, py) = computer::map_to_physical(&w, cx, cy).map_err(|e| e.to_string())?;
+            // is ever activated or clicked (`resolve_and_verify_target`
+            // does both: resolve, record `window_id_out`, verify).
+            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
             // issue #160 round-4 P1 §2 (broadened round-5 review P1 §6): reclaim
             // the foreground BEFORE this click reaches the OS, not after — see
             // `activate_target`'s own doc for why even the click family (not
@@ -434,6 +440,15 @@ async fn run_action(
             // and an Auto approval offers no guarantee the target still holds
             // the real OS foreground either.
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
+            // issue #160 round-10 P1 #B: `activate_target` (inside the call
+            // above) shells out to a potentially slow, blocking OS call
+            // (osascript/wmctrl/`xdotool --sync`) — the window can move,
+            // resize, close, or have its id reused by an unrelated window
+            // WHILE that call runs. Re-resolve/re-verify AFTER it returns,
+            // and map/inject against THIS fresh state — never the
+            // pre-activation `w`, which may already be stale by now.
+            let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let (px, py) = computer::map_to_physical(&w2, cx, cy).map_err(|e| e.to_string())?;
             backend::backend()
                 .click(px, py, button, count)
                 .map_err(|e| e.to_string())?;
@@ -442,10 +457,10 @@ async fn run_action(
             // AFTER the backend call succeeds: a rejected/failed click never
             // touched the real window and must not seed a false freshness
             // record for a later `type`/`key`.
-            record_click_focus(thread, dir, w.id);
+            record_click_focus(thread, dir, w2.id);
             Ok(format!(
                 "{action} at ({px}, {py}) in window {} done — take a screenshot to verify",
-                w.id
+                w2.id
             ))
         }
         "mouse_move" => {
@@ -456,22 +471,21 @@ async fn run_action(
             // See the click-family arm above for why this guard is held
             // across the backend call itself, and why window resolution/
             // coordinate mapping now happen AFTER it (issue #160 round-6
-            // review P1 #3).
+            // review P1 #3), TWICE — once before activation, once after
+            // (issue #160 round-10 P1 #B).
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir).await?;
-            let w = computer::resolve_window(backend::backend().as_ref(), window_query)
-                .map_err(|e| e.to_string())?;
-            *window_id_out = Some(w.id);
-            // issue #160 round-8 P1 #4: see the click-family arm above.
-            verify_approved_target(&approved, &w)?;
-            let (px, py) = computer::map_to_physical(&w, cx, cy).map_err(|e| e.to_string())?;
+            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
+            // issue #160 round-10 P1 #B: see the click-family arm above.
+            let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let (px, py) = computer::map_to_physical(&w2, cx, cy).map_err(|e| e.to_string())?;
             backend::backend()
                 .move_cursor(px, py)
                 .map_err(|e| e.to_string())?;
             Ok(format!(
                 "mouse_move to ({px}, {py}) in window {} done — take a screenshot to verify",
-                w.id
+                w2.id
             ))
         }
         "left_click_drag" => {
@@ -483,20 +497,21 @@ async fn run_action(
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir).await?;
             // issue #160 round-6 review P1 #3: BOTH endpoints are remapped
-            // against the SAME freshly-resolved `w` — a drag has two
-            // coordinates, but only one window to go stale.
-            let b = backend::backend();
-            let w = computer::resolve_window(b.as_ref(), window_query).map_err(|e| e.to_string())?;
-            *window_id_out = Some(w.id);
-            // issue #160 round-8 P1 #4: see the click-family arm above.
-            verify_approved_target(&approved, &w)?;
-            let from = computer::map_to_physical(&w, sx, sy).map_err(|e| e.to_string())?;
-            let to = computer::map_to_physical(&w, ex, ey).map_err(|e| e.to_string())?;
+            // against the SAME freshly-resolved window — a drag has two
+            // coordinates, but only one window to go stale. issue #160
+            // round-10 P1 #B: that resolve now happens TWICE, before and
+            // after activation — see the click-family arm above — and BOTH
+            // endpoints are mapped against the SECOND (post-activation) `w2`.
+            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
+            let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let from = computer::map_to_physical(&w2, sx, sy).map_err(|e| e.to_string())?;
+            let to = computer::map_to_physical(&w2, ex, ey).map_err(|e| e.to_string())?;
+            let b = backend::backend();
             b.drag(from, to).map_err(|e| e.to_string())?;
             Ok(format!(
                 "left_click_drag from ({}, {}) to ({}, {}) in window {} done — take a screenshot to verify",
-                from.0, from.1, to.0, to.1, w.id
+                from.0, from.1, to.0, to.1, w2.id
             ))
         }
         "scroll" => {
@@ -507,19 +522,17 @@ async fn run_action(
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir).await?;
-            let w = computer::resolve_window(backend::backend().as_ref(), window_query)
-                .map_err(|e| e.to_string())?;
-            *window_id_out = Some(w.id);
-            // issue #160 round-8 P1 #4: see the click-family arm above.
-            verify_approved_target(&approved, &w)?;
-            let (px, py) = computer::map_to_physical(&w, cx, cy).map_err(|e| e.to_string())?;
+            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
+            // issue #160 round-10 P1 #B: see the click-family arm above.
+            let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let (px, py) = computer::map_to_physical(&w2, cx, cy).map_err(|e| e.to_string())?;
             backend::backend()
                 .scroll(px, py, dx, dy)
                 .map_err(|e| e.to_string())?;
             Ok(format!(
                 "scroll at ({px}, {py}) dx={dx} dy={dy} in window {} done — take a screenshot to verify",
-                w.id
+                w2.id
             ))
         }
         "type" => {
@@ -542,20 +555,22 @@ async fn run_action(
             // round-2 P1 addendum) is unchanged in SPIRIT — see
             // `require_recent_focus`'s doc — just now checked against a
             // freshly-resolved id rather than a possibly-stale one.
-            let w = computer::resolve_window(backend::backend().as_ref(), window_query)
-                .map_err(|e| e.to_string())?;
-            *window_id_out = Some(w.id);
-            // issue #160 round-8 P1 #4: see the click-family arm above.
-            verify_approved_target(&approved, &w)?;
-            require_recent_focus(thread, dir, w.id)?;
+            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
+            // issue #160 round-10 P1 #B: re-resolve/re-verify AFTER
+            // activation, same as every other input arm — and check focus-
+            // freshness against THIS fresh id (`w2.id`), not the
+            // pre-activation one: the window `require_recent_focus` guards
+            // is the SAME one about to receive the keystrokes.
+            let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            require_recent_focus(thread, dir, w2.id)?;
             backend::backend()
                 .type_text(text)
                 .map_err(|e| e.to_string())?;
             Ok(format!(
                 "typed {} char(s) in window {} done — take a screenshot to verify",
                 text.chars().count(),
-                w.id
+                w2.id
             ))
         }
         "key" => {
@@ -566,17 +581,15 @@ async fn run_action(
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir).await?;
             // See the matching comment in the "type" arm above.
-            let w = computer::resolve_window(backend::backend().as_ref(), window_query)
-                .map_err(|e| e.to_string())?;
-            *window_id_out = Some(w.id);
-            // issue #160 round-8 P1 #4: see the click-family arm above.
-            verify_approved_target(&approved, &w)?;
-            require_recent_focus(thread, dir, w.id)?;
+            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
+            // issue #160 round-10 P1 #B: see the "type" arm above.
+            let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            require_recent_focus(thread, dir, w2.id)?;
             backend::backend().key(combo).map_err(|e| e.to_string())?;
             Ok(format!(
                 "key {combo} in window {} done — take a screenshot to verify",
-                w.id
+                w2.id
             ))
         }
         // No window, no control lock, no throttle — this reads the cursor's
@@ -671,6 +684,31 @@ async fn run_action(
 /// [`run_action`] threads the `Some(w)` through to its own later, FRESH
 /// `resolve_window` call for that same action and refuses to inject if the
 /// two disagree — see [`verify_approved_target`].
+///
+/// issue #160 round-10 P1 #A: the resolve above USED TO happen only once
+/// authorization already landed (`bind_approved_window`, round-8's own
+/// helper, now folded directly into this function — see the `resolved`
+/// binding below). That left a gap `bind_approved_window` alone could never
+/// close: a standing Always grant is looked up by `action_key` ALONE, and
+/// the OLD key (`["gui", action, window_query, digest]`) never captured
+/// WHICH window was actually approved — just the query STRING. Once a human
+/// approved one `type`-into-"notes" call as Always, that SAME key kept
+/// auto-approving every FUTURE `type` into whatever window "notes" happens
+/// to resolve to later, including an entirely different app/title that
+/// closed the original and took its place (round-8's own approve→dispatch
+/// binding only ever caught that drift AFTER approval, never at the
+/// grant-lookup step itself). The fix: for a Write action with a non-blank
+/// window argument, resolve `window_query` AUTHORITATIVELY right here,
+/// BEFORE `action_key` is even built, and fold the resolved `app`+`title`
+/// into the key itself. A standing Always grant then only ever matches the
+/// EXACT window identity it was granted for — a query that now resolves to
+/// a different app/title mints a DIFFERENT key, misses `auto_decision_exact`
+/// entirely, and falls through to a fresh card. This same `resolved` value
+/// is reused directly for the `ApprovedWindow` this function returns on
+/// EITHER success path (a standing grant, or a human's card) — no second
+/// resolve inside a separate `bind_approved_window` step anymore, so there
+/// is no "resolve once for the key, resolve again to bind" drift left to
+/// reopen.
 async fn approve(
     asks: &AskRegistry,
     thread: i32,
@@ -686,7 +724,35 @@ async fn approve(
         format!("computer: {action} @ {window_query}")
     };
     let digest = args_digest(args);
-    let action_key = crate::ask::action_key(&["gui", action, &window_query, &digest]);
+    // issue #160 round-10 P1 #A: resolve the window's identity FIRST, before
+    // `action_key` is even built — see this function's own doc comment above
+    // for the standing-grant identity gap this closes. Only Write-classified
+    // actions with a non-blank window argument get this (mirrors the OLD
+    // `bind_approved_window`'s own gate exactly): `screenshot`/`list_windows`/
+    // `cursor_position` and `wait` (Write-classified but windowless) have
+    // nothing to bind and keep the OLD, resolve-free key shape below.
+    // Fail-CLOSED — `Err`, never `Ok(None)` — when this resolve itself fails:
+    // an input action must not proceed at all once its own authorization
+    // step couldn't even pin down a window identity.
+    let resolved = if risk == crate::ask::RiskLevel::Write && !window_query.trim().is_empty() {
+        let b = backend::backend();
+        Some(computer::resolve_window(b.as_ref(), &window_query).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    // Granularity tradeoff (documented, not a behavior bug): folding
+    // `app`+`title` into an input action's key makes a standing Always grant
+    // scoped to that EXACT window TITLE, not just the app — a title change
+    // (a browser tab navigating, a document renaming itself in its title
+    // bar) mints a new key and re-cards even though a human would likely
+    // consider it "the same window". That is the safe default this round
+    // ships; loosening it to app-only scoping is a legitimate, separately-
+    // discussable product tradeoff for later, not something this round
+    // changes.
+    let action_key = match &resolved {
+        Some(w) => crate::ask::action_key(&["gui", action, &window_query, &w.app, &w.title, &digest]),
+        None => crate::ask::action_key(&["gui", action, &window_query, &digest]),
+    };
     // UNREDACTED, even for `action == "type"`: the human approving THIS card
     // needs to see exactly what is about to be typed to judge whether to
     // allow it — a card that hid the text and only said "N characters" would
@@ -739,11 +805,12 @@ async fn approve(
     // those same three cases; it just never falls through to the read-only
     // batch/issue grant underneath them.
     match asks.auto_decision_exact(thread, dir, &action_key) {
-        // round-8 P1 #4: bind the window identity HERE, the instant this
-        // standing grant authorizes the call — not left for `run_action`'s
-        // OWN later resolution to discover on its own, which is exactly the
-        // "approve one window, dispatch to a different one" gap this closes.
-        Some(Decision::Allow) => return bind_approved_window(risk, &window_query),
+        // issue #160 round-10 P1 #A: `resolved` was already computed above,
+        // BEFORE this grant was even looked up (the key itself depends on
+        // it) — reused directly here rather than resolved a second time, so
+        // there is no "resolve once for the key, resolve again to bind" gap
+        // left for a window swap to land in.
+        Some(Decision::Allow) => return Ok(resolved.map(ApprovedWindow::from)),
         // `auto_decision_exact` never actually returns `Deny` today (only
         // Allow-only standing grants exist) — this arm keeps the gate
         // correct regardless, mirroring `handle_ask`'s own defensive shape,
@@ -758,12 +825,17 @@ async fn approve(
     );
 
     match tokio::time::timeout(crate::bus::server::ASK_WAIT, rx).await {
-        // round-8 P1 #4: same binding, taken the instant the human's card
-        // itself resolves Allow — the window the card's own preview showed
-        // may since have closed/been replaced by the time this returns, so
-        // this resolves FRESH, right here, rather than trusting whatever
-        // `preview_for_action` looked at when the card was first built.
-        Ok(Ok(Decision::Allow)) => bind_approved_window(risk, &window_query),
+        // issue #160 round-10 P1 #A: same `resolved` value, reused here too —
+        // see this function's own top doc comment for why this round
+        // deliberately no longer re-resolves a second time at the moment the
+        // human's card answers Allow (round-8's own `bind_approved_window`
+        // used to): a standing Always grant this call might mint is keyed
+        // off THIS identity regardless, and `run_action`'s own later, fresh
+        // `resolve_window`/`verify_approved_target` pair (issue #160 round-10
+        // P1 #B, run both before AND after activation) is what actually
+        // guards the approve→dispatch gap a long human wait can open, not
+        // this return value.
+        Ok(Ok(Decision::Allow)) => Ok(resolved.map(ApprovedWindow::from)),
         Ok(Ok(Decision::Deny)) => Err("denied in weft".to_string()),
         // Timed out, or the sender was dropped (`AskRegistry::cancel`/
         // `cancel_for` — e.g. an engine/model switch tearing this session
@@ -790,6 +862,13 @@ async fn approve(
 /// reused by the OS/window manager for an entirely unrelated window, so `id`
 /// alone is not sufficient to prove "this is still the window that was
 /// approved" — `app`+`title` must also still match.
+///
+/// issue #160 round-10 P1 #A: this is now ALSO the exact identity folded
+/// into the input action's own `action_key` (see `approve`'s `resolved`
+/// binding) — the same three fields serve both jobs (scoping a standing
+/// Always grant to one window, and verifying dispatch lands on that same
+/// window) since they are, by construction, the identical question: "is
+/// this still the window that was approved".
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ApprovedWindow {
     id: u32,
@@ -797,27 +876,18 @@ struct ApprovedWindow {
     title: String,
 }
 
-/// issue #160 round-8 P1 #4: resolve `window_query` into an [`ApprovedWindow`]
-/// binding, for an action `approve` just authorized — called from BOTH places
-/// `approve` can return `Ok` (a standing grant, or a human's card). Observe
-/// actions (`risk != Write`) and any Write action with no window argument at
-/// all (`wait`) have no target to bind — `Ok(None)`, unchanged behavior. A
-/// Write action WITH a window argument resolves it right here,
-/// AUTHORITATIVELY: success binds `Some(ApprovedWindow)`; failure (not
-/// found, or ambiguous) is `Err` — fail-CLOSED, never `Ok(None)` — since an
-/// input action must not be allowed to proceed at all once even the approval
-/// step's own resolution couldn't pin down a single window.
-fn bind_approved_window(
-    risk: crate::ask::RiskLevel,
-    window_query: &str,
-) -> Result<Option<ApprovedWindow>, String> {
-    if risk != crate::ask::RiskLevel::Write || window_query.trim().is_empty() {
-        return Ok(None);
+/// issue #160 round-10 P1 #A: `approve` resolves a Write action's window
+/// EXACTLY ONCE (see its own `resolved` binding) and reuses that SAME
+/// `WindowInfo` both to build `action_key` and — via this trivial,
+/// infallible conversion — to construct the `ApprovedWindow` it returns.
+/// Replaces round-8's own `bind_approved_window`, which used to re-resolve
+/// `window_query` a SECOND time at the moment authorization landed; folding
+/// window identity into the key itself (this round's fix) means that second
+/// resolve no longer serves any purpose a plain field-copy can't.
+impl From<computer::WindowInfo> for ApprovedWindow {
+    fn from(w: computer::WindowInfo) -> Self {
+        ApprovedWindow { id: w.id, app: w.app, title: w.title }
     }
-    let b = backend::backend();
-    computer::resolve_window(b.as_ref(), window_query)
-        .map(|w| Some(ApprovedWindow { id: w.id, app: w.app, title: w.title }))
-        .map_err(|e| e.to_string())
 }
 
 /// issue #160 round-8 P1 #4: the execution-time check every input arm of
@@ -847,6 +917,38 @@ fn verify_approved_target(
         );
     }
     Ok(())
+}
+
+/// issue #160 round-10 P1 #B: resolve `window_query` fresh against the
+/// process-wide backend, record its id into `window_id_out` — done even when
+/// the very next [`verify_approved_target`] check fails, so the audit log
+/// still names which window was TARGETED, not only ones that actually
+/// received input — then verify it against `approved`. Every input arm of
+/// [`run_action`] calls this TWICE now: once before [`activate_and_recheck`]
+/// (purely to get an id to activate, plus an early identity check), and
+/// again immediately after it returns.
+///
+/// Why twice: `activate_target` (inside `activate_and_recheck`) shells out to
+/// a potentially slow, blocking OS call (`osascript`/`wmctrl`/`xdotool
+/// --sync`) — the window can move, resize, close, or have its id reused by an
+/// entirely unrelated window WHILE that call is in flight. A coordinate
+/// mapped, or a focus-freshness check made, against the PRE-activation
+/// resolve could then land outside the window that's actually there once
+/// activation finishes, or silently target a replacement window that reused
+/// the same id — with no re-check that it's still the one `approve` bound at
+/// authorization time. The SECOND call's `WindowInfo` is what every arm
+/// actually maps coordinates against / checks focus-freshness against /
+/// injects into; the first call exists only to obtain an id for activation
+/// and an early fail-fast identity check.
+fn resolve_and_verify_target(
+    window_query: &str,
+    approved: &Option<ApprovedWindow>,
+    window_id_out: &mut Option<u32>,
+) -> Result<computer::WindowInfo, String> {
+    let w = computer::resolve_window(backend::backend().as_ref(), window_query).map_err(|e| e.to_string())?;
+    *window_id_out = Some(w.id);
+    verify_approved_target(approved, &w)?;
+    Ok(w)
 }
 
 /// Fixed key order for the "consequential parameters" digest folded into the
@@ -1652,11 +1754,82 @@ async fn append_audit(db: &Db, thread: i32, dir: &str, wt: Option<i32>, entry: &
     if tokio::fs::create_dir_all(parent).await.is_err() {
         return;
     }
+    // issue #160 round-10 P1 #F: rotate BEFORE opening for append — see
+    // `rotate_audit_if_needed`'s own doc for the unbounded-growth hazard
+    // this closes (a Full/exact-Always-granted agent looping
+    // `cursor_position`/`list_windows` with no throttle of its own would
+    // otherwise append forever). Best-effort like every other step here:
+    // never blocks or fails the actual append.
+    rotate_audit_if_needed(&path);
     let Ok(line) = audit_line(entry) else { return };
     let Ok(mut file) = open_audit_file_for_append(&path).await else {
         return;
     };
     let _ = file.write_all(line.as_bytes()).await;
+}
+
+/// Single-file rotation cap for `computer-audit.jsonl` (issue #160 round-10
+/// P1 #F): unlike screenshots ([`prune_old_screenshots`]/
+/// [`MAX_RETAINED_SCREENSHOTS`] equivalents live in `computer` — see
+/// `computer::screenshot_window`'s own retention cap), the audit log had NO
+/// rotation/quota/cleanup at all — every `tools/call`, Full/exact-Always
+/// granted or not, appends one more line forever. A looping
+/// `cursor_position`/`list_windows` agent (both `ReadOnly`, both throttled
+/// only by the general input rate limit which doesn't even apply to
+/// observation actions) could grow this file without bound until the
+/// human's disk fills up.
+const MAX_AUDIT_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Rotate `path` — the audit log's own file — to `<path>.1` (overwriting
+/// whatever was previously there) if it is already at/over
+/// [`MAX_AUDIT_BYTES`], via [`rotate_audit_at_size`]. Total on-disk usage for
+/// this one file stays bounded to roughly `2 * MAX_AUDIT_BYTES`: the live
+/// file plus, at most, one rotated `.1`. A more elaborate multi-generation
+/// rotation, or a per-session quota, is a follow-up — this round ships the
+/// simplest scheme that actually bounds growth.
+fn rotate_audit_if_needed(path: &std::path::Path) {
+    rotate_audit_at_size(path, MAX_AUDIT_BYTES);
+}
+
+/// The actual rotation logic, parameterized on `max_bytes` (issue #160
+/// round-10 P1 #F) so a test can drive it against a real, small file without
+/// having to write out multiple real megabytes just to exercise the
+/// threshold — [`rotate_audit_if_needed`] is the one production caller,
+/// always with [`MAX_AUDIT_BYTES`].
+///
+/// Symlink safety: `path` has ALREADY been walked component-by-component by
+/// [`refuse_symlinks`] (via [`audit_log_path`]) before [`append_audit`] ever
+/// calls this — but a worktree is repository-controlled content, so the
+/// window between that check and THIS call is still open. Re-checks via
+/// `symlink_metadata` (never plain `metadata`) right here, immediately
+/// before the `rename`: if `path` is no longer a REGULAR file at all (a
+/// symlink swapped into place in that gap) rotation is skipped outright
+/// rather than renaming something that may not mean what the size check
+/// assumed; the `.1` destination gets the identical check before anything is
+/// renamed onto it, so this never renames a legitimate file over — or reads
+/// the size of — a symlink planted at either path.
+///
+/// Best-effort, like every other step [`append_audit`] takes: ANY failure
+/// here (a metadata read, the rename itself) silently skips rotation for
+/// this one call — audit logging is best-effort end to end, and a rotation
+/// hiccup must never turn into a dropped/corrupted audit line, let alone a
+/// failed tool call.
+fn rotate_audit_at_size(path: &std::path::Path, max_bytes: u64) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return; // doesn't exist yet, or unreadable — nothing to rotate
+    };
+    if !meta.file_type().is_file() || meta.len() < max_bytes {
+        return;
+    }
+    let mut rotated_name = path.as_os_str().to_os_string();
+    rotated_name.push(".1");
+    let rotated = std::path::PathBuf::from(rotated_name);
+    if let Ok(rotated_meta) = std::fs::symlink_metadata(&rotated) {
+        if rotated_meta.file_type().is_symlink() {
+            return; // never rename onto a symlinked destination
+        }
+    }
+    let _ = std::fs::rename(path, &rotated);
 }
 
 /// The actual `open(2)` call [`append_audit`] makes — factored out so its own
@@ -2014,6 +2187,27 @@ mod tests {
     /// durable audit line.
     #[tokio::test]
     async fn approve_sets_detail_redacted_for_type_but_keeps_the_local_detail_raw() {
+        // issue #160 round-10 P1 #A note: `approve` now resolves a Write
+        // action's window AUTHORITATIVELY before it even checks a standing
+        // grant (so it can fold the identity into `action_key`) — this needs
+        // a resolvable "notes" window (`shared_mock`, under
+        // `process_state_test_lock`) so that early resolve itself succeeds,
+        // rather than failing before a card is ever created.
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 907_001,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
         let asks = AskRegistry::new();
         let thread = 907_001;
         let dir = "lead";
@@ -2053,6 +2247,25 @@ mod tests {
     /// harmless) full `detail` for these.
     #[tokio::test]
     async fn approve_leaves_detail_redacted_none_for_a_non_type_action() {
+        // issue #160 round-10 P1 #A note: see the matching comment in
+        // `approve_sets_detail_redacted_for_type_but_keeps_the_local_detail_raw`
+        // above — `left_click` is Write-classified too, so it needs the same
+        // resolvable-window setup for `approve`'s own early resolve.
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 907_002,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
         let asks = AskRegistry::new();
         let thread = 907_002;
         let dir = "lead";
@@ -2490,6 +2703,165 @@ mod tests {
         computer::clear_control();
     }
 
+    // —— issue #160 round-10 P1 #B: re-resolve/re-verify AFTER activation ——
+
+    /// The end-to-end property this fix exists for: while `activate_window`
+    /// runs (standing in for a real, slow OS activation call), the window
+    /// moves to a NEW origin — SAME id/app/title, so `verify_approved_target`
+    /// still passes; only the GEOMETRY changed. The click must land using the
+    /// window's geometry AS OF AFTER activation, never the stale
+    /// pre-activation origin.
+    #[tokio::test]
+    async fn left_click_uses_the_windows_geometry_as_of_after_activation_not_before() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 910_401,
+            app: "Moving".into(),
+            title: "moving window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        let asks = AskRegistry::new();
+        let thread = 910_401;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+
+        let _ = computer::throttle_input();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        // The hook: while `activate_window` runs, the window moves to a NEW
+        // origin — same identity, different geometry.
+        let mock_for_hook = mock.clone();
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+            *mock_for_hook.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+                id: 910_401,
+                app: "Moving".into(),
+                title: "moving window".into(),
+                x: 400,
+                y: 200,
+                width: 800,
+                height: 600,
+            }]);
+        }));
+
+        let mut window_id_out = None;
+        let mut image_out = None;
+        let result = run_action(
+            &db, &asks, thread, dir, None, "computer", "left_click",
+            &json!({"window": "moving", "coordinate": [10, 10]}),
+            &mut window_id_out, &mut image_out,
+        )
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        let actions = mock.actions.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            actions.iter().any(|a| a == "click 410,210 Left x1"),
+            "the click must use the window's geometry AS OF AFTER activation \
+             (400+10, 200+10), not the stale pre-activation origin: {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| a == "click 10,10 Left x1"),
+            "must never use the stale pre-activation origin (0,0): {actions:?}"
+        );
+        drop(actions);
+
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        computer::clear_control();
+    }
+
+    /// The fail-closed half: while `activate_window` runs, the window is
+    /// REPLACED — same query still matches (title substring), but a
+    /// DIFFERENT id AND app — standing in for the original window closing
+    /// and an unrelated one taking its place mid-activation. The action must
+    /// fail closed (the SAME re-approve message `verify_approved_target`
+    /// gives the approve→dispatch gap) and the backend must never receive
+    /// the keystrokes.
+    #[tokio::test]
+    async fn type_fails_closed_when_the_window_is_replaced_during_activation() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 910_501,
+            app: "Swappy".into(),
+            title: "swappy window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        let asks = AskRegistry::new();
+        let thread = 910_501;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+        record_click_focus(thread, dir, 910_501);
+
+        let _ = computer::throttle_input();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        // The hook: while `activate_window` runs, the window is REPLACED by
+        // a different id/app that happens to share the same title substring.
+        let mock_for_hook = mock.clone();
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+            *mock_for_hook.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+                id: 910_502,
+                app: "Different".into(),
+                title: "swappy window".into(),
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            }]);
+        }));
+
+        let mut window_id_out = None;
+        let mut image_out = None;
+        let err = run_action(
+            &db, &asks, thread, dir, None, "computer", "type",
+            &json!({"window": "swappy", "text": "hello"}),
+            &mut window_id_out, &mut image_out,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.contains("changed since this action was approved"),
+            "must fail closed with the re-approve message: {err}"
+        );
+        let actions = mock.actions.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !actions.iter().any(|a| a.starts_with("type ")),
+            "the replaced window must never receive the keystrokes: {actions:?}"
+        );
+        drop(actions);
+
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        computer::clear_control();
+    }
+
     // —— issue #160 round-8 P1 #4: approval bound to the resolved window identity ——
 
     /// The end-to-end property this fix exists for: `approve` resolves the
@@ -2649,12 +3021,143 @@ mod tests {
         computer::clear_control();
     }
 
+    // —— issue #160 round-10 P1 #A: standing Always grant scoped to the
+    // approved window's own identity, not just the query string ——
+
+    /// The end-to-end property this fix exists for: an Always grant seeded
+    /// with a key that includes the CURRENT window's `app`+`title` still
+    /// auto-approves the SAME query when it resolves to that SAME window —
+    /// this is the "narrowing must not break the common case" half.
+    #[tokio::test]
+    async fn standing_always_grant_auto_approves_when_the_window_identity_is_unchanged() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 909_101,
+            app: "Editor".into(),
+            title: "notes.txt — Editor".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let asks = AskRegistry::new();
+        let thread = 909_101;
+        let dir = "lead";
+        let args = json!({"action": "left_click", "window": "editor", "coordinate": [1, 1]});
+        let action_key = crate::ask::action_key(&[
+            "gui",
+            "left_click",
+            "editor",
+            "Editor",
+            "notes.txt — Editor",
+            &args_digest(&args),
+        ]);
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: Vec::new(),
+            always: vec![crate::ask::AlwaysGrant { thread, dir: dir.to_string(), action_key }],
+        });
+
+        let approved = tokio::time::timeout(std::time::Duration::from_secs(5), approve(&asks, thread, dir, "left_click", &args))
+            .await
+            .expect("must resolve without ever needing a human answer")
+            .expect("an exact identity match must auto-approve");
+        assert_eq!(
+            approved,
+            Some(ApprovedWindow { id: 909_101, app: "Editor".into(), title: "notes.txt — Editor".into() })
+        );
+        assert!(asks.open().is_empty(), "an auto-approved call must never surface a card");
+    }
+
+    /// The narrowing half: the SAME query now resolves to a DIFFERENT window
+    /// (different id AND app — standing in for the original window closing
+    /// and an unrelated one taking its place) — the standing Always grant
+    /// seeded for the OLD identity must MISS (a different `action_key`,
+    /// since `app`+`title` are folded into it), falling through to a fresh
+    /// Needs-you card rather than silently auto-approving the replacement
+    /// window. Before issue #160 round-10 P1 #A, the key never captured
+    /// WHICH window was approved (only the query string), so this exact
+    /// scenario would have auto-approved silently.
+    #[tokio::test]
+    async fn standing_always_grant_misses_a_different_window_identity_and_cards() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 909_201,
+            app: "Editor".into(),
+            title: "notes.txt — Editor".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let asks = AskRegistry::new();
+        let thread = 909_201;
+        let dir = "lead";
+        let args = json!({"action": "left_click", "window": "editor", "coordinate": [1, 1]});
+        // Seed an Always grant for the CURRENT (soon-to-be-replaced) window's
+        // identity.
+        let action_key = crate::ask::action_key(&[
+            "gui",
+            "left_click",
+            "editor",
+            "Editor",
+            "notes.txt — Editor",
+            &args_digest(&args),
+        ]);
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: Vec::new(),
+            always: vec![crate::ask::AlwaysGrant { thread, dir: dir.to_string(), action_key }],
+        });
+
+        // The query now resolves to a DIFFERENT window.
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 909_202,
+            app: "OtherApp".into(),
+            title: "an unrelated editor window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let asks_bg = asks.clone();
+        let args_bg = args.clone();
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "left_click", &args_bg).await });
+
+        let mut card = None;
+        for _ in 0..200 {
+            if let Some(a) = asks.open().into_iter().find(|a| a.thread == thread && a.dir == dir) {
+                card = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let card = card.expect(
+            "a DIFFERENT window identity must miss the standing grant's key and surface a fresh card",
+        );
+
+        assert!(asks.answer(card.id, crate::ask::Answer::Deny));
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(err.contains("denied"), "{err}");
+    }
+
     /// Observe-class actions (`screenshot`, `list_windows`) — and any
     /// Write-classified action with NO window argument at all (`wait`) —
-    /// never bind a window at all: `approve` returns `Ok(None)` for them (see
-    /// `bind_approved_window`'s own doc), so they're entirely unaffected by
-    /// round-8 P1 #4 — there is nothing for `verify_approved_target` to ever
-    /// check against for these.
+    /// never bind a window at all: `approve` returns `Ok(None)` for them, and
+    /// (issue #160 round-10 P1 #A) never resolves one in the first place —
+    /// see `approve`'s own `resolved` binding — so they're entirely
+    /// unaffected by round-8 P1 #4/round-10 P1 #A: there is nothing for
+    /// `verify_approved_target` to ever check against for these, and their
+    /// `action_key` keeps the OLD, resolve-free four-part shape.
     #[tokio::test]
     async fn observe_and_windowless_actions_never_bind_a_window() {
         let asks = AskRegistry::new();
@@ -2993,6 +3496,157 @@ mod tests {
 
         assert!(open_audit_file_for_append(&leaf).await.is_ok());
         assert!(leaf.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // —— issue #160 round-10 P1 #F: bounded audit-log rotation ——
+
+    /// The core property: a file already AT (or over) the threshold gets
+    /// renamed to `<path>.1`, and the original path is free again for a
+    /// fresh file (`append_audit`'s subsequent open recreates it).
+    #[test]
+    fn rotate_audit_at_size_renames_an_over_limit_file_to_dot_one() {
+        let base = std::env::temp_dir().join(format!("weft-audit-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("computer-audit.jsonl");
+        std::fs::write(&path, b"0123456789").unwrap(); // 10 bytes
+
+        rotate_audit_at_size(&path, 10);
+
+        assert!(!path.exists(), "the over-limit file must be rotated away from its original path");
+        let rotated = base.join("computer-audit.jsonl.1");
+        assert_eq!(std::fs::read(&rotated).unwrap(), b"0123456789");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A file already under the threshold is left completely alone.
+    #[test]
+    fn rotate_audit_at_size_is_a_no_op_below_the_threshold() {
+        let base = std::env::temp_dir().join(format!("weft-audit-rotate-noop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("computer-audit.jsonl");
+        std::fs::write(&path, b"tiny").unwrap();
+
+        rotate_audit_at_size(&path, 1_000);
+
+        assert!(path.exists(), "an under-limit file must never be rotated");
+        assert!(!base.join("computer-audit.jsonl.1").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pre-existing `.1` is overwritten by the new rotation, not appended
+    /// to or left as a stray extra file — total on-disk usage stays bounded
+    /// to roughly `2 * max_bytes`.
+    #[test]
+    fn rotate_audit_at_size_overwrites_an_existing_dot_one() {
+        let base = std::env::temp_dir().join(format!("weft-audit-rotate-overwrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("computer-audit.jsonl");
+        let rotated = base.join("computer-audit.jsonl.1");
+        std::fs::write(&rotated, b"stale generation").unwrap();
+        std::fs::write(&path, b"0123456789").unwrap();
+
+        rotate_audit_at_size(&path, 10);
+
+        assert_eq!(
+            std::fs::read(&rotated).unwrap(),
+            b"0123456789",
+            "the new rotation must overwrite the stale .1, not sit alongside it"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Missing/nonexistent path: best-effort no-op, never panics.
+    #[test]
+    fn rotate_audit_at_size_is_a_no_op_when_the_file_does_not_exist() {
+        let base = std::env::temp_dir().join(format!("weft-audit-rotate-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("computer-audit.jsonl");
+
+        rotate_audit_at_size(&path, 0);
+        assert!(!path.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Symlink safety: a symlinked audit-log path must never be rotated
+    /// (renamed) — `rotate_audit_at_size` refuses it outright rather than
+    /// renaming a symlink (which would relocate the LINK, not its target,
+    /// but is refused anyway per this function's own doc: `path` no longer
+    /// being a REGULAR file at all is reason enough to skip).
+    #[cfg(unix)]
+    #[test]
+    fn rotate_audit_at_size_refuses_a_symlinked_audit_path() {
+        let base = std::env::temp_dir().join(format!("weft-audit-rotate-symlink-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("weft-audit-rotate-symlink-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&outside);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&outside, b"0123456789").unwrap();
+        let path = base.join("computer-audit.jsonl");
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+
+        rotate_audit_at_size(&path, 10);
+
+        assert!(path.exists(), "the symlink itself must be left in place");
+        assert!(
+            !base.join("computer-audit.jsonl.1").exists(),
+            "a symlinked source must never be rotated"
+        );
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"0123456789",
+            "the symlink's target must be untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    /// End-to-end through `append_audit` itself (not just the pure rotation
+    /// helper): a pre-existing over-limit audit file rotates to `.1` and the
+    /// NEW line lands in a fresh, small file at the original path — proving
+    /// the wiring inside `append_audit`, not just `rotate_audit_at_size` in
+    /// isolation. Uses `rotate_audit_at_size` directly with a tiny threshold
+    /// (rather than writing multiple real megabytes) to stand in for what
+    /// `append_audit` itself calls unconditionally before every open.
+    #[tokio::test]
+    async fn append_audit_rotates_an_over_limit_file_before_writing_the_new_line() {
+        let base = std::env::temp_dir().join(format!("weft-audit-rotate-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("computer-audit.jsonl");
+        std::fs::write(&path, b"old-line-1\nold-line-2\n").unwrap();
+
+        rotate_audit_at_size(&path, 5); // well under the real file's size
+
+        let rotated = base.join("computer-audit.jsonl.1");
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "old-line-1\nold-line-2\n");
+
+        let mut file = open_audit_file_for_append(&path).await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        file.write_all(b"new-line\n").await.unwrap();
+        // `tokio::fs::File::write_all` only QUEUES the write onto its own
+        // background blocking task — an explicit `flush` (which `append_audit`
+        // itself does not call, a separate, pre-existing characteristic this
+        // test doesn't change) is what this test needs to assert the file's
+        // on-disk content deterministically.
+        file.flush().await.unwrap();
+        drop(file);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "new-line\n",
+            "the new file at the original path must start fresh, not append to the rotated-away content"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

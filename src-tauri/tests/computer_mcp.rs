@@ -913,11 +913,23 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // window still holds the real OS foreground at call time either — so
     // this path STILL records an `activate` call, immediately before the
     // `type`.
+    //
+    // issue #160 round-10 P1 #A: `type` is Write-classified with a non-blank
+    // `window` argument, so `approve` now folds the resolved window's own
+    // `app`+`title` into the key too (scoping a standing Always grant to
+    // that EXACT window identity, not just the query string) — this pre-seed
+    // must include the SAME `"Notes"`/`"Untitled"` pair the `WindowInfo` for
+    // id 1 carries (see this test's own `mock` setup above), matching
+    // EXACTLY what `approve` itself would resolve for `window: "notes"`, or
+    // this grant silently stops matching and the call below hangs waiting on
+    // a card nobody is spawned to answer.
     let text_auto = "auto-no-refocus".to_string();
     let type_always_key = weft::ask::action_key(&[
         "gui",
         "type",
         "notes",
+        "Notes",
+        "Untitled",
         &weft::bus::computer_srv::args_digest(&json!({"action":"type","window":"notes","text":text_auto})),
     ]);
     asks_handle.seed_grants(GrantSnapshot {

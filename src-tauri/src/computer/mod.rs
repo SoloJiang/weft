@@ -674,6 +674,19 @@ pub fn screenshot_window(
         image
             .write_to(&mut w, image::ImageFormat::Png)
             .map_err(|e| ComputerError::Io(e.to_string()))?;
+        // issue #160 round-10 P2 #G: `write_to` only writes through the
+        // `BufWriter` — it does NOT itself guarantee the final buffered
+        // bytes reach the underlying file, and `BufWriter::drop` (which would
+        // otherwise run implicitly at the end of this block) SILENTLY
+        // SWALLOWS a flush error rather than propagating it. On a full disk
+        // or a hit quota (especially likely here: the whole PNG can still be
+        // sitting in the buffer for a small screenshot), that dropped error
+        // would let this function return `Ok` — reporting a successful save
+        // — for a file that is actually empty or truncated. An explicit,
+        // propagated `flush` closes that: a flush failure now surfaces as
+        // this function's own `Err` instead of a silently-corrupt `Ok`.
+        use std::io::Write as _;
+        w.flush().map_err(|e| ComputerError::Io(e.to_string()))?;
     }
     #[cfg(not(unix))]
     {
