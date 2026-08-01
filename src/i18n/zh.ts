@@ -807,7 +807,7 @@ export const zh = {
     computerUseGroup: "Computer use",
     computerUseTitle: "允许 computer use",
     computerUseHint:
-      "允许 agent 查看并操控本机其他应用窗口：枚举窗口、对指定应用窗口截图，并在你批准后向其注入点击、滚动、拖拽、文本输入与键盘快捷键。默认关闭。截图始终排除 Weft 自身窗口和任何终端窗口。每次调用会先在「待你处理」中征求批准，但你在卡片上给出的 Always／Full 授权会自动放行后续同类调用；开关变更对之后启动的会话生效。",
+      "允许 agent 查看并操控本机其他应用窗口：枚举窗口、对指定应用窗口截图，并在你批准后向其注入点击、滚动、拖拽、文本输入与键盘快捷键。默认关闭。截图会排除 Weft 自身窗口与已知的终端应用窗口(尽力而为的清单，并非穷尽)。每次调用会先在「待你处理」中征求批准，但你在卡片上给出的 Always／Full 授权会自动放行后续同类调用；开关变更对之后启动的会话生效。",
     computerControlActive:
       "有 agent 正在控制桌面（任务 {{dir}}，线程 {{thread}}）。按 Esc 或点击「立即停止」即可中断。",
     computerControlStop: "立即停止",

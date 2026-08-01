@@ -1863,23 +1863,31 @@ impl AskRegistry {
         }
     }
 
-    /// A standing rule's verdict for an incoming ask, checked BEFORE surfacing:
-    /// full access or a matching always-allow → auto-allow (never shown). Matches
-    /// on the canonical `action_key` (see `Ask::action_key`), NOT the lossy
-    /// display summary — issue #89. `risk` is the SAME `classify_risk` tier the
-    /// ask itself carries (see `Ask::risk`) — it gates the read-only batch/issue
-    /// grants (issue #103): they auto-allow ONLY a `RiskLevel::ReadOnly` ask,
-    /// checked by value equality against what `classify_risk` already decided.
-    /// This function never re-derives or loosens that judgment; a Write/
-    /// NetworkOrCredential/Unknown ask falls through to `None` (surfaces)
-    /// exactly as it would if no read-only grant existed at all.
-    pub fn auto_decision(
-        &self,
-        thread: i32,
-        dir: &str,
-        risk: RiskLevel,
-        action_key: &str,
-    ) -> Option<Decision> {
+    /// The STRICT half of [`auto_decision`] — `dangerous` mode, a Full grant
+    /// for this (thread, dir), or an Always grant matching this EXACT
+    /// `action_key` — with NO read-only batch/issue fallback. Factored out as
+    /// its own method (issue #160 round-5 review P1 §1) for
+    /// `bus::computer_srv::approve`'s GUI actions: a `screenshot`/
+    /// `list_windows` call is `RiskLevel::ReadOnly` by `classify_gui_action`'s
+    /// own construction REGARDLESS OF WHICH WINDOW it targets, so if this
+    /// gate accepted the same read-only batch/issue grant `auto_decision`
+    /// does, a session that once released "all read-only" (issue #103) would
+    /// silently auto-approve screenshotting/enumerating ANY window on the
+    /// human's desktop — including an unrelated app (mail, a browser tab, a
+    /// password manager) — with no computer-specific card and no chance for
+    /// the human to see WHICH window before the pixels are captured. That is
+    /// a materially different disclosure than "skip the card for `git
+    /// status`", which is what the read-only batch grant was actually built
+    /// to cover (issue #103's own scope). A GUI action — observation or
+    /// input alike — may therefore ONLY be auto-approved by a standing rule
+    /// precise enough to name (via `action_key`) the EXACT action, never a
+    /// coarse content-classified risk tier.
+    ///
+    /// [`auto_decision`] itself is unchanged for every OTHER caller (the
+    /// PreToolUse hook path in `bus::server::handle`, Codex's own approval
+    /// path in `lead_chat::engine`, …) — this is a NEW, additional entry
+    /// point, not a behavior change to the existing one.
+    pub fn auto_decision_exact(&self, thread: i32, dir: &str, action_key: &str) -> Option<Decision> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.dangerous {
             return Some(Decision::Allow);
@@ -1891,6 +1899,38 @@ impl AskRegistry {
         if g.always.get(&k).is_some_and(|s| s.contains(action_key)) {
             return Some(Decision::Allow);
         }
+        None
+    }
+
+    /// A standing rule's verdict for an incoming ask, checked BEFORE surfacing:
+    /// full access or a matching always-allow → auto-allow (never shown). Matches
+    /// on the canonical `action_key` (see `Ask::action_key`), NOT the lossy
+    /// display summary — issue #89. `risk` is the SAME `classify_risk` tier the
+    /// ask itself carries (see `Ask::risk`) — it gates the read-only batch/issue
+    /// grants (issue #103): they auto-allow ONLY a `RiskLevel::ReadOnly` ask,
+    /// checked by value equality against what `classify_risk` already decided.
+    /// This function never re-derives or loosens that judgment; a Write/
+    /// NetworkOrCredential/Unknown ask falls through to `None` (surfaces)
+    /// exactly as it would if no read-only grant existed at all.
+    ///
+    /// Built ON TOP OF [`auto_decision_exact`] (issue #160 round-5 review P1
+    /// §1): the exact-match checks (`dangerous`/`full`/`always`) are IDENTICAL
+    /// between the two, factored out so `bus::computer_srv::approve`'s GUI
+    /// gate can reuse them WITHOUT ALSO inheriting the read-only batch/issue
+    /// fallback below — see that method's own doc comment for why a GUI
+    /// action must never be swept in by the coarse grant.
+    pub fn auto_decision(
+        &self,
+        thread: i32,
+        dir: &str,
+        risk: RiskLevel,
+        action_key: &str,
+    ) -> Option<Decision> {
+        if let Some(decision) = self.auto_decision_exact(thread, dir, action_key) {
+            return Some(decision);
+        }
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let k = (thread, dir.to_string());
         // Read-only batch/issue grants (issue #103): a session granted "release
         // all read-only" (`read_only_session`) or a whole issue granted at
         // dispatch-approval time (`read_only_issue`) auto-allows a ReadOnly-tier
@@ -4843,6 +4883,69 @@ mod tests {
             .auto_decision(1, "10", RiskLevel::NetworkOrCredential, "curl x")
             .is_none());
         assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "mystery_tool").is_none());
+    }
+
+    // ---- issue #160 round-5 review P1 §1: `auto_decision_exact` never honors
+    // the read-only batch/issue grant (GUI actions must not be swept by it) ----
+
+    /// The property `bus::computer_srv::approve` depends on: a session/issue
+    /// holding the coarse "release all read-only" grant (issue #103) still
+    /// gets `None` (surfaces a card) from `auto_decision_exact` — the strict
+    /// entry point GUI actions use — even for an action_key `classify_risk`
+    /// would call `ReadOnly`. The ordinary `auto_decision` entry point, used
+    /// by every OTHER tool's ask-creation path, is UNCHANGED: it still honors
+    /// the same grant exactly as before.
+    #[test]
+    fn auto_decision_exact_ignores_the_read_only_session_grant_but_auto_decision_still_honors_it() {
+        let r = AskRegistry::new();
+        r.grant_read_only_session(1, "10");
+
+        assert!(
+            r.auto_decision_exact(1, "10", "[\"gui\",\"screenshot\",\"notes\",\"digest\"]")
+                .is_none(),
+            "a GUI action_key must still card despite a standing read-only-session grant"
+        );
+        // The ordinary entry point every other tool relies on is untouched.
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::ReadOnly, "pwd"),
+            Some(Decision::Allow)
+        );
+    }
+
+    /// Same property for the ISSUE-wide grant (issue #103's dispatch-approval
+    /// propagation) — `auto_decision_exact` must not honor it either.
+    #[test]
+    fn auto_decision_exact_ignores_the_read_only_issue_grant() {
+        let r = AskRegistry::new();
+        r.grant_read_only_issue(1);
+
+        assert!(
+            r.auto_decision_exact(1, "77", "[\"gui\",\"list_windows\",\"\",\"digest\"]")
+                .is_none(),
+            "a GUI action_key must still card despite a standing read-only-issue grant, even for \
+             a dir created after the grant"
+        );
+    }
+
+    /// What `auto_decision_exact` DOES still honor — `dangerous`, a Full
+    /// grant, and an EXACT Always `action_key` match — unchanged from what
+    /// `auto_decision` itself does for those same three cases.
+    #[test]
+    fn auto_decision_exact_still_honors_dangerous_full_and_exact_always() {
+        let r = AskRegistry::new();
+        assert!(r.auto_decision_exact(1, "10", "a").is_none());
+
+        r.set_dangerous(true);
+        assert_eq!(r.auto_decision_exact(1, "10", "a"), Some(Decision::Allow));
+        r.set_dangerous(false);
+
+        r.seed_grants(GrantSnapshot {
+            full: vec![FullGrant { thread: 2, dir: "20".to_string() }],
+            always: vec![AlwaysGrant { thread: 3, dir: "30".to_string(), action_key: "exact".to_string() }],
+        });
+        assert_eq!(r.auto_decision_exact(2, "20", "anything"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision_exact(3, "30", "exact"), Some(Decision::Allow));
+        assert!(r.auto_decision_exact(3, "30", "different").is_none());
     }
 
     /// The whole point of the ISSUE-wide grant vs. the session one: it covers a

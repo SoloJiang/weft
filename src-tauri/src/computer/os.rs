@@ -175,7 +175,7 @@ fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
     // macOS has no public API to raise a SPECIFIC window within a
     // multi-window app without the Accessibility (AX) API's own window
     // handle, which `xcap` does not expose — so this activates at the APP
-    // level instead (`NSRunningApplication`/System Events process
+    // level first (`NSRunningApplication`/System Events process
     // activation), the best-effort approximation the round-4 review's own
     // "NSRunningApplication ... 或 CGWindow 层激活" guidance calls for.
     // Resolves `id`'s owning pid via `xcap` (the SAME window list this
@@ -186,6 +186,14 @@ fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
     // new Cargo dependency, and needs no hand-rolled `objc_msgSend` calls
     // this crate cannot verify compile *or* run in this container (see this
     // module's own build-time note).
+    //
+    // issue #160 round-5 review P1 §7 (issue #160 #2): app-level frontmost
+    // alone does NOT guarantee THIS window — as opposed to some OTHER window
+    // of the same multi-window app — ends up the one actually raised to the
+    // front; that was Codex's own finding on round-4's fix. So this now
+    // ALSO attempts a per-window raise on top of the app-level activation —
+    // see `raise_specific_window`'s own doc for the fail-closed policy that
+    // governs it.
     let windows = xcap::Window::all().map_err(|e| ComputerError::Unsupported(e.to_string()))?;
     let target = windows
         .iter()
@@ -207,7 +215,122 @@ fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
             String::from_utf8_lossy(&output.stderr)
         )));
     }
+
+    raise_specific_window(pid, target)
+}
+
+/// Best-effort, FAIL-CLOSED per-window raise on top of the app-level
+/// `frontmost` activation above (issue #160 round-5 review P1 §7 / issue
+/// #160 #2 — Codex's own finding that app-level activation doesn't pick a
+/// SPECIFIC window within a multi-window app). Matches by TITLE — the only
+/// window handle `xcap::Window` exposes; there is no AXUIElement/window-id
+/// bridge between `xcap`'s id space and System Events' own accessibility
+/// tree without a new Cargo dependency, which is out of scope for this fix
+/// (see this module's own top-of-file dependency note) — via System Events'
+/// accessibility API (`perform action "AXRaise"`), but ONLY when that title
+/// identifies EXACTLY ONE window of the owning process:
+///
+///  - an EMPTY title (real — a borderless palette, some tool/utility
+///    windows genuinely have none) can't be matched to a specific window at
+///    all;
+///  - a title matching ZERO or MORE THAN ONE window of that process (stale
+///    since `xcap`'s own window list was read a moment ago and the window
+///    closed/renamed, or two windows of the same app that happen to share a
+///    title) is likewise not something this can raise with any confidence.
+///
+/// Both cases return `Err` (`Unsupported`) rather than silently leaving the
+/// human with only the app-level frontmost `activate_window_impl` already
+/// performed above — a caller relying on this to reactivate a SPECIFIC
+/// window (`bus::computer_srv::activate_target`) must not be told "done"
+/// when only the wrong window (or an arbitrary one) ended up on top; it fails
+/// closed and the caller's own input action never reaches the OS (see
+/// `activate_target`'s own fail-closed contract).
+///
+/// UNVERIFIED ON REAL MACOS HARDWARE (recorded here and tracked in issue
+/// #160 §9): this container has no macOS toolchain to build OR run this
+/// against — `#[cfg(target_os = "macos")]` code is stripped before
+/// type-checking on any other host target, so even `cargo check --features
+/// computer-os` on this Linux container cannot catch a wrong method name or
+/// a System Events dictionary mistake here, only a gross syntax error. The
+/// AppleScript below is written to the best available knowledge of System
+/// Events' scripting dictionary (a `window`'s `name` property is its
+/// AXTitle; `perform action "AXRaise"` is the standard accessibility raise
+/// action) — a real-machine check is required before trusting this in
+/// production.
+#[cfg(target_os = "macos")]
+fn raise_specific_window(pid: u32, target: &xcap::Window) -> Result<(), ComputerError> {
+    let title = target.title().map_err(|e| ComputerError::Unsupported(e.to_string()))?;
+    if title.trim().is_empty() {
+        return Err(ComputerError::Unsupported(
+            "window has no title to match for a per-window raise — the app itself was brought \
+             forward, but which of its windows ended up on top could not be confirmed"
+                .into(),
+        ));
+    }
+    let title_lit = applescript_string_literal(&title);
+
+    // Count how many of this process's windows share this exact title BEFORE
+    // attempting to raise one of them — an ambiguous title (0, or more than
+    // 1, match) fails closed rather than raising an arbitrary one of several
+    // same-titled windows or silently no-op'ing on a stale title.
+    let count_script = format!(
+        "tell application \"System Events\" to count (every window of (first process whose unix id \
+         is {pid}) whose name is {title_lit})"
+    );
+    let count_output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&count_script)
+        .output()
+        .map_err(|e| ComputerError::Unsupported(format!("osascript (window count): {e}")))?;
+    if !count_output.status.success() {
+        return Err(ComputerError::Unsupported(format!(
+            "couldn't count windows titled {title:?}: {}",
+            String::from_utf8_lossy(&count_output.stderr)
+        )));
+    }
+    let count_text = String::from_utf8_lossy(&count_output.stdout);
+    let count: usize = count_text.trim().parse().map_err(|_| {
+        ComputerError::Unsupported(format!(
+            "couldn't parse the window-count reply as a number: {count_text:?}"
+        ))
+    })?;
+    if count != 1 {
+        return Err(ComputerError::Unsupported(format!(
+            "window title {title:?} matches {count} window(s) of this app — refusing an \
+             ambiguous per-window raise"
+        )));
+    }
+
+    let raise_script = format!(
+        "tell application \"System Events\" to tell (first process whose unix id is {pid}) to \
+         perform action \"AXRaise\" of (first window whose name is {title_lit})"
+    );
+    let raise_output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&raise_script)
+        .output()
+        .map_err(|e| ComputerError::Unsupported(format!("osascript (window raise): {e}")))?;
+    if !raise_output.status.success() {
+        return Err(ComputerError::Unsupported(format!(
+            "per-window raise failed — the app was brought forward, but this specific window \
+             couldn't be confirmed on top: {}",
+            String::from_utf8_lossy(&raise_output.stderr)
+        )));
+    }
     Ok(())
+}
+
+/// Escape a string for embedding as an AppleScript double-quoted string
+/// literal (issue #160 round-5 review P1 §7): a window TITLE is arbitrary,
+/// attacker-influenceable text (whatever the target app chose to display),
+/// so it must never be spliced into the script unescaped — a title
+/// containing `"` would otherwise close the literal early and inject
+/// arbitrary AppleScript. Backslash is escaped FIRST so escaping the quote
+/// right after doesn't double-escape the backslashes it just introduced.
+#[cfg(target_os = "macos")]
+fn applescript_string_literal(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 #[cfg(target_os = "windows")]

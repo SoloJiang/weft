@@ -276,7 +276,10 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     // 1. left_click succeeds: the mock backend records the click, the
-    // response confirms it, and an audit line is appended.
+    // response confirms it, and an audit line is appended. issue #160
+    // round-5 review P1 §6: this session is Full-granted (an Auto approval,
+    // no card), and `activate_target` now runs UNCONDITIONALLY — so this
+    // records TWO backend actions (`activate`, then `click`), not one.
     let out = rpc(
         &base,
         thread,
@@ -289,8 +292,9 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert!(out.contains("done"), "{out}");
     {
         let actions = mock.actions.lock().unwrap();
-        assert_eq!(actions.len(), 1, "{actions:?}");
-        assert!(actions[0].starts_with("click 100,50 Left x1"), "{actions:?}");
+        assert_eq!(actions.len(), 2, "{actions:?}");
+        assert_eq!(actions[0], "activate 1", "{actions:?}");
+        assert!(actions[1].starts_with("click 100,50 Left x1"), "{actions:?}");
     }
     let audit_text = std::fs::read_to_string(&audit_path)
         .unwrap_or_else(|e| panic!("expected audit file at {audit_path:?}: {e}"));
@@ -318,9 +322,30 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     )
     .await;
     assert!(out.contains("text"), "{out}");
-    assert_eq!(mock.actions.lock().unwrap().len(), 1, "missing text must never reach the backend");
+    assert_eq!(mock.actions.lock().unwrap().len(), 2, "missing text must never reach the backend");
     let lines_after_2 = std::fs::read_to_string(&audit_path).unwrap().lines().count();
     assert_eq!(lines_after_2, 3);
+
+    // 2b. issue #160 round-5 review P2 §3: a `type` payload over
+    // `MAX_TYPE_CHARS` is rejected before ever reaching the backend — no new
+    // mock action, and the rejection is itself still audited.
+    let over_limit_text = "a".repeat(weft::bus::computer_srv::MAX_TYPE_CHARS + 1);
+    let out = rpc(
+        &base,
+        thread,
+        dir,
+        json!({"jsonrpc":"2.0","id":301,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"type","window":"notes","text":over_limit_text}}}),
+    )
+    .await;
+    assert!(out.contains("too long"), "{out}");
+    assert_eq!(
+        mock.actions.lock().unwrap().len(),
+        2,
+        "an over-limit type must never reach the backend"
+    );
+    let lines_after_2b = std::fs::read_to_string(&audit_path).unwrap().lines().count();
+    assert_eq!(lines_after_2b, 4);
 
     // 3. `wait` clamps an over-cap duration instead of erroring, and
     // doesn't touch the control lock/throttle at all.
@@ -349,7 +374,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
 
     // 5. Busy: a DIFFERENT (thread, dir) already holds the control lease, so
     // this session's input action is rejected without ever reaching the
-    // backend (mock action count stays at 1).
+    // backend (mock action count stays at 2, from scenario 1's activate+click).
     computer::clear_control();
     computer::acquire_control(999, "other").unwrap();
     let out = rpc(
@@ -361,7 +386,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     )
     .await;
     assert!(out.contains("controlling the desktop"), "{out}");
-    assert_eq!(mock.actions.lock().unwrap().len(), 1, "a Busy call must never reach the backend");
+    assert_eq!(mock.actions.lock().unwrap().len(), 2, "a Busy call must never reach the backend");
     computer::clear_control();
 
     // 6. Suspended: an open permission Ask for this EXACT (thread, dir)
@@ -377,7 +402,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     )
     .await;
     assert!(out.contains("permission card"), "{out}");
-    assert_eq!(mock.actions.lock().unwrap().len(), 1, "a suspended call must never reach the backend");
+    assert_eq!(mock.actions.lock().unwrap().len(), 2, "a suspended call must never reach the backend");
     // Clean up this section's manually-opened ask so it can't leak into the
     // M3-B sections below, which poll `asks.open().first()` and assume the
     // registry starts empty each time.
@@ -641,8 +666,10 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // The THIRD, identical action_key (same action + same window) must skip
     // the card entirely now — the Always grant from the previous answer
     // auto-decides it, mirroring `bus::server::handle_ask`'s own Always
-    // semantics for every other tool. An Auto approval never activates, so
-    // this adds exactly ONE more action (the click itself).
+    // semantics for every other tool. issue #160 round-5 review P1 §6: an
+    // Auto approval now activates the target window too, exactly like an
+    // Interactive one — so this STILL adds TWO more actions (`activate`,
+    // then the click), not just one.
     let out = rpc(
         &base,
         gate_thread,
@@ -655,8 +682,9 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert!(asks_handle.open().is_empty(), "an Always-covered action must never surface a card");
     assert_eq!(
         mock.actions.lock().unwrap().len(),
-        clicks_before + 3,
-        "the Always-covered call must still reach the backend, with no activate call: {:?}",
+        clicks_before + 4,
+        "the Always-covered call must still reach the backend, WITH an activate call too \
+         (round-5 review P1 §6: Auto approvals activate too now): {:?}",
         mock.actions.lock().unwrap()
     );
 
@@ -775,7 +803,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     .await;
     assert!(out.to_lowercase().contains("focus"), "{out}");
 
-    // —— round-4 P1 §2: an Interactive approval must reactivate the target window ——
+    // —— round-4 P1 §2 (broadened round-5 review P1 §6): reactivating the target window ——
     //
     // The real hazard: click target window (foreground -> target) -> `approve`
     // cards the FOLLOWING input action -> a human answers it by clicking
@@ -784,10 +812,12 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // own card). A brand-new, deliberately UNGRANTED (thread, dir) so both
     // the click and the first `type` each surface a REAL card (an
     // `Interactive` approval); a THIRD call pre-seeds an Always grant so
-    // `auto_decision` decides it silently (an `Auto` approval, no card, the
-    // foreground never moves) and must NOT call `activate_window`; a FOURTH
-    // simulates the backend having no activation API at all (`Unsupported`)
-    // and must fail closed, never letting the real action through.
+    // `auto_decision` decides it silently (an `Auto` approval, no card) —
+    // issue #160 round-5 review P1 §6: `activate_target` is now called
+    // UNCONDITIONALLY, so this Auto path activates too, exactly like the
+    // Interactive ones above it; a FOURTH simulates the backend having no
+    // activation API at all (`Unsupported`) and must fail closed, never
+    // letting the real action through.
     //
     // "notes" always resolves to window id 1 (see the `WindowInfo` list this
     // whole test installed above) — every `activate N` assertion below names
@@ -876,9 +906,13 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
 
     // 13c. Auto path: pre-seed an Always grant for a SECOND `type` call (a
     // DIFFERENT `text`, hence a DIFFERENT action_key from 13b's) so
-    // `auto_decision` decides Allow WITHOUT a card ever appearing — the
-    // foreground never leaves the target window in this path, so no
-    // `activate` call should be recorded.
+    // `auto_decision` decides Allow WITHOUT a card ever appearing. issue #160
+    // round-5 review P1 §6: unlike the ORIGINAL round-4 fix (which only
+    // activated on an Interactive approval), `activate_target` now runs
+    // UNCONDITIONALLY — an Auto approval offers no guarantee the target
+    // window still holds the real OS foreground at call time either — so
+    // this path STILL records an `activate` call, immediately before the
+    // `type`.
     let text_auto = "auto-no-refocus".to_string();
     let type_always_key = weft::ask::action_key(&[
         "gui",
@@ -921,11 +955,12 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         let actions = mock.actions.lock().unwrap();
         assert_eq!(
             actions.len(),
-            baseline_auto + 1,
-            "an Auto approval must NOT activate the window — expected exactly ONE new action \
-             (the type itself): {actions:?}"
+            baseline_auto + 2,
+            "round-5 review P1 §6: an Auto approval must ALSO activate the window now — expected \
+             [..., activate, type]: {actions:?}"
         );
-        assert_eq!(actions[baseline_auto], format!("type {text_auto}"), "{actions:?}");
+        assert_eq!(actions[baseline_auto], "activate 1", "{actions:?}");
+        assert_eq!(actions[baseline_auto + 1], format!("type {text_auto}"), "{actions:?}");
     }
 
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -998,6 +1033,65 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     repo::set_setting(&db_handle, computer::K_COMPUTER_USE_ENABLED, "true")
         .await
         .unwrap();
+    computer::clear_control();
+
+    // —— issue #160 round-5 review P1 §2: recheck_after_guard also re-checks has_open ——
+    //
+    // The invariant `check_suspended` establishes UP FRONT — an open
+    // permission card suspends this session's input — must still hold for a
+    // call that already cleared that early check and is now sitting in
+    // `input_flight_guard`'s queue: a DIFFERENT, brand-new ask for the SAME
+    // (thread, dir) can open WHILE this call waits (e.g. the same engine
+    // hitting a completely unrelated permission prompt through its own
+    // hook), and the queued call must not slip its action through
+    // underneath that fresh card once it finally gets the guard. Simulated
+    // exactly like the scenario above: the TEST ITSELF holds the flight
+    // guard, a REAL RPC call queues behind it, then — instead of disabling
+    // the setting — a brand-new ask is opened directly against the SAME
+    // (thread, dir) before the guard is released.
+
+    let (has_open_thread, has_open_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
+    let has_open_dir_s = has_open_dir.to_string();
+    asks_handle.seed_grants(GrantSnapshot {
+        full: vec![FullGrant { thread: has_open_thread, dir: has_open_dir_s.clone() }],
+        always: Vec::new(),
+    });
+    computer::clear_control();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let clicks_before_has_open = mock.actions.lock().unwrap().len();
+
+    let held_guard = computer::input_flight_guard().await;
+    let call = spawn_computer_call(&base, has_open_thread, has_open_dir_s.clone(), "left_click", "notes");
+    // Give the spawned call time to clear `approve`/`acquire_and_throttle`
+    // (both fine, thanks to the Full grant above) and start queuing on the
+    // (held) flight guard.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A brand-new, UNRELATED ask opens for this EXACT (thread, dir) while the
+    // queued call waits — standing in for some other tool's own permission
+    // request racing in.
+    let (new_ask_id, _rx) = asks_handle.request(
+        has_open_thread,
+        &has_open_dir_s,
+        "some_other_tool",
+        "an unrelated permission request",
+        "detail",
+        RiskLevel::Unknown,
+        "[\"unrelated\"]",
+    );
+    drop(held_guard);
+    let out = call.await.unwrap();
+    assert!(
+        out.contains("permission card"),
+        "the queued call must recheck has_open after the guard and see the fresh ask: {out}"
+    );
+    assert_eq!(
+        mock.actions.lock().unwrap().len(),
+        clicks_before_has_open,
+        "a recheck-denied (has_open) call must never reach the backend"
+    );
+
+    // Clean up the unrelated ask so it can't leak into any later section.
+    assert!(asks_handle.answer(new_ask_id, Answer::Deny));
     computer::clear_control();
 }
 

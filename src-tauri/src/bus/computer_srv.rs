@@ -284,7 +284,7 @@ async fn run_action(
     // looked at: a standing grant decides silently, otherwise this blocks on
     // a Needs-you card exactly like `bus::server::handle_ask` does for every
     // other tool call in this crate.
-    let approval = approve(asks, thread, dir, action, args).await?;
+    approve(asks, thread, dir, action, args).await?;
     // issue #160 round-2 P1 §1: re-check the kill switch AFTER the approval
     // await returns — NOT just once, up top, before that (potentially very
     // long, up to `bus::server::ASK_WAIT`) wait began. A human can hit Stop
@@ -385,14 +385,17 @@ async fn run_action(
             // own click on the human's real desktop (issue #160 review R1
             // P2).
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, thread, dir).await?;
-            // issue #160 round-4 P1 §2: reclaim the foreground BEFORE this
-            // click reaches the OS, not after — see `activate_if_interactive`'s
-            // own doc for why even the click family (not just type/key) needs
-            // this: an Interactive approval card can cover the target
+            recheck_after_guard(db, asks, thread, dir).await?;
+            // issue #160 round-4 P1 §2 (broadened round-5 review P1 §6): reclaim
+            // the foreground BEFORE this click reaches the OS, not after — see
+            // `activate_target`'s own doc for why even the click family (not
+            // just type/key) needs this, UNCONDITIONALLY (Auto approvals
+            // included): an Interactive approval card can cover the target
             // window's real on-screen position, so an ABSOLUTE-coordinate
-            // click risks landing on Weft's own card instead of the target.
-            activate_if_interactive(window_id, approval)?;
+            // click risks landing on Weft's own card instead of the target —
+            // and an Auto approval offers no guarantee the target still holds
+            // the real OS foreground either.
+            activate_target(window_id)?;
             backend::backend()
                 .click(px, py, button, count)
                 .map_err(|e| e.to_string())?;
@@ -416,8 +419,8 @@ async fn run_action(
             // See the click-family arm above for why this guard is held
             // across the backend call itself.
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, thread, dir).await?;
-            activate_if_interactive(window_id, approval)?;
+            recheck_after_guard(db, asks, thread, dir).await?;
+            activate_target(window_id)?;
             backend::backend()
                 .move_cursor(px, py)
                 .map_err(|e| e.to_string())?;
@@ -437,8 +440,8 @@ async fn run_action(
             let to = computer::map_to_physical(&w, ex, ey).map_err(|e| e.to_string())?;
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, thread, dir).await?;
-            activate_if_interactive(w.id, approval)?;
+            recheck_after_guard(db, asks, thread, dir).await?;
+            activate_target(w.id)?;
             b.drag(from, to).map_err(|e| e.to_string())?;
             Ok(format!(
                 "left_click_drag from ({}, {}) to ({}, {}) in window {} done — take a screenshot to verify",
@@ -454,8 +457,8 @@ async fn run_action(
             *window_id_out = Some(window_id);
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, thread, dir).await?;
-            activate_if_interactive(window_id, approval)?;
+            recheck_after_guard(db, asks, thread, dir).await?;
+            activate_target(window_id)?;
             backend::backend()
                 .scroll(px, py, dx, dy)
                 .map_err(|e| e.to_string())?;
@@ -466,6 +469,10 @@ async fn run_action(
         "type" => {
             let window_query = required_window(args)?;
             let text = required_text(args)?;
+            // issue #160 round-5 review P2 §3: a hard length ceiling, checked
+            // right after `required_text` and well before any lease/throttle
+            // is touched — see `check_type_length`'s own doc for why.
+            check_type_length(text)?;
             check_suspended(asks, thread, dir)?;
             let window_id = resolve_window_id(window_query)?;
             *window_id_out = Some(window_id);
@@ -478,8 +485,8 @@ async fn run_action(
             require_recent_focus(thread, dir, window_id)?;
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, thread, dir).await?;
-            activate_if_interactive(window_id, approval)?;
+            recheck_after_guard(db, asks, thread, dir).await?;
+            activate_target(window_id)?;
             backend::backend()
                 .type_text(text)
                 .map_err(|e| e.to_string())?;
@@ -498,8 +505,8 @@ async fn run_action(
             require_recent_focus(thread, dir, window_id)?;
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, thread, dir).await?;
-            activate_if_interactive(window_id, approval)?;
+            recheck_after_guard(db, asks, thread, dir).await?;
+            activate_target(window_id)?;
             backend::backend().key(combo).map_err(|e| e.to_string())?;
             Ok(format!(
                 "key {combo} in window {window_id} done — take a screenshot to verify"
@@ -548,10 +555,15 @@ async fn run_action(
 ///     params JSON — see the inline comment below for why that must never be
 ///     redacted here even though the PERSISTED audit line
 ///     (`redact_audit_args`) is.
-///  2. A standing grant (Full / Always for this EXACT `action_key` / a
-///     read-only batch-or-issue grant, gated on `risk` exactly like every
-///     other tool) decides silently via [`crate::ask::AskRegistry::
-///     auto_decision`] — the SAME method/semantics `handle_ask` uses.
+///  2. A standing grant (`dangerous` mode / Full / Always for this EXACT
+///     `action_key`) decides silently via [`crate::ask::AskRegistry::
+///     auto_decision_exact`] — issue #160 round-5 review P1 §1: unlike
+///     `handle_ask`'s own `auto_decision` call, a GUI action is deliberately
+///     NEVER swept in by issue #103's coarse read-only batch-or-issue grant
+///     — see that method's own doc for why a `screenshot`/`list_windows`
+///     call (always `RiskLevel::ReadOnly`, regardless of which window it
+///     targets) cannot be treated the same as an ordinary read-only tool
+///     call for this purpose.
 ///  3. Otherwise, a Needs-you card ([`crate::ask::AskRegistry::
 ///     request_with_preview`], `tool` = the literal `"computer"` — this
 ///     endpoint has no engine identity of its own the way a hook's `?tool=`
@@ -564,36 +576,21 @@ async fn run_action(
 /// the desktop right now — AFTER this gate returns `Ok`; those are a
 /// completely separate concern (issue #160 M2) from "is this call
 /// authorized at all".
-/// How [`approve`] reached its `Ok` — the ONE thing every input arm of
-/// [`run_action`] needs out of it (issue #160 round-4 P1 §2): whether a
-/// Needs-you card actually appeared and a human clicked Weft's own UI to
-/// answer it.
 ///
-///  - [`Approval::Auto`]: a standing grant (`Decision::Allow` from
-///    [`AskRegistry::auto_decision`]) decided this silently — no card ever
-///    rendered, so OS focus/foreground never moved off whatever window last
-///    had it.
-///  - [`Approval::Interactive`]: a card actually rendered and a human
-///    answered Allow through it — which means the human just clicked
-///    somewhere in Weft's own window to do so, taking the foreground (and
-///    likely OS focus) away from whatever window the action targets. See
-///    [`activate_if_interactive`] for what this drives: every input action
-///    (click family / mouse_move / left_click_drag / scroll / type / key)
-///    reactivates the target window through
-///    [`backend::ComputerBackend::activate_window`] before it ever touches
-///    the OS, but ONLY for `Interactive` — an `Auto` decision never showed a
-///    card, so there is nothing to hand back.
-///
-/// Never constructed for a `Deny`/timeout/cancel outcome — those return
-/// `Err` instead, so this only ever distinguishes the two ways an `Ok`
-/// happened, exactly like the doc comment on [`approve`] itself says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Approval {
-    Auto,
-    Interactive,
-}
+/// Returns `()`, not a distinction between how the `Ok` was reached: issue
+/// #160 round-4 P1 §2 originally returned an `Approval::{Auto,Interactive}`
+/// value here so every input arm of [`run_action`] could call
+/// `activate_target` ONLY for an Interactive approval (a card that actually
+/// rendered — a human clicking Weft's own UI to answer it takes the
+/// foreground away from the target). Round-5 review P1 §6 (issue #160 #3)
+/// removed that distinction: `activate_target` is now called
+/// UNCONDITIONALLY by every input arm regardless of how this call approved —
+/// see that function's own doc for why an Auto approval needs the SAME
+/// reactivation an Interactive one does. With no caller left that needs to
+/// tell the two apart, the `Approval` enum this used to return was deleted
+/// entirely rather than kept as unused plumbing.
 
-async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args: &Value) -> Result<Approval, String> {
+async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args: &Value) -> Result<(), String> {
     let window_query = window_arg(args);
     let risk = crate::ask::classify_gui_action(action);
     let summary = if window_query.is_empty() {
@@ -635,12 +632,31 @@ async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args:
     // separate `_redacted` variant.
     let detail_redacted = (action == "type").then(|| redact_audit_args(action, args).to_string());
 
-    match asks.auto_decision(thread, dir, risk, &action_key) {
-        Some(Decision::Allow) => return Ok(Approval::Auto),
-        // `auto_decision` never actually returns `Deny` today (only Allow-
-        // only standing grants exist) — this arm keeps the gate correct
-        // regardless, mirroring `handle_ask`'s own defensive shape, rather
-        // than silently falling through to a redundant card for it.
+    // issue #160 round-5 review P1 §1: GUI actions — observation AND input
+    // alike — go through `auto_decision_exact`, NOT the ordinary
+    // `auto_decision` every other tool's ask-creation path uses. The
+    // difference is deliberate: `auto_decision` also honors issue #103's
+    // coarse "release all read-only" batch/issue grant for any
+    // `RiskLevel::ReadOnly` ask, but `screenshot`/`list_windows` are
+    // `ReadOnly` by `classify_gui_action`'s own construction REGARDLESS OF
+    // WHICH WINDOW they target — so a session that once released "all
+    // read-only" would otherwise silently auto-approve screenshotting or
+    // enumerating ANY window on the human's desktop (mail, a browser tab, a
+    // password manager, …) with no computer-specific card and no chance for
+    // the human to see WHICH window before the pixels are captured. That is
+    // a materially larger disclosure than the coarse grant was ever built to
+    // cover (issue #103's own "skip the card for `git status`" scope). See
+    // `AskRegistry::auto_decision_exact`'s own doc for the full rationale —
+    // it still honors `dangerous` mode, a Full grant, and an EXACT
+    // Always-grant `action_key` match, exactly like `auto_decision` does for
+    // those same three cases; it just never falls through to the read-only
+    // batch/issue grant underneath them.
+    match asks.auto_decision_exact(thread, dir, &action_key) {
+        Some(Decision::Allow) => return Ok(()),
+        // `auto_decision_exact` never actually returns `Deny` today (only
+        // Allow-only standing grants exist) — this arm keeps the gate
+        // correct regardless, mirroring `handle_ask`'s own defensive shape,
+        // rather than silently falling through to a redundant card for it.
         Some(Decision::Deny) => return Err("denied by a standing weft rule".to_string()),
         None => {}
     }
@@ -651,7 +667,7 @@ async fn approve(asks: &AskRegistry, thread: i32, dir: &str, action: &str, args:
     );
 
     match tokio::time::timeout(crate::bus::server::ASK_WAIT, rx).await {
-        Ok(Ok(Decision::Allow)) => Ok(Approval::Interactive),
+        Ok(Ok(Decision::Allow)) => Ok(()),
         Ok(Ok(Decision::Deny)) => Err("denied in weft".to_string()),
         // Timed out, or the sender was dropped (`AskRegistry::cancel`/
         // `cancel_for` — e.g. an engine/model switch tearing this session
@@ -870,10 +886,11 @@ fn redact_audit_args(action: &str, args: &Value) -> Value {
 // focus target), and replaying a synthetic click is itself not side-effect-
 // free (it can collapse a double-click text selection, or re-toggle a
 // checkbox/button the agent never asked to click again). See
-// `activate_if_interactive`'s own doc, right below the [`Approval`] enum's
-// declaration further up this file, for the actual fix: reactivating the
-// TARGET window through `backend::ComputerBackend::activate_window` before
-// ANY input action reaches the OS, not just `type`/`key`.
+// `activate_target`'s own doc, right below this section, for the actual fix:
+// reactivating the TARGET window through `backend::ComputerBackend::
+// activate_window` before ANY input action reaches the OS, not just
+// `type`/`key` — and, since round-5 review P1 §6, before an AUTO-approved
+// input action too, not only one that actually surfaced an Interactive card.
 
 /// How long a click on a window is trusted to still hold that window's OS
 /// focus for a subsequent `type`/`key` — see this section's own doc comment.
@@ -924,7 +941,7 @@ fn require_recent_focus(thread: i32, dir: &str, window_id: u32) -> Result<(), St
     ))
 }
 
-// —— reclaiming the foreground after an Interactive approval card (issue #160 round-4 P1 §2) ——
+// —— reclaiming the foreground before every input action (issue #160 round-4 P1 §2, broadened round-5 review P1 §6) ——
 
 /// The LAST gate every input arm of [`run_action`] clears before the backend
 /// ever touches the OS — click family, `mouse_move`, `left_click_drag`,
@@ -932,37 +949,50 @@ fn require_recent_focus(thread: i32, dir: &str, window_id: u32) -> Result<(), St
 /// §1's own click-replay hack — see the focus-freshness section's own doc
 /// comment above for why that hack was unsafe and insufficient). Called
 /// AFTER [`recheck_after_guard`], while `input_flight_guard` is still held,
-/// right before the action-specific backend call itself:
+/// right before the action-specific backend call itself.
 ///
-///  - [`Approval::Auto`]: no-op. A standing grant decided this call silently
-///    — no card ever rendered, so the target window never lost the
-///    foreground/focus in the first place.
-///  - [`Approval::Interactive`]: a human just answered a Needs-you card by
-///    clicking Weft's own UI, taking the foreground. Calls
-///    `backend::ComputerBackend::activate_window(target_id)` to raise+focus
-///    the TARGET window back to the front BEFORE the real action reaches the
-///    OS — unlike a replayed click, this can't misfire into whatever
-///    happens to be at some stale `(px, py)` and has no side effect on the
-///    target window's own contents (no accidental double-click-collapse, no
-///    re-toggled checkbox).
+/// Round-4 P1 §2 shipped this ONLY for an Interactive approval (a card that
+/// actually rendered, so a human clicking Weft's own UI to answer it just
+/// took the foreground away from the target). Round-5 review P1 §6 (issue
+/// #160 #3) broadens it to EVERY input action, Auto-approved ones included:
+/// Codex's own finding was that a standing grant deciding silently does NOT
+/// mean the target window still holds the real OS foreground/focus at the
+/// moment this call finally runs — a human sitting at the machine can switch
+/// windows, alt-tab, or bring some OTHER app forward between an agent's calls
+/// for reasons that have nothing to do with weft at all, and an Auto approval
+/// (unlike an Interactive one) has no way to know whether that happened. So
+/// this is now called UNCONDITIONALLY for every input action rather than
+/// branching on how the call was approved — the (former) `Approval`
+/// Auto/Interactive split existed ONLY to gate this call, and reactivating an
+/// already-frontmost window is a cheap, idempotent no-op on every backend
+/// this module drives, so there is no real cost to doing it every time
+/// instead of only when a card is known to have stolen focus.
 ///
 /// FAILS CLOSED, never falls through to the real action: `Unsupported` (no
 /// `computer-os` feature, or a real backend that couldn't find a window-
 /// activation API at all — see `backend::ComputerBackend::activate_window`'s
 /// own doc) or any other backend error both propagate as this function's own
-/// `Err`, naming why (the approval card took the foreground and this window
-/// couldn't be reactivated) and the two ways around it: grant this window an
-/// Always approval so future calls never card at all, or answer from weft's
-/// own desktop UI, where the foreground never has anywhere else to go.
-fn activate_if_interactive(target_id: u32, approval: Approval) -> Result<(), String> {
-    if approval != Approval::Interactive {
-        return Ok(());
-    }
+/// `Err`, naming why (the target window couldn't be reactivated) and the way
+/// around it: answer/grant from weft's own desktop UI, where the foreground
+/// never has anywhere else to go.
+///
+/// KNOWN, ACCEPTED residual (recorded here and in issue #160 §9, not
+/// eliminated this round): even after this call succeeds, there is no
+/// cross-platform primitive this module can call to VERIFY the target window
+/// is truly frontmost at the exact instant the backend call right after this
+/// one actually injects — neither `xcap` nor `enigo` exposes a "is this
+/// window frontmost right now" query, so a real focus-stealing race in the
+/// gap between this call returning `Ok` and the very next backend call could
+/// still, in principle, land the input elsewhere. This closes the ORDINARY
+/// case (an agent that never re-activates at all, or one that only did so
+/// for a card-driven Interactive approval) — it is a floor, not a ceiling,
+/// exactly like [`require_recent_focus`]'s own doc says about the
+/// freshness heuristic it complements.
+fn activate_target(target_id: u32) -> Result<(), String> {
     backend::backend().activate_window(target_id).map_err(|e| {
         format!(
-            "the approval card took the foreground and window {target_id} couldn't be reactivated \
-             ({e}) — grant this window an Always approval to skip the card next time, or approve \
-             from weft's own desktop UI instead"
+            "window {target_id} couldn't be activated before this input action ({e}) — answer \
+             from weft's own desktop UI instead, where the foreground never has anywhere else to go"
         )
     })
 }
@@ -1218,12 +1248,35 @@ fn acquire_and_throttle(thread: i32, dir: &str) -> Result<(), String> {
 /// AFTER the queue itself, so a call that waited behind someone else's long
 /// hold sees the world as it is NOW, not as it was when it first queued.
 ///
-/// `Ok` requires BOTH: [`computer::enabled`] still true, AND
-/// [`computer::control_state`] naming this EXACT `(thread, dir)` as the
-/// current holder — a DIFFERENT holder, or no holder at all (an expired or
-/// force-cleared lease), both fail closed rather than let a call that no
-/// longer holds the lease it thinks it does reach the backend anyway.
-async fn recheck_after_guard(db: &Db, thread: i32, dir: &str) -> Result<(), String> {
+/// `Ok` requires ALL THREE: no OTHER ask now open for this `(thread, dir)`
+/// (issue #160 round-5 review P1 §2 — see the paragraph below),
+/// [`computer::enabled`] still true, AND [`computer::control_state`] naming
+/// this EXACT `(thread, dir)` as the current holder — a DIFFERENT holder, or
+/// no holder at all (an expired or force-cleared lease), both fail closed
+/// rather than let a call that no longer holds the lease it thinks it does
+/// reach the backend anyway.
+///
+/// issue #160 round-5 review P1 §2: this used to check only enabled+lease —
+/// Codex's finding was that a call queued on `input_flight_guard` can have a
+/// BRAND-NEW ask open for its SAME `(thread, dir)` while it waits (a
+/// completely unrelated permission request from the same engine, racing in
+/// through its own hook), and once such a call finally acquires the guard it
+/// went straight to dispatch, exactly the "click through the card" hazard
+/// [`check_suspended`]'s own up-front check exists to prevent — just arriving
+/// at it from behind the queue instead of before it. `asks.has_open` here can
+/// only ever be seeing a DIFFERENT ask than the one THIS call itself went
+/// through in [`approve`]: that one is guaranteed resolved (no longer open)
+/// by the time `approve` returns, since it only returns once its own
+/// `oneshot::Receiver` has actually been answered (or the call was denied/
+/// cancelled, which returns `Err` before ever reaching this function at all).
+/// Same fail-closed shape and the SAME `ComputerError::SuspendedPendingAsk`
+/// text [`check_suspended`] itself returns — from the calling agent's point
+/// of view, this is indistinguishable from having queued behind that check
+/// in the first place.
+async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str) -> Result<(), String> {
+    if asks.has_open(thread, dir) {
+        return Err(ComputerError::SuspendedPendingAsk.to_string());
+    }
     if !computer::enabled(db).await {
         return Err(ComputerError::Disabled.to_string());
     }
@@ -1288,6 +1341,57 @@ fn required_text(args: &Value) -> Result<&str, String> {
     args.get("text")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required 'text'".to_string())
+}
+
+/// Hard ceiling on `type`'s payload length (issue #160 round-5 review P2
+/// §3): a single approved `type` call is meant to be a bounded UI
+/// interaction — a form field, a search box, a short reply — not an
+/// HTTP-body-sized blob. Under a Full/Always grant, `enigo.type_text` runs
+/// completely SYNCHRONOUSLY inside [`computer::input_flight_guard`] — held
+/// for this whole call, per that function's own doc — with no way to CANCEL
+/// an in-flight injection partway through: an unbounded string could keep
+/// injecting well past `CONTROL_LEASE_MS` (the 30s control lease this same
+/// call already holds), well past however long the OS-level global Escape
+/// shortcut takes to register/unregister around a lease
+/// (`computer::sync_shortcut_state`), and well past anything else this
+/// module's other fixed-duration gates implicitly assume a single input
+/// action finishes within.
+///
+/// `MAX_TYPE_CHARS` is a DETERMINISTIC bound, not a full fix: chunking a
+/// long `type` into multiple shorter injections with a lease renewal between
+/// chunks (so the FIRST chunk's own cancellation window would actually cover
+/// the rest) is the more complete answer, but it needs a change at the
+/// `enigo` layer this round doesn't touch (there is no partial/cancellable
+/// `type_text` this module could call into today) — tracked as a follow-up,
+/// not required to close the bound this ceiling already provides
+/// unconditionally. `5000` chars is generous for any single interactive
+/// field a human would plausibly want an agent to fill in one call, while
+/// comfortably ruling out something HTTP-body-shaped.
+///
+/// `#[doc(hidden)] pub` (not `pub(crate)`): `tests/computer_mcp.rs` is a
+/// separate integration-test crate that needs the EXACT cap this module
+/// enforces to build an over-limit payload, rather than hardcoding a
+/// duplicate literal that could silently drift from this one — mirrors
+/// `args_digest`'s own doc comment on why a test-only-consumed constant is
+/// `#[doc(hidden)] pub` here rather than `#[cfg(test)]`.
+#[doc(hidden)]
+pub const MAX_TYPE_CHARS: usize = 5_000;
+
+/// Reject a `type` payload over [`MAX_TYPE_CHARS`] — checked right after
+/// [`required_text`] and before the control lease/throttle are ever touched
+/// (the same "fail on a bad argument before it costs anything" ordering
+/// discipline every other action's argument validation already follows —
+/// see `check_suspended`'s own doc comment), and well before
+/// `backend::ComputerBackend::type_text` ever sees the string.
+fn check_type_length(text: &str) -> Result<(), String> {
+    let len = text.chars().count();
+    if len > MAX_TYPE_CHARS {
+        return Err(format!(
+            "text is too long: {len} characters (max {MAX_TYPE_CHARS}) — split it into multiple \
+             shorter type calls, or shorten it"
+        ));
+    }
+    Ok(())
 }
 
 /// `scroll_direction` (required) + `scroll_amount` (optional, default 3,
@@ -1780,6 +1884,110 @@ mod tests {
         let _ = handle.await.unwrap();
     }
 
+    // —— issue #160 round-5 review P1 §1: GUI actions never sweep in the
+    // generic read-only batch/issue grant ——
+
+    /// The end-to-end property the fix exists for: a session already holding
+    /// issue #103's "release all read-only for this session" grant — the
+    /// GENERIC, cross-tool batch grant, not anything computer-specific — must
+    /// still see a real Needs-you card for a `screenshot`/`list_windows`
+    /// call, because those are `RiskLevel::ReadOnly` by `classify_gui_action`'s
+    /// own construction REGARDLESS of which window they target. Before this
+    /// fix, `approve` called the ordinary `auto_decision` (which DOES honor
+    /// that grant for any ReadOnly ask) and would have silently captured
+    /// pixels/enumerated windows with no card and no computer-specific
+    /// Always ever granted.
+    #[tokio::test]
+    async fn screenshot_still_cards_despite_a_read_only_session_grant_with_no_exact_always() {
+        let asks = AskRegistry::new();
+        let thread = 908_001;
+        let dir = "lead";
+        asks.grant_read_only_session(thread, dir);
+
+        let args = json!({"action": "screenshot", "window": "notes"});
+        let asks_bg = asks.clone();
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "screenshot", &args).await });
+
+        let mut card = None;
+        for _ in 0..200 {
+            if let Some(a) = asks.open().into_iter().find(|a| a.thread == thread && a.dir == dir) {
+                card = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let card = card.expect(
+            "a screenshot must still surface a Needs-you card despite the read-only-session grant \
+             — it must never be swept in by the generic read-only batch grant",
+        );
+        assert_eq!(card.risk, crate::ask::RiskLevel::ReadOnly, "{card:?}");
+
+        assert!(asks.answer(card.id, crate::ask::Answer::Deny));
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(err.contains("denied"), "{err}");
+    }
+
+    /// Same property for the ISSUE-wide read-only grant (issue #103's
+    /// dispatch-approval propagation) — `list_windows` must still card too.
+    #[tokio::test]
+    async fn list_windows_still_cards_despite_a_read_only_issue_grant() {
+        let asks = AskRegistry::new();
+        let thread = 908_002;
+        let dir = "lead";
+        asks.grant_read_only_issue(thread);
+
+        let args = json!({"action": "list_windows"});
+        let asks_bg = asks.clone();
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "list_windows", &args).await });
+
+        let mut card = None;
+        for _ in 0..200 {
+            if let Some(a) = asks.open().into_iter().find(|a| a.thread == thread && a.dir == dir) {
+                card = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let card = card.expect(
+            "list_windows must still surface a Needs-you card despite the read-only-issue grant",
+        );
+        assert_eq!(card.risk, crate::ask::RiskLevel::ReadOnly, "{card:?}");
+
+        assert!(asks.answer(card.id, crate::ask::Answer::Deny));
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(err.contains("denied"), "{err}");
+    }
+
+    /// The other half of the property: a session with NO grant at all except
+    /// a precise, EXACT `action_key` Always grant for this SAME
+    /// `screenshot @ notes` call is still auto-approved without a card —
+    /// `auto_decision_exact` keeps honoring Full/Always exactly like
+    /// `auto_decision` does, it just drops the read-only batch/issue
+    /// fallback. Proves the fix is a narrowing, not a blanket "GUI actions
+    /// never auto-approve".
+    #[tokio::test]
+    async fn screenshot_auto_approves_with_an_exact_always_grant_and_no_read_only_batch() {
+        let asks = AskRegistry::new();
+        let thread = 908_003;
+        let dir = "lead";
+        let args = json!({"action": "screenshot", "window": "notes"});
+        let action_key = crate::ask::action_key(&["gui", "screenshot", "notes", &args_digest(&args)]);
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: Vec::new(),
+            always: vec![crate::ask::AlwaysGrant { thread, dir: dir.to_string(), action_key }],
+        });
+
+        // No card ever appears — this must resolve on its own, promptly.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            approve(&asks, thread, dir, "screenshot", &args),
+        )
+        .await
+        .expect("an exact Always grant must auto-approve without ever needing a human answer");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(asks.open().is_empty(), "an auto-approved call must never surface a card");
+    }
+
     // —— issue #160 round-2 P1 addendum: type/key focus-freshness gate ——
     //
     // Each test below uses a UNIQUE synthetic thread id so they can run in
@@ -1834,17 +2042,17 @@ mod tests {
         assert!(require_recent_focus(thread, "lead", 7).is_err());
     }
 
-    // —— issue #160 round-4 P1 §2: activate_if_interactive ——
+    // —— issue #160 round-4 P1 §2, broadened round-5 review P1 §6: activate_target ——
 
-    /// The end-to-end property the round-4 P1 §2 fix exists for: an
-    /// `Interactive` approval (a card that ACTUALLY appeared and a human
-    /// clicked Weft's own UI to answer) must reactivate the target window
-    /// (`backend.activate_window`) before the real action proceeds; an
-    /// `Auto` approval (a standing grant, no card, the foreground never
-    /// moved) must be a complete no-op. Also covers the fail-closed path:
-    /// when activation itself is broken (`Unsupported`), an `Interactive`
-    /// approval must propagate an `Err` naming the window, never fall
-    /// through and let the real action reach the OS anyway.
+    /// The end-to-end property this fix exists for, post round-5 review P1
+    /// §6: `activate_target` reactivates the target window
+    /// (`backend.activate_window`) UNCONDITIONALLY, every time it's called —
+    /// there is no longer an Auto/Interactive distinction to skip it for (see
+    /// this function's own doc for why Codex's round-5 finding removed that
+    /// distinction). Also covers the fail-closed path: when activation itself
+    /// is broken (`Unsupported`), this must propagate an `Err` naming the
+    /// window, never fall through and let the real action reach the OS
+    /// anyway.
     ///
     /// ONE test, not several: `backend::_set_backend_override` is a
     /// set-ONCE-per-process `OnceLock` (see its own doc comment) — a second
@@ -1853,45 +2061,38 @@ mod tests {
     /// scenario that needs to flip `MockBackend::fail_activate` shares this
     /// SAME installed instance instead of trying to install a second one.
     #[test]
-    fn activate_if_interactive_activates_only_when_interactive_and_fails_closed_when_unsupported() {
+    fn activate_target_always_activates_and_fails_closed_when_unsupported() {
         let mock = std::sync::Arc::new(computer::mock::MockBackend::default());
         backend::_set_backend_override(mock.clone());
 
-        // Auto: no card ever appeared, so the foreground never left — must
-        // never touch the backend.
-        assert!(activate_if_interactive(7, Approval::Auto).is_ok());
-        assert!(
-            mock.actions.lock().unwrap().is_empty(),
-            "an Auto approval must never activate a window"
-        );
-
-        // Interactive: a human just answered a real card — must activate the
-        // EXACT target window id, before anything else.
-        assert!(activate_if_interactive(7, Approval::Interactive).is_ok());
+        // Every call activates the EXACT target window id, unconditionally.
+        assert!(activate_target(7).is_ok());
         {
             let actions = mock.actions.lock().unwrap();
             assert_eq!(actions.len(), 1, "{actions:?}");
             assert_eq!(actions[0], "activate 7", "{actions:?}");
         }
 
+        // A second call activates again — this is no longer gated on
+        // "did a card actually appear", so repeated calls each activate.
+        assert!(activate_target(7).is_ok());
+        assert_eq!(mock.actions.lock().unwrap().len(), 2);
+
         // Fail-closed: the backend can't activate the window at all
         // (`Unsupported`) — must propagate an `Err` naming the window,
         // never silently proceed. No NEW action is recorded (the count
-        // stays at 1, from the successful activation above).
+        // stays at 2, from the two successful activations above).
         mock.fail_activate.store(true, std::sync::atomic::Ordering::SeqCst);
-        let err = activate_if_interactive(7, Approval::Interactive).unwrap_err();
+        let err = activate_target(7).unwrap_err();
         assert!(err.contains('7'), "{err}");
         assert_eq!(
             mock.actions.lock().unwrap().len(),
-            1,
+            2,
             "a failed activation must never itself be recorded as a successful action"
         );
-
-        // Auto stays a no-op even with activation broken.
-        assert!(activate_if_interactive(7, Approval::Auto).is_ok());
     }
 
-    // —— issue #160 round-3 P1 §2: recheck_after_guard ——
+    // —— issue #160 round-3 P1 §2 (extended round-5 review P1 §2): recheck_after_guard ——
 
     /// One test exercises `recheck_after_guard`'s whole matrix sequentially,
     /// mirroring `computer::tests::control_lock_busy_expiry_release_and_clear`'s
@@ -1899,17 +2100,24 @@ mod tests {
     /// static as every other `computer::acquire_control`-touching test in
     /// this binary, so splitting these scenarios across separate `#[test]`s
     /// would let `cargo test`'s default parallel threads race each other's
-    /// lease state.
+    /// lease state. issue #160 round-5 review P1 §2's own `has_open` scenario
+    /// lives HERE too, for the exact same reason — a separate `#[tokio::test]`
+    /// that also calls `computer::acquire_control` raced this one and the
+    /// OTHER lease-touching tests in this file/binary under `cargo test`'s
+    /// default parallelism (confirmed: it flaked in CI-style runs).
+    /// `computer::process_state_test_lock` closes that — see its own doc.
     #[tokio::test]
     async fn recheck_after_guard_covers_disabled_foreign_lease_missing_lease_and_the_happy_path() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let asks = AskRegistry::new();
         let thread = 905_001;
         let dir = "lead";
 
         // Disabled setting denies regardless of the lease.
         repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "false").await.unwrap();
         computer::clear_control();
-        let err = recheck_after_guard(&db, thread, dir).await.unwrap_err();
+        let err = recheck_after_guard(&db, &asks, thread, dir).await.unwrap_err();
         assert!(err.to_lowercase().contains("disabled"), "{err}");
 
         // Enabled, but nobody holds the lease at all (it expired, or was
@@ -1917,21 +2125,44 @@ mod tests {
         // not silently allowed just because the setting itself reads true.
         repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
         computer::clear_control();
-        let err = recheck_after_guard(&db, thread, dir).await.unwrap_err();
+        let err = recheck_after_guard(&db, &asks, thread, dir).await.unwrap_err();
         assert!(!err.to_lowercase().contains("disabled"), "{err}");
 
         // Enabled, but a DIFFERENT (thread, dir) now holds the lease
         // (preempted while this call was queued behind the flight guard) —
         // denied.
         computer::acquire_control(999_999, "someone-else").unwrap();
-        let err = recheck_after_guard(&db, thread, dir).await.unwrap_err();
+        let err = recheck_after_guard(&db, &asks, thread, dir).await.unwrap_err();
         assert!(err.contains("999999") || err.contains("someone-else"), "{err}");
         computer::clear_control();
 
         // Enabled AND this exact (thread, dir) still holds the lease —
         // passes.
         computer::acquire_control(thread, dir).unwrap();
-        assert!(recheck_after_guard(&db, thread, dir).await.is_ok());
+        assert!(recheck_after_guard(&db, &asks, thread, dir).await.is_ok());
+
+        // issue #160 round-5 review P1 §2: a brand-new, unrelated ask opening
+        // for this EXACT (thread, dir) — simulating one that opened WHILE this
+        // call sat queued on `input_flight_guard` — must now deny with the
+        // SAME `SuspendedPendingAsk` text `check_suspended`'s own up-front
+        // check returns, even though the lease and the enabled setting are
+        // both still fine (still held from the scenario right above). A
+        // DIFFERENT (thread, dir)'s own open ask must not leak into this one.
+        let (other_id, _rx) =
+            asks.request(thread, "some-other-dir", "tool", "summary", "detail", crate::ask::RiskLevel::Unknown, "[]");
+        assert!(
+            recheck_after_guard(&db, &asks, thread, dir).await.is_ok(),
+            "a DIFFERENT (thread, dir)'s open ask must not affect this one"
+        );
+        assert!(asks.answer(other_id, crate::ask::Answer::Deny));
+
+        let (id, _rx) = asks.request(thread, dir, "tool", "summary", "detail", crate::ask::RiskLevel::Unknown, "[]");
+        let err = recheck_after_guard(&db, &asks, thread, dir).await.unwrap_err();
+        assert!(err.contains("permission card"), "{err}");
+
+        // Once answered, the recheck passes again.
+        assert!(asks.answer(id, crate::ask::Answer::Deny));
+        assert!(recheck_after_guard(&db, &asks, thread, dir).await.is_ok());
 
         computer::clear_control();
     }
@@ -2226,6 +2457,11 @@ mod tests {
         // `computer::mod`'s own tests' notes on the same hazard) — cleared
         // immediately before and after so this test's own assertion isn't
         // muddied by a lease some other test happened to leave behind.
+        // issue #160 round-5 review: that comment previously described the
+        // hazard without actually preventing it — `process_state_test_lock`
+        // does, by serializing this against every other test that touches
+        // the same family of globals.
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         computer::clear_control();
 
         let mut window_id_out = None;
@@ -2247,6 +2483,75 @@ mod tests {
             "a rejected missing-argument call must never touch the control lease"
         );
         computer::clear_control();
+    }
+
+    // —— issue #160 round-5 review P2 §3: MAX_TYPE_CHARS ——
+
+    #[test]
+    fn check_type_length_accepts_up_to_the_cap_and_rejects_over_it() {
+        assert!(check_type_length(&"a".repeat(MAX_TYPE_CHARS)).is_ok());
+        let err = check_type_length(&"a".repeat(MAX_TYPE_CHARS + 1)).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+        assert!(err.contains(&(MAX_TYPE_CHARS + 1).to_string()), "{err}");
+    }
+
+    #[test]
+    fn check_type_length_counts_unicode_scalars_not_bytes() {
+        // Mirrors `redact_audit_args_counts_unicode_scalars_not_bytes`'s own
+        // reasoning: a multi-byte character must count as ONE char, not
+        // however many bytes it takes in UTF-8, or a string well under the
+        // human-meaningful cap could be rejected on byte length alone.
+        let text = "é".repeat(MAX_TYPE_CHARS); // 2 bytes/char in UTF-8, 1 char each
+        assert_eq!(text.chars().count(), MAX_TYPE_CHARS);
+        assert!(check_type_length(&text).is_ok());
+    }
+
+    /// End-to-end through `run_action`'s own "type" arm (Full-granted, so
+    /// `approve` decides silently): an over-limit `type` is rejected before
+    /// EVER resolving the target window — proving the check runs ahead of
+    /// (and therefore ahead of everything downstream of) window resolution,
+    /// the focus-freshness gate, the control lease, and the backend call
+    /// itself. Deliberately does NOT install a `MockBackend` override (this
+    /// module's `backend::_set_backend_override` is a set-ONCE-per-process
+    /// `OnceLock` another test in this same binary may already have claimed
+    /// — see `activate_target_always_activates_and_fails_closed_when_unsupported`'s
+    /// own doc comment on that hazard) — `notes` is never a real window in
+    /// this test's grant/DB setup at all, so a pass here can ONLY mean the
+    /// length check fired before window resolution ever got a chance to
+    /// reject it for a completely different reason (`WindowNotFound`). The
+    /// integration test in `tests/computer_mcp.rs` (its own separate process,
+    /// with its own dedicated `MockBackend`) covers the mock-never-sees-it
+    /// assertion this test can't safely make here.
+    #[tokio::test]
+    async fn run_action_rejects_an_over_limit_type_before_resolving_the_window() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true")
+            .await
+            .unwrap();
+        let asks = AskRegistry::new();
+        let thread = 904_101;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+
+        let over_limit = "a".repeat(MAX_TYPE_CHARS + 1);
+        let mut window_id_out = None;
+        let mut image_out = None;
+        let err = run_action(
+            &db, &asks, thread, dir, None, "computer", "type",
+            &json!({"window": "notes", "text": over_limit}),
+            &mut window_id_out, &mut image_out,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("too long"), "{err}");
+        assert!(
+            window_id_out.is_none(),
+            "the call must fail before ever resolving (and recording) a window id: {window_id_out:?}"
+        );
     }
 
     // —— issue #160 round-2 P2 §5: multi-worktree `wt` routing ——

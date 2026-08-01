@@ -222,6 +222,20 @@ pub struct Screenshot {
 /// Closed list, lower-cased exact-name comparison (not a substring — "Safari"
 /// must not accidentally match nothing here, and "iTerm2 Preferences" is a
 /// different app from "iTerm2").
+///
+/// issue #160 round-5 review P2 §5: this is a BEST-EFFORT list of terminal
+/// emulators known at the time this list was last updated, NOT an exhaustive
+/// catalog of every terminal emulator that exists or will ever exist — a
+/// brand-new or simply-not-yet-added one is still screenshottable until this
+/// list is extended to cover it. `computerUseHint` (`src/i18n/en.ts`/`zh.ts`)
+/// is worded to match that reality ("known terminal-emulator windows", not
+/// "any terminal window") rather than promising a guarantee this table
+/// cannot keep. Round-5 added: Ghostty, foot, Tilix, Rio, st (suckless
+/// simple terminal), urxvt/rxvt, Terminator, Guake, Yakuake, xfce4-terminal,
+/// LXTerminal, QTerminal, Deepin Terminal, Tabby, Contour, WaveTerm, Cool
+/// Retro Term, Eterm, Sakura, Termite, and `kgx` (GNOME Console's own binary
+/// name — GNOME Terminal's newer sibling, distinct from `gnome-terminal`
+/// above).
 const EXCLUDED_TERMINAL_APPS: &[&str] = &[
     "terminal",
     "iterm2",
@@ -237,6 +251,29 @@ const EXCLUDED_TERMINAL_APPS: &[&str] = &[
     "gnome-terminal",
     "konsole",
     "xterm",
+    "ghostty",
+    "foot",
+    "tilix",
+    "rio",
+    "st",
+    "urxvt",
+    "rxvt",
+    "terminator",
+    "guake",
+    "yakuake",
+    "xfce4-terminal",
+    "lxterminal",
+    "qterminal",
+    "deepin-terminal",
+    "tabby",
+    "contour",
+    "waveterm",
+    "wave",
+    "cool-retro-term",
+    "eterm",
+    "sakura",
+    "termite",
+    "kgx",
 ];
 
 /// Weft's own current process name (lower-cased), best-effort. `None` if it
@@ -404,6 +441,28 @@ static SHOT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `out_dir/<unix_ms>-<id>-<seq>.png` (`out_dir` is created if missing) — the
 /// trailing `<seq>` is [`SHOT_SEQ`]'s own collision-proofing nonce (issue
 /// #160 round-3 P2 §4), not derived from anything about the capture itself.
+///
+/// issue #160 round-5 review P2 §4: `bus::computer_srv::screenshot_out_dir`
+/// already walks every path component up through `out_dir` via
+/// `refuse_symlinks` BEFORE ever calling this function — but a worktree is
+/// repository-controlled content, so the window between THAT check and the
+/// actual write below is still open: anything with write access to the
+/// checkout (an agent's own earlier approved write, a background process)
+/// could swap `out_dir` itself for a symlink to an arbitrary path in the
+/// instant between the two. This re-checks `out_dir` itself, via
+/// `symlink_metadata` (never plain `metadata`, so a symlink is caught even
+/// when it points at something real), AFTER `create_dir_all` (which is a
+/// no-op — and does NOT itself error — when `out_dir` already exists as a
+/// symlink to a real directory, so skipping straight to `image.save` without
+/// this recheck would silently follow it) and BEFORE `image.save` ever
+/// touches the filesystem. This narrows, but does not fully close, the race:
+/// a swap landing in the still-open window between THIS check and the
+/// `image.save` call right below it remains — no crate this module already
+/// depends on exposes an `openat`/`O_NOFOLLOW`-guarded image writer the way
+/// `bus::computer_srv::open_audit_file_for_append`'s own `O_NOFOLLOW` open
+/// closes the analogous leaf race for the audit log. A full per-component,
+/// directory-handle-based walk (mirroring that same idea all the way down)
+/// is a larger follow-up, tracked rather than attempted here.
 pub fn screenshot_window(
     backend: &dyn backend::ComputerBackend,
     query: &str,
@@ -415,6 +474,14 @@ pub fn screenshot_window(
     let image = scale_capture(captured.rgba, captured.width, captured.height, scale)?;
 
     std::fs::create_dir_all(out_dir).map_err(|e| ComputerError::Io(e.to_string()))?;
+    if let Ok(meta) = std::fs::symlink_metadata(out_dir) {
+        if meta.file_type().is_symlink() {
+            return Err(ComputerError::Io(format!(
+                "refusing to write a screenshot through a symlink at {}",
+                out_dir.display()
+            )));
+        }
+    }
     let unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| ComputerError::Io(e.to_string()))?
@@ -521,6 +588,37 @@ const CONTROL_LEASE_MS: u64 = 30_000;
 fn control_mutex() -> &'static Mutex<Option<ControlHolderState>> {
     static CONTROL: OnceLock<Mutex<Option<ControlHolderState>>> = OnceLock::new();
     CONTROL.get_or_init(|| Mutex::new(None))
+}
+
+/// Test-only synchronization (issue #160 round-5 review — flake found while
+/// verifying this round's own test suite, not a NEW hazard this round
+/// introduces): every test — in THIS module's own `#[cfg(test)] mod tests`,
+/// or in `bus::computer_srv`'s separate one — that touches ANY process-wide,
+/// un-keyed static this module owns ([`control_mutex`], [`throttle_mutex`],
+/// `shortcut_mutex`/the `SHORTCUT_*_ATTEMPTS` counters, [`EMERGENCY_STOPPED`])
+/// must acquire this lock for its own duration. `cargo test`'s default
+/// parallel test threads would otherwise interleave two such tests' own
+/// acquire/clear/store calls against the exact SAME global state — several of
+/// this file's own pre-existing test doc comments already named this exact
+/// hazard ("splitting them would let cargo test's parallel test threads stomp
+/// on each other's lock state") without actually adding synchronization for
+/// it, which is why it surfaced as a real, reproducible flake under `cargo
+/// test --lib bus::`/`--lib computer` once enough tests touching these
+/// statics existed for the odds to catch up. A test that only touches its
+/// OWN isolated (thread, dir)-keyed state (the preview registry,
+/// `recent_clicks`, an in-memory `Db`, a `MockBackend` it alone owns) does
+/// NOT need this — only the truly global, unkeyed statics do.
+///
+/// `#[doc(hidden)] pub` (not `#[cfg(test)]`): `bus::computer_srv`'s test
+/// module is a DIFFERENT module in the same crate that needs the SAME lock —
+/// mirrors `backend::_set_backend_override`'s own reasoning for exposing a
+/// test-only item this way rather than cfg(test)-gating it, since an
+/// integration/sibling-module test binary can't see a `cfg(test)` item in a
+/// different compilation unit.
+#[doc(hidden)]
+pub fn process_state_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn now_ms() -> u64 {
@@ -1085,6 +1183,42 @@ mod tests {
         assert!(!is_excluded("Safari"));
     }
 
+    /// issue #160 round-5 review P2 §5: the newly-added terminal emulators
+    /// are excluded, case-insensitively, exactly like the pre-existing
+    /// entries — and an unrelated app is still not swept in by the expansion.
+    #[test]
+    fn round_5_added_terminal_apps_are_excluded() {
+        for app in [
+            "ghostty",
+            "Ghostty",
+            "foot",
+            "Tilix",
+            "rio",
+            "st",
+            "urxvt",
+            "rxvt",
+            "Terminator",
+            "guake",
+            "yakuake",
+            "xfce4-terminal",
+            "lxterminal",
+            "qterminal",
+            "deepin-terminal",
+            "Tabby",
+            "contour",
+            "waveterm",
+            "wave",
+            "cool-retro-term",
+            "Eterm",
+            "sakura",
+            "termite",
+            "kgx",
+        ] {
+            assert!(is_excluded(app), "{app} must be excluded");
+        }
+        assert!(!is_excluded("Safari"), "an unrelated app must still not be excluded");
+    }
+
     // —— matching ——
 
     #[test]
@@ -1203,6 +1337,47 @@ mod tests {
         );
         assert!(shot1.path.exists());
         assert!(shot2.path.exists());
+    }
+
+    /// issue #160 round-5 review P2 §4: `out_dir` itself is ALREADY a symlink
+    /// to an outside directory by the time `screenshot_window` runs — standing
+    /// in for the TOCTOU window between `bus::computer_srv::screenshot_out_dir`'s
+    /// own EARLIER `refuse_symlinks` check and this function's own write.
+    /// `create_dir_all` is a no-op here (the symlink already resolves to a
+    /// real, existing directory) and does NOT itself error — so only the
+    /// dedicated `symlink_metadata` recheck this round adds can catch it. Must
+    /// refuse with `ComputerError::Io`, and must never write the PNG through
+    /// the symlink into the outside directory.
+    #[cfg(unix)]
+    #[test]
+    fn screenshot_window_refuses_an_out_dir_thats_a_symlink() {
+        let backend = mock::MockBackend {
+            windows: vec![window_sized(9, "Notes", "Untitled", 800, 600)],
+            image: Some(solid_image(800, 600, 5)),
+            ..Default::default()
+        };
+        let base = std::env::temp_dir().join(format!("weft-screenshot-out-dir-sym-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("weft-screenshot-out-dir-sym-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        // `base` itself (the `out_dir` this call receives) is a symlink to an
+        // ALREADY-EXISTING outside directory — `create_dir_all(base)` sees a
+        // real directory through the symlink and is a no-op, exactly the case
+        // that makes a recheck necessary rather than redundant.
+        std::os::unix::fs::symlink(&outside, &base).unwrap();
+
+        let err = screenshot_window(&backend, "9", &base).unwrap_err();
+        assert!(matches!(err, ComputerError::Io(_)), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "must never write the screenshot through the symlinked out_dir"
+        );
+
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_file(&base);
     }
 
     // —— encode_jpeg_data_uri (issue #160 M3-B) ——
@@ -1338,7 +1513,12 @@ mod tests {
         // (`control_mutex`), so this one test exercises the whole lifecycle
         // sequentially rather than each phase getting its own `#[test]` —
         // splitting them would let `cargo test`'s parallel test threads
-        // stomp on each other's lock state.
+        // stomp on each other's lock state. issue #160 round-5 review:
+        // `process_state_test_lock` ALSO serializes this against every OTHER
+        // test (in this file or `bus::computer_srv`'s) that touches the same
+        // family of un-keyed globals — see that function's own doc for why
+        // this was needed in addition to being "one sequential test".
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         clear_control();
         assert!(control_state().is_none());
 
@@ -1401,6 +1581,11 @@ mod tests {
     /// trusting the stale `expired = true` it was handed.
     #[test]
     fn escape_shortcut_sync_survives_a_new_acquire_racing_in_before_a_belated_cleanup_runs() {
+        // issue #160 round-5 review: see `process_state_test_lock`'s own doc —
+        // this test's own `SHORTCUT_*_ATTEMPTS` counter assertions are exact
+        // counts, so it's especially sensitive to another test's `acquire_control`/
+        // `clear_control` call incrementing them concurrently.
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         clear_control();
         SHORTCUT_REGISTER_ATTEMPTS.store(0, Ordering::SeqCst);
         SHORTCUT_UNREGISTER_ATTEMPTS.store(0, Ordering::SeqCst);
@@ -1459,6 +1644,8 @@ mod tests {
 
     #[tokio::test]
     async fn emergency_stop_disables_the_setting_and_clears_control() {
+        // issue #160 round-5 review: see `process_state_test_lock`'s own doc.
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let db = Db::connect("sqlite::memory:").await.unwrap();
         crate::store::repo::set_setting(&db, K_COMPUTER_USE_ENABLED, "true")
             .await
@@ -1487,7 +1674,10 @@ mod tests {
         // latch lifecycle sequentially, ending with the latch cleared again,
         // rather than splitting it across tests that could interleave with
         // each other (or with `enabled_reads_true_false_and_missing` below)
-        // under `cargo test`'s default parallel test threads.
+        // under `cargo test`'s default parallel test threads. issue #160
+        // round-5 review: that risk was previously only DOCUMENTED, not
+        // actually enforced — `process_state_test_lock` closes it for real.
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let db = Db::connect("sqlite::memory:").await.unwrap();
         clear_emergency_stop();
         crate::store::repo::set_setting(&db, K_COMPUTER_USE_ENABLED, "true")
@@ -1598,6 +1788,10 @@ mod tests {
 
     #[tokio::test]
     async fn enabled_reads_true_false_and_missing() {
+        // `enabled()` reads the process-wide `EMERGENCY_STOPPED` latch FIRST —
+        // see `process_state_test_lock`'s own doc for why this must not
+        // interleave with a test that flips that latch.
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let db = Db::connect("sqlite::memory:").await.unwrap();
         assert!(!enabled(&db).await, "missing setting must fail closed");
 
