@@ -12,15 +12,10 @@ const ACTIVITY_STYLES: Record<ThreadActivityTone, { text: string; dot: string }>
     text: "text-running",
     dot: "weft-pulse h-1.5 w-1.5 rounded-full bg-running",
   },
-  stalled: {
-    text: "text-waiting",
-    dot: "h-1.5 w-1.5 rounded-full bg-waiting",
-  },
 };
 
-const ACTIVITY_TITLE_KEYS: Record<ThreadActivityTone, "workspace.live" | "workspace.stalled"> = {
+const ACTIVITY_TITLE_KEYS: Record<ThreadActivityTone, "workspace.live"> = {
   running: "workspace.live",
-  stalled: "workspace.stalled",
 };
 
 function ActivityCount({

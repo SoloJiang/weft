@@ -553,6 +553,9 @@ async fn handle(
                 let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
                 register_pr_tool(&db, thread, &dir, url, title).await
+            } else if name == "ask_human" {
+                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                ask_human_tool(&db, &reg, thread, &dir, text).await
             } else {
                 call_tool(&reg, thread, &dir, name, &args)
             }
@@ -561,6 +564,49 @@ async fn handle(
     };
 
     sse(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
+async fn ask_human_tool(
+    db: &Db,
+    bus: &BusRegistry,
+    thread_id: i32,
+    direction_scope: &str,
+    text: &str,
+) -> Value {
+    let thread = match crate::store::repo::get_thread(db, thread_id).await {
+        Ok(Some(thread)) => thread,
+        Ok(None) => return text_result(format!("error: thread {thread_id} not found")),
+        Err(err) => return text_result(format!("error: {err}")),
+    };
+    let direction_id = direction_scope.parse::<i32>().unwrap_or(0);
+    match crate::store::repo::create_human_request(
+        db,
+        thread.workspace_id,
+        thread_id,
+        direction_scope,
+        direction_id,
+        0,
+        text,
+    )
+    .await
+    {
+        Ok((request, superseded)) => {
+            for id in superseded {
+                if let Ok(id) = u64::try_from(id) {
+                    bus.cancel_open_asks_by_id(thread_id, id);
+                }
+            }
+            let Ok(id) = u64::try_from(request.id) else {
+                return text_result("error: invalid durable question id".to_string());
+            };
+            bus.ask_human_with_id(thread_id, direction_scope, &request.question, id);
+            text_result(format!(
+                "asked the human (ask #{}); their answer will arrive in your bus_inbox — keep working and check it",
+                request.id
+            ))
+        }
+        Err(err) => text_result(format!("error: {err}")),
+    }
 }
 
 /// Bus tool: the agent sets its own task's lifecycle status. `dir` is the
@@ -598,13 +644,8 @@ async fn register_pr_tool(db: &Db, thread: i32, dir: &str, url: &str, title: &st
         ));
     };
     // Reject an unimplemented host BEFORE creating a row, not after: a row
-    // for a host with no working `PrHost` backend would sweep-fail forever
-    // (every ~60s) with no way to self-clear (the readiness question never
-    // resolves) and no manual dismiss (a non-answerable Needs-you NOTICE has
-    // no close button — see `NeedsRows.tsx`'s `AskRow`). For GitLab
-    // specifically — the exact host this issue's user explicitly needs
-    // supported — that would mean the FIRST time anyone tries it, they get a
-    // permanently-stuck card. Fail the registration itself, honestly, instead.
+    // for a host with no working `PrHost` backend would only create an
+    // unserviceable tracking row. Fail registration honestly instead.
     if crate::host::resolve_host(parts.host_kind).is_err() {
         return text_result(format!(
             "{} tracking isn't supported yet — weft's PR/MR automation currently only implements GitHub. This {} was NOT registered; please track it yourself for now.",
@@ -668,12 +709,6 @@ fn call_tool(reg: &BusRegistry, thread: i32, me: &str, name: &str, args: &Value)
         "bus_inbox" => {
             let msgs = reg.inbox(thread, me);
             text_result(serde_json::to_string(&msgs).unwrap_or_else(|_| "[]".into()))
-        }
-        "ask_human" => {
-            let id = reg.ask_human(thread, me, &s("text"));
-            text_result(format!(
-                "asked the human (ask #{id}); their answer will arrive in your bus_inbox — keep working and check it"
-            ))
         }
         "thread_state_get" => text_result(reg.state_get(thread).to_string()),
         "thread_state_set" => {

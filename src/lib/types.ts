@@ -387,9 +387,6 @@ export type LeadChatPush =
       thread_id: number;
       session_id: number | null;
       state: TurnState;
-      /** True only for the watchdog's stall→busy recovery push — the UI keeps the
-       *  running-tool label on recovery but still clears it on a real/promoted turn. */
-      recovered?: boolean;
       queue: QueuedItem[];
     }
   | {
@@ -517,13 +514,11 @@ export interface LeadStateInfo {
   tools: string[];
 }
 
-/** UI-side runtime status for a live session panel. `stalled` = a busy turn gone
- * silent past the stall-hint threshold (still in-flight, just not progressing). */
-export type SessionStatus = "running" | "stalled" | "idle" | "exited";
+/** UI-side runtime status for a live session panel. */
+export type SessionStatus = "running" | "idle" | "exited";
 
-/** Engine turn state as pushed by the backend / held per session. `stalled` =
- * busy but silent past the stall hint; `stopped` = no live engine (UI default). */
-export type TurnState = "busy" | "stalled" | "idle" | "stopped";
+/** Engine turn state as pushed by the backend / held per session. */
+export type TurnState = "busy" | "idle" | "stopped";
 
 export interface FileDiff {
   path: string;
@@ -819,46 +814,83 @@ export interface ReadOnlyGrants {
   session: ReadOnlySessionGrant[];
 }
 
-/** A lead-proposed write declaration awaiting human approve/deny (Needs you). */
-export interface WriteTrigger {
-  thread_id: number;
-  thread_title: string;
-  index: number;
-  name: string;
-  repo_name: string;
-  reason: string;
-  /** the lead's chosen base branch for this write; "" = the repo's default branch. */
-  base_branch: string;
-  hint: "normal" | "deep";
-  route?: EngineRouteDecision | null;
-  /** the `name` of ANOTHER direction in this SAME proposal that must merge before this one can
-   *  (issue #110 T4); "" = no upstream. */
-  depends_on: string;
+interface AttentionBase {
+  id: string;
+  revision: string;
+  created_at: string;
 }
 
-/** Discriminates what a `NeedItem` represents and how the Needs-you card
- *  should render it — mirrors Rust `bus::AskKind`. Replaces the old
- *  `answerable: boolean`, now that a display-only NOTICE itself splits in
- *  two: most notices (the stall hint, the stopped-worker hint, an ordinary
- *  PR/MR update) are retracted automatically by a background process once the
- *  condition they describe changes ("notice"), but the ONE PR/MR "gave up
- *  tracking" notice (`host::judge::give_up_text`) is not ("notice_action_
- *  required") — nothing will ever re-check and clear it without an explicit
- *  external re-trigger. Rendering the generic "clears itself automatically"
- *  footer under that one directly contradicts its own body text, which is
- *  the bug this discriminant exists to let `AskRow` avoid. */
-export type NeedKind = "question" | "notice" | "notice_action_required";
+export type PermissionAttentionItem = AttentionBase & {
+  kind: "permission";
+  ask: PermissionAsk;
+};
 
-/** An open agent→human question, aggregated workspace-wide for "Needs you". */
-export interface NeedItem {
-  ask_id: number;
+export type QuestionAttentionItem = AttentionBase & {
+  kind: "question";
+  request_id: number;
   thread_id: number;
   thread_title: string;
   direction_id: number;
   direction_name: string;
   text: string;
-  ts: number;
-  kind: NeedKind;
+};
+
+export type PlanApprovalAttentionItem = AttentionBase & {
+  kind: "plan_approval";
+  message_id: number;
+  thread_id: number;
+  thread_title: string;
+  title: string;
+};
+
+export type ScopeApprovalAttentionItem = AttentionBase & {
+  kind: "scope_approval";
+  thread_id: number;
+  thread_title: string;
+};
+
+export interface RepoActionSummary {
+  id: string;
+  label: string;
+  kind: "add" | "new" | "clone";
+}
+
+export type RepoActionAttentionItem = AttentionBase & {
+  kind: "repo_action";
+  message_id: number;
+  thread_id: number;
+  thread_title: string;
+  title: string;
+  actions: RepoActionSummary[];
+};
+
+export type PrTrackingRetryAttentionItem = AttentionBase & {
+  kind: "pr_tracking_retry";
+  pr_id: number;
+  thread_id: number;
+  thread_title: string;
+  direction_id: number;
+  direction_name: string;
+  repo_id: number;
+  number: number;
+  title: string;
+  url: string;
+  error: string;
+  failure_episode: string;
+};
+
+export type AttentionItem =
+  | PermissionAttentionItem
+  | QuestionAttentionItem
+  | PlanApprovalAttentionItem
+  | ScopeApprovalAttentionItem
+  | RepoActionAttentionItem
+  | PrTrackingRetryAttentionItem;
+
+export interface AttentionSnapshot {
+  workspace_id: number;
+  count: number;
+  items: AttentionItem[];
 }
 
 /** IM 话题绑定行：issue ↔ 飞书话题 1:1 映射（M2-5）。 */

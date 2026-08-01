@@ -8,6 +8,7 @@
 
 mod acp;
 mod adapters;
+mod attention;
 pub mod ask;
 mod auth_persist;
 pub mod backup;
@@ -180,17 +181,10 @@ pub fn run() {
         .manage(lead_chat::engine::LeadChatState::default())
         .manage(lead_chat::out_hub::LeadOutHub::default())
         .manage(lead_chat::delta_hub::LeadDeltaHub::default())
-        .manage(commands::GuardrailState::default())
         .manage(power::PowerGuard::default())
         .manage(process_quota::ProcessQuotaGovernor::default())
-        // Issue #110 T3 follow-up: the auto-merge executor's per-(row,
-        // head_sha) merge-attempt backoff, promoted from a plain local
-        // `HashMap` to managed state so `commands::retry_pr_tracking_core`
-        // (the Needs-you "Retry" button's backend) can reach in and clear a
-        // row's exhausted entry — see `host::automerge::MergeBackoffState`'s
-        // doc. Registered here (not lazily inside `spawn_pr_automerge_watch`)
-        // so it exists before EITHER consumer — the sweep loop below and the
-        // `retry_pr_tracking` command — can possibly run.
+        // Auto-merge keeps a bounded per-(row, head_sha) attempt backoff. The
+        // canonical PR tracking Retry action clears the matching row only.
         .manage(host::automerge::MergeBackoffState::default())
         .manage(bus)
         .manage(asks)
@@ -215,20 +209,14 @@ pub fn run() {
         .setup(move |app| {
             let _ = APP_HANDLE.set(app.handle().clone());
             coordinator::run(app.handle().clone(), wake_rx);
-            lead_chat::engine::spawn_watchdog(app.handle().clone());
-            // Install the grant-persist consumer BEFORE revive re-drives tasks, so
+            // Install the grant-persist consumer before boot revive restores
+            // persisted-running tasks, so
             // the persist path is live for the whole run (grants were already
             // seeded synchronously above, before the builder). Ordering hygiene.
             auth_persist::spawn(app.handle().clone());
             lead_chat::revive::spawn_revive(app.handle().clone());
-            // Runtime companion to the boot-only sweep above: re-checks for the
-            // same silent-stall shape (and stopped-worker coverage) on a timer,
-            // since a coordination deadlock can develop while the app is
-            // already running, not only across a restart (issue #95).
-            lead_chat::revive::spawn_stall_watch(app.handle().clone());
-            // Issue #110 T1: the PR/MR state-machine sweep — same
-            // process-level-background shape as the stall watch above, not
-            // tied to any one chat session's lifetime.
+            // PR/MR state-machine polling is process-level and independent of
+            // any one chat session's lifetime.
             host::monitor::spawn_pr_watch(app.handle().clone());
             // Issue #110 T3: the auto-merge executor — its OWN independent
             // sweep loop (opt-in, default off), deliberately NOT chained off
@@ -297,8 +285,8 @@ pub fn run() {
             commands::rename_direction,
             commands::thread_messages,
             commands::bus_post_human,
-            commands::pending_asks,
-            commands::workspace_needs_counts,
+            attention::attention_items,
+            attention::answer_human_request,
             commands::answer_permission,
             commands::list_auth_grants,
             commands::revoke_auth_grant,
@@ -312,7 +300,6 @@ pub fn run() {
             commands::db_enable_encryption,
             commands::db_disable_encryption,
             commands::db_change_password,
-            commands::set_guardrails,
             process_quota::process_quota_status,
             resource_dashboard::resource_dashboard_snapshot,
             os_notify::os_notify_permission,
@@ -324,12 +311,7 @@ pub fn run() {
             commands::session_for,
             commands::session_meta,
             commands::effective_config,
-            commands::needs_you,
-            commands::write_triggers,
-            commands::approve_write_trigger,
-            commands::deny_write_trigger,
-            commands::answer_ask,
-            commands::retry_pr_tracking,
+            attention::retry_pr_tracking,
             lead_chat::commands::lead_send,
             lead_chat::commands::lead_interrupt,
             lead_chat::commands::lead_ensure,

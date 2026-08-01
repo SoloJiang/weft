@@ -560,7 +560,39 @@ pub async fn execute(
             ask_id,
             text,
         } => {
-            if !bus.answer_ask(thread, ask_id, &text) {
+            let persisted = match i32::try_from(ask_id) {
+                Ok(request_id) => crate::store::repo::get_human_request(db, request_id).await?,
+                Err(_) => None,
+            };
+            let answered = if let Some(request) = persisted.filter(|request| {
+                request.thread_id == thread && request.status == "open"
+            }) {
+                let updated = crate::store::repo::answer_human_request(
+                    db,
+                    request.workspace_id,
+                    request.id,
+                    request.revision,
+                    &text,
+                )
+                .await?;
+                if let Some(updated) = updated {
+                    if !bus.answer_ask(thread, ask_id, &updated.answer) {
+                        bus.post(
+                            thread,
+                            crate::bus::HUMAN,
+                            &updated.direction_scope,
+                            &updated.answer,
+                            "message",
+                        );
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !answered {
                 if let Err(e) = channel
                     .send_text(
                         sender,
@@ -1227,35 +1259,13 @@ async fn consume_human_event(
                     .unwrap_or_else(|| ask.from.clone()),
                 Err(_) => ask.from.clone(),
             };
-            // A display-only NOTICE (the self-clearing stall hint) can't be
-            // answered and retracts itself, so it must NOT go through IM's
-            // answer-card pipeline (reply-to-answer, then a resolved/cancelled
-            // patch) — that would show a dead reply prompt and a wrong
-            // "cancelled" patch on recovery. But a remote human still needs to
-            // learn a task froze, so send it as plain TEXT. Crucially, do NOT
-            // record it in CardIndex: a later Answered/Cancelled then finds
-            // nothing to patch (take_human → None), which is exactly right for
-            // a notice that never carries an answer.
-            if !ask.kind.is_answerable() {
-                // Background tasks post a stable token rather than prose (they
-                // have no locale); render it here, or a remote human receives
-                // the raw `acp.force_reset_notice`.
-                let body = crate::bus::notice_text::resolve(&ask.text, IM_LANG)
-                    .unwrap_or(ask.text.as_str());
-                let notice = format!("{title} · {from}\n{body}");
-                if let Err(e) = ch.send_text(&owner, &notice).await {
-                    eprintln!("[weft][im] send stall notice: {e}");
-                }
-                return;
-            }
             match ch
                 .send_card(
                     &owner,
                     outbound::human_card(
                         &title,
                         &from,
-                        crate::bus::notice_text::resolve(&ask.text, IM_LANG)
-                            .unwrap_or(ask.text.as_str()),
+                        &ask.text,
                         IM_LANG,
                     ),
                 )
@@ -1784,6 +1794,25 @@ pub(crate) async fn build_resync_items(
         };
         out.push((a.thread, label));
     }
+    match crate::store::repo::list_all_open_human_requests(db).await {
+        Ok(requests) => {
+            for request in requests {
+                let title = crate::store::repo::get_thread(db, request.thread_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|thread| thread.title)
+                    .unwrap_or_default();
+                let label = if title.is_empty() {
+                    request.question
+                } else {
+                    format!("{}：{}", title, request.question)
+                };
+                out.push((request.thread_id, label));
+            }
+        }
+        Err(error) => eprintln!("[weft][im] resync durable questions: {error}"),
+    }
     out
 }
 
@@ -2027,6 +2056,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_resync_items_restores_durable_questions_without_registry_state() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "API decision",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            11,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+
+        let items = build_resync_items(&db, &asks).await;
+        assert_eq!(
+            items,
+            vec![(thread.id, "API decision：REST or GraphQL?".to_string())]
+        );
+    }
+
+    #[tokio::test]
     async fn im_concierge_thread_uses_effective_default_tool() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         crate::store::repo::set_setting(&db, "default_tool", "codex")
@@ -2045,110 +2109,6 @@ mod tests {
         assert_eq!(thread.kind, "concierge");
         assert_eq!(thread.lead_tool, expected);
     }
-
-    #[derive(Default)]
-    struct CountingChannel {
-        cards: std::sync::atomic::AtomicUsize,
-        texts: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl Channel for CountingChannel {
-        async fn send_card(&self, _o: &str, _c: serde_json::Value) -> anyhow::Result<String> {
-            self.cards.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok("om_card".into())
-        }
-        async fn patch_card(&self, _m: &str, _c: serde_json::Value) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn send_text(&self, _o: &str, _t: &str) -> anyhow::Result<()> {
-            self.texts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(())
-        }
-        async fn send_chat_text(&self, _c: &str, _t: &str) -> anyhow::Result<String> {
-            Ok("om_msg".into())
-        }
-        async fn create_chat_topic(
-            &self,
-            _c: &str,
-            _s: &str,
-            _t: &str,
-        ) -> anyhow::Result<String> {
-            Ok("omt".into())
-        }
-        async fn reply_text(&self, _r: &str, _t: &str) -> anyhow::Result<String> {
-            Ok("om_reply".into())
-        }
-    }
-
-    /// An answerable question goes through IM's answer-card pipeline; a
-    /// display-only stall NOTICE reaches the remote human as plain TEXT instead
-    /// (never an answer card, so no dead reply prompt or wrong "cancelled" patch),
-    /// and — verified below — is NOT recorded in CardIndex.
-    #[tokio::test]
-    async fn stall_notice_forwarded_as_text_to_im() {
-        use crate::bus::state::{Ask, HumanAskEvent};
-        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
-        let w = crate::store::repo::create_workspace(&db, "ws")
-            .await
-            .unwrap();
-        let th = crate::store::repo::create_thread(&db, w.id, "stalled task", "bugfix", "claude")
-            .await
-            .unwrap();
-        // An owner must be bound, else the handler returns before the notice check
-        // and the test would pass for the wrong reason.
-        crate::store::repo::set_setting(&db, K_ALLOW, "owner_open_id")
-            .await
-            .unwrap();
-        let ch = CountingChannel::default();
-        let cards = tokio::sync::Mutex::new(CardIndex::default());
-        let cards_sent = || ch.cards.load(std::sync::atomic::Ordering::Relaxed);
-        let texts_sent = || ch.texts.load(std::sync::atomic::Ordering::Relaxed);
-        let mk = |id: u64, answerable: bool| Ask {
-            id,
-            from: "10".to_string(),
-            text: "x".to_string(),
-            ts: 0,
-            answered: false,
-            kind: if answerable {
-                crate::bus::state::AskKind::Question
-            } else {
-                crate::bus::state::AskKind::Notice
-            },
-        };
-        // An answerable question IS forwarded as an IM answer card.
-        consume_human_event(
-            HumanAskEvent::Asked {
-                thread: th.id,
-                ask: mk(1, true),
-            },
-            &db,
-            &ch,
-            &cards,
-        )
-        .await;
-        assert_eq!(cards_sent(), 1, "answerable → one answer card");
-        assert_eq!(texts_sent(), 0, "answerable → not a plain-text notice");
-        // A non-answerable NOTICE still reaches IM — as plain text, not a card.
-        consume_human_event(
-            HumanAskEvent::Asked {
-                thread: th.id,
-                ask: mk(2, false),
-            },
-            &db,
-            &ch,
-            &cards,
-        )
-        .await;
-        assert_eq!(cards_sent(), 1, "notice must not open an answer card");
-        assert_eq!(texts_sent(), 1, "notice is delivered as plain text");
-        // And it is NOT recorded, so a later Answered/Cancelled patches nothing.
-        assert!(
-            cards.lock().await.take_human(th.id, 2).is_none(),
-            "notice must not be recorded in CardIndex",
-        );
-    }
-
     #[derive(Default)]
     struct TopicChannel {
         created_topics: std::sync::Mutex<Vec<(String, String)>>,
@@ -2205,6 +2165,91 @@ mod tests {
                 .push((reply_to.to_string(), text.to_string()));
             Ok("om_reply".into())
         }
+    }
+
+    #[tokio::test]
+    async fn im_answer_after_restart_resolves_durable_question_and_reaches_direction() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let repo_ref = crate::store::repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "API decision",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let direction = crate::store::repo::create_direction(
+            &db,
+            thread.id,
+            "Backend",
+            "codex",
+            repo_ref.id,
+            "Choose API",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let (request, _) = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            &direction.id.to_string(),
+            direction.id,
+            9,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+
+        // Both registries are intentionally fresh, modeling an app restart.
+        let asks = crate::ask::AskRegistry::new();
+        let bus = crate::bus::BusRegistry::new();
+        let channel = TopicChannel::default();
+        execute(
+            inbound::Route::AnswerHuman {
+                thread: thread.id,
+                ask_id: u64::try_from(request.id).unwrap(),
+                text: "REST".to_string(),
+            },
+            &db,
+            &asks,
+            &bus,
+            &channel,
+            "ou_owner",
+            "en",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = crate::store::repo::get_human_request(&db, request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "resolved");
+        assert_eq!(stored.answer, "REST");
+        assert_eq!(stored.revision, request.revision + 1);
+        let inbox = bus.inbox(thread.id, &direction.id.to_string());
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].from, crate::bus::HUMAN);
+        assert_eq!(inbox[0].text, "REST");
     }
 
     #[tokio::test]

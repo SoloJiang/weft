@@ -2,9 +2,9 @@ import { useEffect, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { Layers, Plus, SquarePen, X } from "lucide-react";
-import { isPendingNeed, useStore } from "../state/store";
+import { attentionThreadId, useStore } from "../state/store";
 import { selectThreadActivity } from "../state/threadActivity";
-import type { NeedItem, PermissionAsk, ThreadOverview } from "../lib/types";
+import type { AttentionItem, ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { ThreadActivity } from "../components/ui/ThreadActivity";
 import { CreateThreadDialog, CreateWorkspaceDialog } from "../nav/dialogs";
@@ -15,26 +15,8 @@ import { cn } from "../lib/cn";
 
 type Phase = "planning" | "working" | "review" | "done";
 
-/** Needs/asks that want the human on this thread — per-direction PLUS thread-level
- * ones (a stalled/blocked lead posts with direction_id -1 / dir "lead"), matched by
- * thread_id. Single source so the card badge and the column sort agree. Excludes
- * self-clearing stall notices (isPendingNeed) — they carry no action, so they
- * don't inflate the card's "N need you" badge (issue #105). */
-function threadAttentionCount(
-  o: ThreadOverview,
-  needs: NeedItem[],
-  asks: PermissionAsk[],
-): number {
-  return (
-    needs.filter(
-      (n) =>
-        isPendingNeed(n) &&
-        (o.direction_ids.includes(n.direction_id) || n.thread_id === o.thread_id),
-    ).length +
-    asks.filter(
-      (a) => o.direction_ids.includes(Number(a.dir)) || a.thread === o.thread_id,
-    ).length
-  );
+function threadAttentionCount(o: ThreadOverview, items: AttentionItem[]): number {
+  return items.filter((item) => attentionThreadId(item) === o.thread_id).length;
 }
 
 function progressBarColor(attention: number, failing: number): string {
@@ -54,8 +36,7 @@ export function WorkspaceKanban() {
   const {
     overview,
     refreshOverview,
-    needs,
-    asks,
+    attentionItems,
     checksByDirection,
     selectThread,
   } = useStore();
@@ -79,10 +60,9 @@ export function WorkspaceKanban() {
 
   // Cards waiting on the human (or with a failing check) bubble to the top of
   // their column — the attention signal without hijacking the stage. Same
-  // thread-level accounting as the card badge, so a stalled lead (which posts
-  // under thread_id, not a direction) sorts up too.
+  // thread-level accounting as the card badge, so lead questions sort up too.
   const urgent = (o: ThreadOverview): boolean =>
-    threadAttentionCount(o, needs, asks) > 0 ||
+    threadAttentionCount(o, attentionItems) > 0 ||
     o.direction_ids.some((id) =>
       (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
     );
@@ -177,7 +157,7 @@ function EmptyBoard() {
 }
 
 function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
-  const { sessions, needs, asks, checksByDirection, openNeeds, leadTurn, authGrants, readOnlyGrants } =
+  const { sessions, attentionItems, checksByDirection, openNeeds, leadTurn, authGrants, readOnlyGrants } =
     useStore();
   const { t } = useTranslation();
   const activity = selectThreadActivity({
@@ -196,7 +176,7 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
   // Unknown — so it gets its own marker rather than folding into `inherited`.
   const readOnlyTrusted = readOnlyGrants.issue.includes(o.thread_id);
   const done = o.statuses.filter((s) => s === "done").length;
-  const attention = threadAttentionCount(o, needs, asks);
+  const attention = threadAttentionCount(o, attentionItems);
   const failing = o.direction_ids.filter((id) =>
     (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
   ).length;

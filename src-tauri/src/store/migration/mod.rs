@@ -1,7 +1,7 @@
 use crate::store::entities::{
-    app_setting, backup_config, code_checkpoint, direction, im_route, lead_message, plan,
-    pull_request, repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread,
-    workspace, worktree,
+    app_setting, backup_config, code_checkpoint, direction, human_request, im_route, lead_message,
+    plan, pull_request, repo_profile, repo_ref, session, skill_enable, skill_source, test_plan,
+    thread, workspace, worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -58,6 +58,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0044EngineRoutingPin),
             Box::new(M0045PullRequest),
             Box::new(M0046DirectionUpstream),
+            Box::new(M0047HumanRequest),
         ]
     }
 }
@@ -1803,15 +1804,9 @@ impl MigrationTrait for M0040LeadMessageConsumedAt {
     }
 }
 
-/// Composite index for the single-row `lead_message` lookups the stall sweep
-/// (`lead_chat::revive`) repeats on every pass. They all shape up as
-/// `thread_id = ? AND kind = ? [AND session_id …]`, but M0007 only ever
-/// indexed `thread_id`, so each one had to walk that thread's ENTIRE message
-/// history — which on a long-lived thread is the whole chat — to return one
-/// row. Three callers ride this: `repo::last_turn_freeze_recovery_secs` (the
-/// turn-freeze grace window, per thread AND per stalled direction) plus the
-/// older `repo::lead_native_id` / `repo::lead_status` meta reads that already
-/// ran twice per thread per sweep.
+/// Composite index for single-row `lead_message` lookups shaped as
+/// `thread_id = ? AND kind = ? [AND session_id …]`. M0007 only indexed
+/// `thread_id`, so each lookup otherwise walks an entire long-lived timeline.
 ///
 /// `(thread_id, kind, session_id, id)` serves all of them: equality on the
 /// leading columns, with `id` last so `ORDER BY id DESC LIMIT 1` reads
@@ -2063,6 +2058,55 @@ impl MigrationName for M0045PullRequest {
         "m0045_pull_request"
     }
 }
+
+/// Durable free-text human questions. Permission prompts deliberately stay out
+/// of this table because their tool-call transport cannot survive restart.
+pub struct M0047HumanRequest;
+impl MigrationName for M0047HumanRequest {
+    fn name(&self) -> &str {
+        "m0047_human_request"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0047HumanRequest {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut statement = schema.create_table_from_entity(human_request::Entity);
+        statement.if_not_exists();
+        manager.create_table(statement).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_human_request_workspace_status")
+                    .table(Alias::new("human_request"))
+                    .col(Alias::new("workspace_id"))
+                    .col(Alias::new("status"))
+                    .col(Alias::new("created_at"))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_human_request_scope_status")
+                    .table(Alias::new("human_request"))
+                    .col(Alias::new("thread_id"))
+                    .col(Alias::new("direction_scope"))
+                    .col(Alias::new("status"))
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("human_request")).to_owned())
+            .await
+    }
+}
 #[async_trait::async_trait]
 impl MigrationTrait for M0045PullRequest {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -2100,7 +2144,10 @@ impl MigrationTrait for M0045PullRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest, M0046DirectionUpstream};
+    use super::{
+        gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest,
+        M0046DirectionUpstream, M0047HumanRequest,
+    };
 
     #[test]
     fn gateway_tier_rewritten_to_backend() {
@@ -2258,12 +2305,12 @@ mod tests {
         assert_eq!(m.consumed_at, None, "consumed_at must exist and default to NULL");
     }
 
-    /// M0041: the composite index exists AND SQLite actually plans the stall
+    /// M0041: the composite index exists AND SQLite actually plans the
     /// sweep's lookups through it. Asserting the query PLAN, not just
     /// `sqlite_master`, is the point: an index that exists but doesn't match
     /// the query's column order would still leave the sweep doing a full
     /// per-thread scan, and only the plan can tell those apart. Covers both
-    /// shapes — the freeze marker (`kind` + `session_id`) and the older
+    /// shapes — session-scoped card lookups (`kind` + `session_id`) and the
     /// `lead_native_id`/`lead_status` meta reads that use the leading prefix.
     #[tokio::test]
     async fn m0041_thread_kind_index_backs_the_sweep_lookups() {
@@ -2287,10 +2334,10 @@ mod tests {
             }
         };
 
-        // The freeze-marker lookup (repo::last_turn_freeze_recovery_secs),
-        // worker form: all three equality columns plus the ORDER BY.
+        // A session-scoped timeline-kind lookup: all three equality columns
+        // plus the ORDER BY.
         let marker = plan_for(
-            "SELECT * FROM lead_message WHERE thread_id = 1 AND kind = 'turn_freeze_recovered' \
+            "SELECT * FROM lead_message WHERE thread_id = 1 AND kind = 'action_card' \
              AND session_id = 2 ORDER BY id DESC LIMIT 1",
         )
         .await;
@@ -2305,9 +2352,9 @@ mod tests {
             "ORDER BY id DESC should read off the index, got: {marker}"
         );
 
-        // The lead form keys `session_id IS NULL` instead.
+        // The lead-scoped form keys `session_id IS NULL` instead.
         let lead_marker = plan_for(
-            "SELECT * FROM lead_message WHERE thread_id = 1 AND kind = 'turn_freeze_recovered' \
+            "SELECT * FROM lead_message WHERE thread_id = 1 AND kind = 'action_card' \
              AND session_id IS NULL ORDER BY id DESC LIMIT 1",
         )
         .await;
@@ -2534,6 +2581,65 @@ mod tests {
             .unwrap();
         let value: i32 = row.try_get("", "depends_on_direction_id").unwrap();
         assert_eq!(value, 1, "a rerun must not clobber an already-recorded upstream edge");
+    }
+
+    #[tokio::test]
+    async fn m0047_human_request_table_indexes_and_defaults_survive_rerun() {
+        use crate::store::repo;
+        use crate::store::Db;
+        use sea_orm::{ConnectionTrait, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "Issue", "feature", "codex")
+            .await
+            .unwrap();
+        let (request, superseded) = repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            7,
+            "Ship it?",
+        )
+        .await
+        .unwrap();
+        assert!(superseded.is_empty());
+        assert_eq!(request.status, "open");
+        assert_eq!(request.revision, 1);
+        assert!(request.answer.is_empty());
+
+        // Migrations are expected to be safely repeatable in hand-repaired or
+        // partially-upgraded databases.
+        M0047HumanRequest
+            .up(&SchemaManager::new(&db.0))
+            .await
+            .unwrap();
+
+        let indexes = db
+            .0
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'human_request'"
+                    .to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(indexes.contains("idx_human_request_workspace_status"));
+        assert!(indexes.contains("idx_human_request_scope_status"));
+        assert_eq!(
+            repo::get_human_request(&db, request.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "open"
+        );
     }
 
     /// M0037: code_checkpoint exists after migration and round-trips a row.

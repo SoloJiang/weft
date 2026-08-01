@@ -158,20 +158,65 @@ async fn answer_human_route_lands_in_asker_inbox() {
         BusRegistry::new(),
         FakeChannel::default(),
     );
-    bus.join(1, "10");
-    let qid = bus.ask_human(1, "10", "major or minor?");
+    let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+    let repo_ref = repo::add_repo_ref(
+        &db,
+        workspace.id,
+        "repo",
+        "/tmp/repo",
+        "main",
+        "",
+        true,
+    )
+    .await
+    .unwrap();
+    let thread = repo::create_thread(&db, workspace.id, "Issue", "feature", "codex")
+        .await
+        .unwrap();
+    let direction = repo::create_direction(
+        &db,
+        thread.id,
+        "Task",
+        "codex",
+        repo_ref.id,
+        "why",
+        "impl-only",
+        "",
+    )
+    .await
+    .unwrap();
+    let scope = direction.id.to_string();
+    let (request, _) = repo::create_human_request(
+        &db,
+        workspace.id,
+        thread.id,
+        &scope,
+        direction.id,
+        1,
+        "major or minor?",
+    )
+    .await
+    .unwrap();
+    let qid = u64::try_from(request.id).unwrap();
+    bus.join(thread.id, &scope);
+    bus.ask_human_with_id(thread.id, &scope, &request.question, qid);
     let r = Route::AnswerHuman {
-        thread: 1,
+        thread: thread.id,
         ask_id: qid,
         text: "minor".into(),
     };
     im::execute(r, &db, &asks, &bus, &ch, "ou_me", "zh", None, None)
         .await
         .unwrap();
-    let inbox = bus.inbox(1, "10");
+    let inbox = bus.inbox(thread.id, &scope);
     assert_eq!(inbox.len(), 1);
     assert_eq!(inbox[0].text, "minor");
     assert_eq!(inbox[0].from, "you");
+    let stored = repo::get_human_request(&db, request.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "resolved");
 }
 
 #[tokio::test]

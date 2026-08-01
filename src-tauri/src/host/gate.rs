@@ -84,14 +84,13 @@ pub enum AutoMergeSkipReason {
     /// The last SUCCESSFUL probe is older than the freshness window. A
     /// different way a row's `Ready` column can outlive its truth than
     /// `ProbeFailing`: `probe_fail_count` can read 0 (no failures recorded)
-    /// while `last_checked_at` is still stale, if the sweep loop itself
-    /// stalled or the whole process was suspended for hours and just
+    /// while `last_checked_at` is still stale, if polling stopped or the whole
+    /// process was suspended for hours and just
     /// resumed. Neither signal alone is sufficient, both are checked.
     Stale,
     /// `ci` is not LITERALLY `CiStatus::Passing`. `judge::merge_readiness`'s
     /// own `ci_verdict` folds `NotConfigured` into the SAME "Clear" bucket as
-    /// `Passing` — correct for a Needs-you notice (no CI configured is
-    /// vacuously fine to leave a human alone about) but wrong for an
+    /// `Passing` — acceptable for a human-facing readiness explanation but wrong for an
     /// unattended, irreversible merge: an empty `statusCheckRollup` also
     /// covers the window right after a new head is pushed, before its checks
     /// have even been reported yet (`github::ci_of`'s own doc). Review round
@@ -230,11 +229,9 @@ pub fn parse_ci(s: &str) -> CiStatus {
     })
 }
 
-/// `now - last_checked_at`, both unix-seconds strings (`pull_request`'s own
-/// storage convention — see `repo::now_unix`). Unparseable or empty (a row
-/// that has never completed a successful probe leaves `last_checked_at`
-/// empty) reads as `i64::MAX` — maximally stale, never treated as fresh by
-/// accident.
+/// `now - last_checked_at` for successful unix-seconds stamps. Unparseable or
+/// empty values (including the precise opaque token stored for a failed probe)
+/// read as `i64::MAX` — maximally stale, never treated as fresh by accident.
 pub fn age_secs(last_checked_at: &str, now: &str) -> i64 {
     let parsed = |s: &str| s.trim().parse::<i64>().ok();
     match (parsed(last_checked_at), parsed(now)) {

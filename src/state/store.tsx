@@ -38,6 +38,7 @@ import {
 } from "../lib/notificationsCore";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
+  AttentionItem,
   BusMsg,
   Direction,
   GrantSnapshot,
@@ -45,8 +46,9 @@ import type {
   LeadChatPush,
   LeadMessage,
   LiveWorkerSlot,
-  NeedItem,
   PermissionAsk,
+  PrTrackingRetryAttentionItem,
+  QuestionAttentionItem,
   ProcessQuotaStatus,
   Proposal,
   QueuedItem,
@@ -69,7 +71,6 @@ import type {
   TurnState,
   Workspace,
   Worktree,
-  WriteTrigger,
 } from "../lib/types";
 
 export type HomeTab = "board" | "repos" | "settings";
@@ -119,41 +120,46 @@ export interface OpenSession {
 
 const SESSION_STATUS: Record<TurnState, SessionStatus> = {
   busy: "running",
-  stalled: "stalled",
   idle: "idle",
   stopped: "exited",
 };
 
-/** A turn still in flight — busy OR stalled (the backend turn is busy either way;
- * stalled just means it went quiet). Single source of truth for "keep the Stop
- * button and queue sends", so a stalled turn stays interruptible from the composer. */
+/** A turn still in flight. Single source of truth for Stop and queued sends. */
 export function isInFlight(state: TurnState): boolean {
-  return state === "busy" || state === "stalled";
+  return state === "busy";
 }
 
-/** A NeedItem that accepts a human reply in a worker conversation. Persistent
- *  action-required notices have a retry control instead, so they remain
- *  excluded from the inline answer form and urgency checks. */
-export function isPendingNeed(item: NeedItem): boolean {
-  return item.kind === "question";
+/** Canonical ownership helpers for thread/task badges and sorting. */
+export function attentionThreadId(item: AttentionItem): number {
+  switch (item.kind) {
+    case "permission":
+      return item.ask.thread;
+    case "question":
+    case "plan_approval":
+    case "scope_approval":
+    case "repo_action":
+    case "pr_tracking_retry":
+      return item.thread_id;
+  }
 }
 
-/** A NeedItem that contributes to numeric "needs you" badges. Ordinary notices
- *  are FYI-only; action-required notices stay counted because their retry
- *  control needs explicit human attention. */
-export function isActionableNeed(item: NeedItem): boolean {
-  return item.kind === "question" || item.kind === "notice_action_required";
+export function attentionDirectionId(item: AttentionItem): number {
+  switch (item.kind) {
+    case "permission":
+      return Number(item.ask.dir) || 0;
+    case "question":
+    case "pr_tracking_retry":
+      return item.direction_id;
+    case "plan_approval":
+    case "scope_approval":
+    case "repo_action":
+      return 0;
+  }
 }
 
-/** Workspace-wide "needs you" count: actionable Needs-you rows + tool-
- *  permission asks + pending write triggers. The queue still renders ordinary
- *  self-clearing notices as FYI rows without counting them. */
-export function pendingNeedsCount(
-  needs: NeedItem[],
-  asks: PermissionAsk[],
-  writeTriggers: WriteTrigger[],
-): number {
-  return needs.filter(isActionableNeed).length + asks.length + writeTriggers.length;
+/** Every canonical attention item is actionable by construction. */
+export function pendingNeedsCount(items: AttentionItem[]): number {
+  return items.length;
 }
 
 const PROCESS_QUOTA_NOTICE_VIEW: Record<
@@ -324,10 +330,6 @@ interface Store {
   /** The per-day "turn on Dangerous mode?" nudge toast state. */
   dangerNudge: "ask" | "enabled" | null;
   setDangerNudge: (v: "ask" | "enabled" | null) => void;
-  /** Runaway guardrails: idle + wall-clock caps in minutes (0 disables). */
-  idleCapMins: number;
-  wallCapMins: number;
-  setGuardrails: (idleMins: number, wallMins: number) => void;
   /** App-wide process quota state; null until the governor's first snapshot. */
   processQuota: ProcessQuotaStatus | null;
   refreshProcessQuota: () => Promise<void>;
@@ -345,7 +347,9 @@ interface Store {
   markSkillsDirty: () => void;
 
   /** Open agent→human questions across the workspace; the Needs-you surface. */
-  needs: NeedItem[];
+  needs: QuestionAttentionItem[];
+  /** Canonical, deterministic workspace action queue used by every aggregate UI. */
+  attentionItems: AttentionItem[];
   /** Pending tool permission requests (the Ask Bridge). */
   asks: PermissionAsk[];
   /** Standing authorization grants (full / always) that persist across restarts,
@@ -372,23 +376,16 @@ interface Store {
    *  (set at dispatch-approval time); dir set revokes just that one session's
    *  batch grant. */
   revokeReadOnlyGrant: (thread: number, dir: string | null) => Promise<void>;
-  /** Lead-proposed write declarations awaiting human approve/deny. */
-  writeTriggers: WriteTrigger[];
-  approveWriteTrigger: (item: WriteTrigger, tool?: string) => Promise<void>;
-  denyWriteTrigger: (item: WriteTrigger) => Promise<void>;
   /** Pending needs count per workspace id (for the workspace switcher). */
   needsByWorkspace: Record<number, number>;
   /** Whether the Needs-you view occupies the main region. */
   showNeeds: boolean;
   openNeeds: () => void;
   refreshNeeds: () => Promise<void>;
-  answerAsk: (item: NeedItem, text: string) => Promise<void>;
-  goToAsk: (item: NeedItem) => Promise<void>;
-  /** "Retry" for the ONE Needs-you notice kind that doesn't clear itself (a
-   *  given-up PR/MR): resets its tracked probe-failure streak so the
-   *  background monitor resumes sweeping it. Resolves once the reset lands;
-   *  the card itself clears on the monitor's next sweep tick, not instantly. */
-  retryPrTracking: (item: NeedItem) => Promise<void>;
+  answerAsk: (item: QuestionAttentionItem, text: string) => Promise<void>;
+  goToAsk: (item: QuestionAttentionItem) => Promise<void>;
+  /** Resume a PR/MR probe only when this exact persisted failure episode is current. */
+  retryPrTracking: (item: PrTrackingRetryAttentionItem) => Promise<void>;
   /** Single-source jump for any worker reference carrying a bus-style
    *  (thread, dir) pair — board cards, needs-you rows, anywhere a worker's
    *  name is shown. `dir` is the direction id as a string (backend convention,
@@ -620,7 +617,6 @@ const NAV_AUTOCOLLAPSE_BELOW = 1000;
  * rule, instead of a mutable `let` reassigned across `if`/`else`. */
 function adoptionStatus(turnState: TurnState | undefined, busy: boolean): SessionStatus {
   if (turnState === "stopped") return "exited";
-  if (turnState === "stalled") return "stalled";
   if (turnState !== "idle" && busy) return "running";
   return "idle";
 }
@@ -706,7 +702,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     sidePanel?: "diff" | "files";
   } | null>(null);
   const [messages, setMessages] = useState<BusMsg[]>([]);
-  const [needs, setNeeds] = useState<NeedItem[]>([]);
+  const [attentionItems, setAttentionItems] = useState<AttentionItem[]>([]);
+  const [needs, setNeeds] = useState<QuestionAttentionItem[]>([]);
   const [asks, setAsks] = useState<PermissionAsk[]>([]);
   const [authGrants, setAuthGrants] = useState<GrantSnapshot>({
     full: [],
@@ -716,7 +713,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     issue: [],
     session: [],
   });
-  const [writeTriggers, setWriteTriggers] = useState<WriteTrigger[]>([]);
   const [needsByWorkspace, setNeedsByWorkspace] = useState<Record<number, number>>({});
   const needsRefreshSeqRef = useRef(0);
   const needsRefreshInFlightRef = useRef<Promise<void> | null>(null);
@@ -1017,37 +1013,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // Turning it on retro-approves the existing permission backlog (the backend
     // releases the blocked agents); clear them from the UI now. Human questions
     // (needs) are NOT auto-answered — they stay.
-    if (on) setAsks([]);
+    if (on) {
+      setAsks([]);
+      setAttentionItems((current) => current.filter((item) => item.kind !== "permission"));
+    }
   }, []);
   const [dangerNudge, setDangerNudge] = useState<"ask" | "enabled" | null>(null);
   // Sync the persisted Dangerous-mode flag to the backend on launch (the bus
   // registry starts fresh each run).
   useEffect(() => {
     void api.setDangerousMode(localStorage.getItem(STORAGE_KEYS.dangerousMode) === "1");
-  }, []);
-
-  // Runaway guardrails (§7): idle + wall-clock caps in MINUTES, persisted. The
-  // backend seeds its defaults from the WEFT_* env, so we only push when the user
-  // has an explicit saved value — an env override survives an untouched install.
-  const [idleCapMins, setIdleCapMins] = useState(
-    () => Number(localStorage.getItem(STORAGE_KEYS.idleCapMins) ?? "30"),
-  );
-  const [wallCapMins, setWallCapMins] = useState(
-    () => Number(localStorage.getItem(STORAGE_KEYS.wallCapMins) ?? "120"),
-  );
-  const setGuardrails = useCallback((idleMins: number, wallMins: number) => {
-    const idle = Math.max(0, Math.round(idleMins));
-    const wall = Math.max(0, Math.round(wallMins));
-    localStorage.setItem(STORAGE_KEYS.idleCapMins, String(idle));
-    localStorage.setItem(STORAGE_KEYS.wallCapMins, String(wall));
-    setIdleCapMins(idle);
-    setWallCapMins(wall);
-    void api.setGuardrails(idle * 60, wall * 60);
-  }, []);
-  useEffect(() => {
-    const i = localStorage.getItem(STORAGE_KEYS.idleCapMins);
-    const w = localStorage.getItem(STORAGE_KEYS.wallCapMins);
-    if (i != null && w != null) void api.setGuardrails(Number(i) * 60, Number(w) * 60);
   }, []);
 
   // Auto-collapse the sidebar when the window gets narrow; auto-restore when it
@@ -1072,7 +1047,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setWorkspaces(ws);
       // Lead turns are global and can belong to a workspace the user has not
       // visited since this WebView launched. Index all thread owners before the
-      // notification baseline arms, so a background lead stall is not dropped.
+      // notification baseline arms, so cross-workspace review routes stay owned.
       const threadLists = await Promise.all(
         ws.map(async (workspace) => {
           try {
@@ -1137,8 +1112,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setWorkspaceLoadReady(false);
       // Do not render the previous workspace's actionable rows under the new
       // workspace while its authoritative Needs refresh is still pending.
+      setAttentionItems([]);
       setNeeds([]);
-      setWriteTriggers([]);
+      setAsks([]);
       setNotificationHydration((current) => ({
         ...current,
         workspaceId: id,
@@ -1451,8 +1427,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setActiveThreadId(null);
       setViewing(null);
       setShowNeeds(false);
+      setAttentionItems([]);
       setNeeds([]);
-      setWriteTriggers([]);
+      setAsks([]);
       setHomeTab("board");
       setCuratorThreadId(null);
       setRepoDrawerOpen(false);
@@ -1469,15 +1446,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     async (threadId: number, title: string) => {
       const t = await api.renameThread(threadId, title);
       setThreads((cur) => cur.map((x) => (x.id === t.id ? t : x)));
-      // needs/asks/write-triggers carry a snapshot of thread_title; patch in place
+      // Canonical attention rows carry a snapshot of thread_title; patch in place
       setNeeds((cur) =>
         cur.map((n) => (n.thread_id === t.id ? { ...n, thread_title: t.title } : n)),
       );
+      setAttentionItems((current) =>
+        current.map((item) => {
+          if (item.kind === "permission") {
+            if (item.ask.thread !== t.id) return item;
+            return { ...item, ask: { ...item.ask, thread_title: t.title } };
+          }
+          if (item.thread_id !== t.id) return item;
+          return { ...item, thread_title: t.title };
+        }),
+      );
       setAsks((cur) =>
         cur.map((a) => (a.thread === t.id ? { ...a, thread_title: t.title } : a)),
-      );
-      setWriteTriggers((cur) =>
-        cur.map((w) => (w.thread_id === t.id ? { ...w, thread_title: t.title } : w)),
       );
       void refreshOverview();
     },
@@ -1492,10 +1476,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }));
     // needs.direction_name and asks.dir_name carry the direction's display name;
     // patch them in place so cards/notifications reflect the rename without
-    // waiting for the next refreshNeeds poll. (WriteTrigger.name is a planned
-    // direction not yet created, so it is unrelated to this rename.)
+    // waiting for the next refreshNeeds poll.
     setNeeds((cur) =>
       cur.map((n) => (n.direction_id === d.id ? { ...n, direction_name: d.name } : n)),
+    );
+    setAttentionItems((current) =>
+      current.map((item) => {
+        if (item.kind === "permission") {
+          if (item.ask.thread !== d.thread_id || item.ask.dir !== d.slug) return item;
+          return { ...item, ask: { ...item.ask, dir_name: d.name } };
+        }
+        if (
+          (item.kind === "question" || item.kind === "pr_tracking_retry") &&
+          item.direction_id === d.id
+        ) {
+          return { ...item, direction_name: d.name };
+        }
+        return item;
+      }),
     );
     setAsks((cur) =>
       cur.map((a) =>
@@ -2304,14 +2302,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // a revived worker's first observed state IS the idle push (no busy push).
           const prevTurn = lastWorkerTurnRef.current[sid];
           lastWorkerTurnRef.current[sid] = p.state;
-          // Clear the running-tool label on a real turn transition, but keep it on a
-          // stall push AND on the watchdog's stall→busy recovery push (p.recovered) —
-          // so the tool context survives the whole stall. A promoted queued turn also
-          // arrives as "busy" but with recovered=false, so it still clears the stale
-          // label. The backend flag distinguishes recovery from a (promoted) new turn,
-          // which the observed state alone cannot.
-          if (p.state !== "stalled" && !p.recovered)
-            setWorkerActivity((a) => ({ ...a, [sid]: null }));
+          // Clear the running-tool label on every authoritative turn transition.
+          setWorkerActivity((a) => ({ ...a, [sid]: null }));
           setWorkerTurn((t) => ({ ...t, [sid]: { state: p.state, queue: p.queue } }));
           setSessions((m) =>
             m[sid]
@@ -2344,10 +2336,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
 
         } else {
-          // Same as the worker path: clear on a real transition, keep on a stall push
-          // AND on the watchdog's recovery push (p.recovered).
-          if (p.state !== "stalled" && !p.recovered)
-            setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
+          setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
           setLeadTurn((t) => ({
             ...t,
             [p.thread_id]: { state: p.state, queue: p.queue },
@@ -2675,21 +2664,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const workspaceId = activeWorkspaceIdRef.current;
     const requestId = ++needsRefreshSeqRef.current;
     const isLatestRequest = () => requestId === needsRefreshSeqRef.current;
-    // Permission Asks are global (not workspace-scoped); always refresh them.
-    try {
-      const nextAsks = await api.pendingAsks();
-      if (isLatestRequest()) {
-        setAsks(nextAsks);
-        setNotificationHydration((current) => ({
-          ...current,
-          asks: true,
-          needs: current.workspaceNeeds,
-        }));
-      }
-    } catch (e) {
-      /* server may not be ready */
-      console.error(e);
-    }
     // Standing grants are global too; refresh so "inherited access" markers stay
     // in sync (e.g. seeded from disk at boot, or granted in another view).
     try {
@@ -2699,7 +2673,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       console.error(e);
     }
     // Read-only auto-allow scopes (issue #103) — in-memory only, so this poll
-    // (plus the explicit refreshes after confirmProposal/approveWriteTrigger/
+    // (plus the explicit refreshes after confirmProposal/
     // releaseSessionReadOnly/revokeReadOnlyGrant below) is the only way the
     // frontend's copy stays honest; the backend's own gate never depends on it.
     try {
@@ -2710,30 +2684,35 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
     if (workspaceId == null) {
       if (isLatestRequest() && activeWorkspaceIdRef.current == null) {
+        setAttentionItems([]);
         setNeeds([]);
-        setWriteTriggers([]);
+        setAsks([]);
         setNotificationHydration((current) => ({
           ...current,
+          asks: true,
           workspaceNeeds: true,
-          needs: current.asks,
+          needs: true,
         }));
       }
       return;
     }
     try {
-      const [nextNeeds, nextWriteTriggers] = await Promise.all([
-        api.needsYou(workspaceId),
-        api.writeTriggers(workspaceId),
-      ]);
+      const snapshot = await api.attentionItems(workspaceId);
       if (isLatestRequest() && activeWorkspaceIdRef.current === workspaceId) {
-        setNeeds(nextNeeds);
-        setWriteTriggers(nextWriteTriggers);
+        setAttentionItems(snapshot.items);
+        setNeeds(snapshot.items.filter((item) => item.kind === "question"));
+        setAsks(
+          snapshot.items
+            .filter((item) => item.kind === "permission")
+            .map((item) => item.ask),
+        );
         setNotificationHydration((current) => {
           if (current.workspaceId !== workspaceId) return current;
           return {
             ...current,
+            asks: true,
             workspaceNeeds: true,
-            needs: current.asks,
+            needs: true,
           };
         });
       }
@@ -2741,10 +2720,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       /* bus may not be ready */
       console.error(e);
     }
-    // per-workspace counts so the switcher can flag OTHER workspaces.
+    // The switcher uses the same canonical projection as the active page.
     try {
-      const counts = await api.workspaceNeedsCounts();
-      if (isLatestRequest()) setNeedsByWorkspace(Object.fromEntries(counts));
+      const snapshots = await Promise.all(
+        workspacesRef.current.map((workspace) => api.attentionItems(workspace.id)),
+      );
+      if (isLatestRequest()) {
+        setNeedsByWorkspace(
+          Object.fromEntries(snapshots.map((snapshot) => [snapshot.workspace_id, snapshot.count])),
+        );
+      }
     } catch (e) {
       /* ignore */
       console.error(e);
@@ -3127,116 +3112,48 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 
   const answerAsk = useCallback(
-    async (item: NeedItem, text: string) => {
+    async (item: QuestionAttentionItem, text: string) => {
       if (!text.trim()) return;
-      // optimistic: drop the answered ask immediately, then reconcile
-      setNeeds((cur) => cur.filter((n) => n.ask_id !== item.ask_id));
-      await api.answerAsk(item.thread_id, item.ask_id, text.trim());
-      await refreshNeeds();
+      const workspaceId = activeWorkspaceIdRef.current;
+      if (workspaceId == null) return;
+      // Optimistic by stable identity; OCC rejects a stale duplicate answer.
+      setAttentionItems((current) => current.filter((candidate) => candidate.id !== item.id));
+      setNeeds((current) => current.filter((candidate) => candidate.id !== item.id));
+      try {
+        await api.answerHumanRequest(
+          workspaceId,
+          item.request_id,
+          Number(item.revision),
+          text.trim(),
+        );
+      } finally {
+        await refreshNeeds();
+      }
     },
     [refreshNeeds],
   );
 
-  const retryPrTracking = useCallback(async (item: NeedItem) => {
-    // No optimistic removal: the backend monitor only retracts/replaces this
-    // notice on its NEXT sweep tick (up to `WEFT_PR_SWEEP_SECS`, default 60s)
-    // once it re-checks the row — not synchronously with this call — so the
-    // card staying put for a moment is correct, not a bug. A toast confirms
-    // the click actually did something in the meantime.
+  const retryPrTracking = useCallback(async (item: PrTrackingRetryAttentionItem) => {
+    const workspaceId = activeWorkspaceIdRef.current;
+    if (workspaceId == null) return;
     try {
-      const resetCount = await api.retryPrTracking(item.direction_id);
-      // One condition drives both the copy and the tone, decided once rather
-      // than re-checked per property (CLAUDE.md's single-discriminant rule).
-      const view =
-        resetCount > 0
-          ? { key: "needs.retryTrackingStarted", tone: "success" as const }
-          : { key: "needs.retryTrackingNothingToRetry", tone: "warning" as const };
-      toast(i18n.t(view.key), view.tone);
+      await api.retryPrTracking(workspaceId, item.pr_id, item.failure_episode);
+      setAttentionItems((current) => current.filter((candidate) => candidate.id !== item.id));
+      toast(i18n.t("needs.retryTrackingStarted"), "success");
+      await refreshNeeds();
     } catch (err) {
       console.error(err);
       toast(i18n.t("needs.retryTrackingFailed"), "danger");
     }
-  }, []);
-
-  const approveWriteTrigger = useCallback(
-    async (item: WriteTrigger, tool?: string) => {
-      // Flush any in-flight base-branch save first. If it REJECTED (re-propose moved
-      // the lane, or a DB error), the backend still holds the old base — refresh the
-      // active proposal and abort rather than approving from a stale base. Mirrors
-      // confirmProposal. Consume the promise so a retry isn't blocked.
-      const pending = pendingBaseSave.current.get(item.thread_id) ?? Promise.resolve();
-      pendingBaseSave.current.delete(item.thread_id);
-      try {
-        await pending;
-      } catch (e) {
-        // handled by the latch below
-      console.error(e);
-    }
-      // Also abort if any EARLIER link in the chain failed — the chain's
-      // `.catch(() => {})` swallows predecessors for serialization, so the final
-      // promise may resolve even when a prior save rejected.
-      if ((baseSaveFailed.current.get(item.thread_id)?.size ?? 0) > 0) {
-        baseSaveFailed.current.delete(item.thread_id);
-        // A rejected base save can mean a re-proposal changed the lane indices, so this
-        // card's item.index is now stale. Refresh the Needs cards (dropping the stale
-        // one) as well as the proposal before aborting — otherwise a second click on the
-        // stale card would approve/dispatch the WRONG lane once the latch is cleared.
-        await refreshNeeds();
-        if (activeThreadId != null) await refreshProposal(activeThreadId);
-        return;
-      }
-      setWriteTriggers((cur) =>
-        cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
-      );
-      try {
-        const dirId = await api.approveWriteTrigger(item.thread_id, item.index, tool);
-        void dispatchDirection(dirId);
-      } finally {
-        await refreshNeeds();
-      }
-    },
-    [dispatchDirection, refreshNeeds, activeThreadId, refreshProposal],
-  );
-
-  const denyWriteTrigger = useCallback(
-    async (item: WriteTrigger) => {
-      // Flush any in-flight base-branch save for this thread FIRST: a blur-save still
-      // writing the proposal can otherwise land AFTER deny_direction and restore the
-      // lane's decision:"" — making the denied write reappear as pending. Mirrors the
-      // flush in confirmProposal/approveWriteTrigger.
-      const pending = pendingBaseSave.current.get(item.thread_id) ?? Promise.resolve();
-      pendingBaseSave.current.delete(item.thread_id);
-      try {
-        await pending;
-      } catch (e) {
-        // handled by the latch check below
-      console.error(e);
-    }
-      // If that save REJECTED, a re-proposal may have moved/replaced the lanes (the
-      // server-side base setter rejects when item.index's lane was replaced), so
-      // item.index is no longer trustworthy — denying by it could deny the WRONG lane.
-      // Abort and refresh to the real state instead of denying a stale index.
-      if ((baseSaveFailed.current.get(item.thread_id)?.size ?? 0) > 0) {
-        baseSaveFailed.current.delete(item.thread_id);
-        await refreshNeeds();
-        return;
-      }
-      setWriteTriggers((cur) =>
-        cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
-      );
-      try {
-        await api.denyWriteTrigger(item.thread_id, item.index);
-      } finally {
-        await refreshNeeds();
-      }
-    },
-    [refreshNeeds],
-  );
+  }, [refreshNeeds]);
 
   const answerPermission = useCallback(
     async (askId: number, answer: "allow" | "deny" | "always" | "full") => {
       // optimistic: drop the card immediately, then unblock the tool
       setAsks((cur) => cur.filter((a) => a.id !== askId));
+      setAttentionItems((current) =>
+        current.filter((item) => item.kind !== "permission" || item.ask.id !== askId),
+      );
       // Per-day nudge: granting broad access (always / full) without Dangerous
       // mode → once a day, suggest turning it on.
       if ((answer === "always" || answer === "full") && !dangerousMode) {
@@ -3313,6 +3230,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // never touched here or there.
   const releaseSessionReadOnly = useCallback(async (thread: number, dir: string) => {
     setAsks((cur) => cur.filter((a) => !(a.thread === thread && a.dir === dir && a.risk === "read_only")));
+    setAttentionItems((current) =>
+      current.filter(
+        (item) =>
+          item.kind !== "permission" ||
+          item.ask.thread !== thread ||
+          item.ask.dir !== dir ||
+          item.ask.risk !== "read_only",
+      ),
+    );
     try {
       const n = await api.releaseSessionReadOnly(thread, dir);
       if (n > 0) toast(i18n.t("grants.readOnlyReleased", { count: n }));
@@ -3321,11 +3247,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
     try {
       setReadOnlyGrants(await api.readOnlyGrants());
-      setAsks(await api.pendingAsks());
+      await refreshNeeds();
     } catch (e) {
       console.error(e);
     }
-  }, []);
+  }, [refreshNeeds]);
 
   const revokeReadOnlyGrant = useCallback(async (thread: number, dir: string | null) => {
     // optimistic: drop the matching scope locally so the indicator clears at once
@@ -3396,7 +3322,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 
   const goToAsk = useCallback(
-    (item: NeedItem) => goToDirectionRef(item.thread_id, String(item.direction_id)),
+    (item: QuestionAttentionItem) => goToDirectionRef(item.thread_id, String(item.direction_id)),
     [goToDirectionRef],
   );
 
@@ -3429,7 +3355,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // makes new questions appear near-instantly.
   useEffect(() => {
     if (activeWorkspaceId == null) {
+      setAttentionItems([]);
       setNeeds([]);
+      setAsks([]);
       return;
     }
     let alive = true;
@@ -3673,12 +3601,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setDangerousMode,
     dangerNudge,
     setDangerNudge,
-    idleCapMins,
-    wallCapMins,
-    setGuardrails,
     processQuota,
     refreshProcessQuota,
     notificationHydration,
+    attentionItems,
     needs,
     asks,
     authGrants,
@@ -3686,9 +3612,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     readOnlyGrants,
     releaseSessionReadOnly,
     revokeReadOnlyGrant,
-    writeTriggers,
-    approveWriteTrigger,
-    denyWriteTrigger,
     needsByWorkspace,
     showNeeds,
     openNeeds,

@@ -44,7 +44,7 @@ type Translate = (key: string, opts?: Record<string, unknown>) => string;
 
 export function useRepoActions() {
   const { t } = useTranslation();
-  const { activeWorkspaceId, refreshReposAndMap } = useStore();
+  const { activeWorkspaceId, refreshReposAndMap, refreshNeeds } = useStore();
   const [busy, setBusy] = useState<Record<string, boolean>>({});
 
   const setBusyFor = useCallback((id: string, v: boolean) => {
@@ -105,6 +105,11 @@ export function useRepoActions() {
           } catch {
             // The repo is already registered; a later workspace refresh will recover.
           }
+          try {
+            await refreshNeeds();
+          } catch {
+            // The canonical queue also polls; a later refresh removes the settled card.
+          }
         } else if (result.status === "error") {
           toast(t("repoActions.failedToast", { message: result.message }));
         }
@@ -113,7 +118,7 @@ export function useRepoActions() {
         setBusyFor(inv.actionId, false);
       }
     },
-    [maybePost, refreshReposAndMap, resolveWorkspaceId, setBusyFor, t],
+    [maybePost, refreshNeeds, refreshReposAndMap, resolveWorkspaceId, setBusyFor, t],
   );
 
   return { run, busy };

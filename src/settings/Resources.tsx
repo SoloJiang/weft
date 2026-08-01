@@ -463,7 +463,7 @@ function ProcessTree({
   );
 }
 
-// ── 内存:Weft owned 子树的常驻内存合计(无危险配色——watchdog 未对内存分级) ────
+// ── 内存:Weft owned 子树的常驻内存合计 ────
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;

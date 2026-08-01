@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type {
   BackupStatusDto,
+  AttentionSnapshot,
   BusMsg,
   ConfigItem,
   DefaultToolInfo,
@@ -14,10 +15,8 @@ import type {
   LeadMessage,
   LeadStateInfo,
   LiveWorkerSlot,
-  NeedItem,
   ObserveRef,
   ParsedSkill,
-  PermissionAsk,
   ProcessQuotaStatus,
   Proposal,
   ReadOnlyGrants,
@@ -41,7 +40,6 @@ import type {
   Worktree,
   WorktreeDiff,
   TargetDiff,
-  WriteTrigger,
 } from "./types";
 
 // Tauri converts camelCase command args to snake_case Rust params.
@@ -259,10 +257,7 @@ export const api = {
   busPostHuman: (threadId: number, to: string | null, text: string) =>
     invoke<void>("bus_post_human", { threadId, to, text }),
 
-  // Ask Bridge: pending tool permission requests + the answer.
-  pendingAsks: () => invoke<PermissionAsk[]>("pending_asks"),
-  workspaceNeedsCounts: () =>
-    invoke<[number, number][]>("workspace_needs_counts"),
+  // Ask Bridge: answer a permission projected by AttentionSnapshot.
   answerPermission: (askId: number, answer: "allow" | "deny" | "always" | "full") =>
     invoke<void>("answer_permission", { askId, answer }),
   // Standing authorization grants (full / always) that persist across restarts —
@@ -288,26 +283,16 @@ export const api = {
   revokeReadOnlyGrant: (thread: number, dir: string | null) =>
     invoke<void>("revoke_read_only_grant", { thread, dir }),
 
-  // Needs-you: open agent→human questions, aggregated across the workspace.
-  needsYou: (workspaceId: number) =>
-    invoke<NeedItem[]>("needs_you", { workspaceId }),
-  answerAsk: (threadId: number, askId: number, text: string) =>
-    invoke<void>("answer_ask", { threadId, askId, text }),
-  // The Needs-you "retry" action for the one notice that doesn't clear itself
-  // (a PR/MR the monitor gave up on): resets that direction's tracked PR/MR
-  // probe-failure streak(s), same effect as the agent re-calling `register_pr`.
-  // Resolves to how many rows were reset (0 = nothing to retry, not an error).
-  retryPrTracking: (directionId: number) =>
-    invoke<number>("retry_pr_tracking", { directionId }),
-
-  // Write triggers: lead-proposed repo writes awaiting human approve/deny.
-  writeTriggers: (workspaceId: number) =>
-    invoke<WriteTrigger[]>("write_triggers", { workspaceId }),
-  approveWriteTrigger: (threadId: number, index: number, tool?: string) =>
-    invoke<number>("approve_write_trigger", { threadId, index, tool: tool ?? null }),
-  denyWriteTrigger: (threadId: number, index: number) =>
-    invoke<void>("deny_write_trigger", { threadId, index }),
-
+  attentionItems: (workspaceId: number) =>
+    invoke<AttentionSnapshot>("attention_items", { workspaceId }),
+  answerHumanRequest: (
+    workspaceId: number,
+    requestId: number,
+    revision: number,
+    text: string,
+  ) => invoke<void>("answer_human_request", { workspaceId, requestId, revision, text }),
+  retryPrTracking: (workspaceId: number, prId: number, failureEpisode: string) =>
+    invoke<void>("retry_pr_tracking", { workspaceId, prId, failureEpisode }),
   // Inspect escape hatches (§4.7): real ways into the hidden plumbing.
   /** Open a real filesystem path verbatim (no chat-token / `:line` stripping). */
   openFile: (path: string) => invoke<void>("open_file", { path }),
@@ -356,10 +341,6 @@ export const api = {
   setDangerousMode: (on: boolean) => invoke<void>("set_dangerous_mode", { on }),
   // Keep-awake: prevent system idle sleep while any session is running.
   setKeepAwake: (on: boolean) => invoke<void>("set_keep_awake", { on }),
-  // Runaway guardrails: idle + wall-clock caps (seconds; 0 disables) for
-  // force-stopping a stuck/runaway agent (enforcement pending on the engine).
-  setGuardrails: (idleSecs: number, wallSecs: number) =>
-    invoke<void>("set_guardrails", { idleSecs, wallSecs }),
   processQuotaStatus: () => invoke<ProcessQuotaStatus>("process_quota_status"),
   // Desktop OS notifications via user-notify (click deep-link capable).
   osNotifyPermission: () => invoke<string>("os_notify_permission"),
@@ -371,6 +352,7 @@ export const api = {
     repoId?: number | null;
     sessionId?: number | null;
     askId?: number | null;
+    attentionId?: string | null;
     workspaceId?: number | null;
     openNeeds?: boolean | null;
     openCurator?: boolean | null;
@@ -383,6 +365,7 @@ export const api = {
       repoId?: number | null;
       sessionId?: number | null;
       askId?: number | null;
+      attentionId?: string | null;
       workspaceId?: number | null;
       openNeeds?: boolean | null;
       openCurator?: boolean | null;
@@ -394,6 +377,7 @@ export const api = {
     repoId?: number | null;
     sessionId?: number | null;
     askId?: number | null;
+    attentionId?: string | null;
     workspaceId?: number | null;
     openNeeds?: boolean | null;
     openCurator?: boolean | null;
@@ -407,6 +391,7 @@ export const api = {
     repoId?: number | null;
     sessionId?: number | null;
     askId?: number | null;
+    attentionId?: string | null;
     workspaceId?: number | null;
     openNeeds?: boolean | null;
     openCurator?: boolean | null;

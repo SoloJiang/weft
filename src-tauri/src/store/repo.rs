@@ -1,15 +1,16 @@
 //! All DB reads/writes go through here. Keeps SeaORM specifics out of commands.
 
 use super::entities::{
-    app_setting, code_checkpoint, direction, im_route, lead_message, plan, pull_request,
-    repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread, workspace,
-    worktree,
+    app_setting, code_checkpoint, direction, human_request, im_route, lead_message, plan,
+    pull_request, repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread,
+    workspace, worktree,
 };
 use super::Db;
 use crate::slug::unique_slug;
 use anyhow::Result;
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set,
+    sea_query::Expr, ActiveModelTrait, ColumnTrait, EntityTrait, NotSet, QueryFilter, QueryOrder,
+    QuerySelect, Set,
     TryIntoModel,
 };
 use std::collections::HashMap;
@@ -26,17 +27,187 @@ pub struct InitialDirectionRoutePin {
     pub tool: String,
 }
 
+/// Create one durable free-text question and supersede older open questions
+/// from the exact same bus scope. Returns the new row plus superseded ids so
+/// the in-memory bus/IM mirrors can close their old cards.
+pub async fn create_human_request(
+    db: &Db,
+    workspace_id: i32,
+    thread_id: i32,
+    direction_scope: &str,
+    direction_id: i32,
+    turn_id: i32,
+    question: &str,
+) -> Result<(human_request::Model, Vec<i32>)> {
+    use sea_orm::TransactionTrait;
+
+    if question.trim().is_empty() {
+        anyhow::bail!("human question cannot be empty");
+    }
+    let thread = get_thread(db, thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
+    if thread.workspace_id != workspace_id {
+        anyhow::bail!("thread {thread_id} does not belong to workspace {workspace_id}");
+    }
+    if direction_id == 0 {
+        if !matches!(direction_scope, "" | "lead") {
+            anyhow::bail!("invalid lead question scope '{direction_scope}'");
+        }
+    } else {
+        let direction = get_direction(db, direction_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
+        if direction.thread_id != thread_id || direction_scope != direction_id.to_string() {
+            anyhow::bail!(
+                "direction {direction_id} does not match thread {thread_id} and scope '{direction_scope}'"
+            );
+        }
+    }
+
+    let txn = db.0.begin().await?;
+    let superseded: Vec<i32> = human_request::Entity::find()
+        .select_only()
+        .column(human_request::Column::Id)
+        .filter(human_request::Column::ThreadId.eq(thread_id))
+        .filter(human_request::Column::DirectionScope.eq(direction_scope))
+        .filter(human_request::Column::Status.eq("open"))
+        .into_tuple()
+        .all(&txn)
+        .await?;
+    if !superseded.is_empty() {
+        human_request::Entity::update_many()
+            .col_expr(human_request::Column::Status, Expr::value("superseded"))
+            .col_expr(
+                human_request::Column::Revision,
+                Expr::col(human_request::Column::Revision).add(1),
+            )
+            .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
+            .filter(human_request::Column::Id.is_in(superseded.clone()))
+            .filter(human_request::Column::Status.eq("open"))
+            .exec(&txn)
+            .await?;
+    }
+    let stamp = now();
+    let inserted = human_request::ActiveModel {
+        id: NotSet,
+        workspace_id: Set(workspace_id),
+        thread_id: Set(thread_id),
+        direction_id: Set(direction_id),
+        direction_scope: Set(direction_scope.to_string()),
+        turn_id: Set(turn_id),
+        question: Set(question.trim().to_string()),
+        status: Set("open".to_string()),
+        answer: Set(String::new()),
+        revision: Set(1),
+        created_at: Set(stamp.clone()),
+        updated_at: Set(stamp),
+    }
+    .insert(&txn)
+    .await?;
+    txn.commit().await?;
+    Ok((inserted, superseded))
+}
+
+pub async fn list_open_human_requests(
+    db: &Db,
+    workspace_id: i32,
+) -> Result<Vec<human_request::Model>> {
+    Ok(human_request::Entity::find()
+        .filter(human_request::Column::WorkspaceId.eq(workspace_id))
+        .filter(human_request::Column::Status.eq("open"))
+        .order_by_asc(human_request::Column::CreatedAt)
+        .order_by_asc(human_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn list_all_open_human_requests(db: &Db) -> Result<Vec<human_request::Model>> {
+    Ok(human_request::Entity::find()
+        .filter(human_request::Column::Status.eq("open"))
+        .order_by_asc(human_request::Column::CreatedAt)
+        .order_by_asc(human_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn get_human_request(
+    db: &Db,
+    request_id: i32,
+) -> Result<Option<human_request::Model>> {
+    Ok(human_request::Entity::find_by_id(request_id).one(&db.0).await?)
+}
+
+/// OCC transition for an answer. `None` means stale, wrong workspace, or no
+/// longer open; no bus message should be delivered in that case.
+pub async fn answer_human_request(
+    db: &Db,
+    workspace_id: i32,
+    request_id: i32,
+    expected_revision: i32,
+    answer: &str,
+) -> Result<Option<human_request::Model>> {
+    if answer.trim().is_empty() {
+        anyhow::bail!("human answer cannot be empty");
+    }
+    let updated = human_request::Entity::update_many()
+        .col_expr(human_request::Column::Status, Expr::value("resolved"))
+        .col_expr(human_request::Column::Answer, Expr::value(answer.trim()))
+        .col_expr(
+            human_request::Column::Revision,
+            Expr::col(human_request::Column::Revision).add(1),
+        )
+        .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
+        .filter(human_request::Column::Id.eq(request_id))
+        .filter(human_request::Column::WorkspaceId.eq(workspace_id))
+        .filter(human_request::Column::Status.eq("open"))
+        .filter(human_request::Column::Revision.eq(expected_revision))
+        .exec(&db.0)
+        .await?;
+    if updated.rows_affected == 0 {
+        return Ok(None);
+    }
+    Ok(human_request::Entity::find_by_id(request_id).one(&db.0).await?)
+}
+
+pub async fn cancel_open_human_requests_for_thread(db: &Db, thread_id: i32) -> Result<u64> {
+    let updated = human_request::Entity::update_many()
+        .col_expr(human_request::Column::Status, Expr::value("cancelled"))
+        .col_expr(
+            human_request::Column::Revision,
+            Expr::col(human_request::Column::Revision).add(1),
+        )
+        .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
+        .filter(human_request::Column::ThreadId.eq(thread_id))
+        .filter(human_request::Column::Status.eq("open"))
+        .exec(&db.0)
+        .await?;
+    Ok(updated.rows_affected)
+}
+
+pub async fn cancel_open_human_requests_for_direction(
+    db: &Db,
+    direction_id: i32,
+) -> Result<u64> {
+    let updated = human_request::Entity::update_many()
+        .col_expr(human_request::Column::Status, Expr::value("cancelled"))
+        .col_expr(
+            human_request::Column::Revision,
+            Expr::col(human_request::Column::Revision).add(1),
+        )
+        .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
+        .filter(human_request::Column::DirectionId.eq(direction_id))
+        .filter(human_request::Column::Status.eq("open"))
+        .exec(&db.0)
+        .await?;
+    Ok(updated.rows_affected)
+}
+
 /// Test-only DB-write failure injection.
 ///
-/// Why it exists: several already-shipped degradation paths differ from their
-/// happy path ONLY when a single store write fails while the writes around it
-/// succeed. `lead_chat::engine::recover_from_freeze`'s marker-gated native-id
-/// clear (issue #93, PR #133) is the canonical one — and a mutation run proved
-/// the entire suite stayed green with that gate deleted, because nothing in this
-/// crate could make one chosen write fail on demand. The alternative, faking the
-/// post-failure DB rows by hand, is worse than no test at all: it asserts a
-/// shape production may never produce (a lesson this repo has already paid for).
-/// This makes the REAL write return a REAL `Err`.
+/// Why it exists: several degradation paths differ from their happy path only
+/// when one store write fails while neighboring writes succeed. This makes the
+/// real selected write return a real `Err` without fabricating impossible rows.
 ///
 /// Boundary — why it cannot leak into production:
 ///   * The module is `#[cfg(test)]`, so it exists only while this crate is
@@ -112,6 +283,17 @@ fn now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("{secs}")
+}
+
+/// Fractional unix seconds for PR failure episodes. Unlike the general row
+/// timestamp, this must distinguish a retry followed by another immediate
+/// failure streak in the same second so the new Retry action gets a new stable
+/// identity.
+fn now_precise() -> String {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos())
 }
 
 /// Unix-secs as string, for skill_source.last_synced.
@@ -748,10 +930,8 @@ macro_rules! probe_after_first_statement {
 /// clears `lead_command`: a per-tool alias pin (e.g. `claude` → `cc-claude`)
 /// is meaningless once `lead_tool` names a DIFFERENT tool identity, and
 /// carrying it forward would silently try to spawn the old alias as the new
-/// tool's binary. Does NOT touch `native_id` or any live in-memory engine —
-/// the caller (lead_chat::commands::switch_lead_tool) owns that half of the
-/// switch (tear down the live engine, clear native id, reconstruct fresh) so
-/// this stays a plain, independently-testable field update. No-op fields
+/// tool's binary. The tool/model/command/native-id update is atomic; the caller
+/// owns live engine teardown and reconstruction. No-op fields
 /// (same tool, same model) still write through — callers may use this to
 /// force-reload an engine so an externally-edited CLI config takes effect.
 pub async fn switch_lead_engine_txn(
@@ -825,14 +1005,6 @@ pub async fn switch_lead_engine_txn_with_pin(
             ma.update(&txn).await?;
         }
     }
-    // …and the grace marker is written in the SAME commit. This is the whole
-    // fix: "the native id is gone" and "there is evidence this surface ran"
-    // are two halves of one invariant (`revive::has_resumable_context`), and a
-    // transaction is what makes them unable to disagree. Everything else this
-    // PR tried — stamping first and gating, retracting on failure, a pending
-    // kind promoted later — existed only to make an EARLIER stamp safe, and
-    // none of it is needed once the two writes are atomic.
-    insert_marker_row(&txn, thread_id, None, MARKER_KIND_RECOVERED).await?;
     txn.commit().await?;
     Ok(())
 }
@@ -1437,6 +1609,7 @@ pub async fn list_directions(db: &Db, thread_id: i32) -> Result<Vec<direction::M
 /// Delete a direction row (and any worktree rows referencing it). Used to roll back
 /// a half-created direction when materialize fails, so a corrected retry starts clean.
 pub async fn delete_direction(db: &Db, direction_id: i32) -> Result<()> {
+    cancel_open_human_requests_for_direction(db, direction_id).await?;
     worktree::Entity::delete_many()
         .filter(worktree::Column::DirectionId.eq(direction_id))
         .exec(&db.0)
@@ -1876,12 +2049,6 @@ pub async fn switch_worker_engine_txn_with_pin(
         anyhow::bail!("direction {direction_id} not found");
     }
     probe_after_first_statement!();
-    let thread_id = direction::Entity::find_by_id(direction_id)
-        .one(&txn)
-        .await?
-        .map(|d| d.thread_id)
-        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} vanished mid-transaction"))?;
-
     if let Some(s) = session::Entity::find_by_id(session_id).one(&txn).await? {
         let mut sa: session::ActiveModel = s.into();
         sa.tool = Set(tool.to_string());
@@ -1897,8 +2064,6 @@ pub async fn switch_worker_engine_txn_with_pin(
         sa.native_session_id = Set(None);
         sa.update(&txn).await?;
     }
-    // Same commit as the writes above — see the lead twin.
-    insert_marker_row(&txn, thread_id, Some(session_id), MARKER_KIND_RECOVERED).await?;
     txn.commit().await?;
     Ok(())
 }
@@ -2494,157 +2659,6 @@ pub async fn set_session_native_id_opt(
         a.update(&db.0).await?;
     }
     Ok(())
-}
-
-/// Stamp a (thread, session) as having just gone through the turn-freeze
-/// auto-recovery (issue #93): an invisible timeline marker row (`kind`
-/// excluded from the frontend's text/tool timeline allowlist, same as
-/// `"meta"`). `session_id = None` for the lead. Uses the SAME
-/// deletion-fenced insert as the rest of the timeline (`insert_lead_message`),
-/// so a thread deleted mid-recovery can't leave an orphaned row.
-///
-/// This row IS the issue #116 coordination point: its `created_at`, read back
-/// via [`last_turn_freeze_recovery_secs`], is what
-/// `lead_chat::revive::freeze_recovery_state` consults to withhold a
-/// just-self-healed lead/worker from the idle re-drive for one grace window,
-/// rather than racing this recovery straight back into the same wedge.
-///
-/// History, because the shape here only makes sense with it (review round 4,
-/// P2): #116 originally landed WITHOUT that consult — `revive.rs` never read
-/// this marker, and the getter had no caller outside this file's own
-/// round-trip test. What kept the re-drive off a just-recovered direction in
-/// the meantime was an unrelated SIDE EFFECT: `recover_from_freeze` also
-/// clears the session's `native_session_id` (see `set_session_native_id_opt` /
-/// `set_lead_native_id_opt`), and `revive::stalled_direction_ids` only selects
-/// a direction whose `native_session_id.is_some()`. Real protection, but
-/// accidental — it depended entirely on THAT field staying cleared at THAT
-/// moment, and would have vanished silently under a refactor that stopped
-/// clearing it, or a re-drive path that stopped gating on it. The grace window
-/// no longer RIDES on that: it reads this marker directly, and has tests that
-/// go red if the read is removed.
-///
-/// The native-id clear is still there, but it is NOT a second guard — `revive`
-/// deliberately stopped treating a missing native id as "not selectable",
-/// because that is what made a freeze-recovered session invisible to the
-/// re-drive forever instead of for one window. The dependency now runs the
-/// other way: `recover_from_freeze` clears the id ONLY if this row was
-/// stamped, since this row is the sole evidence separating "never ran" from
-/// "ran, and the recovery cleared its id" (`revive::has_resumable_context`).
-/// Clearing after a failed stamp would erase that evidence and strand the
-/// session permanently.
-///
-/// Reused (not just freeze recovery) by `lead_chat::commands::{switch_lead_tool,
-/// switch_worker_tool}` (issue #96/#98, adversarial re-review of PR #139, P2):
-/// a deliberate engine/model switch also clears the native id and lands the
-/// engine at idle, which is the EXACT shape `revive`'s stall sweep looks for —
-/// without this stamp, a thread/session that had EVER gone through a genuine
-/// freeze-recovery at any point in its (possibly much older) history would
-/// read `has_resumable_context() == true` from that stale marker alone once
-/// its OWN grace window had long since elapsed, letting the very next sweep
-/// tick (every 60s) auto-redrive the freshly-switched, not-yet-human-verified
-/// engine into a "resume stalled work" prompt — a false positive with no
-/// connection to the switch that just happened. Calling this on a switch too
-/// re-stamps the grace window with the CURRENT time, so `revive`'s existing
-/// (unmodified) cooldown check holds off exactly the way it already does
-/// after a real freeze recovery. The name stays freeze-scoped (renaming would
-/// touch `recover_from_freeze`'s established call site for no behavioral
-/// gain); read it as "the native context was deliberately reset and the next
-/// automated re-drive should back off for one grace window", of which a
-/// self-healed freeze is one cause and a human-initiated switch is another.
-///
-/// The switch path gates on this row the same way `recover_from_freeze` does,
-/// only harder: `lead_chat::commands::persist_switch` stamps it FIRST and
-/// aborts the entire switch if it fails, because a switch cannot fall back on
-/// "skip the clear and let it stall again" — by then the id belongs to an
-/// engine the thread no longer runs. Both writers therefore honour the same
-/// contract: this row exists before the native id is allowed to go missing.
-/// The grace marker's kind. Written by a freeze auto-recovery
-/// ([`mark_turn_freeze_recovered`]) and by an engine/model switch — the latter
-/// from inside its own transaction, so the row and the native-id clear it
-/// vouches for commit together.
-pub const MARKER_KIND_RECOVERED: &str = "turn_freeze_recovered";
-/// One grace-marker row, deletion-fenced like every other timeline insert.
-/// Generic over the connection so the switch transactions can use it
-/// inside the switch's transaction.
-async fn insert_marker_row<C: sea_orm::ConnectionTrait>(
-    conn: &C,
-    thread_id: i32,
-    session_id: Option<i32>,
-    kind: &str,
-) -> Result<i32> {
-    let res = conn
-        .execute(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "INSERT INTO lead_message \
-             (thread_id, session_id, turn_id, role, kind, content, status, created_at) \
-             SELECT ?, ?, 0, 'system', ?, '{}', 'complete', ? \
-             WHERE EXISTS (SELECT 1 FROM thread WHERE id = ?)",
-            [
-                thread_id.into(),
-                session_id.into(),
-                kind.into(),
-                now().into(),
-                thread_id.into(),
-            ],
-        ))
-        .await?;
-    if res.rows_affected() == 0 {
-        anyhow::bail!("thread {thread_id} no longer exists (deleted)");
-    }
-    i32::try_from(res.last_insert_id()).map_err(|_| anyhow::anyhow!("marker id out of i32 range"))
-}
-
-pub async fn mark_turn_freeze_recovered(
-    db: &Db,
-    thread_id: i32,
-    session_id: Option<i32>,
-) -> Result<()> {
-    // Seam point: the failure this write's CALLERS must degrade correctly for
-    // (`engine::stamp_freeze_marker` → the gated native-id clear) has no other
-    // way to be reached from a test. See `fail_write`'s doc for the boundary.
-    fail_write!("mark_turn_freeze_recovered");
-    insert_lead_message(
-        db,
-        thread_id,
-        session_id,
-        0,
-        "system",
-        MARKER_KIND_RECOVERED,
-        "{}",
-        "complete",
-    )
-    .await?;
-    Ok(())
-}
-
-/// The most recent turn-freeze auto-recovery for a (thread, session), as
-/// unix-seconds (same clock as `now()`/`created_at`) — the read side of
-/// [`mark_turn_freeze_recovered`]. `None` if it never happened (the common
-/// case) or the stamp fails to parse (defensive — never panics on a bad row).
-pub async fn last_turn_freeze_recovery_secs(
-    db: &Db,
-    thread_id: i32,
-    session_id: Option<i32>,
-) -> Result<Option<u64>> {
-    last_marker_secs(db, thread_id, session_id, MARKER_KIND_RECOVERED).await
-}
-
-/// Newest marker of one kind for a (thread, session), as unix-seconds.
-async fn last_marker_secs(
-    db: &Db,
-    thread_id: i32,
-    session_id: Option<i32>,
-    kind: &str,
-) -> Result<Option<u64>> {
-    let q = lead_message::Entity::find()
-        .filter(lead_message::Column::ThreadId.eq(thread_id))
-        .filter(lead_message::Column::Kind.eq(kind))
-        .order_by_desc(lead_message::Column::Id);
-    let q = match session_id {
-        Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
-        None => q.filter(lead_message::Column::SessionId.is_null()),
-    };
-    Ok(q.one(&db.0).await?.and_then(|m| m.created_at.parse().ok()))
 }
 
 /// Set a worker session's activity status directly. Unlike
@@ -4206,6 +4220,27 @@ pub async fn list_pull_requests_for_direction(
         .await?)
 }
 
+pub async fn list_pull_requests_for_workspace(
+    db: &Db,
+    workspace_id: i32,
+) -> Result<Vec<pull_request::Model>> {
+    let thread_ids: Vec<i32> = thread::Entity::find()
+        .select_only()
+        .column(thread::Column::Id)
+        .filter(thread::Column::WorkspaceId.eq(workspace_id))
+        .into_tuple()
+        .all(&db.0)
+        .await?;
+    if thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(pull_request::Entity::find()
+        .filter(pull_request::Column::ThreadId.is_in(thread_ids))
+        .order_by_asc(pull_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
 /// Register a newly-opened PR/MR, or refresh an already-tracked one's context
 /// (thread/direction/repo can legitimately change across a re-registration —
 /// e.g. a direction's PR reopened under a new task after a rebase-and-reopen).
@@ -4304,22 +4339,17 @@ pub async fn apply_pull_request_snapshot(
     Ok(())
 }
 
-/// Record a failed probe attempt without touching the last known snapshot,
-/// and bump the consecutive-failure streak (`list_open_pull_requests` stops
-/// sweeping the row once this reaches the caller's give-up threshold).
-/// Returns the NEW streak count (`None` if the row is gone) so the caller can
-/// tell whether THIS attempt is the one that just crossed the threshold — the
-/// monitor uses that to give the row's Needs-you notice honestly different
-/// wording ("stopped checking, here's how to resume") instead of repeating
-/// the same transient-failure text forever after tracking has actually
-/// stopped.
+/// Record a failed probe attempt without touching the last known snapshot and
+/// bump the consecutive-failure streak. `last_checked_at` is a precise,
+/// opaque failure-episode token here; after the threshold the canonical
+/// attention projection uses it for one OCC-scoped Retry action.
 pub async fn mark_pull_request_probe_error(db: &Db, id: i32, message: &str) -> Result<Option<i32>> {
     let Some(row) = pull_request::Entity::find_by_id(id).one(&db.0).await? else {
         return Ok(None);
     };
     let next_fail_count = row.probe_fail_count.saturating_add(1);
     let mut a: pull_request::ActiveModel = row.into();
-    a.last_checked_at = Set(now());
+    a.last_checked_at = Set(now_precise());
     a.last_error = Set(message.to_string());
     a.probe_fail_count = Set(next_fail_count);
     a.update(&db.0).await?;
@@ -4361,77 +4391,6 @@ mod tests {
                 .await
                 .unwrap();
         (ws, repo, thread, direction)
-    }
-
-    // ---- the test-only write-failure seam's own contract ----
-
-    /// The property every caller of [`fail_write`] depends on: arming ONE write
-    /// fails exactly that write and leaves its neighbours alone. Without that
-    /// selectivity the seam could not reproduce the situation the gated
-    /// degradation paths exist for — "this write failed, the ones around it
-    /// succeeded" — it would just look like a dead database.
-    #[tokio::test]
-    async fn fail_write_only_fails_the_armed_write() {
-        let db = mem().await;
-        let thread_id = live_thread(&db).await;
-
-        fail_write::while_failing("mark_turn_freeze_recovered", async {
-            assert!(
-                mark_turn_freeze_recovered(&db, thread_id, None).await.is_err(),
-                "the armed write must fail"
-            );
-            // A neighbour sharing the very same INSERT choke point
-            // (`insert_lead_message`) is untouched — the seam keys on the named
-            // write, not on the statement underneath it.
-            assert!(
-                insert_lead_message(&db, thread_id, None, 1, "assistant", "text", "{}", "complete")
-                    .await
-                    .is_ok(),
-                "an unarmed write through the same choke point must still succeed"
-            );
-            // …and so is the other write the freeze recovery performs around it.
-            assert!(set_lead_native_id_opt(&db, thread_id, None).await.is_ok());
-        })
-        .await;
-    }
-
-    /// Arming is scoped to the task that armed it, and ends with the scope:
-    /// nothing is left armed for the rest of the process (which is what lets
-    /// `cargo test`'s parallel threads arm freely without a serializing lock).
-    #[tokio::test]
-    async fn fail_write_arming_ends_with_its_scope() {
-        let db = mem().await;
-        let thread_id = live_thread(&db).await;
-
-        fail_write::while_failing("mark_turn_freeze_recovered", async {
-            assert!(mark_turn_freeze_recovered(&db, thread_id, None).await.is_err());
-        })
-        .await;
-
-        assert!(
-            mark_turn_freeze_recovered(&db, thread_id, None).await.is_ok(),
-            "outside the scope the same write must behave normally"
-        );
-    }
-
-    /// An armed write fails BEFORE it mutates anything — the seam has to model a
-    /// write that didn't happen, not a half-applied one, or every test built on
-    /// it would be asserting against a state production never reaches.
-    #[tokio::test]
-    async fn fail_write_leaves_no_partial_row() {
-        let db = mem().await;
-        let thread_id = live_thread(&db).await;
-
-        fail_write::while_failing("mark_turn_freeze_recovered", async {
-            let _ = mark_turn_freeze_recovered(&db, thread_id, None).await;
-        })
-        .await;
-
-        assert_eq!(
-            last_turn_freeze_recovery_secs(&db, thread_id, None).await.unwrap(),
-            None,
-            "no marker row may survive an injected failure"
-        );
     }
 
     #[tokio::test]
@@ -7079,7 +7038,6 @@ mod tests {
         let after = get_thread(&a, t.id).await.unwrap().unwrap();
         assert_eq!(after.lead_tool, "codex");
         assert_eq!(after.lead_model.as_deref(), Some("opus"));
-        assert!(last_turn_freeze_recovery_secs(&a, t.id, None).await.unwrap().is_some());
     }
 
     /// PR #140 round 6: the lead's tool/model write and its native-id clear are

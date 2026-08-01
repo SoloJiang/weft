@@ -1944,13 +1944,7 @@ fn switch_failure(surface: &str, interrupted: bool, err: impl std::fmt::Display)
 ///      clears any stale command-alias pin), the native session id
 ///      cleared (dogfooding pitfall #1: a stale native id handed to a
 ///      different engine's `--resume`/`resume` fails fast with "No
-///      conversation found"), and the freeze-recovery grace marker that
-///      vouches for that clear. The marker and the clear are the two halves of
-///      `revive::has_resumable_context`; committing them together is what makes
-///      the defect this fixes impossible rather than merely guarded, and is
-///      why none of the gating/retraction machinery earlier revisions of this
-///      PR carried is present. See `repo::mark_turn_freeze_recovered` for why a
-///      switch writes that marker at all.
+///      conversation found").
 ///   4. reconstruct the engine fresh via `lead_engine` — the exact construction
 ///      path a cold app boot uses (re-injects the ask-hook/MCP servers/
 ///      system-prompt for the NEW tool identity), never a hand-patched partial
@@ -2043,11 +2037,9 @@ async fn switch_lead_tool_inner(
         asks.cancel_for(thread_id, "lead");
     }
 
-    // ONE transaction: the new tool/model, the native-id clear (issue #96
-    // pitfall 1) and the grace marker that vouches for it. The marker and the
-    // clear are the two halves of `revive::has_resumable_context`, and
-    // committing them together is what makes the defect this PR fixes
-    // structurally impossible rather than merely guarded.
+    // ONE transaction: the new tool/model and native-id clear (issue #96
+    // pitfall 1). No activity timestamp or recovery marker participates in
+    // engine switching.
     let pinned = reason.is_none();
     // A fail-over keeps its committing flag in the old engine until the durable
     // route is updated. That prevents a concurrent open from constructing an
@@ -3292,19 +3284,8 @@ mod live_slot_tests {
 /// The engine/model switch's durable write — issue #96/#98, adversarial
 /// re-review of PR #139 (P2).
 ///
-/// The defect: `mark_turn_freeze_recovered` and `clear_native_id` were two
-/// independent writes, so a failed marker write followed by a successful clear
-/// left the surface at `native_id = None && marker = None` — the one
-/// combination `revive::has_resumable_context` reads as "never ran", which
-/// silently drops it out of the automated re-drive pool.
-///
-/// The fix is ONE transaction per axis (`repo::switch_lead_engine_txn` /
-/// `switch_worker_engine_txn`) covering the tool/model change, the native-id
-/// clear and the marker. They commit together or not at all, so the bad
-/// combination cannot be observed. Nine rounds of review went into the
-/// alternatives — stamping early and gating, retracting on failure, a pending
-/// marker kind promoted at commit — and every one of them existed only to make
-/// an EARLIER stamp safe. Atomicity removes the need for all of it.
+/// The engine/model switch's durable transaction covers the tool/model change
+/// and native-id clear. Activity history and legacy freeze markers are ignored.
 ///
 /// SCOPE: these cover the `&Db` core. The `#[tauri::command]` wrappers are out
 /// of reach (this crate has no `AppHandle` harness), so ask cancellation,
@@ -3316,7 +3297,6 @@ mod live_slot_tests {
 /// `store::repo`'s tests, where a failure can be injected between the halves.
 #[cfg(test)]
 mod switch_write_tests {
-    use crate::lead_chat::revive::has_resumable_context;
     use crate::store::{repo, Db};
 
     async fn mem() -> Db {
@@ -3380,7 +3360,7 @@ mod switch_write_tests {
     }
 
     #[tokio::test]
-    async fn a_lead_switch_lands_tool_clear_and_marker_together() {
+    async fn a_lead_switch_lands_tool_and_native_clear_together() {
         let db = mem().await;
         let (th, _dir, _sess) = fixture(&db).await;
 
@@ -3391,20 +3371,17 @@ mod switch_write_tests {
         let t = repo::get_thread(&db, th).await.unwrap().unwrap();
         assert_eq!(t.lead_tool, "codex");
         assert_eq!(t.lead_model.as_deref(), Some("gpt-5.5-high"));
-        let native = repo::lead_native_id(&db, th).await.unwrap();
-        let recovered = repo::last_turn_freeze_recovery_secs(&db, th, None).await.unwrap();
-        assert_eq!(native, None, "issue #96 pitfall 1: the old engine's id must not survive");
-        assert!(recovered.is_some(), "and the marker that vouches for it is in the same commit");
-        assert!(
-            has_resumable_context(native.is_some(), recovered),
-            "id-gone-AND-marker-gone is the silent-strand shape the transaction rules out"
+        assert_eq!(
+            repo::lead_native_id(&db, th).await.unwrap(),
+            None,
+            "issue #96 pitfall 1: the old engine's id must not survive"
         );
     }
 
     #[tokio::test]
-    async fn a_worker_switch_lands_tool_clear_and_marker_together() {
+    async fn a_worker_switch_lands_tool_and_native_clear_together() {
         let db = mem().await;
-        let (th, dir, sess) = fixture(&db).await;
+        let (_th, dir, sess) = fixture(&db).await;
 
         repo::switch_worker_engine_txn(&db, dir, sess, "codex", Some("gpt-5.5-high"))
             .await
@@ -3417,32 +3394,7 @@ mod switch_write_tests {
         let s = repo::get_session(&db, sess).await.unwrap().unwrap();
         assert_eq!(s.tool, "codex");
         assert_eq!(s.model.as_deref(), Some("gpt-5.5-high"));
-        let recovered = repo::last_turn_freeze_recovery_secs(&db, th, Some(sess)).await.unwrap();
         assert_eq!(s.native_session_id, None);
-        assert!(recovered.is_some());
-        assert!(has_resumable_context(s.native_session_id.is_some(), recovered));
-    }
-
-    /// The worker's marker is session-scoped. A worker switch must not stamp
-    /// the LEAD's grace window and mute its independent re-drive.
-    #[tokio::test]
-    async fn a_worker_switch_does_not_stamp_the_leads_window() {
-        let db = mem().await;
-        let (th, dir, sess) = fixture(&db).await;
-
-        repo::switch_worker_engine_txn(&db, dir, sess, "codex", None)
-            .await
-            .unwrap();
-
-        assert!(repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
-            .await
-            .unwrap()
-            .is_some());
-        assert_eq!(
-            repo::last_turn_freeze_recovery_secs(&db, th, None).await.unwrap(),
-            None,
-            "the lead's own marker is a separate row and must stay unstamped"
-        );
     }
 
     /// A failed switch changes nothing — the transaction is the guarantee, and
@@ -3466,11 +3418,6 @@ mod switch_write_tests {
         assert_eq!(
             repo::lead_native_id(&db, th).await.unwrap().as_deref(),
             Some("lead-nat-1")
-        );
-        assert_eq!(
-            repo::last_turn_freeze_recovery_secs(&db, th, None).await.unwrap(),
-            None,
-            "and no marker vouching for a reset that never happened"
         );
     }
 }

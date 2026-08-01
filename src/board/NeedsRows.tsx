@@ -1,177 +1,54 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import {
   AlertTriangle,
   ArrowUpRight,
   Check,
+  ClipboardCheck,
   GitBranch,
-  GitMerge,
+  HelpCircle,
   Layers,
   RefreshCw,
   Send,
-  X,
 } from "lucide-react";
-import type { NeedItem, PermissionAsk, WriteTrigger } from "../lib/types";
+import type {
+  AttentionItem,
+  PermissionAsk,
+  PrTrackingRetryAttentionItem,
+  QuestionAttentionItem,
+} from "../lib/types";
+import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 import { useStore } from "../state/store";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
-import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { PermissionConfirmationCard } from "../components/ConfirmationCard";
-import { routeLabelKey, routeReasonKey, routeToolName } from "../lib/engineRoutingDisplay";
-import { needsRoutingControlOf } from "./needsRoutingControl";
-import { noticeTokenKey } from "../lib/noticeTokens";
-import { ASK_CARD_TONE, ASK_DOT_TONE, NOTICE_FOOTER_VIEW } from "./needsCardView";
-import { dependsOnLabel } from "./dependsOnView";
+import { Dialog, DialogContent } from "../components/ui/Dialog";
+import { useRepoActions } from "../session/useRepoActions";
 
-export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
-  const { approveWriteTrigger, denyWriteTrigger, selectThread, defaultTool, installedTools } =
-    useStore();
-  const { t } = useTranslation();
-  const [busy, setBusy] = useState(false);
-  const [picked, setPicked] = useState<string | null>(null);
-  const routingControl = needsRoutingControlOf({
-    route: item.route,
-    picked,
-    installedTools,
-    defaultTool,
-  });
-  const context = [item.thread_title, item.name].filter(Boolean).join(" · ");
-  const dependsOn = dependsOnLabel(item.depends_on);
+type PromptState = {
+  title: string;
+  placeholder?: string;
+  value: string;
+  resolve: (value: string | null) => void;
+};
 
-  async function act(fn: () => Promise<void>) {
-    if (busy) return;
-    setBusy(true);
-    try {
-      await fn();
-    } finally {
-      setBusy(false);
-    }
+export function AttentionRow({ item }: { item: AttentionItem }) {
+  switch (item.kind) {
+    case "permission":
+      return <PermissionRow ask={item.ask} />;
+    case "question":
+      return <QuestionRow item={item} />;
+    case "plan_approval":
+      return <PlanApprovalRow item={item} />;
+    case "scope_approval":
+      return <ScopeApprovalRow item={item} />;
+    case "repo_action":
+      return <RepoActionRow item={item} />;
+    case "pr_tracking_retry":
+      return <PrRetryRow item={item} />;
   }
-
-  return (
-    <div className="overflow-hidden rounded-[var(--radius-lg)] border border-approval/40 bg-waiting/10">
-      <div className="flex items-center gap-2 px-3.5 pt-3 text-[12px]">
-        <GitBranch size={13} className="shrink-0 text-approval" />
-        <span className="text-ink-faint">{t("needs.wantsToWrite")}</span>
-        <span className="font-mono font-medium text-ink">{item.repo_name}</span>
-        {context && (
-          <button
-            type="button"
-            onClick={() => void selectThread(item.thread_id)}
-            title={t("needs.openDirection")}
-            className="group ml-auto flex min-w-0 items-center gap-1.5 text-ink-faint transition-colors hover:text-ink"
-          >
-            <Layers size={11} className="shrink-0" />
-            <span className="truncate">{context}</span>
-          </button>
-        )}
-      </div>
-      <p className="px-3.5 pb-1 pt-1.5 text-[14px] leading-relaxed text-ink">
-        {item.reason}
-      </p>
-      {routingControl.route && (
-        <div className="flex flex-col gap-0.5 px-3.5 pb-2 text-[11px] text-ink-faint">
-          <span
-            className={cn(
-              "inline-flex items-center gap-1",
-              routingControl.showBlockedStatus && "text-danger",
-            )}
-          >
-            {routingControl.route.tool && (
-              <ToolIcon tool={routingControl.route.tool} size={12} />
-            )}
-            {t(routeLabelKey(routingControl.route), {
-              tool: toolFullName(routeToolName(routingControl.route)),
-            })}
-          </span>
-          <span>{t(routeReasonKey(routingControl.route.reason))}</span>
-          {routingControl.showBlockedStatus && <span>{t("scope.engineRouteBlockedHint")}</span>}
-        </div>
-      )}
-      {(item.base_branch || dependsOn) && (
-        <div className="flex flex-wrap items-center gap-1.5 px-3.5 pb-2">
-          {item.base_branch && (
-            <span
-              title={t("scope.baseBranch")}
-              className="inline-flex items-center gap-1 rounded-full border border-border bg-bg px-2 py-0.5 text-[10.5px] font-mono text-ink-faint"
-            >
-              <GitBranch size={10} />
-              {item.base_branch}
-            </span>
-          )}
-          {dependsOn && (
-            <span
-              title={t("scope.dependsOnHint", { name: dependsOn })}
-              className="inline-flex min-w-0 items-center gap-1 rounded-full border border-border bg-bg px-2 py-0.5 text-[10.5px] text-ink-faint"
-            >
-              <GitMerge size={10} className="shrink-0" />
-              <span className="truncate">{t("scope.dependsOn", { name: dependsOn })}</span>
-            </span>
-          )}
-        </div>
-      )}
-      {/* Issue #103: approving this ALSO propagates a read-only auto-allow to
-          the whole issue (approve_write_trigger → grant_read_only_issue),
-          same as confirming the ScopeReview proposal — reuse its exact
-          disclosure caption so both dispatch-approval entry points are
-          equally upfront about the consequence, not just the batch one. */}
-      <p className="px-3.5 pb-2 text-[11px] leading-snug text-ink-faint">
-        {t("scope.readOnlyPropagationNote")}
-      </p>
-      <div className="flex flex-wrap items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">
-        <Button
-          variant="primary"
-          disabled={busy || routingControl.approvalDisabled}
-          title={
-            routingControl.approvalDisabled
-              ? t("scope.engineRouteBlockedHint")
-              : t("needs.approveRunTitle")
-          }
-          onClick={() => void act(() => approveWriteTrigger(item, routingControl.manualTool))}
-        >
-          <Check size={13} />
-          {t("needs.approveRun")}
-        </Button>
-        {routingControl.pickerVisible && (
-          <div
-            title={t("needs.runWith")}
-            className="inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-bg p-0.5"
-          >
-            {routingControl.pickerOptions.map((tl) => (
-              <button
-                key={tl.tool}
-                type="button"
-                title={toolFullName(tl.tool)}
-                aria-label={toolFullName(tl.tool)}
-                aria-pressed={routingControl.pickerTool === tl.tool}
-                onClick={() => setPicked(tl.tool)}
-                className={cn(
-                  "grid h-6 w-7 place-items-center rounded-[var(--radius-sm)] transition-opacity duration-150",
-                  routingControl.pickerTool === tl.tool
-                    ? "bg-raised"
-                    : "opacity-40 hover:opacity-80",
-                )}
-              >
-                <ToolIcon tool={tl.tool} size={13} />
-              </button>
-            ))}
-          </div>
-        )}
-        <Button
-          variant="ghost"
-          className="ml-auto"
-          disabled={busy}
-          title={t("needs.denyWriteTitle")}
-          onClick={() => void act(() => denyWriteTrigger(item))}
-        >
-          <X size={13} />
-          {t("common.deny")}
-        </Button>
-      </div>
-    </div>
-  );
 }
 
 export function PermissionRow({ ask }: { ask: PermissionAsk }) {
@@ -199,68 +76,18 @@ export function PermissionRow({ ask }: { ask: PermissionAsk }) {
       className="overflow-hidden rounded-[var(--radius-lg)] border-waiting/40 bg-waiting/10 px-3.5 pb-0 pt-3"
       actionsClassName="-mx-3.5 mt-1 self-stretch border-t border-border bg-bg/40 px-3.5 py-2.5"
       context={contextLink}
-      timestamp={
-        <span className="ml-auto whitespace-nowrap text-ink-faint tabular-nums">
-          {ago(ask.ts, t)}
-        </span>
-      }
+      timestamp={<span className="ml-auto whitespace-nowrap text-ink-faint tabular-nums">{agoSeconds(ask.ts, t)}</span>}
       showToolIcon
       summaryMode="block"
     />
   );
 }
 
-function askBodyText(t: TFunction, text: string): string {
-  const key = noticeTokenKey(text);
-  if (key) return t(key);
-  return text;
-}
-
-function NoticeFooter({
-  item,
-  retrying,
-  onRetry,
-}: {
-  item: NeedItem;
-  retrying: boolean;
-  onRetry: () => void;
-}) {
-  const { t } = useTranslation();
-  if (item.kind === "question") return null; // rendered as the answer form instead
-  const view = NOTICE_FOOTER_VIEW[item.kind];
-  return (
-    <div
-      className={cn(
-        "flex items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5 text-[12px]",
-        view.className,
-      )}
-    >
-      {view.icon === "alert" && <AlertTriangle size={13} className="shrink-0" />}
-      <p className="leading-relaxed">{t(view.textKey)}</p>
-      {item.kind === "notice_action_required" && (
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="ml-auto shrink-0"
-          disabled={retrying}
-          title={t("needs.retryTrackingTitle")}
-          onClick={onRetry}
-        >
-          <RefreshCw size={12} className={cn(retrying && "animate-spin")} />
-          {t("needs.retryTracking")}
-        </Button>
-      )}
-    </div>
-  );
-}
-
-export function AskRow({ item }: { item: NeedItem }) {
-  const { answerAsk, retryPrTracking, goToAsk } = useStore();
+function QuestionRow({ item }: { item: QuestionAttentionItem }) {
+  const { answerAsk, goToAsk } = useStore();
   const { t } = useTranslation();
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [retrying, setRetrying] = useState(false);
 
   async function submit() {
     if (!text.trim() || busy) return;
@@ -272,76 +99,294 @@ export function AskRow({ item }: { item: NeedItem }) {
     }
   }
 
-  async function retry() {
-    if (retrying) return;
-    setRetrying(true);
+  return (
+    <ActionCard
+      icon={<HelpCircle size={13} className="text-waiting" />}
+      title={item.direction_name || t("needs.question")}
+      context={item.thread_title}
+      createdAt={item.created_at}
+      onOpen={() => void goToAsk(item)}
+    >
+      <p className="px-3.5 pb-3 pt-1.5 text-[14px] leading-relaxed text-ink">{item.text}</p>
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          void submit();
+        }}
+        className="flex gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5"
+      >
+        <Input
+          autoFocus
+          placeholder={t("needs.answerPlaceholder", { name: item.direction_name })}
+          value={text}
+          onChange={(event) => setText(event.currentTarget.value)}
+        />
+        <Button type="submit" variant="primary" size="icon" disabled={!text.trim() || busy}>
+          <Send size={14} />
+        </Button>
+      </form>
+    </ActionCard>
+  );
+}
+
+function PlanApprovalRow({ item }: { item: Extract<AttentionItem, { kind: "plan_approval" }> }) {
+  const { approvePlanCard, refreshNeeds, selectThread } = useStore();
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+
+  async function approve() {
+    if (busy) return;
+    setBusy(true);
     try {
-      await retryPrTracking(item);
+      await approvePlanCard(item.thread_id, item.message_id, item.title);
+      await refreshNeeds();
     } finally {
-      setRetrying(false);
+      setBusy(false);
     }
   }
 
   return (
-    <div className={cn("overflow-hidden rounded-[var(--radius-lg)] border", ASK_CARD_TONE[item.kind])}>
+    <ActionCard
+      icon={<ClipboardCheck size={13} className="text-approval" />}
+      title={t("needs.planApproval")}
+      context={item.thread_title}
+      createdAt={item.created_at}
+      onOpen={() => void selectThread(item.thread_id)}
+    >
+      {item.title && <p className="px-3.5 pb-3 pt-1.5 text-[14px] text-ink">{item.title}</p>}
+      <CardActions>
+        <Button variant="primary" disabled={busy} onClick={() => void approve()}>
+          <Check size={13} />
+          {t("needs.approvePlan")}
+        </Button>
+      </CardActions>
+    </ActionCard>
+  );
+}
+
+function ScopeApprovalRow({ item }: { item: Extract<AttentionItem, { kind: "scope_approval" }> }) {
+  const { selectThread, setReviewingProposal } = useStore();
+  const { t } = useTranslation();
+
+  async function review() {
+    await selectThread(item.thread_id);
+    setReviewingProposal(true);
+  }
+
+  return (
+    <ActionCard
+      icon={<Layers size={13} className="text-approval" />}
+      title={t("needs.scopeApproval")}
+      context={item.thread_title}
+      createdAt={item.created_at}
+      onOpen={() => void review()}
+    >
+      <CardActions>
+        <Button variant="primary" onClick={() => void review()}>
+          {t("needs.reviewScope")}
+          <ArrowUpRight size={13} />
+        </Button>
+      </CardActions>
+    </ActionCard>
+  );
+}
+
+function RepoActionRow({ item }: { item: Extract<AttentionItem, { kind: "repo_action" }> }) {
+  const { activeWorkspaceId, selectThread, setThreadTab } = useStore();
+  const { t } = useTranslation();
+  const { run, busy } = useRepoActions();
+  const [promptState, setPromptState] = useState<PromptState | null>(null);
+
+  const promptText = (title: string, placeholder?: string) =>
+    new Promise<string | null>((resolve) => {
+      setPromptState({ title, placeholder, value: "", resolve });
+    });
+
+  async function open() {
+    await selectThread(item.thread_id);
+    setThreadTab("lead");
+  }
+
+  async function invoke(action: (typeof item.actions)[number]) {
+    await run({
+      actionId: action.id,
+      kind: action.kind,
+      ctx: {
+        threadId: item.thread_id,
+        messageId: item.message_id,
+        preferredWorkspaceId: activeWorkspaceId,
+      },
+      promptText,
+    });
+  }
+
+  return (
+    <ActionCard
+      icon={<GitBranch size={13} className="text-approval" />}
+      title={item.title || t("needs.repoAction")}
+      context={item.thread_title}
+      createdAt={item.created_at}
+      onOpen={() => void open()}
+    >
+      <div className="flex flex-wrap gap-2 px-3.5 pb-3 pt-2">
+        {item.actions.map((action) => (
+          <Button
+            key={action.id}
+            variant="default"
+            disabled={busy[action.id]}
+            onClick={() => void invoke(action)}
+          >
+            <GitBranch size={13} />
+            {action.label}
+          </Button>
+        ))}
+      </div>
+      <CardActions>
+        <Button variant="ghost" onClick={() => void open()}>
+          {t("needs.reviewRepoActions")}
+          <ArrowUpRight size={13} />
+        </Button>
+      </CardActions>
+      <PromptDialog state={promptState} setState={setPromptState} />
+    </ActionCard>
+  );
+}
+
+function PromptDialog({
+  state,
+  setState,
+}: {
+  state: PromptState | null;
+  setState: (state: PromptState | null) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <Dialog
+      open={state != null}
+      onOpenChange={(open) => {
+        if (!open && state) {
+          state.resolve(null);
+          setState(null);
+        }
+      }}
+    >
+      {state && (
+        <DialogContent title={state.title}>
+          <form
+            className="flex flex-col gap-3"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const value = state.value.trim();
+              state.resolve(value || null);
+              setState(null);
+            }}
+          >
+            <Input
+              autoFocus
+              placeholder={state.placeholder}
+              value={state.value}
+              onChange={(event) => setState({ ...state, value: event.currentTarget.value })}
+            />
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => {
+                  state.resolve(null);
+                  setState(null);
+                }}
+              >
+                {t("session.promptCancel")}
+              </Button>
+              <Button type="submit" variant="primary">
+                {t("session.promptOk")}
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      )}
+    </Dialog>
+  );
+}
+
+function PrRetryRow({ item }: { item: PrTrackingRetryAttentionItem }) {
+  const { retryPrTracking } = useStore();
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+
+  async function retry() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await retryPrTracking(item);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <ActionCard
+      icon={<AlertTriangle size={13} className="text-danger" />}
+      title={item.title || t("needs.pullRequestNumber", { number: item.number })}
+      context={[item.thread_title, item.direction_name].filter(Boolean).join(" · ")}
+      createdAt={item.created_at}
+      onOpen={() => void api.openUrl(item.url)}
+      tone="danger"
+    >
+      <p className="px-3.5 pb-3 pt-1.5 text-[13px] leading-relaxed text-ink-muted">{item.error}</p>
+      <CardActions>
+        <Button variant="primary" disabled={busy} onClick={() => void retry()}>
+          <RefreshCw size={13} className={cn(busy && "animate-spin")} />
+          {t("needs.retryTracking")}
+        </Button>
+        <Button variant="ghost" className="ml-auto" onClick={() => void api.openUrl(item.url)}>
+          {t("needs.openPullRequest")}
+          <ArrowUpRight size={13} />
+        </Button>
+      </CardActions>
+    </ActionCard>
+  );
+}
+
+function ActionCard({
+  icon,
+  title,
+  context,
+  createdAt,
+  onOpen,
+  tone = "waiting",
+  children,
+}: {
+  icon: ReactNode;
+  title: string;
+  context: string;
+  createdAt: string;
+  onOpen: () => void;
+  tone?: "waiting" | "danger";
+  children: ReactNode;
+}) {
+  const { t } = useTranslation();
+  const border = tone === "danger" ? "border-danger/40" : "border-waiting/40";
+  return (
+    <div className={cn("overflow-hidden rounded-[var(--radius-lg)] border bg-waiting/10", border)}>
       <div className="flex items-center gap-2 px-3.5 pt-3 text-[12px]">
-        <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", ASK_DOT_TONE[item.kind])} />
-        {/* The worker reference itself is the primary jump target (not just the
-            trailing icon below) — same handler, so hovering either affords the
-            same one-click landing on its timeline. */}
-        <button
-          type="button"
-          onClick={() => void goToAsk(item)}
-          title={t("needs.openDirection")}
-          className="group flex min-w-0 items-center gap-1.5 text-left"
-        >
-          <span className="truncate font-medium text-ink transition-colors group-hover:text-brand">
-            {item.direction_name}
-          </span>
-          <span className="text-ink-faint">·</span>
-          <span className="truncate text-ink-muted">{item.thread_title}</span>
+        {icon}
+        <button type="button" onClick={onOpen} className="group flex min-w-0 items-center gap-1.5 text-left" title={t("needs.openDirection")}>
+          <span className="truncate font-medium text-ink transition-colors group-hover:text-brand">{title}</span>
+          {context && <span className="truncate text-ink-muted">· {context}</span>}
         </button>
-        <span className="ml-auto whitespace-nowrap text-ink-faint tabular-nums">
-          {ago(item.ts, t)}
-        </span>
-        <button
-          type="button"
-          onClick={() => void goToAsk(item)}
-          title={t("needs.openDirection")}
-          aria-label={t("needs.openDirection")}
-          className="-mr-1 grid h-6 w-6 shrink-0 place-items-center rounded text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
-        >
+        <span className="ml-auto whitespace-nowrap text-ink-faint tabular-nums">{agoIso(createdAt, t)}</span>
+        <button type="button" onClick={onOpen} aria-label={t("needs.openDirection")} className="-mr-1 grid h-6 w-6 shrink-0 place-items-center rounded text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink">
           <ArrowUpRight size={14} />
         </button>
       </div>
-
-      <p className="px-3.5 pb-3 pt-1.5 text-[14px] leading-relaxed text-ink">
-        {askBodyText(t, item.text)}
-      </p>
-
-      {item.kind === "question" ? (
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            void submit();
-          }}
-          className="flex gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5"
-        >
-          <Input
-            autoFocus
-            placeholder={t("needs.answerPlaceholder", { name: item.direction_name })}
-            value={text}
-            onChange={(event) => setText(event.currentTarget.value)}
-          />
-          <Button type="submit" variant="primary" size="icon" disabled={!text.trim() || busy}>
-            <Send size={14} />
-          </Button>
-        </form>
-      ) : (
-        <NoticeFooter item={item} retrying={retrying} onRetry={() => void retry()} />
-      )}
+      {children}
     </div>
   );
+}
+
+function CardActions({ children }: { children: ReactNode }) {
+  return <div className="flex items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">{children}</div>;
 }
 
 export function EmptyNeeds() {
@@ -352,19 +397,27 @@ export function EmptyNeeds() {
         <Check size={22} className="text-running" />
       </div>
       <h2 className="mt-4 text-[15px] font-semibold text-ink">{t("needs.emptyTitle")}</h2>
-      <p className="mt-1.5 max-w-sm text-[13px] leading-relaxed text-ink-faint">
-        {t("needs.emptyBody")}
-      </p>
+      <p className="mt-1.5 max-w-sm text-[13px] leading-relaxed text-ink-faint">{t("needs.emptyBody")}</p>
     </div>
   );
 }
 
-function ago(ts: number, t: TFunction): string {
-  const s = Math.max(0, Math.floor(Date.now() / 1000) - ts);
-  if (s < 60) return t("time.justNow");
-  const m = Math.floor(s / 60);
-  if (m < 60) return t("time.mAgo", { n: m });
-  const h = Math.floor(m / 60);
-  if (h < 24) return t("time.hAgo", { n: h });
-  return t("time.dAgo", { n: Math.floor(h / 24) });
+function agoSeconds(ts: number, t: TFunction): string {
+  return agoFromMilliseconds(ts * 1000, t);
+}
+
+function agoIso(ts: string, t: TFunction): string {
+  const numeric = Number(ts);
+  const milliseconds = Number.isFinite(numeric) ? numeric * 1000 : Date.parse(ts);
+  return agoFromMilliseconds(milliseconds, t);
+}
+
+function agoFromMilliseconds(ts: number, t: TFunction): string {
+  const seconds = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (seconds < 60) return t("time.justNow");
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return t("time.mAgo", { n: minutes });
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return t("time.hAgo", { n: hours });
+  return t("time.dAgo", { n: Math.floor(hours / 24) });
 }

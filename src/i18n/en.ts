@@ -75,7 +75,6 @@ export const en = {
     threadsCount: "{{count}} issues",
     noScope: "no scope yet",
     live: "{{count}} live",
-    stalled: "{{count}} stalled",
     failing: "{{count}} failing",
     writtenByAnother: "Written by another issue too",
     emptyTitleHas: "No issues yet",
@@ -314,9 +313,6 @@ export const en = {
     reviewTitle: "Ready for review",
     reviewBody_one: "{{count}} task reached review",
     reviewBody_other: "{{count}} tasks reached review",
-    stalledTitle: "Agent stalled",
-    stalledBody_one: "{{count}} session went quiet",
-    stalledBody_other: "{{count}} sessions went quiet",
     quotaTitle: "Process capacity full",
     quotaBody_one: "New sessions and turns are paused",
     quotaBody_other: "New sessions and turns are paused",
@@ -336,15 +332,14 @@ export const en = {
   },
   needs: {
     acpPermissionRequired: "Permission required",
-    // Authoritative copy. `scripts/gen-notice-copy.mjs` generates the
-    // backend-readable mirror the IM bridge renders from — edit here, run the
-    // script; `noticeCopy.test.ts` fails if the mirror drifts.
-    acpForceResetNotice:
-      "⏹️ The agent did not answer the cancellation after Stop, so the turn was force-interrupted and continues on a brand-new session. The conversation stays in the timeline, but the new session carries no native context — if later replies seem to have \"forgotten\" earlier details, re-state the key points.",
     title: "Needs you",
     subtitle: "approvals and questions only you can answer",
     wantsPermission: "wants permission",
     question: "needs an answer",
+    planApproval: "Plan approval",
+    scopeApproval: "Scope approval",
+    repoAction: "Repository action",
+    prTrackingRetry: "PR tracking needs a retry",
     openQueue: "Open queue",
     more: "More",
     always: "Always allow",
@@ -360,8 +355,12 @@ export const en = {
     emptyBody:
       "When an agent hits a decision only you can make, it asks here. Answer once and the reply goes straight back to its inbox, so you never have to go hunting for the session.",
     answerPlaceholder: "Answer {{name}}…",
-    selfClearing: "No reply needed — clears itself automatically once it's resolved.",
     openDirection: "Open this task",
+    approvePlan: "Approve plan",
+    reviewScope: "Review scope",
+    reviewRepoActions: "Review repository actions",
+    openPullRequest: "Open pull request",
+    pullRequestNumber: "PR #{{number}}",
     wantsToWrite: "wants to modify",
     approveRun: "Approve & run",
     approveRunTitle: "Create the worktree and start a worker",
@@ -376,11 +375,8 @@ export const en = {
     riskUnknown: "Unknown risk",
     riskUnknownTitle: "Couldn't classify this call — review the arguments before approving",
     detailTruncated: "… {{n}} more characters truncated",
-    actionRequired: "This needs your action — it won't clear itself.",
     retryTracking: "Retry",
-    retryTrackingTitle: "Reset the failed-check streak and any paused auto-merge attempts, and let Weft try again",
     retryTrackingStarted: "Retry requested — Weft will re-check shortly.",
-    retryTrackingNothingToRetry: "Nothing to retry — this may already be resolved.",
     retryTrackingFailed: "Couldn't retry tracking. Try again in a moment.",
   },
   tool: {
@@ -761,7 +757,6 @@ export const en = {
     notifyDeniedUnavailable: "Notifications are blocked by the OS.",
     notifyCat_needs: "Needs you",
     notifyCat_review: "Ready for review",
-    notifyCat_stalled: "Stalled sessions",
     notifyCat_quota: "Process capacity full",
     notifyQuietHours: "Quiet hours",
     notifyQuietHoursHint: "No OS pings during this local window. Dock badge still updates.",
@@ -803,8 +798,6 @@ export const en = {
     issueBudget: "Issue budget",
     issueBudgetHint: "Time boundaries for one issue's automatic progress.",
     issueBudgetValue: "idle {{idle}}m · wall {{wall}}m",
-    loopDetection: "Repeated-failure detection",
-    loopDetectionHint: "Stop auto-retries when the same failure repeats, then surface it in Needs you.",
     reviewGroup: "Review",
     keepAwakeTitle: "Prevent sleep while running",
     keepAwakeHint:
@@ -823,7 +816,7 @@ export const en = {
     autoMergeGroup: "Auto-merge",
     autoMergeTitle: "Auto-merge when truly mergeable",
     autoMergeHint:
-      "When a tracked PR/MR reaches this repo's truly-mergeable bar (CI actually green — not just unconfigured — GitHub's own review decision approved, no conflicts) and a fresh, unstalled check confirms it still holds, squash-merge it automatically — no per-merge prompt. Off by default: this performs an irreversible action (merging code) with nobody confirming that specific merge. Turning this on can immediately, silently merge every already-ready tracked PR/MR on its very first check, not only ones that become ready afterward. Every attempt, success or failure, leaves a marker on the PR's timeline.",
+      "When a tracked PR/MR reaches this repo's truly-mergeable bar (CI actually green — not just unconfigured — GitHub's own review decision approved, no conflicts) and a fresh check confirms it still holds, squash-merge it automatically — no per-merge prompt. Off by default: this performs an irreversible action (merging code) with nobody confirming that specific merge. Turning this on can immediately, silently merge every already-ready tracked PR/MR on its very first check, not only ones that become ready afterward. Every attempt, success or failure, leaves a marker on the PR's timeline.",
     autoMergeDisclosure:
       "Only applies to PR/MR rows Weft is already tracking (via register_pr) on a host with merge support (currently GitHub). A stale or currently-failing status check skips the row instead of merging on an old snapshot. This does NOT independently check unresolved review discussion threads or a repo-specific bot-approval convention (e.g. a review bot's 👍) — only GitHub's own aggregate review decision. If your repo relies on those, turn on GitHub's own branch protection (\"Require conversation resolution before merging\", a required reviewer) so an unmet condition refuses the merge server-side.",
     autoMergeConfirm:
@@ -845,12 +838,6 @@ export const en = {
     mergeGate: "Protected-branch merge",
     deployGate: "Production deploy",
     moneyGate: "High-cost action",
-    guardrailsTitle: "Runaway guardrails",
-    guardrailsDesc:
-      "Force-stop an agent that runs too long or goes silent — the safety net for automation. A session waiting on you isn't counted as idle.",
-    idleCap: "Idle cap (min)",
-    wallCap: "Max runtime (min)",
-    minutesZeroOff: "0 = off",
     im: "IM",
     imProvider: "Feishu",
     imCollapsedHint: "Off — saved credentials stay on this device.",
@@ -1020,7 +1007,6 @@ export const en = {
   },
   status: {
     running: "Running",
-    stalled: "Stalled",
     idle: "Idle",
     exited: "Exited",
   },

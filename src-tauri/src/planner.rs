@@ -1692,9 +1692,8 @@ fn upstream_lanes_from_raw(proposal: &Proposal, raw: &Value) -> Vec<UpstreamLane
 /// Runs AFTER its caller's own persist/CAS/materialize has committed: the
 /// ordering edge is metadata layered on top of already-durable state, not
 /// part of what makes any SINGLE decision atomic, so it is intentionally
-/// best-effort here — see `notify_upstream_edge_write_failed` for why a write
-/// failure escalates to a Needs-you notice instead of failing the causing
-/// operation outright (Codex review, planner.rs:1470).
+/// best-effort here. A failure falls back to the blocking unresolved sentinel
+/// and is logged without creating a generic attention item.
 ///
 /// Per lane: `DependsOnTarget::None` clears any STALE edge a previous proposal
 /// left behind (Codex review, planner.rs:1447 — a re-proposal that drops
@@ -1806,7 +1805,7 @@ async fn record_upstream_edges(db: &Db, thread_id: i32, lanes: &[UpstreamLane]) 
 /// common case (a lane whose edge isn't changing THIS call — including every
 /// plan that never uses `depends_on` at all) to one read and zero writes,
 /// rather than a redundant UPDATE on every single decision in the proposal.
-async fn set_upstream_edge_if_changed(db: &Db, thread_id: i32, direction_id: i32, target: i32) {
+async fn set_upstream_edge_if_changed(db: &Db, _thread_id: i32, direction_id: i32, target: i32) {
     match repo::get_direction(db, direction_id).await {
         Ok(Some(dir)) if dir.depends_on_direction_id == target => return,
         Ok(Some(_)) => {}
@@ -1829,14 +1828,12 @@ async fn set_upstream_edge_if_changed(db: &Db, thread_id: i32, direction_id: i32
                 "[weft][planner] direction {direction_id}: could not read current state before \
                  recording upstream {target}: {e}"
             );
-            notify_upstream_edge_write_failed(thread_id, direction_id, target, &e);
             fall_back_to_unresolved_sentinel(db, direction_id, "the read failure above").await;
             return;
         }
     }
     if let Err(e) = repo::set_direction_upstream(db, direction_id, target).await {
         eprintln!("[weft][planner] direction {direction_id}: could not record upstream {target}: {e}");
-        notify_upstream_edge_write_failed(thread_id, direction_id, target, &e);
         // A REJECTED/FAILED write must never leave the edge at whatever it happened to be
         // BEFORE this call — if that prior value is `0` ("no dependency"), the direction would
         // read as free to merge despite a prerequisite that was just rejected, not satisfied
@@ -1870,105 +1867,6 @@ async fn fall_back_to_unresolved_sentinel(db: &Db, direction_id: i32, context: &
              still read as a stale, possibly-\"no dependency\" value"
         );
     }
-}
-
-/// Human-facing text for a failed `set_direction_upstream` write (Codex
-/// review, PR #159 planner.rs:1470). By the time this runs, the plan is
-/// ALREADY durably confirmed and its directions already dispatched — an
-/// eprintln alone would be the ONLY signal that the ordering safety edge
-/// silently did not land, invisible to anyone not tailing the process log.
-/// Kept as a PURE function (unit-tested without a Tauri runtime) mirroring
-/// `host::judge::give_up_text`'s split between content and the thin,
-/// runtime-dependent call site that posts it — see
-/// `notify_upstream_edge_write_failed`. `upstream_id == 0` means this was a
-/// stale-edge CLEAR that failed, not a fresh write.
-fn upstream_edge_write_failed_text(direction_id: i32, upstream_id: i32, err: &anyhow::Error) -> String {
-    // The recovery instruction deliberately does NOT say "just confirm/approve again": the
-    // confirmed-fast-path retry never re-calls record_upstream_edges (only the transition INTO
-    // "confirmed" does), so a bare retry cannot rescue this edge — only a fresh re-propose
-    // (which resets status back to "proposed") re-earns a pass through it.
-    if upstream_id == 0 {
-        format!(
-            "⚠️ 任务 #{direction_id} 清除过期的上游依赖失败:{err}。自动合并的排序保护可能仍卡在一个已经不存在的依赖上——单纯重新确认/批准不会重试这次写入,请让 agent 针对这个任务重新完整提一次案(re-propose)。"
-        )
-    } else {
-        format!(
-            "⚠️ 任务 #{direction_id} 的上游依赖(#{upstream_id})记录失败:{err}。跨仓合并排序保护可能未生效,这个任务有可能在它依赖的任务之前被自动合并——单纯重新确认/批准不会重试这次写入,请让 agent 针对这个任务重新完整提一次案(re-propose)。"
-        )
-    }
-}
-
-/// Best-effort Needs-you escalation for a failed upstream-edge write.
-///
-/// Deliberately NOT made transactional with (or a hard failure of) the
-/// confirm/settle call that reached this point, despite Codex's review
-/// suggesting exactly that (planner.rs:1470): by the time `record_upstream_
-/// edges` runs, the plan's directions are ALREADY durably created (materialize_
-/// direction already ran) and this call's own return is what the caller uses
-/// to dispatch workers against them — turning THIS failure into an `Err` this
-/// late would make `confirm`/`approve_direction` report failure for work that
-/// in fact succeeded. And a "just retry" recovery does not actually help: the
-/// confirmed-fast-path retry re-dispatches directions but never re-calls
-/// `record_upstream_edges` (that only runs on the transition INTO "confirmed",
-/// not on every re-entry), so neither path can rescue this specific edge —
-/// only a fresh `save_proposal`/re-propose can, since that resets status back
-/// to "proposed" and re-earns a pass through this function. A visible-but-
-/// non-blocking notice is the correct shape for a write that is supplementary
-/// safety metadata layered on top of already-real work, not a coin flip on
-/// whether that work happened at all.
-///
-/// Uses the same `crate::APP_HANDLE` global fallback `bus::server::
-/// emit_proposal_row` also reaches for from deep inside planner/bus logic
-/// that has no `BusRegistry` of its own to thread through — but NOT an exact
-/// mirror of that function's shape, and weaker: `emit_proposal_row` durably
-/// writes to `lead_message` FIRST and only gates the LIVE push notification on
-/// `APP_HANDLE`, so a restart before the live push is seen still leaves the
-/// row for the human to find. This function has no durable counterpart to
-/// fall back on — `BusRegistry`'s asks/notices are in-memory only (this
-/// codebase has no ask/notice DB table at all), so a restart between the
-/// write failure and a human seeing the notice loses BOTH silently, quietly
-/// reverting to the original "nobody can tell" problem with a narrower (but
-/// nonzero) window. This is an EXISTING tradeoff already made elsewhere in
-/// this codebase (issue #88's stall notice is the same shape: memory-only,
-/// no reboot re-scan), not a regression unique to this function — but it is a
-/// real limitation, not a fully-closed gap.
-///
-/// `APP_HANDLE` itself is not the weak link here: it is set once, synchronously,
-/// inside `.setup()`, and `confirm`/`approve_direction` are reachable only
-/// through Tauri IPC, which cannot fire before `.setup()` completes — so in
-/// every real (non-test) run this branch is live. The `None` branches below
-/// exist for the headless test harness, which is also why the notice TEXT is
-/// unit-tested separately above rather than through this call site.
-///
-/// FOLLOW-UP (Codex review, PR #159 planner.rs:1905), deliberately not done here: this
-/// notice is never retracted if a LATER re-propose successfully rewrites the same
-/// direction's edge — a human can be left staring at a stale warning after the underlying
-/// problem is already fixed. `BusRegistry::cancel_open_asks_by_id` (used by `host::monitor`
-/// for exactly this "supersede an earlier notice" purpose) could retract it, but
-/// `host::monitor`'s use of that primitive leans on a `HashMap<i32, (i32, u64, String)>` that
-/// its OWN long-lived sweep loop owns and threads as `&mut` across every iteration (see
-/// `host::monitor`'s `notices` parameter) — this call site has no equivalent: it is reached
-/// from one-shot confirm/re-propose IPC handlers, not a loop, with no natural owner for
-/// mutable state that must survive between two calls that can be minutes or hours apart.
-/// Wiring retraction in here would mean introducing a NEW global correlation map
-/// (direction_id -> last-posted ask id) purely to track that, plus its own tests (posted/
-/// retracted/no-cross-direction-cancel/no-double-post) — real but non-trivial new machinery
-/// for a UX polish concern, not a correctness one (the sentinel this notice warns about
-/// already blocks a free merge regardless of whether the notice itself is ever retracted).
-/// Left as a follow-up rather than bundled into this review response.
-fn notify_upstream_edge_write_failed(thread_id: i32, direction_id: i32, upstream_id: i32, err: &anyhow::Error) {
-    use tauri::Manager;
-    let Some(app) = crate::APP_HANDLE.get() else {
-        return;
-    };
-    let Some(bus) = app.try_state::<crate::bus::BusRegistry>() else {
-        return;
-    };
-    bus.notify_human_action_required(
-        thread_id,
-        &direction_id.to_string(),
-        &upstream_edge_write_failed_text(direction_id, upstream_id, err),
-    );
 }
 
 /// Tear down lanes created in the current confirm attempt (used on any failure to keep
@@ -2897,38 +2795,6 @@ mod tests {
                 known: true
             }
         );
-    }
-
-    /// The one PURELY-testable piece of `notify_upstream_edge_write_failed` (Codex review, PR
-    /// #159 planner.rs:1470): the notice text itself, unit-tested without a Tauri runtime —
-    /// mirrors `host::judge::give_up_text`'s split between content and its thin, untestable
-    /// call site. Must name the direction so a human knows WHICH task's ordering safety edge
-    /// is in question, and must name the recovery action (re-approve/re-confirm) since nothing
-    /// else in the system retries this write on its own.
-    #[test]
-    fn upstream_edge_write_failed_text_names_the_direction_and_the_recovery_path() {
-        let err = anyhow::anyhow!("database is locked");
-        let text = upstream_edge_write_failed_text(42, 7, &err);
-        assert!(text.contains("42"), "must name the direction whose edge failed to write: {text}");
-        assert!(text.contains("7"), "must name the upstream it was trying to point at: {text}");
-        assert!(text.contains("database is locked"), "must keep the underlying error: {text}");
-        assert!(
-            text.contains("审批") || text.contains("确认"),
-            "must name the recovery path (re-approve/re-confirm) — nothing else retries this \
-             write automatically: {text}"
-        );
-    }
-
-    /// The `upstream_id == 0` case (a STALE-edge CLEAR failed, not a fresh write) must read
-    /// distinctly — conflating the two would tell a human to look for a wrong-upstream problem
-    /// when the actual issue is a leftover one that failed to clear.
-    #[test]
-    fn upstream_edge_write_failed_text_distinguishes_a_failed_clear_from_a_failed_write() {
-        let err = anyhow::anyhow!("database is locked");
-        let clear_text = upstream_edge_write_failed_text(42, 0, &err);
-        let write_text = upstream_edge_write_failed_text(42, 7, &err);
-        assert_ne!(clear_text, write_text, "a failed clear and a failed write must not read identically");
-        assert!(clear_text.contains("42"), "must still name the direction: {clear_text}");
     }
 
     #[tokio::test]
@@ -5655,12 +5521,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// THE FIX (Codex review, PR #159 planner.rs:109): `depends_on` must flow all the way
-    /// through to `PendingWrite` — the per-lane Needs-you card's data source (via
-    /// `commands::WriteTrigger`) — not only into the batch `ScopeReview` dialog's
-    /// `ResolvedDirection`. Before this field existed on `PendingWrite`, the human approving a
-    /// single lane through the Needs-you card could not see which producer gates it, even
-    /// though the edge was already decided in the data. Mirrors
+    /// `depends_on` must flow into `PendingWrite` as well as the batch
+    /// `ScopeReview` dialog's `ResolvedDirection`. Mirrors
     /// `pending_writes_carry_base_branch`'s pattern but exercises the RAW-JSON `depends_on`
     /// path (`save_proposal_value`, not the typed `Proposal`/`ProposedDirection` — see that
     /// field's doc on `ResolvedDirection`).

@@ -750,7 +750,6 @@ function AutomationSettings() {
     autoReview,
     setAutoReview,
   } = useStore();
-  const [loopGuard, setLoopGuard] = useState(true);
   const [remoteStandby, setRemoteStandby] = useState(false);
   const [remoteStandbyLoaded, setRemoteStandbyLoaded] = useState(false);
   // issue #97: auto fail-over to the fallback engine when the current one
@@ -848,9 +847,6 @@ function AutomationSettings() {
       <SettingsGroup title={t("settings.rules")}>
         <SettingRow label={t("settings.dangerTitle")} hint={t("settings.dangerDesc")}>
           <Toggle on={dangerousMode} onChange={setDangerousMode} label={t("settings.dangerTitle")} />
-        </SettingRow>
-        <SettingRow label={t("settings.loopDetection")} hint={t("settings.loopDetectionHint")}>
-          <Toggle on={loopGuard} onChange={setLoopGuard} label={t("settings.loopDetection")} />
         </SettingRow>
         <SettingRow label={t("settings.keepAwakeTitle")} hint={t("settings.keepAwakeHint")}>
           <Toggle on={keepAwake} onChange={setKeepAwake} label={t("settings.keepAwakeTitle")} />

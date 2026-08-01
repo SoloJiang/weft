@@ -114,8 +114,8 @@ const PR_AUTOMERGE_SWEEP_DEFAULT_SECS: u64 = 60;
 /// refuses to even attempt a fresh check on its stored `Ready` verdict, even
 /// with zero recorded probe failures (`probe_fail_count == 0`) — the OTHER
 /// way a row's `Ready` column can outlive its truth: not a failing probe
-/// (see `gate::AutoMergeSkipReason::ProbeFailing`), but a STALLED one (the
-/// sweep loop itself wedged, or the whole process was suspended for hours
+/// (see `gate::AutoMergeSkipReason::ProbeFailing`), but missing fresh polling
+/// (the sweep loop wedged, or the whole process was suspended for hours
 /// and just resumed). Ten sweep intervals at `host::monitor`'s own default
 /// cadence — generous enough to ride out ordinary scheduling jitter, far
 /// short of "hours-old". The FINAL authorization (step 5 in this module's
@@ -498,9 +498,8 @@ async fn evaluate_row(
 /// Gate one row twice (pre-filter, then final authorization against fresh
 /// state — both in [`evaluate_row`]), and if it clears both, execute +
 /// confirm + record the merge attempt. No-op (silently) for every `Skip`
-/// verdict — a blocked or indeterminate row already has `host::monitor`'s own
-/// Needs-you notice telling the human why, when that is warranted; this
-/// feature only speaks up when it actually ACTS (see
+/// verdict — the monitor keeps the tracked row's readiness state current; this
+/// feature only speaks up when it actually acts (see
 /// `insert_automerge_marker`'s doc). See this module's own doc for the full
 /// numbered flow, and [`evaluate_row`]'s doc for why steps 1-5 live there.
 async fn maybe_merge_one(
