@@ -88,6 +88,7 @@ jobs:
             wget \
             file \
             libxdo-dev \
+            libpipewire-0.3-dev \
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
