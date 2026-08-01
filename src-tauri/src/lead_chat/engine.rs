@@ -4063,6 +4063,41 @@ fn acp_permission_risk(
     }
 }
 
+/// Which `AskRegistry` entry point decides an ACP permission's standing-grant
+/// auto-verdict (issue #160 round-7 P1). `is_gui` (an omp native `computer`/
+/// `browser` request — see `acp_permission_risk`'s own `PermissionIntent::Gui`
+/// arm) always goes through `auto_decision_exact`: `dangerous` mode, a Full
+/// grant, and an EXACT Always `action_key` match still auto-allow, but the
+/// coarse read-only session/issue batch grant (issue #103) is skipped
+/// entirely — mirrors the SAME protection `bus::computer_srv::approve` already
+/// gives the MCP `weft_computer` path (see that function's own doc for why a
+/// `screenshot`/`list_windows`-shaped ReadOnly tier can't be treated like an
+/// ordinary read-only tool call: it is ReadOnly regardless of WHICH window it
+/// targets, so a blanket "release all read-only" grant would otherwise let it
+/// silently capture pixels from any window on the human's desktop with no
+/// computer-specific card). Every other intent is untouched — `auto_decision`
+/// with its existing semantics, read-only batch grant included.
+///
+/// Pulled out as its own small, synchronous function (rather than inlined at
+/// its one call site in `acp_consumer`) so this decision is unit-testable
+/// without the surrounding async ACP event loop, which needs a live
+/// `acp::runtime::ClientHandle` and isn't itself practical to drive from a
+/// plain `#[test]`.
+fn gui_or_ordinary_auto_decision(
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+    dir: &str,
+    risk: crate::ask::RiskLevel,
+    action_key: &str,
+    is_gui: bool,
+) -> Option<crate::ask::Decision> {
+    if is_gui {
+        asks.auto_decision_exact(thread_id, dir, action_key)
+    } else {
+        asks.auto_decision(thread_id, dir, risk, action_key)
+    }
+}
+
 /// How much of the reasoning stream the busy-line chip shows.
 const THOUGHT_TAIL_CHARS: usize = 160;
 
@@ -4394,8 +4429,18 @@ async fn acp_consumer(
                 // grants (issue #103) key on the tier: deriving it only in the
                 // `None` arm would make every ACP ask miss those grants.
                 let risk = acp_permission_risk(&intent, &detail);
+                // round-7 P1: GUI observation/input (omp's native `computer`/
+                // `browser` tools) must never be silently released by the
+                // coarse read-only session/issue batch grant (issue #103) the
+                // way an ordinary ReadOnly-tier tool call is — that grant was
+                // built for things like "skip the card for `pwd`", not for
+                // "screenshot or enumerate any window on the human's desktop
+                // sight unseen". `is_gui` is the ONE discriminated value this
+                // decides on; every non-GUI intent keeps the exact same
+                // `auto_decision` semantics it always had.
+                let is_gui = matches!(intent, crate::acp::permission::PermissionIntent::Gui { .. });
                 let want = if let Some(asks) = asks {
-                    match asks.auto_decision(thread_id, &dir, risk, &action_key) {
+                    match gui_or_ordinary_auto_decision(&asks, thread_id, &dir, risk, &action_key, is_gui) {
                         Some(crate::ask::Decision::Allow) => crate::acp::Want::AllowOnce,
                         Some(crate::ask::Decision::Deny) => crate::acp::Want::RejectOnce,
                         None => {
@@ -8999,6 +9044,70 @@ mod tests {
             acp_permission_risk(&PermissionIntent::Read { paths: Vec::new() }, ""),
             crate::ask::RiskLevel::Unknown,
             "an unauditable read must not be auto-released as read-only"
+        );
+    }
+
+    /// issue #160 round-7 P1: a GUI (omp native `computer`/`browser`) intent
+    /// must never be silently auto-allowed by the coarse read-only session
+    /// grant (issue #103) that an ordinary ReadOnly-tier ACP ask IS released
+    /// by — `screenshot`/`list_windows` classify `ReadOnly` regardless of
+    /// which window they target, so that grant would otherwise let an agent
+    /// capture pixels from any window on the human's desktop with no
+    /// computer-specific card. An EXACT Always `action_key` grant, and a Full
+    /// grant, still auto-allow a GUI intent exactly like any other — only the
+    /// coarse batch fallback is skipped.
+    #[test]
+    fn gui_intent_ignores_the_read_only_session_grant_but_ordinary_intents_still_use_it() {
+        use crate::ask::{AskRegistry, RiskLevel};
+
+        let asks = AskRegistry::new();
+        asks.grant_read_only_session(1, "10");
+
+        assert!(
+            gui_or_ordinary_auto_decision(&asks, 1, "10", RiskLevel::ReadOnly, "gui-key", true).is_none(),
+            "a GUI intent must still card despite a standing read-only-session grant"
+        );
+        // The exact same session's grant still auto-allows an ORDINARY
+        // ReadOnly-tier ACP ask (e.g. a `read` toolCall) — this fix must not
+        // regress that pre-existing, unrelated behavior.
+        assert_eq!(
+            gui_or_ordinary_auto_decision(&asks, 1, "10", RiskLevel::ReadOnly, "ordinary-key", false),
+            Some(crate::ask::Decision::Allow),
+            "a non-GUI intent must be completely unaffected by this fix"
+        );
+    }
+
+    /// The other half of the same fix: an EXACT Always `action_key` grant (or
+    /// a Full grant) still auto-allows a GUI intent — round-7 P1 narrows away
+    /// only the coarse batch fallback, not the precise per-action grant this
+    /// module's own Always/Full flow relies on.
+    #[test]
+    fn gui_intent_still_honors_an_exact_always_grant_and_full_grant() {
+        use crate::ask::{AlwaysGrant, AskRegistry, Decision, FullGrant, GrantSnapshot, RiskLevel};
+
+        let asks = AskRegistry::new();
+        asks.seed_grants(GrantSnapshot {
+            full: vec![FullGrant { thread: 2, dir: "20".to_string() }],
+            always: vec![AlwaysGrant {
+                thread: 3,
+                dir: "30".to_string(),
+                action_key: "exact-gui-key".to_string(),
+            }],
+        });
+
+        assert_eq!(
+            gui_or_ordinary_auto_decision(&asks, 2, "20", RiskLevel::ReadOnly, "anything", true),
+            Some(Decision::Allow),
+            "a Full grant still auto-allows a GUI intent"
+        );
+        assert_eq!(
+            gui_or_ordinary_auto_decision(&asks, 3, "30", RiskLevel::Write, "exact-gui-key", true),
+            Some(Decision::Allow),
+            "an EXACT Always action_key match still auto-allows a GUI intent"
+        );
+        assert!(
+            gui_or_ordinary_auto_decision(&asks, 3, "30", RiskLevel::Write, "different-key", true).is_none(),
+            "a non-matching action_key must still card, even with a standing Always grant on file"
         );
     }
 

@@ -320,42 +320,49 @@ async fn run_action(
                 shot.scale
             );
             // Both the preview registry and the MCP image block need the raw
-            // pixels; `screenshot_window` only hands back a `Screenshot`
-            // (path + dims), so this re-reads the PNG it just wrote — see
-            // `read_captured_image`'s doc for why (M3-B is scoped to add
-            // exactly one new function to `computer/mod.rs`, not to change
-            // `screenshot_window`'s own return shape). Best-effort: a read/
-            // decode failure here must not fail a screenshot that already
-            // saved successfully — it just means no preview/image this call.
-            if let Some(captured) = read_captured_image(&shot.path) {
-                // ALWAYS refresh the Ask-card preview, regardless of engine —
-                // see `store_screenshot_preview`'s doc. Keyed to
-                // `shot.window_id` — the id `computer::screenshot_window`
-                // ITSELF already resolved and captured against (issue #160
-                // round-6 review P2 #4) — rather than re-resolving
-                // `window_query` a second time here: a second resolution can
-                // land on a DIFFERENT window than the one actually captured
-                // if it closed, was renamed, or its id got reused in the gap
-                // between the two calls, silently mis-keying the preview
-                // (and any input approval card that later attaches it) to
-                // the WRONG window. `computer::Screenshot::window_id` closes
-                // that gap by construction — there is no second resolution
-                // left to drift.
-                if let Ok(preview) =
-                    computer::encode_jpeg_data_uri(&captured, PREVIEW_LONG_EDGE, PREVIEW_QUALITY)
-                {
-                    store_screenshot_preview(thread, dir, preview, shot.window_id);
-                }
-                // The MCP `image` content block is engine-gated — see
-                // `engine_accepts_mcp_image`'s doc table.
-                if engine_accepts_mcp_image(db, thread, dir).await {
-                    if let Ok(uri) = computer::encode_jpeg_data_uri(
-                        &captured,
-                        MCP_IMAGE_LONG_EDGE,
-                        MCP_IMAGE_QUALITY,
-                    ) {
-                        *screenshot_image_b64_out = strip_data_uri_prefix(&uri).map(str::to_string);
-                    }
+            // pixels — read straight off `shot.pixels`, the SAME in-memory
+            // RGBA `screenshot_window` itself scaled and saved (issue #160
+            // round-7 P1), never re-opened from `shot.path`. This used to
+            // re-read the just-saved PNG back off disk (`read_captured_image`,
+            // now deleted): a worker-writable `out_dir` is repository-
+            // controlled content, and the gap between that PNG's own save and
+            // this re-open was an open TOCTOU/symlink window — a sandboxed
+            // background process could swap the freshly-saved file for a
+            // symlink to an arbitrary user-readable image in that gap, and
+            // Weft would follow it with its own permissions, inlining the
+            // substituted pixels to the model/human as if they were the real
+            // capture. Reading `shot.pixels` instead closes that window
+            // entirely rather than narrowing it — there is no second
+            // filesystem access left to race. `encode_jpeg_data_uri` can
+            // still fail on `shot.pixels` (encoding, not decoding, can
+            // theoretically error) — best-effort, same as before: a failure
+            // here must never fail a screenshot that already saved
+            // successfully, it just means no preview/image this call.
+            //
+            // Keyed to `shot.window_id` — the id `computer::screenshot_window`
+            // ITSELF already resolved and captured against (issue #160
+            // round-6 review P2 #4) — rather than re-resolving `window_query`
+            // a second time here: a second resolution can land on a DIFFERENT
+            // window than the one actually captured if it closed, was
+            // renamed, or its id got reused in the gap between the two calls,
+            // silently mis-keying the preview (and any input approval card
+            // that later attaches it) to the WRONG window.
+            // `computer::Screenshot::window_id` closes that gap by
+            // construction — there is no second resolution left to drift.
+            if let Ok(preview) =
+                computer::encode_jpeg_data_uri(&shot.pixels, PREVIEW_LONG_EDGE, PREVIEW_QUALITY)
+            {
+                store_screenshot_preview(thread, dir, preview, shot.window_id);
+            }
+            // The MCP `image` content block is engine-gated — see
+            // `engine_accepts_mcp_image`'s doc table.
+            if engine_accepts_mcp_image(db, thread, dir).await {
+                if let Ok(uri) = computer::encode_jpeg_data_uri(
+                    &shot.pixels,
+                    MCP_IMAGE_LONG_EDGE,
+                    MCP_IMAGE_QUALITY,
+                ) {
+                    *screenshot_image_b64_out = strip_data_uri_prefix(&uri).map(str::to_string);
                 }
             }
             Ok(text)
@@ -1063,27 +1070,6 @@ const MCP_IMAGE_QUALITY: u8 = 75;
 /// payload is the right tradeoff.
 const PREVIEW_LONG_EDGE: u32 = 640;
 const PREVIEW_QUALITY: u8 = 60;
-
-/// Read a just-saved screenshot PNG back into raw RGBA pixels, for
-/// [`computer::encode_jpeg_data_uri`] (both the preview registry and,
-/// engine-permitting, the MCP image content block) — `screenshot_window`
-/// only returns a [`computer::Screenshot`] (path + dims), not the pixels it
-/// already wrote to disk, and this milestone is scoped to add exactly ONE
-/// new function to `computer/mod.rs` (`encode_jpeg_data_uri` itself, not a
-/// change to `screenshot_window`'s own return shape) — so this decodes the
-/// file back rather than plumbing the raw capture out a second way.
-/// `None` on any read/decode failure: best-effort, since a screenshot that
-/// already saved successfully must not fail the whole call just because this
-/// second, purely-additive step couldn't re-read its own output.
-fn read_captured_image(path: &std::path::Path) -> Option<computer::CapturedImage> {
-    let img = image::open(path).ok()?.to_rgba8();
-    let (width, height) = (img.width(), img.height());
-    Some(computer::CapturedImage {
-        rgba: img.into_raw(),
-        width,
-        height,
-    })
-}
 
 /// Strip the `data:image/jpeg;base64,` prefix `encode_jpeg_data_uri` always
 /// adds — the MCP `image` content type wants the RAW base64 payload with no

@@ -286,6 +286,21 @@ pub struct Screenshot {
     /// its id got reused in the gap between the two calls, silently
     /// mis-keying the preview to the wrong window.
     pub window_id: u32,
+    /// The SAVED image's own pixels, RGBA, kept in memory for the life of this
+    /// `Screenshot` value (round-7 P1) — the SAME `width`x`height`, already-
+    /// scaled bytes `screenshot_window` wrote to `path`, captured right around
+    /// its own `image.save` call rather than derived separately. Exists so a
+    /// caller building a preview/MCP-image payload (`bus::computer_srv`) never
+    /// has to re-open `path` off disk to get pixels it already had a moment
+    /// ago: `path` is a path INSIDE the worker's own writable worktree, and
+    /// the gap between this function's `image.save` and any later re-open is
+    /// exactly the window a sandboxed background process could use to swap
+    /// that file for a symlink to an arbitrary user-readable image — Weft
+    /// would then follow that link with its own permissions and hand the
+    /// substituted pixels straight to the model/human as if they were the
+    /// real capture. Reading `pixels` here instead closes that reopen-after-
+    /// save TOCTOU/symlink race entirely, rather than narrowing it.
+    pub pixels: CapturedImage,
 }
 
 /// Apps excluded from window enumeration/screenshots, for two independent
@@ -445,9 +460,25 @@ pub fn resolve_window(backend: &dyn backend::ComputerBackend, query: &str) -> Re
 /// sites can never drift onto two different formulas: long edge > 1280px
 /// gets scaled down to fit (matching [`scale_capture`]'s pre-M2 rule
 /// exactly), everything else is 1:1.
+///
+/// A thin wrapper over [`display_scale_for_dims`] (round-7 P2) — same
+/// formula, just reading its two inputs off a [`WindowInfo`] instead of bare
+/// dimensions, for the two callers (`map_to_physical`'s live re-resolve, and
+/// any caller that only has a `WindowInfo` on hand) that want it that way.
+/// Behavior is unchanged from before the split.
 pub fn display_scale(w: &WindowInfo) -> f64 {
+    display_scale_for_dims(w.width, w.height)
+}
+
+/// The core of [`display_scale`], taking bare dimensions instead of a
+/// [`WindowInfo`] (round-7 P2) — so [`screenshot_window`] can derive the
+/// scale it records from the CAPTURED frame's own dimensions, not from a
+/// window resolved earlier and possibly already stale. See
+/// [`screenshot_window`]'s own doc comment for the resize-in-the-gap race
+/// this exists to close.
+fn display_scale_for_dims(width: u32, height: u32) -> f64 {
     const MAX_LONG_EDGE: u32 = 1280;
-    let long_edge = w.width.max(w.height);
+    let long_edge = width.max(height);
     if long_edge <= MAX_LONG_EDGE {
         return 1.0;
     }
@@ -520,10 +551,41 @@ pub fn map_to_physical(w: &WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), C
 static SHOT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Match `query` against the backend's visible windows, capture the ONE hit,
-/// downscale it (see [`scale_capture`]/[`display_scale`]), and write it to
-/// `out_dir/<unix_ms>-<id>-<seq>.png` (`out_dir` is created if missing) — the
-/// trailing `<seq>` is [`SHOT_SEQ`]'s own collision-proofing nonce (issue
-/// #160 round-3 P2 §4), not derived from anything about the capture itself.
+/// downscale it (see [`scale_capture`]/[`display_scale_for_dims`]), and write
+/// it to `out_dir/<unix_ms>-<id>-<seq>.png` (`out_dir` is created if missing)
+/// — the trailing `<seq>` is [`SHOT_SEQ`]'s own collision-proofing nonce
+/// (issue #160 round-3 P2 §4), not derived from anything about the capture
+/// itself. The returned [`Screenshot`] carries the saved image's pixels
+/// in-memory (`Screenshot::pixels`, round-7 P1) precisely so `bus::
+/// computer_srv` never has to re-open `path` off disk to build a preview/MCP-
+/// image payload — see that field's own doc for the reopen-after-save
+/// symlink/TOCTOU race this closes.
+///
+/// round-7 P2: the recorded `scale` (and the saved pixel dimensions) are
+/// derived from `captured` — the frame actually returned by THIS call's own
+/// `capture_window`, taken AFTER `matched` was resolved — rather than from
+/// `matched`'s own (pre-capture) `width`/`height`. If the window resized in
+/// the gap between `resolve_window` and `capture_window`, `matched`'s
+/// dimensions are already stale by the time this runs; deriving the scale
+/// from them instead of from the frame actually being scaled and saved would
+/// record a `Screenshot::scale` that doesn't match the pixels it describes.
+/// The common, no-resize path (`captured.width == matched.width` and same for
+/// height, true for both `mock::MockBackend` and the real backend absent an
+/// actual mid-call resize) is completely unaffected — same scale, same
+/// output, byte for byte — since `scale_capture` already treats `captured`'s
+/// own dimensions as the coordinate space to scale from either way. Click-time
+/// drift (the window moving/resizing again AFTER this screenshot, before an
+/// input action) is a separate, already-handled concern: `map_to_physical`
+/// re-resolves a FRESH `WindowInfo` and recomputes the scale from ITS current
+/// dimensions on every call, with an out-of-range coordinate rejected rather
+/// than silently mismapped — real-machine HiDPI device-pixel-ratio
+/// calibration beyond that remains issue #160 §9.
+///
+/// round-7 P1: every successful save also best-effort prunes this
+/// `out_dir` down to [`MAX_RETAINED_SCREENSHOTS`] via
+/// [`prune_old_screenshots`] — an unbounded, always-growing set of on-disk
+/// PNGs per session directory is its own resource-exhaustion hazard once
+/// `screenshot` is Always/Full-granted and no longer needs a card per call.
 ///
 /// issue #160 round-5 review P2 §4: `bus::computer_srv::screenshot_out_dir`
 /// already walks every path component up through `out_dir` via
@@ -552,8 +614,11 @@ pub fn screenshot_window(
     out_dir: &Path,
 ) -> Result<Screenshot, ComputerError> {
     let matched = resolve_window(backend, query)?;
-    let scale = display_scale(&matched);
     let captured = backend.capture_window(matched.id)?;
+    // round-7 P2: derive the recorded scale from THIS frame (`captured`), not
+    // from `matched`'s own pre-capture geometry — see this function's own doc
+    // comment for the resize-in-the-gap race this closes.
+    let scale = display_scale_for_dims(captured.width, captured.height);
     let image = scale_capture(captured.rgba, captured.width, captured.height, scale)?;
 
     std::fs::create_dir_all(out_dir).map_err(|e| ComputerError::Io(e.to_string()))?;
@@ -571,15 +636,101 @@ pub fn screenshot_window(
         .as_millis();
     let seq = SHOT_SEQ.fetch_add(1, Ordering::SeqCst);
     let path = out_dir.join(format!("{unix_ms}-{}-{seq}.png", matched.id));
-    image.save(&path).map_err(|e| ComputerError::Io(e.to_string()))?;
+    let width = image.width();
+    let height = image.height();
+    image.save(&path).map_err(|e| ComputerError::Io(e.to_string()))?; // save borrows &image
+    // round-7 P1: keep the just-saved pixels in memory instead of ever having
+    // a caller re-open `path` to get them back — see `Screenshot::pixels`'s
+    // own doc for the symlink/TOCTOU race that reopen would risk. `into_raw`
+    // consumes `image`, so this runs only after `save` (which only borrows
+    // it) has already finished.
+    let pixels = CapturedImage { rgba: image.into_raw(), width, height };
+
+    // round-7 P1: best-effort retention cap — never fails a screenshot that
+    // already saved successfully just because pruning stumbled.
+    prune_old_screenshots(out_dir, MAX_RETAINED_SCREENSHOTS);
 
     Ok(Screenshot {
         path,
-        width: image.width(),
-        height: image.height(),
+        width,
+        height,
         scale,
         window_id: matched.id,
+        pixels,
     })
+}
+
+/// Per-session-directory screenshot retention cap (round-7 P1). An agent
+/// needs recent visual context, not an unbounded history — once `screenshot`
+/// is Always/Full-granted it no longer surfaces a card per call, so nothing
+/// else in this module limits how many PNGs a looping agent can accumulate in
+/// one session's output directory; left alone this grows without bound until
+/// the human's disk fills up. Anything beyond this many, per directory, is
+/// deleted by modification time (oldest first) — see [`prune_old_screenshots`].
+const MAX_RETAINED_SCREENSHOTS: usize = 20;
+
+/// Delete this module's OWN screenshots in `out_dir` beyond the most recent
+/// `keep` (round-7 P1) — best-effort: any I/O error along the way is
+/// silently skipped, since a cleanup failure must never turn an
+/// already-successful screenshot save into a call failure. Only touches
+/// files [`is_own_screenshot_filename`] recognizes as this module's own
+/// `<unix_ms>-<window_id>-<seq>.png` naming — anything else in `out_dir`
+/// (a `.weft` audit directory, a file some other tool left there) is left
+/// alone regardless of age. Uses `symlink_metadata` (never plain `metadata`)
+/// so a symlink sitting in `out_dir` is neither followed nor deleted nor
+/// counted against `keep` — `remove_file` on a symlink removes the directory
+/// entry, never the link's target, but this skips symlinks entirely rather
+/// than relying on that alone. The file [`screenshot_window`] itself JUST
+/// saved is by construction the newest entry here (it was just written), so
+/// it is never among the ones pruned — a caller holding this call's own
+/// `Screenshot::path` always still has a file at that path afterward.
+fn prune_old_screenshots(out_dir: &Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(out_dir) else {
+        return;
+    };
+    let mut shots: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !is_own_screenshot_filename(&path) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue; // skip symlinks/directories — never follow, never delete
+        }
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        shots.push((mtime, path));
+    }
+    if shots.len() <= keep {
+        return;
+    }
+    shots.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    for (_, path) in shots.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Whether `path`'s file name matches this module's OWN screenshot naming —
+/// `<unix_ms>-<window_id>-<seq>.png`, three all-digit, non-empty dash-
+/// separated components with a `.png` extension (round-7 P1). Only a file
+/// matching this is ever a candidate for [`prune_old_screenshots`] to delete
+/// — anything else living in the same directory (today: nothing; in
+/// principle, a `.weft` subdirectory or some unrelated file a human or
+/// another tool placed there) is never touched, matched, or counted, no
+/// matter how old.
+fn is_own_screenshot_filename(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let ext_ok = path.extension().and_then(|s| s.to_str()) == Some("png");
+    let parts: Vec<&str> = stem.split('-').collect();
+    ext_ok
+        && parts.len() == 3
+        && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Downscale `captured` to at most `max_long_edge` px on its long edge (the
@@ -1486,6 +1637,157 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_file(&base);
+    }
+
+    // —— Screenshot::pixels stay in memory (issue #160 round-7 P1) ——
+
+    #[test]
+    fn screenshot_window_pixels_are_the_in_memory_scaled_image_not_a_disk_reread() {
+        let backend = mock::MockBackend {
+            windows: vec![window_sized(9, "Notes", "Untitled", 2560, 1440)],
+            image: Some(solid_image(2560, 1440, 200)),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let shot = screenshot_window(&backend, "9", tmp.path()).unwrap();
+
+        assert_eq!(shot.pixels.width, shot.width);
+        assert_eq!(shot.pixels.height, shot.height);
+        assert_eq!(shot.pixels.rgba.len(), (shot.width * shot.height * 4) as usize);
+        assert!(
+            shot.pixels.rgba.iter().all(|&b| b == 200),
+            "downscaling a solid-color image with a triangle filter must keep it solid"
+        );
+
+        // Hardening: swap the on-disk PNG for a DIFFERENT image AFTER the
+        // call already returned. `shot.pixels` must be totally unaffected —
+        // proof that nothing downstream needs to (or does) re-open
+        // `shot.path` to get pixels, closing the save-then-reopen symlink/
+        // TOCTOU race a worker-writable `out_dir` would otherwise expose.
+        let different = image::RgbaImage::from_pixel(shot.width, shot.height, image::Rgba([1, 2, 3, 4]));
+        different.save(&shot.path).unwrap();
+        assert!(
+            shot.pixels.rgba.iter().all(|&b| b == 200),
+            "shot.pixels must still be the ORIGINAL capture after the disk file was replaced"
+        );
+    }
+
+    // —— recorded scale comes from the captured frame (issue #160 round-7 P2) ——
+
+    #[test]
+    fn screenshot_window_derives_scale_from_the_captured_frame_not_a_stale_resolve() {
+        // `matched` (from resolve_window) reports 800x600 — scale 1.0 by the
+        // OLD (buggy) formula. The mock's own capture returns a DIFFERENT
+        // frame, 2000x1000 (long edge crosses the 1280 threshold) — standing
+        // in for a resize landing between resolve_window and capture_window.
+        // The recorded scale/dims must come from the CAPTURED frame, never
+        // the stale `matched` geometry.
+        let backend = mock::MockBackend {
+            windows: vec![window_sized(9, "Notes", "Untitled", 800, 600)],
+            image: Some(solid_image(2000, 1000, 77)),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let shot = screenshot_window(&backend, "9", tmp.path()).unwrap();
+
+        let expected_scale = display_scale_for_dims(2000, 1000);
+        assert_ne!(expected_scale, 1.0, "the fixture must actually exercise a downscale to be meaningful");
+        assert_eq!(shot.scale, expected_scale, "scale must come from the captured frame, not matched's stale 800x600");
+        let expected = scale_capture(vec![77u8; 2000 * 1000 * 4], 2000, 1000, expected_scale).unwrap();
+        assert_eq!(shot.width, expected.width());
+        assert_eq!(shot.height, expected.height());
+        assert_eq!(shot.pixels.width, expected.width());
+        assert_eq!(shot.pixels.height, expected.height());
+    }
+
+    // —— prune_old_screenshots (issue #160 round-7 P1) ——
+
+    #[cfg(unix)]
+    fn set_mtime(path: &Path, seconds_from_epoch: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(UNIX_EPOCH + Duration::from_secs(seconds_from_epoch)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_old_screenshots_deletes_the_oldest_by_mtime_and_keeps_the_newest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let keep = 5usize;
+        let total = keep + 3;
+        let mut paths = Vec::new();
+        for i in 0..total {
+            let p = dir.join(format!("{}-9-{i}.png", 1_700_000_000_000u64 + i as u64));
+            std::fs::write(&p, b"fake png bytes").unwrap();
+            // Strictly increasing mtimes, spaced well apart — deterministic
+            // regardless of the filesystem's own mtime-write granularity.
+            set_mtime(&p, 1_000_000 + i as u64);
+            paths.push(p);
+        }
+
+        prune_old_screenshots(dir, keep);
+
+        let remaining: std::collections::HashSet<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(remaining.len(), keep, "expected exactly {keep} files left: {remaining:?}");
+        for p in &paths[..total - keep] {
+            assert!(!remaining.contains(p), "{p:?} is one of the oldest and should have been pruned");
+        }
+        for p in &paths[total - keep..] {
+            assert!(remaining.contains(p), "{p:?} is one of the newest and must survive pruning");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_old_screenshots_never_touches_non_own_files_or_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // A lone own-named real file.
+        let own = dir.join("111-9-0.png");
+        std::fs::write(&own, b"fake").unwrap();
+
+        // Non-own files — wrong shape — must survive regardless of age/count.
+        let unrelated = dir.join("note.txt");
+        std::fs::write(&unrelated, b"hello").unwrap();
+        let odd_name = dir.join("abc.png");
+        std::fs::write(&odd_name, b"hello").unwrap();
+
+        // A symlink with an OWN-LOOKING name pointing at a real file
+        // elsewhere — must never be followed, deleted, or counted against
+        // `keep`, even though its name alone would pass `is_own_screenshot_filename`.
+        let link_target = dir.join("real-target.png");
+        std::fs::write(&link_target, b"real").unwrap();
+        let symlink_path = dir.join("222-9-1.png");
+        std::os::unix::fs::symlink(&link_target, &symlink_path).unwrap();
+
+        // keep=0: pruning must consider every LEGIT candidate it finds — the
+        // strongest possible test that non-own files/symlinks are skipped by
+        // construction, not merely left alone because they were under the cap.
+        prune_old_screenshots(dir, 0);
+
+        assert!(!own.exists(), "the lone own-named real file should be pruned at keep=0");
+        assert!(unrelated.exists(), "a non-own file must never be pruned");
+        assert!(odd_name.exists(), "a non-matching .png name must never be pruned");
+        assert!(
+            std::fs::symlink_metadata(&symlink_path).is_ok(),
+            "a symlink must never be pruned, even with an own-looking name and keep=0"
+        );
+        assert!(link_target.exists(), "the symlink's target must never be deleted either");
+    }
+
+    #[test]
+    fn is_own_screenshot_filename_matches_only_the_exact_naming_scheme() {
+        assert!(is_own_screenshot_filename(Path::new("1700000000000-9-3.png")));
+        assert!(!is_own_screenshot_filename(Path::new("note.txt")));
+        assert!(!is_own_screenshot_filename(Path::new("abc.png")), "non-digit parts must not match");
+        assert!(!is_own_screenshot_filename(Path::new("1-2.png")), "must be exactly three parts");
+        assert!(!is_own_screenshot_filename(Path::new("1-2-3.jpg")), "must be a .png extension");
+        assert!(!is_own_screenshot_filename(Path::new("1--3.png")), "an empty middle part must not match");
     }
 
     // —— encode_jpeg_data_uri (issue #160 M3-B) ——
