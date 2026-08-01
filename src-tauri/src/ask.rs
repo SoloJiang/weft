@@ -1302,6 +1302,9 @@ pub struct Ask {
     pub thread_title: String,
     #[serde(default)]
     pub dir_name: String,
+    /// Owning workspace id, filled when listed (pending_asks).
+    #[serde(default)]
+    pub workspace_id: Option<i32>,
     /// The canonical, EXACT action identity (full command / full path set /
     /// full args) set by the engine's ask-creation call — distinct from
     /// `summary`, which may truncate for display. Used ONLY for Always-grant
@@ -1688,6 +1691,7 @@ impl AskRegistry {
             ts: now(),
             thread_title: String::new(),
             dir_name: String::new(),
+            workspace_id: None,
             action_key: action_key.to_string(),
         };
         g.open.push(ask.clone());

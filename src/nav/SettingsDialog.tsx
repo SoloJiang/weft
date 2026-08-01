@@ -37,9 +37,14 @@ import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 import { spawnableToolsOf } from "../lib/toolStatus.ts";
 import {
+  canOpenSystemNotificationSettings,
   ensureNotifyPermission,
+  formatQuietTime,
+  NOTIFY_CATEGORIES,
   notifyPermission,
   openSystemNotificationSettings,
+  parseQuietTime,
+  type NotifyCategory,
   type NotifyPermission,
 } from "../lib/notifications";
 import { useStore, type SettingsPage } from "../state/store";
@@ -79,17 +84,27 @@ const NAV_GROUPS: { labelKey: string; items: NavItem[] }[] = [
 
 export function SettingsScreen() {
   const { t } = useTranslation();
-  const { closeSettings, settingsInitialPage, clearSettingsInitialPage } = useStore();
+  const {
+    closeSettings,
+    settingsInitialPage,
+    clearSettingsInitialPage,
+    settingsRequestedPage,
+  } = useStore();
   // Seeded once from the store's one-shot request (e.g. the quota banner's "View
   // details" landing on Resources instead of General) — captured at mount, not
   // subscribed, so navigating within an already-open Settings never gets yanked
   // back by a stale request. Consumed immediately after so the NEXT openSettings()
   // (e.g. the nav rail's plain gear icon) isn't stuck reusing this destination.
+  // Live deep links while Settings is already open go through settingsRequestedPage.
   const [active, setActive] = useState<SettingsPage>(() => settingsInitialPage ?? "general");
   useEffect(() => {
     clearSettingsInitialPage();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  useEffect(() => {
+    if (settingsRequestedPage == null) return;
+    setActive(settingsRequestedPage.page);
+  }, [settingsRequestedPage]);
   const [query, setQuery] = useState("");
 
   const groups = useMemo(() => {
@@ -215,10 +230,28 @@ function GeneralSettings() {
     refreshDefaultTool,
     notifyEnabled,
     setNotifyEnabled,
+    notifyCategories,
+    setNotifyCategory,
+    quietHours,
+    setQuietHours,
   } = useStore();
   const [lang, setLangState] = useState<Lang>(currentLang());
 
   const spawnable = spawnableToolsOf(installedTools);
+  const canOpenNotificationSettings = canOpenSystemNotificationSettings();
+  const deniedNotificationHint = canOpenNotificationSettings ? (
+    <button
+      type="button"
+      onClick={() => void openSystemNotificationSettings()}
+      className="text-[11px] text-waiting transition-colors hover:text-ink hover:underline"
+    >
+      {t("settings.notifyDenied")}
+    </button>
+  ) : (
+    <span className="text-[11px] text-waiting">
+      {t("settings.notifyDeniedUnavailable")}
+    </span>
+  );
 
   // Per-tool command overrides ("aliases", e.g. claude → cc-claude). `draft`
   // holds in-progress edits; `saved` is what the backend persisted, so a Save
@@ -379,20 +412,69 @@ function GeneralSettings() {
           </div>
         </SettingRow>
         <SettingRow label={t("settings.notifications")} hint={t("settings.notificationsHint")}>
-          <div className="flex flex-col items-end gap-1">
+          <div className="flex flex-col items-end gap-2">
             <Toggle
               on={notifyEnabled}
               onChange={onNotifyToggle}
               label={t("settings.notifications")}
             />
-            {notifyEnabled && notifyPerm === "denied" && (
-              <button
-                type="button"
-                onClick={() => void openSystemNotificationSettings()}
-                className="text-[11px] text-waiting transition-colors hover:text-ink hover:underline"
-              >
-                {t("settings.notifyDenied")}
-              </button>
+            {notifyEnabled && notifyPerm === "denied" && deniedNotificationHint}
+            {notifyEnabled && (
+              <div className="flex w-full max-w-[280px] flex-col gap-1.5 rounded-[var(--radius-md)] border border-border bg-bg/50 px-2.5 py-2">
+                {NOTIFY_CATEGORIES.map((kind) => (
+                  <label
+                    key={kind}
+                    className="flex items-center justify-between gap-3 text-[12px] text-ink-muted"
+                  >
+                    <span>{t(`settings.notifyCat_${kind}`)}</span>
+                    <Toggle
+                      on={notifyCategories[kind]}
+                      onChange={(on) => setNotifyCategory(kind as NotifyCategory, on)}
+                      label={t(`settings.notifyCat_${kind}`)}
+                    />
+                  </label>
+                ))}
+                <div className="mt-1 border-t border-border pt-1.5">
+                  <label className="flex items-center justify-between gap-3 text-[12px] text-ink-muted">
+                    <span>{t("settings.notifyQuietHours")}</span>
+                    <Toggle
+                      on={quietHours.enabled}
+                      onChange={(on) => setQuietHours({ ...quietHours, enabled: on })}
+                      label={t("settings.notifyQuietHours")}
+                    />
+                  </label>
+                  {quietHours.enabled && (
+                    <div className="mt-1.5 flex items-center justify-end gap-1.5 text-[12px] text-ink-muted">
+                      <input
+                        type="time"
+                        value={formatQuietTime(quietHours.startMin)}
+                        onChange={(e) => {
+                          const v = parseQuietTime(e.currentTarget.value);
+                          if (v == null) return;
+                          setQuietHours({ ...quietHours, startMin: v });
+                        }}
+                        className="rounded-[var(--radius-sm)] border border-border bg-bg px-1.5 py-0.5 text-[12px] text-ink"
+                        aria-label={t("settings.notifyQuietStart")}
+                      />
+                      <span className="text-ink-faint">–</span>
+                      <input
+                        type="time"
+                        value={formatQuietTime(quietHours.endMin)}
+                        onChange={(e) => {
+                          const v = parseQuietTime(e.currentTarget.value);
+                          if (v == null) return;
+                          setQuietHours({ ...quietHours, endMin: v });
+                        }}
+                        className="rounded-[var(--radius-sm)] border border-border bg-bg px-1.5 py-0.5 text-[12px] text-ink"
+                        aria-label={t("settings.notifyQuietEnd")}
+                      />
+                    </div>
+                  )}
+                  <p className="mt-1 text-right text-[11px] leading-snug text-ink-faint">
+                    {t("settings.notifyQuietHoursHint")}
+                  </p>
+                </div>
+              </div>
             )}
           </div>
         </SettingRow>

@@ -26,6 +26,16 @@ import {
 } from "../lib/processQuota";
 import { routeReasonKey } from "../lib/engineRoutingDisplay";
 import { STORAGE_KEYS } from "../lib/storageKeys";
+import {
+  parseNotifyCategories,
+  parseQuietHours,
+  serializeNotifyCategories,
+  serializeQuietHours,
+  type NotifyCategory,
+  type NotifyCategoryFlags,
+  type NotificationOverview,
+  type QuietHours,
+} from "../lib/notificationsCore";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
@@ -64,6 +74,22 @@ import type {
 
 export type HomeTab = "board" | "repos" | "settings";
 export type ThreadTab = "lead" | "board";
+export interface NotificationHydration {
+  workspaceId: number | null;
+  /** Global permission asks have completed one authoritative pull. */
+  asks: boolean;
+  /** Active workspace Needs-you rows have completed one authoritative pull. */
+  workspaceNeeds: boolean;
+  /** Both Needs-you sources are ready for opening the combined surface. */
+  needs: boolean;
+  overview: boolean;
+  quota: boolean;
+  /** A quota push arrived before the initial status snapshot was ready. */
+  quotaPushPending: boolean;
+  liveWorkers: boolean;
+}
+
+const NOTIFICATION_SOURCE_RETRY_MS = 10_000;
 /** Settings nav destinations (mirrors `nav/SettingsDialog.tsx`'s own list —
  *  that file imports this type rather than redeclaring it, so the two can't
  *  drift). */
@@ -85,6 +111,10 @@ export interface OpenSession {
   /** the thread this session belongs to (the worker's parent). */
   threadId: number;
   nativeId: string | null;
+  /** True when the frontend observed this session from a local/event-driven start. */
+  eventDriven?: boolean;
+  /** Owning workspace when known (adopted/revived workers may predate a visit). */
+  workspaceId?: number;
 }
 
 const SESSION_STATUS: Record<TurnState, SessionStatus> = {
@@ -101,31 +131,29 @@ export function isInFlight(state: TurnState): boolean {
   return state === "busy" || state === "stalled";
 }
 
-/** A NeedItem the human must actually act on — excludes EITHER display-only
- *  NOTICE kind (`item.kind !== "question"`: the self-clearing stall hint, the
- *  stopped-worker hint, or the non-self-clearing PR/MR give-up notice). Every
- *  notice surfaces in the Needs-you queue as an FYI row but has no answer to
- *  give. Single source of truth for every "needs you" badge/count/urgent-flag
- *  so a notice can't inflate a number that promises "N things need your
- *  action" (issue #105) — even the one notice kind that, unlike the others,
- *  won't clear itself; see `NeedsRows.tsx`'s `AskRow` for how that one is
- *  instead made visually unmissable. */
+/** A NeedItem that accepts a human reply in a worker conversation. Persistent
+ *  action-required notices have a retry control instead, so they remain
+ *  excluded from the inline answer form and urgency checks. */
 export function isPendingNeed(item: NeedItem): boolean {
   return item.kind === "question";
 }
 
-/** Workspace-wide "needs you" count: real agent questions (excludes
- *  self-clearing NOTICEs via `isPendingNeed`) + tool-permission asks + pending
- *  write triggers — everything actually waiting on the human. Single source for
- *  every numeric badge (dock strip, nav item) so they can't drift apart; the
- *  Needs-you queue itself still RENDERS a notice row (so a stall hint stays
- *  reachable) — it just doesn't count toward this number. */
+/** A NeedItem that contributes to numeric "needs you" badges. Ordinary notices
+ *  are FYI-only; action-required notices stay counted because their retry
+ *  control needs explicit human attention. */
+export function isActionableNeed(item: NeedItem): boolean {
+  return item.kind === "question" || item.kind === "notice_action_required";
+}
+
+/** Workspace-wide "needs you" count: actionable Needs-you rows + tool-
+ *  permission asks + pending write triggers. The queue still renders ordinary
+ *  self-clearing notices as FYI rows without counting them. */
 export function pendingNeedsCount(
   needs: NeedItem[],
   asks: PermissionAsk[],
   writeTriggers: WriteTrigger[],
 ): number {
-  return needs.filter(isPendingNeed).length + asks.length + writeTriggers.length;
+  return needs.filter(isActionableNeed).length + asks.length + writeTriggers.length;
 }
 
 const PROCESS_QUOTA_NOTICE_VIEW: Record<
@@ -198,6 +226,18 @@ interface Store {
   activeWorkspaceId: number | null;
   repos: RepoRef[];
   threads: Thread[];
+  /** Cumulative thread_id → workspace_id map across visited workspaces. */
+  threadWorkspaceById: Record<number, number>;
+  /** Cumulative thread_id → kind map, including background workspace indexes. */
+  threadKindById: Record<number, string>;
+  /** Bumps after each selectWorkspace finishes loading repos/threads. */
+  workspaceLoadSeq: number;
+  /** True while selectWorkspace is mid-fetch/reset for the active workspace. */
+  workspaceLoading: boolean;
+  /** True while the workspace list is being restored during startup/refresh. */
+  workspaceRestoring: boolean;
+  /** True only after the latest workspace selection committed repos and threads. */
+  workspaceLoadReady: boolean;
   directionsByThread: Record<number, Direction[]>;
   worktreesByDirection: Record<number, Worktree[]>;
 
@@ -291,6 +331,8 @@ interface Store {
   /** App-wide process quota state; null until the governor's first snapshot. */
   processQuota: ProcessQuotaStatus | null;
   refreshProcessQuota: () => Promise<void>;
+  /** Initial notification sources have completed at least one authoritative load. */
+  notificationHydration: NotificationHydration;
   /** Whether the board canvas is showing the proposal's scope-confirm. */
   reviewingProposal: boolean;
   setReviewingProposal: (v: boolean) => void;
@@ -352,7 +394,11 @@ interface Store {
    *  name is shown. `dir` is the direction id as a string (backend convention,
    *  see WorkerConversation's dir-parsing note) or a non-numeric sentinel
    *  ("lead") for a thread-level ask with no specific direction. */
-  goToDirectionRef: (thread: number, dir: string) => Promise<void>;
+  goToDirectionRef: (
+    thread: number,
+    dir: string,
+    opts?: { repoId?: number; sessionId?: number },
+  ) => Promise<void>;
   answerPermission: (
     askId: number,
     answer: "allow" | "deny" | "always" | "full",
@@ -384,6 +430,11 @@ interface Store {
    *  `openSettings()` call (e.g. from the nav rail's gear icon). */
   settingsInitialPage: SettingsPage | null;
   clearSettingsInitialPage: () => void;
+  /** Live requested settings page while Settings is already open. Unlike
+   *  `settingsInitialPage`, this is not cleared on mount and is intended for
+   *  in-session deep links (e.g. quota notification → Resources). `seq`
+   *  changes even when the page repeats so SettingsScreen can re-apply. */
+  settingsRequestedPage: { page: SettingsPage; seq: number } | null;
   /** Jump to the workspace home's Repos tab. */
   openRepoMap: () => void;
   refreshRepoMap: () => Promise<void>;
@@ -434,7 +485,9 @@ interface Store {
 
   /** Workspace board: per-thread roll-ups for the portfolio view. */
   overview: ThreadOverview[];
-  refreshOverview: () => Promise<void>;
+  /** All-workspace roll-ups used by background review notifications. */
+  notificationOverview: NotificationOverview[];
+  refreshOverview: (force?: boolean) => Promise<void>;
 
   selectWorkspace: (id: number) => Promise<void>;
   refreshWorkspaces: () => Promise<void>;
@@ -526,9 +579,15 @@ interface Store {
   /** Auto-run the review skill when a task flows into the review column. */
   autoReview: boolean;
   setAutoReview: (on: boolean) => void;
-  /** OS notifications for new Needs-you items / review-ready sub-tasks. */
+  /** OS notifications master switch (categories below only apply when on). */
   notifyEnabled: boolean;
   setNotifyEnabled: (on: boolean) => void;
+  /** Per-category mute flags under the master switch. */
+  notifyCategories: NotifyCategoryFlags;
+  setNotifyCategory: (kind: NotifyCategory, on: boolean) => void;
+  /** Local quiet-hours window; suppresses OS pings while active. */
+  quietHours: QuietHours;
+  setQuietHours: (qh: QuietHours) => void;
   /** Prevent system idle sleep while any session is running. */
   keepAwake: boolean;
   setKeepAwake: (on: boolean) => void;
@@ -573,16 +632,67 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // workspace instead of the stale one captured when they started.
   const activeWorkspaceIdRef = useRef(activeWorkspaceId);
   activeWorkspaceIdRef.current = activeWorkspaceId;
+  const workspacesRef = useRef(workspaces);
+  workspacesRef.current = workspaces;
   const [repos, setRepos] = useState<RepoRef[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
+  const [threadWorkspaceById, setThreadWorkspaceById] = useState<Record<number, number>>({});
+  const [threadKindById, setThreadKindById] = useState<Record<number, string>>({});
+  const [workspaceLoadSeq, setWorkspaceLoadSeq] = useState(0);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceRestoring, setWorkspaceRestoring] = useState(true);
+  const [workspaceLoadReady, setWorkspaceLoadReady] = useState(false);
+  const workspaceSelectionGenerationRef = useRef(0);
+  const workspaceSelectionInFlightRef = useRef<
+    Map<number, { generation: number; promise: Promise<void> }>
+  >(new Map());
+  const rememberThreads = useCallback((list: Thread[]) => {
+    setThreads(list);
+    setThreadWorkspaceById((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const th of list) {
+        if (next[th.id] !== th.workspace_id) {
+          next[th.id] = th.workspace_id;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    setThreadKindById((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const th of list) {
+        if (next[th.id] !== th.kind) {
+          next[th.id] = th.kind;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, []);
   const [directionsByThread, setDirections] = useState<Record<number, Direction[]>>({});
   const [worktreesByDirection, setWorktrees] = useState<Record<number, Worktree[]>>({});
   const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
+  // Invalidates proposal loads started by an older selection. Notification
+  // navigation can await getProposal while a user manually selects another
+  // thread; the late response must not overwrite the new thread's proposal.
+  const threadSelectionGenerationRef = useRef(0);
   // Live mirror so async tasks can check the CURRENT active thread instead of
   // the stale one captured when they started (mirrors activeWorkspaceIdRef).
   const activeThreadIdRef = useRef(activeThreadId);
   activeThreadIdRef.current = activeThreadId;
   const [sessions, setSessions] = useState<Record<number, OpenSession>>({});
+  const [notificationHydration, setNotificationHydration] = useState<NotificationHydration>({
+    workspaceId: null,
+    asks: false,
+    workspaceNeeds: false,
+    needs: false,
+    overview: false,
+    quota: false,
+    quotaPushPending: false,
+    liveWorkers: false,
+  });
   const [checksByDirection, setChecksByDirection] = useState<Record<number, RepoChecks[]>>({});
   const [checkingDirections, setCheckingDirections] = useState<Record<number, boolean>>({});
   // Directions with an auto-(re)dispatch in flight, so the poll-driven effect
@@ -608,12 +718,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   });
   const [writeTriggers, setWriteTriggers] = useState<WriteTrigger[]>([]);
   const [needsByWorkspace, setNeedsByWorkspace] = useState<Record<number, number>>({});
+  const needsRefreshSeqRef = useRef(0);
+  const needsRefreshInFlightRef = useRef<Promise<void> | null>(null);
+  const needsRefreshPendingRef = useRef(false);
+  const needsRefreshTrailingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshNeedsRef = useRef<() => Promise<void>>(() => Promise.resolve());
   const [showNeeds, setShowNeeds] = useState(false);
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
   const [repoAnalysisActive, setRepoAnalysisActive] = useState(false);
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
   const [settingsInitialPage, setSettingsInitialPage] = useState<SettingsPage | null>(null);
+  const [settingsRequestedPage, setSettingsRequestedPage] = useState<
+    { page: SettingsPage; seq: number } | null
+  >(null);
+  const settingsRequestSeqRef = useRef(0);
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
   const [repoDrawerTab, setRepoDrawerTabState] = useState<"detail" | "curator">("detail");
@@ -636,11 +755,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   } | null>(null);
   const [proposal, setProposal] = useState<ResolvedProposal | null>(null);
   const [overview, setOverview] = useState<ThreadOverview[]>([]);
+  const [notificationOverview, setNotificationOverview] = useState<NotificationOverview[]>([]);
   // Monotonic request token so an older, slower-resolving workspace_overview
   // fetch (e.g. the WorkspaceKanban mount fetch racing a just-issued
   // post-create refresh) can never clobber a fresher one that already landed —
   // last REQUEST issued wins, not last response to arrive.
   const overviewReqRef = useRef(0);
+  const overviewInFlightRef = useRef<Promise<void> | null>(null);
+  const overviewPendingRef = useRef(false);
+  const refreshOverviewRef = useRef<(force?: boolean) => Promise<void>>(
+    () => Promise.resolve(),
+  );
   // Thread-bus drawer + proposal-review state.
   const [showBus, setShowBus] = useState(false);
   const [reviewingProposal, setReviewingProposal] = useState(false);
@@ -706,6 +831,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const [processQuota, setProcessQuota] = useState<ProcessQuotaStatus | null>(null);
   const processQuotaRef = useRef<ProcessQuotaStatus | null>(null);
+  const processQuotaObservedRef = useRef<ProcessQuotaStatus | null>(null);
+  const processQuotaFirstPushRef = useRef<ProcessQuotaStatus | null>(null);
+  const processQuotaHydratedRef = useRef(false);
   const applyProcessQuota = useCallback((next: ProcessQuotaStatus) => {
     const previous = processQuotaRef.current;
     if (!shouldApplyProcessQuotaStatus(previous, next)) return;
@@ -720,7 +848,25 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
   const refreshProcessQuota = useCallback(async () => {
     try {
-      applyProcessQuota(await api.processQuotaStatus());
+      const next = await api.processQuotaStatus();
+      const firstPush = processQuotaFirstPushRef.current;
+      const firstPushAdvancedBeyondRead =
+        firstPush !== null &&
+        (firstPush.transitionSeq > next.transitionSeq ||
+          (firstPush.transitionSeq === next.transitionSeq &&
+            firstPush.status !== next.status));
+      applyProcessQuota(next);
+      const observed = processQuotaObservedRef.current;
+      if (observed === null || shouldApplyProcessQuotaStatus(observed, next)) {
+        processQuotaObservedRef.current = next;
+      }
+      processQuotaFirstPushRef.current = null;
+      processQuotaHydratedRef.current = true;
+      setNotificationHydration((current) => ({
+        ...current,
+        quota: true,
+        quotaPushPending: current.quotaPushPending || firstPushAdvancedBeyondRead,
+      }));
     } catch (error) {
       // Pure Vite dev and an older backend do not expose the governor command.
       if (import.meta.env.DEV) console.error(error);
@@ -728,11 +874,32 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [applyProcessQuota]);
   useEffect(() => {
     const unlisten = listen<ProcessQuotaStatus>("process-quota://changed", (event) => {
+      const previous = processQuotaObservedRef.current;
+      const isNewTransition =
+        previous !== null && event.payload.transitionSeq > previous.transitionSeq;
+      if (previous === null) {
+        processQuotaFirstPushRef.current ??= event.payload;
+      }
+      if (
+        previous === null ||
+        shouldApplyProcessQuotaStatus(previous, event.payload)
+      ) {
+        processQuotaObservedRef.current = event.payload;
+      }
       applyProcessQuota(event.payload);
+      setNotificationHydration((current) => ({
+        ...current,
+        quota: processQuotaHydratedRef.current,
+        quotaPushPending: current.quotaPushPending || isNewTransition,
+      }));
     });
     void refreshProcessQuota();
+    const retryId = setInterval(() => {
+      if (!processQuotaHydratedRef.current) void refreshProcessQuota();
+    }, NOTIFICATION_SOURCE_RETRY_MS);
     return () => {
       void unlisten.then((stop) => stop());
+      clearInterval(retryId);
     };
   }, [applyProcessQuota, refreshProcessQuota]);
 
@@ -758,14 +925,37 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(STORAGE_KEYS.autoReview, on ? "1" : "0");
     setAutoReviewState(on);
   }, []);
-  // System notifications: new Needs-you items / review-ready sub-tasks raise an
-  // OS notification while the window is unfocused. Default ON.
+  // System notifications: master switch + per-category mutes + quiet hours.
+  // Default master ON; categories all ON; quiet hours OFF.
   const [notifyEnabled, setNotifyEnabledState] = useState(
     () => localStorage.getItem(STORAGE_KEYS.notify) !== "0",
   );
   const setNotifyEnabled = useCallback((on: boolean) => {
     localStorage.setItem(STORAGE_KEYS.notify, on ? "1" : "0");
     setNotifyEnabledState(on);
+    setNotificationHydration((current) => ({ ...current, overview: false }));
+    setNotificationOverview([]);
+  }, []);
+  const [notifyCategories, setNotifyCategoriesState] = useState<NotifyCategoryFlags>(
+    () => parseNotifyCategories(localStorage.getItem(STORAGE_KEYS.notifyCategories)),
+  );
+  const setNotifyCategory = useCallback((kind: NotifyCategory, on: boolean) => {
+    setNotifyCategoriesState((prev) => {
+      const next = { ...prev, [kind]: on };
+      localStorage.setItem(STORAGE_KEYS.notifyCategories, serializeNotifyCategories(next));
+      return next;
+    });
+    if (kind === "review") {
+      setNotificationHydration((current) => ({ ...current, overview: false }));
+      setNotificationOverview([]);
+    }
+  }, []);
+  const [quietHours, setQuietHoursState] = useState<QuietHours>(
+    () => parseQuietHours(localStorage.getItem(STORAGE_KEYS.notifyQuietHours)),
+  );
+  const setQuietHours = useCallback((qh: QuietHours) => {
+    localStorage.setItem(STORAGE_KEYS.notifyQuietHours, serializeQuietHours(qh));
+    setQuietHoursState(qh);
   }, []);
   // Keep-awake: hold a "prevent idle sleep" OS assertion while any session is
   // busy (the display may still turn off). Default ON; synced to the backend
@@ -876,49 +1066,151 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refreshWorkspaces = useCallback(async () => {
-    const ws = await api.listWorkspaces();
-    setWorkspaces(ws);
-    setActiveWorkspaceId((cur) => {
-      // Keep the live selection as long as it still exists.
-      if (cur != null && ws.some((w) => w.id === cur)) return cur;
-      // Cold start / webview reload drops the in-memory selection back to null;
-      // restore the last-used workspace instead of snapping to the first one.
-      // Only fall back to the first when the saved id is gone (deleted) or there
-      // is none yet.
-      const saved = Number(localStorage.getItem(STORAGE_KEYS.activeWorkspace));
-      if (saved && ws.some((w) => w.id === saved)) return saved;
-      return ws[0]?.id ?? null;
-    });
+    setWorkspaceRestoring(true);
+    try {
+      const ws = await api.listWorkspaces();
+      setWorkspaces(ws);
+      // Lead turns are global and can belong to a workspace the user has not
+      // visited since this WebView launched. Index all thread owners before the
+      // notification baseline arms, so a background lead stall is not dropped.
+      const threadLists = await Promise.all(
+        ws.map(async (workspace) => {
+          try {
+            return await api.listThreads(workspace.id);
+          } catch (e) {
+            console.error(e);
+            return [];
+          }
+        }),
+      );
+      setThreadWorkspaceById((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const list of threadLists) {
+          for (const thread of list) {
+            if (next[thread.id] === thread.workspace_id) continue;
+            next[thread.id] = thread.workspace_id;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+      setThreadKindById((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const list of threadLists) {
+          for (const thread of list) {
+            if (next[thread.id] !== thread.kind) {
+              next[thread.id] = thread.kind;
+              changed = true;
+            }
+          }
+        }
+        return changed ? next : prev;
+      });
+      setActiveWorkspaceId((cur) => {
+        // Keep the live selection as long as it still exists.
+        if (cur != null && ws.some((w) => w.id === cur)) return cur;
+        // Cold start / webview reload drops the in-memory selection back to null;
+        // restore the last-used workspace instead of snapping to the first one.
+        // Only fall back to the first when the saved id is gone (deleted) or there
+        // is none yet.
+        const saved = Number(localStorage.getItem(STORAGE_KEYS.activeWorkspace));
+        if (saved && ws.some((w) => w.id === saved)) return saved;
+        return ws[0]?.id ?? null;
+      });
+    } finally {
+      setWorkspaceRestoring(false);
+    }
   }, []);
 
-  const selectWorkspace = useCallback(async (id: number) => {
-    setActiveWorkspaceId(id);
-    // Clear the old workspace's repo map first so the curator panel (gated on
-    // repoProfiles.length >= 2) can't mount from stale, other-workspace profiles
-    // during the switch and ensure a thread for the wrong workspace.
-    setRepoProfiles([]);
-    setRepoEdges([]);
-    // Remember the choice so a relaunch/reload lands here, not on the first one.
-    localStorage.setItem(STORAGE_KEYS.activeWorkspace, String(id));
-    // Drop the previous workspace's curator thread id so it is re-ensured lazily.
-    setCuratorThreadId(null);
-    // Repos side panel: open state resets each visit (canvas starts full-width);
-    // per-surface width is remembered in the panel's own localStorage, not here.
-    setRepoDrawerOpen(false);
-    setRepoDrawerTabState("detail");
-    setSelectedRepoId(null);
-    const [r, t] = await Promise.all([api.listRepos(id), api.listThreads(id)]);
-    setRepos(r);
-    setThreads(t);
-    setDirections({});
-    setWorktrees({});
-    setActiveThreadId(null);
-    setViewing(null);
-    setShowNeeds(false);
-    setHomeTab("board");
-    setProposal(null);
-    setOverview([]);
-  }, []);
+  const selectWorkspace = useCallback((id: number): Promise<void> => {
+    const inFlight = workspaceSelectionInFlightRef.current.get(id);
+    if (inFlight && inFlight.generation === workspaceSelectionGenerationRef.current) {
+      return inFlight.promise;
+    }
+    const load = (async () => {
+      const selectionGeneration = ++workspaceSelectionGenerationRef.current;
+      setActiveWorkspaceId(id);
+      setWorkspaceRestoring(false);
+      setWorkspaceLoading(true);
+      setWorkspaceLoadReady(false);
+      // Do not render the previous workspace's actionable rows under the new
+      // workspace while its authoritative Needs refresh is still pending.
+      setNeeds([]);
+      setWriteTriggers([]);
+      setNotificationHydration((current) => ({
+        ...current,
+        workspaceId: id,
+        workspaceNeeds: false,
+        needs: false,
+        overview: false,
+      }));
+      try {
+        // Clear the old workspace's repo map first so the curator panel (gated on
+        // repoProfiles.length >= 2) can't mount from stale, other-workspace profiles
+        // during the switch and ensure a thread for the wrong workspace.
+        setRepoProfiles([]);
+        setRepoEdges([]);
+        // Remember the choice so a relaunch/reload lands here, not on the first one.
+        localStorage.setItem(STORAGE_KEYS.activeWorkspace, String(id));
+        // Drop the previous workspace's curator thread id so it is re-ensured lazily.
+        setCuratorThreadId(null);
+        // Repos side panel: open state resets each visit (canvas starts full-width);
+        // per-surface width is remembered in the panel's own localStorage, not here.
+        setRepoDrawerOpen(false);
+        setRepoDrawerTabState("detail");
+        setSelectedRepoId(null);
+        const [r, t] = await Promise.all([api.listRepos(id), api.listThreads(id)]);
+        if (selectionGeneration !== workspaceSelectionGenerationRef.current) return;
+        setRepos(r);
+        rememberThreads(t);
+        setDirections({});
+        setWorktrees({});
+        setActiveThreadId(null);
+        setViewing(null);
+        setShowNeeds(false);
+        setHomeTab("board");
+        setProposal(null);
+        // A concurrent overview poll may have marked the source ready before this
+        // load resets its data. Invalidate that response and re-arm hydration for
+        // the empty snapshot that is now authoritative until the next poll.
+        overviewReqRef.current += 1;
+        setOverview([]);
+        setNotificationHydration((current) => {
+          if (current.workspaceId !== id) return current;
+          return { ...current, overview: false };
+        });
+        setWorkspaceLoadReady(true);
+      } finally {
+        // Deep-link markers count every settled load. Route application separately
+        // checks workspaceLoadReady so a rejected load can never satisfy a route
+        // prerequisite with stale repos/threads.
+        setWorkspaceLoadSeq((n) => n + 1);
+        if (selectionGeneration === workspaceSelectionGenerationRef.current) {
+          setWorkspaceLoading(false);
+        }
+      }
+    })();
+    const tracked = load.then(
+      () => {
+        if (workspaceSelectionInFlightRef.current.get(id)?.promise === tracked) {
+          workspaceSelectionInFlightRef.current.delete(id);
+        }
+      },
+      (error) => {
+        if (workspaceSelectionInFlightRef.current.get(id)?.promise === tracked) {
+          workspaceSelectionInFlightRef.current.delete(id);
+        }
+        throw error;
+      },
+    );
+    workspaceSelectionInFlightRef.current.set(id, {
+      generation: workspaceSelectionGenerationRef.current,
+      promise: tracked,
+    });
+    return tracked;
+  }, [rememberThreads]);
 
   const loadThreadChildren = useCallback(async (threadId: number) => {
     const dirs = await api.listDirections(threadId);
@@ -935,6 +1227,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const selectThread = useCallback(
     async (threadId: number) => {
+      const selectionGeneration = ++threadSelectionGenerationRef.current;
       setActiveThreadId(threadId);
       setViewing(null);
       setShowNeeds(false);
@@ -942,34 +1235,109 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setThreadTab("lead");
       setShowBus(false);
       setReviewingProposal(false);
+      setProposal(null);
       try {
-        setProposal(await api.getProposal(threadId));
+        const nextProposal = await api.getProposal(threadId);
+        if (
+          selectionGeneration !== threadSelectionGenerationRef.current ||
+          (nextProposal != null && nextProposal.thread_id !== threadId)
+        ) {
+          return;
+        }
+        setProposal(nextProposal);
       } catch (e) {
-        setProposal(null);
+        if (selectionGeneration === threadSelectionGenerationRef.current) {
+          setProposal(null);
+        }
       }
       await loadThreadChildren(threadId);
     },
     [loadThreadChildren],
   );
 
-  const refreshOverview = useCallback(async () => {
-    if (activeWorkspaceId == null) {
+  const refreshOverviewOnce = useCallback(async () => {
+    const activeId = activeWorkspaceIdRef.current;
+    if (activeId == null) {
       overviewReqRef.current += 1;
       setOverview([]);
+      setNotificationOverview([]);
       return;
     }
+    const workspaceIds = new Set(workspacesRef.current.map((workspace) => workspace.id));
+    workspaceIds.add(activeId);
     const reqId = ++overviewReqRef.current;
     try {
-      const data = await api.workspaceOverview(activeWorkspaceId);
-      // A newer refreshOverview() was issued while this one was in flight —
+      const entries = await Promise.all(
+        [...workspaceIds].map(async (workspaceId) => {
+          try {
+            return {
+              workspaceId,
+              data: await api.workspaceOverview(workspaceId),
+            };
+          } catch (error) {
+            console.error(error);
+            return { workspaceId, data: null };
+          }
+        }),
+      );
+      // A newer refreshOverviewOnce() was issued while this one was in flight —
       // drop this stale response instead of overwriting the fresher state.
-      if (reqId !== overviewReqRef.current) return;
-      setOverview(data);
+      if (
+        reqId !== overviewReqRef.current ||
+        activeWorkspaceIdRef.current !== activeId
+      ) {
+        return;
+      }
+      const activeOverview = entries.find((entry) => entry.workspaceId === activeId);
+      if (activeOverview?.data != null) setOverview(activeOverview.data);
+      const allOverview = entries.flatMap((entry) =>
+        entry.data?.map((row) => ({ ...row, workspace_id: entry.workspaceId })) ?? [],
+      );
+      setNotificationOverview(allOverview);
+      const allWorkspacesSucceeded = entries.every((entry) => entry.data != null);
+      setNotificationHydration((current) => {
+        if (current.workspaceId !== activeId) return current;
+        return { ...current, overview: allWorkspacesSucceeded };
+      });
     } catch (e) {
       /* ignore */
       console.error(e);
     }
-  }, [activeWorkspaceId]);
+  }, []);
+
+  const refreshOverview = useCallback(async (force = false) => {
+    const inFlight = overviewInFlightRef.current;
+    if (inFlight) {
+      if (!force) {
+        await inFlight;
+        return;
+      }
+      // A mutation caller must observe a pass issued AFTER the in-flight poll,
+      // not merely the stale pass that started before its backend mutation.
+      overviewPendingRef.current = true;
+      await inFlight;
+      const trailing = overviewInFlightRef.current;
+      if (trailing && trailing !== inFlight) {
+        await trailing;
+        return;
+      }
+      if (overviewPendingRef.current) {
+        overviewPendingRef.current = false;
+        await refreshOverviewRef.current(true);
+      }
+      return;
+    }
+    overviewPendingRef.current = false;
+    const current = refreshOverviewOnce();
+    overviewInFlightRef.current = current;
+    try {
+      await current;
+    } finally {
+      if (overviewInFlightRef.current !== current) return;
+      overviewInFlightRef.current = null;
+    }
+  }, [refreshOverviewOnce]);
+  refreshOverviewRef.current = refreshOverview;
 
   const backToWorkspace = useCallback(() => {
     setActiveThreadId(null);
@@ -981,6 +1349,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const openSettings = useCallback(
     (page?: SettingsPage) => {
+      const requestPage = (target: SettingsPage) => {
+        settingsRequestSeqRef.current += 1;
+        setSettingsRequestedPage({
+          page: target,
+          seq: settingsRequestSeqRef.current,
+        });
+      };
+      // Already on Settings: only navigate pages. Re-snapshotting would capture
+      // homeTab="settings" and make Back restore Settings instead of the app.
+      if (homeTab === "settings") {
+        if (page != null) {
+          requestPage(page);
+        }
+        return;
+      }
       // Snapshot first — once we flip homeTab + clear thread/viewing the
       // info is gone and the back arrow can't restore it.
       prevHomeRef.current = {
@@ -993,6 +1376,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setViewing(null);
       setShowNeeds(false);
       setSettingsInitialPage(page ?? null);
+      if (page != null) {
+        requestPage(page);
+      } else {
+        setSettingsRequestedPage(null);
+      }
       setHomeTab("settings");
     },
     [homeTab, activeThreadId, viewing, showNeeds],
@@ -1005,6 +1393,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const closeSettings = useCallback(() => {
     const prev = prevHomeRef.current;
     prevHomeRef.current = null;
+    setSettingsRequestedPage(null);
     if (!prev) {
       // First-launch / direct deep link into Settings — nothing to restore.
       setHomeTab("board");
@@ -1052,6 +1441,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
 
       setActiveWorkspaceId(null);
+      setWorkspaceLoadReady(false);
       setRepos([]);
       setThreads([]);
       setDirections({});
@@ -1070,6 +1460,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setSelectedRepoId(null);
       setProposal(null);
       setOverview([]);
+      setNotificationOverview([]);
     },
     [selectWorkspace],
   );
@@ -1224,9 +1615,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // views are already consistent. See issue #106.
       const [threadList] = await Promise.all([
         api.listThreads(activeWorkspaceId),
-        refreshOverview(),
+        refreshOverview(true),
       ]);
-      setThreads(threadList);
+      rememberThreads(threadList);
       return t;
     },
     [activeWorkspaceId, refreshOverview],
@@ -1236,7 +1627,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     async (threadId: number) => {
       await api.deleteThread(threadId);
       if (activeWorkspaceId != null)
-        setThreads(await api.listThreads(activeWorkspaceId));
+        rememberThreads(await api.listThreads(activeWorkspaceId));
       setDirections((m) => {
         const n = { ...m };
         delete n[threadId];
@@ -1301,13 +1692,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           status: "running",
           directionId,
           repoId,
-          threadId: activeThreadId ?? -1,
+          threadId: info.thread_id,
           nativeId: info.native_id,
+          eventDriven: true,
         },
       }));
       if (focus) openWorker(directionId, repoId);
     },
-    [activeThreadId, openWorker],
+    [openWorker],
   );
 
   const viewDirection = useCallback(
@@ -1354,15 +1746,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             status: "running",
             directionId,
             repoId,
-            threadId: activeThreadId ?? -1,
+            // The backend resolves the direction's owning thread. Do not use
+            // activeThreadId here: background auto-review can start a worker
+            // for a different cached thread while another issue is open.
+            threadId: info.thread_id,
             nativeId: info.native_id,
+            eventDriven: true,
           },
         };
       });
       if (focus) openWorker(directionId, repoId);
       return info.session_id;
     },
-    [activeThreadId, openWorker],
+    [openWorker],
   );
 
   // Adopt a backend-initiated worker (boot revive, or one still alive after a
@@ -1374,41 +1770,55 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // authoritatively by the backend (see the idle-turn handler), so the busy seed
   // below is UI-only (typing indicator / Stop button / nav running count) and arms
   // no verify latch.
-  const adoptWorker = useCallback((slot: LiveWorkerSlot) => {
-    const sid = slot.info.session_id;
-    if (slot.busy) {
-      // Seed the worker's busy turn state so the chat surface shows the typing
-      // indicator + Stop button and WorkspaceNav counts it as running — a revived
-      // worker emits no turn push until its turn completes. Done BEFORE the
-      // already-mapped early return so a session that driveDirection (the
-      // active-thread redispatch) inserted without a workerTurn entry still gets
-      // seeded. Guard on absence so a raced idle/stopped value the listener already
-      // recorded wins. (Verify is backend-driven, so this seeds UI state only.)
-      setWorkerTurn((t) =>
-        t[sid] ? t : { ...t, [sid]: { state: "busy", queue: slot.queue ?? [] } },
-      );
-    }
-    if (sessionsRef.current[sid]) return;
-    // Reconcile status with any turn state the lead-chat listener already recorded:
-    // if the worker's idle push raced in before this adoption, the live slot still
-    // says busy, but the dot/live-counts must show idle (not stuck "running").
-    const status = adoptionStatus(workerTurnRef.current[sid]?.state, slot.busy);
-    setSessions((m) =>
-      m[sid]
-        ? m
-        : {
-            ...m,
-            [sid]: {
-              info: slot.info,
-              status,
-              directionId: slot.direction_id,
-              repoId: slot.repo_id,
-              threadId: slot.thread_id,
-              nativeId: slot.info.native_id,
+  const adoptWorker = useCallback(
+    (slot: LiveWorkerSlot, eventDriven = false) => {
+      const sid = slot.info.session_id;
+      if (slot.busy) {
+        // Seed the worker's busy turn state so the chat surface shows the typing
+        // indicator + Stop button and WorkspaceNav counts it as running — a revived
+        // worker emits no turn push until its turn completes. Done BEFORE the
+        // already-mapped early return so a session that driveDirection (the
+        // active-thread redispatch) inserted without a workerTurn entry still gets
+        // seeded. Guard on absence so a raced idle/stopped value the listener already
+        // recorded wins. (Verify is backend-driven, so this seeds UI state only.)
+        setWorkerTurn((t) =>
+          t[sid] ? t : { ...t, [sid]: { state: "busy", queue: slot.queue ?? [] } },
+        );
+      }
+      if (sessionsRef.current[sid]) {
+        if (eventDriven && !sessionsRef.current[sid].eventDriven) {
+          setSessions((m) =>
+            m[sid] && !m[sid].eventDriven
+              ? { ...m, [sid]: { ...m[sid], eventDriven: true } }
+              : m,
+          );
+        }
+        return;
+      }
+      // Reconcile status with any turn state the lead-chat listener already recorded:
+      // if the worker's idle push raced in before this adoption, the live slot still
+      // says busy, but the dot/live-counts must show idle (not stuck "running").
+      const status = adoptionStatus(workerTurnRef.current[sid]?.state, slot.busy);
+      setSessions((m) =>
+        m[sid]
+          ? m
+          : {
+              ...m,
+              [sid]: {
+                info: slot.info,
+                status,
+                directionId: slot.direction_id,
+                repoId: slot.repo_id,
+                threadId: slot.thread_id,
+                nativeId: slot.info.native_id,
+                eventDriven,
+                workspaceId: slot.workspace_id ?? undefined,
+              },
             },
-          },
-    );
-  }, []);
+      );
+    },
+    [],
+  );
 
   // Pull the backend's live worker engines and adopt any the frontend doesn't
   // know about. Called on mount (backstop for workers live before the listener
@@ -1418,43 +1828,81 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // (e.g. the revive event firing while the mount pull is still in flight).
   const hydratingRef = useRef(false);
   const hydratePendingRef = useRef(false);
-  const hydrateLiveWorkers = useCallback(async () => {
+  const hydratePendingEventRef = useRef(false);
+  const hydrateTrailingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hydrateLiveWorkersRef = useRef<
+    (eventDriven?: boolean) => Promise<void>
+  >(() => Promise.resolve());
+  const liveWorkersHydratedRef = useRef(false);
+  const scheduleTrailingHydrate = useCallback(() => {
+    if (hydrateTrailingTimerRef.current != null) return;
+    hydrateTrailingTimerRef.current = setTimeout(() => {
+      hydrateTrailingTimerRef.current = null;
+      if (hydratingRef.current) return;
+      void hydrateLiveWorkersRef.current().catch((error) => console.error(error));
+    }, 0);
+  }, []);
+  const hydrateLiveWorkers = useCallback(async (eventDriven = false) => {
     if (hydratingRef.current) {
       hydratePendingRef.current = true;
+      hydratePendingEventRef.current ||= eventDriven;
       return;
     }
     hydratingRef.current = true;
+    const passEventDriven =
+      eventDriven ||
+      hydratePendingEventRef.current ||
+      liveWorkersHydratedRef.current;
+    hydratePendingEventRef.current = false;
     try {
-      do {
-        hydratePendingRef.current = false;
-        const slots = await api.listLiveWorkerSlots();
-        // Load each adopted worker's thread directions so WorkspaceNav can match the
-        // session to its direction and count it as running — a revived worker can
-        // live in a thread the user never opened this session, whose
-        // directionsByThread entry would otherwise be empty. (Best-effort; verify
-        // does not depend on this — the backend reads the phase itself.)
-        const threadIds = [...new Set(slots.map((s) => s.thread_id))];
-        await Promise.all(
-          threadIds.map(async (tid) => {
-            try {
-              const dirs = await api.listDirections(tid);
-              setDirections((m) => ({ ...m, [tid]: dirs }));
-            } catch (e) {
-              /* best-effort: a thread whose directions fail to load just won't
-                 show its running count until opened */
-      console.error(e);
-    }
-          }),
-        );
-        for (const slot of slots) adoptWorker(slot);
-      } while (hydratePendingRef.current);
+      const slots = await api.listLiveWorkerSlots();
+      // Load each adopted worker's thread directions so WorkspaceNav can match the
+      // session to its direction and count it as running — a revived worker can
+      // live in a thread the user never opened this session, whose
+      // directionsByThread entry would otherwise be empty. (Best-effort; verify
+      // does not depend on this — the backend reads the phase itself.)
+      const threadIds = [...new Set(slots.map((s) => s.thread_id))];
+      await Promise.all(
+        threadIds.map(async (tid) => {
+          try {
+            const dirs = await api.listDirections(tid);
+            setDirections((m) => ({ ...m, [tid]: dirs }));
+          } catch (e) {
+            /* best-effort: a thread whose directions fail to load just won't
+               show its running count until opened */
+            console.error(e);
+          }
+        }),
+      );
+      for (const slot of slots) adoptWorker(slot, passEventDriven);
+      // Index adopted workers' thread ownership so notifications can route
+      // even before the user visits those workspaces.
+      setThreadWorkspaceById((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const slot of slots) {
+          if (slot.workspace_id == null) continue;
+          if (next[slot.thread_id] !== slot.workspace_id) {
+            next[slot.thread_id] = slot.workspace_id;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+      liveWorkersHydratedRef.current = true;
+      setNotificationHydration((current) => ({ ...current, liveWorkers: true }));
     } catch (e) {
       /* best-effort hydration */
       console.error(e);
     } finally {
       hydratingRef.current = false;
+      if (hydratePendingRef.current) {
+        hydratePendingRef.current = false;
+        scheduleTrailingHydrate();
+      }
     }
-  }, [adoptWorker]);
+  }, [adoptWorker, scheduleTrailingHydrate]);
+  hydrateLiveWorkersRef.current = hydrateLiveWorkers;
 
   // Adopt backend-headless workers the frontend never drove (boot revive, or
   // alive after a reload/HMR). Register the `worker-revived` listener BEFORE the
@@ -1467,8 +1915,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let un: (() => void) | undefined;
     let cancelled = false;
+    const retryId = setInterval(() => {
+      if (!liveWorkersHydratedRef.current) void hydrateLiveWorkers();
+    }, NOTIFICATION_SOURCE_RETRY_MS);
     async function attach() {
-      un = await listen("worker-revived", () => void hydrateLiveWorkers());
+      un = await listen("worker-revived", () => void hydrateLiveWorkers(true));
       if (cancelled) {
         un();
         un = undefined;
@@ -1480,6 +1931,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
       un?.();
+      clearInterval(retryId);
+      if (hydrateTrailingTimerRef.current != null) {
+        clearTimeout(hydrateTrailingTimerRef.current);
+        hydrateTrailingTimerRef.current = null;
+      }
     };
   }, [hydrateLiveWorkers]);
 
@@ -1864,6 +2320,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                   [sid]: {
                     ...m[sid],
                     status: SESSION_STATUS[p.state],
+                    eventDriven: true,
                   },
                 }
               : m,
@@ -2214,10 +2671,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [activeThreadId],
   );
 
-  const refreshNeeds = useCallback(async () => {
+  const refreshNeedsOnce = useCallback(async () => {
+    const workspaceId = activeWorkspaceIdRef.current;
+    const requestId = ++needsRefreshSeqRef.current;
+    const isLatestRequest = () => requestId === needsRefreshSeqRef.current;
     // Permission Asks are global (not workspace-scoped); always refresh them.
     try {
-      setAsks(await api.pendingAsks());
+      const nextAsks = await api.pendingAsks();
+      if (isLatestRequest()) {
+        setAsks(nextAsks);
+        setNotificationHydration((current) => ({
+          ...current,
+          asks: true,
+          needs: current.workspaceNeeds,
+        }));
+      }
     } catch (e) {
       /* server may not be ready */
       console.error(e);
@@ -2225,7 +2693,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // Standing grants are global too; refresh so "inherited access" markers stay
     // in sync (e.g. seeded from disk at boot, or granted in another view).
     try {
-      setAuthGrants(await api.listAuthGrants());
+      const nextGrants = await api.listAuthGrants();
+      if (isLatestRequest()) setAuthGrants(nextGrants);
     } catch (e) {
       console.error(e);
     }
@@ -2234,30 +2703,88 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // releaseSessionReadOnly/revokeReadOnlyGrant below) is the only way the
     // frontend's copy stays honest; the backend's own gate never depends on it.
     try {
-      setReadOnlyGrants(await api.readOnlyGrants());
+      const nextGrants = await api.readOnlyGrants();
+      if (isLatestRequest()) setReadOnlyGrants(nextGrants);
     } catch (e) {
       console.error(e);
     }
-    if (activeWorkspaceId == null) {
-      setNeeds([]);
-      setWriteTriggers([]);
+    if (workspaceId == null) {
+      if (isLatestRequest() && activeWorkspaceIdRef.current == null) {
+        setNeeds([]);
+        setWriteTriggers([]);
+        setNotificationHydration((current) => ({
+          ...current,
+          workspaceNeeds: true,
+          needs: current.asks,
+        }));
+      }
       return;
     }
     try {
-      setNeeds(await api.needsYou(activeWorkspaceId));
-      setWriteTriggers(await api.writeTriggers(activeWorkspaceId));
+      const [nextNeeds, nextWriteTriggers] = await Promise.all([
+        api.needsYou(workspaceId),
+        api.writeTriggers(workspaceId),
+      ]);
+      if (isLatestRequest() && activeWorkspaceIdRef.current === workspaceId) {
+        setNeeds(nextNeeds);
+        setWriteTriggers(nextWriteTriggers);
+        setNotificationHydration((current) => {
+          if (current.workspaceId !== workspaceId) return current;
+          return {
+            ...current,
+            workspaceNeeds: true,
+            needs: current.asks,
+          };
+        });
+      }
     } catch (e) {
       /* bus may not be ready */
       console.error(e);
     }
     // per-workspace counts so the switcher can flag OTHER workspaces.
     try {
-      setNeedsByWorkspace(Object.fromEntries(await api.workspaceNeedsCounts()));
+      const counts = await api.workspaceNeedsCounts();
+      if (isLatestRequest()) setNeedsByWorkspace(Object.fromEntries(counts));
     } catch (e) {
       /* ignore */
       console.error(e);
     }
-  }, [activeWorkspaceId]);
+  }, []);
+
+  const scheduleTrailingNeedsRefresh = useCallback(() => {
+    if (needsRefreshTrailingTimerRef.current != null) return;
+    needsRefreshTrailingTimerRef.current = setTimeout(() => {
+      needsRefreshTrailingTimerRef.current = null;
+      // A caller may have started the trailing pass before this timer fired;
+      // that pass already represents the pending refresh.
+      if (needsRefreshInFlightRef.current != null) return;
+      void refreshNeedsRef.current().catch((error) => console.error(error));
+    }, 0);
+  }, []);
+
+  const refreshNeeds = useCallback(async () => {
+    const inFlight = needsRefreshInFlightRef.current;
+    if (inFlight) {
+      // Coalesce callers onto the current pass, but let each waiter resolve
+      // when that bounded pass ends. A trailing pass is scheduled separately.
+      needsRefreshPendingRef.current = true;
+      await inFlight;
+      return;
+    }
+    const current = refreshNeedsOnce();
+    needsRefreshInFlightRef.current = current;
+    try {
+      await current;
+    } finally {
+      if (needsRefreshInFlightRef.current !== current) return;
+      needsRefreshInFlightRef.current = null;
+      if (needsRefreshPendingRef.current) {
+        needsRefreshPendingRef.current = false;
+        scheduleTrailingNeedsRefresh();
+      }
+    }
+  }, [refreshNeedsOnce, scheduleTrailingNeedsRefresh]);
+  refreshNeedsRef.current = refreshNeeds;
 
   const openNeeds = useCallback(() => {
     setViewing(null);
@@ -2321,7 +2848,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // across threads — refresh the board overview and the open thread's children
       // so stale task cards (now pointing at deleted rows) don't linger and open
       // blank worker views or failed diff/session fetches.
-      await refreshOverview();
+      await refreshOverview(true);
       if (activeThreadId != null) await loadThreadChildren(activeThreadId);
     },
     [activeWorkspaceId, refreshReposAndMap, refreshOverview, activeThreadId, loadThreadChildren],
@@ -2339,7 +2866,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const id = await api.openCuratorChat(ws); // get-or-create; returns the id
       const list = await api.listThreads(ws);
       if (activeWorkspaceIdRef.current === ws) {
-        setThreads(list);
+        rememberThreads(list);
         setCuratorThreadId(id);
       }
       return id;
@@ -2367,9 +2894,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setRepoDrawerOpen(true);
   }, []);
   const openCurator = useCallback(() => {
+    // Curator lives inside RepoMapView's side panel. Always land on the Repo Map
+    // first and clear issue/worker overlays; otherwise openCurator only flips
+    // drawer flags that no mounted surface can show.
+    setActiveThreadId(null);
+    setShowNeeds(false);
+    setViewing(null);
+    setHomeTab("repos");
     setRepoDrawerTabState("curator");
     setRepoDrawerOpen(true);
-  }, []);
+    void refreshRepoMap();
+  }, [refreshRepoMap]);
 
   // Every Analyze entry — the graph's button, the map's regenerate, or a typed
   // request — funnels to the ONE reanalyze tool: post a real user message to the
@@ -2820,14 +3355,37 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // never spawned a worker). `dir` non-numeric (e.g. the "lead" sentinel) just
   // fails the live lookup and falls through to the thread — never throws.
   const goToDirectionRef = useCallback(
-    async (thread: number, dir: string) => {
+    async (
+      thread: number,
+      dir: string,
+      opts?: { repoId?: number; sessionId?: number },
+    ) => {
       setShowNeeds(false);
       setViewing(null);
       const directionId = Number(dir);
-      const live = Number.isFinite(directionId)
-        ? Object.values(sessions).find((s) => s.directionId === directionId)
+      const all = Object.values(sessions);
+      let live =
+      opts?.sessionId != null
+        ? all.find(
+            (s) => s.info.session_id === opts.sessionId && s.status !== "exited",
+          )
         : undefined;
+      if (!live && opts?.repoId != null && Number.isFinite(directionId)) {
+        live = all.find(
+          (s) =>
+            s.directionId === directionId &&
+            s.repoId === opts.repoId &&
+            s.status !== "exited",
+        );
+      }
+      if (!live && opts?.repoId == null && Number.isFinite(directionId)) {
+        live = all.find(
+          (s) => s.directionId === directionId && s.status !== "exited",
+        );
+      }
       if (live) {
+        threadSelectionGenerationRef.current += 1;
+        setProposal(null);
         setActiveThreadId(thread);
         openWorker(live.directionId, live.repoId);
         return;
@@ -2846,9 +3404,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     void refreshWorkspaces();
   }, [refreshWorkspaces]);
   useEffect(() => {
-    if (activeWorkspaceId != null) void selectWorkspace(activeWorkspaceId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeWorkspaceId]);
+    if (activeWorkspaceId != null && !workspaceLoadReady) {
+      void selectWorkspace(activeWorkspaceId);
+    }
+  }, [activeWorkspaceId, workspaceLoadReady, selectWorkspace]);
 
   // Reset a thread's sub-view (lead tab, in-flight proposal review) only when the
   // active thread actually CHANGES. This lives in the store — not in ThreadBoard —
@@ -2886,6 +3445,34 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       void unChanged.then((f) => f());
     };
   }, [activeWorkspaceId, refreshNeeds]);
+
+  useEffect(() => {
+    return () => {
+      if (needsRefreshTrailingTimerRef.current != null) {
+        clearTimeout(needsRefreshTrailingTimerRef.current);
+        needsRefreshTrailingTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Board overview poll: review transitions (and any status drift) stay fresh
+  // even when the kanban is unmounted. 10s matches the previous notify hook.
+  useEffect(() => {
+    if (activeWorkspaceId == null || !notifyEnabled || !notifyCategories.review) {
+      return;
+    }
+    let alive = true;
+    const tick = () => {
+      if (alive) void refreshOverview();
+    };
+    tick();
+    const h = setInterval(tick, 10_000);
+    return () => {
+      alive = false;
+      clearInterval(h);
+    };
+  }, [activeWorkspaceId, notifyEnabled, notifyCategories.review, refreshOverview]);
+
 
   // Live-refresh the repo map when the curator calibrates an edge (or the auto
   // pass finishes) for the active workspace.
@@ -3028,6 +3615,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     activeWorkspaceId,
     repos,
     threads,
+    threadWorkspaceById,
+    threadKindById,
+    workspaceLoadSeq,
+    workspaceLoading,
+    workspaceRestoring,
+    workspaceLoadReady,
     directionsByThread,
     worktreesByDirection,
     activeThreadId,
@@ -3085,6 +3678,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setGuardrails,
     processQuota,
     refreshProcessQuota,
+    notificationHydration,
     needs,
     asks,
     authGrants,
@@ -3113,6 +3707,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     closeSettings,
     settingsInitialPage,
     clearSettingsInitialPage,
+    settingsRequestedPage,
     openRepoMap,
     refreshRepoMap,
     refreshReposAndMap,
@@ -3139,6 +3734,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setProposalDirectionBase,
     approvePlanCard,
     overview,
+    notificationOverview,
     refreshOverview,
     selectWorkspace,
     refreshWorkspaces,
@@ -3176,6 +3772,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setAutoReview,
     notifyEnabled,
     setNotifyEnabled,
+    notifyCategories,
+    setNotifyCategory,
+    quietHours,
+    setQuietHours,
     keepAwake,
     setKeepAwake,
     focusSession,

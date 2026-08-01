@@ -52,6 +52,7 @@ fn push_model_arg(extra: &mut Vec<String>, model: Option<&str>) {
 #[derive(serde::Serialize, Clone)]
 pub struct SessionInfo {
     pub session_id: i32,
+    pub thread_id: i32,
     pub repo: String,
     pub worktree: String,
     pub branch: String,
@@ -1086,6 +1087,9 @@ pub struct LiveWorkerSlot {
     /// The worker's OWN thread (from EngineInner.thread_id) — adoption must not
     /// assume the active thread.
     pub thread_id: i32,
+    /// Owning workspace of the worker's thread, so the frontend can deep-link
+    /// adopted/revived workers even before that workspace is visited.
+    pub workspace_id: Option<i32>,
     pub busy: bool,
     pub queue: Vec<engine::QueuedItem>,
 }
@@ -1119,9 +1123,15 @@ async fn build_worker_slots(db: &Db, snaps: Vec<WorkerSnapshot>) -> Vec<LiveWork
             continue;
         };
         let command = crate::tool_command::effective(sess.command.as_deref(), &sess.tool);
+        let workspace_id = repo::get_thread(db, s.thread_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.workspace_id);
         out.push(LiveWorkerSlot {
             info: SessionInfo {
                 session_id: sess.id,
+                thread_id: s.thread_id,
                 repo: wt.path.clone(),
                 worktree: wt.path,
                 branch: wt.branch,
@@ -1133,6 +1143,7 @@ async fn build_worker_slots(db: &Db, snaps: Vec<WorkerSnapshot>) -> Vec<LiveWork
             direction_id: sess.direction_id,
             repo_id: sess.repo_id,
             thread_id: s.thread_id,
+            workspace_id,
             busy: s.busy,
             queue: s.queue,
         });
@@ -1560,6 +1571,7 @@ pub(crate) async fn chat_open_worker_impl(
     let command = crate::tool_command::effective(sess.command.as_deref(), &session_tool);
     Ok(SessionInfo {
         session_id: sess.id,
+        thread_id: dir.thread_id,
         repo: wt.path.clone(),
         worktree: wt.path,
         branch: wt.branch,

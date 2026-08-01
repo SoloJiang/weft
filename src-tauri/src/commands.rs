@@ -1976,6 +1976,7 @@ pub async fn pending_asks(
     for a in &mut open {
         if let Ok(Some(t)) = repo::get_thread(&db, a.thread).await {
             a.thread_title = t.title;
+            a.workspace_id = Some(t.workspace_id);
         }
         if let Ok(id) = a.dir.parse::<i32>() {
             if let Ok(Some(d)) = repo::get_direction(&db, id).await {
@@ -2374,19 +2375,26 @@ pub async fn workspace_needs_counts(
     let open_asks = asks.open();
     let mut out = Vec::new();
     for w in repo::list_workspaces(&db).await.map_err(e)? {
-        let threads: Vec<_> = repo::list_threads(&db, w.id)
+        let all_threads = repo::list_threads(&db, w.id)
             .await
-            .map_err(e)?
+            .map_err(e)?;
+        let workspace_tids: HashSet<i32> = all_threads.iter().map(|t| t.id).collect();
+        let threads: Vec<_> = all_threads
             .into_iter()
             .filter(|t| t.kind != "curator") // hidden curator chat isn't a board issue
             .collect();
-        let tids: HashSet<i32> = threads.iter().map(|t| t.id).collect();
         let mut count: u32 = 0;
         for t in &threads {
-            // Excludes self-clearing NOTICEs (e.g. the stall hint) — they carry
-            // no action, so they must not inflate the "needs you" count that
-            // flags other workspaces (issue #105).
+            // Questions still come from open_answerable_ask_count (issue #105).
+            // Action-required notices are not answerable, but they leave a durable
+            // Retry control in Needs-you, so the dock badge and workspace switcher
+            // should count them. Self-clearing notices stay out.
             count += bus.open_answerable_ask_count(t.id) as u32;
+            count += bus
+                .open_asks(t.id)
+                .iter()
+                .filter(|a| a.kind == crate::bus::AskKind::NoticeActionRequired)
+                .count() as u32;
             count += crate::planner::pending_writes(&db, t.id)
                 .await
                 .map_err(e)?
@@ -2394,7 +2402,10 @@ pub async fn workspace_needs_counts(
         }
         count += open_asks
             .iter()
-            .filter(|a| tids.contains(&a.thread))
+            // Permission asks are global and the hidden curator thread is not
+            // part of `threads` above, but its asks still belong to this
+            // workspace and appear in Needs-you.
+            .filter(|a| workspace_tids.contains(&a.thread))
             .count() as u32;
         out.push((w.id, count));
     }
