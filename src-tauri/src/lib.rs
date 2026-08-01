@@ -373,6 +373,8 @@ pub fn run() {
             commands::set_default_tool,
             commands::get_automatic_engine_routing_enabled,
             commands::set_automatic_engine_routing_enabled,
+            commands::get_computer_use_enabled,
+            commands::set_computer_use_enabled,
             commands::get_quota_failover_enabled,
             commands::set_quota_failover_enabled,
             commands::get_pr_auto_merge_enabled,

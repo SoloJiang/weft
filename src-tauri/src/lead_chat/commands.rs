@@ -264,6 +264,21 @@ pub async fn lead_engine(
         extra.extend(
             crate::bus::inject::inject(&base, thread_id, crate::bus::LEAD, &t.lead_tool, &cwd).args,
         );
+        // issue #160: opt-in computer-use MCP, issue-lead only (never
+        // concierge/curator). Gated on the setting so an unconfigured install
+        // never grows an extra MCP server unasked.
+        if crate::computer::enabled(db).await {
+            extra.extend(
+                crate::bus::inject::inject_computer(
+                    &base,
+                    thread_id,
+                    crate::bus::LEAD,
+                    &t.lead_tool,
+                    &cwd,
+                )
+                .args,
+            );
+        }
     }
     push_model_arg(&mut extra, t.lead_model.as_deref());
     let system_prompt = if is_concierge {
@@ -1471,6 +1486,20 @@ pub(crate) async fn chat_open_worker_impl(
     }
     let mut extra = ask.args;
     extra.extend(inj.args);
+    // issue #160: opt-in computer-use MCP for workers, same fail-closed gate
+    // as the lead branch — off unless the setting is explicitly enabled.
+    if crate::computer::enabled(db).await {
+        extra.extend(
+            crate::bus::inject::inject_computer(
+                &base,
+                dir.thread_id,
+                &direction_id.to_string(),
+                &session_tool,
+                &cwd,
+            )
+            .args,
+        );
+    }
     push_model_arg(&mut extra, sess.model.as_deref());
 
     let key = sess.id as i64;
@@ -1615,6 +1644,20 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     }
     let mut extra = ask.args;
     extra.extend(inj.args);
+    // issue #160: opt-in computer-use MCP, same fail-closed gate as the
+    // first-spawn path above — this is the worker resume/rebuild path.
+    if crate::computer::enabled(db).await {
+        extra.extend(
+            crate::bus::inject::inject_computer(
+                &base,
+                dir.thread_id,
+                &sess.direction_id.to_string(),
+                &sess.tool,
+                &cwd,
+            )
+            .args,
+        );
+    }
     push_model_arg(&mut extra, sess.model.as_deref());
     let mut inner = engine::EngineInner {
         thread_id: dir.thread_id,

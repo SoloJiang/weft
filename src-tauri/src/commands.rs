@@ -1578,6 +1578,24 @@ pub async fn set_automatic_engine_routing_enabled(
     .map_err(e)
 }
 
+/// issue #160 M1: whether OS-level computer use (window enumeration +
+/// screenshot) is turned on. Fails closed — see `crate::computer::enabled`.
+#[tauri::command]
+pub async fn get_computer_use_enabled(db: State<'_, Db>) -> R<bool> {
+    Ok(crate::computer::enabled(&db).await)
+}
+
+#[tauri::command]
+pub async fn set_computer_use_enabled(db: State<'_, Db>, enabled: bool) -> R<()> {
+    repo::set_setting(
+        &db,
+        crate::computer::K_COMPUTER_USE_ENABLED,
+        if enabled { "true" } else { "false" },
+    )
+    .await
+    .map_err(e)
+}
+
 /// issue #97: whether Weft should auto-switch a thread/session to its
 /// fallback engine when the current one reports its usage limit as exceeded
 /// (`crate::lead_chat::commands::maybe_failover_on_quota`). Opt-in, default

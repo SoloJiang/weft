@@ -31,6 +31,10 @@ fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
     format!("{base}/ask/{thread}/{dir}?tool={tool}")
 }
 
+fn computer_url(base: &str, thread: i32, dir: &str) -> String {
+    format!("{base}/computer/{thread}/{dir}/mcp")
+}
+
 /// HTTP MCP servers Weft should pass on ACP `session/new|resume` for this
 /// engine role. Workers get `weft_bus`; lead also gets planner when `dir` is
 /// the lead lane; concierge/global callers pass `include_global`.
@@ -42,6 +46,7 @@ pub fn acp_mcp_servers(
     include_planner: bool,
     include_global: bool,
     include_curator: bool,
+    include_computer: bool,
 ) -> Vec<crate::acp::McpServerSpec> {
     let mut out = Vec::new();
     // Concierge is global-only (no per-thread bus) — same as inject_global path.
@@ -67,6 +72,12 @@ pub fn acp_mcp_servers(
         out.push(crate::acp::McpServerSpec {
             name: "weft_global".into(),
             url: global_url(base),
+        });
+    }
+    if include_computer {
+        out.push(crate::acp::McpServerSpec {
+            name: "weft_computer".into(),
+            url: computer_url(base, thread, dir),
         });
     }
     out
@@ -272,6 +283,22 @@ pub fn inject_curator(base: &str, thread: i32, tool: &str, cwd: &Path) -> Inject
     )
 }
 
+/// Build the computer-use MCP injection (issue #160) for a session, per
+/// thread/direction. Same additive mechanism as the bus — claude gets its own
+/// `.weft-computer.mcp.json`, codex a `-c mcp_servers.weft_computer.url=...`
+/// override, opencode a deep-merge, ACP tools nothing (see `acp_mcp_servers`).
+/// Callers MUST gate this on `crate::computer::enabled(db)` themselves — this
+/// function injects unconditionally.
+pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Injection {
+    inject_mcp(
+        "weft_computer",
+        "computer",
+        &computer_url(base, thread, dir),
+        tool,
+        cwd,
+    )
+}
+
 /// Build the global-MCP injection for the Concierge engine (M3-2). Not
 /// per-thread — the URL has no thread/dir in path; identity is "the global
 /// helper running in IM single-chat". Same additive shape as planner.
@@ -389,6 +416,57 @@ mod tests {
             dir.join(".weft-bus.mcp.json").to_string_lossy()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn computer_claude_writes_its_own_config() {
+        let dir = std::env::temp_dir().join(format!("weft-inj-comp-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", &dir);
+        assert_eq!(inj.args[0], "--mcp-config");
+        let cfg = std::fs::read_to_string(dir.join(".weft-computer.mcp.json")).unwrap();
+        assert!(cfg.contains("weft_computer") && cfg.contains("/computer/1/10/mcp"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn computer_codex_uses_config_override() {
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Path::new("/tmp"));
+        assert_eq!(
+            inj.args,
+            vec![
+                "-c".to_string(),
+                "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn acp_mcp_servers_include_computer_toggles_weft_computer() {
+        let with_computer = acp_mcp_servers(
+            "http://127.0.0.1:9",
+            1,
+            "10",
+            true,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(with_computer.iter().any(|s| s.name == "weft_computer"
+            && s.url == "http://127.0.0.1:9/computer/1/10/mcp"));
+
+        let without_computer = acp_mcp_servers(
+            "http://127.0.0.1:9",
+            1,
+            "10",
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(!without_computer.iter().any(|s| s.name == "weft_computer"));
     }
 
     #[test]

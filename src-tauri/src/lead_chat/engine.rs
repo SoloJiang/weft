@@ -3342,6 +3342,10 @@ async fn spawn_acp_turn(
         .try_state::<crate::BusBase>()
         .map(|b| b.0.clone())
         .unwrap_or_default();
+    // issue #160: opt-in computer-use MCP. Concierge/curator never get it;
+    // issue lead and workers do, gated on the same setting as the non-ACP
+    // injection points in lead_chat/commands.rs.
+    let computer = crate::computer::enabled(&db).await;
     let mcp = if base.is_empty() {
         vec![]
     } else if sid.is_none() {
@@ -3353,23 +3357,23 @@ async fn spawn_acp_turn(
             .map(|th| th.kind)
             .unwrap_or_default();
         match kind.as_str() {
-            // Concierge: weft_global only (never bus).
+            // Concierge: weft_global only (never bus, never computer).
             "concierge" => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, "lead", false, false, true, false,
+                &base, thread_id_i, "lead", false, false, true, false, false,
             ),
-            // Curator: curator MCP + bus under LEAD identity.
+            // Curator: curator MCP + bus under LEAD identity (never computer).
             "curator" => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, crate::bus::LEAD, true, false, false, true,
+                &base, thread_id_i, crate::bus::LEAD, true, false, false, true, false,
             ),
-            // Issue lead: planner + bus.
+            // Issue lead: planner + bus (+ computer when enabled).
             _ => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, crate::bus::LEAD, true, true, false, false,
+                &base, thread_id_i, crate::bus::LEAD, true, true, false, false, computer,
             ),
         }
     } else {
-        // Worker: bus only under direction id.
+        // Worker: bus only under direction id (+ computer when enabled).
         crate::bus::inject::acp_mcp_servers(
-            &base, thread_id_i, &ask_dir, true, false, false, false,
+            &base, thread_id_i, &ask_dir, true, false, false, false, computer,
         )
     };
 
