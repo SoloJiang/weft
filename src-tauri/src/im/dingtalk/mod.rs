@@ -47,6 +47,7 @@ struct Inner {
     recent_inbound: Mutex<HashMap<String, Instant>>,
     robot_code: Mutex<String>,
     local_id: AtomicU64,
+    copy: super::outbound::DingTalkCopy,
 }
 
 #[derive(Clone)]
@@ -55,12 +56,17 @@ pub struct DingTalkChannel {
 }
 
 impl DingTalkChannel {
-    pub fn new(client_id: &str, client_secret: &str) -> anyhow::Result<Self> {
+    pub fn new(
+        client_id: &str,
+        client_secret: &str,
+        copy: super::outbound::DingTalkCopy,
+    ) -> anyhow::Result<Self> {
         let client_id = client_id.trim();
         let client_secret = client_secret.trim();
         if client_id.is_empty() || client_secret.is_empty() {
             anyhow::bail!("dingtalk client id and client secret are required");
         }
+        copy.validate()?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
@@ -76,6 +82,7 @@ impl DingTalkChannel {
                 recent_inbound: Mutex::new(HashMap::new()),
                 robot_code: Mutex::new(client_id.to_string()),
                 local_id: AtomicU64::new(1),
+                copy,
             }),
         })
     }
@@ -275,9 +282,7 @@ impl DingTalkChannel {
             .map_err(|e| safe_transport_error("session reply", &e))?;
         let status = response.status();
         let value = response_value(response, "session reply").await?;
-        if !status.is_success() {
-            return Err(api_error("session reply", status, &value));
-        }
+        ensure_session_reply_success(status, &value)?;
         Ok(response_message_id(&value).unwrap_or_else(|| format!("dingtalk-reply-{message_id}")))
     }
 
@@ -330,12 +335,12 @@ impl super::Channel for DingTalkChannel {
         &self,
         open_id: &str,
         ask: &crate::ask::Ask,
-        lang: &str,
+        _lang: &str,
     ) -> anyhow::Result<String> {
         let message_id = self
             .send_private_message(
                 open_id,
-                &super::outbound::dingtalk_permission_text(ask, lang),
+                &super::outbound::dingtalk_permission_text(ask, &self.inner.copy),
             )
             .await?;
         self.remember_prompt_recipient(&message_id, open_id);
@@ -347,11 +352,11 @@ impl super::Channel for DingTalkChannel {
         message_id: &str,
         summary: &str,
         verdict: &str,
-        lang: &str,
+        _lang: &str,
     ) -> anyhow::Result<()> {
         self.send_prompt_status(
             message_id,
-            &super::outbound::dingtalk_permission_resolved_text(summary, verdict, lang),
+            &super::outbound::dingtalk_permission_resolved_text(summary, verdict, &self.inner.copy),
         )
         .await
     }
@@ -364,7 +369,7 @@ impl super::Channel for DingTalkChannel {
         thread_title: &str,
         from: &str,
         text: &str,
-        lang: &str,
+        _lang: &str,
     ) -> anyhow::Result<String> {
         let body = super::outbound::dingtalk_human_question_text(
             thread_id,
@@ -372,7 +377,7 @@ impl super::Channel for DingTalkChannel {
             thread_title,
             from,
             text,
-            lang,
+            &self.inner.copy,
         );
         let message_id = self.send_private_message(open_id, &body).await?;
         self.remember_prompt_recipient(&message_id, open_id);
@@ -383,21 +388,33 @@ impl super::Channel for DingTalkChannel {
         &self,
         message_id: &str,
         answer: &str,
-        lang: &str,
+        _lang: &str,
     ) -> anyhow::Result<()> {
         self.send_prompt_status(
             message_id,
-            &super::outbound::dingtalk_human_resolved_text(answer, lang),
+            &super::outbound::dingtalk_human_resolved_text(answer, &self.inner.copy),
         )
         .await
     }
 
-    async fn cancel_human_question_card(&self, message_id: &str, lang: &str) -> anyhow::Result<()> {
+    async fn cancel_human_question_card(
+        &self,
+        message_id: &str,
+        _lang: &str,
+    ) -> anyhow::Result<()> {
         self.send_prompt_status(
             message_id,
-            super::outbound::dingtalk_human_cancelled_text(lang),
+            super::outbound::dingtalk_human_cancelled_text(&self.inner.copy),
         )
         .await
+    }
+
+    fn issue_reply_text(&self, _lang: &str, text: &str) -> String {
+        super::outbound::dingtalk_issue_reply_text(&self.inner.copy, text)
+    }
+
+    fn resync_summary(&self, _lang: &str, items: &[(i32, String)]) -> String {
+        super::outbound::dingtalk_resync_summary(&self.inner.copy, items)
     }
 
     async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()> {
@@ -510,6 +527,29 @@ fn api_error(scope: &str, status: reqwest::StatusCode, value: &Value) -> anyhow:
     anyhow::anyhow!("dingtalk {scope}: HTTP {status}, code={code}, message={message}")
 }
 
+fn ensure_session_reply_success(status: reqwest::StatusCode, value: &Value) -> anyhow::Result<()> {
+    if !status.is_success() {
+        return Err(api_error("session reply", status, value));
+    }
+    let Some(code) = value.get("errcode") else {
+        return Ok(());
+    };
+    let succeeded = code.as_i64() == Some(0) || code.as_str() == Some("0");
+    if succeeded {
+        return Ok(());
+    }
+    let code = code
+        .as_i64()
+        .map(|value| value.to_string())
+        .or_else(|| code.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    let message = value
+        .get("errmsg")
+        .and_then(Value::as_str)
+        .unwrap_or("request rejected");
+    anyhow::bail!("dingtalk session reply rejected: errcode={code}, errmsg={message}")
+}
+
 fn validated_session_webhook(raw: &str) -> anyhow::Result<reqwest::Url> {
     let url = reqwest::Url::parse(raw)
         .map_err(|_| anyhow::anyhow!("dingtalk session webhook is invalid"))?;
@@ -537,6 +577,39 @@ fn session_webhook_is_fresh(expires_at_ms: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn copy() -> super::super::outbound::DingTalkCopy {
+        super::super::outbound::DingTalkCopy {
+            permission_title: "permission".into(),
+            permission_reply_command: "reply".into(),
+            verdict_allowed: "allowed".into(),
+            verdict_always_allowed: "always".into(),
+            verdict_full_access: "full".into(),
+            verdict_denied: "denied".into(),
+            verdict_expired: "expired".into(),
+            verdict_resolved: "resolved".into(),
+            human_question_title: "question".into(),
+            human_answer_instruction: "answer".into(),
+            human_answer_placeholder: "placeholder".into(),
+            human_answered: "answered".into(),
+            answer_prefix: "answer-prefix".into(),
+            human_cancelled: "cancelled".into(),
+            issue_not_found: "missing".into(),
+            bind_thread_prefix: "bound".into(),
+            permission_already_handled: "handled".into(),
+            human_already_answered: "already-answered".into(),
+            permission_command_usage: "permission-usage".into(),
+            human_answer_usage: "answer-usage".into(),
+            thread_required: "thread-required".into(),
+            free_text_unavailable: "unavailable".into(),
+            unbound_thread: "unbound".into(),
+            lead_prefix: "lead".into(),
+            resync_one: "one".into(),
+            resync_many: "many {n}".into(),
+            resync_more: "more {n}".into(),
+            resync_hint: "hint".into(),
+        }
+    }
 
     #[test]
     fn proactive_message_bodies_match_robot_openapi_shape() {
@@ -574,6 +647,17 @@ mod tests {
     }
 
     #[test]
+    fn session_reply_rejects_http_200_error_envelope() {
+        let error = json!({"errcode": 310000, "errmsg": "session webhook expired"});
+        assert!(ensure_session_reply_success(reqwest::StatusCode::OK, &error).is_err());
+        assert!(ensure_session_reply_success(
+            reqwest::StatusCode::OK,
+            &json!({"errcode": 0, "errmsg": "ok"}),
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn text_clamp_is_cjk_safe() {
         let text = "汉".repeat(MAX_TEXT_CHARS + 10);
         let clamped = clamp_text(&text);
@@ -583,7 +667,7 @@ mod tests {
 
     #[test]
     fn remembered_thread_reply_falls_back_to_open_conv_thread_id() {
-        let channel = DingTalkChannel::new("ding_app", "secret").unwrap();
+        let channel = DingTalkChannel::new("ding_app", "secret", copy()).unwrap();
         let message = ws::RobotMessage {
             conversation_id: "cid_parent".into(),
             open_conversation_id: "cid_parent".into(),
@@ -617,7 +701,7 @@ mod tests {
 
     #[test]
     fn inbound_message_ids_are_deduplicated() {
-        let channel = DingTalkChannel::new("ding_app", "secret").unwrap();
+        let channel = DingTalkChannel::new("ding_app", "secret", copy()).unwrap();
         assert!(channel.mark_inbound_once("msg_1"));
         assert!(!channel.mark_inbound_once("msg_1"));
         assert!(channel.mark_inbound_once("msg_2"));
@@ -625,7 +709,7 @@ mod tests {
 
     #[test]
     fn reply_contexts_are_bounded() {
-        let channel = DingTalkChannel::new("ding_app", "secret").unwrap();
+        let channel = DingTalkChannel::new("ding_app", "secret", copy()).unwrap();
         let mut message = ws::RobotMessage {
             conversation_id: "cid_parent".into(),
             open_conversation_id: "cid_parent".into(),

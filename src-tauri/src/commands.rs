@@ -2734,6 +2734,28 @@ pub fn im_status(bridge: State<'_, crate::im::ImBridge>) -> R<String> {
     Ok(bridge.status())
 }
 
+/// Synchronize DingTalk's fixed user-facing copy from the frontend i18n
+/// catalogs. The bundle is memory-only and contains no credentials. A locale
+/// change restarts only an active DingTalk bridge so future robot messages use
+/// the newly selected UI language.
+#[tauri::command]
+pub async fn im_set_dingtalk_copy(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    bridge: State<'_, crate::im::ImBridge>,
+    copy: crate::im::outbound::DingTalkCopy,
+) -> R<()> {
+    copy.validate().map_err(e)?;
+    if !bridge.set_dingtalk_copy(copy) {
+        return Ok(());
+    }
+    let settings = crate::im::ImSettings::load(&db).await.map_err(e)?;
+    if settings.provider == crate::im::ImProvider::DingTalk {
+        crate::im::spawn(app);
+    }
+    Ok(())
+}
+
 // ───────────────────────── 飞书扫码接入(device-flow）─────────────────────────
 
 #[derive(serde::Serialize)]

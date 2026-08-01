@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { StoreProvider, useStore } from "./state/store";
 import { WorkspaceNav } from "./nav/WorkspaceNav";
 import { AppTopBar } from "./nav/AppTopBar";
@@ -17,12 +18,56 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { SettingsScreen } from "./nav/SettingsDialog";
 import { useAppShortcuts } from "./state/shortcuts";
 import { useSystemNotifications } from "./lib/notifications";
+import { api, type DingTalkCopy } from "./lib/api";
 
 // Below this window width the nav rail can't coexist with an open worker side
 // panel: rail (288) + diff panel min (360) + main min (360). When a diff/files
 // panel is open under it, hide the rail to give the panel + main room — without
 // touching the user's manual collapse choice (navCollapsed governs the rest).
 const RAIL_PLUS_PANEL_MIN = 288 + 360 + 360;
+
+function ImMessageCopySync() {
+  const { t, i18n } = useTranslation();
+  const locale = i18n.resolvedLanguage === "zh" ? "zh" : "en";
+
+  useEffect(() => {
+    const copy: DingTalkCopy = {
+      permissionTitle: t("imMessages.permissionTitle"),
+      permissionReplyCommand: t("imMessages.permissionReplyCommand"),
+      verdictAllowed: t("imMessages.verdictAllowed"),
+      verdictAlwaysAllowed: t("imMessages.verdictAlwaysAllowed"),
+      verdictFullAccess: t("imMessages.verdictFullAccess"),
+      verdictDenied: t("imMessages.verdictDenied"),
+      verdictExpired: t("imMessages.verdictExpired"),
+      verdictResolved: t("imMessages.verdictResolved"),
+      humanQuestionTitle: t("imMessages.humanQuestionTitle"),
+      humanAnswerInstruction: t("imMessages.humanAnswerInstruction"),
+      humanAnswerPlaceholder: t("imMessages.humanAnswerPlaceholder"),
+      humanAnswered: t("imMessages.humanAnswered"),
+      answerPrefix: t("imMessages.answerPrefix"),
+      humanCancelled: t("imMessages.humanCancelled"),
+      issueNotFound: t("imMessages.issueNotFound"),
+      bindThreadPrefix: t("imMessages.bindThreadPrefix"),
+      permissionAlreadyHandled: t("imMessages.permissionAlreadyHandled"),
+      humanAlreadyAnswered: t("imMessages.humanAlreadyAnswered"),
+      permissionCommandUsage: t("imMessages.permissionCommandUsage"),
+      humanAnswerUsage: t("imMessages.humanAnswerUsage"),
+      threadRequired: t("imMessages.threadRequired"),
+      freeTextUnavailable: t("imMessages.freeTextUnavailable"),
+      unboundThread: t("imMessages.unboundThread"),
+      leadPrefix: t("imMessages.leadPrefix"),
+      resyncOne: t("imMessages.resyncOne"),
+      resyncMany: t("imMessages.resyncMany"),
+      resyncMore: t("imMessages.resyncMore"),
+      resyncHint: t("imMessages.resyncHint"),
+    };
+    void api.imSetDingTalkCopy(copy).catch((error) => {
+      console.error("[weft][im] synchronize DingTalk copy", error);
+    });
+  }, [locale, t]);
+
+  return null;
+}
 
 function NavRailGate() {
   const { navCollapsed, activeSidePanel } = useStore();
@@ -109,6 +154,7 @@ function Shell() {
 export default function App() {
   return (
     <StoreProvider>
+      <ImMessageCopySync />
       <Shell />
     </StoreProvider>
   );

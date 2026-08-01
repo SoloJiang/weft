@@ -390,6 +390,7 @@ pub fn run() {
             commands::im_set_enabled,
             commands::im_set_remote_standby,
             commands::im_status,
+            commands::im_set_dingtalk_copy,
             commands::feishu_scan_begin,
             commands::feishu_scan_status,
             commands::feishu_scan_cancel,

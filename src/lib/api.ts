@@ -451,6 +451,8 @@ export const api = {
   imSetRemoteStandby: (enabled: boolean) =>
     invoke<void>("im_set_remote_standby", { enabled }),
   imStatus: () => invoke<string>("im_status"),
+  imSetDingTalkCopy: (copy: DingTalkCopy) =>
+    invoke<void>("im_set_dingtalk_copy", { copy }),
   feishuScanBegin: () =>
     invoke<{ qr_data_uri: string; expire_secs: number; poll_interval_ms: number }>(
       "feishu_scan_begin",
@@ -514,3 +516,34 @@ export const api = {
     return [];
   },
 };
+
+export interface DingTalkCopy {
+  permissionTitle: string;
+  permissionReplyCommand: string;
+  verdictAllowed: string;
+  verdictAlwaysAllowed: string;
+  verdictFullAccess: string;
+  verdictDenied: string;
+  verdictExpired: string;
+  verdictResolved: string;
+  humanQuestionTitle: string;
+  humanAnswerInstruction: string;
+  humanAnswerPlaceholder: string;
+  humanAnswered: string;
+  answerPrefix: string;
+  humanCancelled: string;
+  issueNotFound: string;
+  bindThreadPrefix: string;
+  permissionAlreadyHandled: string;
+  humanAlreadyAnswered: string;
+  permissionCommandUsage: string;
+  humanAnswerUsage: string;
+  threadRequired: string;
+  freeTextUnavailable: string;
+  unboundThread: string;
+  leadPrefix: string;
+  resyncOne: string;
+  resyncMany: string;
+  resyncMore: string;
+  resyncHint: string;
+}

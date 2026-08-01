@@ -222,7 +222,11 @@ pub fn route_for_provider(
             text,
         } => {
             let sender_allowed = allow.iter().any(|a| a == sender_open_id);
-            if sender_allowed {
+            // Explicit-ID slash commands are the deterministic fallback for
+            // DingTalk, which has no stable Feishu-style reply-parent card
+            // contract. Feishu must resolve its indexed parent first so an
+            // otherwise command-shaped human answer is delivered verbatim.
+            if provider == ImProvider::DingTalk && sender_allowed {
                 if let Some((ask_id, answer)) = parse_permission_command(text) {
                     return Route::AnswerPerm { ask_id, answer };
                 }
@@ -493,6 +497,19 @@ mod tests {
                 thread: 3,
                 ask_id: 9,
                 text: "minor 就行".into()
+            }
+        );
+    }
+
+    #[test]
+    fn feishu_human_card_reply_wins_over_dingtalk_slash_commands() {
+        let allow = vec!["ou_me".to_string()];
+        assert_eq!(
+            route(&text("ou_me", Some("om_q"), "/allow 42"), &allow, &cards(),),
+            Route::AnswerHuman {
+                thread: 3,
+                ask_id: 9,
+                text: "/allow 42".into(),
             }
         );
     }

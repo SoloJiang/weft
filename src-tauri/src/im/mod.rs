@@ -564,6 +564,16 @@ pub trait Channel: Send + Sync {
     }
     /// 发纯文本到用户（p2p）。
     async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()>;
+    /// Render an issue reply using provider-specific localized copy. Feishu's
+    /// established renderer remains the default; DingTalk overrides it with
+    /// the frontend-synchronized catalog bundle.
+    fn issue_reply_text(&self, lang: &str, text: &str) -> String {
+        outbound::issue_reply_text(lang, text)
+    }
+    /// Render the reconnect backlog summary with the same localization source.
+    fn resync_summary(&self, lang: &str, items: &[(i32, String)]) -> String {
+        outbound::resync_summary(lang, items)
+    }
     /// 发纯文本到群聊，返回根 message_id；非话题群 fallback 会用它。
     async fn send_chat_text(&self, _chat_id: &str, _text: &str) -> anyhow::Result<String> {
         anyhow::bail!("send_chat_text unsupported by this channel")
@@ -670,6 +680,7 @@ pub async fn execute(
         bus,
         channel,
         ImProvider::Feishu,
+        None,
         sender,
         lang,
         app,
@@ -685,12 +696,20 @@ pub async fn execute_for_provider(
     bus: &crate::bus::BusRegistry,
     channel: &dyn Channel,
     provider: ImProvider,
+    dingtalk_copy: Option<&outbound::DingTalkCopy>,
     sender: &str,
     lang: &str,
     app: Option<&tauri::AppHandle>,
     ctx: Option<&ExecuteCtx>,
 ) -> anyhow::Result<()> {
     let t = |zh: &'static str, en: &'static str| if lang == "zh" { zh } else { en };
+    let dingtalk_copy = match provider {
+        ImProvider::Feishu => None,
+        ImProvider::DingTalk => Some(
+            dingtalk_copy
+                .ok_or_else(|| anyhow::anyhow!("DingTalk localized copy is unavailable"))?,
+        ),
+    };
     match route {
         inbound::Route::Ignore => {}
         inbound::Route::Bind {
@@ -739,13 +758,11 @@ pub async fn execute_for_provider(
         } => {
             let thread = crate::store::repo::get_thread(db, thread_id).await?;
             let Some(thread) = thread else {
-                if let Err(e) = channel
-                    .send_text(
-                        sender,
-                        &t("没有找到这个 issue。", "No issue with that id was found."),
-                    )
-                    .await
-                {
+                let message = match dingtalk_copy {
+                    Some(copy) => copy.issue_not_found.as_str(),
+                    None => t("没有找到这个 issue。", "No issue with that id was found."),
+                };
+                if let Err(e) = channel.send_text(sender, message).await {
                     eprintln!("[weft][im] bind-issue missing hint: {e}");
                 }
                 return Ok(());
@@ -772,12 +789,12 @@ pub async fn execute_for_provider(
                     thread.id,
                     thread.title
                 ),
-                ImProvider::DingTalk => format!(
-                    "{} #{} · {}",
-                    t("已绑定钉钉 thread 到", "Bound this DingTalk thread to"),
-                    thread.id,
-                    thread.title
-                ),
+                ImProvider::DingTalk => {
+                    let prefix = dingtalk_copy
+                        .map(|copy| copy.bind_thread_prefix.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("DingTalk localized copy is unavailable"))?;
+                    format!("{prefix} #{} · {}", thread.id, thread.title)
+                }
             };
             let sent = match provider {
                 // Preserve the established Feishu confirmation path.
@@ -802,16 +819,14 @@ pub async fn execute_for_provider(
         }
         inbound::Route::AnswerPerm { ask_id, answer } => {
             if !asks.answer(ask_id, answer) {
-                if let Err(e) = channel
-                    .send_text(
-                        sender,
-                        t(
-                            "这条权限请求已被处理或已过期。",
-                            "That permission ask was already handled or has expired.",
-                        ),
-                    )
-                    .await
-                {
+                let message = match dingtalk_copy {
+                    Some(copy) => copy.permission_already_handled.as_str(),
+                    None => t(
+                        "这条权限请求已被处理或已过期。",
+                        "That permission ask was already handled or has expired.",
+                    ),
+                };
+                if let Err(e) = channel.send_text(sender, message).await {
                     eprintln!("[weft][im] stale-perm hint: {e}");
                 }
             }
@@ -823,64 +838,48 @@ pub async fn execute_for_provider(
             text,
         } => {
             if !bus.answer_ask(thread, ask_id, &text) {
-                if let Err(e) = channel
-                    .send_text(
-                        sender,
-                        t(
-                            "这个提问已被回答过了。",
-                            "That question was already answered.",
-                        ),
-                    )
-                    .await
-                {
+                let message = match dingtalk_copy {
+                    Some(copy) => copy.human_already_answered.as_str(),
+                    None => t(
+                        "这个提问已被回答过了。",
+                        "That question was already answered.",
+                    ),
+                };
+                if let Err(e) = channel.send_text(sender, message).await {
                     eprintln!("[weft][im] stale-human hint: {e}");
                 }
             }
         }
         inbound::Route::BadVerdict => {
-            let hint = if provider == ImProvider::DingTalk {
-                t(
-                    "格式不对。请发送：/allow <ask-id>、/deny <ask-id>、/always <ask-id> 或 /full <ask-id>。",
-                    "Invalid format. Send /allow <ask-id>, /deny <ask-id>, /always <ask-id>, or /full <ask-id>.",
-                )
-            } else {
-                t(
+            let hint = match dingtalk_copy {
+                Some(copy) => copy.permission_command_usage.as_str(),
+                None => t(
                     "没看懂。回复：允许 / 拒绝 / 总是 / 放行（或 1/2/3/4）。",
                     "Didn't catch that. Reply: allow / deny / always / full (or 1/2/3/4).",
-                )
+                ),
             };
-            if let Err(e) = channel
-                .send_text(sender, hint)
-                .await
-            {
+            if let Err(e) = channel.send_text(sender, hint).await {
                 eprintln!("[weft][im] verdict hint: {e}");
             }
         }
         inbound::Route::BadHumanAnswer => {
-            if let Err(e) = channel
-                .send_text(
-                    sender,
+            let message = dingtalk_copy
+                .map(|copy| copy.human_answer_usage.as_str())
+                .unwrap_or_else(|| {
                     t(
                         "格式不对。请发送：/answer <issue-id> <ask-id> <回答>",
                         "Invalid format. Send: /answer <issue-id> <ask-id> <answer>",
-                    ),
-                )
-                .await
-            {
+                    )
+                });
+            if let Err(e) = channel.send_text(sender, message).await {
                 eprintln!("[weft][im] answer hint: {e}");
             }
         }
         inbound::Route::IssueThreadRequired => {
-            if let Err(e) = channel
-                .send_text(
-                    sender,
-                    t(
-                        "钉钉支持 thread，但机器人 API 不能可靠创建并返回新 thread ID。请先在话题圈创建或打开一个话题，再在该 thread 内发送 /bind <issue-id>；如果已经在 thread 内，请直接使用 /bind。",
-                        "DingTalk supports threads, but the robot API cannot reliably create and return a new thread ID. Create or open a topic-circle thread, then send /bind <issue-id> inside it; if you are already in a thread, use /bind directly.",
-                    ),
-                )
-                .await
-            {
+            let message = dingtalk_copy
+                .map(|copy| copy.thread_required.as_str())
+                .ok_or_else(|| anyhow::anyhow!("DingTalk localized copy is unavailable"))?;
+            if let Err(e) = channel.send_text(sender, message).await {
                 eprintln!("[weft][im] unsupported topic hint: {e}");
             }
         }
@@ -915,10 +914,14 @@ pub async fn execute_for_provider(
             } else if let Err(e) = channel
                 .send_text(
                     sender,
-                    t(
-                        "自由对话（当前 IM 会话助理）需要桌面 app 运行上下文；当前路径无法处理，请回复卡片消息作答权限与提问。",
-                        "Free chat (this IM conversation's concierge) needs the desktop app context; this path cannot handle it, so reply to cards for asks.",
-                    ),
+                    dingtalk_copy
+                        .map(|copy| copy.free_text_unavailable.as_str())
+                        .unwrap_or_else(|| {
+                            t(
+                                "自由对话（当前 IM 会话助理）需要桌面 app 运行上下文；当前路径无法处理，请回复卡片消息作答权限与提问。",
+                                "Free chat (this IM conversation's concierge) needs the desktop app context; this path cannot handle it, so reply to cards for asks.",
+                            )
+                        }),
                 )
                 .await
             {
@@ -947,11 +950,9 @@ pub async fn execute_for_provider(
                         if let Err(e) = channel
                             .reply_text(
                                 mid,
-                                if provider == ImProvider::Feishu {
-                                    "这段飞书话题还没有绑定 Weft issue。发送 /bind <issue-id> 绑定当前话题，或在群里发送 /topic <issue-id> 创建 issue topic。"
-                                } else {
-                                    "这个钉钉 thread 还没有绑定 Weft issue。请在当前 thread 发送 /bind <issue-id>。"
-                                },
+                                dingtalk_copy
+                                    .map(|copy| copy.unbound_thread.as_str())
+                                    .unwrap_or("这段飞书话题还没有绑定 Weft issue。发送 /bind <issue-id> 绑定当前话题，或在群里发送 /topic <issue-id> 创建 issue topic。"),
                             )
                             .await
                         {
@@ -1074,6 +1075,10 @@ struct BridgeInner {
     /// finalize 出站，桥侧把对应 thread 的所有挂账 reaction 全部清掉——队列
     /// 里挤压的多条 👀 一次性收回，回执语义诚实反映「轮到这条被回复」。
     pending_acks: Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
+    /// Authored by `src/i18n/{en,zh}.ts` and synchronized by the WebView. The
+    /// bundle survives bridge generations so provider/language restarts do not
+    /// create a window with hard-coded backend copy.
+    dingtalk_copy: Option<outbound::DingTalkCopy>,
 }
 
 impl ImBridge {
@@ -1087,6 +1092,21 @@ impl ImBridge {
     }
     fn set_status(&self, s: &str) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).status = s.to_string();
+    }
+    pub fn set_dingtalk_copy(&self, copy: outbound::DingTalkCopy) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.dingtalk_copy.as_ref() == Some(&copy) {
+            return false;
+        }
+        inner.dingtalk_copy = Some(copy);
+        true
+    }
+    fn dingtalk_copy(&self) -> Option<outbound::DingTalkCopy> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dingtalk_copy
+            .clone()
     }
     /// 起新一代：自增代际号、换一张干净的卡片索引（旧任务下次 live() 检查时退出）。
     fn bump(
@@ -1141,6 +1161,15 @@ pub fn spawn(app: tauri::AppHandle) {
         // 所以不依赖瞬时连接状态。
         crate::power::set_standby(&app, settings.remote_standby);
         let provider = settings.provider;
+        let dingtalk_copy = if provider == ImProvider::DingTalk {
+            let Some(copy) = bridge.dingtalk_copy() else {
+                bridge.set_status("waiting_locale");
+                return;
+            };
+            Some(copy)
+        } else {
+            None
+        };
         let (channel, dingtalk_channel): (
             Arc<dyn Channel>,
             Option<Arc<dingtalk::DingTalkChannel>>,
@@ -1157,7 +1186,11 @@ pub fn spawn(app: tauri::AppHandle) {
                 }
             }
             ImProvider::DingTalk => {
-                match dingtalk::DingTalkChannel::new(&settings.app_id, &settings.app_secret) {
+                let Some(copy) = dingtalk_copy.clone() else {
+                    bridge.set_status("waiting_locale");
+                    return;
+                };
+                match dingtalk::DingTalkChannel::new(&settings.app_id, &settings.app_secret, copy) {
                     Ok(channel) => {
                         let channel = Arc::new(channel);
                         (channel.clone(), Some(channel))
@@ -1248,12 +1281,13 @@ pub fn spawn(app: tauri::AppHandle) {
         // —— 入站：ws → 路由 → 执行 ——
         let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
         {
-            let (app2, db2, ch, cards2, acks2) = (
+            let (app2, db2, ch, cards2, acks2, copy2) = (
                 app.clone(),
                 db.clone(),
                 channel.clone(),
                 cards.clone(),
                 acks.clone(),
+                dingtalk_copy.clone(),
             );
             tauri::async_runtime::spawn(async move {
                 let bridge = app2.state::<ImBridge>();
@@ -1315,6 +1349,7 @@ pub fn spawn(app: tauri::AppHandle) {
                         &bus,
                         ch.as_ref(),
                         provider,
+                        copy2.as_ref(),
                         &sender,
                         IM_LANG,
                         Some(&app2),
@@ -1342,7 +1377,7 @@ pub fn spawn(app: tauri::AppHandle) {
                     }
                     match rx.recv().await {
                         Ok(out) => {
-                            consume_lead_out(out, &db2, ch.as_ref(), &acks2, true).await;
+                            consume_lead_out(out, &db2, ch.as_ref(), provider, &acks2, true).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             // engine 产文本太快 / 桥太慢——容量 64 已远超单轮 finalize
@@ -1390,8 +1425,15 @@ pub fn spawn(app: tauri::AppHandle) {
                         }
                     }
                     for frame in coalesce_delta_frames(d, pending) {
-                        consume_lead_delta_frame(frame, &db2, ch.as_ref(), &mut streams, &acks2)
-                            .await;
+                        consume_lead_delta_frame(
+                            frame,
+                            &db2,
+                            ch.as_ref(),
+                            provider,
+                            &mut streams,
+                            &acks2,
+                        )
+                        .await;
                     }
                 }
             });
@@ -1782,7 +1824,7 @@ async fn send_delta_fallback(
             issue_style,
         } => {
             let body = if *issue_style {
-                outbound::issue_reply_text(IM_LANG, text)
+                ch.issue_reply_text(IM_LANG, text)
             } else {
                 text.to_string()
             };
@@ -1794,7 +1836,7 @@ async fn send_delta_fallback(
             issue_style,
         } => {
             let body = if *issue_style {
-                outbound::issue_reply_text(IM_LANG, text)
+                ch.issue_reply_text(IM_LANG, text)
             } else {
                 text.to_string()
             };
@@ -1825,31 +1867,25 @@ where
         .collect()
 }
 
+fn route_matches_provider(provider: ImProvider, channel: &str) -> bool {
+    channel == provider.route_channel() || channel == provider.concierge_channel()
+}
+
 async fn consume_lead_delta_frame(
     d: crate::lead_chat::delta_hub::LeadDelta,
     db: &crate::store::Db,
     ch: &dyn Channel,
+    provider: ImProvider,
     streams: &mut HashMap<i32, feishu::streaming::StreamSession>,
     acks: &Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
 ) {
     let route = match crate::store::repo::im_route_of_thread(db, d.thread_id).await {
-        Ok(Some(r))
-            if matches!(
-                r.channel.as_str(),
-                "feishu_concierge" | "feishu" | "dingtalk_concierge" | "dingtalk"
-            ) =>
-        {
-            r
-        }
+        Ok(Some(r)) if route_matches_provider(provider, &r.channel) => r,
         _ => return,
     };
     let is_issue_thread = matches!(route.channel.as_str(), "feishu" | "dingtalk");
     let content = if is_issue_thread {
-        format!(
-            "{}{}",
-            if IM_LANG == "zh" { "Lead：" } else { "Lead: " },
-            d.accumulated
-        )
+        ch.issue_reply_text(IM_LANG, &d.accumulated)
     } else {
         d.accumulated.clone()
     };
@@ -1951,6 +1987,7 @@ pub async fn consume_lead_out(
     out: crate::lead_chat::out_hub::LeadOut,
     db: &crate::store::Db,
     ch: &dyn Channel,
+    provider: ImProvider,
     acks: &Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
     streaming: bool,
 ) {
@@ -1962,6 +1999,9 @@ pub async fn consume_lead_out(
             return;
         }
     };
+    if !route_matches_provider(provider, &route.channel) {
+        return;
+    }
     if streaming && route.channel.ends_with("_concierge") {
         return;
     }
@@ -2138,7 +2178,7 @@ async fn send_resync_summary(app: &tauri::AppHandle, ch: &dyn Channel) {
     };
     let Some(owner) = owner else { return };
     let items = build_resync_items(&db, asks.inner()).await;
-    let body = outbound::resync_summary(IM_LANG, &items);
+    let body = ch.resync_summary(IM_LANG, &items);
     if body.is_empty() {
         return; // 无积压：spec 明确「上线时无待办则不打扰」
     }
@@ -2848,6 +2888,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -2963,6 +3004,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -3015,6 +3057,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -3065,6 +3108,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::DingTalk,
             &mut streams,
             &acks,
         )
@@ -3074,6 +3118,70 @@ mod tests {
             ch.chat_texts.lock().unwrap().as_slice(),
             [("convThreadEncrypted".into(), "Lead：我查到了。".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn inactive_provider_routes_are_ignored_by_delta_and_final_consumers() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "provider switch",
+            "bugfix",
+            "claude",
+        )
+        .await
+        .unwrap();
+        crate::store::repo::bind_im_route(
+            &db,
+            issue.id,
+            "feishu",
+            "oc_old_provider",
+            "omt_old_provider",
+        )
+        .await
+        .unwrap();
+        let channel = TopicStreamFallbackChannel::default();
+        let mut streams = HashMap::new();
+        let acks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: issue.id,
+                message_id: 12,
+                accumulated: "must stay local".into(),
+                done: true,
+                origin_tag: None,
+            },
+            &db,
+            &channel,
+            ImProvider::DingTalk,
+            &mut streams,
+            &acks,
+        )
+        .await;
+        consume_lead_out(
+            crate::lead_chat::out_hub::LeadOut {
+                thread_id: issue.id,
+                message_id: 12,
+                text: "must stay local".into(),
+                origin_tag: None,
+            },
+            &db,
+            &channel,
+            ImProvider::DingTalk,
+            &acks,
+            false,
+        )
+        .await;
+
+        assert!(streams.is_empty());
+        assert!(channel.stream_replies.lock().unwrap().is_empty());
+        assert!(channel.replies.lock().unwrap().is_empty());
+        assert!(channel.chat_texts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3103,6 +3211,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &acks,
             false,
         )
@@ -3146,6 +3255,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -3161,6 +3271,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -3217,6 +3328,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -3273,6 +3385,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -3288,6 +3401,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )

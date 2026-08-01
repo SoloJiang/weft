@@ -192,6 +192,10 @@ async fn dingtalk_bind_route_persists_native_thread_channel() {
         im_thread_ref: "convThreadEncrypted".into(),
         seed_message_id: "msg_bind".into(),
     };
+    let copy = im::outbound::DingTalkCopy {
+        bind_thread_prefix: "已绑定钉钉 thread 到".into(),
+        ..Default::default()
+    };
 
     im::execute_for_provider(
         route,
@@ -200,6 +204,7 @@ async fn dingtalk_bind_route_persists_native_thread_channel() {
         &bus,
         &ch,
         ImProvider::DingTalk,
+        Some(&copy),
         "staff_owner",
         "zh",
         None,
@@ -592,7 +597,7 @@ async fn consume_lead_out_replies_and_drains_acks() {
         text: "搞定了一半".into(),
         origin_tag: None,
     };
-    im::consume_lead_out(out, &db, &ch, &acks, false).await;
+    im::consume_lead_out(out, &db, &ch, ImProvider::Feishu, &acks, false).await;
     // reply 一次：目标是最新入站 message_id，不是持久 topic id；body 带 Lead 前缀
     let replies = ch.replies.lock().unwrap();
     assert_eq!(replies.len(), 1);
@@ -620,7 +625,7 @@ async fn consume_lead_out_unbound_thread_is_noop() {
         text: "nope".into(),
         origin_tag: None,
     };
-    im::consume_lead_out(out, &db, &ch, &acks, false).await;
+    im::consume_lead_out(out, &db, &ch, ImProvider::Feishu, &acks, false).await;
     assert!(ch.replies.lock().unwrap().is_empty());
     assert!(ch.deletions.lock().unwrap().is_empty());
 }
@@ -690,7 +695,7 @@ async fn consume_lead_out_concierge_replies_to_bound_dm_route() {
         origin_tag: None,
     };
 
-    im::consume_lead_out(out, &db, &ch, &acks, false).await;
+    im::consume_lead_out(out, &db, &ch, ImProvider::Feishu, &acks, false).await;
 
     let texts = ch.texts.lock().unwrap();
     assert_eq!(texts.len(), 1);
@@ -727,7 +732,7 @@ async fn consume_lead_out_concierge_replies_to_bound_group_route() {
         origin_tag: None,
     };
 
-    im::consume_lead_out(out, &db, &ch, &acks, false).await;
+    im::consume_lead_out(out, &db, &ch, ImProvider::Feishu, &acks, false).await;
 
     assert!(ch.texts.lock().unwrap().is_empty());
     let chat_texts = ch.chat_texts.lock().unwrap();
@@ -765,7 +770,7 @@ async fn consume_lead_out_concierge_replies_to_latest_group_message() {
         origin_tag: None,
     };
 
-    im::consume_lead_out(out, &db, &ch, &acks, false).await;
+    im::consume_lead_out(out, &db, &ch, ImProvider::Feishu, &acks, false).await;
 
     assert!(ch.texts.lock().unwrap().is_empty());
     assert!(ch.chat_texts.lock().unwrap().is_empty());

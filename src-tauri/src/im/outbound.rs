@@ -5,6 +5,102 @@
 
 use serde_json::{json, Value};
 
+/// Localized DingTalk copy is authored in the frontend i18n catalogs and
+/// synchronized into the bridge at app startup. Keeping the fixed strings out
+/// of Rust means the robot follows the same locale source as the desktop UI.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DingTalkCopy {
+    pub permission_title: String,
+    pub permission_reply_command: String,
+    pub verdict_allowed: String,
+    pub verdict_always_allowed: String,
+    pub verdict_full_access: String,
+    pub verdict_denied: String,
+    pub verdict_expired: String,
+    pub verdict_resolved: String,
+    pub human_question_title: String,
+    pub human_answer_instruction: String,
+    pub human_answer_placeholder: String,
+    pub human_answered: String,
+    pub answer_prefix: String,
+    pub human_cancelled: String,
+    pub issue_not_found: String,
+    pub bind_thread_prefix: String,
+    pub permission_already_handled: String,
+    pub human_already_answered: String,
+    pub permission_command_usage: String,
+    pub human_answer_usage: String,
+    pub thread_required: String,
+    pub free_text_unavailable: String,
+    pub unbound_thread: String,
+    pub lead_prefix: String,
+    pub resync_one: String,
+    pub resync_many: String,
+    pub resync_more: String,
+    pub resync_hint: String,
+}
+
+impl DingTalkCopy {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        const MAX_FIELD_CHARS: usize = 2_000;
+        let fields = [
+            ("permissionTitle", self.permission_title.as_str()),
+            (
+                "permissionReplyCommand",
+                self.permission_reply_command.as_str(),
+            ),
+            ("verdictAllowed", self.verdict_allowed.as_str()),
+            ("verdictAlwaysAllowed", self.verdict_always_allowed.as_str()),
+            ("verdictFullAccess", self.verdict_full_access.as_str()),
+            ("verdictDenied", self.verdict_denied.as_str()),
+            ("verdictExpired", self.verdict_expired.as_str()),
+            ("verdictResolved", self.verdict_resolved.as_str()),
+            ("humanQuestionTitle", self.human_question_title.as_str()),
+            (
+                "humanAnswerInstruction",
+                self.human_answer_instruction.as_str(),
+            ),
+            (
+                "humanAnswerPlaceholder",
+                self.human_answer_placeholder.as_str(),
+            ),
+            ("humanAnswered", self.human_answered.as_str()),
+            ("answerPrefix", self.answer_prefix.as_str()),
+            ("humanCancelled", self.human_cancelled.as_str()),
+            ("issueNotFound", self.issue_not_found.as_str()),
+            ("bindThreadPrefix", self.bind_thread_prefix.as_str()),
+            (
+                "permissionAlreadyHandled",
+                self.permission_already_handled.as_str(),
+            ),
+            ("humanAlreadyAnswered", self.human_already_answered.as_str()),
+            (
+                "permissionCommandUsage",
+                self.permission_command_usage.as_str(),
+            ),
+            ("humanAnswerUsage", self.human_answer_usage.as_str()),
+            ("threadRequired", self.thread_required.as_str()),
+            ("freeTextUnavailable", self.free_text_unavailable.as_str()),
+            ("unboundThread", self.unbound_thread.as_str()),
+            ("leadPrefix", self.lead_prefix.as_str()),
+            ("resyncOne", self.resync_one.as_str()),
+            ("resyncMany", self.resync_many.as_str()),
+            ("resyncMore", self.resync_more.as_str()),
+            ("resyncHint", self.resync_hint.as_str()),
+        ];
+        for (name, value) in fields {
+            if value.trim().is_empty() {
+                anyhow::bail!("DingTalk copy field {name} is empty");
+            }
+            if value.chars().count() > MAX_FIELD_CHARS {
+                anyhow::bail!("DingTalk copy field {name} is too long");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// 卡片按钮开关：基线 = 回复消息作答，
 /// 按钮只是增强（飞书长连接官方仅保证事件订阅，spec §1）。
 pub const CARD_BUTTONS: bool = false;
@@ -156,7 +252,7 @@ pub fn human_cancelled_card(lang: &str) -> Value {
 /// 钉钉基础机器人消息没有飞书 reply-parent / 可 patch 卡片的稳定等价物。
 /// 因此权限与提问都携带完整、显式、可复制的命令；detail 用纯文本拼接，避免
 /// markdown 把真实命令渲染成另一种含义。
-pub fn dingtalk_permission_text(ask: &crate::ask::Ask, lang: &str) -> String {
+pub fn dingtalk_permission_text(ask: &crate::ask::Ask, copy: &DingTalkCopy) -> String {
     let title = if ask.thread_title.is_empty() {
         "weft"
     } else {
@@ -169,10 +265,10 @@ pub fn dingtalk_permission_text(ask: &crate::ask::Ask, lang: &str) -> String {
     };
     format!(
         "{} · {title}\n{}\n{who}\n\n{}\n\n{}\n/allow {}\n/deny {}\n/always {}\n/full {}",
-        t(lang, "权限请求", "Permission ask"),
+        copy.permission_title,
         clamp(&ask.summary, 200),
         clamp(&ask.detail, 3000),
-        t(lang, "复制一条命令回复：", "Reply with one command:",),
+        copy.permission_reply_command,
         ask.id,
         ask.id,
         ask.id,
@@ -180,14 +276,18 @@ pub fn dingtalk_permission_text(ask: &crate::ask::Ask, lang: &str) -> String {
     )
 }
 
-pub fn dingtalk_permission_resolved_text(summary: &str, verdict: &str, lang: &str) -> String {
+pub fn dingtalk_permission_resolved_text(
+    summary: &str,
+    verdict: &str,
+    copy: &DingTalkCopy,
+) -> String {
     let label = match verdict {
-        "allow" => t(lang, "已允许 ✓", "Allowed ✓"),
-        "always" => t(lang, "已允许（总是）✓", "Always-allowed ✓"),
-        "full" => t(lang, "已放行（任务全权）✓", "Full access ✓"),
-        "deny" => t(lang, "已拒绝 ✕", "Denied ✕"),
-        "cancelled" => t(lang, "已过期（回落工具自答）", "Expired (tool fallback)"),
-        _ => t(lang, "已处理", "Resolved"),
+        "allow" => copy.verdict_allowed.as_str(),
+        "always" => copy.verdict_always_allowed.as_str(),
+        "full" => copy.verdict_full_access.as_str(),
+        "deny" => copy.verdict_denied.as_str(),
+        "cancelled" => copy.verdict_expired.as_str(),
+        _ => copy.verdict_resolved.as_str(),
     };
     if summary.is_empty() {
         label.to_string()
@@ -202,42 +302,62 @@ pub fn dingtalk_human_question_text(
     thread_title: &str,
     from: &str,
     text: &str,
-    lang: &str,
+    copy: &DingTalkCopy,
 ) -> String {
     format!(
         "{} · {}\n{}\n{}\n\n{}\n/answer {thread_id} {ask_id} {}",
-        t(lang, "agent 提问", "Agent question"),
+        copy.human_question_title,
         thread_title,
         from,
         clamp(text, 3000),
-        t(
-            lang,
-            "把末尾的 <回答> 替换成你的答复：",
-            "Replace <answer> with your reply:",
-        ),
-        t(lang, "<回答>", "<answer>"),
+        copy.human_answer_instruction,
+        copy.human_answer_placeholder,
     )
 }
 
-pub fn dingtalk_human_resolved_text(answer: &str, lang: &str) -> String {
+pub fn dingtalk_human_resolved_text(answer: &str, copy: &DingTalkCopy) -> String {
     if answer.is_empty() {
-        t(lang, "提问已回答 ✓", "Question answered ✓").to_string()
+        copy.human_answered.clone()
     } else {
         format!(
             "{}\n{}{}",
-            t(lang, "提问已回答 ✓", "Question answered ✓"),
-            t(lang, "答：", "Answer: "),
+            copy.human_answered,
+            copy.answer_prefix,
             clamp(answer, 1000)
         )
     }
 }
 
-pub fn dingtalk_human_cancelled_text(lang: &str) -> &'static str {
-    t(
-        lang,
-        "提问已取消：对应 workspace 已删除。",
-        "Question cancelled: its workspace was deleted.",
-    )
+pub fn dingtalk_human_cancelled_text(copy: &DingTalkCopy) -> &str {
+    &copy.human_cancelled
+}
+
+pub fn dingtalk_issue_reply_text(copy: &DingTalkCopy, body: &str) -> String {
+    format!("{}{}", copy.lead_prefix, clamp(body.trim(), 9000))
+}
+
+pub fn dingtalk_resync_summary(copy: &DingTalkCopy, items: &[(i32, String)]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut body = if items.len() == 1 {
+        copy.resync_one.clone()
+    } else {
+        copy.resync_many.replace("{n}", &items.len().to_string())
+    };
+    let cap = 8;
+    for (thread_id, summary) in items.iter().take(cap) {
+        body.push_str(&format!("\n- #{thread_id} {}", clamp(summary, 160)));
+    }
+    if items.len() > cap {
+        body.push_str(
+            &copy
+                .resync_more
+                .replace("{n}", &(items.len() - cap).to_string()),
+        );
+    }
+    body.push_str(&copy.resync_hint);
+    body
 }
 
 /// M2-4：lead/Concierge 回流飞书话题的纯文本渲染。前缀「Lead：/Lead: 」
@@ -310,6 +430,39 @@ mod tests {
             dir_name: "backend".into(),
             workspace_id: None,
             action_key: "claude:npm test".into(),
+        }
+    }
+
+    fn dingtalk_copy() -> DingTalkCopy {
+        DingTalkCopy {
+            permission_title: "权限请求".into(),
+            permission_reply_command: "复制一条命令回复：".into(),
+            verdict_allowed: "已允许 ✓".into(),
+            verdict_always_allowed: "已允许（总是）✓".into(),
+            verdict_full_access: "已放行（任务全权）✓".into(),
+            verdict_denied: "已拒绝 ✕".into(),
+            verdict_expired: "已过期".into(),
+            verdict_resolved: "已处理".into(),
+            human_question_title: "Agent question".into(),
+            human_answer_instruction: "Replace <answer> with your reply:".into(),
+            human_answer_placeholder: "<answer>".into(),
+            human_answered: "Question answered ✓".into(),
+            answer_prefix: "Answer: ".into(),
+            human_cancelled: "提问已取消".into(),
+            issue_not_found: "没有找到 issue".into(),
+            bind_thread_prefix: "已绑定 thread".into(),
+            permission_already_handled: "权限请求已处理".into(),
+            human_already_answered: "提问已回答".into(),
+            permission_command_usage: "permission usage".into(),
+            human_answer_usage: "human usage".into(),
+            thread_required: "thread required".into(),
+            free_text_unavailable: "unavailable".into(),
+            unbound_thread: "unbound".into(),
+            lead_prefix: "Lead：".into(),
+            resync_one: "1 项待处理".into(),
+            resync_many: "{n} 项待处理".into(),
+            resync_more: "（+{n} 条）".into(),
+            resync_hint: "\n在桌面端处理".into(),
         }
     }
 
@@ -416,14 +569,15 @@ mod tests {
 
     #[test]
     fn dingtalk_prompts_use_explicit_deterministic_commands() {
-        let permission = dingtalk_permission_text(&ask(), "zh");
+        let copy = dingtalk_copy();
+        let permission = dingtalk_permission_text(&ask(), &copy);
         assert!(permission.contains("/allow 42"));
         assert!(permission.contains("/deny 42"));
         assert!(permission.contains("/always 42"));
         assert!(permission.contains("/full 42"));
 
         let human =
-            dingtalk_human_question_text(7, 9, "登录超时修复", "backend", "major or minor?", "en");
+            dingtalk_human_question_text(7, 9, "登录超时修复", "backend", "major or minor?", &copy);
         assert!(human.contains("/answer 7 9 <answer>"));
         assert!(human.contains("major or minor?"));
     }
@@ -431,12 +585,32 @@ mod tests {
     #[test]
     fn dingtalk_resolution_copy_matches_answer_protocol() {
         use crate::ask::Answer;
+        let copy = dingtalk_copy();
         assert!(
-            dingtalk_permission_resolved_text("x", Answer::Always.as_str(), "zh")
+            dingtalk_permission_resolved_text("x", Answer::Always.as_str(), &copy)
                 .contains("已允许（总是）")
         );
-        assert!(dingtalk_human_resolved_text("minor", "en").contains("Answer: minor"));
-        assert!(dingtalk_human_cancelled_text("zh").contains("已取消"));
+        assert!(dingtalk_human_resolved_text("minor", &copy).contains("Answer: minor"));
+        assert!(dingtalk_human_cancelled_text(&copy).contains("已取消"));
+    }
+
+    #[test]
+    fn dingtalk_copy_is_validated_and_drives_issue_and_resync_text() {
+        let copy = dingtalk_copy();
+        assert!(copy.validate().is_ok());
+        assert_eq!(
+            dingtalk_issue_reply_text(&copy, " 推进了一下 "),
+            "Lead：推进了一下"
+        );
+        let summary = dingtalk_resync_summary(&copy, &[(7, "Run tests".into())]);
+        assert!(summary.contains("1 项待处理"));
+        assert!(summary.contains("#7 Run tests"));
+
+        let invalid = DingTalkCopy {
+            permission_title: String::new(),
+            ..copy
+        };
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
