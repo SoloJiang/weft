@@ -766,6 +766,12 @@ function AutomationSettings() {
   // above) — a narrow, rarely-touched preference with no other consumer.
   const [autoMerge, setAutoMergeState] = useState(false);
   const [autoMergeLoaded, setAutoMergeLoaded] = useState(false);
+  // issue #160 M1: OS-level computer use (window enumeration + screenshot of a
+  // named app window) for visual verification. Own local+effect pair (mirrors
+  // automaticRouting just above) — a narrow, rarely-touched preference with
+  // no other consumer.
+  const [computerUse, setComputerUseState] = useState(false);
+  const [computerUseLoaded, setComputerUseLoaded] = useState(false);
 
   useEffect(() => {
     void api.imGetSettings().then((s) => {
@@ -783,6 +789,10 @@ function AutomationSettings() {
     void api.getPrAutoMergeEnabled().then((enabled) => {
       setAutoMergeState(enabled);
       setAutoMergeLoaded(true);
+    });
+    void api.getComputerUseEnabled().then((enabled) => {
+      setComputerUseState(enabled);
+      setComputerUseLoaded(true);
     });
   }, []);
 
@@ -839,6 +849,17 @@ function AutomationSettings() {
       await api.setPrAutoMergeEnabled(on);
     } catch (err) {
       setAutoMergeState(prev);
+      throw err;
+    }
+  }
+
+  async function toggleComputerUse(on: boolean) {
+    const prev = computerUse;
+    setComputerUseState(on);
+    try {
+      await api.setComputerUseEnabled(on);
+    } catch (err) {
+      setComputerUseState(prev);
       throw err;
     }
   }
@@ -926,6 +947,22 @@ function AutomationSettings() {
         <p className="px-3 pb-3 text-[11px] leading-relaxed text-ink-faint">
           {t("settings.autoMergeDisclosure")}
         </p>
+      </SettingsGroup>
+      <SettingsGroup title={t("settings.computerUseGroup")}>
+        <SettingRow label={t("settings.computerUseTitle")} hint={t("settings.computerUseHint")}>
+          {computerUseLoaded ? (
+            <Toggle
+              on={computerUse}
+              onChange={(v) => void toggleComputerUse(v)}
+              label={t("settings.computerUseTitle")}
+            />
+          ) : (
+            <div
+              aria-hidden
+              className="h-[22px] w-[38px] shrink-0 rounded-full bg-border-strong/40"
+            />
+          )}
+        </SettingRow>
       </SettingsGroup>
       <SettingsGroup title={t("settings.reviewGroup")}>
         <SettingRow label={t("settings.reviewSkill")} hint={t("settings.reviewSkillHint")}>

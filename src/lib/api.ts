@@ -332,6 +332,11 @@ export const api = {
     invoke<boolean>("get_automatic_engine_routing_enabled"),
   setAutomaticEngineRoutingEnabled: (enabled: boolean) =>
     invoke<void>("set_automatic_engine_routing_enabled", { enabled }),
+  // issue #160 M1: OS-level computer use (window enumeration + screenshot of a
+  // named app window) for visual verification. Opt-in — off by default.
+  getComputerUseEnabled: () => invoke<boolean>("get_computer_use_enabled"),
+  setComputerUseEnabled: (enabled: boolean) =>
+    invoke<void>("set_computer_use_enabled", { enabled }),
   // issue #97: auto fail-over to the fallback engine on a quota-exceeded turn.
   // Opt-in — off by default, since switching engines mid-task ships that
   // engine's own history digest to a DIFFERENT provider.

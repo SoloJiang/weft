@@ -832,6 +832,10 @@ export const en = {
     automaticRoutingTitle: "Let Weft choose engines automatically",
     automaticRoutingHint:
       "Global opt-in for new leads, tasks, curator chat, and read-only analysis. Normal work prefers Codex; deep work prefers Claude. Manual engine choices remain pinned.",
+    computerUseGroup: "Computer use",
+    computerUseTitle: "Allow computer use",
+    computerUseHint:
+      "Lets an agent enumerate on-screen windows and take a screenshot of one named application window for visual verification. Off by default. Screenshots always exclude Weft's own window and any terminal window. Every call still needs your approval in Needs you.",
     detecting: "Detecting…",
     installed: "installed",
     installedVersion: "v{{version}}",

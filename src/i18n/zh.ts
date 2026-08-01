@@ -802,6 +802,10 @@ export const zh = {
     automaticRoutingTitle: "允许 Weft 自动选择引擎",
     automaticRoutingHint:
       "全局开关，作用于新 lead、任务、curator 对话和只读分析。普通工作优先 Codex，深度工作优先 Claude；手动选择始终保持 pin。",
+    computerUseGroup: "Computer use",
+    computerUseTitle: "允许 computer use",
+    computerUseHint:
+      "允许 agent 枚举当前屏幕上的窗口，并对指定的某个应用窗口截图，用于视觉验证。默认关闭。截图始终排除 Weft 自身窗口和任何终端窗口。每次调用仍需在「待你处理」中经你批准。",
     detecting: "检测中…",
     installed: "已安装",
     installedVersion: "v{{version}}",
