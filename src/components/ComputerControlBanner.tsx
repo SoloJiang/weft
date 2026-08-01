@@ -78,6 +78,19 @@ function bannerText(status: BannerStatus, state: ControlState | null, t: TFuncti
  * standing, more-emphasized error state (cleared only by a successful
  * retry), never a silently swallowed `.catch`. Esc and the Stop button both
  * funnel through this same handler, so they get identical error handling.
+ *
+ * issue #160 round-6 review P2 #6: that local `.catch`-driven error state
+ * only ever covers a Stop issued from THIS button. The OS-level global
+ * Escape shortcut (`computer::register_global_escape`) triggers the exact
+ * same `emergency_stop` from a spawned backend task with nobody watching
+ * its result — a persist failure there had no UI to surface it at all,
+ * since once the lease clears there's no holder left for the polling loop
+ * to show either. The poll below now ALSO fetches
+ * `get_computer_stop_persist_failed` every tick, so a failure from EITHER
+ * path (this button's local catch, or the backend's own sticky flag) flips
+ * the SAME error-state banner — reusing round-4's `stopFailed` UI/copy
+ * rather than inventing a second one, since the underlying meaning
+ * ("the disabled setting may not have persisted") is identical either way.
  * Mounted once near the top of the shell, above the content area, alongside
  * `ProcessQuotaBar`.
  */
@@ -85,18 +98,26 @@ export function ComputerControlBanner() {
   const { t } = useTranslation();
   const reduce = useReducedMotion();
   const [state, setState] = useState<ControlState | null>(null);
-  const [stopFailed, setStopFailed] = useState(false);
+  // Two independent sources for the SAME error state (issue #160 round-6
+  // review P2 #6) — a local one (this button's own call failed) and a
+  // server one (ANY emergency_stop, including the OS-level Escape path,
+  // failed to persist and hasn't since been cleared by a successful
+  // re-enable). Combined below into the one discriminated `status`; neither
+  // is re-derived anywhere else.
+  const [localStopFailed, setLocalStopFailed] = useState(false);
+  const [serverStopFailed, setServerStopFailed] = useState(false);
   const [stopping, setStopping] = useState(false);
 
   useEffect(() => {
     let alive = true;
     const tick = async () => {
-      try {
-        const next = await api.getComputerControlState();
-        if (alive) setState(next);
-      } catch {
-        if (alive) setState(null);
-      }
+      const [controlResult, persistResult] = await Promise.allSettled([
+        api.getComputerControlState(),
+        api.getComputerStopPersistFailed(),
+      ]);
+      if (!alive) return;
+      setState(controlResult.status === "fulfilled" ? controlResult.value : null);
+      setServerStopFailed(persistResult.status === "fulfilled" ? persistResult.value : false);
     };
     void tick();
     const h = setInterval(() => void tick(), POLL_MS);
@@ -111,17 +132,17 @@ export function ComputerControlBanner() {
     api.computerEmergencyStop().then(
       () => {
         setStopping(false);
-        setStopFailed(false);
+        setLocalStopFailed(false);
         setState(null);
       },
       () => {
         setStopping(false);
-        setStopFailed(true);
+        setLocalStopFailed(true);
       },
     );
   }, []);
 
-  const status = bannerStatus(state, stopFailed);
+  const status = bannerStatus(state, localStopFailed || serverStopFailed);
 
   useEffect(() => {
     if (status === "hidden") return;

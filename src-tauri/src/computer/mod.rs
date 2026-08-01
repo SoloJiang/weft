@@ -41,14 +41,14 @@ pub const K_COMPUTER_USE_ENABLED: &str = "computer_use_enabled";
 /// row, or any value other than the literal "true" all read as disabled —
 /// this gate gets no benefit of the doubt, unlike most weft settings.
 ///
-/// issue #160 review R1 #1: the emergency-stop latch ([`EMERGENCY_STOPPED`])
-/// is checked FIRST, before the DB is even touched — once tripped, this
-/// returns `false` unconditionally, so a `set_setting` write failure inside
-/// [`emergency_stop`] (which the latch does NOT depend on — see that
-/// function's doc) can never leave the kill switch silently fail-open
-/// because the setting row still reads "true".
+/// issue #160 review R1 #1: the emergency-stop latch ([`stop_state`]'s
+/// `stopped` field) is checked FIRST, before the DB is even touched — once
+/// tripped, this returns `false` unconditionally, so a `set_setting` write
+/// failure inside [`emergency_stop`] (which the latch does NOT depend on —
+/// see that function's doc) can never leave the kill switch silently
+/// fail-open because the setting row still reads "true".
 pub async fn enabled(db: &crate::store::Db) -> bool {
-    if EMERGENCY_STOPPED.load(Ordering::SeqCst) {
+    if stop_state().lock().unwrap_or_else(|e| e.into_inner()).stopped {
         return false;
     }
     matches!(
@@ -57,29 +57,102 @@ pub async fn enabled(db: &crate::store::Db) -> bool {
     )
 }
 
-/// Process-level emergency-stop latch (issue #160 review R1 #1). Once
-/// tripped by [`emergency_stop`], [`enabled`] returns `false`
-/// UNCONDITIONALLY, before it even reads the `computer_use_enabled` DB
-/// setting — so this is the actual fail-closed mechanism the kill switch
+/// Process-level emergency-stop latch state, PLUS the generation counter
+/// [`clear_emergency_stop`] needs to detect a stale caller (issue #160
+/// round-6 review P1 #1) — kept together behind ONE mutex rather than
+/// `stopped` as a lone `AtomicBool` and `generation` as a separate
+/// `AtomicU64`: [`clear_emergency_stop`]'s whole job is a check-THEN-act
+/// ("is the generation still what the caller expects; if so, clear
+/// `stopped`") that two INDEPENDENT atomics cannot make atomic against a
+/// concurrent [`emergency_stop`] call landing in the gap between the check
+/// and the act (a compare-then-store on two separate atomics still leaves a
+/// window where `emergency_stop`'s own two writes could straddle it) — see
+/// [`clear_emergency_stop`]'s own doc for the exact race this closes.
+///
+/// `stopped`, once tripped by [`emergency_stop`], makes [`enabled`] return
+/// `false` UNCONDITIONALLY, before it even reads the `computer_use_enabled`
+/// DB setting — so this is the actual fail-closed mechanism the kill switch
 /// relies on, and the DB write in [`emergency_stop`] is best-effort
 /// persistence for the NEXT launch, not something [`enabled`] depends on
-/// within THIS process's life. The ONLY function allowed to clear it is
-/// [`clear_emergency_stop`], itself called from exactly one place —
+/// within THIS process's life. The ONLY function allowed to clear `stopped`
+/// is [`clear_emergency_stop`], itself called from exactly one place —
 /// `commands::set_computer_use_enabled` when a human explicitly re-enables
-/// computer use from Settings. `Ordering::SeqCst` throughout: this gates
-/// every input action process-wide, so the extra fence cost over a looser
-/// ordering is nothing next to a kill switch that could otherwise be
-/// reordered into fail-open.
-static EMERGENCY_STOPPED: AtomicBool = AtomicBool::new(false);
+/// computer use from Settings.
+struct StopState {
+    stopped: bool,
+    /// Bumped by every [`emergency_stop`] call (issue #160 round-6 review P1
+    /// #1). `commands::set_computer_use_enabled(true)` reads this via
+    /// [`stop_generation`] BEFORE its own (possibly slow) `set_setting`
+    /// write, then only actually clears the latch (via
+    /// [`clear_emergency_stop`]) if the generation it read is STILL current
+    /// once that write finishes. A Stop that lands WHILE the enable's write
+    /// is in flight bumps this, so the enable's later clear attempt is
+    /// recognized as stale and refused — an explicit, LATER Stop always
+    /// wins over an EARLIER, still-in-flight enable, never the reverse.
+    generation: u64,
+}
 
-/// Clear the emergency-stop latch (issue #160 review R1 #1). The ONLY
-/// legitimate caller is `commands::set_computer_use_enabled` when `enabled
-/// == true` — a human explicitly turning computer use back on from Settings
-/// after a kill switch trip. Nothing else in this codebase may call this:
-/// there is deliberately no other path back to "computer use may run again"
-/// once the latch is tripped.
-pub fn clear_emergency_stop() {
-    EMERGENCY_STOPPED.store(false, Ordering::SeqCst);
+fn stop_state() -> &'static Mutex<StopState> {
+    static STATE: OnceLock<Mutex<StopState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(StopState { stopped: false, generation: 0 }))
+}
+
+/// The current stop-generation (issue #160 round-6 review P1 #1) — see
+/// [`StopState::generation`]'s own doc for the full read-before-write,
+/// clear-only-if-still-current contract this exists for.
+pub fn stop_generation() -> u64 {
+    stop_state().lock().unwrap_or_else(|e| e.into_inner()).generation
+}
+
+/// Clear the emergency-stop latch (issue #160 review R1 #1; generation check
+/// added round-6 review P1 #1 — see [`StopState`]'s own doc for why a lone
+/// `AtomicBool`/`AtomicU64` pair could not make this fully race-safe). The
+/// ONLY legitimate caller is `commands::set_computer_use_enabled` when
+/// `enabled == true` — a human explicitly turning computer use back on from
+/// Settings after a kill switch trip. Nothing else in this codebase may call
+/// this: there is deliberately no other path back to "computer use may run
+/// again" once the latch is tripped.
+///
+/// `expected_gen` must be a [`stop_generation`] value the caller read BEFORE
+/// its own `set_setting` write started. This clears the latch (and returns
+/// `true`) ONLY when the generation is STILL exactly what the caller
+/// expects — i.e. no [`emergency_stop`] ran in between. If a Stop DID land
+/// in between (the generation has since moved on), this returns `false` and
+/// leaves the latch tripped: an explicit, LATER Stop must never be silently
+/// undone by an EARLIER enable request that only just now finished its own
+/// DB write (issue #160 round-6 review P1 #1 — this is the exact bug this
+/// generation check exists to close). Also resets [`STOP_PERSIST_FAILED`] on
+/// an actual clear (issue #160 round-6 review P2 #6): a human explicitly
+/// re-enabling computer use from Settings is the closest thing this feature
+/// has to an acknowledgment that any earlier persist failure has been dealt
+/// with.
+pub fn clear_emergency_stop(expected_gen: u64) -> bool {
+    let mut guard = stop_state().lock().unwrap_or_else(|e| e.into_inner());
+    if guard.generation != expected_gen {
+        return false;
+    }
+    guard.stopped = false;
+    drop(guard);
+    STOP_PERSIST_FAILED.store(false, Ordering::SeqCst);
+    true
+}
+
+/// Set (issue #160 round-6 review P2 #6) whenever the MOST RECENT
+/// [`emergency_stop`] call's own `set_setting` write failed — covering BOTH
+/// paths that call it (`commands::computer_emergency_stop`, the Stop button/
+/// dialog, AND the OS-level global Escape shortcut's own spawned call — see
+/// [`register_global_escape`]), since neither can otherwise tell a human
+/// "the kill switch tripped in-memory, but the setting may still read
+/// `true` on disk for the next launch". Reset to `false` only by a
+/// SUCCESSFUL [`clear_emergency_stop`] — see that function's own doc.
+/// `bus::computer_srv`/the frontend never touch this directly; read it via
+/// [`stop_persist_failed`] / `commands::get_computer_stop_persist_failed`.
+static STOP_PERSIST_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the most recent [`emergency_stop`] call's own DB write failed and
+/// hasn't since been cleared — see [`STOP_PERSIST_FAILED`]'s own doc.
+pub fn stop_persist_failed() -> bool {
+    STOP_PERSIST_FAILED.load(Ordering::SeqCst)
 }
 
 /// One discriminated error value for the whole module (CLAUDE.md: derive ONE
@@ -203,6 +276,16 @@ pub struct Screenshot {
     /// recover real screen coordinates; recorded here so that mapping has
     /// something authoritative to read instead of re-deriving it.
     pub scale: f64,
+    /// The id of the window this screenshot ACTUALLY captured — [`screenshot_window`]'s
+    /// own `matched.id`, from the SAME resolution it captured against (issue
+    /// #160 round-6 review P2 #4). Exists so a caller that needs to key
+    /// something off "the window this screenshot came from" (the Ask-card
+    /// preview registry in `bus::computer_srv`) never has to re-resolve
+    /// `query` a second time — a second resolution can land on a DIFFERENT
+    /// window than the one actually captured if it closed, was renamed, or
+    /// its id got reused in the gap between the two calls, silently
+    /// mis-keying the preview to the wrong window.
+    pub window_id: u32,
 }
 
 /// Apps excluded from window enumeration/screenshots, for two independent
@@ -495,6 +578,7 @@ pub fn screenshot_window(
         width: image.width(),
         height: image.height(),
         scale,
+        window_id: matched.id,
     })
 }
 
@@ -595,8 +679,8 @@ fn control_mutex() -> &'static Mutex<Option<ControlHolderState>> {
 /// introduces): every test — in THIS module's own `#[cfg(test)] mod tests`,
 /// or in `bus::computer_srv`'s separate one — that touches ANY process-wide,
 /// un-keyed static this module owns ([`control_mutex`], [`throttle_mutex`],
-/// `shortcut_mutex`/the `SHORTCUT_*_ATTEMPTS` counters, [`EMERGENCY_STOPPED`])
-/// must acquire this lock for its own duration. `cargo test`'s default
+/// `shortcut_mutex`/the `SHORTCUT_*_ATTEMPTS` counters, [`stop_state`],
+/// [`STOP_PERSIST_FAILED`]) must acquire this lock for its own duration. `cargo test`'s default
 /// parallel test threads would otherwise interleave two such tests' own
 /// acquire/clear/store calls against the exact SAME global state — several of
 /// this file's own pre-existing test doc comments already named this exact
@@ -790,12 +874,33 @@ pub fn clear_control() {
 /// the caller (`Err`) rather than silently dropped, since a UI that thinks
 /// the setting persisted when it didn't is its own kind of foot-gun — it is
 /// just not the FAIL-CLOSED mechanism itself anymore.
+///
+/// issue #160 round-6 review P1 #1: the generation bump happens in the SAME
+/// locked critical section as the `stopped` flip (see [`StopState`]'s own
+/// doc) — so a `set_computer_use_enabled(true)` request that read
+/// [`stop_generation`] before this call started is guaranteed to see a
+/// DIFFERENT generation afterward, and its own later
+/// [`clear_emergency_stop`] call is refused rather than undoing THIS stop.
+///
+/// issue #160 round-6 review P2 #6: on a persist failure, this also sets
+/// [`STOP_PERSIST_FAILED`] — covering both callers (the Settings/command
+/// path AND the OS-level global Escape shortcut's own spawned call below),
+/// since round-4 only wired the frontend's error state to the command path's
+/// own local `.catch`, leaving the Escape path's failures silently dropped.
 pub async fn emergency_stop(db: &crate::store::Db) -> Result<(), String> {
-    EMERGENCY_STOPPED.store(true, Ordering::SeqCst);
+    {
+        let mut guard = stop_state().lock().unwrap_or_else(|e| e.into_inner());
+        guard.stopped = true;
+        guard.generation = guard.generation.wrapping_add(1);
+    }
     clear_control();
-    crate::store::repo::set_setting(db, K_COMPUTER_USE_ENABLED, "false")
+    let result = crate::store::repo::set_setting(db, K_COMPUTER_USE_ENABLED, "false")
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    if result.is_err() {
+        STOP_PERSIST_FAILED.store(true, Ordering::SeqCst);
+    }
+    result
 }
 
 // —— OS-level global Escape (issue #160 review R1 #5) ——
@@ -865,7 +970,7 @@ fn escape_shortcut() -> tauri_plugin_global_shortcut::Shortcut {
 /// failure (already grabbed by another app, unsupported platform/desktop
 /// environment, ...) is logged and swallowed the same way, for the same
 /// reason: the WebView's own Esc listener and the in-memory
-/// [`EMERGENCY_STOPPED`] latch are the mechanisms that actually have to
+/// [`StopState::stopped`] latch are the mechanisms that actually have to
 /// work; this is upside only.
 fn register_global_escape() {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
@@ -878,10 +983,10 @@ fn register_global_escape() {
         tauri::async_runtime::spawn(async move {
             use tauri::Manager as _;
             let db = app.state::<crate::store::Db>().inner().clone();
-            // Error ignored: `emergency_stop` sets the in-memory
-            // `EMERGENCY_STOPPED` latch BEFORE its own fallible DB write, so
-            // the kill switch has already taken effect even on an `Err` here
-            // — see that function's doc comment.
+            // Error ignored (but not un-observable — see `STOP_PERSIST_FAILED`):
+            // `emergency_stop` sets the in-memory latch BEFORE its own
+            // fallible DB write, so the kill switch has already taken effect
+            // even on an `Err` here — see that function's doc comment.
             let _ = emergency_stop(&db).await;
         });
     });
@@ -1312,6 +1417,9 @@ mod tests {
         assert_eq!(shot.width, 1280);
         assert_eq!(shot.height, 720);
         assert_eq!(shot.scale, 0.5);
+        // issue #160 round-6 review P2 #4: the id of the window actually
+        // captured, not something a caller must re-resolve `query` to get.
+        assert_eq!(shot.window_id, 9);
         let opened = image::open(&shot.path).unwrap();
         assert_eq!((opened.width(), opened.height()), (1280, 720));
     }
@@ -1661,15 +1769,15 @@ mod tests {
         // in this binary — see `emergency_stop_latch_wins_over_a_true_setting_until_explicitly_cleared`'s
         // own note on why every latch-touching test must clean up after
         // itself.
-        clear_emergency_stop();
+        clear_emergency_stop(stop_generation());
     }
 
     // —— emergency-stop latch (issue #160 review R1 #1) ——
 
     #[tokio::test]
     async fn emergency_stop_latch_wins_over_a_true_setting_until_explicitly_cleared() {
-        // `EMERGENCY_STOPPED` is a process-wide static shared by every test
-        // in this binary (same category of shared state as `control_mutex`/
+        // `stop_state` is a process-wide static shared by every test in this
+        // binary (same category of shared state as `control_mutex`/
         // `throttle_mutex` above) — kept as ONE test exercising the whole
         // latch lifecycle sequentially, ending with the latch cleared again,
         // rather than splitting it across tests that could interleave with
@@ -1679,26 +1787,116 @@ mod tests {
         // actually enforced — `process_state_test_lock` closes it for real.
         let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        clear_emergency_stop();
+        clear_emergency_stop(stop_generation());
         crate::store::repo::set_setting(&db, K_COMPUTER_USE_ENABLED, "true")
             .await
             .unwrap();
         assert!(enabled(&db).await, "baseline: latch clear, setting true -> enabled");
 
-        EMERGENCY_STOPPED.store(true, Ordering::SeqCst);
+        stop_state().lock().unwrap_or_else(|e| e.into_inner()).stopped = true;
         assert!(
             !enabled(&db).await,
             "the latch must win even though the underlying setting is still \"true\""
         );
 
-        clear_emergency_stop();
+        clear_emergency_stop(stop_generation());
         assert!(
             enabled(&db).await,
             "clearing the latch restores the underlying setting's value"
         );
 
         // Leave it cleared for any other test in this binary.
-        clear_emergency_stop();
+        clear_emergency_stop(stop_generation());
+    }
+
+    /// issue #160 round-6 review P1 #1: reproduces the exact race the
+    /// generation check exists to close — a `set_computer_use_enabled(true)`
+    /// request reads the stop-generation, then (while its own DB write is
+    /// still "in flight" here, simulated by simply not having called
+    /// `clear_emergency_stop` yet) a real Stop lands. The enable's own later
+    /// `clear_emergency_stop` call, using the STALE generation it read
+    /// before the Stop, must be refused — the later, explicit Stop wins.
+    #[tokio::test]
+    async fn clear_emergency_stop_refuses_a_stale_generation_from_an_enable_that_lost_a_race_to_a_later_stop() {
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        // Known-clean starting point regardless of what an earlier test in
+        // this binary left behind.
+        clear_emergency_stop(stop_generation());
+        crate::store::repo::set_setting(&db, K_COMPUTER_USE_ENABLED, "true")
+            .await
+            .unwrap();
+        assert!(enabled(&db).await);
+
+        // The "enable" request reads the generation BEFORE its own (here,
+        // simulated) DB write.
+        let stale_gen = stop_generation();
+
+        // A real Stop lands WHILE that write is "in flight".
+        emergency_stop(&db).await.unwrap();
+        assert!(!enabled(&db).await, "the stop must win immediately");
+
+        // The enable's write finishes and it tries to clear the latch with
+        // the now-STALE generation it read before the stop happened.
+        let cleared = clear_emergency_stop(stale_gen);
+        assert!(!cleared, "a stale generation must not be allowed to clear a NEWER stop");
+        assert!(!enabled(&db).await, "the latch must still be tripped — the later Stop wins");
+
+        // The normal, no-race path: reading the CURRENT generation and
+        // clearing with it succeeds. `emergency_stop` above persisted
+        // "false" to the DB, so re-set it to "true" first (mirroring
+        // `commands::set_computer_use_enabled`'s own write-then-clear order)
+        // to prove the LATCH, not the DB row, was blocking `enabled`.
+        let current_gen = stop_generation();
+        assert!(
+            clear_emergency_stop(current_gen),
+            "clearing with the CURRENT (non-stale) generation must succeed"
+        );
+        crate::store::repo::set_setting(&db, K_COMPUTER_USE_ENABLED, "true")
+            .await
+            .unwrap();
+        assert!(enabled(&db).await, "clearing the latch with a valid generation restores the setting's value");
+
+        // Leave it cleared for any other test in this binary.
+        clear_emergency_stop(stop_generation());
+    }
+
+    /// issue #160 round-6 review P2 #6: a persist failure inside
+    /// `emergency_stop` (here: a read-only sqlite connection, standing in for
+    /// a real disk-full/read-only-filesystem `set_setting` failure) must set
+    /// `STOP_PERSIST_FAILED` — and a SUCCESSFUL `clear_emergency_stop` must
+    /// reset it again.
+    #[tokio::test]
+    async fn emergency_stop_sets_stop_persist_failed_on_a_write_failure_and_clear_emergency_stop_resets_it() {
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_emergency_stop(stop_generation());
+        STOP_PERSIST_FAILED.store(false, Ordering::SeqCst);
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        use sea_orm::ConnectionTrait;
+        // `PRAGMA query_only` fails every write at the SQLite engine level —
+        // deterministic regardless of OS file permissions/process privilege
+        // (a plain chmod-based trick would NOT reliably fail a write for a
+        // process running as root, which this container does).
+        db.0.execute_unprepared("PRAGMA query_only = ON;").await.unwrap();
+
+        let result = emergency_stop(&db).await;
+        assert!(result.is_err(), "a read-only connection must fail the persist write");
+        assert!(stop_persist_failed(), "a failed persist must set the flag");
+        // The in-memory latch itself must still have tripped — see
+        // `emergency_stop`'s own doc: the latch flips BEFORE the fallible DB
+        // write, so persistence failing never leaves the kill switch
+        // fail-open.
+        assert!(!enabled(&db).await);
+
+        assert!(
+            clear_emergency_stop(stop_generation()),
+            "no concurrent stop landed here, so this must clear"
+        );
+        assert!(!stop_persist_failed(), "clearing the latch must reset the persist-failed flag too");
+
+        // Leave it cleared for any other test in this binary.
+        clear_emergency_stop(stop_generation());
     }
 
     // —— input throttle (issue #160 M2) ——
@@ -1788,8 +1986,8 @@ mod tests {
 
     #[tokio::test]
     async fn enabled_reads_true_false_and_missing() {
-        // `enabled()` reads the process-wide `EMERGENCY_STOPPED` latch FIRST —
-        // see `process_state_test_lock`'s own doc for why this must not
+        // `enabled()` reads the process-wide `stop_state` latch FIRST — see
+        // `process_state_test_lock`'s own doc for why this must not
         // interleave with a test that flips that latch.
         let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let db = Db::connect("sqlite::memory:").await.unwrap();

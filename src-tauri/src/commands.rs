@@ -1585,8 +1585,17 @@ pub async fn get_computer_use_enabled(db: State<'_, Db>) -> R<bool> {
     Ok(crate::computer::enabled(&db).await)
 }
 
+/// issue #160 round-6 review P1 #1: an `enabled == true` request reads the
+/// current stop-generation via `computer::stop_generation` BEFORE its own
+/// `set_setting` write starts — see `computer::clear_emergency_stop`'s own
+/// doc for why this is required. Without it, a Stop landing WHILE this
+/// write is in flight would tick the generation, `clear_emergency_stop`
+/// would still (wrongly) clear the latch using a now-stale expectation, and
+/// a more-recent, explicit Stop would be silently undone by an
+/// earlier-issued enable request that only just now finished its own I/O.
 #[tauri::command]
 pub async fn set_computer_use_enabled(db: State<'_, Db>, enabled: bool) -> R<()> {
+    let gen = enabled.then(crate::computer::stop_generation);
     repo::set_setting(
         &db,
         crate::computer::K_COMPUTER_USE_ENABLED,
@@ -1599,8 +1608,16 @@ pub async fn set_computer_use_enabled(db: State<'_, Db>, enabled: bool) -> R<()>
     // from Settings after a kill switch trip. See
     // `computer::clear_emergency_stop`'s doc comment for why nothing else
     // (in particular, not `enabled == false`) may call it.
-    if enabled {
-        crate::computer::clear_emergency_stop();
+    //
+    // issue #160 round-6 review P1 #1: this now passes the generation read
+    // ABOVE, before the write — `clear_emergency_stop` refuses to clear the
+    // latch if a `emergency_stop` ran in between (the generation moved on),
+    // leaving THIS request's own "enable" silently overridden by the more
+    // recent Stop rather than the other way around. `enabled == false`
+    // reads `gen` as `None` and never calls this at all, unchanged from
+    // before.
+    if let Some(g) = gen {
+        crate::computer::clear_emergency_stop(g);
     }
     Ok(())
 }
@@ -1626,6 +1643,21 @@ pub async fn get_computer_control_state() -> R<Option<crate::computer::ControlHo
 #[tauri::command]
 pub async fn computer_emergency_stop(db: State<'_, Db>) -> R<()> {
     crate::computer::emergency_stop(&db).await
+}
+
+/// issue #160 round-6 review P2 #6: whether the MOST RECENT emergency stop
+/// (button/dialog OR the OS-level global Escape shortcut — both funnel
+/// through `computer::emergency_stop`) failed to persist
+/// `computer_use_enabled = false` to disk. The in-memory kill switch is
+/// still in effect either way (see `computer::emergency_stop`'s own doc) —
+/// this exists so the frontend can warn a human that a RESTART might
+/// silently re-enable computer use, even when no session currently holds
+/// the control lease (so `get_computer_control_state` alone has nothing to
+/// show). Cleared only by a subsequent, successful re-enable from Settings
+/// — see `computer::clear_emergency_stop`'s own doc.
+#[tauri::command]
+pub async fn get_computer_stop_persist_failed() -> R<bool> {
+    Ok(crate::computer::stop_persist_failed())
 }
 
 /// issue #97: whether Weft should auto-switch a thread/session to its

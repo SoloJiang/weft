@@ -329,21 +329,22 @@ async fn run_action(
             // saved successfully — it just means no preview/image this call.
             if let Some(captured) = read_captured_image(&shot.path) {
                 // ALWAYS refresh the Ask-card preview, regardless of engine —
-                // see `store_screenshot_preview`'s doc. Keyed to the window
-                // it actually came from (issue #160 round-2 P1 §2) — re-
-                // resolve `window_query` (cheap, no capture; the same kind of
-                // fresh re-resolve every OTHER action makes) rather than
-                // threading `screenshot_window`'s own internal resolution
-                // out a second way. Best-effort: if the window vanished in
-                // the instant since `screenshot_window` captured it, just
-                // skip storing this preview rather than fail an already-
-                // successful screenshot.
+                // see `store_screenshot_preview`'s doc. Keyed to
+                // `shot.window_id` — the id `computer::screenshot_window`
+                // ITSELF already resolved and captured against (issue #160
+                // round-6 review P2 #4) — rather than re-resolving
+                // `window_query` a second time here: a second resolution can
+                // land on a DIFFERENT window than the one actually captured
+                // if it closed, was renamed, or its id got reused in the gap
+                // between the two calls, silently mis-keying the preview
+                // (and any input approval card that later attaches it) to
+                // the WRONG window. `computer::Screenshot::window_id` closes
+                // that gap by construction — there is no second resolution
+                // left to drift.
                 if let Ok(preview) =
                     computer::encode_jpeg_data_uri(&captured, PREVIEW_LONG_EDGE, PREVIEW_QUALITY)
                 {
-                    if let Ok(w) = computer::resolve_window(b.as_ref(), window_query) {
-                        store_screenshot_preview(thread, dir, preview, w.id);
-                    }
+                    store_screenshot_preview(thread, dir, preview, shot.window_id);
                 }
                 // The MCP `image` content block is engine-gated — see
                 // `engine_accepts_mcp_image`'s doc table.
@@ -360,17 +361,19 @@ async fn run_action(
             Ok(text)
         }
         "left_click" | "right_click" | "double_click" | "triple_click" => {
-            // issue #160 round-2 P2 §4: every FALLIBLE, non-mutating check
-            // for this action — the window argument, the coordinate, and
-            // (for type/key below) the focus-freshness gate — runs BEFORE
-            // the control lease/throttle are touched. See this section's own
-            // "input gates" doc comment further down for the full ordering
-            // rationale.
+            // issue #160 round-2 P2 §4: every PURELY-argument-shaped check
+            // for this action (the window argument being non-empty, the
+            // coordinate's shape) runs BEFORE the control lease/throttle are
+            // touched — see this section's own "input gates" doc comment
+            // further down for the full ordering rationale. issue #160
+            // round-6 review P1 #2+#3: the window's actual RESOLUTION and
+            // the coordinate's mapping against it are NOT purely-argument
+            // checks (they depend on the live desktop's current state) and
+            // now run AFTER `input_flight_guard`/the first
+            // `recheck_after_guard` instead — see the comment right below.
             let window_query = required_window(args)?;
             let (cx, cy) = parse_coordinate(args, "coordinate")?;
             check_suspended(asks, thread, dir)?;
-            let (window_id, px, py) = resolve_and_map(window_query, cx, cy)?;
-            *window_id_out = Some(window_id);
             let button = if action == "right_click" { MouseButton::Right } else { MouseButton::Left };
             let count: u32 = match action {
                 "double_click" => 2,
@@ -386,6 +389,20 @@ async fn run_action(
             // P2).
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir).await?;
+            // issue #160 round-6 review P1 #3: resolve the window AND map
+            // the coordinate FRESH here, after the flight guard — not
+            // before it, as this used to. A call that queued on the guard
+            // behind another session's in-flight action could sit there for
+            // as long as that action's own backend round trip takes; a
+            // window resolved/mapped BEFORE the guard could have since
+            // moved, resized, closed, or had its id reused by the time this
+            // call actually gets to inject, landing the click outside the
+            // (now stale) coordinates were computed against — or on an
+            // entirely different window that reused the same id.
+            let w = computer::resolve_window(backend::backend().as_ref(), window_query)
+                .map_err(|e| e.to_string())?;
+            *window_id_out = Some(w.id);
+            let (px, py) = computer::map_to_physical(&w, cx, cy).map_err(|e| e.to_string())?;
             // issue #160 round-4 P1 §2 (broadened round-5 review P1 §6): reclaim
             // the foreground BEFORE this click reaches the OS, not after — see
             // `activate_target`'s own doc for why even the click family (not
@@ -395,7 +412,7 @@ async fn run_action(
             // click risks landing on Weft's own card instead of the target —
             // and an Auto approval offers no guarantee the target still holds
             // the real OS foreground either.
-            activate_target(window_id)?;
+            activate_and_recheck(db, asks, thread, dir, w.id).await?;
             backend::backend()
                 .click(px, py, button, count)
                 .map_err(|e| e.to_string())?;
@@ -404,28 +421,34 @@ async fn run_action(
             // AFTER the backend call succeeds: a rejected/failed click never
             // touched the real window and must not seed a false freshness
             // record for a later `type`/`key`.
-            record_click_focus(thread, dir, window_id);
+            record_click_focus(thread, dir, w.id);
             Ok(format!(
-                "{action} at ({px}, {py}) in window {window_id} done — take a screenshot to verify"
+                "{action} at ({px}, {py}) in window {} done — take a screenshot to verify",
+                w.id
             ))
         }
         "mouse_move" => {
             let window_query = required_window(args)?;
             let (cx, cy) = parse_coordinate(args, "coordinate")?;
             check_suspended(asks, thread, dir)?;
-            let (window_id, px, py) = resolve_and_map(window_query, cx, cy)?;
-            *window_id_out = Some(window_id);
             acquire_and_throttle(thread, dir)?;
             // See the click-family arm above for why this guard is held
-            // across the backend call itself.
+            // across the backend call itself, and why window resolution/
+            // coordinate mapping now happen AFTER it (issue #160 round-6
+            // review P1 #3).
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir).await?;
-            activate_target(window_id)?;
+            let w = computer::resolve_window(backend::backend().as_ref(), window_query)
+                .map_err(|e| e.to_string())?;
+            *window_id_out = Some(w.id);
+            let (px, py) = computer::map_to_physical(&w, cx, cy).map_err(|e| e.to_string())?;
+            activate_and_recheck(db, asks, thread, dir, w.id).await?;
             backend::backend()
                 .move_cursor(px, py)
                 .map_err(|e| e.to_string())?;
             Ok(format!(
-                "mouse_move to ({px}, {py}) in window {window_id} done — take a screenshot to verify"
+                "mouse_move to ({px}, {py}) in window {} done — take a screenshot to verify",
+                w.id
             ))
         }
         "left_click_drag" => {
@@ -433,15 +456,18 @@ async fn run_action(
             let (sx, sy) = parse_coordinate(args, "start_coordinate")?;
             let (ex, ey) = parse_coordinate(args, "coordinate")?;
             check_suspended(asks, thread, dir)?;
+            acquire_and_throttle(thread, dir)?;
+            let _flight = computer::input_flight_guard().await;
+            recheck_after_guard(db, asks, thread, dir).await?;
+            // issue #160 round-6 review P1 #3: BOTH endpoints are remapped
+            // against the SAME freshly-resolved `w` — a drag has two
+            // coordinates, but only one window to go stale.
             let b = backend::backend();
             let w = computer::resolve_window(b.as_ref(), window_query).map_err(|e| e.to_string())?;
             *window_id_out = Some(w.id);
             let from = computer::map_to_physical(&w, sx, sy).map_err(|e| e.to_string())?;
             let to = computer::map_to_physical(&w, ex, ey).map_err(|e| e.to_string())?;
-            acquire_and_throttle(thread, dir)?;
-            let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir).await?;
-            activate_target(w.id)?;
+            activate_and_recheck(db, asks, thread, dir, w.id).await?;
             b.drag(from, to).map_err(|e| e.to_string())?;
             Ok(format!(
                 "left_click_drag from ({}, {}) to ({}, {}) in window {} done — take a screenshot to verify",
@@ -453,17 +479,20 @@ async fn run_action(
             let (cx, cy) = parse_coordinate(args, "coordinate")?;
             let (dx, dy) = parse_scroll(args)?;
             check_suspended(asks, thread, dir)?;
-            let (window_id, px, py) = resolve_and_map(window_query, cx, cy)?;
-            *window_id_out = Some(window_id);
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir).await?;
-            activate_target(window_id)?;
+            let w = computer::resolve_window(backend::backend().as_ref(), window_query)
+                .map_err(|e| e.to_string())?;
+            *window_id_out = Some(w.id);
+            let (px, py) = computer::map_to_physical(&w, cx, cy).map_err(|e| e.to_string())?;
+            activate_and_recheck(db, asks, thread, dir, w.id).await?;
             backend::backend()
                 .scroll(px, py, dx, dy)
                 .map_err(|e| e.to_string())?;
             Ok(format!(
-                "scroll at ({px}, {py}) dx={dx} dy={dy} in window {window_id} done — take a screenshot to verify"
+                "scroll at ({px}, {py}) dx={dx} dy={dy} in window {} done — take a screenshot to verify",
+                w.id
             ))
         }
         "type" => {
@@ -474,42 +503,49 @@ async fn run_action(
             // is touched — see `check_type_length`'s own doc for why.
             check_type_length(text)?;
             check_suspended(asks, thread, dir)?;
-            let window_id = resolve_window_id(window_query)?;
-            *window_id_out = Some(window_id);
-            // Focus-freshness gate (issue #160 round-2 P1 addendum) — see
-            // `require_recent_focus`'s doc. Checked AFTER resolving the
-            // window (so the error names the SAME window id every other
-            // error/confirmation for this call names) but still BEFORE the
-            // control lease/throttle (round-2 P2 §4) and well BEFORE the
-            // backend ever sees the keystrokes.
-            require_recent_focus(thread, dir, window_id)?;
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir).await?;
-            activate_target(window_id)?;
+            // issue #160 round-6 review P1 #2+#3: resolve the window (and,
+            // right below, check focus-freshness against it) AFTER the
+            // flight guard now too — a queued `type` used to resolve the
+            // window BEFORE the guard, so a stale id from a closed/reused
+            // window could reach `require_recent_focus`/`activate_target`
+            // for the wrong target. Focus-freshness gate itself (issue #160
+            // round-2 P1 addendum) is unchanged in SPIRIT — see
+            // `require_recent_focus`'s doc — just now checked against a
+            // freshly-resolved id rather than a possibly-stale one.
+            let w = computer::resolve_window(backend::backend().as_ref(), window_query)
+                .map_err(|e| e.to_string())?;
+            *window_id_out = Some(w.id);
+            require_recent_focus(thread, dir, w.id)?;
+            activate_and_recheck(db, asks, thread, dir, w.id).await?;
             backend::backend()
                 .type_text(text)
                 .map_err(|e| e.to_string())?;
             Ok(format!(
-                "typed {} char(s) in window {window_id} done — take a screenshot to verify",
-                text.chars().count()
+                "typed {} char(s) in window {} done — take a screenshot to verify",
+                text.chars().count(),
+                w.id
             ))
         }
         "key" => {
             let window_query = required_window(args)?;
             let combo = required_text(args)?;
             check_suspended(asks, thread, dir)?;
-            let window_id = resolve_window_id(window_query)?;
-            *window_id_out = Some(window_id);
-            // See the matching comment in the "type" arm above.
-            require_recent_focus(thread, dir, window_id)?;
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir).await?;
-            activate_target(window_id)?;
+            // See the matching comment in the "type" arm above.
+            let w = computer::resolve_window(backend::backend().as_ref(), window_query)
+                .map_err(|e| e.to_string())?;
+            *window_id_out = Some(w.id);
+            require_recent_focus(thread, dir, w.id)?;
+            activate_and_recheck(db, asks, thread, dir, w.id).await?;
             backend::backend().key(combo).map_err(|e| e.to_string())?;
             Ok(format!(
-                "key {combo} in window {window_id} done — take a screenshot to verify"
+                "key {combo} in window {} done — take a screenshot to verify",
+                w.id
             ))
         }
         // No window, no control lock, no throttle — this reads the cursor's
@@ -943,13 +979,20 @@ fn require_recent_focus(thread: i32, dir: &str, window_id: u32) -> Result<(), St
 
 // —— reclaiming the foreground before every input action (issue #160 round-4 P1 §2, broadened round-5 review P1 §6) ——
 
-/// The LAST gate every input arm of [`run_action`] clears before the backend
-/// ever touches the OS — click family, `mouse_move`, `left_click_drag`,
-/// `scroll`, `type`, `key` (issue #160 round-4 P1 §2, replacing round-3 P1
-/// §1's own click-replay hack — see the focus-freshness section's own doc
-/// comment above for why that hack was unsafe and insufficient). Called
-/// AFTER [`recheck_after_guard`], while `input_flight_guard` is still held,
-/// right before the action-specific backend call itself.
+/// Reactivates the target window before the backend ever touches the OS —
+/// click family, `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`
+/// (issue #160 round-4 P1 §2, replacing round-3 P1 §1's own click-replay
+/// hack — see the focus-freshness section's own doc comment above for why
+/// that hack was unsafe and insufficient). Called via [`activate_and_recheck`]
+/// — NOT this function directly — from every input arm of [`run_action`]:
+/// AFTER the FIRST [`recheck_after_guard`] (right after acquiring
+/// `input_flight_guard`) and the arm's own fresh window resolution (issue
+/// #160 round-6 review P1 #2+#3), and immediately followed by a SECOND
+/// `recheck_after_guard` call before the action-specific backend call
+/// itself — see [`activate_and_recheck`]'s own doc for why THIS call, being
+/// a potentially slow, blocking OS call (`osascript`/`wmctrl`/`xdotool`),
+/// needed its own dedicated recheck rather than trusting the one already
+/// taken before it started.
 ///
 /// Round-4 P1 §2 shipped this ONLY for an Interactive approval (a card that
 /// actually rendered, so a human clicking Weft's own UI to answer it just
@@ -981,13 +1024,18 @@ fn require_recent_focus(thread: i32, dir: &str, window_id: u32) -> Result<(), St
 /// cross-platform primitive this module can call to VERIFY the target window
 /// is truly frontmost at the exact instant the backend call right after this
 /// one actually injects — neither `xcap` nor `enigo` exposes a "is this
-/// window frontmost right now" query, so a real focus-stealing race in the
-/// gap between this call returning `Ok` and the very next backend call could
-/// still, in principle, land the input elsewhere. This closes the ORDINARY
-/// case (an agent that never re-activates at all, or one that only did so
-/// for a card-driven Interactive approval) — it is a floor, not a ceiling,
-/// exactly like [`require_recent_focus`]'s own doc says about the
-/// freshness heuristic it complements.
+/// window frontmost right now" query, so a real THIRD-PARTY focus-stealing
+/// race (some other app/window grabbing focus back) in the gap between this
+/// call returning `Ok` and the very next backend call could still, in
+/// principle, land the input elsewhere. This closes the ORDINARY case (an
+/// agent that never re-activates at all, or one that only did so for a
+/// card-driven Interactive approval) — it is a floor, not a ceiling, exactly
+/// like [`require_recent_focus`]'s own doc says about the freshness
+/// heuristic it complements. This residual is scoped to third-party focus
+/// theft specifically — a human hitting Stop DURING this call is a
+/// DIFFERENT, now-closed hazard: see [`activate_and_recheck`]'s own doc for
+/// the second `recheck_after_guard` that closes it (issue #160 round-6
+/// review P1 #2).
 fn activate_target(target_id: u32) -> Result<(), String> {
     backend::backend().activate_window(target_id).map_err(|e| {
         format!(
@@ -1189,18 +1237,27 @@ fn window_arg(args: &Value) -> String {
 /// issue #160 round-2 P2 §4 split this single gate in two and moved the
 /// MUTATING half ([`acquire_and_throttle`] — it actually takes the 30s
 /// control lease and consumes a throttle slot) to run AFTER every
-/// action-specific, purely-FALLIBLE-but-non-mutating check for that action
-/// (the window argument, the coordinate/text/scroll shape, and — for
-/// `type`/`key` — the focus-freshness gate) has already passed, right before
-/// the backend call itself. Before this split, the mutating half ran FIRST,
-/// so a malformed call (e.g. a `left_click` missing `coordinate`) still
-/// occupied the 30s lease and a throttle slot — and lit the desktop-control
-/// banner in Settings — for a call that was always going to be rejected
-/// anyway. [`check_suspended`] (the non-mutating half) still runs early,
-/// right after `approve`: it's about a DIFFERENT, unrelated ask still
-/// waiting on the human (so an agent can't click through/at the permission
-/// UI while it's up), and doesn't itself acquire or consume anything, so
-/// there's no cost to checking it before argument parsing.
+/// action-specific, purely-argument-shaped check for that action (the window
+/// argument's presence, the coordinate/text/scroll shape) has already
+/// passed, right before `input_flight_guard`. Before this split, the
+/// mutating half ran FIRST, so a malformed call (e.g. a `left_click` missing
+/// `coordinate`) still occupied the 30s lease and a throttle slot — and lit
+/// the desktop-control banner in Settings — for a call that was always going
+/// to be rejected anyway. [`check_suspended`] (the non-mutating half) still
+/// runs early, right after `approve`: it's about a DIFFERENT, unrelated ask
+/// still waiting on the human (so an agent can't click through/at the
+/// permission UI while it's up), and doesn't itself acquire or consume
+/// anything, so there's no cost to checking it before argument parsing.
+///
+/// issue #160 round-6 review P1 #2+#3: the window's actual RESOLUTION (and,
+/// for the mouse family, the coordinate's mapping against it; for `type`/
+/// `key`, the focus-freshness check against it) are NOT purely-argument
+/// checks — they depend on the live desktop's current state, which can have
+/// changed while this call sat queued on `input_flight_guard` behind another
+/// session's in-flight action. Those now run AFTER `input_flight_guard`/the
+/// first [`recheck_after_guard`] instead, immediately followed by
+/// [`activate_and_recheck`] — see that function's own doc, and each input
+/// arm of `run_action`, for the full ordering this section now describes.
 ///
 /// Both halves run AFTER [`approve`] in [`run_action`]'s dispatch, never
 /// before: `has_open` here is a completely separate concern from "is THIS
@@ -1226,11 +1283,15 @@ fn acquire_and_throttle(thread: i32, dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The LAST gate every input branch of [`run_action`] clears, immediately
-/// after acquiring `computer::input_flight_guard()` and before it touches the
-/// backend at all (issue #160 round-3 P1 §2): re-verify the kill switch AND
-/// that the control lease this call took in [`acquire_and_throttle`] is
-/// STILL held by THIS EXACT `(thread, dir)`.
+/// A gate every input branch of [`run_action`] clears TWICE now (issue #160
+/// round-6 review P1 #2): once immediately after acquiring
+/// `computer::input_flight_guard()` (before that branch's own fresh window
+/// resolution/coordinate mapping/focus check), and again via
+/// [`activate_and_recheck`] right after `activate_target` — see that
+/// function's own doc for why a second call is needed on top of the first.
+/// Either call re-verifies the kill switch AND that the control lease this
+/// call took in [`acquire_and_throttle`] is STILL held by THIS EXACT
+/// `(thread, dir)`.
 ///
 /// Why this is needed on top of every earlier check: `input_flight_guard` is
 /// a single process-wide mutex a SECOND `tools/call` for the SAME session
@@ -1291,25 +1352,33 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
     }
 }
 
-/// Resolve `window_query` to exactly one window and map `(cx, cy)` — a
-/// screenshot-space coordinate — to that window's current physical position.
-/// Re-resolves the window FRESH every call (this turn's `list_windows`, not
-/// anything cached), matching [`computer::map_to_physical`]'s own contract.
-fn resolve_and_map(window_query: &str, cx: u32, cy: u32) -> Result<(u32, i32, i32), String> {
-    let b = backend::backend();
-    let w = computer::resolve_window(b.as_ref(), window_query).map_err(|e| e.to_string())?;
-    let (px, py) = computer::map_to_physical(&w, cx, cy).map_err(|e| e.to_string())?;
-    Ok((w.id, px, py))
-}
-
-/// Resolve `window_query` to exactly one window's id, with NO coordinate
-/// mapping — `type`/`key` don't need a position, just the existence check
-/// (and the id, for the audit log).
-fn resolve_window_id(window_query: &str) -> Result<u32, String> {
-    let b = backend::backend();
-    computer::resolve_window(b.as_ref(), window_query)
-        .map(|w| w.id)
-        .map_err(|e| e.to_string())
+/// The shared "reactivate, then recheck the kill switch/lease a SECOND
+/// time" tail every input branch of [`run_action`] runs, immediately after
+/// its own branch-specific fresh window resolution (and, for the mouse
+/// family, coordinate remap / for `type`/`key`, focus-freshness check) and
+/// right before the actual backend call (issue #160 round-6 review P1 #2).
+///
+/// `activate_target` shells out to a blocking OS call (`osascript`/
+/// `wmctrl`/`xdotool` — see its own doc) that can itself take a real amount
+/// of wall-clock time. The FIRST `recheck_after_guard`, right after
+/// acquiring `input_flight_guard`, only proves the kill switch/lease were
+/// still fine at the INSTANT the guard was acquired — a human hitting Stop
+/// DURING the activation call that follows would otherwise go unnoticed,
+/// and the backend call right after `activate_target` returns would inject
+/// input anyway even though the lease is gone and the latch is tripped.
+/// This re-runs the identical check one more time, right after activation
+/// returns, so a Stop that lands mid-activation is still honored before the
+/// backend ever sees the injection — the caller must `?` this and never
+/// fall through to its own backend call on an `Err` here.
+async fn activate_and_recheck(
+    db: &Db,
+    asks: &AskRegistry,
+    thread: i32,
+    dir: &str,
+    window_id: u32,
+) -> Result<(), String> {
+    activate_target(window_id)?;
+    recheck_after_guard(db, asks, thread, dir).await
 }
 
 /// `arr[0]`/`arr[1]` must each fit `u32` — issue #160 round-3 P2 §3: this
@@ -2044,6 +2113,30 @@ mod tests {
 
     // —— issue #160 round-4 P1 §2, broadened round-5 review P1 §6: activate_target ——
 
+    /// The ONE shared `MockBackend` every test in this module that needs to
+    /// drive `run_action` through the process-wide `backend::backend()`
+    /// singleton installs — `backend::_set_backend_override` is a
+    /// set-ONCE-per-process `OnceLock` (see its own doc comment), so a
+    /// second test calling it with a DIFFERENT `MockBackend` instance would
+    /// just silently keep using whichever one happened to install first.
+    /// Every such test calls THIS helper instead of installing its own, then
+    /// configures the SAME instance's interior-mutable fields
+    /// (`windows_override`, `actions`, `fail_activate`, `on_activate`) for
+    /// its own scenario — resetting whatever it depends on at the START of
+    /// its own test body (never relying on a previous test's cleanup), and
+    /// under `computer::process_state_test_lock` like every other test in
+    /// this file that touches shared, un-keyed process state (the mock
+    /// backend override is exactly that kind of state once installed).
+    fn shared_mock() -> std::sync::Arc<computer::mock::MockBackend> {
+        static MOCK: OnceLock<std::sync::Arc<computer::mock::MockBackend>> = OnceLock::new();
+        MOCK.get_or_init(|| {
+            let mock = std::sync::Arc::new(computer::mock::MockBackend::default());
+            backend::_set_backend_override(mock.clone());
+            mock
+        })
+        .clone()
+    }
+
     /// The end-to-end property this fix exists for, post round-5 review P1
     /// §6: `activate_target` reactivates the target window
     /// (`backend.activate_window`) UNCONDITIONALLY, every time it's called —
@@ -2053,17 +2146,13 @@ mod tests {
     /// is broken (`Unsupported`), this must propagate an `Err` naming the
     /// window, never fall through and let the real action reach the OS
     /// anyway.
-    ///
-    /// ONE test, not several: `backend::_set_backend_override` is a
-    /// set-ONCE-per-process `OnceLock` (see its own doc comment) — a second
-    /// test calling it with a DIFFERENT `MockBackend` instance would just
-    /// silently keep using whichever one happened to install first, so every
-    /// scenario that needs to flip `MockBackend::fail_activate` shares this
-    /// SAME installed instance instead of trying to install a second one.
     #[test]
     fn activate_target_always_activates_and_fails_closed_when_unsupported() {
-        let mock = std::sync::Arc::new(computer::mock::MockBackend::default());
-        backend::_set_backend_override(mock.clone());
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
         // Every call activates the EXACT target window id, unconditionally.
         assert!(activate_target(7).is_ok());
@@ -2090,6 +2179,192 @@ mod tests {
             2,
             "a failed activation must never itself be recorded as a successful action"
         );
+
+        // Leave clean for the next test sharing this mock instance.
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    // —— issue #160 round-6 review P1 #2+#3: input branches re-resolve/re-activate AFTER the flight guard ——
+
+    /// issue #160 round-6 review P1 #3: a `left_click` that queues on
+    /// `computer::input_flight_guard` behind another in-flight action must
+    /// use the window's geometry AS IT IS once it actually gets to inject —
+    /// not whatever `resolve_window`/`map_to_physical` would have computed
+    /// before it ever reached the guard. This test holds the guard itself
+    /// (standing in for "another session's own in-flight call"), spawns the
+    /// click, moves the mock window's origin while the click sits queued
+    /// behind it, then releases the guard and asserts the injected
+    /// coordinates reflect the NEW origin, never the stale one that was
+    /// current when the call started.
+    #[tokio::test]
+    async fn left_click_uses_the_windows_geometry_as_of_after_the_flight_guard_not_before() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 906_301,
+            app: "Baz".into(),
+            title: "Baz".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        let asks = AskRegistry::new();
+        let thread = 906_301;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+
+        // Prime the global input throttle well ahead of time so the real
+        // click below isn't itself rejected as rate-limited.
+        let _ = computer::throttle_input();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        // Hold the flight guard OURSELVES — the click below must queue
+        // behind it, exactly like a second `tools/call` racing an in-flight
+        // one would.
+        let held = computer::input_flight_guard().await;
+
+        let db_bg = db.clone();
+        let asks_bg = asks.clone();
+        let handle = tokio::spawn(async move {
+            let mut window_id_out = None;
+            let mut image_out = None;
+            run_action(
+                &db_bg, &asks_bg, thread, dir, None, "computer", "left_click",
+                &json!({"window": "Baz", "coordinate": [100, 50]}),
+                &mut window_id_out, &mut image_out,
+            )
+            .await
+        });
+
+        // Give the spawned call a chance to run its own pre-guard work
+        // (argument parsing, `check_suspended`, `acquire_and_throttle`) and
+        // reach — and block on — the flight guard THIS test still holds.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The window "moves" while the click sits queued.
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 906_301,
+            app: "Baz".into(),
+            title: "Baz".into(),
+            x: 500,
+            y: 300,
+            width: 800,
+            height: 600,
+        }]);
+
+        drop(held);
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+
+        let actions = mock.actions.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            actions.iter().any(|a| a == "click 600,350 Left x1"),
+            "the click must land at the window's NEW origin (500+100, 300+50), not a stale one \
+             computed before the flight guard: {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| a == "click 100,50 Left x1"),
+            "must never use the STALE pre-guard coordinates: {actions:?}"
+        );
+        drop(actions);
+
+        computer::clear_control();
+    }
+
+    /// issue #160 round-6 review P1 #2: `activate_target` shells out to a
+    /// (potentially slow, blocking) OS call. A Stop that lands WHILE that
+    /// call is running must still be honored: the SECOND
+    /// `recheck_after_guard` (run via `activate_and_recheck`, right after
+    /// activation) must reject, and the backend must NEVER receive the
+    /// `type_text` call. Reproduced deterministically via
+    /// `MockBackend::on_activate`, which runs synchronously from INSIDE the
+    /// mock's own `activate_window` — standing in for "a human's Stop
+    /// finished processing while the real, blocking activation call was
+    /// still running" — so by the time `activate_window` returns, its
+    /// effect (here: `computer::clear_control()`, exactly what a real
+    /// `emergency_stop` also does) has already happened, without needing
+    /// genuine OS-thread concurrency to "catch" the race.
+    #[tokio::test]
+    async fn type_is_rejected_by_the_second_recheck_if_the_control_lease_is_lost_during_activation() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 906_201,
+            app: "Bar".into(),
+            title: "Bar".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        let asks = AskRegistry::new();
+        let thread = 906_201;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+
+        // Focus-freshness: `type` requires a recent click on the SAME
+        // window first (see `require_recent_focus`) — seed it directly
+        // rather than driving a real `left_click` through the whole gate a
+        // second time just to satisfy this precondition.
+        record_click_focus(thread, dir, 906_201);
+
+        // Prime + clear the global input throttle so the real call below
+        // isn't itself rejected as rate-limited.
+        let _ = computer::throttle_input();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        // The hook: simulate a Stop landing DURING activation by clearing
+        // the control lease from inside `activate_window` itself.
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(computer::clear_control));
+
+        let mut window_id_out = None;
+        let mut image_out = None;
+        let err = run_action(
+            &db, &asks, thread, dir, None, "computer", "type",
+            &json!({"window": "Bar", "text": "hello"}),
+            &mut window_id_out, &mut image_out,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.contains("lost") || err.to_lowercase().contains("busy"),
+            "expected a lost-lease/busy rejection from the SECOND recheck: {err}"
+        );
+        let actions = mock.actions.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(actions.iter().any(|a| a == "activate 906201"), "{actions:?}");
+        assert!(
+            !actions.iter().any(|a| a.starts_with("type ")),
+            "the backend must never receive the type call once the lease is lost mid-activation: {actions:?}"
+        );
+        drop(actions);
+
+        // Leave clean for the next test sharing this mock instance.
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        computer::clear_control();
     }
 
     // —— issue #160 round-3 P1 §2 (extended round-5 review P1 §2): recheck_after_guard ——
@@ -2514,9 +2789,9 @@ mod tests {
     /// itself. Deliberately does NOT install a `MockBackend` override (this
     /// module's `backend::_set_backend_override` is a set-ONCE-per-process
     /// `OnceLock` another test in this same binary may already have claimed
-    /// — see `activate_target_always_activates_and_fails_closed_when_unsupported`'s
-    /// own doc comment on that hazard) — `notes` is never a real window in
-    /// this test's grant/DB setup at all, so a pass here can ONLY mean the
+    /// — see `shared_mock`'s own doc comment on that hazard) — `notes` is
+    /// never a real window in this test's grant/DB setup at all, so a pass
+    /// here can ONLY mean the
     /// length check fired before window resolution ever got a chance to
     /// reject it for a completely different reason (`WindowNotFound`). The
     /// integration test in `tests/computer_mcp.rs` (its own separate process,

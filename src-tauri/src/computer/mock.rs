@@ -13,6 +13,16 @@ use std::sync::Mutex;
 #[derive(Default)]
 pub struct MockBackend {
     pub windows: Vec<WindowInfo>,
+    /// When `Some`, `list_windows` returns THIS instead of `windows` (issue
+    /// #160 round-6 review P1 #2+#3) — a test-controlled way to simulate a
+    /// window's geometry (or the whole visible set) changing BETWEEN two
+    /// resolutions of the SAME query, e.g. while a call sits queued on
+    /// `computer::input_flight_guard`. Write it directly (`*mock.
+    /// windows_override.lock().unwrap() = Some(vec![...])`) at whatever
+    /// point in a test's own timeline the change should become visible;
+    /// `None` (the `Default` value) behaves exactly like every existing
+    /// test's plain `windows` field — most tests never need this at all.
+    pub windows_override: Mutex<Option<Vec<WindowInfo>>>,
     pub image: Option<CapturedImage>,
     /// One line per input method call (issue #160 M2), in call order — e.g.
     /// `"click 100,200 Left x1"`. Lets a test assert an action actually
@@ -34,6 +44,17 @@ pub struct MockBackend {
     /// `ComputerBackend` impl. `false` (the `Default` value) behaves exactly
     /// like every other successful mock action.
     pub fail_activate: AtomicBool,
+    /// Run synchronously, once, from INSIDE `activate_window` right before it
+    /// records its own action and returns `Ok` (issue #160 round-6 review P1
+    /// #2) — lets a test simulate "a human hit Stop WHILE the (real,
+    /// blocking) activation call was in flight" deterministically, without
+    /// needing genuine OS-thread concurrency: the closure runs on the SAME
+    /// task that called `activate_window`, so whatever it does (e.g.
+    /// `computer::clear_control()`) is guaranteed to have already happened
+    /// by the time `activate_window` returns and the caller's OWN next step
+    /// (a second `recheck_after_guard`) runs. `None` (the `Default` value)
+    /// is a no-op, identical to every other test's plain activation.
+    pub on_activate: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 impl MockBackend {
@@ -47,7 +68,11 @@ impl MockBackend {
 
 impl ComputerBackend for MockBackend {
     fn list_windows(&self) -> Result<Vec<WindowInfo>, ComputerError> {
-        Ok(self.windows.clone())
+        let over = self.windows_override.lock().unwrap_or_else(|e| e.into_inner());
+        match over.as_ref() {
+            Some(w) => Ok(w.clone()),
+            None => Ok(self.windows.clone()),
+        }
     }
 
     /// Ignores `id` — tests configure at most one canned image per
@@ -99,6 +124,9 @@ impl ComputerBackend for MockBackend {
             return Err(ComputerError::Unsupported(
                 "mock backend: activate_window forced to fail".into(),
             ));
+        }
+        if let Some(hook) = self.on_activate.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            hook();
         }
         self.record(format!("activate {id}"));
         Ok(())

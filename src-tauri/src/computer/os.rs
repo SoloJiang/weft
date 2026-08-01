@@ -211,13 +211,30 @@ fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
         .map_err(|e| ComputerError::Unsupported(format!("osascript: {e}")))?;
     if !output.status.success() {
         return Err(ComputerError::Unsupported(format!(
-            "osascript activation failed: {}",
+            "osascript activation failed: {} — {MACOS_ACCESSIBILITY_HINT}",
             String::from_utf8_lossy(&output.stderr)
         )));
     }
 
     raise_specific_window(pid, target)
 }
+
+/// Appended to a macOS activation failure that most likely stems from
+/// missing Accessibility permission (issue #160 round-6 review P2 #5): the
+/// System Events automation this module shells out to requires it to
+/// control other apps' windows at all, so an `osascript` call failing here
+/// is, in practice, almost always that rather than a transient error.
+/// Replaces round-4's own Linux-only "grant this window an Always approval
+/// to avoid needing focus reclaim at all" suggestion — that advice stopped
+/// being true once every input action (Auto-approved ones included) started
+/// calling `activate_window` unconditionally (see
+/// `bus::computer_srv::activate_target`'s own doc), so this points at the
+/// actual, currently-supported remedy instead: granting the permission, not
+/// avoiding activation.
+#[cfg(target_os = "macos")]
+const MACOS_ACCESSIBILITY_HINT: &str =
+    "if weft (or the terminal/process launching it) lacks Accessibility permission, grant it in \
+     System Settings → Privacy & Security → Accessibility so System Events can activate other apps' windows";
 
 /// Best-effort, FAIL-CLOSED per-window raise on top of the app-level
 /// `frontmost` activation above (issue #160 round-5 review P1 §7 / issue
@@ -313,7 +330,7 @@ fn raise_specific_window(pid: u32, target: &xcap::Window) -> Result<(), Computer
     if !raise_output.status.success() {
         return Err(ComputerError::Unsupported(format!(
             "per-window raise failed — the app was brought forward, but this specific window \
-             couldn't be confirmed on top: {}",
+             couldn't be confirmed on top: {} — {MACOS_ACCESSIBILITY_HINT}",
             String::from_utf8_lossy(&raise_output.stderr)
         )));
     }
@@ -412,9 +429,9 @@ fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
         }
     }
     Err(ComputerError::Unsupported(
-        "couldn't activate the window — neither `wmctrl` nor `xdotool` is available/succeeded \
-         (install one of them, or grant this window an Always approval to avoid needing focus \
-         reclaim at all)"
+        "couldn't activate the window — neither `wmctrl` nor `xdotool` is available/succeeded; \
+         install one of them (e.g. `sudo apt install wmctrl` or `xdotool`) so weft can reactivate \
+         the target window before each input action"
             .into(),
     ))
 }

@@ -344,6 +344,11 @@ export const api = {
       "get_computer_control_state",
     ),
   computerEmergencyStop: () => invoke<void>("computer_emergency_stop"),
+  // issue #160 round-6 review P2 #6: whether the most recent emergency stop
+  // (button OR the OS-level global Escape shortcut) failed to persist the
+  // disabled setting to disk — the kill switch itself still took effect
+  // in-memory either way; see `ComputerControlBanner`'s own doc.
+  getComputerStopPersistFailed: () => invoke<boolean>("get_computer_stop_persist_failed"),
   // issue #97: auto fail-over to the fallback engine on a quota-exceeded turn.
   // Opt-in — off by default, since switching engines mid-task ships that
   // engine's own history digest to a DIFFERENT provider.
