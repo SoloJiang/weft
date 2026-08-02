@@ -363,12 +363,13 @@ impl PrSnapshot {
     /// PARTIAL probe (see `store::repo::apply_pull_request_snapshot`, which
     /// only resets the consecutive-failure streak for a complete one).
     ///
-    /// Lives on the snapshot rather than in either sweep because BOTH the
-    /// monitor and the auto-merge loop persist snapshots, and they must agree.
-    /// If one of them reported "complete" for a partial read, it would zero
-    /// the streak the other is accumulating and the give-up threshold would
-    /// never be reached — the exact bug this distinction exists to fix, just
-    /// reintroduced through the second writer.
+    /// Lives on the snapshot rather than inside `host::monitor` (its only
+    /// caller today — `host::automerge` persists snapshots but is not
+    /// entitled to move the streak at all, see `repo::StreakUpdate`) because
+    /// it answers a question about the SNAPSHOT, not about the sweep: is
+    /// every axis here a real reading? Adding a sixth axis with an
+    /// unreadable state then has one obvious place to declare that, instead
+    /// of the monitor re-deriving axis semantics it does not own.
     ///
     /// ONLY the review-thread axis qualifies, and only its `Unknown` variant.
     /// That is deliberate: [`ThreadStatus::Unknown`] means a REQUEST failed

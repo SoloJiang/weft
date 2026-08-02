@@ -206,15 +206,22 @@ async fn apply_probe_result(
             )
             .await
             {
-                Ok(count) => count,
+                Ok(count) => Some(count),
                 Err(e) => {
                     eprintln!("[weft][host] pr #{}: could not save snapshot: {e}", pr.id);
                     None
                 }
             };
-            if changed {
+            // Only a PERSISTED change is announced. Restructuring this write
+            // to also return the failure count turned the original `if let
+            // Err … else if changed` into an unconditional emit, which would
+            // announce state the DB never accepted — the same "claiming
+            // something we could not confirm" this whole feature exists to
+            // stop. Found in self-review, not by a reviewer.
+            if fail_count.is_some() && changed {
                 emit_pr_changed(app, pr);
             }
+            let fail_count = fail_count.flatten();
             if snapshot.lifecycle != super::PrLifecycle::Open {
                 None // merged/closed — the readiness question is moot now
             } else if let Some(reason) = axis_error {
