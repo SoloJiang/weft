@@ -2874,6 +2874,29 @@ async fn spawn_hidden_turn_after_admission(
     }
 }
 
+/// Restore a stopped engine only when the failed batch still owns the same
+/// reset epoch. A concurrent reset/restart is authoritative and must not be
+/// overwritten by a stale rollback after its spawn/write await completes.
+async fn restore_stopped_after_failed_batch(
+    db: &Db,
+    eng: &EngineRef,
+    was_stopped: bool,
+    initial_epoch: u64,
+) {
+    if !was_stopped {
+        return;
+    }
+    let status = {
+        let mut inner = eng.lock().await;
+        if inner.reset_epoch != initial_epoch {
+            return;
+        }
+        inner.stopped = true;
+        (inner.session_id, inner.thread_id)
+    };
+    persist_activity(db, status.0, status.1, STATUS_STOPPED).await;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DurableResumeAuthorization {
     Background,
@@ -2956,7 +2979,6 @@ async fn admit_pending_durable_batch_admitted(
         return Ok(false);
     }
 
-    let thread_id = inner.thread_id;
     let was_stopped = inner.stopped;
     let initial_epoch = inner.reset_epoch;
     if may_resume {
@@ -3040,11 +3062,7 @@ async fn admit_pending_durable_batch_admitted(
                 if let Err(error) = write_user(&mut inner, &out).await {
                     drop(inner);
                     rollback_failed_turn(app, db, eng, turn_id, "error").await;
-                    if was_stopped {
-                        let mut restored = eng.lock().await;
-                        restored.stopped = true;
-                        persist_activity(db, restored.session_id, thread_id, STATUS_STOPPED).await;
-                    }
+                    restore_stopped_after_failed_batch(db, eng, was_stopped, initial_epoch).await;
                     return Err(error);
                 }
                 admitted = true;
@@ -3063,11 +3081,7 @@ async fn admit_pending_durable_batch_admitted(
                 .await
                 {
                     rollback_failed_turn(app, db, eng, turn_id, "error").await;
-                    if was_stopped {
-                        let mut restored = eng.lock().await;
-                        restored.stopped = true;
-                        persist_activity(db, restored.session_id, thread_id, STATUS_STOPPED).await;
-                    }
+                    restore_stopped_after_failed_batch(db, eng, was_stopped, initial_epoch).await;
                     return Err(error);
                 }
                 admitted = true;
@@ -10879,6 +10893,27 @@ mod tests {
             &rows,
             DurableResumeAuthorization::Background
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_batch_restore_is_epoch_guarded() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(test_inner("codex")));
+        {
+            let mut inner = eng.lock().await;
+            inner.stopped = false;
+            inner.reset_epoch = 9;
+        }
+
+        // A reset/restart that bumped the epoch owns the current state; a
+        // stale failed batch must not put it back into stopped mode.
+        restore_stopped_after_failed_batch(&db, &eng, true, 8).await;
+        assert!(!eng.lock().await.stopped);
+
+        // When the failed batch still owns the epoch, restoring stopped is the
+        // expected rollback and remains visible in memory for the next retry.
+        restore_stopped_after_failed_batch(&db, &eng, true, 9).await;
+        assert!(eng.lock().await.stopped);
     }
 
     /// The final admission snapshot must trust the durable state, not the
