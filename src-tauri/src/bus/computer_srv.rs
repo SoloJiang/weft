@@ -38,7 +38,7 @@ use crate::computer::{self, backend, backend::MouseButton, ComputerError};
 use crate::store::{repo, Db};
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -300,6 +300,7 @@ pub async fn handle_computer(
     Query(q): Query<HashMap<String, String>>,
     State(db): State<Db>,
     State(asks): State<AskRegistry>,
+    headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> Response {
     // issue #160 round-11 P1 #A: reject BEFORE the request's `method`/`id`
@@ -309,7 +310,26 @@ pub async fn handle_computer(
     // or one that doesn't match THIS EXACT path's `(thread, dir)` gets a bare
     // 401 — no JSON-RPC envelope, no hint about method/id/tool shape, nothing
     // that would help a guessing caller narrow down the real token.
-    let supplied_key = q.get("key").map(String::as_str).unwrap_or("");
+    //
+    // issue #160 round-15 P1 (Codex inject.rs:364): the SAME token is now also
+    // accepted as `Authorization: Bearer <token>` — codex carries its MCP
+    // config on argv (`-c` flags), where a `?key=` URL would be world-readable
+    // through process listings, so its injection names an env var instead and
+    // codex's own `bearer_token_env_var` support turns that into this header
+    // (see `inject::inject_computer`'s codex arm). One verification path for
+    // both channels: whichever the caller supplied is checked against the ONE
+    // `(thread, dir, wt)` MAC — a query key, when present, wins (every other
+    // engine still uses it), and an empty/absent one falls through to the
+    // header.
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let supplied_key = match q.get("key").map(String::as_str) {
+        Some(k) if !k.is_empty() => k,
+        _ => bearer,
+    };
     // issue #160 round-13/14 P1 (Codex computer_srv.rs:214 + inject.rs:483): the
     // per-session bearer is bound to the EXACT worktree this URL carries, not
     // just `(thread, dir)` — see [`computer_token_mac`]'s own doc for the
@@ -1010,6 +1030,17 @@ async fn run_action(
 
 // —— server-side approval gate (issue #160 round-2 P1) ——
 
+/// issue #160 round-15 P2 (Codex computer_srv.rs:1288): how many OBSERVE-class
+/// (`RiskLevel::ReadOnly`) computer-use Ask cards may sit open at once for one
+/// `(thread, dir)` before further grant-less observe calls fail closed instead
+/// of opening more — see `approve`'s observe branch. Small on purpose: a human
+/// can only meaningfully consider a couple of screenshot/list_windows cards at
+/// a time, and each open card is a held waiter (`bus::server::ASK_WAIT` — up
+/// to an hour) plus an IM-bridge push; Write (input) actions are stricter
+/// still (ANY open ask suspends them — `check_suspended` /
+/// `request_with_preview_unless_open`).
+const MAX_OPEN_OBSERVE_ASKS: usize = 3;
+
 /// Gate EVERY `tools/call` here, server-side, before [`run_action`]'s dispatch
 /// looks at any action-specific argument — see this module's own top doc
 /// comment for the full architecture rationale (this closes the "any local
@@ -1283,10 +1314,49 @@ async fn approve(
             None => return Err(ComputerError::SuspendedPendingAsk.to_string()),
         }
     } else {
-        asks.request_with_preview(
+        // issue #160 round-15 P2 (Codex computer_srv.rs:1288): observe actions
+        // (`screenshot`/`list_windows`/`cursor_position`) are deliberately NOT
+        // suspended by an unrelated open card the way Write actions are — but
+        // that must not mean UNBOUNDED: without a cap, a worker looping
+        // grant-less observe calls minted one Ask + waiter per call (each held
+        // up to `bus::server::ASK_WAIT`), flooding the registry/UI/IM bridge,
+        // and a later Full answer released the whole backlog at once. The
+        // bounded variant counts THIS session's open GUI asks and inserts
+        // atomically under [`MAX_OPEN_OBSERVE_ASKS`] — over the cap, the call
+        // fails closed with a retry hint instead of opening yet another card.
+        match asks.request_with_preview_gui_bounded(
             thread, dir, "computer", &summary, &detail, detail_redacted.as_deref(), risk, &action_key, preview,
-        )
+            MAX_OPEN_OBSERVE_ASKS,
+        ) {
+            Some(pair) => pair,
+            None => {
+                return Err(format!(
+                    "too many computer-use approvals are already waiting on the human for this \
+                     session (max {MAX_OPEN_OBSERVE_ASKS} open at once) — wait for the open cards \
+                     to be answered, then retry"
+                ))
+            }
+        }
     };
+
+    // issue #160 round-15 P1 (Codex commands.rs:1619): re-check the SYNCHRONOUS
+    // stop latch immediately AFTER publishing the card, and self-cancel it if a
+    // stop/disable landed. `run_action`'s top `computer::enabled` gate can be
+    // passed by a call that then straddles the disable transition — window
+    // resolution above is a real OS call, so the gap between "enabled read
+    // true" and "card inserted" is unbounded. Both disable paths (Emergency
+    // Stop AND, as of round-15, the Settings toggle) run trip_stop_latch →
+    // cancel_gui_asks: a card inserted BEFORE the sweep is killed by the sweep;
+    // one inserted AFTER it is exactly this straddler — the sweep missed it,
+    // but the latch was already visible when we get here (this check is after
+    // the insert in program order), so we cancel our OWN card and fail closed.
+    // Either interleaving leaves NO surviving card a human could later answer
+    // Always/Full into a post-disable grant. `stop_latched` is latch-only and
+    // sync (no await between insert and check — nothing can wedge in).
+    if computer::stop_latched() {
+        asks.cancel(id);
+        return Err(ComputerError::Disabled.to_string());
+    }
 
     match tokio::time::timeout(crate::bus::server::ASK_WAIT, rx).await {
         // issue #160 round-10 P1 #A: same `resolved` value, reused here too —
@@ -1672,17 +1742,27 @@ const FOCUS_FRESHNESS_MS: u64 = 15_000;
 const FOCUS_FRESHNESS_SECS: u64 = FOCUS_FRESHNESS_MS / 1000;
 
 /// Process-level "last window this `(thread, dir)` actually clicked, and
-/// when" registry — see this section's own doc comment. `now_ms()`-based
-/// (wall clock), consistent with every other timestamp this module already
-/// records (the audit log's own `ts_ms`); a system clock adjustment
-/// mid-session is not a hazard this heuristic needs to defend against.
+/// when" registry — see this section's own doc comment.
 /// issue #160 round-4 P1 §2: no longer carries the click's physical
 /// `(px, py)` — that existed ONLY to feed the round-3 P1 §1 replay-click
 /// hack this round removes (see this section's own top doc comment); the
 /// window id + timestamp pair is all [`require_recent_focus`] itself has
 /// ever needed.
-fn recent_clicks() -> &'static Mutex<HashMap<(i32, String), (u32, u64)>> {
-    static CLICKS: OnceLock<Mutex<HashMap<(i32, String), (u32, u64)>>> = OnceLock::new();
+///
+/// issue #160 round-15 P2 (Codex computer_srv.rs:1707): the timestamp is a
+/// monotonic [`std::time::Instant`] now, NOT wall-clock `now_ms()`. This used
+/// to reason "a system clock adjustment mid-session is not a hazard this
+/// heuristic needs to defend against" — wrong for a PERMISSION-adjacent gate:
+/// with wall clock, a backward clock step (manual correction, NTP sync) made
+/// `now_ms().saturating_sub(ts)` read 0, so ONE old click stayed "fresh" for
+/// as long as the rollback was large — letting `type`/`key` bypass the
+/// documented 15-second click requirement for minutes or hours. `Instant` is
+/// process-local and monotonic, which is exactly what this check is: a
+/// process-local freshness heuristic. (The audit log's `ts_ms` stays wall
+/// clock — that's a human-readable record, not a gate.)
+fn recent_clicks() -> &'static Mutex<HashMap<(i32, String), (u32, std::time::Instant)>> {
+    static CLICKS: OnceLock<Mutex<HashMap<(i32, String), (u32, std::time::Instant)>>> =
+        OnceLock::new();
     CLICKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1693,7 +1773,7 @@ fn recent_clicks() -> &'static Mutex<HashMap<(i32, String), (u32, u64)>> {
 /// a later `type`/`key`.
 fn record_click_focus(thread: i32, dir: &str, window_id: u32) {
     let mut g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
-    g.insert((thread, dir.to_string()), (window_id, now_ms()));
+    g.insert((thread, dir.to_string()), (window_id, std::time::Instant::now()));
 }
 
 /// `type`/`key`'s pre-execution gate: reject unless a click on THIS EXACT
@@ -1702,9 +1782,13 @@ fn record_click_focus(thread: i32, dir: &str, window_id: u32) {
 /// is (and is not) verifying.
 fn require_recent_focus(thread: i32, dir: &str, window_id: u32) -> Result<(), String> {
     let g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
+    // issue #160 round-15 P2: `Instant::elapsed` is monotonic — a wall-clock
+    // rollback can no longer stretch one click's freshness window (see
+    // [`recent_clicks`]'s own doc).
     let fresh = matches!(
         g.get(&(thread, dir.to_string())),
-        Some((clicked, ts)) if *clicked == window_id && now_ms().saturating_sub(*ts) <= FOCUS_FRESHNESS_MS
+        Some((clicked, ts)) if *clicked == window_id
+            && ts.elapsed() <= std::time::Duration::from_millis(FOCUS_FRESHNESS_MS)
     );
     if fresh {
         return Ok(());
@@ -2743,9 +2827,19 @@ fn refuse_symlinks(base: &std::path::Path, components: &[&str]) -> Result<std::p
 ///    was never inside a git-tracked worktree to begin with, so there is
 ///    nothing left to exclude FROM (and nothing left that could leak a
 ///    `.weft/` entry into a canonical repo's `info/exclude`).
-///  - lead lane: the lead's scratch cwd itself, `<weft_home>/leads/<thread>`
-///    (no extra suffix — that whole directory is already weft-private).
-///    Unchanged by this round.
+///  - lead lane: `<session_root>/.weft/screenshots` — issue #160 round-15 P2
+///    (Codex computer_srv.rs:2759). This used to be the lead's scratch cwd
+///    ITSELF (`<weft_home>/leads/<thread>`, no suffix), but that directory is
+///    a real, shared, git-init'd working dir other tooling (and the lead's
+///    own file writes) also lands in — and `computer::prune_old_screenshots`
+///    deletes ANY regular file there matching the generic
+///    `<digits>-<digits>-<digits>.png` naming once more than the retention
+///    cap exist. An unrelated image the lead (or any scratch-cwd tool)
+///    happened to create under a matching name could be mistaken for an old
+///    Weft screenshot and deleted. A dedicated subdirectory — under the
+///    lead's existing `.weft/` bookkeeping layer, next to its audit log —
+///    makes retention operate only over files this module itself wrote,
+///    exactly like the worker lane's own dedicated `screenshots/` dir.
 ///
 /// `Err` (not silently `None`) on a resolution failure OR a refused symlink
 /// (issue #160 round-2 P2 §3, via [`refuse_symlinks`]) — callers surface the
@@ -2756,7 +2850,7 @@ async fn screenshot_out_dir(db: &Db, thread: i32, dir: &str, wt: Option<i32>) ->
         .await
         .ok_or_else(|| "no worktree for this session".to_string())?;
     if dir == crate::bus::LEAD {
-        return Ok(root);
+        return refuse_symlinks(&root, &[".weft", "screenshots"]);
     }
     refuse_symlinks(&root, &["screenshots"])
 }
@@ -3405,10 +3499,19 @@ mod tests {
         // Seed a click stamped older than `FOCUS_FRESHNESS_MS` directly,
         // rather than sleeping 15s in a test — same "no fake clock needed"
         // approach the coordinator's spec calls for, just expressed as a
-        // pre-expired timestamp instead of a real-time wait.
+        // pre-expired `Instant` (round-15 P2: the registry is monotonic
+        // Instant-based now) instead of a real-time wait. `checked_sub` can
+        // only return `None` if the process somehow started less than ~15s
+        // after the Instant epoch — skip (vacuously pass) rather than panic
+        // in that unreachable-in-practice case.
+        let Some(stale) = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(FOCUS_FRESHNESS_MS + 1_000))
+        else {
+            return;
+        };
         {
             let mut g = recent_clicks().lock().unwrap();
-            g.insert((thread, "lead".to_string()), (7, now_ms() - FOCUS_FRESHNESS_MS - 1));
+            g.insert((thread, "lead".to_string()), (7, stale));
         }
         assert!(require_recent_focus(thread, "lead", 7).is_err());
     }
@@ -5945,6 +6048,94 @@ mod tests {
             "the backend must never be touched by a malformed call"
         );
         computer::clear_control();
+    }
+
+    /// issue #160 round-15 P1 (Codex commands.rs:1619): a card published by a
+    /// caller that straddled the disable transition (passed `run_action`'s
+    /// `enabled` gate BEFORE the latch tripped, inserted its card AFTER
+    /// `cancel_gui_asks`'s sweep) self-cancels via `approve`'s post-insert
+    /// `stop_latched` check — leaving NO surviving card a human could answer
+    /// Always/Full into a post-disable grant. Driven by calling `approve`
+    /// directly with the latch already tripped (`wait` is Write-classified but
+    /// windowless, so no backend is needed) — through `run_action`'s front
+    /// door the top gate would already reject, which is exactly why only the
+    /// straddler path can reach this insert.
+    #[tokio::test]
+    async fn approve_self_cancels_a_card_published_after_the_stop_latch_tripped() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        let asks = AskRegistry::new(); // no grant → would otherwise open a card
+        let thread = 904_402;
+        let dir = "lead";
+
+        computer::trip_stop_latch();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            approve(&asks, thread, dir, "wait", &json!({"duration_ms": 5})),
+        )
+        .await
+        .expect("the post-insert latch check must fail fast, never block on the card");
+
+        let err = result.unwrap_err();
+        assert!(err.contains("disabled"), "expected the disabled rejection, got: {err}");
+        assert!(
+            asks.open().is_empty(),
+            "the straddler's card must be self-cancelled, not left open: {:?}",
+            asks.open()
+        );
+
+        computer::clear_emergency_stop(computer::stop_generation());
+    }
+
+    /// issue #160 round-15 P2 (Codex computer_srv.rs:1288): grant-less OBSERVE
+    /// calls stop opening cards once [`MAX_OPEN_OBSERVE_ASKS`] are already
+    /// open for this (thread, dir) — the one-over call fails closed with the
+    /// backlog error instead of minting an unbounded Ask + waiter per call.
+    /// `list_windows` is used (ReadOnly, windowless — no backend resolution),
+    /// with each under-cap call parked on its own spawned task awaiting its
+    /// card.
+    #[tokio::test]
+    async fn observe_asks_are_capped_per_session_once_the_backlog_is_full() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        let asks = AskRegistry::new();
+        let thread = 904_403;
+        let dir = "lead";
+
+        let mut parked = Vec::new();
+        for _ in 0..MAX_OPEN_OBSERVE_ASKS {
+            let a = asks.clone();
+            parked.push(tokio::spawn(async move {
+                let _ = approve(&a, thread, dir, "list_windows", &json!({})).await;
+            }));
+        }
+        // Wait (bounded) until all under-cap cards are actually open.
+        for _ in 0..200 {
+            if asks.open().len() == MAX_OPEN_OBSERVE_ASKS {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(asks.open().len(), MAX_OPEN_OBSERVE_ASKS, "precondition: backlog full");
+
+        // The one-over call must reject immediately — no fourth card.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            approve(&asks, thread, dir, "list_windows", &json!({})),
+        )
+        .await
+        .expect("an over-cap observe call must fail fast, never open another card");
+        let err = result.unwrap_err();
+        assert!(err.contains("too many"), "expected the backlog rejection, got: {err}");
+        assert_eq!(asks.open().len(), MAX_OPEN_OBSERVE_ASKS, "no card past the cap");
+
+        // Unblock and reap the parked callers.
+        for a in asks.open() {
+            asks.cancel(a.id);
+        }
+        for p in parked {
+            let _ = p.await;
+        }
     }
 
     // —— issue #160 round-2 P2 §5: multi-worktree `wt` routing ——

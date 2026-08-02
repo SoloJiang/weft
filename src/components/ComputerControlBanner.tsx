@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertOctagon } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import type { TFunction } from "i18next";
@@ -91,6 +91,24 @@ function bannerText(status: BannerStatus, state: ControlState | null, t: TFuncti
  * the SAME error-state banner — reusing round-4's `stopFailed` UI/copy
  * rather than inventing a second one, since the underlying meaning
  * ("the disabled setting may not have persisted") is identical either way.
+ *
+ * issue #160 round-15 P2: round-6's merge only ran one direction — nothing
+ * ever cleared `localStopFailed` again. When a human fixes the problem by
+ * re-enabling computer use from Settings, the backend clears its OWN sticky
+ * flag (`clear_emergency_stop` resets `STOP_PERSIST_FAILED`), so polling
+ * picks that up and `serverStopFailed` goes back to false — but a Stop that
+ * failed from THIS button's own local `.catch` left `localStopFailed` stuck
+ * true forever, pinning the banner in the emphasized error state even though
+ * computer use is enabled again and nothing is actually wrong anymore. Fixed
+ * by watching for a true -> false TRANSITION of the server flag across
+ * successful polls (tracked in `lastServerStopFailedRef`, updated only when
+ * a poll actually resolves — never on a rejection, preserving round-13's
+ * fail-safe below) and clearing `localStopFailed` only on that transition.
+ * A transition, not a bare "server says false", because a purely local
+ * failure (the invoke rejects before ever reaching the backend) never flips
+ * the server flag true in the first place — so a steady stream of `false`
+ * polls must NOT be read as "resolved" and clear it out from under a still-
+ * unretried local failure.
  * Mounted once near the top of the shell, above the content area, alongside
  * `ProcessQuotaBar`.
  */
@@ -107,6 +125,13 @@ export function ComputerControlBanner() {
   const [localStopFailed, setLocalStopFailed] = useState(false);
   const [serverStopFailed, setServerStopFailed] = useState(false);
   const [stopping, setStopping] = useState(false);
+  // issue #160 round-15 P2: last CONFIRMED (successfully polled) server
+  // value, used only to detect a true -> false transition — see the class
+  // doc comment above for why a transition (and not a bare "is false")
+  // is what's required to also clear `localStopFailed`. Only ever written
+  // from inside a fulfilled poll, so it shares round-13's fail-safe: a
+  // rejected poll leaves it (and everything else) untouched.
+  const lastServerStopFailedRef = useRef(false);
 
   useEffect(() => {
     let alive = true;
@@ -123,7 +148,14 @@ export function ComputerControlBanner() {
       // rejected one keeps the last known value, so the banner stays up until a
       // real poll confirms control and the persistence warning are both gone.
       if (controlResult.status === "fulfilled") setState(controlResult.value);
-      if (persistResult.status === "fulfilled") setServerStopFailed(persistResult.value);
+      if (persistResult.status === "fulfilled") {
+        const next = persistResult.value;
+        // round-15 P2: only a confirmed true -> false transition means "the
+        // backend just cleared a persist failure" — clear the local flag too.
+        if (lastServerStopFailedRef.current && !next) setLocalStopFailed(false);
+        lastServerStopFailedRef.current = next;
+        setServerStopFailed(next);
+      }
     };
     void tick();
     const h = setInterval(() => void tick(), POLL_MS);

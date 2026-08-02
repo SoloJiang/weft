@@ -699,12 +699,13 @@ impl Client {
     pub async fn connect_session(
         program: &str,
         extra_args: &[String],
+        extra_env: &[(String, String)],
         cwd: &std::path::Path,
         owner: crate::proc_registry::Owner,
     ) -> anyhow::Result<Client> {
         let client = Client(Arc::new(Mutex::new(None)));
         client
-            .spawn_inner(program, extra_args, Some(cwd), owner)
+            .spawn_inner(program, extra_args, extra_env, Some(cwd), owner)
             .await?;
         Ok(client)
     }
@@ -782,6 +783,7 @@ impl Client {
         self.spawn_inner(
             &crate::tool_command::command_for("codex"),
             &[],
+            &[],
             None,
             crate::proc_registry::Owner::global_app_server(),
         )
@@ -792,6 +794,7 @@ impl Client {
         &self,
         program: &str,
         extra_args: &[String],
+        extra_env: &[(String, String)],
         cwd: Option<&std::path::Path>,
         owner: crate::proc_registry::Owner,
     ) -> anyhow::Result<()> {
@@ -809,6 +812,11 @@ impl Client {
         // Resolve nvm/fnm/volta CLIs from a GUI launch's minimal PATH without
         // mutating the global env (see detect::tool_path).
         command.env("PATH", crate::detect::tool_path());
+        // issue #160 round-15 P1 (Codex inject.rs:364): injection-supplied env —
+        // the codex computer-use bearer rides the child's environment (readable
+        // only by its own uid), never `-c` argv (world-readable via ps). See
+        // `bus::inject::Injection::env`.
+        command.envs(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

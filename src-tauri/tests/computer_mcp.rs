@@ -234,6 +234,50 @@ async fn endpoint_auth_rejects_a_key_minted_for_a_different_thread_dir() {
     );
 }
 
+/// issue #160 round-15 P1 (Codex inject.rs:364): the SAME per-session token is
+/// accepted as `Authorization: Bearer <token>` with NO `?key=` at all — the
+/// channel codex uses via `bearer_token_env_var`, so its argv never carries the
+/// secret. A wrong bearer is a bare 401 exactly like a wrong `?key=`.
+#[tokio::test]
+async fn endpoint_auth_accepts_the_bearer_header_and_rejects_a_wrong_one() {
+    let reg = BusRegistry::new();
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let asks = AskRegistry::new();
+    let (base, _h) = server::serve(reg, db, asks).await.unwrap();
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!("{base}/computer/1/10/mcp");
+
+    // The correct token for THIS (thread, dir, absent-wt), via the header only.
+    let token = computer_srv::computer_session_token(1, "10", None);
+    let resp = client
+        .post(&url)
+        .header("Accept", "application/json, text/event-stream")
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "the bearer header must authorize exactly like ?key= does"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("\"computer\""), "tools/list must answer through the bearer path: {body}");
+
+    // A wrong bearer fails closed with the same bare 401.
+    let resp = client
+        .post(&url)
+        .header("Accept", "application/json, text/event-stream")
+        .header("Authorization", "Bearer 0000000000000000000000000000000000000000000000000000000000000000")
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
 /// `computer_session_token` is exactly what [`inject::computer_url`] appends
 /// to the injected URL (proven directly in `bus::inject`'s own unit tests via
 /// the identical helper) — this proves the OTHER end of that contract: a
@@ -404,11 +448,24 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         .unwrap()
         .join("leads")
         .join(thread.to_string());
-    let has_png = std::fs::read_dir(&expected_dir)
+    // issue #160 round-15 P2 (Codex computer_srv.rs:2759): lead screenshots
+    // land in a DEDICATED `.weft/screenshots` subdirectory, never in the
+    // shared scratch cwd root — retention pruning must only ever operate over
+    // files this module itself wrote.
+    let shots_dir = expected_dir.join(".weft").join("screenshots");
+    let has_png = std::fs::read_dir(&shots_dir)
+        .unwrap_or_else(|e| panic!("expected {shots_dir:?} to exist: {e}"))
+        .filter_map(|e| e.ok())
+        .any(|e| e.path().extension().map(|ext| ext == "png").unwrap_or(false));
+    assert!(has_png, "expected a .png under {shots_dir:?}");
+    let root_has_png = std::fs::read_dir(&expected_dir)
         .unwrap_or_else(|e| panic!("expected {expected_dir:?} to exist: {e}"))
         .filter_map(|e| e.ok())
         .any(|e| e.path().extension().map(|ext| ext == "png").unwrap_or(false));
-    assert!(has_png, "expected a .png under {expected_dir:?}");
+    assert!(
+        !root_has_png,
+        "the lead's shared scratch cwd root must no longer receive screenshots"
+    );
 
     // —— M2: input actions, gates, and the audit log ——
     //

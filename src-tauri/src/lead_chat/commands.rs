@@ -242,6 +242,10 @@ pub async fn lead_engine(
     let ask = crate::bus::inject::inject_ask_hook(&base, thread_id, "lead", &t.lead_tool, &cwd);
     crate::skills::inject_for(db, t.workspace_id, &cwd).await;
     let mut extra = ask.args;
+    // issue #160 round-15 P1: env pairs the injections ask the spawn to set on
+    // the tool child (today: only the codex computer-use bearer) — see
+    // `bus::inject::Injection::env` / `engine::EngineInner::extra_env`.
+    let mut extra_env: Vec<(String, String)> = vec![];
     if is_concierge {
         // Concierge is the IM-scoped global helper, not a thread participant: it
         // gets weft_global, never the per-thread bus.
@@ -272,20 +276,22 @@ pub async fn lead_engine(
         // setting on/off from Settings takes effect immediately, without
         // needing to rebuild this already-running engine — see
         // `bus::inject::inject_computer`'s own doc.
-        extra.extend(
-            crate::bus::inject::inject_computer(
-                &base,
-                thread_id,
-                crate::bus::LEAD,
-                &t.lead_tool,
-                &cwd,
-                // issue #160 round-2 P2 §5: the lead lane has no
-                // worktree at all (it runs out of its own scratch cwd),
-                // so it never has a `wt` to pin — always `None`.
-                None,
-            )
-            .args,
+        // issue #160 round-15 P1: keep BOTH halves of the computer injection —
+        // args on argv, the codex bearer via the child's env (see
+        // `bus::inject::Injection::env`).
+        let comp = crate::bus::inject::inject_computer(
+            &base,
+            thread_id,
+            crate::bus::LEAD,
+            &t.lead_tool,
+            &cwd,
+            // issue #160 round-2 P2 §5: the lead lane has no
+            // worktree at all (it runs out of its own scratch cwd),
+            // so it never has a `wt` to pin — always `None`.
+            None,
         );
+        extra.extend(comp.args);
+        extra_env.extend(comp.env);
     }
     push_model_arg(&mut extra, t.lead_model.as_deref());
     let system_prompt = if is_concierge {
@@ -322,6 +328,7 @@ pub async fn lead_engine(
         session_id: None,
         cwd,
         extra_args: extra,
+        extra_env,
         system_prompt,
         native_id: repo::lead_native_id(db, thread_id).await.ok().flatten(),
         pending_context_digest: None,
@@ -1498,21 +1505,23 @@ pub(crate) async fn chat_open_worker_impl(
     // UNCONDITIONALLY for workers too, same as the lead branch above — the
     // setting/kill-switch is enforced dynamically, server-side, on every
     // call (see that branch's own doc for why).
-    extra.extend(
-        crate::bus::inject::inject_computer(
-            &base,
-            dir.thread_id,
-            &direction_id.to_string(),
-            &session_tool,
-            &cwd,
-            // issue #160 round-2 P2 §5: this worker's OWN worktree
-            // (`wt`, resolved above for this EXACT direction+repo pair)
-            // — not "the first worktree of this direction" a
-            // multi-repo direction would otherwise fall back to.
-            Some(wt.id),
-        )
-        .args,
+    // issue #160 round-15 P1: keep BOTH halves of the computer injection —
+    // args on argv, the codex bearer via the child's env (see
+    // `bus::inject::Injection::env`).
+    let comp = crate::bus::inject::inject_computer(
+        &base,
+        dir.thread_id,
+        &direction_id.to_string(),
+        &session_tool,
+        &cwd,
+        // issue #160 round-2 P2 §5: this worker's OWN worktree
+        // (`wt`, resolved above for this EXACT direction+repo pair)
+        // — not "the first worktree of this direction" a
+        // multi-repo direction would otherwise fall back to.
+        Some(wt.id),
     );
+    extra.extend(comp.args);
+    let extra_env = comp.env;
     push_model_arg(&mut extra, sess.model.as_deref());
 
     let key = sess.id as i64;
@@ -1527,6 +1536,7 @@ pub(crate) async fn chat_open_worker_impl(
                 session_id: Some(sess.id),
                 cwd,
                 extra_args: extra,
+                extra_env,
                 system_prompt: String::new(),
                 native_id: native.clone(),
                 pending_context_digest: None,
@@ -1671,17 +1681,19 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     // UNCONDITIONALLY, same as the first-spawn path above — this is the
     // worker resume/rebuild path; the setting/kill-switch is enforced
     // dynamically, server-side, on every call.
-    extra.extend(
-        crate::bus::inject::inject_computer(
-            &base,
-            dir.thread_id,
-            &sess.direction_id.to_string(),
-            &sess.tool,
-            &cwd,
-            worktree_id,
-        )
-        .args,
+    // issue #160 round-15 P1: keep BOTH halves of the computer injection —
+    // args on argv, the codex bearer via the child's env (see
+    // `bus::inject::Injection::env`).
+    let comp = crate::bus::inject::inject_computer(
+        &base,
+        dir.thread_id,
+        &sess.direction_id.to_string(),
+        &sess.tool,
+        &cwd,
+        worktree_id,
     );
+    extra.extend(comp.args);
+    let extra_env = comp.env;
     push_model_arg(&mut extra, sess.model.as_deref());
     let mut inner = engine::EngineInner {
         thread_id: dir.thread_id,
@@ -1690,6 +1702,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         session_id: Some(sess.id),
         cwd,
         extra_args: extra,
+        extra_env,
         system_prompt: String::new(),
         native_id: sess.native_session_id.clone(),
         pending_context_digest: None,

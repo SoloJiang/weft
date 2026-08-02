@@ -1602,21 +1602,37 @@ pub async fn set_computer_use_enabled_inner(
     asks: &crate::ask::AskRegistry,
     enabled: bool,
 ) -> R<()> {
-    // issue #160 round-13 P1 (Codex commands.rs:1676): on the OFF transition,
-    // cancel every open GUI ask FIRST — mirroring `computer_emergency_stop`'s
-    // own trip→cancel→persist ordering. Without this, a computer permission
-    // card left open at the moment a human disables Computer Use through
-    // Settings could still be answered `Always`/`Full`, and `AskRegistry::
-    // answer` records that standing grant BEFORE the waiting action rechecks
-    // the now-disabled setting and rejects itself — so re-enabling later would
-    // silently activate a permission minted AFTER access was turned off.
-    // `cancel_gui_asks` resolves those cards as denied, so no grant can be
-    // recorded on the way down. Synchronous and independent of the DB write,
-    // so it runs before the first `.await` below (the serialize lock) — no
-    // racing answer can slip in between cancel and persist. The enable path
-    // (`enabled == true`) never cancels anything.
+    // issue #160 round-13 P1 (Codex commands.rs:1676) + round-15 P1 (Codex
+    // commands.rs:1619): the OFF transition is now the EXACT trip → cancel →
+    // persist sequence `computer_emergency_stop` runs — a Settings-disable IS
+    // a (softer-intentioned) stop, and giving it a weaker sequence left a
+    // window Codex demonstrated twice. Round-13's fix cancelled open GUI asks
+    // but only BEFORE the first await; while this function then queued on the
+    // serialize mutex (or its `set_setting` write ran), `computer::enabled`
+    // still read `true`, so a NEW GUI request arriving in that gap sailed
+    // through `run_action`'s top gate and opened a fresh card that survived
+    // the disable — answering it `Always`/`Full` after the fact minted a
+    // grant that would silently activate on the next re-enable. Tripping the
+    // in-memory latch FIRST (synchronous, before any await) closes the front
+    // door for the ENTIRE transition: from this instant `computer::enabled`
+    // reads `false`, so no new call can pass `run_action`'s gate no matter
+    // how long the persisted write takes. `cancel_gui_asks` then sweeps the
+    // cards that were already open, and `bus::computer_srv::approve`'s own
+    // post-insert `stop_latched` self-check (round-15's other half — see that
+    // call site) catches the one remaining straddler: a call that passed the
+    // enabled gate BEFORE the trip and inserted its card AFTER this sweep.
+    // `persist_stop` (not a bare `set_setting`) finishes the job: it shares
+    // `enable_serialize_mutex` (round-12 P2 #F call-order guarantee), and a
+    // failed write sets the sticky `STOP_PERSIST_FAILED` flag so the banner
+    // warns that a restart may silently re-enable — the same
+    // half-persisted-stop honesty the Emergency Stop button already has.
+    // Recovery is unchanged: the `enabled == true` branch below is still the
+    // one and only path that clears the latch (`clear_emergency_stop` via
+    // `reconcile_enable_after_write`).
     if !enabled {
+        let my_gen = crate::computer::trip_stop_latch();
         asks.cancel_gui_asks();
+        return crate::computer::persist_stop(db, my_gen).await;
     }
     // issue #160 round-10 P2 #D: held for this ENTIRE function — read gen,
     // write the setting, reconcile — so a second overlapping enable request
@@ -1637,30 +1653,23 @@ pub async fn set_computer_use_enabled_inner(
     // PERSISTED write is — so a human's Stop still cuts in immediately,
     // exactly as before.
     let _serialize = crate::computer::enable_serialize_mutex().lock().await;
-    let gen = enabled.then(crate::computer::stop_generation);
-    repo::set_setting(
-        db,
-        crate::computer::K_COMPUTER_USE_ENABLED,
-        if enabled { "true" } else { "false" },
-    )
-    .await
-    .map_err(e)?;
+    let gen = crate::computer::stop_generation();
+    repo::set_setting(db, crate::computer::K_COMPUTER_USE_ENABLED, "true")
+        .await
+        .map_err(e)?;
     // issue #160 review R1 #1: this is the ONLY place that clears the
     // emergency-stop latch — a human explicitly re-enabling computer use
-    // from Settings after a kill switch trip. See
+    // from Settings after a kill switch trip (which, as of round-15, every
+    // Settings-disable also trips — see the early-return branch above). See
     // `computer::clear_emergency_stop`'s doc comment for why nothing else
-    // (in particular, not `enabled == false`) may call it.
+    // may call it.
     //
     // issue #160 round-6 review P1 #1: this now passes the generation read
     // ABOVE, before the write — `clear_emergency_stop` refuses to clear the
     // latch if a `emergency_stop` ran in between (the generation moved on),
     // leaving THIS request's own "enable" silently overridden by the more
-    // recent Stop rather than the other way around. `enabled == false`
-    // reads `gen` as `None` and never calls this at all, unchanged from
-    // before.
-    if let Some(g) = gen {
-        reconcile_enable_after_write(db, g).await?;
-    }
+    // recent Stop rather than the other way around.
+    reconcile_enable_after_write(db, gen).await?;
     Ok(())
 }
 
@@ -4432,6 +4441,7 @@ mod tests {
         // Enabling must not cancel anything.
         set_computer_use_enabled_inner(&db, &asks, true).await.unwrap();
         assert_eq!(asks.open().len(), 2, "enabling must not cancel any open ask");
+        assert!(crate::computer::enabled(&db).await, "precondition: enabled");
 
         // Disabling cancels ONLY the GUI card; the bash card survives.
         set_computer_use_enabled_inner(&db, &asks, false).await.unwrap();
@@ -4441,6 +4451,22 @@ mod tests {
             open[0].tool, "bash",
             "only the GUI card is cancelled — an unrelated non-GUI card is left alone"
         );
+        // issue #160 round-15 P1 (Codex commands.rs:1619): the OFF transition
+        // trips the in-memory latch BEFORE any await, so the gate is closed for
+        // the entire (possibly slow) persist — both the latch and the persisted
+        // setting must agree.
+        assert!(crate::computer::stop_latched(), "Settings-disable must trip the latch");
+        assert!(!crate::computer::enabled(&db).await);
+        assert_eq!(
+            repo::get_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED).await.unwrap().as_deref(),
+            Some("false")
+        );
+
+        // An explicit re-enable is still the one path back: latch cleared,
+        // setting true.
+        set_computer_use_enabled_inner(&db, &asks, true).await.unwrap();
+        assert!(!crate::computer::stop_latched(), "re-enable must clear the latch");
+        assert!(crate::computer::enabled(&db).await, "re-enable must take effect");
 
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
     }

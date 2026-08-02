@@ -104,6 +104,20 @@ pub fn stop_generation() -> u64 {
     stop_state().lock().unwrap_or_else(|e| e.into_inner()).generation
 }
 
+/// SYNCHRONOUS read of the in-memory stop latch alone (issue #160 round-15
+/// P1, Codex commands.rs:1619) — `true` the instant [`trip_stop_latch`] runs,
+/// with no DB read and no `.await`. [`enabled`] already consults this latch
+/// first, but is `async` (it falls through to the persisted setting);
+/// `bus::computer_srv::approve` needs a latch-only check it can run INSIDE a
+/// synchronous window right after publishing an Ask card — see that
+/// function's post-insert self-check for the disable-transition race this
+/// closes. Deliberately latch-only: a `false` here does NOT mean computer use
+/// is enabled (the persisted setting may still be off) — every real
+/// authorization path still goes through [`enabled`].
+pub fn stop_latched() -> bool {
+    stop_state().lock().unwrap_or_else(|e| e.into_inner()).stopped
+}
+
 /// Clear the emergency-stop latch (issue #160 review R1 #1; generation check
 /// added round-6 review P1 #1 — see [`StopState`]'s own doc for why a lone
 /// `AtomicBool`/`AtomicU64` pair could not make this fully race-safe). The
@@ -217,6 +231,19 @@ pub enum ComputerError {
     /// build) — see [`register_global_escape`]'s own doc for that
     /// distinction.
     EscapeUnavailable,
+    /// A control lease exists for this exact `(thread, dir)` but its
+    /// kill-switch registration has not yet been CONFIRMED live (issue #160
+    /// round-15 P1, Codex mod.rs:1395) — see [`acquire_control`]'s own doc
+    /// for the pending-registration race this closes. Distinct from
+    /// [`EscapeUnavailable`](ComputerError::EscapeUnavailable): registration
+    /// has not necessarily FAILED here, it just has not finished yet (or, in
+    /// the rare case where it finished successfully but this exact lease was
+    /// lost to expiry/takeover in the meantime), so the right move is a
+    /// short retry rather than treating the kill switch as permanently
+    /// unregisterable. Never returned for a renewal once `escape_ready` is
+    /// `true` — only for a same-holder call that raced in before the FIRST
+    /// hold's own registration round-trip confirmed it.
+    EscapeRegistrationPending,
 }
 
 impl std::fmt::Display for ComputerError {
@@ -260,6 +287,12 @@ impl std::fmt::Display for ComputerError {
                 "the global emergency-stop shortcut (Escape) could not be registered — it's likely \
                  already claimed by another app — so computer control is refused; release whatever \
                  is holding Escape, or drive this from weft's own window instead"
+            ),
+            ComputerError::EscapeRegistrationPending => write!(
+                f,
+                "the emergency-stop kill switch is still being registered for this session's control \
+                 lease — wait a moment and retry this call; it is not safe to inject input until the \
+                 Escape shortcut is confirmed live"
             ),
         }
     }
@@ -1241,6 +1274,22 @@ struct ControlHolderState {
     thread: i32,
     dir: String,
     expires_at_ms: u64,
+    /// Whether THIS hold's OS-level global Escape shortcut registration has
+    /// actually finished and passed [`escape_guard_permits_control`] (issue
+    /// #160 round-15 P1, Codex mod.rs:1395) — `false` from the instant a
+    /// FRESH hold is written in [`acquire_control`]'s locked section until
+    /// its later, unlocked `sync_shortcut_state`/`escape_guard_permits_
+    /// control` round-trip confirms the kill switch is actually live, then
+    /// flips to `true`. A LIVE same-holder re-acquire while this is still
+    /// `false` is refused outright (see [`acquire_control`]'s own doc) rather
+    /// than treated as an ordinary renewal — otherwise a second call from the
+    /// SAME session, racing in while the first call's registration is still
+    /// in flight (e.g. stalled past the 500ms throttle window), would read
+    /// "live same holder" and start injecting input with no confirmed Escape
+    /// kill switch at all. Not part of the public [`ControlHolder`] snapshot
+    /// the Settings banner reads — that UI only cares who holds the lease,
+    /// not this in-between bookkeeping state.
+    escape_ready: bool,
 }
 
 /// A snapshot of who currently holds the computer-use control lease, for
@@ -1355,8 +1404,10 @@ fn now_ms() -> u64 {
 /// its NEXT input action) pushes `expires_at_ms` forward, so a session
 /// mid-task never loses the lock to its own next call. Succeeds immediately
 /// when nobody holds it, the previous lease already expired, or the SAME
-/// `(thread, dir)` is re-acquiring; fails [`ComputerError::Busy`] when a
-/// DIFFERENT, still-live holder has it.
+/// `(thread, dir)` is re-acquiring with a CONFIRMED kill switch already in
+/// place; fails [`ComputerError::Busy`] when a DIFFERENT, still-live holder
+/// has it, and fails [`ComputerError::EscapeRegistrationPending`] when the
+/// SAME holder's own kill-switch registration is still in flight (see below).
 ///
 /// There is no turn-boundary hook to release this automatically when a
 /// session finishes (weft has none available here), so the lease's own
@@ -1370,6 +1421,30 @@ fn now_ms() -> u64 {
 /// a LIVE same-holder renewal — syncs the OS-level global Escape shortcut
 /// (see [`sync_shortcut_state`]), so it exists only while a lease is
 /// genuinely live.
+///
+/// issue #160 round-15 P1 (Codex mod.rs:1395): a control-lease acquire and
+/// the OS-level Escape registration it triggers were not serialized against
+/// EACH OTHER — a fresh hold writes the new `ControlHolderState` and releases
+/// the lock BEFORE its own `sync_shortcut_state`/`escape_guard_permits_
+/// control` round-trip (register a real OS shortcut, possibly slow, possibly
+/// failing) runs. A second call from the exact SAME `(thread, dir)` racing in
+/// during that window used to read "live same holder" and renew — sailing
+/// straight through the flight guard and injecting input — while the kill
+/// switch was still unregistered, or had just failed to register outright;
+/// the first call's own eventual rollback (on failure) cannot undo input the
+/// second call already sent. [`ControlHolderState::escape_ready`] closes
+/// this: a fresh hold starts `escape_ready: false`, and a live same-holder
+/// re-acquire while it is still `false` is REFUSED (not renewed) with
+/// `EscapeRegistrationPending` — no state changes on that path, so the
+/// original in-flight registration is left completely alone to finish on its
+/// own. `escape_ready` only flips to `true` once THIS call's own
+/// registration round-trip below actually confirms the kill switch, at which
+/// point ordinary renewals resume. Deliberately does NOT change
+/// [`holder_is_live`]: a pending hold still counts as live within its
+/// `expires_at_ms` window, so a DIFFERENT `(thread, dir)` racing in during
+/// the same registration window still gets `Busy` (never steals the slot),
+/// and a registration that hangs forever still self-heals via the normal 30s
+/// lease expiry rather than wedging the desktop.
 pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
     let now = now_ms();
     let sync_needed;
@@ -1385,22 +1460,49 @@ pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
                         dir: holder.dir.clone(),
                     });
                 }
-                // A LIVE same-holder re-acquire is a renewal: the shortcut
-                // from the earlier acquire is already registered and stays
-                // that way, so this skips syncing it again. Every other path
-                // that reaches here (nobody held it live, or the previous
-                // lease already expired) is a FRESH hold as far as the
-                // shortcut is concerned, even when `(thread, dir)` happens to
-                // match the previous holder.
-                sync_needed = !(is_live && is_same_holder);
+                if is_live && is_same_holder {
+                    // issue #160 round-15 P1: this exact holder's own
+                    // registration round-trip has not confirmed the kill
+                    // switch yet — refuse the renewal outright rather than
+                    // let a racing-in second call from the SAME session
+                    // inherit an unconfirmed lease. Nothing is mutated on
+                    // this path: the original still-registering acquire is
+                    // left untouched.
+                    if !holder.escape_ready {
+                        return Err(ComputerError::EscapeRegistrationPending);
+                    }
+                    // An ordinary renewal: the shortcut from the earlier
+                    // acquire is already registered AND confirmed, so this
+                    // skips syncing it again.
+                    sync_needed = false;
+                } else {
+                    // Nobody held it live (expired — `is_live && !is_same_
+                    // holder` above already returned for the only OTHER way
+                    // to reach here): a FRESH hold as far as the shortcut is
+                    // concerned, even when `(thread, dir)` happens to match
+                    // the previous holder.
+                    sync_needed = true;
+                }
             }
             None => sync_needed = true,
         }
-        *guard = Some(ControlHolderState {
-            thread,
-            dir: dir.to_string(),
-            expires_at_ms: now + CONTROL_LEASE_MS,
-        });
+        // Apply the decision made above. A renewal (`sync_needed == false`)
+        // only advances the sliding window IN PLACE, preserving `escape_
+        // ready: true` — rewriting the whole struct here (as this used to,
+        // pre-round-15) would silently reset it to `false` on every single
+        // renewal, permanently reopening the exact race this round closes.
+        // Every other reachable path is a fresh hold and always starts
+        // `escape_ready: false`.
+        if sync_needed {
+            *guard = Some(ControlHolderState {
+                thread,
+                dir: dir.to_string(),
+                expires_at_ms: now + CONTROL_LEASE_MS,
+                escape_ready: false,
+            });
+        } else if let Some(holder) = guard.as_mut() {
+            holder.expires_at_ms = now + CONTROL_LEASE_MS;
+        }
     }
     // Synced OUTSIDE the mutex guard (issue #160 review R1 #5): the Escape
     // callback spawns a task that eventually calls `clear_control`, which
@@ -1435,6 +1537,37 @@ pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
                 *guard = None;
             }
             return Err(ComputerError::EscapeUnavailable);
+        }
+        // issue #160 round-15 P1: registration for THIS fresh hold is now
+        // CONFIRMED — flip `escape_ready` so a same-holder renewal (any that
+        // raced in earlier were refused with `EscapeRegistrationPending`
+        // above and must simply retry) can proceed normally from here on.
+        // Re-lock and re-check identity rather than trusting the guard
+        // released above: this exact `(thread, dir)` slot is not guaranteed
+        // to still be ours — the registration round-trip (a real OS call)
+        // can run long enough for `CONTROL_LEASE_MS` to lapse and let a
+        // DIFFERENT session legitimately win the now-vacant lease in the
+        // meantime (this is exactly why `escape_ready` exists rather than
+        // `holder_is_live` alone: an unconfirmed hold still counts as live
+        // for `Busy` purposes, but that says nothing about who owns the slot
+        // once this call resumes).
+        let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some(h) if h.thread == thread && h.dir == dir => {
+                h.escape_ready = true;
+            }
+            _ => {
+                // Someone else's fresh hold won this slot while our own
+                // registration was in flight — our lease is gone.
+                // `EscapeRegistrationPending` here (rather than
+                // `EscapeUnavailable`) is deliberate: nothing failed
+                // PERMANENTLY — the OS-level registration this call just ran
+                // actually succeeded — so the right instruction to the
+                // caller is the same "retry me" contract as the pending-
+                // renewal refusal above, not "the kill switch itself is
+                // unavailable".
+                return Err(ComputerError::EscapeRegistrationPending);
+            }
         }
     }
     Ok(())
@@ -3588,6 +3721,95 @@ mod tests {
         let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         clear_control();
         assert!(acquire_control(920_001, "esc-no-handle").is_ok());
+        clear_control();
+    }
+
+    // —— issue #160 round-15 P1: registration-pending leases (Codex mod.rs:1395) ——
+
+    /// A fresh hold in THIS test binary (no `APP_HANDLE`, so
+    /// `escape_guard_permits_control(false, _)` always permits — see
+    /// `acquire_control_grants_when_no_app_handle_subsystem_exists`'s own
+    /// note) must still flip `escape_ready` to `true` once its own
+    /// registration round-trip completes, not leave it `false` forever —
+    /// otherwise EVERY renewal in this whole test binary would wrongly hit
+    /// `EscapeRegistrationPending`.
+    #[test]
+    fn acquire_control_fresh_hold_marks_escape_ready_when_no_subsystem_exists() {
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_control();
+        assert!(acquire_control(920_101, "esc-ready-fresh").is_ok());
+        {
+            let guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            let holder = guard.as_ref().expect("fresh acquire must have stored a holder");
+            assert_eq!(holder.thread, 920_101);
+            assert_eq!(holder.dir, "esc-ready-fresh");
+            assert!(holder.escape_ready, "a completed fresh-hold registration must mark escape_ready");
+        }
+        clear_control();
+    }
+
+    /// The end-to-end property round-15 exists for: a holder whose OWN
+    /// registration is still in flight (`escape_ready: false`) must not be
+    /// inherited by ANY later `acquire_control` call — not a same-holder
+    /// renewal (would race straight past the flight guard with no confirmed
+    /// kill switch), and not a different holder either (still `Busy`, exactly
+    /// as an ordinary live lease would be). Once registration completes
+    /// (`escape_ready` flips to `true`, simulated here directly rather than
+    /// via a real OS callback), the same holder's renewal succeeds normally.
+    #[test]
+    fn acquire_control_pending_registration_blocks_same_holder_renewal() {
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_control();
+        let now = now_ms();
+        {
+            let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(ControlHolderState {
+                thread: 920_201,
+                dir: "esc-pending".to_string(),
+                expires_at_ms: now + CONTROL_LEASE_MS,
+                escape_ready: false,
+            });
+        }
+
+        // (a) The SAME holder racing back in while registration is still
+        // pending must be refused, not silently renewed.
+        let err = acquire_control(920_201, "esc-pending").unwrap_err();
+        assert!(
+            matches!(err, ComputerError::EscapeRegistrationPending),
+            "a same-holder re-acquire against a pending lease must be refused, got {err:?}"
+        );
+
+        // (b) A DIFFERENT holder still reads this pending lease as live and
+        // gets the ordinary Busy error — it must not be able to steal the
+        // slot just because registration hasn't confirmed yet.
+        let err = acquire_control(920_202, "esc-other").unwrap_err();
+        assert!(
+            matches!(err, ComputerError::Busy { thread: 920_201, ref dir } if dir == "esc-pending"),
+            "a different holder must still see Busy against a pending lease, got {err:?}"
+        );
+
+        // The pending holder's own state must be untouched by either of the
+        // rejected calls above.
+        {
+            let guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            let holder = guard.as_ref().expect("the pending holder must still be present");
+            assert_eq!((holder.thread, holder.dir.as_str()), (920_201, "esc-pending"));
+            assert!(!holder.escape_ready, "a rejected renewal attempt must not flip escape_ready itself");
+        }
+
+        // (c) Once registration completes, the SAME holder's renewal
+        // succeeds normally.
+        {
+            let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(h) = guard.as_mut() {
+                h.escape_ready = true;
+            }
+        }
+        assert!(
+            acquire_control(920_201, "esc-pending").is_ok(),
+            "a same-holder renewal must succeed once escape_ready is true"
+        );
+
         clear_control();
     }
 

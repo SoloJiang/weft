@@ -1022,9 +1022,16 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
         "-c".to_string(),
         "approval_policy=\"never\"".to_string(),
     ];
-    let client =
-        Client::connect_session(&program, &read_only, cwd, crate::proc_registry::Owner::curator())
-            .await?;
+    let client = Client::connect_session(
+        &program,
+        &read_only,
+        // The curator never receives the computer-use injection, so it has no
+        // env to carry (issue #160 round-15 P1 — see `Injection::env`).
+        &[],
+        cwd,
+        crate::proc_registry::Owner::curator(),
+    )
+    .await?;
     let cwd_s = cwd.to_string_lossy().into_owned();
     // codex has no thread/start system-prompt field, so prepend it to the turn
     // (exactly as the exec adapter and the engine's first-turn text do).

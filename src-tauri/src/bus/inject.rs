@@ -9,6 +9,28 @@ use std::path::Path;
 /// subcommand, e.g. `codex -c k=v resume <id>`).
 pub struct Injection {
     pub args: Vec<String>,
+    /// Environment variables the spawn site must set on the tool's OWN child
+    /// process (issue #160 round-15 P1, Codex inject.rs:364). Exists for ONE
+    /// producer today: the codex computer-use injection, whose per-session
+    /// bearer must not ride in `-c` argv (world-readable via process listings
+    /// on Linux) — the `-c` flag names only the VARIABLE, and the secret rides
+    /// here instead (a child's environment is readable only by its own uid).
+    /// Every other injection leaves this empty.
+    pub env: Vec<(String, String)>,
+}
+
+impl Injection {
+    /// The empty injection — no args, no env. The overwhelmingly common
+    /// fallback shape in this module.
+    fn none() -> Injection {
+        Injection { args: vec![], env: vec![] }
+    }
+
+    /// An args-only injection (no env) — every producer except the codex
+    /// computer-use arm.
+    fn args_only(args: Vec<String>) -> Injection {
+        Injection { args, env: vec![] }
+    }
 }
 
 fn mcp_url(base: &str, thread: i32, dir: &str) -> String {
@@ -195,22 +217,22 @@ exit 0"#;
 /// instead — no worktree files. Best-effort: empty args if files can't be written.
 pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Injection {
     if crate::acp::backend_for(tool).is_some() {
-        return Injection { args: vec![] };
+        return Injection::none();
     }
     if tool == "opencode" {
         return inject_opencode_ask_plugin(base, thread, dir, cwd);
     }
     if tool != "claude" && tool != "codex" {
-        return Injection { args: vec![] };
+        return Injection::none();
     }
     let url = ask_url(base, thread, dir, tool);
     if tool == "codex" {
         let route = cwd.join(".weft-codex-ask-url");
         if std::fs::write(&route, &url).is_err() {
-            return Injection { args: vec![] };
+            return Injection::none();
         }
         crate::git::git_exclude(cwd, ".weft-codex-ask-url");
-        return Injection { args: vec![] };
+        return Injection::none();
     }
     let script = cwd.join(".weft-ask-hook.sh");
     // Reads the PreToolUse JSON on stdin, asks weft, echoes weft's decision JSON —
@@ -224,7 +246,7 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
          {HOOK_DECIDE_OR_DENY}\n"
     );
     if std::fs::write(&script, body).is_err() {
-        return Injection { args: vec![] };
+        return Injection::none();
     }
     #[cfg(unix)]
     {
@@ -258,18 +280,16 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
             )
             .is_err()
             {
-                return Injection { args: vec![] };
+                return Injection::none();
             }
             crate::git::git_exclude(cwd, ".weft-ask.settings.json");
-            Injection {
-                args: vec!["--settings".into(), settings.to_string_lossy().to_string()],
-            }
+            Injection::args_only(vec!["--settings".into(), settings.to_string_lossy().to_string()])
         }
         // Codex now warns loudly when --dangerously-bypass-hook-trust is used.
         // Do not inject Weft's PreToolUse hook through that bypass path; Codex's
         // own sandbox/approval mode remains authoritative for exec sessions.
-        "codex" => Injection { args: vec![] },
-        _ => Injection { args: vec![] },
+        "codex" => Injection::none(),
+        _ => Injection::none(),
     }
 }
 
@@ -285,13 +305,13 @@ fn inject_opencode_ask_plugin(base: &str, thread: i32, dir: &str, cwd: &Path) ->
     let url = ask_url(base, thread, dir, "opencode");
     let plugins = cwd.join(".opencode").join("plugins");
     if std::fs::create_dir_all(&plugins).is_err() {
-        return Injection { args: vec![] };
+        return Injection::none();
     }
     let template = include_str!("weft-ask-plugin.js");
     let body = template.replace("__URL__", &url);
     let _ = std::fs::write(plugins.join("weft-ask.js"), body);
     crate::git::git_exclude(cwd, ".opencode/plugins/weft-ask.js");
-    Injection { args: vec![] }
+    Injection::none()
 }
 
 /// Build the thread-bus injection. `cwd` is the worktree (used for the claude
@@ -355,21 +375,57 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
     if crate::acp::backend_for(tool).is_some() {
         // MCP is supplied on session/new|resume, not via launch flags/files —
         // same rule `inject_mcp` applies for every other server.
-        return Injection { args: vec![] };
+        return Injection::none();
     }
     let url = computer_url(base, thread, dir, wt);
     match tool {
         "claude" => inject_computer_claude(thread, dir, wt, &url),
-        "codex" => Injection {
-            args: vec!["-c".into(), format!("mcp_servers.weft_computer.url={url}")],
-        },
+        // issue #160 round-15 P1 (Codex inject.rs:364): codex is the ONE tool
+        // whose injection rides argv (`-c` flags), and argv is world-readable
+        // through process listings on Linux — so the bearer must NOT be part
+        // of the URL here the way it is for every file-carried config above.
+        // Instead: the URL goes in WITHOUT `key=`, a second `-c` names the
+        // ENVIRONMENT VARIABLE codex should read the bearer from
+        // (`bearer_token_env_var` — codex's own streamable-HTTP MCP auth
+        // field; codex sends it as `Authorization: Bearer <value>`, which
+        // `bus::computer_srv::handle_computer` accepts as a full equivalent
+        // of `?key=`), and the token itself travels via `Injection::env`,
+        // which the spawn site sets on the codex child process ONLY — a
+        // child's environment is readable by its own uid alone (the accepted
+        // same-uid residual), never via `ps` from another account. The
+        // `?wt=` pin stays in the URL: a worktree id is not a secret.
+        "codex" => {
+            let no_key_url = match wt {
+                Some(id) => format!("{base}/computer/{thread}/{dir}/mcp?wt={id}"),
+                None => format!("{base}/computer/{thread}/{dir}/mcp"),
+            };
+            Injection {
+                args: vec![
+                    "-c".into(),
+                    format!("mcp_servers.weft_computer.url={no_key_url}"),
+                    "-c".into(),
+                    format!("mcp_servers.weft_computer.bearer_token_env_var={COMPUTER_TOKEN_ENV_VAR}"),
+                ],
+                env: vec![(
+                    COMPUTER_TOKEN_ENV_VAR.to_string(),
+                    crate::bus::computer_srv::computer_session_token(thread, dir, wt),
+                )],
+            }
+        }
         "opencode" => {
             inject_computer_opencode(cwd, &url);
-            Injection { args: vec![] }
+            Injection::none()
         }
-        _ => Injection { args: vec![] },
+        _ => Injection::none(),
     }
 }
+
+/// The environment variable name the codex computer-use injection routes the
+/// per-session bearer through (issue #160 round-15 P1) — see the codex arm of
+/// [`inject_computer`]. `#[doc(hidden)] pub` for the same cross-crate-test
+/// reason as `computer_srv::computer_session_token`.
+#[doc(hidden)]
+pub const COMPUTER_TOKEN_ENV_VAR: &str = "WEFT_COMPUTER_MCP_TOKEN";
 
 /// Write `bytes` to `path` as an ATOMICALLY-created, owner-only file (issue
 /// #160 round-12 P1 #D, Codex round-11 finding): a bare `std::fs::write`
@@ -410,7 +466,7 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
 /// there this crate can portably act on) — matches every other
 /// `#[cfg(unix)]` split in this codebase. Returns whether the write actually
 /// landed, so callers keep their existing best-effort
-/// `Injection { args: vec![] }` fallback on failure.
+/// `Injection::none()` fallback on failure.
 fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> bool {
     #[cfg(unix)]
     {
@@ -476,11 +532,11 @@ fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> bool {
 /// `inject_mcp`'s own best-effort contract.
 fn inject_computer_claude(thread: i32, dir: &str, wt: Option<i32>, url: &str) -> Injection {
     let Ok(home) = crate::paths::weft_home() else {
-        return Injection { args: vec![] };
+        return Injection::none();
     };
     let mcp_dir = home.join("computer-mcp");
     if std::fs::create_dir_all(&mcp_dir).is_err() {
-        return Injection { args: vec![] };
+        return Injection::none();
     }
     // issue #160 round-14 P1 (Codex inject.rs:483): the config filename includes
     // the worktree `wt`, with a DISTINCT representation for the absent/lead
@@ -504,11 +560,9 @@ fn inject_computer_claude(thread: i32, dir: &str, wt: Option<i32>, url: &str) ->
     });
     let bytes = serde_json::to_vec_pretty(&json).unwrap_or_default();
     if !write_owner_only_atomic(&file, &bytes) {
-        return Injection { args: vec![] };
+        return Injection::none();
     }
-    Injection {
-        args: vec!["--mcp-config".into(), file.to_string_lossy().to_string()],
-    }
+    Injection::args_only(vec!["--mcp-config".into(), file.to_string_lossy().to_string()])
 }
 
 /// Keep only characters safe as a bare filename component — everything else
@@ -599,7 +653,7 @@ pub fn inject_global(base: &str, tool: &str, cwd: &Path) -> Injection {
 fn inject_mcp(server: &str, stem: &str, url: &str, tool: &str, cwd: &Path) -> Injection {
     if crate::acp::backend_for(tool).is_some() {
         // MCP is supplied on session/new|resume, not via launch flags/files.
-        return Injection { args: vec![] };
+        return Injection::none();
     }
     match tool {
         "claude" => {
@@ -613,13 +667,12 @@ fn inject_mcp(server: &str, stem: &str, url: &str, tool: &str, cwd: &Path) -> In
             });
             let _ = std::fs::write(&cfg, serde_json::to_vec_pretty(&json).unwrap_or_default());
             crate::git::git_exclude(cwd, &file);
-            Injection {
-                args: vec!["--mcp-config".into(), cfg.to_string_lossy().to_string()],
-            }
+            Injection::args_only(vec!["--mcp-config".into(), cfg.to_string_lossy().to_string()])
         }
-        "codex" => Injection {
-            args: vec!["-c".into(), format!("mcp_servers.{server}.url={url}")],
-        },
+        "codex" => Injection::args_only(vec![
+            "-c".into(),
+            format!("mcp_servers.{server}.url={url}"),
+        ]),
         "opencode" => {
             // `secret: false` — none of `weft_bus`/`weft_planner`/
             // `weft_curator`/`weft_global` carry a bearer token, so the
@@ -627,9 +680,9 @@ fn inject_mcp(server: &str, stem: &str, url: &str, tool: &str, cwd: &Path) -> In
             // before round-12 P1 #D. Only `inject_computer_opencode`'s
             // `weft_computer` merge passes `true`.
             merge_opencode_config(cwd, server, url, false);
-            Injection { args: vec![] }
+            Injection::none()
         }
-        _ => Injection { args: vec![] },
+        _ => Injection::none(),
     }
 }
 
@@ -893,18 +946,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// issue #160 round-15 P1 (Codex inject.rs:364): codex's argv carries NO
+    /// bearer — the URL is key-less, a second `-c` names the env VARIABLE, and
+    /// the token itself rides `Injection::env` for the spawn site to set on
+    /// the codex child alone.
     #[test]
-    fn computer_codex_uses_config_override() {
+    fn computer_codex_uses_config_override_with_the_bearer_in_env_not_argv() {
+        let token = crate::bus::computer_srv::computer_session_token(1, "10", None);
         let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Path::new("/tmp"), None);
         assert_eq!(
             inj.args,
             vec![
                 "-c".to_string(),
-                format!(
-                    "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp?key={}",
-                    crate::bus::computer_srv::computer_session_token(1, "10", None)
-                ),
+                "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp".to_string(),
+                "-c".to_string(),
+                format!("mcp_servers.weft_computer.bearer_token_env_var={COMPUTER_TOKEN_ENV_VAR}"),
             ]
+        );
+        assert_eq!(inj.env, vec![(COMPUTER_TOKEN_ENV_VAR.to_string(), token.clone())]);
+        assert!(
+            inj.args.iter().all(|a| !a.contains(&token)),
+            "the bearer must never appear in any argv element: {:?}",
+            inj.args
         );
     }
 
@@ -936,14 +999,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&weft_home);
 
+        // codex (issue #160 round-15 P1): the `?wt=` pin stays in the argv URL
+        // (a worktree id is not a secret) but the bearer rides env, minted for
+        // this EXACT `wt`.
         let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Path::new("/tmp"), Some(42));
         assert_eq!(
             inj.args,
             vec![
                 "-c".to_string(),
-                format!("mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp?wt=42&key={key}"),
+                "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp?wt=42".to_string(),
+                "-c".to_string(),
+                format!("mcp_servers.weft_computer.bearer_token_env_var={COMPUTER_TOKEN_ENV_VAR}"),
             ]
         );
+        assert_eq!(inj.env, vec![(COMPUTER_TOKEN_ENV_VAR.to_string(), key.clone())]);
+        assert!(inj.args.iter().all(|a| !a.contains(&key)), "{:?}", inj.args);
     }
 
     // —— issue #160 round-11 P1 #A: computer_url mints a per-session `&key=` ——

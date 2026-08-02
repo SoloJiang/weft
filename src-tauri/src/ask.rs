@@ -1991,6 +1991,53 @@ impl AskRegistry {
         Some((id, rx))
     }
 
+    /// issue #160 round-15 P2 (Codex computer_srv.rs:1288): the OBSERVE-side
+    /// counterpart to [`Self::request_with_preview_unless_open`] — an atomic
+    /// "count open GUI asks for (thread, dir), insert only under the cap"
+    /// under ONE lock acquisition. Returns `None` (inserting nothing) once
+    /// `max_open_gui` GUI asks are already open for this session.
+    ///
+    /// Write (input) actions already had a hard per-session exclusion (any
+    /// open ask suspends them — the method above), but observation actions
+    /// (`screenshot`/`list_windows`/`cursor_position`) deliberately are NOT
+    /// suspended by an unrelated pending card… which left them UNBOUNDED: an
+    /// authenticated worker looping observe calls with no standing grant
+    /// could mint an Ask + waiter per call (each held up to `bus::server::
+    /// ASK_WAIT`), flooding the registry/UI/IM bridge — and a later Full
+    /// answer would release that whole backlog at once. Counting ONLY
+    /// GUI-keyed asks (`action_key_is_gui`) keeps the cap from ever being
+    /// consumed by — or blocking — this session's ordinary non-GUI asks
+    /// (bash approvals etc.), which have their own flow-control story.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_with_preview_gui_bounded(
+        &self,
+        thread: i32,
+        dir: &str,
+        tool: &str,
+        summary: &str,
+        detail: &str,
+        detail_redacted: Option<&str>,
+        risk: RiskLevel,
+        action_key: &str,
+        preview: Option<String>,
+        max_open_gui: usize,
+    ) -> Option<(u64, oneshot::Receiver<Decision>)> {
+        let (tx, rx) = oneshot::channel();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let open_gui = g
+            .open
+            .iter()
+            .filter(|a| a.thread == thread && a.dir == dir && action_key_is_gui(&a.action_key))
+            .count();
+        if open_gui >= max_open_gui {
+            return None;
+        }
+        let id = Self::push_open_ask_locked(
+            &mut g, tx, thread, dir, tool, summary, detail, detail_redacted, risk, action_key, preview,
+        );
+        Some((id, rx))
+    }
+
     /// Toggle Dangerous mode (global): every incoming ask auto-allows. Turning it
     /// ON also releases the whole existing backlog — every already-open ask
     /// resolves to Allow, so agents currently blocked on a prompt unblock at once.
@@ -4618,6 +4665,43 @@ mod tests {
         );
         assert!(other.is_some(), "a different session is not suspended by the first's card");
         assert_eq!(r.open().len(), 2);
+    }
+
+    /// issue #160 round-15 P2 (Codex computer_srv.rs:1288): the atomic
+    /// count-and-insert for observe-class GUI asks — inserts under the cap,
+    /// refuses over it, and counts ONLY GUI-keyed asks (a non-GUI bash card
+    /// neither consumes nor is blocked by the GUI budget).
+    #[test]
+    fn request_with_preview_gui_bounded_caps_open_gui_asks_only() {
+        let r = AskRegistry::new();
+        let gui_key = |i: usize| action_key(&["gui", "screenshot", &format!("w{i}")]);
+
+        // A non-GUI ask open for the SAME session must not consume the cap.
+        let (_bid, _brx) =
+            r.request(1, "10", "bash", "run", "ls", RiskLevel::Write, &action_key(&["bash", "ls"]));
+
+        let mut receivers = Vec::new();
+        for i in 0..2 {
+            let got = r.request_with_preview_gui_bounded(
+                1, "10", "computer", "s", "d", None, RiskLevel::ReadOnly, &gui_key(i), None, 2,
+            );
+            let (_, rx) = got.expect("under the cap, every insert succeeds");
+            receivers.push(rx);
+        }
+        assert_eq!(r.open().len(), 3, "2 GUI + 1 bash card open");
+
+        // At the cap: refused, nothing inserted.
+        let over = r.request_with_preview_gui_bounded(
+            1, "10", "computer", "s", "d", None, RiskLevel::ReadOnly, &gui_key(9), None, 2,
+        );
+        assert!(over.is_none(), "the cap must refuse the one-over GUI insert");
+        assert_eq!(r.open().len(), 3, "the refused call must insert nothing");
+
+        // A DIFFERENT session has its own budget.
+        let other = r.request_with_preview_gui_bounded(
+            2, "20", "computer", "s", "d", None, RiskLevel::ReadOnly, &gui_key(0), None, 2,
+        );
+        assert!(other.is_some(), "the cap is per-(thread, dir), not global");
     }
 
     // ---- authorization persistence ------------------------------------------

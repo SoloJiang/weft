@@ -1841,6 +1841,13 @@ pub struct EngineInner {
     pub cwd: std::path::PathBuf,
     /// Ask-hook + MCP injection args, appended to every spawn.
     pub extra_args: Vec<String>,
+    /// Environment variables set on every spawned tool child alongside
+    /// `extra_args` (issue #160 round-15 P1, Codex inject.rs:364) — today
+    /// carries exactly one thing: the codex computer-use bearer, which must
+    /// ride the child's environment (owner-only readable) instead of `-c`
+    /// argv (world-readable via process listings). See
+    /// `bus::inject::Injection::env`. Empty for every non-codex engine.
+    pub extra_env: Vec<(String, String)>,
     pub system_prompt: String,
     pub native_id: Option<String>,
     /// A mechanical digest of the thread's history, staged by an engine/model
@@ -2427,6 +2434,9 @@ async fn ensure_running_locked(
         .args(build_args(inner))
         .current_dir(&inner.cwd)
         .env("PATH", crate::detect::tool_path())
+        // issue #160 round-15 P1: injection-supplied env (the codex computer
+        // bearer travels here, never argv — see `EngineInner::extra_env`).
+        .envs(inner.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -3510,7 +3520,7 @@ async fn spawn_codex_turn(
     out: Outgoing,
     expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
-    let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing, program) = {
+    let (native, cwd, sid, thread_id_i, system_prompt, extra_args, extra_env, existing, program) = {
         let i = eng.lock().await;
         // Atomic with the snapshot: don't start a codex turn for a stopped engine
         // (a stop racing the send's Phase-3-to-spawn window, which is widest on the
@@ -3530,6 +3540,7 @@ async fn spawn_codex_turn(
             i.thread_id,
             i.system_prompt.clone(),
             i.extra_args.clone(),
+            i.extra_env.clone(),
             i.codex_client.clone(),
             // Effective codex binary for THIS session: a per-session pin wins over
             // the global override, so a pinned (opt-out) codex session keeps its
@@ -3553,6 +3564,7 @@ async fn spawn_codex_turn(
             let c = crate::codex_app_server::Client::connect_session(
                 &program,
                 &extra_args,
+                &extra_env,
                 &cwd,
                 owner,
             )
@@ -5791,6 +5803,9 @@ async fn spawn_turn(
         .args(&args)
         .current_dir(&inner.cwd)
         .env("PATH", crate::detect::tool_path())
+        // issue #160 round-15 P1: injection-supplied env (the codex computer
+        // bearer travels here, never argv — see `EngineInner::extra_env`).
+        .envs(inner.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         // stderr → app log: a per-turn CLI that dies prints its reason there.
@@ -7068,6 +7083,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         session_id: None,
         cwd: "/tmp".into(),
         extra_args: vec![],
+        extra_env: vec![],
         system_prompt: String::new(),
         native_id: None,
         pending_context_digest: None,
@@ -7936,6 +7952,7 @@ async fn rewind_reserved(
             tool: inner.tool.clone(),
             command: inner.command.clone(),
             extra_args: inner.extra_args.clone(),
+            extra_env: inner.extra_env.clone(),
             cwd: inner.cwd.clone(),
             native_id: inner.native_id.clone(),
             ask_dir: inner.ask_dir.clone(),
@@ -8522,6 +8539,7 @@ struct RewindSnap {
     tool: String,
     command: Option<String>,
     extra_args: Vec<String>,
+    extra_env: Vec<(String, String)>,
     cwd: std::path::PathBuf,
     native_id: Option<String>,
     ask_dir: String,
@@ -8558,6 +8576,7 @@ async fn fork_codex_thread(
     let c = crate::codex_app_server::Client::connect_session(
         &program,
         &snap.extra_args,
+        &snap.extra_env,
         &snap.cwd,
         owner,
     )
@@ -11878,6 +11897,7 @@ mod tests {
             session_id: None,
             cwd: "/tmp".into(),
             extra_args: vec!["--mcp-config".into(), "x".into()],
+            extra_env: vec![],
             system_prompt: "be lead".into(),
             native_id: None,
             pending_context_digest: None,
