@@ -83,6 +83,15 @@ fn issue_id_arg(args: &Value) -> Option<i32> {
         .map(|x| x as i32)
 }
 
+const IM_CONTEXT_MUTATING_TOOLS: [&str; 6] = [
+    "answer_permission",
+    "answer_question",
+    "message_lead",
+    "create_issue_from_im",
+    "ensure_issue_im_topic",
+    "ensure_issue_topic",
+];
+
 /// Per-tool dispatch. Errors short-return via text_result so MCP clients see a
 /// friendly message instead of a transport failure (mirrors `call_planner`).
 pub async fn call_global(
@@ -92,6 +101,22 @@ pub async fn call_global(
     name: &str,
     args: &Value,
 ) -> Value {
+    // Every tool that mutates on behalf of an IM conversation shares the same
+    // read lease. Provider/owner/enable changes take the write side through
+    // persistence + bridge retirement, so ask answers, DB writes, and the
+    // actual lead enqueue are each linearized wholly before or after a revoke.
+    let _authority = if IM_CONTEXT_MUTATING_TOOLS.contains(&name) {
+        match crate::APP_HANDLE.get() {
+            Some(app) => Some(
+                app.state::<crate::im::ImBridge>()
+                    .authority_read_lease()
+                    .await,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
     match name {
         "list_workspaces" => match list_workspaces(db).await {
             Ok(v) => json_result(v),
@@ -397,19 +422,13 @@ async fn message_lead(db: &Db, thread_id: i32, text: &str, args: &Value) -> anyh
     let app = crate::APP_HANDLE
         .get()
         .ok_or_else(|| anyhow::anyhow!("app handle not initialized"))?;
-    // Hold the bridge's authority read lease through the ACTUAL engine enqueue.
-    // Provider/owner replacement paths take the matching write lease through
-    // their DB mutation and generation bump, so retirement either waits for
-    // this enqueue or wins first and makes the validation below fail closed.
-    let bridge = app.state::<crate::im::ImBridge>();
-    let _authority = bridge.authority_read_lease().await;
     // Resolve the delivery target before starting the engine. DingTalk issue
     // output cannot fall back to a stable topic message, so a no-origin turn
     // would run successfully while silently discarding its response.
     message_lead_origin(db, thread_id, args).await?;
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, im_lang(args)).await?;
-    // Revalidate after engine lookup while the authority lease remains held;
-    // `engine::send` cannot now straddle a reset/switch.
+    // Revalidate after engine lookup while call_global's authority lease
+    // remains held; `engine::send` cannot straddle a reset/switch/disable.
     let origin = message_lead_origin(db, thread_id, args).await?;
     crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new(), origin).await
 }
@@ -872,6 +891,12 @@ mod tests {
         repo::set_setting(&db, crate::im::K_ALLOW, "owner")
             .await
             .unwrap();
+        repo::set_setting(&db, crate::im::K_ENABLED, "1")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::im::K_DINGTALK_ENABLED, "1")
+            .await
+            .unwrap();
         db
     }
 
@@ -1135,6 +1160,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabling_active_provider_invalidates_in_flight_im_mutations() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let workspace = repo::create_workspace(&db, "alpha").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::im::K_DINGTALK_ALLOW, "owner")
+            .await
+            .unwrap();
+        let context = json!({
+            "provider": "dingtalk",
+            "conversation": { "sender_id": "owner" }
+        });
+        let (permission_id, _permission_rx) = asks.request(
+            1,
+            "10",
+            "claude",
+            "Run tests",
+            "cargo test",
+            RiskLevel::Unknown,
+            "cargo test",
+        );
+        let human_id = bus.ask_human(1, "10", "Which release channel?");
+
+        // Model a tool call whose asynchronous preparation began while remote
+        // control was enabled, then the active provider was disabled before
+        // its final registry/DB mutation boundary.
+        let prepared = prepare_issue(&db).await;
+        repo::set_setting(&db, crate::im::K_DINGTALK_ENABLED, "0")
+            .await
+            .unwrap();
+
+        let permission = call_global(
+            &db,
+            &asks,
+            &bus,
+            "answer_permission",
+            &json!({
+                "ask_id": permission_id,
+                "verdict": "full",
+                "im_context": context.clone()
+            }),
+        )
+        .await;
+        let question = call_global(
+            &db,
+            &asks,
+            &bus,
+            "answer_question",
+            &json!({
+                "issue_id": 1,
+                "ask_id": human_id,
+                "text": "stale answer",
+                "im_context": context.clone()
+            }),
+        )
+        .await;
+        let create_error = persist_prepared_issue(
+            &db,
+            workspace.id,
+            "Must not exist",
+            "feature",
+            prepared,
+            Some(&json!({ "im_context": context })),
+        )
+        .await
+        .unwrap_err();
+
+        for result in [permission, question] {
+            assert!(result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("provider is disabled")));
+        }
+        assert!(create_error.to_string().contains("provider is disabled"));
+        assert!(asks.open().iter().any(|ask| ask.id == permission_id));
+        assert!(bus.open_asks(1).iter().any(|ask| ask.id == human_id));
+        assert!(repo::list_threads(&db, workspace.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn answer_permission_unknown_verdict_soft_errors() {
         let db = mem_db().await;
         let asks = AskRegistry::new();
@@ -1193,14 +1303,7 @@ mod tests {
     #[test]
     fn mutating_tools_declare_the_complete_im_context() {
         let specs = global_specs();
-        for name in [
-            "answer_permission",
-            "answer_question",
-            "message_lead",
-            "create_issue_from_im",
-            "ensure_issue_im_topic",
-            "ensure_issue_topic",
-        ] {
+        for name in IM_CONTEXT_MUTATING_TOOLS {
             let spec = specs
                 .as_array()
                 .unwrap()

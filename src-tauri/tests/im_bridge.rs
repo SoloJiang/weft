@@ -642,6 +642,9 @@ async fn ensure_issue_topic_creates_feishu_root_and_binds_issue() {
     repo::set_setting(&db, im::K_ALLOW, "owner")
         .await
         .unwrap();
+    repo::set_setting(&db, im::K_ENABLED, "1")
+        .await
+        .unwrap();
     let ch = FakeChannel::default();
     let ws = repo::create_workspace(&db, "ws").await.unwrap();
     let t = repo::create_thread(&db, ws.id, "issue-topic", "feature", "claude")

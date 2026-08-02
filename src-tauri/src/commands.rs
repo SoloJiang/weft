@@ -2678,6 +2678,22 @@ async fn persist_im_enabled(
     repo::set_setting(db, provider.enabled_key(), if enabled { "1" } else { "0" }).await
 }
 
+async fn apply_im_enabled(
+    app: &tauri::AppHandle,
+    db: &Db,
+    provider: crate::im::ImProvider,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    let bridge = app.state::<crate::im::ImBridge>();
+    // A disable is an authority retirement. Keep the write lease through both
+    // persistence and generation bump so an in-flight lead enqueue is wholly
+    // before the disable or validates against the disabled state afterward.
+    let _authority = bridge.authority_write_lease().await;
+    persist_im_enabled(db, provider, enabled).await?;
+    crate::im::spawn(app.clone());
+    Ok(())
+}
+
 async fn reset_im_owner(
     app: &tauri::AppHandle,
     db: &Db,
@@ -2744,15 +2760,15 @@ pub async fn im_set_enabled(
     // Toggling a named provider must not select it. A delayed toggle can race a
     // newer provider choice; keeping K_PROVIDER untouched makes that newer
     // choice authoritative while still preserving this provider's enabled bit.
-    let persist = persist_im_enabled(&db, provider, enabled);
+    // Feishu's registration apply gate stays outermost, matching credentials,
+    // scan completion, and owner reset; this prevents lock-order inversion.
+    let apply = apply_im_enabled(&app, &db, provider, enabled);
     if provider == crate::im::ImProvider::Feishu {
-        registration.supersede_with(persist).await
+        registration.supersede_with(apply).await
     } else {
-        persist.await
+        apply.await
     }
-    .map_err(e)?;
-    crate::im::spawn(app);
-    Ok(())
+    .map_err(e)
 }
 
 /// Clear a provider's locally bound owner without deleting credentials. The

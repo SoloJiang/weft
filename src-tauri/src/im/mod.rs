@@ -400,6 +400,26 @@ impl ImSettings {
         }
     }
 
+    /// Preserve the bridge's legacy enable default (credentials imply enabled
+    /// until the switch is explicitly stored) while exposing one fail-closed
+    /// check for stale Concierge mutation contexts.
+    pub async fn provider_enabled(
+        db: &crate::store::Db,
+        provider: ImProvider,
+    ) -> anyhow::Result<bool> {
+        use crate::store::repo::get_setting;
+        if let Some(value) = get_setting(db, provider.enabled_key()).await? {
+            return Ok(value == "1" || value == "true");
+        }
+        let app_id = get_setting(db, provider.app_id_key())
+            .await?
+            .unwrap_or_default();
+        let app_secret = get_setting(db, provider.app_secret_key())
+            .await?
+            .unwrap_or_default();
+        Ok(!app_id.is_empty() && !app_secret.is_empty())
+    }
+
     /// Fail closed unless `sender_open_id` is still authorized for the active
     /// provider. Concierge turns can outlive a provider switch or an owner
     /// reset, so provider identity alone is not a sufficient mutation fence.
@@ -413,6 +433,12 @@ impl ImSettings {
             anyhow::bail!(
                 "stale IM context: active provider is {}, not {}",
                 active_provider.as_str(),
+                provider.as_str()
+            );
+        }
+        if !Self::provider_enabled(db, provider).await? {
+            anyhow::bail!(
+                "stale IM context: active {} provider is disabled",
                 provider.as_str()
             );
         }
@@ -1189,11 +1215,12 @@ fn ws_loop_actions(sent_resync: bool) -> Vec<WsLoopAction> {
 #[derive(Default)]
 pub struct ImBridge {
     inner: Arc<std::sync::Mutex<BridgeInner>>,
-    /// Linearizes provider/owner retirement against a Concierge lead enqueue.
-    /// A global-tool send holds a read lease through `engine::send`; settings
-    /// paths that replace the provider or owner hold the write lease through
-    /// persistence + generation bump. Thus an enqueue is wholly before the
-    /// retirement or observes the retired DB state, never halfway across it.
+    /// Linearizes IM authority retirement against Concierge mutations.
+    /// A context-bearing global-tool mutation holds a read lease through its
+    /// final registry/DB/enqueue boundary; settings paths that replace or
+    /// disable the provider/owner hold the write lease through persistence +
+    /// generation bump. Thus a mutation is wholly before the retirement or
+    /// observes the retired DB state, never halfway across it.
     authority_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
@@ -3416,6 +3443,9 @@ mod tests {
         crate::store::repo::set_setting(&db, K_ALLOW, "owner")
             .await
             .unwrap();
+        crate::store::repo::set_setting(&db, K_ENABLED, "1")
+            .await
+            .unwrap();
         let ws = crate::store::repo::create_workspace(&db, "ws")
             .await
             .unwrap();
@@ -3454,6 +3484,9 @@ mod tests {
     async fn ensure_issue_topic_replaces_an_inactive_dingtalk_route() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         crate::store::repo::set_setting(&db, K_ALLOW, "owner")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_ENABLED, "1")
             .await
             .unwrap();
         let ws = crate::store::repo::create_workspace(&db, "ws")
@@ -4342,6 +4375,57 @@ mod tests {
             .expect("retirement should proceed after the enqueue lease is released")
             .unwrap();
         retirement.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabling_provider_waits_for_an_in_flight_im_tool_lease() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_DINGTALK_ENABLED, "1")
+            .await
+            .unwrap();
+        let bridge = Arc::new(ImBridge::default());
+        let tool_call = bridge.authority_read_lease().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (disabled_tx, mut disabled_rx) = tokio::sync::oneshot::channel();
+        let disabling_bridge = bridge.clone();
+        let disabling_db = db.clone();
+        let disable = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _retirement = disabling_bridge.authority_write_lease().await;
+            crate::store::repo::set_setting(&disabling_db, K_DINGTALK_ENABLED, "0")
+                .await
+                .unwrap();
+            let _ = disabled_tx.send(());
+        });
+
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut disabled_rx)
+                .await
+                .is_err(),
+            "disable must wait until the in-flight tool releases authority"
+        );
+        assert_eq!(
+            crate::store::repo::get_setting(&db, K_DINGTALK_ENABLED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+
+        drop(tool_call);
+        tokio::time::timeout(Duration::from_secs(1), &mut disabled_rx)
+            .await
+            .expect("disable should proceed after the tool lease is released")
+            .unwrap();
+        disable.await.unwrap();
+        assert_eq!(
+            crate::store::repo::get_setting(&db, K_DINGTALK_ENABLED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
     }
 
     #[tokio::test]
