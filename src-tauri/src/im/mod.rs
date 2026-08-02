@@ -157,10 +157,12 @@ pub fn format_im_user_message(
     im_thread_ref: &str,
     reply_to: Option<&str>,
     text: &str,
+    lang: &str,
     caps: &ImProviderCapabilities,
 ) -> String {
     let ctx = serde_json::json!({
         "provider": caps.provider_id,
+        "locale": if lang == "zh" { "zh" } else { "en" },
         "conversation": {
             "chat_id": chat_id,
             "topic_ref": im_thread_ref,
@@ -1038,6 +1040,24 @@ async fn drain_inbound_reactions(
 use std::sync::Arc;
 use tauri::Manager;
 
+type DingTalkCopyState = Arc<std::sync::RwLock<outbound::DingTalkCopy>>;
+
+fn dingtalk_copy_snapshot(state: &DingTalkCopyState) -> outbound::DingTalkCopy {
+    state.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn bridge_lang(copy_state: Option<&DingTalkCopyState>) -> String {
+    copy_state
+        .map(|state| {
+            state
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .locale
+                .clone()
+        })
+        .unwrap_or_else(|| IM_LANG.to_string())
+}
+
 /// Providers without synchronized copy use the project-default Chinese locale.
 /// DingTalk carries the active WebView locale in `DingTalkCopy` instead.
 const IM_LANG: &str = "zh";
@@ -1063,6 +1083,13 @@ pub struct ImBridge {
     inner: Arc<std::sync::Mutex<BridgeInner>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DingTalkCopyUpdate {
+    Unchanged,
+    Initialized,
+    Updated,
+}
+
 #[derive(Default)]
 struct BridgeInner {
     generation: u64,
@@ -1078,10 +1105,10 @@ struct BridgeInner {
     /// finalize 出站，桥侧把对应 thread 的所有挂账 reaction 全部清掉——队列
     /// 里挤压的多条 👀 一次性收回，回执语义诚实反映「轮到这条被回复」。
     pending_acks: Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
-    /// Authored by `src/i18n/{en,zh}.ts` and synchronized by the WebView. The
-    /// bundle survives bridge generations so provider/language restarts do not
-    /// create a window with hard-coded backend copy.
-    dingtalk_copy: Option<outbound::DingTalkCopy>,
+    /// Authored by `src/i18n/{en,zh}.ts` and synchronized by the WebView. Active
+    /// channels share this state so locale changes do not retire broadcast
+    /// subscribers or create a window with hard-coded backend copy.
+    dingtalk_copy: Option<DingTalkCopyState>,
 }
 
 impl ImBridge {
@@ -1113,15 +1140,20 @@ impl ImBridge {
         drop(inner);
         Some(installed)
     }
-    pub fn set_dingtalk_copy(&self, copy: outbound::DingTalkCopy) -> bool {
+    pub fn set_dingtalk_copy(&self, copy: outbound::DingTalkCopy) -> DingTalkCopyUpdate {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.dingtalk_copy.as_ref() == Some(&copy) {
-            return false;
+        let Some(copy_state) = inner.dingtalk_copy.as_ref() else {
+            inner.dingtalk_copy = Some(Arc::new(std::sync::RwLock::new(copy)));
+            return DingTalkCopyUpdate::Initialized;
+        };
+        let mut current = copy_state.write().unwrap_or_else(|e| e.into_inner());
+        if *current == copy {
+            return DingTalkCopyUpdate::Unchanged;
         }
-        inner.dingtalk_copy = Some(copy);
-        true
+        *current = copy;
+        DingTalkCopyUpdate::Updated
     }
-    fn dingtalk_copy(&self) -> Option<outbound::DingTalkCopy> {
+    fn dingtalk_copy_state(&self) -> Option<DingTalkCopyState> {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1235,12 +1267,12 @@ pub fn spawn(app: tauri::AppHandle) {
             crate::power::set_standby(&app, settings.remote_standby);
         });
         let provider = settings.provider;
-        let dingtalk_copy = if provider == ImProvider::DingTalk {
-            let Some(copy) = bridge.dingtalk_copy() else {
+        let dingtalk_copy_state = if provider == ImProvider::DingTalk {
+            let Some(copy_state) = bridge.dingtalk_copy_state() else {
                 bridge.set_status_if_live(generation, "waiting_locale");
                 return;
             };
-            Some(copy)
+            Some(copy_state)
         } else {
             None
         };
@@ -1262,11 +1294,15 @@ pub fn spawn(app: tauri::AppHandle) {
                 }
             }
             ImProvider::DingTalk => {
-                let Some(copy) = dingtalk_copy.clone() else {
+                let Some(copy_state) = dingtalk_copy_state.clone() else {
                     bridge.set_status_if_live(generation, "waiting_locale");
                     return;
                 };
-                match dingtalk::DingTalkChannel::new(&settings.app_id, &settings.app_secret, copy) {
+                match dingtalk::DingTalkChannel::new_with_shared_copy(
+                    &settings.app_id,
+                    &settings.app_secret,
+                    copy_state,
+                ) {
                     Ok(channel) => {
                         let channel = Arc::new(channel);
                         (channel.clone(), Some(channel))
@@ -1282,11 +1318,6 @@ pub fn spawn(app: tauri::AppHandle) {
                 }
             }
         };
-        let notice_lang = dingtalk_copy
-            .as_ref()
-            .map(|copy| copy.locale.as_str())
-            .unwrap_or(IM_LANG)
-            .to_string();
 
         // 入站 👀 reaction 是回执增强，不应挡住消息进入 lead engine。所有飞书
         // reaction REST 调用放到独立 worker 串行处理；失败只影响回执，不影响投递。
@@ -1350,11 +1381,11 @@ pub fn spawn(app: tauri::AppHandle) {
             return;
         };
         {
-            let (db2, ch, cards2, notice_lang2) = (
+            let (db2, ch, cards2, copy_state2) = (
                 db.clone(),
                 channel.clone(),
                 cards.clone(),
-                notice_lang.clone(),
+                dingtalk_copy_state.clone(),
             );
             let mut notifier_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
@@ -1374,12 +1405,13 @@ pub fn spawn(app: tauri::AppHandle) {
                     }
                 }
                 for (thread, ask) in human_snapshot {
+                    let lang = bridge_lang(copy_state2.as_ref());
                     let operation = consume_human_event(
                         crate::bus::state::HumanAskEvent::Asked { thread, ask },
                         &db2,
                         ch.as_ref(),
                         &cards2,
-                        &notice_lang2,
+                        &lang,
                     );
                     if run_until_generation_cancelled(&mut notifier_cancel, operation)
                         .await
@@ -1404,8 +1436,8 @@ pub fn spawn(app: tauri::AppHandle) {
                                 consume_ask_event(ev, &db2, ch.as_ref(), &cards2).await;
                             }
                             BridgeNotifyEvent::Human(ev) => {
-                                consume_human_event(ev, &db2, ch.as_ref(), &cards2, &notice_lang2)
-                                    .await;
+                                let lang = bridge_lang(copy_state2.as_ref());
+                                consume_human_event(ev, &db2, ch.as_ref(), &cards2, &lang).await;
                             }
                         }
                     };
@@ -1422,13 +1454,13 @@ pub fn spawn(app: tauri::AppHandle) {
         // —— 入站：ws → 路由 → 执行 ——
         let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
         {
-            let (app2, db2, ch, cards2, acks2, copy2) = (
+            let (app2, db2, ch, cards2, acks2, copy_state2) = (
                 app.clone(),
                 db.clone(),
                 channel.clone(),
                 cards.clone(),
                 acks.clone(),
-                dingtalk_copy.clone(),
+                dingtalk_copy_state.clone(),
             );
             let mut inbound_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
@@ -1486,6 +1518,11 @@ pub fn spawn(app: tauri::AppHandle) {
                             acks: Some(acks2.clone()),
                             reaction_tx: Some(reaction_tx.clone()),
                         };
+                        let active_copy = copy_state2.as_ref().map(dingtalk_copy_snapshot);
+                        let lang = active_copy
+                            .as_ref()
+                            .map(|copy| copy.locale.as_str())
+                            .unwrap_or(IM_LANG);
                         if let Err(e) = execute_for_provider(
                             r,
                             &db2,
@@ -1493,9 +1530,9 @@ pub fn spawn(app: tauri::AppHandle) {
                             &bus,
                             ch.as_ref(),
                             provider,
-                            copy2.as_ref(),
+                            active_copy.as_ref(),
                             &sender,
-                            IM_LANG,
+                            lang,
                             Some(&app2),
                             Some(&ctx),
                         )
@@ -1891,8 +1928,8 @@ async fn consume_human_event(
     }
 }
 
-/// M2-3: 把飞书话题里的一条消息灌进 issue 对应的 lead engine。
-/// 不感知前端 lang 设置——桥侧固定中文（spec：IM 出站默认 zh）。
+/// M2-3: 把 provider thread 里的消息灌进 issue 对应的 lead engine，并沿用
+/// 当前 provider 会话的活动语言。
 async fn feed_issue_message(
     app: &tauri::AppHandle,
     db: &crate::store::Db,
@@ -1912,6 +1949,7 @@ async fn feed_issue_message(
         im_thread_ref,
         reply_to,
         text,
+        lang,
         &provider_capabilities(provider, true),
     );
     // Each issue-topic turn carries its originating message id via origin_tag so the
@@ -2371,6 +2409,7 @@ async fn consume_free_text(
         im_thread_ref,
         reply_to,
         text,
+        lang,
         &provider_capabilities(provider, can_use_group_route),
     );
     crate::lead_chat::engine::send(
@@ -2577,6 +2616,7 @@ mod tests {
             "chat:oc_chat",
             Some("om_msg"),
             "创建一个 issue",
+            "zh",
             &super::feishu_provider_capabilities(true),
         );
 
@@ -2602,6 +2642,7 @@ mod tests {
             "dm:ou_sender",
             None,
             "创建一个 issue",
+            "zh",
             &dm,
         );
         assert!(dm_frame.contains("\"default_on_create_issue\":false"));
@@ -2623,9 +2664,11 @@ mod tests {
             "convThreadEncrypted",
             Some("msg_1"),
             "推进一下",
+            "en",
             &caps,
         );
         assert!(frame.contains("\"provider\":\"dingtalk\""));
+        assert!(frame.contains("\"locale\":\"en\""));
         assert!(frame.contains("\"issue_topic\":{\"can_create_from_current_conversation\":false"));
         assert!(frame.contains("\"issue_conversation_binding\""));
         assert!(frame.contains("/bind <issue-id>"));
@@ -3776,6 +3819,35 @@ mod tests {
         let (result, ()) = tokio::join!(blocked, restart);
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn dingtalk_copy_update_preserves_the_active_generation() {
+        let bridge = ImBridge::default();
+        let initial = outbound::DingTalkCopy {
+            locale: "zh".into(),
+            truncated_marker: "……（内容已截断）".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            bridge.set_dingtalk_copy(initial.clone()),
+            DingTalkCopyUpdate::Initialized
+        );
+        let (generation, _, _, cancel) = bridge.bump();
+
+        let updated = outbound::DingTalkCopy {
+            locale: "en".into(),
+            truncated_marker: "…(truncated)".into(),
+            ..initial
+        };
+        assert_eq!(
+            bridge.set_dingtalk_copy(updated),
+            DingTalkCopyUpdate::Updated
+        );
+        assert!(bridge.live(generation));
+        assert!(!*cancel.borrow());
+        let state = bridge.dingtalk_copy_state().unwrap();
+        assert_eq!(bridge_lang(Some(&state)), "en");
     }
 
     #[tokio::test]

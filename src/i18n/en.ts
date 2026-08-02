@@ -715,6 +715,7 @@ export const en = {
     taskName: "Name",
   },
   imMessages: {
+    truncatedMarker: "…(truncated)",
     permissionTitle: "Permission ask",
     permissionReplyCommand: "Reply with one command:",
     verdictAllowed: "Allowed ✓",

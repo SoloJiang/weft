@@ -163,7 +163,7 @@ pub async fn call_global(
             if text.trim().is_empty() {
                 return text_result("error: text required".into());
             }
-            match message_lead(db, tid, &text).await {
+            match message_lead(db, tid, &text, im_lang(args)).await {
                 Ok(()) => text_result(format!("delivered to lead of issue {tid}")),
                 Err(e) => text_result(format!("error: {e}")),
             }
@@ -358,11 +358,11 @@ async fn pending_needs_you(db: &Db, asks: &AskRegistry) -> anyhow::Result<Value>
 /// Push a message into the lead engine of `thread_id` from outside (Concierge).
 /// Pulls the global `AppHandle` from the `OnceLock` set in `setup()` — by the
 /// time an MCP request lands, the Tauri builder is long past that point.
-async fn message_lead(db: &Db, thread_id: i32, text: &str) -> anyhow::Result<()> {
+async fn message_lead(db: &Db, thread_id: i32, text: &str, lang: &str) -> anyhow::Result<()> {
     let app = crate::APP_HANDLE
         .get()
         .ok_or_else(|| anyhow::anyhow!("app handle not initialized"))?;
-    let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, "zh").await?;
+    let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, lang).await?;
     crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new(), None).await
 }
 
@@ -370,6 +370,13 @@ fn im_provider(args: &Value) -> &str {
     args.pointer("/im_context/provider")
         .and_then(|v| v.as_str())
         .unwrap_or("")
+}
+
+fn im_lang(args: &Value) -> &str {
+    match args.pointer("/im_context/locale").and_then(Value::as_str) {
+        Some("en") => "en",
+        _ => "zh",
+    }
 }
 
 /// Whether a topic can be created from the CURRENT conversation — not merely
@@ -445,14 +452,23 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim();
+    let open_hint = if provider == "dingtalk" {
+        format!("/bind {thread_id}")
+    } else {
+        "provider does not support issue topic in this conversation".to_string()
+    };
     let mut im = json!({
         "provider": provider,
         "topic_exists": false,
         "topic_created": false,
         "topic_ref": null,
-        "open_hint": "provider does not support issue topic in this conversation"
+        "open_hint": open_hint
     });
-    if let Some(route) = repo::im_route_of_thread(db, thread_id).await? {
+    let existing_route = repo::im_route_of_thread(db, thread_id).await?;
+    if let Some(route) = existing_route
+        .as_ref()
+        .filter(|route| route.channel == provider)
+    {
         im = json!({
             "provider": route.channel,
             "topic_exists": true,
@@ -461,7 +477,7 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
             "chat_id": route.chat_id,
             "open_hint": "已有 issue topic，请进入那里继续讨论"
         });
-    } else if provider == "feishu" && can_create {
+    } else if existing_route.is_none() && provider == "feishu" && can_create {
         if let Some(chat_id) = im_chat_id(args) {
             let v = ensure_issue_topic(db, thread_id, chat_id).await?;
             im = json!({
@@ -481,7 +497,9 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let delivered = if has_topic && !initial_message.is_empty() {
-        message_lead(db, thread_id, initial_message).await.is_ok()
+        message_lead(db, thread_id, initial_message, im_lang(args))
+            .await
+            .is_ok()
     } else {
         false
     };
@@ -582,9 +600,9 @@ pub fn global_specs() -> Value {
         },
         {
             "name": "message_lead",
-            "description": "Send a message into an issue's lead engine, as if the human typed it in the desktop. Use when the human wants to nudge a specific issue's lead from IM.",
+            "description": "Send a message into an issue's lead engine, as if the human typed it in the desktop. Use when the human wants to nudge a specific issue's lead from IM; pass the current im_context so the lead uses the active locale.",
             "inputSchema": { "type": "object",
-                "properties": { "issue_id": i(), "text": s() },
+                "properties": { "issue_id": i(), "text": s(), "im_context": { "type": "object" } },
                 "required": ["issue_id", "text"] }
         },
         {
@@ -870,6 +888,42 @@ mod tests {
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("om_root"));
         assert!(text.contains("\"topic_created\":false"));
+    }
+
+    #[tokio::test]
+    async fn ensure_issue_im_topic_rejects_an_inactive_provider_route() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let ws = repo::create_workspace(&db, "alpha").await.unwrap();
+        let issue = repo::create_thread(&db, ws.id, "Existing", "feature", "claude")
+            .await
+            .unwrap();
+        repo::bind_im_route(&db, issue.id, "feishu", "oc_old", "omt_old")
+            .await
+            .unwrap();
+        let args = json!({
+            "issue_id": issue.id,
+            "initial_message": "继续推进",
+            "im_context": {
+                "provider": "dingtalk",
+                "locale": "zh",
+                "conversation": { "chat_id": "cid_current" },
+                "capabilities": {
+                    "issue_topic": { "supported": true, "can_create_from_current_conversation": false }
+                }
+            }
+        });
+
+        let result = call_global(&db, &asks, &bus, "ensure_issue_im_topic", &args).await;
+        let parsed: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["im"]["provider"], "dingtalk");
+        assert_eq!(parsed["im"]["topic_exists"], false);
+        assert_eq!(parsed["lead_message_delivered"], false);
+        assert!(parsed["im"]["open_hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains(&format!("/bind {}", issue.id))));
     }
 
     #[tokio::test]

@@ -2746,9 +2746,9 @@ pub fn im_status(bridge: State<'_, crate::im::ImBridge>) -> R<String> {
 }
 
 /// Synchronize DingTalk's fixed user-facing copy from the frontend i18n
-/// catalogs. The bundle is memory-only and contains no credentials. A locale
-/// change restarts only an active DingTalk bridge so future robot messages use
-/// the newly selected UI language.
+/// catalogs. Active channels share this memory-only bundle, so locale changes
+/// update rendering in place without retiring output subscribers. The first
+/// bundle still starts a selected DingTalk bridge that was waiting for copy.
 #[tauri::command]
 pub async fn im_set_dingtalk_copy(
     app: tauri::AppHandle,
@@ -2757,8 +2757,11 @@ pub async fn im_set_dingtalk_copy(
     copy: crate::im::outbound::DingTalkCopy,
 ) -> R<()> {
     copy.validate().map_err(e)?;
-    if !bridge.set_dingtalk_copy(copy) {
-        return Ok(());
+    match bridge.set_dingtalk_copy(copy) {
+        crate::im::DingTalkCopyUpdate::Unchanged | crate::im::DingTalkCopyUpdate::Updated => {
+            return Ok(())
+        }
+        crate::im::DingTalkCopyUpdate::Initialized => {}
     }
     let settings = crate::im::ImSettings::load(&db).await.map_err(e)?;
     if settings.provider == crate::im::ImProvider::DingTalk {

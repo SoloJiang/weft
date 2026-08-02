@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 #[serde(rename_all = "camelCase")]
 pub struct DingTalkCopy {
     pub locale: String,
+    pub truncated_marker: String,
     pub permission_title: String,
     pub permission_reply_command: String,
     pub verdict_allowed: String,
@@ -51,6 +52,7 @@ impl DingTalkCopy {
             anyhow::bail!("DingTalk copy locale must be en or zh");
         }
         let fields = [
+            ("truncatedMarker", self.truncated_marker.as_str()),
             ("permissionTitle", self.permission_title.as_str()),
             (
                 "permissionReplyCommand",
@@ -123,13 +125,17 @@ fn t(lang: &str, zh: &'static str, en: &'static str) -> &'static str {
 
 /// 按字符截断（CJK 安全：字节切片落在多字节字符中间会 panic，生产路径
 /// deny panic）。飞书卡片消息体上限 30KB——超限报 230025 且整次 send 失败，
-/// 权限卡会静默丢失，故各字段出卡前先行截断。截断标记固定英文，不随 lang。
+/// 权限卡会静默丢失，故各字段出卡前先行截断。
 fn clamp(s: &str, max_chars: usize) -> String {
+    clamp_with_marker(s, max_chars, "…(truncated)")
+}
+
+fn clamp_with_marker(s: &str, max_chars: usize, marker: &str) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {
         let mut out: String = s.chars().take(max_chars).collect();
-        out.push_str("…(truncated)");
+        out.push_str(marker);
         out
     }
 }
@@ -274,8 +280,8 @@ pub fn dingtalk_permission_text(ask: &crate::ask::Ask, copy: &DingTalkCopy) -> S
     format!(
         "{} · {title}\n{}\n{who}\n\n{}\n\n{}\n/allow {}\n/deny {}\n/always {}\n/full {}",
         copy.permission_title,
-        clamp(&ask.summary, 200),
-        clamp(&ask.detail, 3000),
+        clamp_with_marker(&ask.summary, 200, &copy.truncated_marker),
+        clamp_with_marker(&ask.detail, 3000, &copy.truncated_marker),
         copy.permission_reply_command,
         ask.id,
         ask.id,
@@ -300,7 +306,10 @@ pub fn dingtalk_permission_resolved_text(
     if summary.is_empty() {
         label.to_string()
     } else {
-        format!("{label}\n{}", clamp(summary, 200))
+        format!(
+            "{label}\n{}",
+            clamp_with_marker(summary, 200, &copy.truncated_marker)
+        )
     }
 }
 
@@ -317,7 +326,7 @@ pub fn dingtalk_human_question_text(
         copy.human_question_title,
         thread_title,
         from,
-        clamp(text, 3000),
+        clamp_with_marker(text, 3000, &copy.truncated_marker),
         copy.human_answer_instruction,
         copy.human_answer_placeholder,
     )
@@ -331,7 +340,7 @@ pub fn dingtalk_human_resolved_text(answer: &str, copy: &DingTalkCopy) -> String
             "{}\n{}{}",
             copy.human_answered,
             copy.answer_prefix,
-            clamp(answer, 1000)
+            clamp_with_marker(answer, 1000, &copy.truncated_marker)
         )
     }
 }
@@ -341,7 +350,11 @@ pub fn dingtalk_human_cancelled_text(copy: &DingTalkCopy) -> &str {
 }
 
 pub fn dingtalk_issue_reply_text(copy: &DingTalkCopy, body: &str) -> String {
-    format!("{}{}", copy.lead_prefix, clamp(body.trim(), 9000))
+    format!(
+        "{}{}",
+        copy.lead_prefix,
+        clamp_with_marker(body.trim(), 9000, &copy.truncated_marker)
+    )
 }
 
 pub fn dingtalk_resync_summary(copy: &DingTalkCopy, items: &[(i32, String)]) -> String {
@@ -355,7 +368,10 @@ pub fn dingtalk_resync_summary(copy: &DingTalkCopy, items: &[(i32, String)]) -> 
     };
     let cap = 8;
     for (thread_id, summary) in items.iter().take(cap) {
-        body.push_str(&format!("\n- #{thread_id} {}", clamp(summary, 160)));
+        body.push_str(&format!(
+            "\n- #{thread_id} {}",
+            clamp_with_marker(summary, 160, &copy.truncated_marker)
+        ));
     }
     if items.len() > cap {
         body.push_str(
@@ -444,6 +460,7 @@ mod tests {
     fn dingtalk_copy() -> DingTalkCopy {
         DingTalkCopy {
             locale: "zh".into(),
+            truncated_marker: "……（内容已截断）".into(),
             permission_title: "权限请求".into(),
             permission_reply_command: "复制一条命令回复：".into(),
             verdict_allowed: "已允许 ✓".into(),
@@ -613,6 +630,8 @@ mod tests {
             dingtalk_issue_reply_text(&copy, " 推进了一下 "),
             "Lead：推进了一下"
         );
+        let oversized = dingtalk_issue_reply_text(&copy, &"汉".repeat(10_000));
+        assert!(oversized.ends_with(&copy.truncated_marker));
         let summary = dingtalk_resync_summary(&copy, &[(7, "Run tests".into())]);
         assert!(summary.contains("1 项待处理"));
         assert!(summary.contains("#7 Run tests"));

@@ -69,7 +69,7 @@ struct Inner {
     recent_inbound: Mutex<HashMap<String, Instant>>,
     robot_code: Mutex<String>,
     local_id: AtomicU64,
-    copy: super::outbound::DingTalkCopy,
+    copy: super::DingTalkCopyState,
 }
 
 #[derive(Clone)]
@@ -83,12 +83,24 @@ impl DingTalkChannel {
         client_secret: &str,
         copy: super::outbound::DingTalkCopy,
     ) -> anyhow::Result<Self> {
+        Self::new_with_shared_copy(
+            client_id,
+            client_secret,
+            Arc::new(std::sync::RwLock::new(copy)),
+        )
+    }
+
+    pub(super) fn new_with_shared_copy(
+        client_id: &str,
+        client_secret: &str,
+        copy: super::DingTalkCopyState,
+    ) -> anyhow::Result<Self> {
         let client_id = client_id.trim();
         let client_secret = client_secret.trim();
         if client_id.is_empty() || client_secret.is_empty() {
             anyhow::bail!("dingtalk client id and client secret are required");
         }
-        copy.validate()?;
+        super::dingtalk_copy_snapshot(&copy).validate()?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
@@ -107,6 +119,10 @@ impl DingTalkChannel {
                 copy,
             }),
         })
+    }
+
+    fn copy(&self) -> super::outbound::DingTalkCopy {
+        super::dingtalk_copy_snapshot(&self.inner.copy)
     }
 
     pub(super) fn credentials(&self) -> (&str, &str) {
@@ -267,7 +283,8 @@ impl DingTalkChannel {
     }
 
     async fn send_private_message(&self, user_id: &str, text: &str) -> anyhow::Result<String> {
-        let body = private_message_body(&self.robot_code(), user_id, text);
+        let marker = self.copy().truncated_marker;
+        let body = private_message_body(&self.robot_code(), user_id, text, &marker);
         let response = self
             .post_openapi(PRIVATE_SEND_URL, &body, "private send")
             .await?;
@@ -275,7 +292,8 @@ impl DingTalkChannel {
     }
 
     async fn send_group_message(&self, chat_id: &str, text: &str) -> anyhow::Result<String> {
-        let body = group_message_body(&self.robot_code(), chat_id, text);
+        let marker = self.copy().truncated_marker;
+        let body = group_message_body(&self.robot_code(), chat_id, text, &marker);
         let response = self
             .post_openapi(GROUP_SEND_URL, &body, "group send")
             .await?;
@@ -290,6 +308,7 @@ impl DingTalkChannel {
     ) -> anyhow::Result<String> {
         let url = validated_session_webhook(&context.session_webhook)?;
         let token = self.access_token(false).await?;
+        let marker = self.copy().truncated_marker;
         let response = self
             .inner
             .http
@@ -297,7 +316,7 @@ impl DingTalkChannel {
             .header("x-acs-dingtalk-access-token", token)
             .json(&json!({
                 "msgtype": "text",
-                "text": { "content": clamp_text(text) },
+                "text": { "content": clamp_text(text, &marker) },
                 "at": { "isAtAll": false, "atUserIds": [context.sender_user_id] }
             }))
             .send()
@@ -358,10 +377,11 @@ impl super::Channel for DingTalkChannel {
         ask: &crate::ask::Ask,
         _lang: &str,
     ) -> anyhow::Result<String> {
+        let copy = self.copy();
         let message_id = self
             .send_private_message(
                 open_id,
-                &super::outbound::dingtalk_permission_text(ask, &self.inner.copy),
+                &super::outbound::dingtalk_permission_text(ask, &copy),
             )
             .await?;
         self.remember_prompt_recipient(&message_id, open_id);
@@ -375,9 +395,10 @@ impl super::Channel for DingTalkChannel {
         verdict: &str,
         _lang: &str,
     ) -> anyhow::Result<()> {
+        let copy = self.copy();
         self.send_prompt_status(
             message_id,
-            &super::outbound::dingtalk_permission_resolved_text(summary, verdict, &self.inner.copy),
+            &super::outbound::dingtalk_permission_resolved_text(summary, verdict, &copy),
         )
         .await
     }
@@ -392,13 +413,14 @@ impl super::Channel for DingTalkChannel {
         text: &str,
         _lang: &str,
     ) -> anyhow::Result<String> {
+        let copy = self.copy();
         let body = super::outbound::dingtalk_human_question_text(
             thread_id,
             ask_id,
             thread_title,
             from,
             text,
-            &self.inner.copy,
+            &copy,
         );
         let message_id = self.send_private_message(open_id, &body).await?;
         self.remember_prompt_recipient(&message_id, open_id);
@@ -411,9 +433,10 @@ impl super::Channel for DingTalkChannel {
         answer: &str,
         _lang: &str,
     ) -> anyhow::Result<()> {
+        let copy = self.copy();
         self.send_prompt_status(
             message_id,
-            &super::outbound::dingtalk_human_resolved_text(answer, &self.inner.copy),
+            &super::outbound::dingtalk_human_resolved_text(answer, &copy),
         )
         .await
     }
@@ -423,19 +446,20 @@ impl super::Channel for DingTalkChannel {
         message_id: &str,
         _lang: &str,
     ) -> anyhow::Result<()> {
+        let copy = self.copy();
         self.send_prompt_status(
             message_id,
-            super::outbound::dingtalk_human_cancelled_text(&self.inner.copy),
+            super::outbound::dingtalk_human_cancelled_text(&copy),
         )
         .await
     }
 
     fn issue_reply_text(&self, _lang: &str, text: &str) -> String {
-        super::outbound::dingtalk_issue_reply_text(&self.inner.copy, text)
+        super::outbound::dingtalk_issue_reply_text(&self.copy(), text)
     }
 
     fn resync_summary(&self, _lang: &str, items: &[(i32, String)]) -> String {
-        super::outbound::dingtalk_resync_summary(&self.inner.copy, items)
+        super::outbound::dingtalk_resync_summary(&self.copy(), items)
     }
 
     async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()> {
@@ -476,31 +500,31 @@ impl super::Channel for DingTalkChannel {
     }
 }
 
-fn clamp_text(text: &str) -> String {
+fn clamp_text(text: &str, marker: &str) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= MAX_TEXT_CHARS {
         return trimmed.to_string();
     }
     let mut out: String = trimmed.chars().take(MAX_TEXT_CHARS).collect();
-    out.push_str("…(truncated)");
+    out.push_str(marker);
     out
 }
 
-fn private_message_body(robot_code: &str, user_id: &str, text: &str) -> Value {
+fn private_message_body(robot_code: &str, user_id: &str, text: &str, marker: &str) -> Value {
     json!({
         "robotCode": robot_code,
         "userIds": [user_id],
         "msgKey": "sampleText",
-        "msgParam": json!({ "content": clamp_text(text) }).to_string(),
+        "msgParam": json!({ "content": clamp_text(text, marker) }).to_string(),
     })
 }
 
-fn group_message_body(robot_code: &str, chat_id: &str, text: &str) -> Value {
+fn group_message_body(robot_code: &str, chat_id: &str, text: &str, marker: &str) -> Value {
     json!({
         "robotCode": robot_code,
         "openConversationId": chat_id,
         "msgKey": "sampleText",
-        "msgParam": json!({ "content": clamp_text(text) }).to_string(),
+        "msgParam": json!({ "content": clamp_text(text, marker) }).to_string(),
     })
 }
 
@@ -602,6 +626,7 @@ mod tests {
     fn copy() -> super::super::outbound::DingTalkCopy {
         super::super::outbound::DingTalkCopy {
             locale: "en".into(),
+            truncated_marker: "…(truncated)".into(),
             permission_title: "permission".into(),
             permission_reply_command: "reply".into(),
             verdict_allowed: "allowed".into(),
@@ -637,13 +662,13 @@ mod tests {
 
     #[test]
     fn proactive_message_bodies_match_robot_openapi_shape() {
-        let private = private_message_body("ding_bot", "user-1", " hello ");
+        let private = private_message_body("ding_bot", "user-1", " hello ", "…(truncated)");
         assert_eq!(private["robotCode"], "ding_bot");
         assert_eq!(private["userIds"], json!(["user-1"]));
         assert_eq!(private["msgKey"], "sampleText");
         assert_eq!(private["msgParam"], r#"{"content":"hello"}"#);
 
-        let group = group_message_body("ding_bot", "cid-1", "hello");
+        let group = group_message_body("ding_bot", "cid-1", "hello", "…(truncated)");
         assert_eq!(group["openConversationId"], "cid-1");
         assert!(group.get("userIds").is_none());
     }
@@ -684,9 +709,32 @@ mod tests {
     #[test]
     fn text_clamp_is_cjk_safe() {
         let text = "汉".repeat(MAX_TEXT_CHARS + 10);
-        let clamped = clamp_text(&text);
+        let marker = "……（内容已截断）";
+        let clamped = clamp_text(&text, marker);
         assert!(clamped.starts_with(&"汉".repeat(MAX_TEXT_CHARS)));
-        assert!(clamped.ends_with("…(truncated)"));
+        assert!(clamped.ends_with(marker));
+    }
+
+    #[test]
+    fn channel_reads_copy_updates_from_shared_state() {
+        let state = Arc::new(std::sync::RwLock::new(copy()));
+        let channel =
+            DingTalkChannel::new_with_shared_copy("ding_app", "secret", state.clone()).unwrap();
+        assert_eq!(channel.copy().locale, "en");
+        assert_eq!(
+            super::super::Channel::issue_reply_text(&channel, "en", "body"),
+            "leadbody"
+        );
+
+        let mut updated = state.write().unwrap();
+        updated.locale = "zh".into();
+        updated.lead_prefix = "Lead：".into();
+        drop(updated);
+        assert_eq!(channel.copy().locale, "zh");
+        assert_eq!(
+            super::super::Channel::issue_reply_text(&channel, "zh", "正文"),
+            "Lead：正文"
+        );
     }
 
     #[test]

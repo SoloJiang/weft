@@ -687,6 +687,7 @@ export const zh = {
     taskName: "名称",
   },
   imMessages: {
+    truncatedMarker: "……（内容已截断）",
     permissionTitle: "权限请求",
     permissionReplyCommand: "复制一条命令回复：",
     verdictAllowed: "已允许 ✓",
