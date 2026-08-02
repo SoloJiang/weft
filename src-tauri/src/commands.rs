@@ -2601,21 +2601,26 @@ async fn persist_im_credentials(
     app_secret: &str,
     enable: bool,
     owner_id: Option<&str>,
+    select_provider: bool,
 ) -> anyhow::Result<()> {
-    repo::set_setting(db, provider.app_id_key(), app_id.trim()).await?;
+    let app_id = app_id.trim();
+    let app_secret = app_secret.trim();
+    let owner_id = owner_id.map(str::trim).filter(|owner| !owner.is_empty());
+    let mut settings = Vec::with_capacity(5);
+    if select_provider {
+        settings.push((crate::im::K_PROVIDER, provider.as_str()));
+    }
+    settings.push((provider.app_id_key(), app_id));
     if !app_secret.is_empty() {
-        repo::set_setting(db, provider.app_secret_key(), app_secret.trim()).await?;
+        settings.push((provider.app_secret_key(), app_secret));
     }
     if let Some(owner_id) = owner_id {
-        let owner_id = owner_id.trim();
-        if !owner_id.is_empty() {
-            repo::set_setting(db, provider.allow_key(), owner_id).await?;
-        }
+        settings.push((provider.allow_key(), owner_id));
     }
     if enable {
-        repo::set_setting(db, provider.enabled_key(), "1").await?;
+        settings.push((provider.enabled_key(), "1"));
     }
-    Ok(())
+    repo::set_settings_atomic(db, &settings).await
 }
 
 async fn apply_im_credentials(
@@ -2627,8 +2632,16 @@ async fn apply_im_credentials(
     enable: bool,
     owner_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    repo::set_setting(db, crate::im::K_PROVIDER, provider.as_str()).await?;
-    persist_im_credentials(db, provider, app_id, app_secret, enable, owner_id).await?;
+    persist_im_credentials(
+        db,
+        provider,
+        app_id,
+        app_secret,
+        enable,
+        owner_id,
+        true,
+    )
+    .await?;
     crate::im::spawn(app.clone());
     Ok(())
 }
@@ -2650,6 +2663,7 @@ async fn persist_feishu_scan_credentials(
         app_secret,
         true,
         Some(owner_open_id),
+        false,
     )
     .await
 }
@@ -2682,22 +2696,19 @@ pub async fn im_set_provider(
 pub async fn im_set_settings(
     app: tauri::AppHandle,
     db: State<'_, Db>,
+    registration: State<'_, crate::im::feishu::registration::RegistrationService>,
     provider: String,
     app_id: String,
     app_secret: String,
 ) -> R<()> {
     let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
-    apply_im_credentials(
-        &app,
-        &db,
-        provider,
-        &app_id,
-        &app_secret,
-        false,
-        None,
-    )
-        .await
-        .map_err(e)
+    let apply = apply_im_credentials(&app, &db, provider, &app_id, &app_secret, false, None);
+    let result = if provider == crate::im::ImProvider::Feishu {
+        registration.supersede_with(apply).await
+    } else {
+        apply.await
+    };
+    result.map_err(e)
 }
 
 /// 开关桥：写 enabled 标志并重启。off = 断开但保留凭证；on = 凭证齐全则连接
@@ -2706,6 +2717,7 @@ pub async fn im_set_settings(
 pub async fn im_set_enabled(
     app: tauri::AppHandle,
     db: State<'_, Db>,
+    registration: State<'_, crate::im::feishu::registration::RegistrationService>,
     provider: String,
     enabled: bool,
 ) -> R<()> {
@@ -2713,9 +2725,13 @@ pub async fn im_set_enabled(
     // Toggling a named provider must not select it. A delayed toggle can race a
     // newer provider choice; keeping K_PROVIDER untouched makes that newer
     // choice authoritative while still preserving this provider's enabled bit.
-    persist_im_enabled(&db, provider, enabled)
-        .await
-        .map_err(e)?;
+    let persist = persist_im_enabled(&db, provider, enabled);
+    if provider == crate::im::ImProvider::Feishu {
+        registration.supersede_with(persist).await
+    } else {
+        persist.await
+    }
+    .map_err(e)?;
     crate::im::spawn(app);
     Ok(())
 }
@@ -2727,13 +2743,20 @@ pub async fn im_set_enabled(
 pub async fn im_reset_owner(
     app: tauri::AppHandle,
     db: State<'_, Db>,
+    registration: State<'_, crate::im::feishu::registration::RegistrationService>,
     provider: String,
 ) -> R<()> {
     let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
     let active_provider = crate::im::ImSettings::active_provider(&db)
         .await
         .map_err(e)?;
-    crate::im::reset_owner(&db, provider).await.map_err(e)?;
+    let reset = crate::im::reset_owner(&db, provider);
+    if provider == crate::im::ImProvider::Feishu {
+        registration.supersede_with(reset).await
+    } else {
+        reset.await
+    }
+    .map_err(e)?;
     if active_provider == provider {
         crate::im::spawn(app);
     }
@@ -2814,18 +2837,33 @@ pub async fn feishu_scan_begin(
 ) -> R<ScanBeginView> {
     use crate::im::feishu::registration::{OnSuccess, ReqwestTransport};
     let app_cb = app.clone();
-    let on_success: OnSuccess = std::sync::Arc::new(move |client_id, client_secret, open_id| {
-        let app = app_cb.clone();
-        Box::pin(async move {
-            let db = app.state::<Db>().inner().clone();
-            persist_feishu_scan_credentials(&db, &client_id, &client_secret, &open_id).await?;
-            let selected = crate::im::ImSettings::active_provider(&db).await?;
-            if selected == crate::im::ImProvider::Feishu {
-                crate::im::spawn(app);
-            }
-            Ok(())
-        }) as futures::future::BoxFuture<'static, anyhow::Result<()>>
-    });
+    let registration_cb = svc.inner().clone();
+    let on_success: OnSuccess = std::sync::Arc::new(
+        move |generation, client_id, client_secret, open_id| {
+            let app = app_cb.clone();
+            let registration = registration_cb.clone();
+            Box::pin(async move {
+                registration
+                    .apply_if_live(generation, async move {
+                        let db = app.state::<Db>().inner().clone();
+                        persist_feishu_scan_credentials(
+                            &db,
+                            &client_id,
+                            &client_secret,
+                            &open_id,
+                        )
+                        .await?;
+                        let selected = crate::im::ImSettings::active_provider(&db).await?;
+                        if selected == crate::im::ImProvider::Feishu {
+                            crate::im::spawn(app);
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                Ok(())
+            }) as futures::future::BoxFuture<'static, anyhow::Result<()>>
+        },
+    );
     let transport = std::sync::Arc::new(ReqwestTransport::default());
     let begin = svc.begin(transport, on_success).await.map_err(e)?;
     Ok(ScanBeginView {
@@ -2856,10 +2894,10 @@ pub fn feishu_scan_status(
 
 /// 取消扫码(关闭 dialog / 卸载时调用),停止后台轮询。
 #[tauri::command]
-pub fn feishu_scan_cancel(
+pub async fn feishu_scan_cancel(
     svc: State<'_, crate::im::feishu::registration::RegistrationService>,
 ) -> R<()> {
-    svc.cancel();
+    svc.cancel().await;
     Ok(())
 }
 
@@ -3051,6 +3089,57 @@ mod tests {
                 .as_deref(),
             Some("1")
         );
+    }
+
+    #[tokio::test]
+    async fn late_scan_generation_cannot_overwrite_newer_manual_feishu_credentials() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let registration =
+            crate::im::feishu::registration::RegistrationService::default();
+
+        registration
+            .supersede_with(persist_im_credentials(
+                &db,
+                crate::im::ImProvider::Feishu,
+                "cli_manual",
+                "sec_manual",
+                false,
+                None,
+                true,
+            ))
+            .await
+            .unwrap();
+        let applied = registration
+            .apply_if_live(
+                0,
+                persist_feishu_scan_credentials(&db, "cli_scan", "sec_scan", "ou_scan"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!applied, "superseded scan callback must not write");
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_APP_ID)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cli_manual")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_APP_SECRET)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("sec_manual")
+        );
+        assert!(repo::get_setting(&db, crate::im::K_ALLOW)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo::get_setting(&db, crate::im::K_ENABLED)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

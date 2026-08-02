@@ -10,7 +10,7 @@ use crate::slug::unique_slug;
 use anyhow::Result;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-    TryIntoModel,
+    TransactionTrait, TryIntoModel,
 };
 use std::collections::HashMap;
 use crate::host;
@@ -380,6 +380,32 @@ pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<()> {
         )
         .exec(&db.0)
         .await?;
+    Ok(())
+}
+
+/// Persist a related settings bundle in one transaction. Credential tuples
+/// must never become visible half-written (for example a new app id paired
+/// with an old secret) when scan and manual-save flows overlap.
+pub async fn set_settings_atomic(db: &Db, settings: &[(&str, &str)]) -> Result<()> {
+    if settings.is_empty() {
+        return Ok(());
+    }
+    let txn = db.0.begin().await?;
+    for (key, value) in settings {
+        let model = app_setting::ActiveModel {
+            key: Set((*key).to_string()),
+            value: Set((*value).to_string()),
+        };
+        app_setting::Entity::insert(model)
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::column(app_setting::Column::Key)
+                    .update_column(app_setting::Column::Value)
+                    .to_owned(),
+            )
+            .exec(&txn)
+            .await?;
+    }
+    txn.commit().await?;
     Ok(())
 }
 

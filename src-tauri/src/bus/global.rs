@@ -724,14 +724,62 @@ pub fn global_specs() -> Value {
         json!({
             "type": "object",
             "properties": {
-                "provider": { "type": "string" },
+                "provider": { "type": "string", "enum": ["feishu", "dingtalk"] },
+                "locale": { "type": "string", "enum": ["zh", "en"] },
                 "conversation": {
                     "type": "object",
-                    "properties": { "sender_id": { "type": "string" } },
-                    "required": ["sender_id"]
+                    "properties": {
+                        "chat_id": { "type": "string" },
+                        "topic_ref": { "type": "string" },
+                        "reply_to": { "type": ["string", "null"] },
+                        "sender_id": { "type": "string" }
+                    },
+                    "required": ["chat_id", "topic_ref", "reply_to", "sender_id"]
+                },
+                "capabilities": {
+                    "type": "object",
+                    "properties": {
+                        "issue_topic": {
+                            "type": "object",
+                            "properties": {
+                                "supported": { "type": "boolean" },
+                                "default_on_create_issue": { "type": "boolean" },
+                                "can_create_from_current_conversation": { "type": "boolean" },
+                                "terminology": {
+                                    "type": "object",
+                                    "properties": {
+                                        "zh": { "type": "string" },
+                                        "en": { "type": "string" }
+                                    },
+                                    "required": ["zh", "en"]
+                                }
+                            },
+                            "required": [
+                                "supported",
+                                "default_on_create_issue",
+                                "can_create_from_current_conversation",
+                                "terminology"
+                            ]
+                        },
+                        "reply": {
+                            "type": "object",
+                            "properties": { "supported": { "type": "boolean" } },
+                            "required": ["supported"]
+                        },
+                        "issue_conversation_binding": {
+                            "type": "object",
+                            "properties": {
+                                "supported": { "type": "boolean" },
+                                "can_bind_current_conversation": { "type": "boolean" },
+                                "command": { "type": "string" }
+                            },
+                            "required": ["supported", "can_bind_current_conversation", "command"]
+                        }
+                    },
+                    "required": ["issue_topic", "reply", "issue_conversation_binding"]
                 }
             },
-            "required": ["provider", "conversation"]
+            "required": ["provider", "locale", "conversation", "capabilities"]
         })
     };
     json!([
@@ -1137,9 +1185,16 @@ mod tests {
     }
 
     #[test]
-    fn mutating_answer_tools_require_im_context() {
+    fn mutating_tools_declare_the_complete_im_context() {
         let specs = global_specs();
-        for name in ["answer_permission", "answer_question"] {
+        for name in [
+            "answer_permission",
+            "answer_question",
+            "message_lead",
+            "create_issue_from_im",
+            "ensure_issue_im_topic",
+            "ensure_issue_topic",
+        ] {
             let spec = specs
                 .as_array()
                 .unwrap()
@@ -1151,13 +1206,79 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|required| required == "im_context"));
-            assert!(spec["inputSchema"]["properties"]["im_context"]["properties"]
-                ["conversation"]["required"]
+            let context = &spec["inputSchema"]["properties"]["im_context"];
+            assert_eq!(
+                context["required"],
+                json!(["provider", "locale", "conversation", "capabilities"]),
+                "{name} must preserve the complete framed context"
+            );
+            assert_eq!(
+                context["properties"]["conversation"]["required"],
+                json!(["chat_id", "topic_ref", "reply_to", "sender_id"]),
+                "{name} must preserve every conversation delivery field"
+            );
+            assert_eq!(
+                context["properties"]["capabilities"]["required"],
+                json!(["issue_topic", "reply", "issue_conversation_binding"]),
+                "{name} must preserve provider capabilities"
+            );
+            assert!(context["properties"]["capabilities"]["properties"]["issue_topic"]
+                ["required"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|required| required == "sender_id"));
+                .any(|required| required == "can_create_from_current_conversation"));
         }
+    }
+
+    #[test]
+    fn im_context_schema_covers_every_field_in_the_framed_bus_context() {
+        fn assert_declared(schema: &Value, value: &Value, path: &str) {
+            let Some(object) = value.as_object() else {
+                return;
+            };
+            let properties = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("schema properties missing at {path}"));
+            let required = schema["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("schema required missing at {path}"));
+            for (key, child) in object {
+                let child_schema = properties
+                    .get(key)
+                    .unwrap_or_else(|| panic!("framed field {path}.{key} is undeclared"));
+                assert!(
+                    required.iter().any(|required| required == key),
+                    "framed field {path}.{key} is optional in the tool schema"
+                );
+                assert_declared(child_schema, child, &format!("{path}.{key}"));
+            }
+        }
+
+        let frame = crate::im::format_im_user_message(
+            "ou_owner",
+            "oc_chat",
+            "chat:oc_chat",
+            Some("om_reply"),
+            "continue",
+            "en",
+            &crate::im::feishu_provider_capabilities(true),
+        );
+        let context_json = frame
+            .strip_prefix("<weft:im_context>")
+            .and_then(|rest| rest.split_once("</weft:im_context>"))
+            .map(|(context, _)| context)
+            .expect("framed IM context");
+        let context: Value = serde_json::from_str(context_json).unwrap();
+        let specs = global_specs();
+        let schema = &specs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|spec| spec["name"] == "message_lead")
+            .unwrap()["inputSchema"]["properties"]["im_context"];
+
+        assert_declared(schema, &context, "im_context");
     }
 
     #[test]
