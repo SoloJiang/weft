@@ -5565,6 +5565,20 @@ pub async fn complete_repo_action_execution(
         txn.rollback().await?;
         anyhow::bail!("action_card_stale");
     }
+    let Some(owner_thread) = thread::Entity::find_by_id(execution.thread_id)
+        .one(&txn)
+        .await?
+    else {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    };
+    if owner_thread.workspace_id != execution.workspace_id
+        || repo_action_scope_is_deleting_on(&txn, execution.workspace_id, execution.thread_id)
+            .await?
+    {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    }
     let persisted_repo = repo_ref::Entity::find_by_id(completed_repo.id)
         .one(&txn)
         .await?;
@@ -5580,6 +5594,7 @@ pub async fn complete_repo_action_execution(
     let exact_unresolved_action = message.thread_id == execution.thread_id
         && message.kind == "action_card"
         && message.role == "assistant"
+        && message.status == "complete"
         && message.session_id.is_none()
         && !action_card_is_resolved(&message.content)
         && action_card_contains_action(

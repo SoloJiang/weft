@@ -4384,6 +4384,329 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_new_and_clone_cards_leave_no_target_or_staging_side_effect() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        let new_dest = root.path().join("new-dest");
+        std::fs::create_dir_all(&new_dest).unwrap();
+        let (new_workspace, new_thread, new_card) =
+            repo_action_card(&db, "stale-new", "new").await;
+        repo::insert_lead_message(
+            &db,
+            new_thread.id,
+            None,
+            2,
+            "assistant",
+            "text",
+            "A newer turn superseded the repository card",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let new_error = create_repo_inner(
+            &db,
+            new_workspace.id,
+            "checkout".to_string(),
+            new_dest.to_string_lossy().into_owned(),
+            Some(new_thread.id),
+            Some(new_card.id),
+            Some("stale-new".to_string()),
+            Some("new".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(new_error, "action_card_stale");
+        assert!(repo::get_repo_action_execution(&db, new_card.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo::list_repos(&db, new_workspace.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!new_dest.join("checkout").exists());
+        assert!(std::fs::read_dir(&new_dest)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("weft-repo-action")));
+
+        let source = init_main_repo(root.path(), "stale-clone-source");
+        let clone_dest = root.path().join("clone-dest");
+        std::fs::create_dir_all(&clone_dest).unwrap();
+        let (clone_workspace, clone_thread, clone_card) =
+            repo_action_card(&db, "stale-clone", "clone").await;
+        repo::insert_lead_message(
+            &db,
+            clone_thread.id,
+            None,
+            2,
+            "assistant",
+            "text",
+            "A newer turn superseded the clone card",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let clone_error = clone_repo_inner(
+            &db,
+            clone_workspace.id,
+            source.to_string_lossy().into_owned(),
+            clone_dest.to_string_lossy().into_owned(),
+            "checkout".to_string(),
+            Some(clone_thread.id),
+            Some(clone_card.id),
+            Some("stale-clone".to_string()),
+            Some("clone".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(clone_error, "action_card_stale");
+        assert!(repo::get_repo_action_execution(&db, clone_card.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo::list_repos(&db, clone_workspace.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!clone_dest.join("checkout").exists());
+        assert!(std::fs::read_dir(&clone_dest)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("weft-repo-action")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_exact_repo_action_is_one_execution_mutation_resolution_and_feedback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let local = init_main_repo(root.path(), "concurrent-local");
+        let (workspace, thread, card) = repo_action_card(&db, "concurrent-add", "add").await;
+        let args = || {
+            (
+                workspace.id,
+                "concurrent-local".to_string(),
+                local.to_string_lossy().into_owned(),
+                Some(thread.id),
+                Some(card.id),
+                Some("concurrent-add".to_string()),
+                Some("add".to_string()),
+            )
+        };
+
+        let first_db = db.clone();
+        let (first_workspace, first_name, first_path, first_thread, first_message, first_id, first_kind) =
+            args();
+        let first = tokio::spawn(async move {
+            add_repo_ref_inner(
+                &first_db,
+                first_workspace,
+                first_name,
+                first_path,
+                first_thread,
+                first_message,
+                first_id,
+                first_kind,
+            )
+            .await
+        });
+        let second_db = db.clone();
+        let (second_workspace, second_name, second_path, second_thread, second_message, second_id, second_kind) =
+            args();
+        let second = tokio::spawn(async move {
+            add_repo_ref_inner(
+                &second_db,
+                second_workspace,
+                second_name,
+                second_path,
+                second_thread,
+                second_message,
+                second_id,
+                second_kind,
+            )
+            .await
+        });
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        let outcomes = [first.outcome, second.outcome];
+        assert!(outcomes.contains(&RepoActionExecutionOutcome::FreshlyCompleted));
+        assert!(outcomes.contains(&RepoActionExecutionOutcome::Replayed));
+        assert_eq!(first.repo.id, second.repo.id);
+        assert_eq!(repo::list_repos(&db, workspace.id).await.unwrap().len(), 1);
+
+        let message = repo::get_lead_message(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let content: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+        assert_eq!(content["resolved"], "concurrent-local");
+        let execution = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, repo::REPO_ACTION_COMPLETED);
+        assert_eq!(execution.repo_id, first.repo.id);
+        assert_eq!(execution.feedback_state, repo::REPO_ACTION_FEEDBACK_PENDING);
+
+        let deliveries = std::sync::Arc::new(AtomicUsize::new(0));
+        let first_deliveries = deliveries.clone();
+        let second_deliveries = deliveries.clone();
+        let execution_id = execution.id;
+        let expected_thread_id = thread.id;
+        let first_drain = drain_repo_action_feedback_with(
+            &db,
+            execution_id,
+            move |delivered_thread_id, payload| async move {
+                assert_eq!(delivered_thread_id, expected_thread_id);
+                assert_eq!(payload["execution_id"], execution_id);
+                first_deliveries.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+        );
+        let second_drain = drain_repo_action_feedback_with(
+            &db,
+            execution_id,
+            move |_, _| async move {
+                second_deliveries.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+        );
+        let (first_done, second_done) = tokio::join!(first_drain, second_drain);
+        assert!(first_done.unwrap() || second_done.unwrap());
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repo::get_repo_action_execution(&db, card.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .feedback_state,
+            repo::REPO_ACTION_FEEDBACK_DELIVERED
+        );
+    }
+
+    #[tokio::test]
+    async fn claimed_repo_action_owner_completes_after_newer_assistant_activity() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let local = init_main_repo(root.path(), "barrier-local");
+        let (workspace, thread, card) = repo_action_card(&db, "barrier-add", "add").await;
+        let local_text = local.to_string_lossy().into_owned();
+        let target = normalized_existing_repo_target(&local_text).unwrap();
+        let target_text = target.to_string_lossy().into_owned();
+        let fingerprint = repo_action_fingerprint(&["add", &target_text, "barrier-local"]);
+        let mut admission = admit_repo_action(
+            &db,
+            workspace.id,
+            Some(thread.id),
+            Some(card.id),
+            Some("barrier-add"),
+            Some("add"),
+            "add",
+            &fingerprint,
+            &target,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(admission.execution.status, repo::REPO_ACTION_PENDING);
+
+        // The claim is the write-first actionability linearization point. A
+        // newer assistant row after it must not revoke this owner completion;
+        // otherwise the already-authorized mutation could strand its repo.
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            2,
+            "assistant",
+            "text",
+            "A newer turn arrived after the action claim",
+            "complete",
+        )
+        .await
+        .unwrap();
+        admission.execution = repo::mark_repo_action_materialized(
+            &db,
+            admission.execution.id,
+            &admission.execution.execution_token,
+        )
+        .await
+        .unwrap();
+        let repo_ref = register_repo_without_schedule(
+            &db,
+            workspace.id,
+            "barrier-local",
+            &target_text,
+            Some(&admission._os_lock),
+        )
+        .await
+        .unwrap();
+        complete_admitted_repo_action(&db, &mut admission, &repo_ref)
+        .await
+        .unwrap();
+        cleanup_completed_action_target(&admission, &repo_ref).unwrap();
+        drop(admission);
+
+        assert_eq!(repo::list_repos(&db, workspace.id).await.unwrap().len(), 1);
+        let message = repo::get_lead_message(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let content: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+        assert_eq!(content["resolved"], "barrier-local");
+        let execution = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, repo::REPO_ACTION_COMPLETED);
+        assert_eq!(execution.feedback_state, repo::REPO_ACTION_FEEDBACK_PENDING);
+
+        let deliveries = std::sync::Arc::new(AtomicUsize::new(0));
+        let first_deliveries = deliveries.clone();
+        let second_deliveries = deliveries.clone();
+        let first = drain_repo_action_feedback_with(
+            &db,
+            execution.id,
+            move |_, payload| async move {
+                assert_eq!(payload["execution_id"], execution.id);
+                first_deliveries.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+        );
+        let second = drain_repo_action_feedback_with(
+            &db,
+            execution.id,
+            move |_, _| async move {
+                second_deliveries.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+        );
+        let (first, second) = tokio::join!(first, second);
+        assert!(first.unwrap() || second.unwrap());
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repo::get_repo_action_execution(&db, card.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .feedback_state,
+            repo::REPO_ACTION_FEEDBACK_DELIVERED
+        );
+    }
+
     #[test]
     fn repo_action_os_lock_allows_only_one_execution_holder() {
         let token = new_repo_action_token();
@@ -6757,6 +7080,222 @@ mod tests {
             crate::bus::state::HumanAskEvent::Answered { ask_id, .. }
                 if ask_id == u64::try_from(request.id).unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_thread_delete_preserves_durable_state_and_retry_commits_once() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "retry delete").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "retry me", "feature", "codex")
+            .await
+            .unwrap();
+        let open_request = repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "Open question",
+        )
+        .await
+        .unwrap();
+        let answered_request = repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            2,
+            0,
+            0,
+            "Answered question",
+        )
+        .await
+        .unwrap();
+        let answered_request = repo::answer_human_request(
+            &db,
+            workspace.id,
+            answered_request.id,
+            answered_request.revision,
+            "keep this answer",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let open_route = repo::HumanRequestImRoute {
+            channel: "feishu".to_string(),
+            account: "cli_test".to_string(),
+            owner: "ou_owner".to_string(),
+            message_id: "om_retry_open".to_string(),
+            terminal_revision: 0,
+        };
+        let answered_route = repo::HumanRequestImRoute {
+            channel: "feishu".to_string(),
+            account: "cli_test".to_string(),
+            owner: "ou_owner".to_string(),
+            message_id: "om_retry_answered".to_string(),
+            terminal_revision: 0,
+        };
+        repo::record_human_request_im_route(&db, open_request.id, &open_route)
+            .await
+            .unwrap();
+        repo::record_human_request_im_route(&db, answered_request.id, &answered_route)
+            .await
+            .unwrap();
+
+        let bus = crate::bus::BusRegistry::new();
+        let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(bus.set_ask_notifier(events).is_empty());
+        assert!(bus.restore_human_request(
+            thread.id,
+            "lead",
+            &open_request.question,
+            u64::try_from(open_request.id).unwrap(),
+        ));
+        assert!(bus.restore_durable_answer(
+            thread.id,
+            u64::try_from(answered_request.id).unwrap(),
+            "lead",
+            &answered_request.answer,
+        ));
+        bus.post(thread.id, "system", "lead", "ordinary bus history", "message");
+        let baseline_log = bus.log(thread.id);
+        let baseline_inbox = bus.inbox(thread.id, "lead");
+        assert!(baseline_inbox.iter().any(|message| {
+            message.request_id == Some(u64::try_from(answered_request.id).unwrap())
+        }));
+        assert!(baseline_inbox.iter().any(|message| message.request_id.is_none()));
+        bus.restore_inbox(thread.id, "lead", baseline_inbox.clone());
+
+        let open_before = repo::get_human_request(&db, open_request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let answered_before = repo::get_human_request(&db, answered_request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(open_before.status, repo::HUMAN_REQUEST_OPEN);
+        assert_eq!(answered_before.status, repo::HUMAN_REQUEST_ANSWERED);
+
+        db.0.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            format!(
+                "CREATE TRIGGER fail_retry_thread_delete BEFORE DELETE ON thread \
+                     WHEN OLD.id = {} BEGIN SELECT RAISE(ABORT, 'forced retry delete failure'); END",
+                thread.id
+            ),
+        ))
+        .await
+        .unwrap();
+        let failed = delete_thread_cascade_after_bus_fence(
+            &db,
+            &bus,
+            &crate::ask::AskRegistry::new(),
+            thread.id,
+            Vec::new(),
+        )
+        .await;
+        assert!(failed
+            .unwrap_err()
+            .contains("forced retry delete failure"));
+
+        let open_after_failure = repo::get_human_request(&db, open_request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let answered_after_failure = repo::get_human_request(&db, answered_request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(open_after_failure, open_before);
+        assert_eq!(answered_after_failure, answered_before);
+        assert!(repo::get_human_card_terminal_outbox_for_route(&db, &open_route)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo::get_human_card_terminal_outbox_for_route(&db, &answered_route)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            bus.open_asks(thread.id)
+                .into_iter()
+                .map(|ask| ask.id)
+                .collect::<Vec<_>>(),
+            vec![u64::try_from(open_request.id).unwrap()]
+        );
+        let inbox_after_failure = bus.inbox(thread.id, "lead");
+        assert_eq!(inbox_after_failure, baseline_inbox);
+        bus.restore_inbox(thread.id, "lead", inbox_after_failure);
+        assert_eq!(bus.log(thread.id), baseline_log);
+        assert!(event_rx.try_recv().is_err());
+
+        db.0.execute_unprepared("DROP TRIGGER fail_retry_thread_delete")
+            .await
+            .unwrap();
+        delete_thread_cascade_after_bus_fence(
+            &db,
+            &bus,
+            &crate::ask::AskRegistry::new(),
+            thread.id,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(repo::get_thread(&db, thread.id).await.unwrap().is_none());
+        assert!(bus.open_asks(thread.id).is_empty());
+        assert!(bus.inbox(thread.id, "lead").is_empty());
+        assert!(bus.log(thread.id).is_empty());
+
+        let mut cancelled_ids = Vec::new();
+        while let Ok(crate::bus::state::HumanAskEvent::Cancelled { ask_id, .. }) =
+            event_rx.try_recv()
+        {
+            cancelled_ids.push(ask_id);
+        }
+        cancelled_ids.sort_unstable();
+        assert_eq!(
+            cancelled_ids,
+            vec![
+                u64::try_from(open_request.id).unwrap(),
+                u64::try_from(answered_request.id).unwrap(),
+            ]
+        );
+        let open_outbox = repo::get_human_card_terminal_outbox_for_route(&db, &open_route)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(open_outbox.terminal_status, repo::HUMAN_REQUEST_CANCELLED);
+        assert_eq!(open_outbox.terminal_revision, open_before.revision + 1);
+        assert!(!open_outbox.delivered);
+        let answered_outbox =
+            repo::get_human_card_terminal_outbox_for_route(&db, &answered_route)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            answered_outbox.terminal_revision,
+            answered_before.revision + 1
+        );
+        assert!(!answered_outbox.delivered);
+
+        let retry_error = delete_thread_cascade_after_bus_fence(
+            &db,
+            &bus,
+            &crate::ask::AskRegistry::new(),
+            thread.id,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(retry_error.contains("thread") && retry_error.contains("not found"));
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]

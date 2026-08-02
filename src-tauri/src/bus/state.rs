@@ -111,7 +111,14 @@ struct ThreadBus {
 }
 
 impl ThreadBus {
-    fn unavailable(&self) -> bool {
+    /// Reads remain visible while a deletion transaction is in flight. The
+    /// reversible `closing` fence only blocks new process-local writes; the
+    /// irreversible `closed` tombstone hides all state after commit.
+    fn read_unavailable(&self) -> bool {
+        self.closed
+    }
+
+    fn write_unavailable(&self) -> bool {
         self.closed || self.closing
     }
 }
@@ -193,7 +200,7 @@ impl BusRegistry {
         let mut snapshot = inner
             .iter()
             .flat_map(|(thread, bus)| {
-                if bus.unavailable() {
+                if bus.read_unavailable() {
                     return Vec::new().into_iter();
                 }
                 bus.asks
@@ -254,7 +261,7 @@ impl BusRegistry {
     pub fn join(&self, thread: i32, dir: &str) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
-        if bus.unavailable() {
+        if bus.write_unavailable() {
             return;
         }
         bus.members.insert(dir.to_string());
@@ -289,7 +296,7 @@ impl BusRegistry {
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
-            if bus.unavailable() {
+            if bus.write_unavailable() {
                 return false;
             }
             bus.log.push(m.clone());
@@ -326,7 +333,7 @@ impl BusRegistry {
         let targets: Vec<String> = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
-            if bus.unavailable() {
+            if bus.write_unavailable() {
                 return;
             }
             let mut targets: Vec<String> = bus
@@ -358,7 +365,7 @@ impl BusRegistry {
     pub fn inbox(&self, thread: i32, me: &str) -> Vec<Msg> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
-        if bus.unavailable() {
+        if bus.read_unavailable() {
             return Vec::new();
         }
         bus.inboxes.remove(me).unwrap_or_default()
@@ -373,7 +380,7 @@ impl BusRegistry {
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
-        if bus.unavailable() {
+        if bus.write_unavailable() {
             return;
         }
         let existing = bus.inboxes.remove(me).unwrap_or_default();
@@ -389,7 +396,7 @@ impl BusRegistry {
             let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.iter()
                 .flat_map(|(thread, bus)| {
-                    if bus.unavailable() {
+                    if bus.read_unavailable() {
                         return Vec::new().into_iter();
                     }
                     bus.inboxes
@@ -410,7 +417,7 @@ impl BusRegistry {
     pub fn state_get(&self, thread: i32) -> serde_json::Value {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
-        if bus.unavailable() {
+        if bus.read_unavailable() {
             return serde_json::json!({});
         }
         if bus.state.is_object() {
@@ -424,7 +431,7 @@ impl BusRegistry {
     pub fn state_set(&self, thread: i32, patch: serde_json::Value) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
-        if bus.unavailable() {
+        if bus.write_unavailable() {
             return;
         }
         if !bus.state.is_object() {
@@ -441,7 +448,7 @@ impl BusRegistry {
     pub fn log(&self, thread: i32) -> Vec<Msg> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
-        if bus.unavailable() {
+        if bus.read_unavailable() {
             return Vec::new();
         }
         bus.log.clone()
@@ -495,7 +502,7 @@ impl BusRegistry {
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
-            if bus.unavailable() {
+            if bus.write_unavailable() {
                 return id;
             }
             bus.asks.push(ask.clone());
@@ -519,7 +526,7 @@ impl BusRegistry {
         self.next_ask_id.fetch_max(id, Ordering::Relaxed);
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
-        if bus.unavailable() {
+        if bus.write_unavailable() {
             return false;
         }
         if bus.asks.iter().any(|ask| ask.id == id) {
@@ -550,7 +557,7 @@ impl BusRegistry {
         self.next_ask_id.fetch_max(request_id, Ordering::Relaxed);
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
-        if bus.unavailable() {
+        if bus.write_unavailable() {
             return false;
         }
         if bus
@@ -578,7 +585,7 @@ impl BusRegistry {
     pub fn open_asks(&self, thread: i32) -> Vec<Ask> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
-        if bus.unavailable() {
+        if bus.read_unavailable() {
             return Vec::new();
         }
         bus.asks
@@ -595,7 +602,7 @@ impl BusRegistry {
         let target = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
-            if bus.unavailable() {
+            if bus.write_unavailable() {
                 return false;
             }
             let hit = match bus
@@ -693,7 +700,7 @@ impl BusRegistry {
         let ids: HashSet<u64> = request_ids.iter().copied().collect();
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
-        if bus.unavailable() {
+        if bus.write_unavailable() {
             return 0;
         }
         let before: usize = bus.inboxes.values().map(Vec::len).sum();
@@ -718,7 +725,8 @@ impl BusRegistry {
     /// Install a reversible admission fence before deletion starts while
     /// retaining the complete bus for rollback. Returns whether a live bus
     /// existed plus ask ids whose cancellation event must wait for the durable
-    /// DB transition. Late answer/post/restore work sees `closing` and no-ops.
+    /// DB transition. Late answer/post/restore writes see `closing` and no-op;
+    /// readers continue to observe the retained state until commit.
     pub fn begin_thread_close(&self, thread: i32) -> (bool, Vec<u64>) {
         let mut g = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let bus = g.entry(thread).or_default();
@@ -868,7 +876,7 @@ impl BusRegistry {
         let cancelled = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
-            if bus.unavailable() {
+            if bus.write_unavailable() {
                 Vec::new()
             } else {
                 let mut cancelled = Vec::new();
@@ -1186,7 +1194,19 @@ mod tests {
         let (existed, cancelled) = r.begin_thread_close(7);
         assert!(existed);
         assert_eq!(cancelled, vec![44]);
-        assert!(r.inbox(7, "10").is_empty(), "closing blocks reads before commit");
+        let retained_inbox = {
+            let g = r.inner.lock().unwrap_or_else(|error| error.into_inner());
+            g.get(&7)
+                .and_then(|bus| bus.inboxes.get("10"))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(retained_inbox.len(), 1, "closing keeps reads visible before commit");
+        assert_eq!(retained_inbox[0].request_id, Some(42));
+        assert_eq!(r.open_asks(7).iter().map(|ask| ask.id).collect::<Vec<_>>(), vec![44]);
+        assert!(!r.log(7).is_empty(), "closing keeps the live log visible before commit");
+        r.post(7, "10", "lead", "late write", "message");
+        assert!(!r.answer_ask(7, 44, "late answer"), "closing blocks writes before commit");
         assert!(rx.try_recv().is_err(), "purge alone does not outrun DB cancellation");
         r.apply_thread_human_cancellation(7);
         r.notify_cancelled_asks(7, &cancelled);
