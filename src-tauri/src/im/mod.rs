@@ -400,6 +400,40 @@ impl ImSettings {
         }
     }
 
+    /// Fail closed unless `sender_open_id` is still authorized for the active
+    /// provider. Concierge turns can outlive a provider switch or an owner
+    /// reset, so provider identity alone is not a sufficient mutation fence.
+    pub async fn require_active_owner(
+        db: &crate::store::Db,
+        provider: ImProvider,
+        sender_open_id: &str,
+    ) -> anyhow::Result<()> {
+        let active_provider = Self::active_provider(db).await?;
+        if provider != active_provider {
+            anyhow::bail!(
+                "stale IM context: active provider is {}, not {}",
+                active_provider.as_str(),
+                provider.as_str()
+            );
+        }
+        let sender_open_id = sender_open_id.trim();
+        if sender_open_id.is_empty() {
+            anyhow::bail!("current IM sender context is required");
+        }
+        let allow = Self::parse_allow(
+            &crate::store::repo::get_setting(db, provider.allow_key())
+                .await?
+                .unwrap_or_default(),
+        );
+        if !allow.iter().any(|allowed| allowed == sender_open_id) {
+            anyhow::bail!(
+                "stale IM context: sender is no longer authorized for the active {} owner binding",
+                provider.as_str()
+            );
+        }
+        Ok(())
+    }
+
     /// 从 app_setting 读取设置。「键不存在」是默认值；DB 错误原样传播。
     /// Err 必须 fail-closed：桥侧把 Err 当连接错误处理，绝不当作未配置/空白名单
     /// （否则瞬时 DB 错误会清空白名单，导致首个私聊发送者被自动绑定）。
@@ -860,7 +894,16 @@ pub async fn execute_for_provider(
             chat_id,
             reply_to,
         } => {
-            ensure_issue_topic(db, channel, thread_id, &chat_id, Some(&reply_to), lang).await?;
+            ensure_issue_topic(
+                db,
+                channel,
+                thread_id,
+                &chat_id,
+                sender,
+                Some(&reply_to),
+                lang,
+            )
+            .await?;
         }
         inbound::Route::AnswerPerm { ask_id, answer } => {
             if !asks.answer(ask_id, answer) {
@@ -2051,12 +2094,11 @@ pub async fn ensure_issue_topic(
     ch: &dyn Channel,
     thread_id: i32,
     chat_id: &str,
+    sender_open_id: &str,
     reply_to: Option<&str>,
     lang: &str,
 ) -> anyhow::Result<()> {
-    if ImSettings::active_provider(db).await? != ImProvider::Feishu {
-        anyhow::bail!("Feishu is not the active IM provider");
-    }
+    ImSettings::require_active_owner(db, ImProvider::Feishu, sender_open_id).await?;
     let Some(thread) = crate::store::repo::get_thread(db, thread_id).await? else {
         if let Some(reply_to) = reply_to {
             if let Err(e) = ch
@@ -2120,12 +2162,10 @@ pub async fn ensure_issue_topic(
     let topic_id = ch
         .create_chat_topic(chat_id, &seed_message_id, &lead_intro)
         .await?;
-    // Topic creation is an external await. If the user switched providers while
-    // it was in flight, leave the previous route intact instead of binding this
-    // now-inactive Feishu result over the active provider.
-    if ImSettings::active_provider(db).await? != ImProvider::Feishu {
-        anyhow::bail!("active IM provider changed before Feishu topic binding");
-    }
+    // Topic creation is an external await. If the user switched providers or
+    // reset/replaced the owner while it was in flight, leave the previous route
+    // intact instead of binding this retired turn's result.
+    ImSettings::require_active_owner(db, ImProvider::Feishu, sender_open_id).await?;
     crate::store::repo::bind_im_route(db, thread.id, "feishu", chat_id, &topic_id).await?;
     // Persist a replyable seed message id (an `om_*` member of the topic) for the
     // no-ack / no-origin_tag fallback (Finding C).
@@ -3294,6 +3334,9 @@ mod tests {
     #[tokio::test]
     async fn ensure_issue_topic_binds_feishu_thread_id_not_plain_message_id() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "owner")
+            .await
+            .unwrap();
         let ws = crate::store::repo::create_workspace(&db, "ws")
             .await
             .unwrap();
@@ -3302,7 +3345,15 @@ mod tests {
             .unwrap();
         let ch = TopicChannel::default();
 
-        ensure_issue_topic(&db, &ch, issue.id, "oc_chat", Some("om_request"), "zh")
+        ensure_issue_topic(
+            &db,
+            &ch,
+            issue.id,
+            "oc_chat",
+            "owner",
+            Some("om_request"),
+            "zh",
+        )
             .await
             .unwrap();
 
@@ -3323,6 +3374,9 @@ mod tests {
     #[tokio::test]
     async fn ensure_issue_topic_replaces_an_inactive_dingtalk_route() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "owner")
+            .await
+            .unwrap();
         let ws = crate::store::repo::create_workspace(&db, "ws")
             .await
             .unwrap();
@@ -3334,7 +3388,15 @@ mod tests {
             .unwrap();
         let ch = TopicChannel::default();
 
-        ensure_issue_topic(&db, &ch, issue.id, "oc_current", Some("om_request"), "zh")
+        ensure_issue_topic(
+            &db,
+            &ch,
+            issue.id,
+            "oc_current",
+            "owner",
+            Some("om_request"),
+            "zh",
+        )
             .await
             .unwrap();
 
@@ -3392,6 +3454,9 @@ mod tests {
     #[tokio::test]
     async fn provider_switch_during_topic_creation_preserves_the_active_route() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "owner")
+            .await
+            .unwrap();
         let ws = crate::store::repo::create_workspace(&db, "ws")
             .await
             .unwrap();
@@ -3408,15 +3473,14 @@ mod tests {
             &ch,
             issue.id,
             "oc_stale",
+            "owner",
             Some("om_request"),
             "zh",
         )
         .await
         .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("active IM provider changed"));
+        assert!(error.to_string().contains("stale IM context"));
         let route = crate::store::repo::im_route_of_thread(&db, issue.id)
             .await
             .unwrap()

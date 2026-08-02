@@ -639,13 +639,16 @@ async fn consume_lead_out_unbound_thread_is_noop() {
 #[tokio::test]
 async fn ensure_issue_topic_creates_feishu_root_and_binds_issue() {
     let db = mem_db().await;
+    repo::set_setting(&db, im::K_ALLOW, "owner")
+        .await
+        .unwrap();
     let ch = FakeChannel::default();
     let ws = repo::create_workspace(&db, "ws").await.unwrap();
     let t = repo::create_thread(&db, ws.id, "issue-topic", "feature", "claude")
         .await
         .unwrap();
 
-    im::ensure_issue_topic(&db, &ch, t.id, "oc_g", Some("om_cmd"), "zh")
+    im::ensure_issue_topic(&db, &ch, t.id, "oc_g", "owner", Some("om_cmd"), "zh")
         .await
         .unwrap();
 
