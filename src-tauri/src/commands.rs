@@ -2632,6 +2632,8 @@ async fn apply_im_credentials(
     enable: bool,
     owner_id: Option<&str>,
 ) -> anyhow::Result<()> {
+    let bridge = app.state::<crate::im::ImBridge>();
+    let _authority = bridge.authority_write_lease().await;
     persist_im_credentials(
         db,
         provider,
@@ -2676,6 +2678,21 @@ async fn persist_im_enabled(
     repo::set_setting(db, provider.enabled_key(), if enabled { "1" } else { "0" }).await
 }
 
+async fn reset_im_owner(
+    app: &tauri::AppHandle,
+    db: &Db,
+    provider: crate::im::ImProvider,
+) -> anyhow::Result<()> {
+    let bridge = app.state::<crate::im::ImBridge>();
+    let _authority = bridge.authority_write_lease().await;
+    let active_provider = crate::im::ImSettings::active_provider(db).await?;
+    crate::im::reset_owner(db, provider).await?;
+    if active_provider == provider {
+        crate::im::spawn(app.clone());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn im_set_provider(
     app: tauri::AppHandle,
@@ -2683,10 +2700,12 @@ pub async fn im_set_provider(
     provider: String,
 ) -> R<()> {
     let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    let bridge = app.state::<crate::im::ImBridge>();
+    let _authority = bridge.authority_write_lease().await;
     repo::set_setting(&db, crate::im::K_PROVIDER, provider.as_str())
         .await
         .map_err(e)?;
-    crate::im::spawn(app);
+    crate::im::spawn(app.clone());
     Ok(())
 }
 
@@ -2747,20 +2766,16 @@ pub async fn im_reset_owner(
     provider: String,
 ) -> R<()> {
     let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
-    let active_provider = crate::im::ImSettings::active_provider(&db)
-        .await
-        .map_err(e)?;
-    let reset = crate::im::reset_owner(&db, provider);
+    // Feishu keeps the registration apply gate outermost, matching manual and
+    // scan credential paths. The authority gate is acquired inside `reset` so
+    // concurrent registration callbacks cannot deadlock on inverted lock order.
+    let reset = reset_im_owner(&app, &db, provider);
     if provider == crate::im::ImProvider::Feishu {
         registration.supersede_with(reset).await
     } else {
         reset.await
     }
-    .map_err(e)?;
-    if active_provider == provider {
-        crate::im::spawn(app);
-    }
-    Ok(())
+    .map_err(e)
 }
 
 /// 远程待命：桥启用期间持有「防空闲休眠」断言，保证飞书指令随时可达。
@@ -2788,6 +2803,13 @@ pub fn im_status(bridge: State<'_, crate::im::ImBridge>) -> R<String> {
     Ok(bridge.status())
 }
 
+fn dingtalk_copy_should_start_bridge(
+    update: crate::im::DingTalkCopyUpdate,
+    bridge_status: &str,
+) -> bool {
+    update == crate::im::DingTalkCopyUpdate::Initialized || bridge_status == "waiting_locale"
+}
+
 /// Synchronize DingTalk's fixed user-facing copy from the frontend i18n
 /// catalogs. Active channels share this memory-only bundle, so locale changes
 /// update rendering in place without retiring output subscribers. The first
@@ -2800,11 +2822,9 @@ pub async fn im_set_dingtalk_copy(
     copy: crate::im::outbound::DingTalkCopy,
 ) -> R<()> {
     copy.validate().map_err(e)?;
-    match bridge.set_dingtalk_copy(copy) {
-        crate::im::DingTalkCopyUpdate::Unchanged | crate::im::DingTalkCopyUpdate::Updated => {
-            return Ok(())
-        }
-        crate::im::DingTalkCopyUpdate::Initialized => {}
+    let update = bridge.set_dingtalk_copy(copy);
+    if !dingtalk_copy_should_start_bridge(update, &bridge.status()) {
+        return Ok(());
     }
     let settings = crate::im::ImSettings::load(&db).await.map_err(e)?;
     if settings.provider == crate::im::ImProvider::DingTalk {
@@ -2846,6 +2866,8 @@ pub async fn feishu_scan_begin(
                 registration
                     .apply_if_live(generation, async move {
                         let db = app.state::<Db>().inner().clone();
+                        let bridge = app.state::<crate::im::ImBridge>();
+                        let _authority = bridge.authority_write_lease().await;
                         persist_feishu_scan_credentials(
                             &db,
                             &client_id,
@@ -2855,7 +2877,7 @@ pub async fn feishu_scan_begin(
                         .await?;
                         let selected = crate::im::ImSettings::active_provider(&db).await?;
                         if selected == crate::im::ImProvider::Feishu {
-                            crate::im::spawn(app);
+                            crate::im::spawn(app.clone());
                         }
                         Ok(())
                     })
@@ -3022,6 +3044,22 @@ pub async fn db_change_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_dingtalk_bridge_retries_after_copy_was_already_initialized() {
+        assert!(dingtalk_copy_should_start_bridge(
+            crate::im::DingTalkCopyUpdate::Unchanged,
+            "waiting_locale"
+        ));
+        assert!(dingtalk_copy_should_start_bridge(
+            crate::im::DingTalkCopyUpdate::Updated,
+            "waiting_locale"
+        ));
+        assert!(!dingtalk_copy_should_start_bridge(
+            crate::im::DingTalkCopyUpdate::Updated,
+            "online"
+        ));
+    }
 
     #[tokio::test]
     async fn toggling_named_im_provider_does_not_select_it() {

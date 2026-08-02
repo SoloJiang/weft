@@ -21,6 +21,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
+use tauri::Manager;
 
 fn text_result(s: String) -> Value {
     json!({ "content": [{ "type": "text", "text": s }] })
@@ -393,17 +394,22 @@ async fn message_lead_origin(
 }
 
 async fn message_lead(db: &Db, thread_id: i32, text: &str, args: &Value) -> anyhow::Result<()> {
+    let app = crate::APP_HANDLE
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("app handle not initialized"))?;
+    // Hold the bridge's authority read lease through the ACTUAL engine enqueue.
+    // Provider/owner replacement paths take the matching write lease through
+    // their DB mutation and generation bump, so retirement either waits for
+    // this enqueue or wins first and makes the validation below fail closed.
+    let bridge = app.state::<crate::im::ImBridge>();
+    let _authority = bridge.authority_read_lease().await;
     // Resolve the delivery target before starting the engine. DingTalk issue
     // output cannot fall back to a stable topic message, so a no-origin turn
     // would run successfully while silently discarding its response.
     message_lead_origin(db, thread_id, args).await?;
-    let app = crate::APP_HANDLE
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("app handle not initialized"))?;
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, im_lang(args)).await?;
-    // Engine lookup can await process setup. Revalidate at the final enqueue
-    // boundary so a provider switch during that await cannot leak an old turn
-    // into the newly active bridge.
+    // Revalidate after engine lookup while the authority lease remains held;
+    // `engine::send` cannot now straddle a reset/switch.
     let origin = message_lead_origin(db, thread_id, args).await?;
     crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new(), origin).await
 }

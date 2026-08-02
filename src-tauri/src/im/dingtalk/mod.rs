@@ -149,9 +149,6 @@ impl DingTalkChannel {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = message.robot_code.trim().to_string();
         }
-        if message.session_webhook.trim().is_empty() {
-            return;
-        }
         let sender_user_id = message.sender_user_id();
         if sender_user_id.is_empty() {
             return;
@@ -500,7 +497,12 @@ impl super::Channel for DingTalkChannel {
             .get(reply_to)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("dingtalk reply context is unavailable"))?;
-        if session_webhook_is_fresh(context.expires_at_ms) {
+        // Some valid DM / ordinary-group callbacks omit sessionWebhook. Keep
+        // their sender/chat context and go straight to the documented
+        // proactive fallback instead of losing the Concierge response.
+        if !context.session_webhook.trim().is_empty()
+            && session_webhook_is_fresh(context.expires_at_ms)
+        {
             match self.post_session_reply(reply_to, &context, text).await {
                 Ok(message_id) => return Ok(message_id),
                 Err(e) => eprintln!("[weft][im] dingtalk session reply fallback: {e}"),
@@ -844,6 +846,43 @@ mod tests {
         assert_eq!(context.chat_id, "cid_parent");
         assert_eq!(context.thread_id.as_deref(), Some("convThreadEncrypted"));
         assert!(reply_fallback_target(context).is_err());
+    }
+
+    #[test]
+    fn webhookless_dm_and_ordinary_group_keep_proactive_fallback_contexts() {
+        let channel = DingTalkChannel::new("ding_app", "secret", copy()).unwrap();
+        let mut message = ws::RobotMessage {
+            conversation_id: "cid_private".into(),
+            open_conversation_id: "cid_private".into(),
+            conversation_type: "1".into(),
+            msg_id: "msg_dm".into(),
+            sender_staff_id: "staff_1".into(),
+            session_webhook: String::new(),
+            robot_code: "ding_bot".into(),
+            msgtype: "text".into(),
+            ..Default::default()
+        };
+        channel.remember_inbound(&message);
+
+        message.conversation_id = "cid_group".into();
+        message.open_conversation_id = "cid_group".into();
+        message.conversation_type = "2".into();
+        message.msg_id = "msg_group".into();
+        channel.remember_inbound(&message);
+
+        let contexts = channel
+            .inner
+            .reply_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            reply_fallback_target(contexts.get("msg_dm").unwrap()).unwrap(),
+            ReplyFallbackTarget::Private("staff_1")
+        );
+        assert_eq!(
+            reply_fallback_target(contexts.get("msg_group").unwrap()).unwrap(),
+            ReplyFallbackTarget::Group("cid_group")
+        );
     }
 
     #[test]

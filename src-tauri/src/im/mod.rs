@@ -786,6 +786,14 @@ pub async fn execute_for_provider(
             reply_to,
             text,
         } => {
+            // Owner establishment is the inverse of reset/replacement, so it
+            // participates in the same authority linearization gate. Release
+            // it immediately after persistence; the first Concierge enqueue
+            // below then uses the ordinary read-lease send path.
+            let authority = match app {
+                Some(app) => Some(app.state::<ImBridge>().authority_write_lease().await),
+                None => None,
+            };
             // Route 读的是 allow 快照；落库前重查仍为空（Route::Bind doc 的竞态契约）。
             let cur = crate::store::repo::get_setting(db, provider.allow_key())
                 .await?
@@ -794,6 +802,7 @@ pub async fn execute_for_provider(
                 return Ok(()); // 已有 owner：本次绑定静默放弃
             }
             crate::store::repo::set_setting(db, provider.allow_key(), &open_id).await?;
+            drop(authority);
             // Startup snapshots are consumed before an owner may exist and are
             // intentionally skipped in that state. Wake the bridge's single
             // notifier consumer now that delivery has a target; it re-reads the
@@ -841,7 +850,18 @@ pub async fn execute_for_provider(
                     Some(copy) => copy.issue_not_found.as_str(),
                     None => t("没有找到这个 issue。", "No issue with that id was found."),
                 };
-                if let Err(e) = channel.send_text(sender, message).await {
+                let sent = match provider {
+                    ImProvider::Feishu => channel.send_text(sender, message).await,
+                    // Keep a failed `/bind` in the exact topic-circle thread
+                    // where the command was issued. DingTalk's proactive
+                    // private-message endpoint would otherwise move the error
+                    // into the owner's DM and make the command look unanswered.
+                    ImProvider::DingTalk => channel
+                        .reply_text(&seed_message_id, message)
+                        .await
+                        .map(|_| ()),
+                };
+                if let Err(e) = sent {
                     eprintln!("[weft][im] bind-issue missing hint: {e}");
                 }
                 return Ok(());
@@ -1169,6 +1189,12 @@ fn ws_loop_actions(sent_resync: bool) -> Vec<WsLoopAction> {
 #[derive(Default)]
 pub struct ImBridge {
     inner: Arc<std::sync::Mutex<BridgeInner>>,
+    /// Linearizes provider/owner retirement against a Concierge lead enqueue.
+    /// A global-tool send holds a read lease through `engine::send`; settings
+    /// paths that replace the provider or owner hold the write lease through
+    /// persistence + generation bump. Thus an enqueue is wholly before the
+    /// retirement or observes the retired DB state, never halfway across it.
+    authority_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1200,6 +1226,14 @@ struct BridgeInner {
 }
 
 impl ImBridge {
+    pub async fn authority_read_lease(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.authority_gate.clone().read_owned().await
+    }
+
+    pub async fn authority_write_lease(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.authority_gate.clone().write_owned().await
+    }
+
     pub fn status(&self) -> String {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.status.is_empty() {
@@ -2611,6 +2645,7 @@ pub(crate) async fn build_resync_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn parse_allow_trims_and_drops_empties() {
@@ -3277,6 +3312,7 @@ mod tests {
     struct TopicChannel {
         created_topics: std::sync::Mutex<Vec<(String, String)>>,
         replies: std::sync::Mutex<Vec<(String, String)>>,
+        direct_messages: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     #[async_trait::async_trait]
@@ -3297,7 +3333,11 @@ mod tests {
             Ok(())
         }
 
-        async fn send_text(&self, _open_id: &str, _text: &str) -> anyhow::Result<()> {
+        async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()> {
+            self.direct_messages
+                .lock()
+                .unwrap()
+                .push((open_id.to_string(), text.to_string()));
             Ok(())
         }
 
@@ -3329,6 +3369,45 @@ mod tests {
                 .push((reply_to.to_string(), text.to_string()));
             Ok("om_reply".into())
         }
+    }
+
+    #[tokio::test]
+    async fn missing_dingtalk_bind_replies_in_the_originating_thread() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        let bus = crate::bus::BusRegistry::new();
+        let channel = TopicChannel::default();
+        let copy = outbound::DingTalkCopy {
+            issue_not_found: "No issue with that id was found.".into(),
+            ..Default::default()
+        };
+
+        execute_for_provider(
+            inbound::Route::BindIssueThread {
+                thread_id: 404,
+                chat_id: "cid_parent".into(),
+                im_thread_ref: "thread_1".into(),
+                seed_message_id: "msg_bind".into(),
+            },
+            &db,
+            &asks,
+            &bus,
+            &channel,
+            ImProvider::DingTalk,
+            Some(&copy),
+            "owner",
+            "en",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            channel.replies.lock().unwrap().as_slice(),
+            [("msg_bind".into(), "No issue with that id was found.".into())]
+        );
+        assert!(channel.direct_messages.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4234,6 +4313,35 @@ mod tests {
         let (received, ()) = tokio::join!(waiting, switch_provider);
 
         assert_eq!(received.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn authority_retirement_waits_for_an_active_lead_enqueue_lease() {
+        let bridge = Arc::new(ImBridge::default());
+        let enqueue = bridge.authority_read_lease().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (retired_tx, mut retired_rx) = tokio::sync::oneshot::channel();
+        let retiring_bridge = bridge.clone();
+        let retirement = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _retirement = retiring_bridge.authority_write_lease().await;
+            let _ = retired_tx.send(());
+        });
+
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut retired_rx)
+                .await
+                .is_err(),
+            "owner/provider retirement must not cross an active enqueue boundary"
+        );
+
+        drop(enqueue);
+        tokio::time::timeout(Duration::from_secs(1), &mut retired_rx)
+            .await
+            .expect("retirement should proceed after the enqueue lease is released")
+            .unwrap();
+        retirement.await.unwrap();
     }
 
     #[tokio::test]
