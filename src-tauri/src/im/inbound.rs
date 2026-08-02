@@ -160,17 +160,45 @@ fn is_permission_command(text: &str) -> bool {
 }
 
 fn parse_human_answer_command(text: &str) -> Option<(i32, u64, String)> {
-    let mut parts = text.split_whitespace();
-    if parts.next()?.to_ascii_lowercase() != "/answer" {
+    fn next_token<'a>(text: &'a str, cursor: &mut usize) -> Option<&'a str> {
+        let remaining = &text[*cursor..];
+        let start = remaining
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())?
+            .0;
+        let start = *cursor + start;
+        let end = text[start..]
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(offset, _)| start + offset)
+            .unwrap_or(text.len());
+        *cursor = end;
+        Some(&text[start..end])
+    }
+
+    let mut cursor = 0;
+    if next_token(text, &mut cursor)?.to_ascii_lowercase() != "/answer" {
         return None;
     }
-    let thread = parts.next()?.parse::<i32>().ok().filter(|id| *id > 0)?;
-    let ask_id = parts.next()?.parse::<u64>().ok()?;
-    let answer = parts.collect::<Vec<_>>().join(" ");
-    if answer.is_empty() {
+    let thread = next_token(text, &mut cursor)?
+        .parse::<i32>()
+        .ok()
+        .filter(|id| *id > 0)?;
+    let ask_id = next_token(text, &mut cursor)?.parse::<u64>().ok()?;
+    let remainder = &text[cursor..];
+    let separator = remainder.chars().next()?;
+    if !separator.is_whitespace() {
         return None;
     }
-    Some((thread, ask_id, answer))
+    let mut answer_start = cursor + separator.len_utf8();
+    if separator == '\r' && text[answer_start..].starts_with('\n') {
+        answer_start += '\n'.len_utf8();
+    }
+    let answer = &text[answer_start..];
+    if answer.trim().is_empty() {
+        return None;
+    }
+    Some((thread, ask_id, answer.to_string()))
 }
 
 fn is_human_answer_command(text: &str) -> bool {
@@ -493,6 +521,23 @@ mod tests {
                 ImProvider::DingTalk,
             ),
             Route::BadHumanAnswer
+        );
+        assert_eq!(
+            route_for_provider(
+                &text(
+                    "ou_me",
+                    None,
+                    "/answer 7 9\n    let  value = 1;\n\n  keep indent",
+                ),
+                &allow,
+                &cards(),
+                ImProvider::DingTalk,
+            ),
+            Route::AnswerHuman {
+                thread: 7,
+                ask_id: 9,
+                text: "    let  value = 1;\n\n  keep indent".into(),
+            }
         );
     }
 

@@ -2799,8 +2799,7 @@ pub async fn feishu_scan_begin(
         Box::pin(async move {
             let db = app.state::<Db>().inner().clone();
             persist_feishu_scan_credentials(&db, &client_id, &client_secret, &open_id).await?;
-            let selected = repo::get_setting(&db, crate::im::K_PROVIDER).await?;
-            let selected = crate::im::ImProvider::parse(selected.as_deref().unwrap_or_default())?;
+            let selected = crate::im::ImSettings::active_provider(&db).await?;
             if selected == crate::im::ImProvider::Feishu {
                 crate::im::spawn(app);
             }
@@ -3031,6 +3030,24 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_profile_scan_uses_default_feishu_provider() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        persist_feishu_scan_credentials(&db, "cli_feishu", "sec_feishu", "ou_owner")
+            .await
+            .unwrap();
+
+        assert!(repo::get_setting(&db, crate::im::K_PROVIDER)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            crate::im::ImSettings::active_provider(&db).await.unwrap(),
+            crate::im::ImProvider::Feishu
         );
     }
 
