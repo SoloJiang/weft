@@ -646,6 +646,11 @@ pub struct InboundAckJob {
     pub message_id: String,
 }
 
+enum BridgeNotifyEvent {
+    Permission(crate::ask::AskEvent),
+    Human(crate::bus::state::HumanAskEvent),
+}
+
 /// Route execution requires an AppHandle when an issue message has to be fed
 /// into the lead engine (M2-3 / M3 Concierge): the engine wiring (planner MCP,
 /// ask hook, etc.) lives on app state. For tests that don't exercise those
@@ -1061,11 +1066,10 @@ pub struct ImBridge {
 #[derive(Default)]
 struct BridgeInner {
     generation: u64,
-    /// Per-generation cancellation edge for the long-lived websocket future.
-    /// Replacing this sender in `bump` wakes the previous generation even when
-    /// it is blocked inside `run_ws`, so the stale socket is dropped before it
-    /// can ACK a callback that its retired inbound consumer would discard.
-    ws_cancel: Option<tokio::sync::watch::Sender<bool>>,
+    /// Per-generation cancellation edge shared by every task that captures a
+    /// provider/channel. Replacing this sender in `bump` drops in-flight work
+    /// before a retired generation can perform another external side effect.
+    generation_cancel: Option<tokio::sync::watch::Sender<bool>>,
     /// "disabled" | "connecting" | "online" | "error: …"
     status: String,
     cards: Arc<tokio::sync::Mutex<CardIndex>>,
@@ -1089,8 +1093,25 @@ impl ImBridge {
             g.status.clone()
         }
     }
-    fn set_status(&self, s: &str) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).status = s.to_string();
+    fn set_status_if_live(&self, generation: u64, status: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.generation != generation {
+            return false;
+        }
+        inner.status = status.to_string();
+        true
+    }
+    /// Run one synchronous installation step while holding the generation
+    /// guard. A newer `bump` cannot interleave between the liveness check and
+    /// the setter, so a stale startup can never overwrite a newer notifier.
+    fn with_live_generation<T>(&self, generation: u64, install: impl FnOnce() -> T) -> Option<T> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.generation != generation {
+            return None;
+        }
+        let installed = install();
+        drop(inner);
+        Some(installed)
     }
     pub fn set_dingtalk_copy(&self, copy: outbound::DingTalkCopy) -> bool {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1118,7 +1139,7 @@ impl ImBridge {
     ) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        if let Some(previous) = g.ws_cancel.replace(cancel_tx) {
+        if let Some(previous) = g.generation_cancel.replace(cancel_tx) {
             let _ = previous.send(true);
         }
         g.generation += 1;
@@ -1152,10 +1173,10 @@ async fn recv_for_live_generation<T: Clone>(
     Ok(bridge.live(generation).then_some(item))
 }
 
-/// Race a generation-scoped operation against `ImBridge::bump`. Dropping the
-/// losing websocket future closes its transport; the biased cancellation branch
-/// wins when a socket frame and a restart become ready in the same poll.
-async fn run_until_bridge_cancelled<F>(
+/// Race any provider/channel operation against `ImBridge::bump`. Dropping the
+/// losing future cancels its remaining awaits; the biased cancellation branch
+/// wins when retirement and the next side-effect step become ready together.
+async fn run_until_generation_cancelled<F>(
     cancel: &mut tokio::sync::watch::Receiver<bool>,
     operation: F,
 ) -> Option<F::Output>
@@ -1178,33 +1199,40 @@ where
 pub fn spawn(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         let bridge = app.state::<ImBridge>();
-        let (generation, cards, acks, mut ws_cancel) = bridge.bump();
+        let (generation, cards, acks, mut generation_cancel) = bridge.bump();
         let db = app.state::<crate::store::Db>().inner().clone();
 
         let settings = match ImSettings::load(&db).await {
             Ok(s) => s,
             Err(e) => {
                 // fail-closed：DB/连接错误不当作未配置，置 error 并退出本代。
-                bridge.set_status(&format!("error: {e}"));
+                bridge.set_status_if_live(generation, &format!("error: {e}"));
                 eprintln!("[weft][im] load settings: {e}");
                 return;
             }
         };
+        if !bridge.live(generation) {
+            return;
+        }
         // 启动需「已启用 且 凭证齐全」。关开关 = 保留凭证但断开（status 回 disabled，
         // 旧代任务下次 live() 检查时退出）。
         if !(settings.enabled && settings.ready()) {
-            bridge.set_status("disabled");
-            crate::power::set_standby(&app, false);
+            bridge.set_status_if_live(generation, "disabled");
+            let _ = bridge.with_live_generation(generation, || {
+                crate::power::set_standby(&app, false);
+            });
             return;
         }
-        bridge.set_status("connecting");
+        bridge.set_status_if_live(generation, "connecting");
         // 远程待命跟随「已启用且凭证齐全」的意图——断线重连也需要机器醒着，
         // 所以不依赖瞬时连接状态。
-        crate::power::set_standby(&app, settings.remote_standby);
+        let _ = bridge.with_live_generation(generation, || {
+            crate::power::set_standby(&app, settings.remote_standby);
+        });
         let provider = settings.provider;
         let dingtalk_copy = if provider == ImProvider::DingTalk {
             let Some(copy) = bridge.dingtalk_copy() else {
-                bridge.set_status("waiting_locale");
+                bridge.set_status_if_live(generation, "waiting_locale");
                 return;
             };
             Some(copy)
@@ -1220,15 +1248,17 @@ pub fn spawn(app: tauri::AppHandle) {
                     Ok(channel) => (Arc::new(channel), None),
                     Err(e) => {
                         eprintln!("[weft][im] feishu client build: {e}");
-                        bridge.set_status("error");
-                        crate::power::set_standby(&app, false);
+                        bridge.set_status_if_live(generation, "error");
+                        let _ = bridge.with_live_generation(generation, || {
+                            crate::power::set_standby(&app, false);
+                        });
                         return;
                     }
                 }
             }
             ImProvider::DingTalk => {
                 let Some(copy) = dingtalk_copy.clone() else {
-                    bridge.set_status("waiting_locale");
+                    bridge.set_status_if_live(generation, "waiting_locale");
                     return;
                 };
                 match dingtalk::DingTalkChannel::new(&settings.app_id, &settings.app_secret, copy) {
@@ -1238,8 +1268,10 @@ pub fn spawn(app: tauri::AppHandle) {
                     }
                     Err(e) => {
                         eprintln!("[weft][im] dingtalk client build: {e}");
-                        bridge.set_status("error");
-                        crate::power::set_standby(&app, false);
+                        bridge.set_status_if_live(generation, "error");
+                        let _ = bridge.with_live_generation(generation, || {
+                            crate::power::set_standby(&app, false);
+                        });
                         return;
                     }
                 }
@@ -1251,27 +1283,38 @@ pub fn spawn(app: tauri::AppHandle) {
         let (reaction_tx, mut reaction_rx) =
             tokio::sync::mpsc::unbounded_channel::<InboundAckJob>();
         {
-            let (app_ack, ch_ack, acks_ack) = (app.clone(), channel.clone(), acks.clone());
+            let (ch_ack, acks_ack) = (channel.clone(), acks.clone());
+            let mut reaction_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
-                let bridge = app_ack.state::<ImBridge>();
-                while let Some(job) = reaction_rx.recv().await {
-                    if !bridge.live(generation) {
+                loop {
+                    let received =
+                        run_until_generation_cancelled(&mut reaction_cancel, reaction_rx.recv())
+                            .await;
+                    let Some(Some(job)) = received else {
                         return;
-                    }
-                    match ch_ack
-                        .add_reaction(&job.message_id, INBOUND_ACK_EMOJI)
-                        .await
-                    {
-                        Ok(rid) if !rid.is_empty() => {
-                            acks_ack
-                                .lock()
-                                .await
-                                .entry(job.thread_id)
-                                .or_default()
-                                .push((job.message_id, rid));
+                    };
+                    let operation = async {
+                        match ch_ack
+                            .add_reaction(&job.message_id, INBOUND_ACK_EMOJI)
+                            .await
+                        {
+                            Ok(rid) if !rid.is_empty() => {
+                                acks_ack
+                                    .lock()
+                                    .await
+                                    .entry(job.thread_id)
+                                    .or_default()
+                                    .push((job.message_id, rid));
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[weft][im] add reaction: {e}"),
                         }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("[weft][im] add reaction: {e}"),
+                    };
+                    if run_until_generation_cancelled(&mut reaction_cancel, operation)
+                        .await
+                        .is_none()
+                    {
+                        return;
                     }
                 }
             });
@@ -1280,57 +1323,80 @@ pub fn spawn(app: tauri::AppHandle) {
         // —— 出站：registry 通知 → 发卡/patch ——
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel();
         let (hum_tx, mut hum_rx) = tokio::sync::mpsc::unbounded_channel();
-        // set_notifier 返回挂接瞬间已 open 的快照：桥重启时补发卡片（无 miss/dup）。
-        let permission_snapshot = app.state::<crate::ask::AskRegistry>().set_notifier(ask_tx);
-        // Human asks use the same snapshot+edge contract. This is critical for
-        // DingTalk startup: the first spawn can wait for frontend-localized
-        // copy, while agents revived in that window may already have asked a
-        // question. The copy-triggered respawn replays those still-open asks.
-        let human_snapshot = app
-            .state::<crate::bus::BusRegistry>()
-            .set_ask_notifier(hum_tx);
+        // Install both notifier edges under the same generation guard. This
+        // prevents an older startup future from replacing a newer generation's
+        // senders after an awaited settings/copy step completes out of order.
+        let installed = bridge.with_live_generation(generation, || {
+            // set_notifier 返回挂接瞬间已 open 的快照：桥重启时补发卡片（无 miss/dup）。
+            let permission_snapshot = app.state::<crate::ask::AskRegistry>().set_notifier(ask_tx);
+            // Human asks use the same snapshot+edge contract. This is critical
+            // for copy-gated DingTalk startup and revived agents.
+            let human_snapshot = app
+                .state::<crate::bus::BusRegistry>()
+                .set_ask_notifier(hum_tx);
+            (permission_snapshot, human_snapshot)
+        });
+        let Some((permission_snapshot, human_snapshot)) = installed else {
+            return;
+        };
         {
-            let (app2, db2, ch, cards2) = (app.clone(), db.clone(), channel.clone(), cards.clone());
+            let (db2, ch, cards2) = (db.clone(), channel.clone(), cards.clone());
+            let mut notifier_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
-                let bridge = app2.state::<ImBridge>();
                 // 先补发快照里的已开 Ask（挂接前就 open 的，不会再有 Opened 事件）。
                 for ask in permission_snapshot {
-                    if !bridge.live(generation) {
-                        return;
-                    }
-                    consume_ask_event(
+                    let operation = consume_ask_event(
                         crate::ask::AskEvent::Opened(ask),
                         &db2,
                         ch.as_ref(),
                         &cards2,
-                    )
-                    .await;
-                }
-                for (thread, ask) in human_snapshot {
-                    if !bridge.live(generation) {
+                    );
+                    if run_until_generation_cancelled(&mut notifier_cancel, operation)
+                        .await
+                        .is_none()
+                    {
                         return;
                     }
-                    consume_human_event(
+                }
+                for (thread, ask) in human_snapshot {
+                    let operation = consume_human_event(
                         crate::bus::state::HumanAskEvent::Asked { thread, ask },
                         &db2,
                         ch.as_ref(),
                         &cards2,
-                    )
-                    .await;
-                }
-                loop {
-                    if !bridge.live(generation) {
+                    );
+                    if run_until_generation_cancelled(&mut notifier_cancel, operation)
+                        .await
+                        .is_none()
+                    {
                         return;
                     }
-                    tokio::select! {
-                        ev = ask_rx.recv() => match ev {
-                            None => return,
-                            Some(ev) => consume_ask_event(ev, &db2, ch.as_ref(), &cards2).await,
-                        },
-                        ev = hum_rx.recv() => match ev {
-                            None => return,
-                            Some(ev) => consume_human_event(ev, &db2, ch.as_ref(), &cards2).await,
-                        },
+                }
+                loop {
+                    let next = tokio::select! {
+                        biased;
+                        _ = notifier_cancel.changed() => return,
+                        ev = ask_rx.recv() => ev.map(BridgeNotifyEvent::Permission),
+                        ev = hum_rx.recv() => ev.map(BridgeNotifyEvent::Human),
+                    };
+                    let Some(next) = next else {
+                        return;
+                    };
+                    let operation = async {
+                        match next {
+                            BridgeNotifyEvent::Permission(ev) => {
+                                consume_ask_event(ev, &db2, ch.as_ref(), &cards2).await;
+                            }
+                            BridgeNotifyEvent::Human(ev) => {
+                                consume_human_event(ev, &db2, ch.as_ref(), &cards2).await;
+                            }
+                        }
+                    };
+                    if run_until_generation_cancelled(&mut notifier_cancel, operation)
+                        .await
+                        .is_none()
+                    {
+                        return;
                     }
                 }
             });
@@ -1347,75 +1413,85 @@ pub fn spawn(app: tauri::AppHandle) {
                 acks.clone(),
                 dingtalk_copy.clone(),
             );
+            let mut inbound_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
-                let bridge = app2.state::<ImBridge>();
-                while let Some(inb) = in_rx.recv().await {
-                    if !bridge.live(generation) {
+                loop {
+                    let received =
+                        run_until_generation_cancelled(&mut inbound_cancel, in_rx.recv()).await;
+                    let Some(Some(inb)) = received else {
                         return;
-                    }
-                    // 每条入站重读白名单（绑定后即时生效）；Err 丢弃该条（fail-closed）。
-                    let allow = match ImSettings::load(&db2).await {
-                        Ok(s) => s.allow_open_ids,
-                        Err(e) => {
-                            eprintln!("[weft][im] reload allowlist: {e}");
-                            continue;
+                    };
+                    let operation = async {
+                        // 每条入站重读白名单（绑定后即时生效）；Err 丢弃该条（fail-closed）。
+                        let allow = match ImSettings::load(&db2).await {
+                            Ok(s) => s.allow_open_ids,
+                            Err(e) => {
+                                eprintln!("[weft][im] reload allowlist: {e}");
+                                return;
+                            }
+                        };
+                        let (sender, in_mid) = match &inb {
+                            inbound::Inbound::Text {
+                                sender_open_id,
+                                message_id,
+                                ..
+                            } => (sender_open_id.clone(), Some(message_id.clone())),
+                            inbound::Inbound::Action {
+                                operator_open_id, ..
+                            } => (operator_open_id.clone(), None),
+                        };
+                        let r = {
+                            inbound::route_for_provider(
+                                &inb,
+                                &allow,
+                                &*cards2.lock().await,
+                                provider,
+                            )
+                        };
+                        let route_name = match &r {
+                            inbound::Route::Ignore => "ignore",
+                            inbound::Route::Bind { .. } => "bind",
+                            inbound::Route::BindIssueThread { .. } => "bind_issue_thread",
+                            inbound::Route::EnsureIssueTopic { .. } => "ensure_issue_topic",
+                            inbound::Route::AnswerPerm { .. } => "answer_perm",
+                            inbound::Route::AnswerHuman { .. } => "answer_human",
+                            inbound::Route::BadVerdict => "bad_verdict",
+                            inbound::Route::BadHumanAnswer => "bad_human_answer",
+                            inbound::Route::IssueThreadRequired => "issue_thread_required",
+                            inbound::Route::IssueMessage { .. } => "issue_message",
+                            inbound::Route::FreeText { .. } => "free_text",
+                        };
+                        eprintln!("[weft][im] route={route_name} sender={sender}");
+                        let asks = app2.state::<crate::ask::AskRegistry>();
+                        let bus = app2.state::<crate::bus::BusRegistry>();
+                        let ctx = ExecuteCtx {
+                            inbound_message_id: in_mid,
+                            acks: Some(acks2.clone()),
+                            reaction_tx: Some(reaction_tx.clone()),
+                        };
+                        if let Err(e) = execute_for_provider(
+                            r,
+                            &db2,
+                            &asks,
+                            &bus,
+                            ch.as_ref(),
+                            provider,
+                            copy2.as_ref(),
+                            &sender,
+                            IM_LANG,
+                            Some(&app2),
+                            Some(&ctx),
+                        )
+                        .await
+                        {
+                            eprintln!("[weft][im] execute: {e}");
                         }
                     };
-                    let (sender, in_mid) = match &inb {
-                        inbound::Inbound::Text {
-                            sender_open_id,
-                            message_id,
-                            ..
-                        } => (sender_open_id.clone(), Some(message_id.clone())),
-                        inbound::Inbound::Action {
-                            operator_open_id, ..
-                        } => (operator_open_id.clone(), None),
-                    };
-                    let r = {
-                        inbound::route_for_provider(
-                            &inb,
-                            &allow,
-                            &*cards2.lock().await,
-                            provider,
-                        )
-                    };
-                    let route_name = match &r {
-                        inbound::Route::Ignore => "ignore",
-                        inbound::Route::Bind { .. } => "bind",
-                        inbound::Route::BindIssueThread { .. } => "bind_issue_thread",
-                        inbound::Route::EnsureIssueTopic { .. } => "ensure_issue_topic",
-                        inbound::Route::AnswerPerm { .. } => "answer_perm",
-                        inbound::Route::AnswerHuman { .. } => "answer_human",
-                        inbound::Route::BadVerdict => "bad_verdict",
-                        inbound::Route::BadHumanAnswer => "bad_human_answer",
-                        inbound::Route::IssueThreadRequired => "issue_thread_required",
-                        inbound::Route::IssueMessage { .. } => "issue_message",
-                        inbound::Route::FreeText { .. } => "free_text",
-                    };
-                    eprintln!("[weft][im] route={route_name} sender={sender}");
-                    let asks = app2.state::<crate::ask::AskRegistry>();
-                    let bus = app2.state::<crate::bus::BusRegistry>();
-                    let ctx = ExecuteCtx {
-                        inbound_message_id: in_mid,
-                        acks: Some(acks2.clone()),
-                        reaction_tx: Some(reaction_tx.clone()),
-                    };
-                    if let Err(e) = execute_for_provider(
-                        r,
-                        &db2,
-                        &asks,
-                        &bus,
-                        ch.as_ref(),
-                        provider,
-                        copy2.as_ref(),
-                        &sender,
-                        IM_LANG,
-                        Some(&app2),
-                        Some(&ctx),
-                    )
-                    .await
+                    if run_until_generation_cancelled(&mut inbound_cancel, operation)
+                        .await
+                        .is_none()
                     {
-                        eprintln!("[weft][im] execute: {e}");
+                        return;
                     }
                 }
             });
@@ -1427,15 +1503,31 @@ pub fn spawn(app: tauri::AppHandle) {
             let mut rx = hub.subscribe();
             let (db2, ch, acks2) = (db.clone(), channel.clone(), acks.clone());
             let app4 = app.clone();
+            let mut outbound_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
                 let bridge = app4.state::<ImBridge>();
                 loop {
                     if !bridge.live(generation) {
                         return;
                     }
-                    match recv_for_live_generation(&bridge, generation, &mut rx).await {
+                    let received = run_until_generation_cancelled(
+                        &mut outbound_cancel,
+                        recv_for_live_generation(&bridge, generation, &mut rx),
+                    )
+                    .await;
+                    let Some(received) = received else {
+                        return;
+                    };
+                    match received {
                         Ok(Some(out)) => {
-                            consume_lead_out(out, &db2, ch.as_ref(), provider, &acks2, true).await;
+                            let operation =
+                                consume_lead_out(out, &db2, ch.as_ref(), provider, &acks2, true);
+                            if run_until_generation_cancelled(&mut outbound_cancel, operation)
+                                .await
+                                .is_none()
+                            {
+                                return;
+                            }
                         }
                         Ok(None) => return,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1456,6 +1548,7 @@ pub fn spawn(app: tauri::AppHandle) {
             let mut rx = hub.subscribe();
             let (db2, ch, acks2) = (db.clone(), channel.clone(), acks.clone());
             let app5 = app.clone();
+            let mut delta_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
                 let bridge = app5.state::<ImBridge>();
                 // 每条 assistant 消息一张流式卡，按 message_id 归并帧。
@@ -1464,7 +1557,15 @@ pub fn spawn(app: tauri::AppHandle) {
                     if !bridge.live(generation) {
                         return;
                     }
-                    let d = match recv_for_live_generation(&bridge, generation, &mut rx).await {
+                    let received = run_until_generation_cancelled(
+                        &mut delta_cancel,
+                        recv_for_live_generation(&bridge, generation, &mut rx),
+                    )
+                    .await;
+                    let Some(received) = received else {
+                        return;
+                    };
+                    let d = match received {
                         Ok(Some(d)) => d,
                         Ok(None) => return,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1488,15 +1589,20 @@ pub fn spawn(app: tauri::AppHandle) {
                         if !bridge.live(generation) {
                             return;
                         }
-                        consume_lead_delta_frame(
+                        let operation = consume_lead_delta_frame(
                             frame,
                             &db2,
                             ch.as_ref(),
                             provider,
                             &mut streams,
                             &acks2,
-                        )
-                        .await;
+                        );
+                        if run_until_generation_cancelled(&mut delta_cancel, operation)
+                            .await
+                            .is_none()
+                        {
+                            return;
+                        }
                     }
                 }
             });
@@ -1519,7 +1625,8 @@ pub fn spawn(app: tauri::AppHandle) {
                 Ok(rt) => rt,
                 Err(e) => {
                     eprintln!("[weft][im] ws runtime: {e}");
-                    app3.state::<ImBridge>().set_status(&format!("error: {e}"));
+                    app3.state::<ImBridge>()
+                        .set_status_if_live(generation, &format!("error: {e}"));
                     return;
                 }
             };
@@ -1541,17 +1648,22 @@ pub fn spawn(app: tauri::AppHandle) {
                                 sent_resync = true;
                                 let app_summary = app3.clone();
                                 let ch_summary = ch_for_summary.clone();
+                                let mut resync_cancel = generation_cancel.clone();
                                 tauri::async_runtime::spawn(async move {
-                                    if !app_summary.state::<ImBridge>().live(generation) {
-                                        return;
-                                    }
                                     eprintln!("[weft][im] resync summary task start");
-                                    send_resync_summary(&app_summary, ch_summary.as_ref()).await;
+                                    let operation =
+                                        send_resync_summary(&app_summary, ch_summary.as_ref());
+                                    if run_until_generation_cancelled(&mut resync_cancel, operation)
+                                        .await
+                                        .is_none()
+                                    {
+                                        eprintln!("[weft][im] stale resync generation cancelled");
+                                    }
                                 });
                             }
                             WsLoopAction::OpenWs => {
                                 opened = true;
-                                bridge.set_status("online"); // 连接建立细节在 run_ws 内
+                                bridge.set_status_if_live(generation, "online");
                                 eprintln!("[weft][im] ws loop entering run_ws");
                                 let operation = async {
                                     match provider {
@@ -1574,8 +1686,11 @@ pub fn spawn(app: tauri::AppHandle) {
                                         },
                                     }
                                 };
-                                let Some(result) =
-                                    run_until_bridge_cancelled(&mut ws_cancel, operation).await
+                                let Some(result) = run_until_generation_cancelled(
+                                    &mut generation_cancel,
+                                    operation,
+                                )
+                                .await
                                 else {
                                     eprintln!("[weft][im] stale ws generation cancelled");
                                     return;
@@ -1583,11 +1698,9 @@ pub fn spawn(app: tauri::AppHandle) {
                                 match result {
                                     Ok(()) => backoff = 1,
                                     Err(e) => {
-                                        bridge.set_status(&format!("error: {e}"));
-                                        eprintln!(
-                                            "[weft][im] {} ws: {e}",
-                                            provider.as_str()
-                                        );
+                                        bridge
+                                            .set_status_if_live(generation, &format!("error: {e}"));
+                                        eprintln!("[weft][im] {} ws: {e}", provider.as_str());
                                     }
                                 }
                             }
@@ -1599,7 +1712,13 @@ pub fn spawn(app: tauri::AppHandle) {
                     if !bridge.live(generation) {
                         return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    let sleep = tokio::time::sleep(std::time::Duration::from_secs(backoff));
+                    if run_until_generation_cancelled(&mut generation_cancel, sleep)
+                        .await
+                        .is_none()
+                    {
+                        return;
+                    }
                     backoff = (backoff * 2).min(60);
                 }
             });
@@ -3603,8 +3722,10 @@ mod tests {
         let bridge = ImBridge::default();
         let (_, _, _, mut cancel) = bridge.bump();
 
-        let blocked =
-            run_until_bridge_cancelled(&mut cancel, std::future::pending::<anyhow::Result<()>>());
+        let blocked = run_until_generation_cancelled(
+            &mut cancel,
+            std::future::pending::<anyhow::Result<()>>(),
+        );
         let restart = async {
             tokio::task::yield_now().await;
             let _ = bridge.bump();
@@ -3612,6 +3733,69 @@ mod tests {
         let (result, ()) = tokio::join!(blocked, restart);
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_startup_cannot_replace_newer_human_ask_notifier() {
+        let bridge = ImBridge::default();
+        let (older, _, _, _) = bridge.bump();
+        let (newer, _, _, _) = bridge.bump();
+        let bus = crate::bus::BusRegistry::new();
+
+        let (new_tx, mut new_rx) = tokio::sync::mpsc::unbounded_channel();
+        let installed = bridge.with_live_generation(newer, || bus.set_ask_notifier(new_tx));
+        assert!(installed.is_some_and(|snapshot| snapshot.is_empty()));
+
+        let (stale_tx, mut stale_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stale = bridge.with_live_generation(older, || bus.set_ask_notifier(stale_tx));
+        assert!(stale.is_none());
+
+        let ask_id = bus.ask_human(7, "42", "still routed to the new bridge");
+        assert!(matches!(
+            new_rx.recv().await,
+            Some(crate::bus::state::HumanAskEvent::Asked { thread: 7, ask })
+                if ask.id == ask_id
+        ));
+        assert!(stale_rx.try_recv().is_err());
+    }
+
+    async fn assert_bump_cancels_delayed_side_effect() {
+        let bridge = ImBridge::default();
+        let (_, _, _, mut cancel) = bridge.bump();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let side_effect = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let operation = {
+            let entered = entered.clone();
+            let release = release.clone();
+            let side_effect = side_effect.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                side_effect.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+        let guarded = run_until_generation_cancelled(&mut cancel, operation);
+        let retire = async {
+            entered.notified().await;
+            let _ = bridge.bump();
+            release.notify_one();
+        };
+        let (result, ()) = tokio::join!(guarded, retire);
+
+        assert!(result.is_none());
+        assert!(!side_effect.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn bridge_bump_cancels_dequeued_inbound_before_execution() {
+        assert_bump_cancels_delayed_side_effect().await;
+    }
+
+    #[tokio::test]
+    async fn bridge_bump_cancels_resync_before_send() {
+        assert_bump_cancels_delayed_side_effect().await;
     }
 
     #[test]
