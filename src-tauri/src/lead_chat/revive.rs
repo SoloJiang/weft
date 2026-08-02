@@ -1,8 +1,11 @@
 //! Boot-time recovery for turns that were durably recorded as `running` when
-//! the app exited. This module deliberately has no timer, idle inference, stall
-//! detector, or redrive loop: persisted `running` is the only recovery signal.
+//! the app exited, plus durable hidden lead batches accepted before dispatch.
+//! This module deliberately has no timer, idle inference, stall detector, or
+//! redrive loop: persisted `running` and pending hidden rows are the only
+//! recovery signals. A pending plan decision is explicit authorization to
+//! revive an idle/stopped lead; repo-only feedback never wakes a stopped lead.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager};
@@ -24,8 +27,15 @@ struct WorkerTarget {
     session_id: i32,
 }
 
-/// Run one boot-only recovery pass. A target is selected only from durable
-/// `running` state and is excluded when the same engine key is already live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingLeadTarget {
+    thread_id: i32,
+    has_plan_decision: bool,
+}
+
+/// Run one boot-only recovery pass. Running sessions are selected from durable
+/// `running` state; hidden lead batches are selected from durable pending rows.
+/// Both are excluded when the same engine key is already live.
 pub fn spawn_revive(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         if let Err(err) = sweep(&app).await {
@@ -76,24 +86,64 @@ async fn collect_targets(
     Ok((leads, workers))
 }
 
+/// Select durable hidden lead batches that were accepted before a process
+/// exit but never reached the engine. A live engine, or a lead already selected
+/// for running-turn recovery, will hydrate the same batch through
+/// `lead_engine`; excluding those targets here prevents a second startup task
+/// from constructing or dispatching the same engine concurrently.
+async fn collect_pending_lead_targets(
+    db: &Db,
+    live: &HashSet<i64>,
+    revived_leads: &HashSet<i32>,
+) -> anyhow::Result<Vec<PendingLeadTarget>> {
+    let mut targets: Vec<PendingLeadTarget> = Vec::new();
+    let mut indexes: HashMap<i32, usize> = HashMap::new();
+    for row in repo::list_pending_lead_hidden_deliveries(db, None).await? {
+        if live.contains(&lead_key(row.thread_id)) || revived_leads.contains(&row.thread_id) {
+            continue;
+        }
+        if let Some(index) = indexes.get(&row.thread_id).copied() {
+            targets[index].has_plan_decision |= row.source_kind == "plan_decision";
+            continue;
+        }
+        indexes.insert(row.thread_id, targets.len());
+        targets.push(PendingLeadTarget {
+            thread_id: row.thread_id,
+            has_plan_decision: row.source_kind == "plan_decision",
+        });
+    }
+    Ok(targets)
+}
+
 async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
     let Some(db) = app.try_state::<Db>() else {
         return Ok(());
     };
     let db = Db(db.0.clone(), db.1);
+    // Materialize any journal-backed repo feedback before taking the live
+    // engine snapshot. Otherwise a later plan row could be recovered first,
+    // while the older repo row is still waiting for the separate startup
+    // feedback task to create its durable hidden delivery.
+    if let Err(error) = crate::commands::restore_pending_repo_action_feedback_once(&db, None).await
+    {
+        eprintln!("[weft][revive] repository feedback startup pass failed: {error}");
+    }
     let live: HashSet<i64> = {
         let state = app.state::<LeadChatState>();
         state.0.iter().map(|entry| *entry.key()).collect()
     };
     let (leads, workers) = collect_targets(&db, &live).await?;
-    if leads.is_empty() && workers.is_empty() {
+    let revived_leads = leads.iter().copied().collect::<HashSet<_>>();
+    let pending_leads = collect_pending_lead_targets(&db, &live, &revived_leads).await?;
+    if leads.is_empty() && workers.is_empty() && pending_leads.is_empty() {
         return Ok(());
     }
 
     eprintln!(
-        "[weft][revive] reviving {} worker(s), {} lead(s)",
+        "[weft][revive] reviving {} worker(s), {} lead(s), {} pending hidden lead batch(es)",
         workers.len(),
-        leads.len()
+        leads.len(),
+        pending_leads.len()
     );
     let revived_workers = workers.len();
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
@@ -106,6 +156,16 @@ async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
                 return;
             };
             revive_lead(&app, thread_id).await;
+        }));
+    }
+    for target in pending_leads {
+        let app = app.clone();
+        let semaphore = semaphore.clone();
+        handles.push(tauri::async_runtime::spawn(async move {
+            let Ok(_permit) = semaphore.acquire().await else {
+                return;
+            };
+            revive_pending_lead(&app, target).await;
         }));
     }
     for worker in workers {
@@ -125,6 +185,45 @@ async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
         let _ = app.emit("worker-revived", ());
     }
     Ok(())
+}
+
+async fn revive_pending_lead(app: &AppHandle, target: PendingLeadTarget) {
+    let Some(db) = app.try_state::<Db>() else {
+        return;
+    };
+    let db = Db(db.0.clone(), db.1);
+    if let Err(error) = try_revive_pending_lead(app, &db, target).await {
+        eprintln!(
+            "[weft][revive] pending hidden lead batch @{} failed: {error}",
+            target.thread_id
+        );
+    }
+}
+
+async fn try_revive_pending_lead(
+    app: &AppHandle,
+    db: &Db,
+    target: PendingLeadTarget,
+) -> anyhow::Result<bool> {
+    // A plan decision is explicit persisted user authorization and may revive
+    // an idle/stopped lead through the existing ordered batch admission. A
+    // repo-only batch has no such authorization: never wake a stopped lead in
+    // the background merely because feedback is pending.
+    let status = repo::lead_status(db, target.thread_id).await?;
+    if !pending_lead_can_start(status.as_deref(), target.has_plan_decision) {
+        return Ok(false);
+    }
+
+    // `lead_engine` performs the one ordered durable-batch admission before it
+    // returns, including the plan-authorized stopped-lead revive. Keeping this
+    // call as the sole startup path avoids constructing another engine or
+    // dispatching the same rows a second time.
+    let _ = lead_engine(app, db, target.thread_id, "en").await?;
+    Ok(true)
+}
+
+fn pending_lead_can_start(status: Option<&str>, has_plan_decision: bool) -> bool {
+    has_plan_decision || status != Some("stopped")
 }
 
 async fn revive_worker(app: &AppHandle, worker: WorkerTarget) {
@@ -347,5 +446,130 @@ mod tests {
 
         assert!(leads.is_empty());
         assert!(workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disk_restart_recovers_one_plan_batch_in_row_id_order() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("revive-plan.sqlite");
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let db = Db::connect(&url).await.unwrap();
+        let workspace = repo::create_workspace(&db, "restart-plan").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        repo::set_lead_status(&db, thread.id, "stopped")
+            .await
+            .unwrap();
+        let older = repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "repo_action",
+            41,
+            "repo_action:41",
+            r#"{"tool":"repo_action","execution_id":41,"status":"ok"}"#,
+        )
+        .await
+        .unwrap();
+        let card = repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "plan_card",
+            r#"{"title":"Ship it","requirements":[],"approach":"","split":[],"risks":[]}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let (resolved_card, newer) = repo::enqueue_plan_decision_and_resolve(
+            &db,
+            thread.id,
+            card.id,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(resolved_card.content.contains("resolved"));
+        drop(db);
+
+        // Reopen the same file to model a fresh process. The transaction that
+        // accepted the plan already committed, while no engine receipt exists.
+        let db = Db::connect(&url).await.unwrap();
+        let targets = collect_pending_lead_targets(&db, &HashSet::new(), &HashSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            targets,
+            vec![PendingLeadTarget {
+                thread_id: thread.id,
+                has_plan_decision: true,
+            }]
+        );
+        let rows = repo::list_pending_lead_hidden_deliveries(&db, Some(thread.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![older.id, newer.id],
+            "startup recovery must hand the whole batch to ordered admission"
+        );
+        let reloaded_card = repo::get_lead_message(&db, card.id).await.unwrap().unwrap();
+        assert!(
+            reloaded_card.content.contains("resolved"),
+            "the committed plan transaction must leave no actionable card to replay"
+        );
+        assert!(
+            pending_lead_can_start(Some("stopped"), true),
+            "the persisted plan decision is explicit authorization to revive"
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_restart_defers_repo_only_batch_for_stopped_lead() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("revive-repo-only.sqlite");
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let db = Db::connect(&url).await.unwrap();
+        let workspace = repo::create_workspace(&db, "restart-repo-only").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        repo::set_lead_status(&db, thread.id, "stopped")
+            .await
+            .unwrap();
+        repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "repo_action",
+            51,
+            "repo_action:51",
+            r#"{"tool":"repo_action","execution_id":51,"status":"ok"}"#,
+        )
+        .await
+        .unwrap();
+        drop(db);
+
+        let db = Db::connect(&url).await.unwrap();
+        let targets = collect_pending_lead_targets(&db, &HashSet::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert!(!targets[0].has_plan_decision);
+        assert!(
+            !pending_lead_can_start(Some("stopped"), targets[0].has_plan_decision),
+            "repo feedback alone must not wake a stopped lead during startup"
+        );
+        assert_eq!(
+            repo::list_pending_lead_hidden_deliveries(&db, Some(thread.id))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "defer must retain the durable row for a later explicit recovery"
+        );
     }
 }

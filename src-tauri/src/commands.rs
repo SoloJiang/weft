@@ -1464,17 +1464,39 @@ fn spawn_repo_action_feedback_drain(db: Db, execution_id: i32) {
 
 pub(crate) fn spawn_pending_repo_action_feedback(db: Db, thread_id: Option<i32>) {
     tauri::async_runtime::spawn(async move {
-        match repo::pending_repo_action_feedback(&db, thread_id).await {
-            Ok(executions) => {
-                for execution in executions {
-                    spawn_repo_action_feedback_drain(db.clone(), execution.id);
+        match restore_pending_repo_action_feedback_once(&db, thread_id).await {
+            Ok(retry_ids) => {
+                for execution_id in retry_ids {
+                    spawn_repo_action_feedback_drain(db.clone(), execution_id);
                 }
             }
-            Err(error) => {
-                eprintln!("[weft] list pending repository action feedback failed: {error}");
-            }
+            Err(error) => eprintln!("[weft] list pending repository action feedback failed: {error}"),
         }
     });
+}
+
+/// Perform one synchronous startup pass over the repository-action journal.
+/// This is intentionally separate from the delayed retry loop: boot revive
+/// awaits this pass before scanning hidden lead rows, so an older repo-action
+/// row is materialized before a later plan decision can be admitted. A false
+/// or failed delivery remains retryable and is returned to the caller; the
+/// durable hidden row, when accepted, is still pending until the engine emits
+/// its activity receipt.
+pub(crate) async fn restore_pending_repo_action_feedback_once(
+    db: &Db,
+    thread_id: Option<i32>,
+) -> Result<Vec<i32>, String> {
+    let executions = repo::pending_repo_action_feedback(db, thread_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut retry_ids = Vec::new();
+    for execution in executions {
+        match drain_repo_action_feedback_once(db, execution.id).await {
+            Ok(true) => {}
+            Ok(false) | Err(_) => retry_ids.push(execution.id),
+        }
+    }
+    Ok(retry_ids)
 }
 
 async fn add_repo_ref_inner(

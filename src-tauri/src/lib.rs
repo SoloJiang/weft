@@ -218,6 +218,10 @@ pub fn run() {
             // the persist path is live for the whole run (grants were already
             // seeded synchronously above, before the builder). Ordering hygiene.
             auth_persist::spawn(app.handle().clone());
+            // Boot revive covers both interrupted running turns and durable
+            // hidden lead batches whose plan decision committed before the
+            // process exited; repo-only feedback on a stopped lead remains
+            // pending until an explicit lead action.
             lead_chat::revive::spawn_revive(app.handle().clone());
             // PR/MR state-machine polling is process-level and independent of
             // any one chat session's lifetime.
