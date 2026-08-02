@@ -3377,7 +3377,8 @@ async fn dispatch_hidden_delivery(
                 .map_err(|error| error.to_string())?
         }
     };
-    dispatch_hidden_delivery_with_engine(app, db, row, &eng).await
+    let revive = row.source_kind == "plan_decision";
+    dispatch_hidden_delivery_with_engine(app, db, row, &eng, revive).await
 }
 
 async fn dispatch_hidden_delivery_with_engine(
@@ -3385,15 +3386,13 @@ async fn dispatch_hidden_delivery_with_engine(
     db: &Db,
     row: &crate::store::entities::lead_hidden_delivery::Model,
     eng: &EngineRef,
+    revive_stopped: bool,
 ) -> Result<bool, String> {
     if row.state == repo::LEAD_HIDDEN_DELIVERY_CONSUMED {
         return Ok(true);
     }
-    let payload: serde_json::Value = serde_json::from_str(&row.payload)
-        .map_err(|error| format!("invalid hidden lead delivery payload: {error}"))?;
-    let text = hidden_feedback_text(&payload).map_err(|error| error.to_string())?;
-    let revive = row.source_kind == "plan_decision";
-    engine::send_hidden_delivery_existing(app, db, eng, text, row.id, revive)
+    let text = engine::durable_hidden_delivery_text(row).map_err(|error| error.to_string())?;
+    engine::send_hidden_delivery_existing(app, db, eng, text, row.id, revive_stopped)
         .await
         .map_err(|error| error.to_string())
 }
@@ -3466,20 +3465,13 @@ async fn restore_pending_hidden_deliveries_on_engine(
 ) -> anyhow::Result<()> {
     let rows = repo::list_pending_lead_hidden_deliveries(db, Some(thread_id)).await?;
     for row in rows {
-        match dispatch_hidden_delivery_with_engine(app, db, &row, eng).await {
-            Ok(accepted) if row.source_kind == "plan_decision" && !accepted => {
-                anyhow::bail!("pending plan hidden delivery {} was not admitted", row.id);
-            }
+        // Startup/background hydration must never revive a stopped lead. An
+        // explicit visible send performs its own ordered admission instead.
+        match dispatch_hidden_delivery_with_engine(app, db, &row, eng, false).await {
             Ok(_) => {}
-            Err(error) if row.source_kind == "plan_decision" => {
-                return Err(anyhow::anyhow!(
-                    "pending plan hidden delivery {} replay failed: {error}",
-                    row.id
-                ));
-            }
             Err(error) => {
                 eprintln!(
-                    "[weft] non-critical repo hidden delivery {} replay deferred: {error}",
+                    "[weft] hidden delivery {} replay deferred: {error}",
                     row.id
                 );
             }

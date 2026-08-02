@@ -764,6 +764,13 @@ fn hidden_turn_admissible(inner: &EngineInner) -> bool {
     !inner.stopped && !inner.tearing_down
 }
 
+fn hidden_delivery_is_duplicate(inner: &EngineInner, delivery_id: i32) -> bool {
+    inner.turn_user_row == Some(-delivery_id)
+        || inner.turn.queue.iter().any(|out| {
+            hidden_delivery_id_from_tag(out.origin_tag.as_deref()) == Some(delivery_id)
+        })
+}
+
 async fn begin_hidden_turn(
     app: &AppHandle,
     db: &Db,
@@ -2421,6 +2428,231 @@ async fn ensure_running_for_send_admitted(
     ensure_running_admitted(app, db, eng).await
 }
 
+/// Build the exact prompt carried by one durable hidden row. Durable rows are
+/// restricted to the two stable source kinds, so the source kind (rather than
+/// caller-supplied payload fields) remains the protocol tag used on the wire.
+/// Keeping this formatter in the engine lets visible-send pre-admission and
+/// background/retry replay share one representation.
+pub(crate) fn durable_hidden_delivery_text(
+    row: &crate::store::entities::lead_hidden_delivery::Model,
+) -> anyhow::Result<String> {
+    if !matches!(row.source_kind.as_str(), "plan_decision" | "repo_action") {
+        anyhow::bail!("unsupported durable hidden delivery kind {}", row.source_kind);
+    }
+    let payload: serde_json::Value = serde_json::from_str(&row.payload)
+        .map_err(|error| anyhow::anyhow!("invalid hidden lead delivery payload: {error}"))?;
+    let json = serde_json::to_string(&payload)?;
+    Ok(format!(
+        "<weft:{}>{json}</weft:{}>",
+        row.source_kind, row.source_kind
+    ))
+}
+
+struct PendingHiddenSpawn {
+    out: Outgoing,
+    turn_id: i32,
+    reset_epoch: u64,
+}
+
+/// Spawn the first per-turn/connection hidden delivery after its turn slot has
+/// been reserved under the engine mutex. The reservation stays ahead of every
+/// later visible send; callers roll it back on an actual spawn failure.
+async fn spawn_hidden_turn_after_admission(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    out: Outgoing,
+    expected_epoch: u64,
+) -> anyhow::Result<()> {
+    let (codex_appserver, acp) = {
+        let inner = eng.lock().await;
+        (
+            inner.tool == "codex" && codex_appserver_enabled(),
+            is_acp_tool(&inner.tool),
+        )
+    };
+    if codex_appserver {
+        spawn_codex_turn_or_exec(
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            out,
+            Some(expected_epoch),
+        )
+        .await
+    } else if acp {
+        spawn_acp_turn(
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            out,
+            Some(expected_epoch),
+        )
+        .await
+    } else {
+        spawn_turn(
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            out,
+            Some(expected_epoch),
+        )
+        .await
+    }
+}
+
+/// Admit every pending durable hidden row before a visible user send. This is
+/// called only after `send` has acquired its engine-admission read guard, and
+/// all row-order/duplicate checks plus hidden reservations happen under one
+/// engine mutex boundary. A stopped lead is revived here only because the
+/// visible send is explicit user authorization; background hydration never
+/// calls this path.
+///
+/// Resident tools start/write the first hidden turn while the mutex is held;
+/// per-turn/connection tools reserve the first hidden turn and spawn it before
+/// returning. Later durable rows are queued FIFO, so the visible Phase-1
+/// reservation necessarily lands behind them. No receipt is consumed here —
+/// `note_turn_activity` remains the sole transition to delivered/consumed.
+async fn admit_pending_durable_hidden_for_visible(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+) -> anyhow::Result<()> {
+    let (thread_id, prepared) = {
+        let inner = eng.lock().await;
+        let rows = repo::list_pending_lead_hidden_deliveries(db, Some(inner.thread_id)).await?;
+        let mut prepared = Vec::with_capacity(rows.len());
+        for row in rows {
+            let text = durable_hidden_delivery_text(&row)?;
+            prepared.push((row, text));
+        }
+        (inner.thread_id, prepared)
+    };
+    if prepared.is_empty() {
+        return Ok(());
+    }
+
+    let was_stopped = { eng.lock().await.stopped };
+    let mut pending_spawn: Option<PendingHiddenSpawn> = None;
+    {
+        let mut inner = eng.lock().await;
+        if inner.tearing_down {
+            anyhow::bail!("engine is tearing down");
+        }
+        // Explicit visible input is the only path allowed to clear this flag
+        // for durable replay. The background restore path passes revive=false.
+        inner.stopped = false;
+
+        for (row, text) in prepared {
+            // The snapshot was taken under this same engine boundary. A row may
+            // already be represented by the current or queued hidden turn (for
+            // example, a retry racing a previous admission); preserve that
+            // reservation instead of enqueueing a duplicate.
+            if hidden_delivery_is_duplicate(&inner, row.id) {
+                continue;
+            }
+
+            let mut delivery = hidden_delivery(
+                &inner.tool,
+                inner.turn.busy,
+                inner.stdin.is_some(),
+                inner.stopped,
+            );
+            // A stopped resident has no stdin. We have just admitted explicit
+            // user intent, so start the resident before classifying its first
+            // hidden row; the spawn and the hidden turn reservation stay in the
+            // same mutex boundary.
+            if !inner.turn.busy && !per_turn(&inner.tool) && !is_acp_tool(&inner.tool) {
+                let reader = match ensure_running_locked(app, &mut inner).await {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        inner.stopped = was_stopped;
+                        return Err(error);
+                    }
+                };
+                if let Some((stdout, generation, quota_command)) = reader {
+                    spawn_reader(
+                        app.clone(),
+                        db.clone(),
+                        eng.clone(),
+                        stdout,
+                        generation,
+                        quota_command,
+                    );
+                }
+                delivery = hidden_delivery(
+                    &inner.tool,
+                    inner.turn.busy,
+                    inner.stdin.is_some(),
+                    inner.stopped,
+                );
+            }
+
+            let out = Outgoing {
+                text,
+                images: vec![],
+                tracked: false,
+                origin_tag: Some(hidden_delivery_tag(row.id)),
+                queue_id: None,
+                has_attachments: false,
+            };
+            match delivery {
+                HiddenDelivery::Noop => {
+                    inner.stopped = was_stopped;
+                    anyhow::bail!("durable hidden delivery {} is not admissible", row.id);
+                }
+                HiddenDelivery::Queue => {
+                    queue_hidden_delivery(app, &mut inner, out);
+                }
+                HiddenDelivery::WriteResident => {
+                    let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await;
+                    if let Err(error) = write_user(&mut inner, &out).await {
+                        drop(inner);
+                        rollback_failed_turn(app, db, eng, turn_id, "error").await;
+                        if was_stopped {
+                            let mut restored = eng.lock().await;
+                            restored.stopped = true;
+                            persist_activity(db, restored.session_id, thread_id, STATUS_STOPPED).await;
+                        }
+                        return Err(error);
+                    }
+                }
+                HiddenDelivery::SpawnTurn => {
+                    let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await;
+                    // Only the first hidden row can need a spawn: it owns the
+                    // busy slot, and every following row observes Queue.
+                    pending_spawn = Some(PendingHiddenSpawn {
+                        out,
+                        turn_id,
+                        reset_epoch: inner.reset_epoch,
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(pending) = pending_spawn {
+        if let Err(error) = spawn_hidden_turn_after_admission(
+            app,
+            db,
+            eng,
+            pending.out,
+            pending.reset_epoch,
+        )
+        .await
+        {
+            rollback_failed_turn(app, db, eng, pending.turn_id, "error").await;
+            if was_stopped {
+                let mut restored = eng.lock().await;
+                restored.stopped = true;
+                persist_activity(db, restored.session_id, thread_id, STATUS_STOPPED).await;
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 /// Drop the resident child and its stdin so the next send respawns a clean
 /// process. Used when a write fails or times out mid-line: a partial JSON
 /// message may be stuck in the old stdin pipe, so reusing that pipe would
@@ -2751,6 +2983,11 @@ pub async fn send(
         // defensively so a still-open tool row can't outlive the bounce.
         finalize_orphan_tool_rows(app, db, tid, orphans, "interrupted").await;
     }
+    // A visible send is the explicit resume boundary. Admit every pending
+    // durable hidden handoff before any visible-send preflight can succeed, so
+    // a replay/admission failure blocks the visible send itself.
+    admit_pending_durable_hidden_for_visible(app, db, eng).await?;
+
     // Pre-flight agent resolution: if the configured CLI can't be found on PATH, a
     // spawn would fail deep inside with a raw "No such file or directory (os error
     // 2)" that surfaces only as a generic "errored" label. Surface a friendly,
@@ -9907,6 +10144,93 @@ mod tests {
         assert_eq!(inner.turn_id, 1);
         assert!(inner.clock.started_millis > 0);
         assert!(inner.current_origin_tag.is_none());
+    }
+
+    #[test]
+    fn durable_hidden_delivery_text_uses_the_stable_source_tag() {
+        let row = crate::store::entities::lead_hidden_delivery::Model {
+            id: 41,
+            thread_id: 1,
+            source_kind: "repo_action".into(),
+            source_id: 9,
+            dedupe_key: "repo_action:9".into(),
+            payload: r#"{"tool":"repo_action","status":"ok"}"#.into(),
+            state: repo::LEAD_HIDDEN_DELIVERY_PENDING.into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        assert_eq!(
+            durable_hidden_delivery_text(&row).unwrap(),
+            "<weft:repo_action>{\"status\":\"ok\",\"tool\":\"repo_action\"}</weft:repo_action>"
+        );
+    }
+
+    #[test]
+    fn durable_hidden_delivery_text_rejects_invalid_rows_before_resume() {
+        let malformed = crate::store::entities::lead_hidden_delivery::Model {
+            id: 42,
+            thread_id: 1,
+            source_kind: "repo_action".into(),
+            source_id: 9,
+            dedupe_key: "repo_action:9".into(),
+            payload: "not-json".into(),
+            state: repo::LEAD_HIDDEN_DELIVERY_PENDING.into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        assert!(durable_hidden_delivery_text(&malformed).is_err());
+
+        let unsupported = crate::store::entities::lead_hidden_delivery::Model {
+            source_kind: "ephemeral".into(),
+            ..malformed
+        };
+        assert!(durable_hidden_delivery_text(&unsupported).is_err());
+    }
+
+    #[test]
+    fn durable_hidden_rows_stay_ahead_of_visible_queue_for_both_transports() {
+        for tool in ["claude", "opencode"] {
+            let mut inner = test_inner(tool);
+            inner.turn.busy = true;
+            inner.turn_user_row = Some(-10);
+            inner.turn.queue.push_back(Outgoing {
+                text: "second repo feedback".into(),
+                origin_tag: Some(hidden_delivery_tag(11)),
+                ..Default::default()
+            });
+            inner.turn.queue.push_back(Outgoing {
+                text: "visible user message".into(),
+                tracked: true,
+                queue_id: Some(99),
+                ..Default::default()
+            });
+
+            assert_eq!(inner.turn_user_row, Some(-10), "{tool}: first hidden turn");
+            assert!(hidden_delivery_is_duplicate(&inner, 10), "{tool}: current idempotence");
+            assert!(hidden_delivery_is_duplicate(&inner, 11), "{tool}: queued idempotence");
+            assert!(!hidden_delivery_is_duplicate(&inner, 12), "{tool}: new id admitted");
+            assert_eq!(
+                inner.turn.queue[0].origin_tag.as_deref(),
+                Some(hidden_delivery_tag(11).as_str()),
+                "{tool}: durable row order"
+            );
+            assert_eq!(inner.turn.queue[1].queue_id, Some(99), "{tool}: visible follows");
+        }
+    }
+
+    #[test]
+    fn background_hidden_admission_keeps_stopped_resident_and_per_turn_engines_stopped() {
+        for tool in ["claude", "opencode"] {
+            let mut inner = test_inner(tool);
+            inner.stopped = true;
+            assert_eq!(
+                hidden_delivery(tool, false, false, true),
+                HiddenDelivery::Noop,
+                "{tool}: background replay must not revive a stopped engine"
+            );
+            assert!(!hidden_turn_admissible(&inner), "{tool}: stopped guard");
+        }
     }
 
     #[test]
