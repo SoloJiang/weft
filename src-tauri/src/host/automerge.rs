@@ -585,7 +585,22 @@ async fn evaluate_and_execute_merge(
     tests::after_automerge_evaluation_probe(pr.id).await;
 
     let lifecycle_gate = bus.thread_lifecycle_gate(pr.thread_id);
-    let _lifecycle = lifecycle_gate.lock().await;
+    // The live host evaluation above intentionally runs outside this fence, but
+    // a concurrent repository action may hold it while its own bounded work is
+    // in flight. Do not wait on that action with a ready verdict in hand: the
+    // external CI/review state can change while we wait, and the SQLite reload
+    // below only protects the local snapshot. Defer this row to the next sweep
+    // so it gets another fresh host read instead of authorizing from stale data.
+    let _lifecycle = match lifecycle_gate.try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            eprintln!(
+                "[weft][automerge] pr #{}: lifecycle gate busy; deferring merge to next sweep",
+                pr.id
+            );
+            return None;
+        }
+    };
     let current = match repo::reload_pull_request_merge_candidate(db, &pr, &head_sha).await {
         Ok(Some(current)) => current,
         Ok(None) => return None,
@@ -1516,6 +1531,55 @@ mod tests {
         })))
     }
 
+    fn lifecycle_race_ready_snapshot() -> PrSnapshot {
+        PrSnapshot {
+            head_sha: "fresh_sha_lifecycle_race".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: PrLifecycle::Open,
+            ci: CiStatus::Passing,
+            review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
+            conflict: ConflictStatus::Clean,
+        }
+    }
+
+    /// Mutable host state for the lifecycle-gate race seam below. The
+    /// resolver signature is intentionally a plain function pointer, so the
+    /// state lives behind a test-only process-local mutex and is changed only
+    /// after the fresh read has reached `after_automerge_evaluation_probe`.
+    fn lifecycle_race_snapshot() -> &'static std::sync::Mutex<PrSnapshot> {
+        static SNAPSHOT: std::sync::OnceLock<std::sync::Mutex<PrSnapshot>> =
+            std::sync::OnceLock::new();
+        SNAPSHOT.get_or_init(|| std::sync::Mutex::new(lifecycle_race_ready_snapshot()))
+    }
+
+    fn set_lifecycle_race_snapshot(snapshot: PrSnapshot) {
+        *lifecycle_race_snapshot()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = snapshot;
+    }
+
+    struct MutableLifecycleRaceHost;
+
+    impl PrHost for MutableLifecycleRaceHost {
+        fn kind(&self) -> HostKind {
+            HostKind::GitHub
+        }
+
+        fn fetch_status(&self, _target: &PrTarget) -> Result<PrSnapshot, HostError> {
+            Ok(lifecycle_race_snapshot()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone())
+        }
+    }
+
+    fn resolver_fresh_lifecycle_race(_: HostKind) -> Result<Box<dyn PrHost>, HostError> {
+        Ok(Box::new(MutableLifecycleRaceHost))
+    }
+
     /// Test-only seam (mirrors `planner::tests::between_upstream_passes_probe`): lets a test
     /// PAUSE `evaluate_row` exactly between its FIRST upstream read (step 4) and its re-check
     /// (step 5.5) — the same window a concurrent re-proposal could land in (Codex review, PR
@@ -1789,6 +1853,138 @@ mod tests {
         assert!(execution.merge_result.is_ok());
         assert_eq!(execution.head_sha, "fresh_sha_fully_ready");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn busy_lifecycle_gate_defers_same_sha_drift_until_the_next_fresh_evaluation() {
+        // The first fresh read is ready, but the lifecycle fence is already
+        // held by a concurrent repository action. Change only the host
+        // verdict (keep the exact same head SHA) while the evaluation is
+        // paused at the production seam immediately before lock acquisition.
+        // The busy attempt must not wait and must not invoke the merge runner;
+        // after release, the next sweep must fetch the changed host state and
+        // refuse it again. Exercise each verdict that can reopen this window:
+        // unresolved threads, changes requested, and failing CI.
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let bus = std::sync::Arc::new(crate::bus::BusRegistry::new());
+        let backoff = MergeBackoffState::default();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let runner: MergeRunner = std::sync::Arc::new(move |_, _, _, _, _| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+
+        let bad_states = [
+            (
+                "unresolved review threads",
+                PrSnapshot {
+                    head_sha: "fresh_sha_lifecycle_race".to_string(),
+                    base_ref: "main".to_string(),
+                    url: String::new(),
+                    title: String::new(),
+                    lifecycle: PrLifecycle::Open,
+                    ci: CiStatus::Passing,
+                    review: ReviewStatus::Approved,
+                    threads: ThreadStatus::Unresolved { count: 1 },
+                    conflict: ConflictStatus::Clean,
+                },
+            ),
+            (
+                "changes requested",
+                PrSnapshot {
+                    head_sha: "fresh_sha_lifecycle_race".to_string(),
+                    base_ref: "main".to_string(),
+                    url: String::new(),
+                    title: String::new(),
+                    lifecycle: PrLifecycle::Open,
+                    ci: CiStatus::Passing,
+                    review: ReviewStatus::ChangesRequested,
+                    threads: ThreadStatus::AllResolved,
+                    conflict: ConflictStatus::Clean,
+                },
+            ),
+            (
+                "failing CI",
+                PrSnapshot {
+                    head_sha: "fresh_sha_lifecycle_race".to_string(),
+                    base_ref: "main".to_string(),
+                    url: String::new(),
+                    title: String::new(),
+                    lifecycle: PrLifecycle::Open,
+                    ci: CiStatus::Failing,
+                    review: ReviewStatus::Approved,
+                    threads: ThreadStatus::AllResolved,
+                    conflict: ConflictStatus::Clean,
+                },
+            ),
+        ];
+
+        for (label, bad_snapshot) in bad_states {
+            set_lifecycle_race_snapshot(lifecycle_race_ready_snapshot());
+            let lifecycle = bus.thread_lifecycle_gate(pr.thread_id).lock_owned().await;
+            let (reached, resume) = arm_after_automerge_evaluation_probe(pr.id);
+            let evaluate_db = db.clone();
+            let evaluate_bus = bus.clone();
+            let evaluate_backoff = backoff.clone();
+            let evaluate_pr = pr.clone();
+            let evaluate_runner = runner.clone();
+            let mut evaluate = tokio::spawn(async move {
+                evaluate_and_execute_merge(
+                    &evaluate_db,
+                    &evaluate_bus,
+                    evaluate_pr,
+                    &evaluate_backoff,
+                    resolver_fresh_lifecycle_race,
+                    HostKind::GitHub,
+                    &evaluate_runner,
+                )
+                .await
+            });
+
+            reached.await.expect("fresh evaluation should reach the probe");
+            set_lifecycle_race_snapshot(bad_snapshot);
+            resume.send(()).expect("evaluation should still be paused");
+            let first = tokio::time::timeout(Duration::from_secs(1), &mut evaluate)
+                .await
+                .unwrap_or_else(|_| panic!("busy lifecycle gate must defer {label} without waiting"))
+                .expect("the evaluation task should not panic");
+            assert!(
+                first.is_none(),
+                "the busy lifecycle gate must skip {label} instead of running the merge"
+            );
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the merge runner must stay untouched while the lifecycle gate is busy ({label})"
+            );
+            drop(lifecycle);
+
+            let next = evaluate_and_execute_merge(
+                &db,
+                &bus,
+                pr.clone(),
+                &backoff,
+                resolver_fresh_lifecycle_race,
+                HostKind::GitHub,
+                &runner,
+            )
+            .await;
+            assert!(
+                next.is_none(),
+                "the next fresh evaluation must refuse the changed host verdict ({label})"
+            );
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no merge runner call is allowed after the changed host verdict ({label})"
+            );
+        }
+
+        // Do not leak a failing verdict into another test that happens to use
+        // this process-local resolver seam.
+        set_lifecycle_race_snapshot(lifecycle_race_ready_snapshot());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
