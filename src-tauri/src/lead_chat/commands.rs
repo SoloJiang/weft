@@ -231,12 +231,20 @@ pub async fn lead_engine(
     lang: &str,
 ) -> anyhow::Result<EngineRef> {
     let state = app.state::<LeadChatState>();
+    // Engine construction is itself an admission point: a durable enqueue may
+    // race the first `lead_engine` call when no resident engine exists yet.
+    // Use the same per-thread serial gate as visible/hidden sends, then take
+    // the registry read lock (the global lock order is gate -> read).
+    let serial = engine::admission_gate_for_key(lead_key(thread_id))
+        .lock_owned()
+        .await;
     let existing = {
         let _engine_admission = state.engine_admission_read().await;
         state.get(lead_key(thread_id))
     };
     if let Some(e) = existing {
         repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+        drop(serial);
         restore_pending_hidden_deliveries_on_engine(app, db, thread_id, &e).await?;
         return Ok(e);
     }
@@ -382,6 +390,9 @@ pub async fn lead_engine(
     let eng: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     let selected = state.get_or_insert(lead_key(thread_id), eng);
     drop(engine_admission);
+    // Hydration dispatch acquires the same gate through send_hidden_inner; do
+    // not hold the construction gate across that call or it would self-deadlock.
+    drop(serial);
     // Hydrate durable hidden rows before returning the engine to a caller that
     // may immediately send a visible turn. Fire-and-forget replay allowed a
     // post-restart visible send to win the engine mutex ahead of an old plan
@@ -3406,10 +3417,23 @@ pub(crate) async fn post_repo_action_feedback_from_journal(
     execution_id: i32,
     lang: &str,
 ) -> Result<bool, String> {
-    let Some(delivery) = repo::enqueue_repo_action_feedback_from_journal(db, execution_id)
+    let Some(execution) = repo::get_repo_action_execution_by_id(db, execution_id)
         .await
         .map_err(|error| error.to_string())?
     else {
+        return Ok(false);
+    };
+    // The journal transaction is a durable hidden-row linearization point. It
+    // must share the lead's serial admission gate with visible sends so a row
+    // inserted before Phase 1 is absorbed in FIFO order, while a row inserted
+    // after Phase 1 is unambiguously a later follow-up.
+    let delivery = engine::with_admission_gate(lead_key(execution.thread_id), || async {
+        repo::enqueue_repo_action_feedback_from_journal(db, execution_id)
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .await?;
+    let Some(delivery) = delivery else {
         return Ok(false);
     };
     match dispatch_hidden_delivery(app, db, &delivery, lang).await {
@@ -3504,18 +3528,26 @@ pub(crate) async fn post_lead_tool_result_inner(
     let Some(message_id) = (source_id > 0).then_some(source_id) else {
         return Ok(false);
     };
-    let Some((resolved, delivery)) = repo::enqueue_plan_decision_and_resolve(
-        db,
-        thread_id,
-        message_id,
-        payload
-            .get("allow_proposed_scope")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-    )
-    .await
-    .map_err(|error| error.to_string())?
-    else {
+    let Some((resolved, delivery)) = ({
+        // The plan decision transaction creates the durable row and resolves
+        // the card atomically. Serialize that enqueue with the engine's visible
+        // admission boundary; release before dispatch because the hidden send
+        // acquires the same gate again.
+        engine::with_admission_gate(lead_key(thread_id), || async {
+            repo::enqueue_plan_decision_and_resolve(
+                db,
+                thread_id,
+                message_id,
+                payload
+                    .get("allow_proposed_scope")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await?
+    }) else {
         return Ok(false);
     };
     let _ = app.emit(

@@ -659,9 +659,19 @@ fn note_turn_activity(app: &AppHandle, db: &Db, eng: &EngineRef, inner: &mut Eng
     };
     if message_id < 0 {
         let delivery_id = -message_id;
+        let admission_key = inner
+            .session_id
+            .map(i64::from)
+            .unwrap_or_else(|| super::commands::lead_key(inner.thread_id));
         let db = db.clone();
         let eng = eng.clone();
         tauri::async_runtime::spawn(async move {
+            // Durable consumption is another linearization point for the
+            // hidden/visible admission pair. Serialize it with the same
+            // per-surface gate before touching the DB: if admission wins, the
+            // row is already represented by that hidden turn; if consumption
+            // wins, the visible recheck observes `consumed` and skips it.
+            let _serial = admission_gate_for_key(admission_key).lock_owned().await;
             match repo::consume_lead_hidden_delivery(&db, delivery_id).await {
                 Ok(Some(_)) | Ok(None) => {
                     let mut i = eng.lock().await;
@@ -2077,6 +2087,63 @@ pub fn apply_persisted_meta(inner: &mut EngineInner, json: &str) {
     inner.last_tools = m.tools;
 }
 
+/// One serial admission gate per lead thread / worker session. This is kept
+/// outside [`EngineInner`] so constructors, engine replacement, and durable
+/// journal enqueue all converge on the same gate even when no engine is
+/// resident yet. The gate is always acquired before the global engine
+/// admission `RwLock`; callers must not invert that order.
+static ENGINE_ADMISSION_GATES:
+    std::sync::OnceLock<DashMap<i64, std::sync::Weak<tokio::sync::Mutex<()>>>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn admission_gate_for_key(key: i64) -> Arc<tokio::sync::Mutex<()>> {
+    let gates = ENGINE_ADMISSION_GATES.get_or_init(DashMap::new);
+    // Weak values let an engine/session release its gate, but the map still
+    // needs opportunistic pruning so a long-lived app does not retain every
+    // historical thread key forever. An entry whose gate is still held by an
+    // admission guard upgrades successfully and is therefore preserved.
+    let stale_keys = gates
+        .iter()
+        .filter_map(|entry| entry.value().upgrade().is_none().then_some(*entry.key()))
+        .collect::<Vec<_>>();
+    for stale_key in stale_keys {
+        // `remove_if` rechecks the Weak under the shard lock. A concurrent
+        // caller may have replaced the dead entry with a live gate after the
+        // scan; never remove that replacement, or the next caller could mint a
+        // second mutex for the same key while the first guard is still held.
+        let _ = gates.remove_if(&stale_key, |_key, weak| weak.upgrade().is_none());
+    }
+    match gates.entry(key) {
+        dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+            if let Some(gate) = entry.get().upgrade() {
+                return gate;
+            }
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            entry.insert(Arc::downgrade(&gate));
+            gate
+        }
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            entry.insert(Arc::downgrade(&gate));
+            gate
+        }
+    }
+}
+
+/// Run one durable enqueue/dispatch linearization point while holding the
+/// per-surface serial gate. Commands use this for journal-backed inserts; the
+/// visible send keeps an owned guard for its longer Phase-1→spawn admission.
+/// Keeping this small helper shared makes barrier tests exercise the exact gate
+/// primitive used by production enqueue paths rather than a test-only mutex.
+pub(crate) async fn with_admission_gate<T, F, Fut>(key: i64, operation: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let _serial = admission_gate_for_key(key).lock_owned().await;
+    operation().await
+}
+
 /// All live chat engines, keyed by `-thread_id` (lead) or `session_id` (worker).
 ///
 /// A [`DashMap`] (sharded, lock-free at the map level) rather than a
@@ -2370,13 +2437,29 @@ async fn validate_registered_engine_identity(
     Ok(())
 }
 
+pub(crate) struct EngineAdmissionGuard {
+    _serial: tokio::sync::OwnedMutexGuard<()>,
+    _global: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
 async fn engine_admission_guard(
     app: &AppHandle,
     db: &Db,
     eng: &EngineRef,
-) -> anyhow::Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>> {
+) -> anyhow::Result<EngineAdmissionGuard> {
+    let key = {
+        let inner = eng.lock().await;
+        inner
+            .session_id
+            .map(i64::from)
+            .unwrap_or_else(|| super::commands::lead_key(inner.thread_id))
+    };
+    // Lock order is deliberate: per-surface serial gate first, global engine
+    // admission read second. We do not hold the engine mutex while waiting on
+    // either gate, so a delete writer or stop path cannot form a cycle.
+    let serial = admission_gate_for_key(key).lock_owned().await;
     let state = app.try_state::<LeadChatState>();
-    let guard = if let Some(state) = state.as_ref() {
+    let global = if let Some(state) = state.as_ref() {
         Some(state.engine_admission_read().await)
     } else {
         None
@@ -2394,7 +2477,10 @@ async fn engine_admission_guard(
         &direction_scope,
     )
     .await?;
-    Ok(guard)
+    Ok(EngineAdmissionGuard {
+        _serial: serial,
+        _global: global,
+    })
 }
 
 async fn ensure_running_admitted(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
@@ -2446,6 +2532,34 @@ pub(crate) fn durable_hidden_delivery_text(
         "<weft:{}>{json}</weft:{}>",
         row.source_kind, row.source_kind
     ))
+}
+
+/// Read the authoritative pending hidden rows at a visible-send admission
+/// boundary. Callers must hold the engine mutex (and the per-surface admission
+/// gate) while awaiting this helper; the returned rows are only a validated
+/// snapshot, so the caller still performs one final `get_by_id` recheck before
+/// each reservation. Keeping the DB read/format step in a production helper
+/// gives tests a seam that exercises the same pending-row path as `send`.
+async fn pending_hidden_rows_at_admission(
+    db: &Db,
+    inner: &EngineInner,
+) -> anyhow::Result<Vec<(
+    crate::store::entities::lead_hidden_delivery::Model,
+    String,
+)>> {
+    let rows = repo::list_pending_lead_hidden_deliveries(db, Some(inner.thread_id)).await?;
+    let mut prepared = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(current) = repo::get_lead_hidden_delivery(db, row.id).await? else {
+            continue;
+        };
+        if current.state != repo::LEAD_HIDDEN_DELIVERY_PENDING {
+            continue;
+        }
+        let text = durable_hidden_delivery_text(&current)?;
+        prepared.push((current, text));
+    }
+    Ok(prepared)
 }
 
 struct PendingHiddenSpawn {
@@ -2518,119 +2632,131 @@ async fn admit_pending_durable_hidden_for_visible(
     db: &Db,
     eng: &EngineRef,
 ) -> anyhow::Result<()> {
-    let (thread_id, prepared) = {
-        let inner = eng.lock().await;
-        let rows = repo::list_pending_lead_hidden_deliveries(db, Some(inner.thread_id)).await?;
-        let mut prepared = Vec::with_capacity(rows.len());
-        for row in rows {
-            let text = durable_hidden_delivery_text(&row)?;
-            prepared.push((row, text));
-        }
-        (inner.thread_id, prepared)
-    };
+    // Keep the engine mutex from the final pending-row snapshot through every
+    // DB state recheck and hidden reservation. The per-surface admission gate
+    // held by `send` covers the lock gap before/after this helper; retaining
+    // this mutex here closes the older stale-snapshot window where a consume
+    // task could clear the marker after the snapshot and before enqueue.
+    let mut inner = eng.lock().await;
+    if inner.tearing_down {
+        anyhow::bail!("engine is tearing down");
+    }
+    if inner.rewinding {
+        anyhow::bail!("会话正在回退，请稍后重试");
+    }
+    // Validate/format the snapshot before mutating engine state. A malformed
+    // durable row therefore fails the visible send without partially reviving
+    // the stopped lead or reserving an earlier row.
+    let prepared = pending_hidden_rows_at_admission(db, &inner).await?;
     if prepared.is_empty() {
         return Ok(());
     }
 
-    let was_stopped = { eng.lock().await.stopped };
+    let thread_id = inner.thread_id;
+    let was_stopped = inner.stopped;
     let mut pending_spawn: Option<PendingHiddenSpawn> = None;
-    {
-        let mut inner = eng.lock().await;
-        if inner.tearing_down {
-            anyhow::bail!("engine is tearing down");
+    // Explicit visible input is the only path allowed to clear this flag for
+    // durable replay. The background restore path passes revive=false.
+    inner.stopped = false;
+
+    for (snapshot, _) in prepared {
+        // The DB row is authoritative at the actual reservation point. In
+        // particular, note_turn_activity may have consumed it while the
+        // engine mutex was held (its marker clear is intentionally a later
+        // re-lock); a consumed/deleted row must never be re-enqueued.
+        let Some(row) = repo::get_lead_hidden_delivery(db, snapshot.id).await? else {
+            continue;
+        };
+        if row.state != repo::LEAD_HIDDEN_DELIVERY_PENDING {
+            continue;
         }
-        // Explicit visible input is the only path allowed to clear this flag
-        // for durable replay. The background restore path passes revive=false.
-        inner.stopped = false;
+        let text = durable_hidden_delivery_text(&row)?;
 
-        for (row, text) in prepared {
-            // The snapshot was taken under this same engine boundary. A row may
-            // already be represented by the current or queued hidden turn (for
-            // example, a retry racing a previous admission); preserve that
-            // reservation instead of enqueueing a duplicate.
-            if hidden_delivery_is_duplicate(&inner, row.id) {
-                continue;
+        // A row may already be represented by the current or queued hidden
+        // turn (for example, a retry racing a previous admission); preserve
+        // that reservation instead of enqueueing a duplicate.
+        if hidden_delivery_is_duplicate(&inner, row.id) {
+            continue;
+        }
+
+        let mut delivery = hidden_delivery(
+            &inner.tool,
+            inner.turn.busy,
+            inner.stdin.is_some(),
+            inner.stopped,
+        );
+        // A stopped resident has no stdin. We have just admitted explicit user
+        // intent, so start the resident before classifying its first hidden row;
+        // the spawn and the hidden turn reservation stay in this mutex boundary.
+        if !inner.turn.busy && !per_turn(&inner.tool) && !is_acp_tool(&inner.tool) {
+            let reader = match ensure_running_locked(app, &mut inner).await {
+                Ok(reader) => reader,
+                Err(error) => {
+                    inner.stopped = was_stopped;
+                    return Err(error);
+                }
+            };
+            if let Some((stdout, generation, quota_command)) = reader {
+                spawn_reader(
+                    app.clone(),
+                    db.clone(),
+                    eng.clone(),
+                    stdout,
+                    generation,
+                    quota_command,
+                );
             }
-
-            let mut delivery = hidden_delivery(
+            delivery = hidden_delivery(
                 &inner.tool,
                 inner.turn.busy,
                 inner.stdin.is_some(),
                 inner.stopped,
             );
-            // A stopped resident has no stdin. We have just admitted explicit
-            // user intent, so start the resident before classifying its first
-            // hidden row; the spawn and the hidden turn reservation stay in the
-            // same mutex boundary.
-            if !inner.turn.busy && !per_turn(&inner.tool) && !is_acp_tool(&inner.tool) {
-                let reader = match ensure_running_locked(app, &mut inner).await {
-                    Ok(reader) => reader,
-                    Err(error) => {
-                        inner.stopped = was_stopped;
-                        return Err(error);
-                    }
-                };
-                if let Some((stdout, generation, quota_command)) = reader {
-                    spawn_reader(
-                        app.clone(),
-                        db.clone(),
-                        eng.clone(),
-                        stdout,
-                        generation,
-                        quota_command,
-                    );
-                }
-                delivery = hidden_delivery(
-                    &inner.tool,
-                    inner.turn.busy,
-                    inner.stdin.is_some(),
-                    inner.stopped,
-                );
-            }
+        }
 
-            let out = Outgoing {
-                text,
-                images: vec![],
-                tracked: false,
-                origin_tag: Some(hidden_delivery_tag(row.id)),
-                queue_id: None,
-                has_attachments: false,
-            };
-            match delivery {
-                HiddenDelivery::Noop => {
-                    inner.stopped = was_stopped;
-                    anyhow::bail!("durable hidden delivery {} is not admissible", row.id);
-                }
-                HiddenDelivery::Queue => {
-                    queue_hidden_delivery(app, &mut inner, out);
-                }
-                HiddenDelivery::WriteResident => {
-                    let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await;
-                    if let Err(error) = write_user(&mut inner, &out).await {
-                        drop(inner);
-                        rollback_failed_turn(app, db, eng, turn_id, "error").await;
-                        if was_stopped {
-                            let mut restored = eng.lock().await;
-                            restored.stopped = true;
-                            persist_activity(db, restored.session_id, thread_id, STATUS_STOPPED).await;
-                        }
-                        return Err(error);
+        let out = Outgoing {
+            text,
+            images: vec![],
+            tracked: false,
+            origin_tag: Some(hidden_delivery_tag(row.id)),
+            queue_id: None,
+            has_attachments: false,
+        };
+        match delivery {
+            HiddenDelivery::Noop => {
+                inner.stopped = was_stopped;
+                anyhow::bail!("durable hidden delivery {} is not admissible", row.id);
+            }
+            HiddenDelivery::Queue => {
+                queue_hidden_delivery(app, &mut inner, out);
+            }
+            HiddenDelivery::WriteResident => {
+                let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await;
+                if let Err(error) = write_user(&mut inner, &out).await {
+                    drop(inner);
+                    rollback_failed_turn(app, db, eng, turn_id, "error").await;
+                    if was_stopped {
+                        let mut restored = eng.lock().await;
+                        restored.stopped = true;
+                        persist_activity(db, restored.session_id, thread_id, STATUS_STOPPED).await;
                     }
+                    return Err(error);
                 }
-                HiddenDelivery::SpawnTurn => {
-                    let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await;
-                    // Only the first hidden row can need a spawn: it owns the
-                    // busy slot, and every following row observes Queue.
-                    pending_spawn = Some(PendingHiddenSpawn {
-                        out,
-                        turn_id,
-                        reset_epoch: inner.reset_epoch,
-                    });
-                }
+            }
+            HiddenDelivery::SpawnTurn => {
+                let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await;
+                // Only the first hidden row can need a spawn: it owns the busy
+                // slot, and every following row observes Queue.
+                pending_spawn = Some(PendingHiddenSpawn {
+                    out,
+                    turn_id,
+                    reset_epoch: inner.reset_epoch,
+                });
             }
         }
     }
 
+    drop(inner);
     if let Some(pending) = pending_spawn {
         if let Err(error) = spawn_hidden_turn_after_admission(
             app,
@@ -10186,6 +10312,241 @@ mod tests {
             ..malformed
         };
         assert!(durable_hidden_delivery_text(&unsupported).is_err());
+    }
+
+    async fn durable_hidden_fixture(tool: &str) -> (Db, EngineRef, i32) {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "admission-gate").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "thread", "issue", tool)
+            .await
+            .unwrap();
+        let row = repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "plan_decision",
+            7,
+            "plan_decision:7",
+            r#"{"tool":"plan_decision","message_id":7}"#,
+        )
+        .await
+        .unwrap();
+        let mut inner = test_inner(tool);
+        inner.thread_id = thread.id;
+        (
+            db,
+            std::sync::Arc::new(tokio::sync::Mutex::new(inner)),
+            row.id,
+        )
+    }
+
+    /// The final admission snapshot must trust the durable state, not the
+    /// in-memory negative marker. `note_turn_activity` consumes first and
+    /// clears that marker only after a later engine re-lock, so a visible send
+    /// arriving in between must observe the consumed row and skip it.
+    #[tokio::test]
+    async fn pending_hidden_admission_skips_consumed_row_with_stale_marker() {
+        let (db, eng, delivery_id) = durable_hidden_fixture("codex").await;
+        {
+            let mut inner = eng.lock().await;
+            mark_hidden_turn_started_with_delivery(&mut inner, Some(delivery_id));
+            assert_eq!(inner.turn_user_row, Some(-delivery_id));
+        }
+        repo::consume_lead_hidden_delivery(&db, delivery_id)
+            .await
+            .unwrap();
+
+        let inner = eng.lock().await;
+        let rows = pending_hidden_rows_at_admission(&db, &inner).await.unwrap();
+        assert!(rows.is_empty(), "consumed DB state is authoritative");
+        assert_eq!(inner.turn_user_row, Some(-delivery_id), "marker clear is deferred");
+    }
+
+    /// A delete/rewind fence removes the durable row before the visible send's
+    /// final recheck. The production snapshot helper must treat the missing row
+    /// exactly like `consumed`, even if a stale queue marker remains in memory.
+    #[tokio::test]
+    async fn pending_hidden_admission_skips_deleted_row_with_stale_marker() {
+        let (db, eng, delivery_id) = durable_hidden_fixture("opencode").await;
+        {
+            let mut inner = eng.lock().await;
+            mark_hidden_turn_started_with_delivery(&mut inner, Some(delivery_id));
+        }
+        repo::delete_lead_hidden_deliveries_for_thread(&db, eng.lock().await.thread_id)
+            .await
+            .unwrap();
+
+        let inner = eng.lock().await;
+        let rows = pending_hidden_rows_at_admission(&db, &inner).await.unwrap();
+        assert!(rows.is_empty(), "deleted DB state is authoritative");
+    }
+
+    /// The journal enqueue path uses the same production admission-gate
+    /// primitive as plan decisions and visible sends (`with_admission_gate`
+    /// for the short DB transaction, an owned guard for `send`). A visible
+    /// Phase-1 barrier therefore absorbs rows inserted before it and lets rows
+    /// inserted after it linearize as a later follow-up, never interleaving in
+    /// the middle.
+    #[tokio::test]
+    async fn durable_enqueue_waits_for_visible_admission_barrier() {
+        let (db, eng, _old_id) = durable_hidden_fixture("codex").await;
+        let key = -eng.lock().await.thread_id as i64;
+        let serial = admission_gate_for_key(key).lock_owned().await;
+        let db_for_enqueue = db.clone();
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let enqueue = tokio::spawn(async move {
+            with_admission_gate(key, || async move {
+                let _ = started_tx.send(());
+                repo::enqueue_lead_hidden_delivery(
+                    &db_for_enqueue,
+                    -key as i32,
+                    "plan_decision",
+                    8,
+                    "plan_decision:8",
+                    r#"{"tool":"plan_decision","message_id":8}"#,
+                )
+                .await
+            })
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut started_rx)
+                .await
+                .is_err(),
+            "enqueue must wait while visible Phase 1 owns the gate"
+        );
+        drop(serial);
+        started_rx.await.unwrap();
+        let inserted = enqueue.await.unwrap().unwrap();
+        assert_eq!(inserted.source_id, 8);
+
+        let inner = eng.lock().await;
+        let rows = pending_hidden_rows_at_admission(&db, &inner).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|(row, _)| row.source_id).collect::<Vec<_>>(),
+            vec![7, 8],
+            "the later enqueue is FIFO after the already-pending row"
+        );
+    }
+
+    /// Hidden per-turn/ACP/Codex spawn completion is part of the same serial
+    /// admission scope. This barrier test injects a spawn result at the
+    /// production gate seam: a visible send cannot pass while spawn is pending,
+    /// and it is released only after the failure has rolled back.
+    #[tokio::test]
+    async fn admission_gate_blocks_visible_send_until_hidden_spawn_result() {
+        let key = -9_001_337_i64;
+        let gate = admission_gate_for_key(key);
+        let (spawn_started_tx, spawn_started_rx) = tokio::sync::oneshot::channel();
+        let (spawn_release_tx, spawn_release_rx) = tokio::sync::oneshot::channel();
+        let hidden = tokio::spawn(async move {
+            let result: anyhow::Result<()> = with_admission_gate(key, || async move {
+                let _ = spawn_started_tx.send(());
+                let _ = spawn_release_rx.await;
+                anyhow::bail!("injected spawn failure")
+            })
+            .await;
+            result
+        });
+        spawn_started_rx.await.unwrap();
+
+        let (visible_tx, mut visible_rx) = tokio::sync::oneshot::channel();
+        let visible = tokio::spawn(async move {
+            with_admission_gate(key, || async move {
+                let _ = visible_tx.send(());
+            })
+            .await;
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut visible_rx)
+                .await
+                .is_err(),
+            "visible admission must wait for the hidden spawn result"
+        );
+        spawn_release_tx.send(()).unwrap();
+        assert!(hidden.await.unwrap().is_err());
+        visible.await.unwrap();
+        visible_rx.await.unwrap();
+        drop(gate);
+    }
+
+    /// Resident stdin write failures have the same ordering guarantee as a
+    /// per-turn spawn failure: the visible gate remains held until rollback
+    /// finishes, so no promotion/direct dispatch can race the failed turn.
+    #[tokio::test]
+    async fn admission_gate_blocks_visible_send_until_resident_write_result() {
+        let key = -9_001_338_i64;
+        let (write_started_tx, write_started_rx) = tokio::sync::oneshot::channel();
+        let (write_release_tx, write_release_rx) = tokio::sync::oneshot::channel();
+        let resident = tokio::spawn(async move {
+            let result: anyhow::Result<()> = with_admission_gate(key, || async move {
+                let _ = write_started_tx.send(());
+                let _ = write_release_rx.await;
+                anyhow::bail!("injected resident write failure")
+            })
+            .await;
+            result
+        });
+        write_started_rx.await.unwrap();
+
+        let (visible_tx, mut visible_rx) = tokio::sync::oneshot::channel();
+        let visible = tokio::spawn(async move {
+            with_admission_gate(key, || async move {
+                let _ = visible_tx.send(());
+            })
+            .await;
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut visible_rx)
+                .await
+                .is_err(),
+            "visible admission must wait for the resident write result"
+        );
+        write_release_tx.send(()).unwrap();
+        assert!(resident.await.unwrap().is_err());
+        visible.await.unwrap();
+        visible_rx.await.unwrap();
+    }
+
+    /// The static map reuses one gate while any admission guard is live, so a
+    /// same-key hidden activity task cannot acquire a second mutex and run in
+    /// parallel. Weak values plus pruning then allow abandoned keys to be
+    /// collected instead of growing forever.
+    #[tokio::test]
+    async fn same_admission_key_reuses_one_gate_and_serializes_activity() {
+        let key = -9_001_339_i64;
+        let first = admission_gate_for_key(key);
+        let second = admission_gate_for_key(key);
+        assert!(Arc::ptr_eq(&first, &second));
+        let guard = first.clone().lock_owned().await;
+        let (activity_tx, mut activity_rx) = tokio::sync::oneshot::channel();
+        let activity = tokio::spawn(async move {
+            with_admission_gate(key, || async move {
+                let _ = activity_tx.send(());
+            })
+            .await;
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut activity_rx)
+                .await
+                .is_err(),
+            "same-key activity must not run under a second gate"
+        );
+        drop(guard);
+        activity.await.unwrap();
+        activity_rx.await.unwrap();
+        drop(first);
+        drop(second);
+        // The expired Weak remains only until the next gate lookup; that
+        // lookup prunes it under the DashMap shard lock without deleting a
+        // concurrently recreated live gate.
+        let replacement = admission_gate_for_key(key + 1);
+        assert!(
+            !ENGINE_ADMISSION_GATES
+                .get()
+                .is_some_and(|gates| gates.contains_key(&key)),
+            "expired key must be reclaimed"
+        );
+        drop(replacement);
     }
 
     #[test]
