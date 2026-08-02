@@ -42,6 +42,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -77,16 +78,203 @@ fn sse(value: Value) -> Response {
         .into_response()
 }
 
+/// The `?wt=` query param's three distinguishable states (issue #160
+/// round-10 P2 #2, Codex 107) — CLAUDE.md: derive ONE discriminated value,
+/// map it exhaustively, rather than re-deriving "is this absent, valid, or
+/// garbage" ad hoc. Before this type existed, `q.get("wt").and_then(|s|
+/// s.parse::<i32>().ok())` collapsed BOTH "no `?wt=` at all" and "a `?wt=`
+/// present but not a number" onto the identical `None` — so a malformed/
+/// forged non-numeric `wt` on a multi-repo direction took the SAME "first
+/// worktree" fallback an honestly-absent one gets, silently misdirecting a
+/// worker's screenshots/audit into a DIFFERENT repo's checkout. Round-8 P2 #7
+/// already closed this for an explicit NUMERIC id that doesn't resolve to a
+/// worktree of this direction (fail closed, never fall back to first); this
+/// closes the identical gap one parse step earlier, for a `wt` that isn't
+/// even numeric to begin with.
+enum WtParam {
+    /// No `?wt=` in the URL at all — the pre-existing "first worktree for
+    /// this direction" fallback in `session_root` is unchanged.
+    Absent,
+    /// `?wt=<n>` parsed to a valid i32 — may still fail closed later, in
+    /// `session_root`, if `n` doesn't name a worktree of THIS direction
+    /// (round-8 P2 #7); this variant only proves the STRING was numeric.
+    Explicit(i32),
+    /// `?wt=<garbage>` present but NOT a valid i32 — an EXPLICIT pin that is
+    /// simply malformed. Must reject the call outright, never fall back to
+    /// "first worktree": whatever worktree the caller meant to pin, a
+    /// non-numeric value manifestly isn't "no preference at all", so
+    /// silently guessing on its behalf reopens the exact misdirection
+    /// round-8 P2 #7 already refuses for a well-formed-but-wrong id.
+    Invalid,
+}
+
+impl WtParam {
+    fn parse(q: &HashMap<String, String>) -> WtParam {
+        match q.get("wt") {
+            None => WtParam::Absent,
+            Some(s) => match s.parse::<i32>() {
+                Ok(id) => WtParam::Explicit(id),
+                Err(_) => WtParam::Invalid,
+            },
+        }
+    }
+
+    /// Collapse to what `session_root` already knows how to resolve
+    /// (`Ok(Option<i32>)`, honoring round-8 P2 #7's own closed-set fail-
+    /// closed rule), or a fixed rejection for `Invalid` — the exhaustive map
+    /// CLAUDE.md asks for, kept in ONE place rather than an `if` scattered at
+    /// the call site.
+    fn resolve(&self) -> Result<Option<i32>, String> {
+        match self {
+            WtParam::Absent => Ok(None),
+            WtParam::Explicit(id) => Ok(Some(*id)),
+            WtParam::Invalid => Err(
+                "invalid wt query parameter — it must be a worktree id (a plain integer); omit it \
+                 entirely to fall back to this direction's first worktree"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+// —— issue #160 round-11 P1 #A: per-session bearer for this ONE privileged
+// endpoint ——
+//
+// Every OTHER bus MCP endpoint (`/bus/:thread/:dir/mcp`, `/planner/:thread/
+// mcp`, …) relies on the URL path alone for identity — an accepted, deliberate
+// local-first tradeoff for tools that only ever READ/steer a chat session (see
+// `bus::server`'s own top-of-file doc comment). `/computer/:thread/:dir/mcp` is
+// different in kind, not just degree: a POST that reaches [`call_computer`]
+// can capture the human's real screen and inject real mouse/keyboard input —
+// and unlike the bus endpoints, this one had NO caller-side authentication of
+// its own at all. The URL this route lives at is itself injected into a
+// worker's OWN MCP config/launch args (`inject::computer_url`) — readable by
+// that same worker's process (or, same-uid, by ANY other local process that
+// can read that worker's own config/environment) — so ANY local process that
+// can read (or simply guess: the path is just `/computer/<thread>/<dir>/mcp`,
+// two small integers/strings) could POST directly into this endpoint,
+// impersonating an arbitrary `(thread, dir)` identity. If that identity
+// happens to already hold a Full/exact-Always grant for some GUI action,
+// `auto_decision_exact` in [`approve`] would silently wave the forged call
+// through with no card at all — Weft would screenshot/click/type with its own
+// desktop permissions on a forged caller's behalf.
+//
+// The fix: a per-session, unguessable bearer token bound to the EXACT
+// `(thread, dir)` in the URL path, checked BEFORE the request's `method`/`id`
+// are even inspected and before ANY authorization logic runs — see
+// [`verify_computer_token`]. Deliberately NOT a persisted per-session secret
+// (no new store table, no migration): the token is a keyed HMAC of the path's
+// own `(thread, dir)` under a process-lifetime random secret, so verifying it
+// needs nothing more than recomputing the SAME HMAC from the SAME path values
+// — no lookup table to keep in sync, no secret to ever write to disk.
+//
+// KNOWN, ACCEPTED residual (not eliminated this round): a SAME-UID local
+// process can still read a legitimate worker's own MCP config file / process
+// environment / launch args and recover this SAME token from there — this
+// closes "any local process, any uid, can forge the path or guess a URL",
+// not "no same-uid process can ever recover this session's own credential".
+// That is the same-uid isolation ceiling this repo's other residuals already
+// live with (nothing here is weaker than the rest of the process's own trust
+// boundary) — full closure needs OS-level uid/sandbox isolation between
+// weft and the tool processes it launches, tracked (like the other real-
+// machine residuals in this file) as issue #160 §9 follow-up work, not
+// something a single-process HMAC can fix on its own.
+
+/// The process-wide HMAC key, generated ONCE per process from a CSPRNG
+/// (`rand::rngs::OsRng` — already in this crate's dependency tree, see
+/// `Cargo.toml`; this reuses it rather than adding a `getrandom`-direct
+/// dependency) the first time this is called, and NEVER regenerated,
+/// persisted, logged, or placed into any injected config — it lives ONLY in
+/// this process's memory for its own lifetime. A restart mints a brand-new
+/// secret (invalidating every previously-issued token, which is fine: a
+/// fresh process re-injects fresh URLs with fresh tokens for every session it
+/// spawns — nothing here needs to survive a restart).
+fn computer_endpoint_secret() -> &'static [u8; 32] {
+    static SECRET: OnceLock<[u8; 32]> = OnceLock::new();
+    SECRET.get_or_init(|| {
+        use rand::RngCore;
+        let mut buf = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        buf
+    })
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// The ONE place this module's HMAC key material gets constructed — shared by
+/// both [`computer_session_token`] (mint) and [`verify_computer_token`]
+/// (verify), so the two can never drift onto two different derivations of
+/// "the MAC for this (thread, dir)". Returns `Err` only if `HmacSha256::
+/// new_from_slice` itself rejects the key — HMAC accepts a key of ANY length
+/// (including this fixed 32-byte CSPRNG buffer), so this is a can't-happen
+/// path in practice; matched explicitly (never `.expect()`/`.unwrap()`) per
+/// CLAUDE.md's ban on panicking in a production path.
+fn computer_token_mac(thread: i32, dir: &str) -> Result<HmacSha256, hmac::digest::InvalidLength> {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(computer_endpoint_secret())?;
+    mac.update(format!("{thread}/{dir}").as_bytes());
+    Ok(mac)
+}
+
+/// The per-session token [`inject::computer_url`] appends as `&key=<token>`
+/// (issue #160 round-11 P1 #A) — hex(HMAC-SHA256(process secret,
+/// "{thread}/{dir}")). Deterministic for the SAME `(thread, dir)` (so a
+/// worker's own injected URL keeps working for the life of the process — this
+/// is never re-minted per-call), but unforgeable without either the process
+/// secret (never leaves memory) or reading it back off a legitimate worker's
+/// own already-injected config (the same-uid residual — see this module's own
+/// top-of-file doc comment).
+///
+/// `#[doc(hidden)] pub` (not `pub(crate)`): `bus::inject` is a SIBLING module
+/// (not a descendant of this one) that mints this into the URL it injects,
+/// and `tests/computer_mcp.rs` is a separate integration-test crate that needs
+/// to build the SAME token to drive the real endpoint — mirrors `args_digest`/
+/// `MAX_TYPE_CHARS`'s own doc comments on why a cross-module/cross-crate
+/// test-and-production-shared item is exposed this way. On the can't-happen
+/// HMAC-construction failure (see [`computer_token_mac`]'s own doc), this
+/// returns a fixed sentinel string that is not valid hex and therefore can
+/// NEVER equal a legitimately hex-encoded `key=` a caller could ever supply —
+/// keeping mint/verify symmetric (both go through the identical fallback) and
+/// fail-closed even in this can't-happen case, rather than silently minting
+/// (or accepting) an empty/predictable token.
+#[doc(hidden)]
+pub fn computer_session_token(thread: i32, dir: &str) -> String {
+    match computer_token_mac(thread, dir) {
+        Ok(mac) => hex::encode(mac.finalize().into_bytes()),
+        Err(_) => "hmac-init-failed-not-valid-hex".to_string(),
+    }
+}
+
+/// Constant-time verification of a caller-supplied `key` against the token
+/// [`computer_session_token`] would mint for THIS EXACT path `(thread, dir)`
+/// (issue #160 round-11 P1 #A) — used by [`handle_computer`] before anything
+/// else runs. Goes through `hmac`'s own `Mac::verify_slice` (backed by
+/// `subtle`'s constant-time equality) rather than decoding+comparing hex
+/// strings with `==`, which would short-circuit on the first mismatching
+/// byte and leak timing information about how much of the token the caller
+/// got right. A `supplied` that isn't even valid hex fails immediately
+/// (`hex::decode` error) — there is no valid token shape it could be
+/// mistaken for.
+fn verify_computer_token(thread: i32, dir: &str, supplied: &str) -> bool {
+    let Ok(supplied_bytes) = hex::decode(supplied) else {
+        return false;
+    };
+    match computer_token_mac(thread, dir) {
+        Ok(mac) => mac.verify_slice(&supplied_bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
 // `thread`/`dir` come from the URL path (same identity-can't-be-spoofed
 // guarantee `bus::server::handle` relies on for `/bus/:thread/:dir/mcp`).
 //
 // `?wt=<worktree_id>` (issue #160 round-2 P2 §5): an OPTIONAL query param a
 // caller can attach when it already knows the EXACT worktree its own worker
 // session materialized into — see `inject::computer_url`'s doc for who sets
-// it and why. Without it (or when it fails the closed-set check further
-// down, in `session_root`), the pre-existing "first worktree for this
+// it and why. Without it, the pre-existing "first worktree for this
 // direction" fallback is unchanged — a bare `?wt=`-less URL behaves exactly
-// as it always did.
+// as it always did. A malformed/non-numeric `wt` (issue #160 round-10 P2 #2)
+// is now REJECTED outright — see [`WtParam`] — rather than silently taking
+// that same fallback.
 pub async fn handle_computer(
     Path((thread, dir)): Path<(i32, String)>,
     Query(q): Query<HashMap<String, String>>,
@@ -94,17 +282,24 @@ pub async fn handle_computer(
     State(asks): State<AskRegistry>,
     Json(req): Json<Value>,
 ) -> Response {
+    // issue #160 round-11 P1 #A: reject BEFORE the request's `method`/`id`
+    // are even inspected, and before ANY authorization logic (`approve`'s own
+    // gate included) ever runs — see this module's own top-of-section doc
+    // comment for the full rationale. A caller with no `key=`, an empty one,
+    // or one that doesn't match THIS EXACT path's `(thread, dir)` gets a bare
+    // 401 — no JSON-RPC envelope, no hint about method/id/tool shape, nothing
+    // that would help a guessing caller narrow down the real token.
+    let supplied_key = q.get("key").map(String::as_str).unwrap_or("");
+    if !verify_computer_token(thread, &dir, supplied_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     // Notifications (no id) get a bare 202, same as the other bus handlers.
     let id = match req.get("id") {
         Some(v) => v.clone(),
         None => return StatusCode::ACCEPTED.into_response(),
     };
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    // Malformed/non-numeric `wt` is treated exactly like an absent one — the
-    // closed-set check in `session_root` would reject a forged value anyway,
-    // so a parse failure here just takes the same fallback path a step
-    // earlier.
-    let wt: Option<i32> = q.get("wt").and_then(|s| s.parse::<i32>().ok());
+    let wt = WtParam::parse(&q);
 
     let result: Value = match method {
         "initialize" => json!({
@@ -122,7 +317,10 @@ pub async fn handle_computer(
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            call_computer(&db, &asks, thread, &dir, wt, name, &args).await
+            match wt.resolve() {
+                Ok(wt) => call_computer(&db, &asks, thread, &dir, wt, name, &args).await,
+                Err(msg) => text_result(msg),
+            }
         }
         _ => json!({}),
     };
@@ -155,7 +353,7 @@ fn computer_tool_specs() -> Value {
     json!([
         {
             "name": "computer",
-            "description": format!("Observe AND control the human's screen — OS-level window listing/screenshot plus mouse/keyboard input injection. `action=list_windows` lists visible on-screen windows (Weft's own window and terminal-emulator apps are excluded, so you can never see yourself or the terminal you're running inside). `action=screenshot` captures ONE window — never the whole desktop — and returns a PNG FILE PATH; for clients that accept an inline MCP image (Claude, and ACP/omp sessions) the same result ALSO carries the screenshot inlined as an image block, so you can reason over it directly with no need to open the path yourself — other clients should open that file path with their own image-viewing tool. Every action except `list_windows`, `cursor_position`, and `wait` needs `window` (same id/substring rule as screenshot) and drives that window's input: `left_click`/`right_click`/`double_click`/`triple_click`/`mouse_move` need `coordinate` [x, y]; `left_click_drag` needs `start_coordinate` AND `coordinate` (end point); `scroll` needs `coordinate` plus `scroll_direction`; `type`/`key` need `text` (literal text to type, or a combo like \"cmd+s\"/\"ctrl+shift+t\"/\"Return\"/\"f5\" for `key`). ALL coordinates are in the pixel space of the MOST RECENT screenshot of that window — take a screenshot first (or again after the window resizes) to get coordinates that still line up, since the mapping is recomputed from the window's CURRENT size on every call and an out-of-range coordinate is rejected rather than guessed at. `type`/`key` additionally require a `left_click`/`right_click`/`double_click`/`triple_click` on that SAME window within the last {FOCUS_FRESHNESS_SECS}s — click inside the target window first to focus it, then type/key within {FOCUS_FRESHNESS_SECS}s, or the call is rejected. Every call — observation or input — may pause for a human's permission card (Needs-you) before it runs; an input action can additionally come back `Busy` (another session currently has it) or fail while a DIFFERENT permission card is still waiting on the human — retry after a moment. Input actions are also rate-limited to roughly 2 per second."),
+            "description": format!("Observe AND control the human's screen — OS-level window listing/screenshot plus mouse/keyboard input injection. `action=list_windows` lists visible on-screen windows (Weft's own window and terminal-emulator apps are excluded, so you can never see yourself or the terminal you're running inside). `action=screenshot` captures ONE window — never the whole desktop — and returns a PNG FILE PATH; for clients that accept an inline MCP image (Claude, and ACP/omp sessions) the same result ALSO carries the screenshot inlined as an image block, so you can reason over it directly with no need to open the path yourself — other clients should open that file path with their own image-viewing tool. Every action except `list_windows`, `cursor_position`, and `wait` needs `window` (same id/substring rule as screenshot) and drives that window's input: `left_click`/`right_click`/`double_click`/`triple_click`/`mouse_move` need `coordinate` [x, y]; `left_click_drag` needs `start_coordinate` AND `coordinate` (end point); `scroll` needs `coordinate` plus `scroll_direction`; `type`/`key` need `text` (literal text to type, or a combo like \"cmd+s\"/\"ctrl+shift+t\"/\"Return\"/\"f5\" for `key`). ALL coordinates are in the pixel space of the MOST RECENT screenshot of that window — you MUST screenshot a window before clicking/dragging/scrolling/moving the mouse in it, or the call is rejected (there is no screenshot on file yet to map coordinates against); a coordinate maps proportionally onto the window's CURRENT position and size even if it moved or resized since that screenshot, and an out-of-range coordinate (judged against the screenshot's own dimensions) is rejected rather than guessed at. `type`/`key` additionally require a `left_click`/`right_click`/`double_click`/`triple_click` on that SAME window within the last {FOCUS_FRESHNESS_SECS}s — click inside the target window first to focus it, then type/key within {FOCUS_FRESHNESS_SECS}s, or the call is rejected. Every call — observation or input — may pause for a human's permission card (Needs-you) before it runs; an input action can additionally come back `Busy` (another session currently has it) or fail while a DIFFERENT permission card is still waiting on the human — retry after a moment. Input actions are also rate-limited to roughly 2 per second."),
             "inputSchema": { "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": VALID_ACTIONS,
@@ -285,6 +483,27 @@ async fn run_action(
     // a Needs-you card exactly like `bus::server::handle_ask` does for every
     // other tool call in this crate.
     //
+    // issue #160 round-10 P2 #5 (Codex 296): for a Write (input) action,
+    // refuse to even OPEN a new approval card when this EXACT (thread, dir)
+    // already has a DIFFERENT one open and unanswered — checked BEFORE
+    // `approve` below, not just in each input arm's own later call (which
+    // still runs, unchanged, to catch a card that races in DURING the
+    // `approve` await itself — see `check_suspended`'s own doc). Without this
+    // earlier check, a human sitting on an unrelated open card who answers
+    // THIS action's brand-new one with Always/Full would record a standing
+    // grant for a call that then never actually runs (the in-arm check
+    // rejects it anyway, since the original card is still open) — two cards
+    // opened, one of them entirely wasted, and a grant recorded for
+    // authorization that was never exercised. Observation actions
+    // (`screenshot`/`list_windows`/`cursor_position`) are untouched — they
+    // never take the control lease and were never meant to be blocked by an
+    // unrelated pending ask; `wait` IS Write-classified (see
+    // `GUI_WRITE_ACTIONS`'s own doc: it's part of an input sequence) and so
+    // IS now subject to this same pre-approve gate, even though its own arm
+    // below never calls `check_suspended` itself.
+    if crate::ask::classify_gui_action(action) == crate::ask::RiskLevel::Write {
+        check_suspended(asks, thread, dir)?;
+    }
     // issue #160 round-8 P1 #4: `approved` is the window identity `approve`
     // itself resolved AUTHORITATIVELY at the moment it authorized this call,
     // for a Write (input) action with a window argument — `None` for every
@@ -317,8 +536,40 @@ async fn run_action(
         }
         "screenshot" => {
             let window_query = required_window(args)?;
+            // issue #160 round-11 P1 #C: verify the window `approve` bound at
+            // authorization time (screenshot now binds one too — see that
+            // function's own `resolved`/doc comment) is STILL the window
+            // about to be captured — fail-closed otherwise, never silently
+            // capturing whatever the query happens to resolve to NOW. The
+            // read-only twin of every input arm's own
+            // `resolve_and_verify_target` gate (issue #160 round-8 P1 #4),
+            // applied here to an OBSERVE action for the first time: a card
+            // can sit open for a long time (up to `bus::server::ASK_WAIT`)
+            // before a human answers it, during which the ORIGINAL window
+            // could close and a same-titled replacement take its place — an
+            // exact-Always grant has the identical gap between "the window
+            // it was granted for" and "whatever the query resolves to on
+            // THIS call". Also records `window_id_out` for the audit line,
+            // even on the failure path (matches every input arm's own
+            // ordering — see that helper's doc).
+            // `_w` is used only for the verification above — every line
+            // below this keys off `shot.window_id` instead (the id
+            // `screenshot_window` ITSELF resolved and captured against),
+            // matching this arm's own pre-existing "no second resolution to
+            // drift" discipline (see the `store_screenshot_preview` call
+            // below).
+            let _w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
             let out_dir = screenshot_out_dir(db, thread, dir, wt).await?;
             let b = backend::backend();
+            // `screenshot_window` re-resolves `window_query` internally —
+            // the SAME query just verified above, against the SAME
+            // unchanging backend state, with no await/OS call in between —
+            // so it captures the IDENTICAL window `_w` just verified. This
+            // mirrors the accepted "resolve twice" pattern the click-family
+            // arms already use (`resolve_and_verify_target` itself is called
+            // twice per input action, once before/once after activation);
+            // here the gap is narrower still (no activation in between at
+            // all).
             let shot = computer::screenshot_window(b.as_ref(), window_query, &out_dir)
                 .map_err(|e| e.to_string())?;
             // issue #160 round-10 P2 #H: this confirmation text is shared by
@@ -371,6 +622,15 @@ async fn run_action(
             {
                 store_screenshot_preview(thread, dir, preview, shot.window_id);
             }
+            // issue #160 round-11 P1 #D: record THIS capture's own saved
+            // dimensions for (thread, dir, shot.window_id) — every
+            // coordinate-taking input arm below maps against whatever is on
+            // file here (see `computer::map_screenshot_coord`'s own doc),
+            // fail-closed if nothing is. Recorded unconditionally, on every
+            // successful capture, regardless of which engine is asking —
+            // matches `store_screenshot_preview`'s own "refresh every
+            // successful screenshot" rule right above.
+            computer::record_shot_dims(thread, dir, shot.window_id, shot.width, shot.height);
             // The MCP `image` content block is engine-gated — see
             // `engine_accepts_mcp_image`'s doc table.
             if engine_accepts_mcp_image(db, thread, dir).await {
@@ -448,7 +708,7 @@ async fn run_action(
             // and map/inject against THIS fresh state — never the
             // pre-activation `w`, which may already be stale by now.
             let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
-            let (px, py) = computer::map_to_physical(&w2, cx, cy).map_err(|e| e.to_string())?;
+            let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
             backend::backend()
                 .click(px, py, button, count)
                 .map_err(|e| e.to_string())?;
@@ -479,7 +739,7 @@ async fn run_action(
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
             // issue #160 round-10 P1 #B: see the click-family arm above.
             let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
-            let (px, py) = computer::map_to_physical(&w2, cx, cy).map_err(|e| e.to_string())?;
+            let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
             backend::backend()
                 .move_cursor(px, py)
                 .map_err(|e| e.to_string())?;
@@ -505,8 +765,8 @@ async fn run_action(
             let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
             let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
-            let from = computer::map_to_physical(&w2, sx, sy).map_err(|e| e.to_string())?;
-            let to = computer::map_to_physical(&w2, ex, ey).map_err(|e| e.to_string())?;
+            let from = map_input_coord(thread, dir, &w2, sx, sy)?;
+            let to = map_input_coord(thread, dir, &w2, ex, ey)?;
             let b = backend::backend();
             b.drag(from, to).map_err(|e| e.to_string())?;
             Ok(format!(
@@ -526,7 +786,7 @@ async fn run_action(
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
             // issue #160 round-10 P1 #B: see the click-family arm above.
             let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
-            let (px, py) = computer::map_to_physical(&w2, cx, cy).map_err(|e| e.to_string())?;
+            let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
             backend::backend()
                 .scroll(px, py, dx, dy)
                 .map_err(|e| e.to_string())?;
@@ -576,6 +836,23 @@ async fn run_action(
         "key" => {
             let window_query = required_window(args)?;
             let combo = required_text(args)?;
+            // issue #160 round-10 P2 #4 (Codex 580): validate the combo's
+            // SHAPE — a pure, argument-only check, no lease/throttle/backend
+            // touched — before `check_suspended`/`acquire_and_throttle`
+            // below, mirroring round-2 P2 §4's "purely-argument checks run
+            // first" discipline every other input arm already follows (see
+            // this section's own "input gates" doc comment further down).
+            // Before this, a malformed combo (e.g. "ctrl+a+b") wasn't
+            // rejected until `OsBackend::key` actually ran it through
+            // `parse_key_combo` a SECOND time — by which point this call had
+            // already taken the 30s control lease, consumed a throttle slot,
+            // and activated the target window, for a call that was always
+            // going to fail. The parsed tokens are discarded here (`let _`)
+            // — this exists ONLY to reject a malformed shape early; the
+            // combo's ACTUAL injection still goes through
+            // `backend::backend().key(combo)` below, unchanged (os.rs itself
+            // is not touched).
+            let _ = computer::parse_key_combo(combo).map_err(|e| e.to_string())?;
             check_suspended(asks, thread, dir)?;
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
@@ -726,15 +1003,33 @@ async fn approve(
     let digest = args_digest(args);
     // issue #160 round-10 P1 #A: resolve the window's identity FIRST, before
     // `action_key` is even built — see this function's own doc comment above
-    // for the standing-grant identity gap this closes. Only Write-classified
-    // actions with a non-blank window argument get this (mirrors the OLD
-    // `bind_approved_window`'s own gate exactly): `screenshot`/`list_windows`/
+    // for the standing-grant identity gap this closes. Every Write-classified
+    // action with a non-blank window argument gets this (mirrors the OLD
+    // `bind_approved_window`'s own gate exactly): `list_windows`/
     // `cursor_position` and `wait` (Write-classified but windowless) have
     // nothing to bind and keep the OLD, resolve-free key shape below.
-    // Fail-CLOSED — `Err`, never `Ok(None)` — when this resolve itself fails:
-    // an input action must not proceed at all once its own authorization
-    // step couldn't even pin down a window identity.
-    let resolved = if risk == crate::ask::RiskLevel::Write && !window_query.trim().is_empty() {
+    //
+    // issue #160 round-11 P1 #C: `screenshot` now ALSO resolves here, even
+    // though it's `RiskLevel::ReadOnly` — before this round, ONLY Write
+    // actions bound a window at all, so a screenshot's approval card/standing
+    // grant was scoped to the bare QUERY STRING alone, never the window it
+    // actually resolved to. That let a card opened (or an Always grant
+    // earned) for "screenshot @ notes" keep silently authorizing every FUTURE
+    // capture of whatever "notes" happens to resolve to later — including a
+    // DIFFERENT window that closed the original and took its place while the
+    // card sat open, or after the grant was earned. Folding the resolved
+    // identity into a screenshot's own key too closes that the same way
+    // round-10 P1 #A already closed it for input actions: a standing grant
+    // only ever matches the EXACT window it was granted against, and this
+    // same `resolved` value is what the screenshot arm below verifies the
+    // window it's ABOUT TO CAPTURE against (see `verify_approved_target`'s
+    // new call site there) — fail-closed if a human/Always-approved ONE
+    // window and a later capture would land on a DIFFERENT one.
+    // `list_windows`/`cursor_position` (no specific window target at all)
+    // are unaffected: `window_query` is always blank for them.
+    let resolved = if !window_query.trim().is_empty()
+        && (risk == crate::ask::RiskLevel::Write || action == "screenshot")
+    {
         let b = backend::backend();
         Some(computer::resolve_window(b.as_ref(), &window_query).map_err(|e| e.to_string())?)
     } else {
@@ -749,8 +1044,40 @@ async fn approve(
     // ships; loosening it to app-only scoping is a legitimate, separately-
     // discussable product tradeoff for later, not something this round
     // changes.
+    //
+    // issue #160 round-11 P1 #B: the resolved window's own `id` is now ALSO
+    // folded in — right after `window_query`, before `app`/`title` — for
+    // every action this branch covers (both Write actions with a window, and
+    // now `screenshot`). Before this, the key carried `app`+`title` but NOT
+    // `id`: if the ORIGINAL window closed and a NEW window opened with the
+    // exact same app+title (a relaunched app, a reopened document with an
+    // identical name), the key was IDENTICAL to the one a standing Always
+    // grant was earned against — silently authorizing input into (or a
+    // capture of) the REPLACEMENT window instance, even though
+    // `verify_approved_target`'s execution-time check (which DOES compare
+    // `id`) would have caught the SAME mismatch had the grant lookup itself
+    // been scoped that tightly to begin with. Folding `id` into the key
+    // closes that at the SOURCE: a new window instance (new id) mints a
+    // DIFFERENT key regardless of how closely its app/title happen to match
+    // the old one, missing `auto_decision_exact` and falling through to a
+    // fresh card — the safer default for input/capture actions, at the cost
+    // of re-prompting once per window instance rather than once per
+    // app+title (documented tradeoff, not a bug: see the top-of-file doc for
+    // the a `type` Always-grant's own note on this same shape).
+    // `always_key_is_persistable` (ask.rs) only inspects `parts[0]`/`parts[1]`
+    // (`"gui"`/the action name) to decide whether a `type` grant is safe to
+    // persist — inserting `id` at position 3 (0-indexed) doesn't touch either
+    // of those, so that gate is unaffected by this shape change.
     let action_key = match &resolved {
-        Some(w) => crate::ask::action_key(&["gui", action, &window_query, &w.app, &w.title, &digest]),
+        Some(w) => crate::ask::action_key(&[
+            "gui",
+            action,
+            &window_query,
+            &w.id.to_string(),
+            &w.app,
+            &w.title,
+            &digest,
+        ]),
         None => crate::ask::action_key(&["gui", action, &window_query, &digest]),
     };
     // UNREDACTED, even for `action == "type"`: the human approving THIS card
@@ -949,6 +1276,33 @@ fn resolve_and_verify_target(
     *window_id_out = Some(w.id);
     verify_approved_target(approved, &w)?;
     Ok(w)
+}
+
+/// Map an agent-given screenshot-space coordinate for `w` — the FRESHLY
+/// resolved (post-activation) window every coordinate-taking input arm
+/// already has on hand — to a physical on-screen point, using `(thread,
+/// dir, w.id)`'s most recently recorded screenshot dimensions (issue #160
+/// round-11 P1 #D) rather than re-deriving a scale from `w`'s CURRENT size —
+/// see `computer::map_screenshot_coord`'s own doc for the resize-drift bug
+/// this replaces `computer::map_to_physical` to close.
+///
+/// Fails CLOSED — a clear, agent-facing error, never a silent fallback to
+/// "current size" — when NOTHING is on file for this exact `(thread, dir,
+/// w.id)`: an agent that never screenshotted `w.id` this session (or whose
+/// last screenshot fell out of `computer::MAX_SHOT_DIMS`'s bound) has no
+/// screenshot-space coordinate system to interpret its own `coordinate`
+/// against at all — this ALSO happens to enforce "screenshot before you
+/// click", a good practice this round is happy to require outright rather
+/// than merely encourage.
+fn map_input_coord(thread: i32, dir: &str, w: &computer::WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), String> {
+    let (shot_w, shot_h) = computer::shot_dims(thread, dir, w.id).ok_or_else(|| {
+        format!(
+            "no recent screenshot of window {} to map this coordinate against — take a screenshot of \
+             it first, then read coordinates off THAT screenshot",
+            w.id
+        )
+    })?;
+    computer::map_screenshot_coord(w, shot_w, shot_h, cx, cy).map_err(|e| e.to_string())
 }
 
 /// Fixed key order for the "consequential parameters" digest folded into the
@@ -1861,39 +2215,74 @@ fn rotate_audit_at_size(path: &std::path::Path, max_bytes: u64) {
 /// a real per-component atomic open (an `openat`-style walk with
 /// `FILE_FLAG_OPEN_REPARSE_POINT` at each step) is a follow-up, not required
 /// to close THIS specific leaf race, which is what this flag targets.
+///
+/// issue #160 round-10 P2 #3 (Codex 1868): `#[cfg(unix)]` also sets the
+/// create mode to `0o600` (owner read/write only). Before this, a fresh
+/// `computer-audit.jsonl` was created with whatever `open(2)`'s own default
+/// (`0o666`) survives the process umask — `0o644` under the common `022`
+/// umask — leaving desktop-activity metadata (target window queries, action
+/// arguments, timestamps, outcomes) world/group-readable on a shared
+/// machine. The screenshot files themselves were already `0o600` (see
+/// `computer::screenshot_window`); this brings the audit log to the SAME
+/// owner-only bar. Mode is only consulted by `open(2)` when it actually
+/// CREATES a new file (`O_CREAT` with no existing inode) — appending to an
+/// already-existing, already-lenient file from before this round keeps
+/// whatever mode it already had; only fresh files (and rotated-away originals
+/// — see `rotate_if_full`) get the tightened default.
 async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
     let mut options = tokio::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(unix)]
+    options.mode(0o600);
     options.open(path).await
 }
 
-/// The session's own working directory for `(thread, dir)`, before any
-/// output-specific suffix is appended — the shared base for
+/// The session's own Weft-managed output root for `(thread, dir[, wt])`,
+/// before any output-specific suffix is appended — the shared base for
 /// [`screenshot_out_dir`] (which appends a DIFFERENT suffix per lane; see
-/// its own doc comment) and [`audit_log_path`] (which appends the SAME
-/// `.weft/computer-audit.jsonl` suffix for both lanes).
+/// its own doc comment) and [`audit_log_path`] (which appends a per-lane
+/// suffix too).
 ///
-///  - worker lane (`dir` a direction id): a worktree of that direction's —
-///    see `wt`'s own doc below for exactly which one.
-///  - lead lane (`dir == bus::LEAD`): the lead's own scratch cwd,
-///    `<weft_home>/leads/<thread>` — same formula as
+///  - worker lane (`dir` a direction id): `<weft_home>/computer/<thread>/
+///    <dir>/wt-<id>`, `id` being the RESOLVED worktree id (see `wt`'s own doc
+///    below for exactly which one). issue #160 round-10 P1 #1 (Codex 1992 +
+///    672) moved this OFF the worktree entirely and into Weft's own managed
+///    storage — see [`crate::paths::computer_output_root`]'s doc for why: in
+///    a LINKED worktree, `git rev-parse --git-path info/exclude` resolves to
+///    the CANONICAL repo's own SHARED `.git/info/exclude` (worktrees share
+///    one gitdir's `info/` directory), so the OLD `<worktree>/.weft/...`
+///    location — once "excluded" via `git::git_exclude(".weft/")` — silently
+///    wrote a `.weft/` entry into the user's REAL repo metadata on the very
+///    first screenshot/audit line: a hard violation of "never wire Weft's
+///    own bookkeeping into a canonical repo". Nothing computer-use writes for
+///    the worker lane touches the worktree at all anymore, so that
+///    `git_exclude` call is gone too (see [`screenshot_out_dir`]/
+///    [`audit_log_path`]) — there is no longer anything to exclude FROM. The
+///    `wt-<id>` suffix keeps the SAME per-worktree isolation the old
+///    worktree-rooted path got for free (round-2 P2 §5): two worktrees of the
+///    same multi-repo direction still never share an output directory,
+///    whether `id` came from an EXPLICIT pin or the first-worktree fallback
+///    below.
+///  - lead lane (`dir == bus::LEAD`): UNCHANGED by this round — the lead's
+///    own scratch cwd, `<weft_home>/leads/<thread>` — same formula as
 ///    `lead_chat::commands::ensure_lead_cwd`, duplicated here since that
 ///    helper is private to its own module (see `builtin_allow.rs`'s doc
 ///    comment on why a lead's cwd is this scratch dir and not one of its
-///    workspace's repos).
+///    workspace's repos). Already Weft-managed storage before this round —
+///    it was never inside any worktree — so there was nothing to move.
 ///
 /// `wt` (issue #160 round-2 P2 §5): the CALLER's own worktree id, when it
 /// could resolve one — see `inject::computer_url`'s doc for who sets this
 /// and why (a multi-repo direction has MORE THAN ONE worktree row, and
 /// without this every worker sharing that direction fell back to whichever
 /// one happened to be first — screenshots/audit for a worker in repo B could
-/// silently land inside repo A's checkout instead). CLOSED-SET validated
-/// here: `Some(id)` is only honored when `id` names a worktree that actually
+/// silently land in repo A's namespace instead). CLOSED-SET validated here:
+/// `Some(id)` is only honored when `id` names a worktree that actually
 /// belongs to THIS direction (which is itself already confirmed to belong to
 /// THIS thread, below) — a forged/foreign worktree id can never redirect
-/// output into another direction's (or another thread's) worktree.
+/// output into another direction's (or another thread's) namespace.
 ///
 /// issue #160 round-8 P2 #7: an EXPLICIT `wt` that fails that check is now
 /// FAIL-CLOSED — `None` — rather than silently falling back to "the first
@@ -1903,18 +2292,21 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
 /// DIFFERENT direction/repo) it actively misdirected output: in a multi-repo
 /// direction, a worker session that explicitly pinned worktree B and lost the
 /// race against a deletion (or was handed a forged/stale id) would have had
-/// its screenshots and audit log silently written into worktree A's checkout
-/// instead — exposing that OTHER repo's on-screen pixels and activity to the
-/// wrong worker. Only a genuinely ABSENT `wt` (`None`) still falls back to
-/// "first worktree for this direction"; an explicit id that doesn't resolve
-/// now fails the whole call closed instead of picking a different worktree
-/// on its own.
+/// its screenshots and audit log silently written into worktree A's
+/// namespace instead — exposing that OTHER repo's on-screen pixels and
+/// activity to the wrong worker. Only a genuinely ABSENT `wt` (`None`) still
+/// falls back to "first worktree for this direction"; an explicit id that
+/// doesn't resolve now fails the whole call closed instead of picking a
+/// different worktree on its own. issue #160 round-10 P2 #2 ([`WtParam`])
+/// extends the SAME fail-closed rule one parse step earlier, for a `?wt=`
+/// that isn't even numeric — that rejection happens in `handle_computer`,
+/// before this function (or any of its callers) is ever reached.
 ///
-/// `None` on any failure (DB error, unresolvable path, deleted worktree row,
-/// a numeric `dir` that doesn't resolve to a direction belonging to THIS
-/// thread, or — per round-8 P2 #7 above — an EXPLICIT `wt` that doesn't name
-/// a worktree of this direction) — callers turn that into their own
-/// soft-failure text rather than a 500.
+/// `None` on any failure (DB error, unresolvable path, no worktree at all
+/// for this direction, a numeric `dir` that doesn't resolve to a direction
+/// belonging to THIS thread, or — per round-8 P2 #7 above — an EXPLICIT `wt`
+/// that doesn't name a worktree of this direction) — callers turn that into
+/// their own soft-failure text rather than a 500.
 async fn session_root(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Option<std::path::PathBuf> {
     if dir == crate::bus::LEAD {
         let home = crate::paths::weft_home().ok()?;
@@ -1926,24 +2318,37 @@ async fn session_root(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Optio
         _ => return None,
     }
     let worktrees = repo::list_worktrees(db, Some(direction_id)).await.ok()?;
-    match wt {
-        // round-8 P2 #7: an EXPLICIT pin must hit an actual worktree of THIS
-        // direction, or the whole call fails closed — silently falling back
-        // to the first worktree would write this session's screenshots/audit
-        // into a DIFFERENT repo's checkout in a multi-repo direction.
-        Some(id) => worktrees.iter().find(|w| w.id == id).map(|w| std::path::PathBuf::from(&w.path)),
-        None => worktrees.into_iter().next().map(|w| std::path::PathBuf::from(w.path)),
-    }
+    // round-8 P2 #7: an EXPLICIT pin must hit an actual worktree of THIS
+    // direction, or the whole call fails closed — silently falling back to
+    // the first worktree would write this session's screenshots/audit into a
+    // DIFFERENT repo's namespace in a multi-repo direction. An ABSENT `wt`
+    // still falls back to the first worktree, same as always.
+    let resolved_id = match wt {
+        Some(id) => worktrees.iter().find(|w| w.id == id).map(|w| w.id),
+        None => worktrees.first().map(|w| w.id),
+    }?;
+    let root = crate::paths::computer_output_root()
+        .ok()?
+        .join(thread.to_string())
+        .join(dir)
+        .join(format!("wt-{resolved_id}"));
+    Some(root)
 }
 
 /// Build `base/components[0]/components[1]/...`, refusing if ANY existing
-/// path component along the way is a symlink (issue #160 round-2 P2 §3): a
-/// worktree is repository-controlled content, so if anything with write
-/// access to the checkout (an agent's own earlier approved write, or the
-/// repo itself) replaces `.weft`, `.weft/computer-audit.jsonl`, or
-/// `.weft/screenshots` with a symlink, this WEFT PROCESS — not the sandboxed
-/// agent — would otherwise happily create/append/write straight through it
-/// to an arbitrary path OUTSIDE the worktree.
+/// path component along the way is a symlink (issue #160 round-2 P2 §3).
+/// Originally guarded a worktree's own `.weft` subtree (repository-controlled
+/// content a sandboxed agent's own approved writes could tamper with);
+/// round-10 P1 #1 moved the worker lane's own `base` off the worktree
+/// entirely and into a Weft-owned directory under `weft_home` (see
+/// [`session_root`]'s own doc) — that directory is created by Weft itself,
+/// never handed to a sandboxed agent to write into directly, so the
+/// worktree-tampering scenario this originally guarded against is largely
+/// closed by construction now. Kept anyway as defense in depth (a SEPARATE,
+/// same-uid process on the human's own machine could still reach into
+/// `weft_home` — a residual risk noted here, not fixed by this round) and
+/// because the lead lane's `base` (`<weft_home>/leads/<thread>`) is still a
+/// real, git-init'd working directory other tooling can touch.
 ///
 /// Checked component-by-component from `base` via `symlink_metadata` (never
 /// plain `metadata`, so a symlink is caught even when it points at something
@@ -1971,16 +2376,19 @@ fn refuse_symlinks(base: &std::path::Path, components: &[&str]) -> Result<std::p
 }
 
 /// Resolve the screenshot output directory for `(thread, dir[, wt])`:
-///  - worker lane: `<worktree>/.weft/screenshots` — excluded from git via
-///    `git::git_exclude` so weft's own screenshots never show up in `git
-///    status`/diffs.
+///  - worker lane: `<session_root>/screenshots` — a dedicated, Weft-managed
+///    directory (see [`session_root`]'s own doc for the round-10 P1 #1 move
+///    off the worktree). No `git::git_exclude` call anymore: this directory
+///    was never inside a git-tracked worktree to begin with, so there is
+///    nothing left to exclude FROM (and nothing left that could leak a
+///    `.weft/` entry into a canonical repo's `info/exclude`).
 ///  - lead lane: the lead's scratch cwd itself, `<weft_home>/leads/<thread>`
-///    (no extra `.weft/` layer — that whole directory is already
-///    weft-private).
+///    (no extra suffix — that whole directory is already weft-private).
+///    Unchanged by this round.
 ///
 /// `Err` (not silently `None`) on a resolution failure OR a refused symlink
 /// (issue #160 round-2 P2 §3, via [`refuse_symlinks`]) — callers surface the
-/// SPECIFIC reason (missing worktree vs. a compromised `.weft` path) to the
+/// SPECIFIC reason (missing worktree vs. a compromised output path) to the
 /// calling agent rather than one flattened "no worktree" text for both.
 async fn screenshot_out_dir(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Result<std::path::PathBuf, String> {
     let root = session_root(db, thread, dir, wt)
@@ -1989,29 +2397,68 @@ async fn screenshot_out_dir(db: &Db, thread: i32, dir: &str, wt: Option<i32>) ->
     if dir == crate::bus::LEAD {
         return Ok(root);
     }
-    crate::git::git_exclude(&root, ".weft/");
-    refuse_symlinks(&root, &[".weft", "screenshots"])
+    refuse_symlinks(&root, &["screenshots"])
 }
 
-/// Resolve the audit log path for `(thread, dir[, wt])`: `<session_root>/
-/// .weft/computer-audit.jsonl` for BOTH lanes (unlike [`screenshot_out_dir`],
-/// which skips the `.weft/` layer for the lead lane — the audit log always
-/// gets it, so it never collides with anything else a lead's scratch cwd
-/// might hold). Covered by the same `git::git_exclude(".weft/")` call as
-/// screenshots for the worker lane; a no-op, harmless call for the
-/// (non-git) lead scratch dir. `None` (best-effort, per [`append_audit`]'s
-/// own doc) on a resolution failure OR a refused symlink (issue #160 round-2
-/// P2 §3, via [`refuse_symlinks`]) — a compromised `.weft` just means this
-/// one call goes unlogged, same as any other audit-write failure.
+/// Resolve the audit log path for `(thread, dir[, wt])`:
+///  - worker lane: `<session_root>/computer-audit.jsonl` — directly under the
+///    dedicated per-(thread, dir, wt) directory [`session_root`] resolves
+///    (issue #160 round-10 P1 #1); no `.weft/` layer needed since the whole
+///    directory is already private to this one session, and no
+///    `git::git_exclude` call anymore for the SAME reason [`screenshot_out_dir`]
+///    no longer needs one.
+///  - lead lane: `<session_root>/.weft/computer-audit.jsonl` — UNCHANGED by
+///    this round. The lead's scratch cwd is a real, git-init'd directory
+///    holding other content too (see `session_root`'s own doc), so its audit
+///    log keeps its own `.weft/` subfolder rather than colliding at the top
+///    level.
+///
+/// `None` (best-effort, per [`append_audit`]'s own doc) on a resolution
+/// failure OR a refused symlink (issue #160 round-2 P2 §3, via
+/// [`refuse_symlinks`]) — a compromised output path just means this one call
+/// goes unlogged, same as any other audit-write failure.
 async fn audit_log_path(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Option<std::path::PathBuf> {
     let root = session_root(db, thread, dir, wt).await?;
-    crate::git::git_exclude(&root, ".weft/");
-    refuse_symlinks(&root, &[".weft", "computer-audit.jsonl"]).ok()
+    if dir == crate::bus::LEAD {
+        return refuse_symlinks(&root, &[".weft", "computer-audit.jsonl"]).ok();
+    }
+    refuse_symlinks(&root, &["computer-audit.jsonl"]).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // —— issue #160 round-10 P2 #2: `?wt=` three-state parsing ——
+
+    #[test]
+    fn wt_param_parse_distinguishes_absent_explicit_and_invalid() {
+        let mut q = HashMap::new();
+        assert!(matches!(WtParam::parse(&q), WtParam::Absent), "no wt key at all");
+
+        q.insert("wt".to_string(), "42".to_string());
+        assert!(matches!(WtParam::parse(&q), WtParam::Explicit(42)));
+
+        q.insert("wt".to_string(), "abc".to_string());
+        assert!(matches!(WtParam::parse(&q), WtParam::Invalid), "non-numeric");
+
+        q.insert("wt".to_string(), String::new());
+        assert!(matches!(WtParam::parse(&q), WtParam::Invalid), "present but empty");
+
+        q.insert("wt".to_string(), "-7".to_string());
+        assert!(
+            matches!(WtParam::parse(&q), WtParam::Explicit(-7)),
+            "a negative number still parses as i32 — session_root's own closed-set check is what \
+             ultimately rejects an id that doesn't name a real worktree, not this parse step"
+        );
+    }
+
+    #[test]
+    fn wt_param_resolve_only_invalid_rejects_absent_and_explicit_pass_through() {
+        assert_eq!(WtParam::Absent.resolve(), Ok(None));
+        assert_eq!(WtParam::Explicit(5).resolve(), Ok(Some(5)));
+        assert!(WtParam::Invalid.resolve().is_err());
+    }
 
     #[test]
     fn audit_line_is_one_json_object_per_line() {
@@ -2304,6 +2751,27 @@ mod tests {
     /// Always ever granted.
     #[tokio::test]
     async fn screenshot_still_cards_despite_a_read_only_session_grant_with_no_exact_always() {
+        // issue #160 round-11 P1 #C note: `approve` now resolves a
+        // `screenshot`'s window authoritatively too (not just Write actions),
+        // even on the path to opening a card — this needs a resolvable
+        // "notes" window (`shared_mock`, under `process_state_test_lock`) so
+        // that resolve itself succeeds, rather than failing before a card is
+        // ever created.
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 908_001,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
         let asks = AskRegistry::new();
         let thread = 908_001;
         let dir = "lead";
@@ -2372,11 +2840,40 @@ mod tests {
     /// never auto-approve".
     #[tokio::test]
     async fn screenshot_auto_approves_with_an_exact_always_grant_and_no_read_only_batch() {
+        // issue #160 round-11 P1 #C: `screenshot` now resolves its window
+        // authoritatively too, folding `id`/`app`/`title` into the key
+        // (issue #160 round-11 P1 #B) exactly like a Write action's key —
+        // this pre-seeded Always grant must be built the SAME way `approve`
+        // itself now would, or it silently misses and this call hangs
+        // waiting on a card nobody is spawned to answer.
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 908_003,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
         let asks = AskRegistry::new();
         let thread = 908_003;
         let dir = "lead";
         let args = json!({"action": "screenshot", "window": "notes"});
-        let action_key = crate::ask::action_key(&["gui", "screenshot", "notes", &args_digest(&args)]);
+        let action_key = crate::ask::action_key(&[
+            "gui",
+            "screenshot",
+            "notes",
+            "908003",
+            "Notes",
+            "notes",
+            &args_digest(&args),
+        ]);
         asks.seed_grants(crate::ask::GrantSnapshot {
             full: Vec::new(),
             always: vec![crate::ask::AlwaysGrant { thread, dir: dir.to_string(), action_key }],
@@ -2560,6 +3057,13 @@ mod tests {
             full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
             always: Vec::new(),
         });
+        // issue #160 round-11 P1 #D: an input action now maps its coordinate
+        // against a RECORDED screenshot's own dimensions (fail-closed with
+        // none on file) rather than the window's current size — seed the
+        // record directly (standing in for "this session already
+        // screenshotted this window") since the CURRENT size is what this
+        // test's own window origin/size started at, at 1:1 scale.
+        computer::record_shot_dims(thread, dir, 906_301, 800, 600);
 
         // Prime the global input throttle well ahead of time so the real
         // click below isn't itself rejected as rate-limited.
@@ -2738,6 +3242,11 @@ mod tests {
             full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
             always: Vec::new(),
         });
+        // issue #160 round-11 P1 #D: seed this window's own recorded
+        // screenshot dims (its size never changes in this scenario, only its
+        // origin does — see the hook below) so the click's coordinate mapping
+        // doesn't fail closed for want of a screenshot on file.
+        computer::record_shot_dims(thread, dir, 910_401, 800, 600);
 
         let _ = computer::throttle_input();
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
@@ -2994,6 +3503,10 @@ mod tests {
             full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
             always: Vec::new(),
         });
+        // issue #160 round-11 P1 #D: seed this window's recorded screenshot
+        // dims (unchanged for this scenario) so the click's coordinate
+        // mapping doesn't fail closed for want of a screenshot on file.
+        computer::record_shot_dims(thread, dir, 907_501, 800, 600);
 
         let _ = computer::throttle_input();
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
@@ -3053,6 +3566,7 @@ mod tests {
             "gui",
             "left_click",
             "editor",
+            "909101",
             "Editor",
             "notes.txt — Editor",
             &args_digest(&args),
@@ -3109,6 +3623,7 @@ mod tests {
             "gui",
             "left_click",
             "editor",
+            "909201",
             "Editor",
             "notes.txt — Editor",
             &args_digest(&args),
@@ -3150,16 +3665,158 @@ mod tests {
         assert!(err.contains("denied"), "{err}");
     }
 
-    /// Observe-class actions (`screenshot`, `list_windows`) — and any
-    /// Write-classified action with NO window argument at all (`wait`) —
-    /// never bind a window at all: `approve` returns `Ok(None)` for them, and
-    /// (issue #160 round-10 P1 #A) never resolves one in the first place —
-    /// see `approve`'s own `resolved` binding — so they're entirely
-    /// unaffected by round-8 P1 #4/round-10 P1 #A: there is nothing for
-    /// `verify_approved_target` to ever check against for these, and their
-    /// `action_key` keeps the OLD, resolve-free four-part shape.
+    // —— issue #160 round-11 P1 #B: Always key now also binds the window INSTANCE (id) ——
+
+    /// The exact gap round-11 P1 #B closes, isolated from round-10 P1 #A's
+    /// own (broader) "different window entirely" scenario above: the ORIGINAL
+    /// window closes and a NEW one opens with the EXACT SAME `app`+`title` —
+    /// a relaunched app, a reopened document with an identical name — but a
+    /// DIFFERENT `id`. Before this round, the key carried `app`+`title` but
+    /// NOT `id`, so this replacement window's key was IDENTICAL to the
+    /// original's — the standing Always grant would have silently kept
+    /// authorizing input into the REPLACEMENT instance. With `id` folded in,
+    /// the SAME query now mints a DIFFERENT key and must fall through to a
+    /// fresh card instead.
     #[tokio::test]
-    async fn observe_and_windowless_actions_never_bind_a_window() {
+    async fn standing_always_grant_misses_a_replaced_window_instance_with_the_same_app_and_title() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 909_301,
+            app: "Editor".into(),
+            title: "notes.txt — Editor".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let asks = AskRegistry::new();
+        let thread = 909_301;
+        let dir = "lead";
+        let args = json!({"action": "left_click", "window": "editor", "coordinate": [1, 1]});
+        // Seed an Always grant for the ORIGINAL window's identity (id 909_301).
+        let action_key = crate::ask::action_key(&[
+            "gui",
+            "left_click",
+            "editor",
+            "909301",
+            "Editor",
+            "notes.txt — Editor",
+            &args_digest(&args),
+        ]);
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: Vec::new(),
+            always: vec![crate::ask::AlwaysGrant { thread, dir: dir.to_string(), action_key }],
+        });
+
+        // The ORIGINAL window closed; a REPLACEMENT opened with the SAME
+        // app+title but a NEW id (909_302) — standing in for a relaunched
+        // app / reopened document with an identical name.
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 909_302,
+            app: "Editor".into(),
+            title: "notes.txt — Editor".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let asks_bg = asks.clone();
+        let args_bg = args.clone();
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "left_click", &args_bg).await });
+
+        let mut card = None;
+        for _ in 0..200 {
+            if let Some(a) = asks.open().into_iter().find(|a| a.thread == thread && a.dir == dir) {
+                card = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let card = card.expect(
+            "a REPLACED window instance (new id, same app+title) must miss the standing grant's \
+             key — bound to the OLD id — and surface a fresh card",
+        );
+
+        assert!(asks.answer(card.id, crate::ask::Answer::Allow));
+        let approved = handle.await.unwrap().unwrap();
+        assert_eq!(
+            approved,
+            Some(ApprovedWindow { id: 909_302, app: "Editor".into(), title: "notes.txt — Editor".into() }),
+            "the fresh card's own Allow binds the NEW window instance"
+        );
+    }
+
+    /// The mirror image, for completeness: the EXACT same window instance
+    /// (same id+app+title) still auto-approves via the standing grant — this
+    /// round's narrowing must not re-card a window that never actually
+    /// changed. (`standing_always_grant_auto_approves_when_the_window_
+    /// identity_is_unchanged` above already covers this end-to-end; this is
+    /// a second, differently-shaped window/query pair for variety, not a
+    /// duplicate of that test's own assertions.)
+    #[tokio::test]
+    async fn standing_always_grant_auto_approves_the_exact_same_window_instance() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 909_401,
+            app: "Notes".into(),
+            title: "Untitled".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let asks = AskRegistry::new();
+        let thread = 909_401;
+        let dir = "lead";
+        let args = json!({"action": "left_click", "window": "notes", "coordinate": [2, 2]});
+        let action_key = crate::ask::action_key(&[
+            "gui",
+            "left_click",
+            "notes",
+            "909401",
+            "Notes",
+            "Untitled",
+            &args_digest(&args),
+        ]);
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: Vec::new(),
+            always: vec![crate::ask::AlwaysGrant { thread, dir: dir.to_string(), action_key }],
+        });
+
+        let approved = tokio::time::timeout(std::time::Duration::from_secs(5), approve(&asks, thread, dir, "left_click", &args))
+            .await
+            .expect("must resolve without ever needing a human answer")
+            .expect("an exact id+app+title match must auto-approve");
+        assert_eq!(approved, Some(ApprovedWindow { id: 909_401, app: "Notes".into(), title: "Untitled".into() }));
+        assert!(asks.open().is_empty(), "an auto-approved call must never surface a card");
+    }
+
+    /// `list_windows` (no window argument at all) and `wait` (Write-classified
+    /// but windowless) never bind a window: `approve` returns `Ok(None)` for
+    /// both, and never even attempts a resolve for either — there is nothing
+    /// for `verify_approved_target` to ever check against, and their
+    /// `action_key` keeps the OLD, resolve-free four-part shape.
+    ///
+    /// issue #160 round-11 P1 #C note: this test USED TO also cover
+    /// `screenshot` here (asserting it never binds a window either) — that is
+    /// no longer true: `screenshot` now resolves and binds a window exactly
+    /// like a Write action does (see `approve`'s own `resolved` doc comment)
+    /// — see `screenshot_binds_its_resolved_window_like_a_write_action` and
+    /// `screenshot_fails_closed_when_its_window_arg_cannot_resolve` below for
+    /// screenshot's OWN, now-different behavior.
+    #[tokio::test]
+    async fn list_windows_and_wait_never_bind_a_window_arg() {
         let asks = AskRegistry::new();
         let thread = 907_601;
         let dir = "lead";
@@ -3167,13 +3824,6 @@ mod tests {
             full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
             always: Vec::new(),
         });
-
-        let screenshot_args = json!({"action": "screenshot", "window": "anything"});
-        let approved = approve(&asks, thread, dir, "screenshot", &screenshot_args).await.unwrap();
-        assert!(
-            approved.is_none(),
-            "an observe action must never bind a window, even with a window arg present: {approved:?}"
-        );
 
         let list_windows_args = json!({"action": "list_windows"});
         let approved_lw = approve(&asks, thread, dir, "list_windows", &list_windows_args).await.unwrap();
@@ -3185,6 +3835,242 @@ mod tests {
             approved_wait.is_none(),
             "wait is Write-classified but has no window argument to bind: {approved_wait:?}"
         );
+    }
+
+    // —— issue #160 round-11 P1 #C: screenshot ALSO binds its resolved window ——
+
+    /// The end-to-end property the fix exists for: a `screenshot` with a
+    /// non-blank, resolvable `window` argument now binds that window's
+    /// identity in `approve`'s return value, exactly like a Write action
+    /// does — closing the gap where a screenshot's standing grant/card used
+    /// to be scoped to the bare QUERY STRING alone (see `approve`'s own doc
+    /// comment for the full rationale).
+    #[tokio::test]
+    async fn screenshot_binds_its_resolved_window_like_a_write_action() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 907_602,
+            app: "Anything".into(),
+            title: "anything window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let asks = AskRegistry::new();
+        let thread = 907_602;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+
+        let screenshot_args = json!({"action": "screenshot", "window": "anything"});
+        let approved = approve(&asks, thread, dir, "screenshot", &screenshot_args).await.unwrap();
+        assert_eq!(
+            approved,
+            Some(ApprovedWindow { id: 907_602, app: "Anything".into(), title: "anything window".into() }),
+            "a resolvable screenshot must bind the SAME window identity a Write action would"
+        );
+    }
+
+    /// The fail-closed half: a `screenshot` whose `window` argument does NOT
+    /// resolve to any visible window must reject the WHOLE call — never
+    /// silently proceed with `Ok(None)` the way an unresolvable query used to
+    /// before this round (when screenshot never attempted a resolve at all).
+    #[tokio::test]
+    async fn screenshot_fails_closed_when_its_window_arg_cannot_resolve() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // No window matches "nonexistent-window-query" at all.
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 907_603,
+            app: "SomethingElse".into(),
+            title: "unrelated".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let asks = AskRegistry::new();
+        let thread = 907_603;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+
+        let screenshot_args = json!({"action": "screenshot", "window": "nonexistent-window-query"});
+        let err = approve(&asks, thread, dir, "screenshot", &screenshot_args).await.unwrap_err();
+        assert!(err.to_lowercase().contains("no visible window"), "{err}");
+    }
+
+    /// The end-to-end property `screenshot`'s NEW capture-time identity check
+    /// exists for (issue #160 round-11 P1 #C): a card is opened for
+    /// `screenshot @ shifty`, binding window X's identity the instant it
+    /// opens; while the human sits on that still-open card, the ORIGINAL
+    /// window closes and a DIFFERENT one — same title substring, so the SAME
+    /// query still matches — takes its place. The human's (now-stale) Allow
+    /// must NOT let the capture proceed against the replacement: `run_action`'s
+    /// own "screenshot" arm re-resolves fresh and must reject, exactly like
+    /// every input arm's own `resolve_and_verify_target` gate — no pixels are
+    /// ever captured of the wrong window.
+    #[tokio::test]
+    async fn screenshot_fails_closed_when_the_window_is_replaced_between_approval_and_capture() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 911_101,
+            app: "Shifty".into(),
+            title: "shifty window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        // Deliberately UNGRANTED — a real card must open, binding window X's
+        // identity at the instant it does.
+        let asks = AskRegistry::new();
+        let thread = 911_101;
+        let dir = "lead";
+
+        let db_bg = db.clone();
+        let asks_bg = asks.clone();
+        let handle = tokio::spawn(async move {
+            let mut window_id_out = None;
+            let mut image_out = None;
+            run_action(
+                &db_bg, &asks_bg, thread, dir, None, "computer", "screenshot",
+                &json!({"window": "shifty"}), &mut window_id_out, &mut image_out,
+            )
+            .await
+        });
+
+        let mut card = None;
+        for _ in 0..200 {
+            if let Some(a) = asks.open().into_iter().find(|a| a.thread == thread && a.dir == dir) {
+                card = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let card = card.expect("a screenshot with no standing grant must surface a card");
+
+        // The window is REPLACED while the card sits open: the SAME title
+        // substring still matches, but a DIFFERENT id and app — standing in
+        // for the original window closing and an unrelated one taking its
+        // place before the human answers.
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 911_102,
+            app: "Different App".into(),
+            title: "shifty window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        assert!(asks.answer(card.id, crate::ask::Answer::Allow));
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(
+            err.contains("changed since this action was approved"),
+            "must fail closed with the re-approve message, never silently capture the replacement: {err}"
+        );
+        assert!(
+            computer::shot_dims(thread, dir, 911_102).is_none(),
+            "a fail-closed capture must never record shot dims for the replacement window either"
+        );
+    }
+
+    /// The Always-grant twin of the test above: a standing Always grant
+    /// scoped to window X's identity must MISS once the query resolves to a
+    /// DIFFERENT window Y — falling through to a fresh card rather than
+    /// silently auto-capturing Y under a grant the human only ever earned for
+    /// X. Mirrors `standing_always_grant_misses_a_different_window_identity_
+    /// and_cards` (the click-family version) for `screenshot` specifically.
+    #[tokio::test]
+    async fn screenshot_standing_always_grant_misses_a_replaced_window_and_cards() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 911_201,
+            app: "Shifty".into(),
+            title: "shifty window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let asks = AskRegistry::new();
+        let thread = 911_201;
+        let dir = "lead";
+        let args = json!({"action": "screenshot", "window": "shifty"});
+        // Seed an Always grant for the CURRENT (soon-to-be-replaced) window's
+        // identity.
+        let action_key = crate::ask::action_key(&[
+            "gui",
+            "screenshot",
+            "shifty",
+            "911201",
+            "Shifty",
+            "shifty window",
+            &args_digest(&args),
+        ]);
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: Vec::new(),
+            always: vec![crate::ask::AlwaysGrant { thread, dir: dir.to_string(), action_key }],
+        });
+
+        // The query now resolves to a DIFFERENT window.
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 911_202,
+            app: "OtherApp".into(),
+            title: "an unrelated shifty window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let asks_bg = asks.clone();
+        let args_bg = args.clone();
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "screenshot", &args_bg).await });
+
+        let mut card = None;
+        for _ in 0..200 {
+            if let Some(a) = asks.open().into_iter().find(|a| a.thread == thread && a.dir == dir) {
+                card = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let card = card.expect(
+            "a DIFFERENT window identity must miss the screenshot's own standing grant key and \
+             surface a fresh card",
+        );
+
+        assert!(asks.answer(card.id, crate::ask::Answer::Deny));
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(err.contains("denied"), "{err}");
     }
 
     // —— issue #160 round-3 P1 §2 (extended round-5 review P1 §2): recheck_after_guard ——
@@ -3338,6 +4224,134 @@ mod tests {
             err.to_lowercase().contains("disabled"),
             "the re-check must deny with the disabled message, not proceed to dispatch: {err}"
         );
+    }
+
+    // —— issue #160 round-11 P1 #D: coordinate mapping by SAVED screenshot geometry ——
+
+    /// The fail-closed half, end-to-end through `run_action`'s own "left_click"
+    /// arm (Full-granted, so `approve` decides silently): a window that
+    /// resolves fine but was NEVER screenshotted for this exact (thread, dir)
+    /// has no screenshot-space coordinate system to map against at all —
+    /// the click must be rejected, never silently fall back to mapping
+    /// against the window's CURRENT size (the exact bug this round closes).
+    #[tokio::test]
+    async fn left_click_fails_closed_when_no_screenshot_is_on_file_for_the_window() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 912_001,
+            app: "Fresh".into(),
+            title: "never screenshotted".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        let asks = AskRegistry::new();
+        let thread = 912_001;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+        // Deliberately NO `computer::record_shot_dims` call for this
+        // (thread, dir, 912_001) — this window has never been screenshotted.
+
+        // Clear the global input throttle window so this call isn't itself
+        // rejected as rate-limited (which would mask the property under
+        // test) — mirrors every other real-input test in this module.
+        let _ = computer::throttle_input();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        let mut window_id_out = None;
+        let mut image_out = None;
+        let err = run_action(
+            &db, &asks, thread, dir, None, "computer", "left_click",
+            &json!({"window": "fresh", "coordinate": [1, 1]}),
+            &mut window_id_out, &mut image_out,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_lowercase().contains("screenshot"), "{err}");
+        assert!(
+            mock.actions.lock().unwrap_or_else(|e| e.into_inner()).iter().all(|a| !a.starts_with("click")),
+            "a fail-closed coordinate mapping must never let the click itself reach the backend"
+        );
+        computer::clear_control();
+    }
+
+    /// The end-to-end property this whole round exists for (the review's own
+    /// example: a 2000px window screenshotted at a downscaled 1280px, then
+    /// resized DOWN to 1000px before the next click): a coordinate read off
+    /// the SAVED screenshot must map to the SAME proportional position on the
+    /// window's CURRENT rectangle — never a position derived from treating
+    /// the screenshot as if it were sized to match the window's PRESENT
+    /// dimensions (`map_to_physical`'s old bug this round replaces).
+    #[tokio::test]
+    async fn left_click_maps_the_screenshot_coordinate_proportionally_after_a_resize() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // The window's CURRENT size — already resized DOWN from whatever it
+        // was at screenshot time.
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 912_101,
+            app: "Resizable".into(),
+            title: "resizable window".into(),
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        let asks = AskRegistry::new();
+        let thread = 912_101;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+        // The screenshot this agent is reading coordinates off of was saved
+        // at 1280x800 — BEFORE the window resized down to 1000x600 above.
+        computer::record_shot_dims(thread, dir, 912_101, 1280, 800);
+
+        // Clear the global input throttle window so this call isn't itself
+        // rejected as rate-limited.
+        let _ = computer::throttle_input();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        let mut window_id_out = None;
+        let mut image_out = None;
+        // (640, 400) is the exact midpoint of the 1280x800 screenshot.
+        let result = run_action(
+            &db, &asks, thread, dir, None, "computer", "left_click",
+            &json!({"window": "resizable", "coordinate": [640, 400]}),
+            &mut window_id_out, &mut image_out,
+        )
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        let actions = mock.actions.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            actions.iter().any(|a| a == "click 500,300 Left x1"),
+            "must land at the CURRENT window's own midpoint (500, 300 of 1000x600), not a position \
+             derived from the window's now-stale 1280x800 screenshot-time size: {actions:?}"
+        );
+        drop(actions);
+        computer::clear_control();
     }
 
     // —— issue #160 round-2 P2 §2: args_digest / Always-grant action_key ——
@@ -3500,6 +4514,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// issue #160 round-10 P2 #3 (Codex 1868): a freshly-created audit file
+    /// must be owner-only `0600`, never the umask-`022`-survivable `0644` a
+    /// bare `open(2)` with no explicit mode would leave it at. Checked via
+    /// `symlink_metadata` (not `metadata`) purely out of habit-consistency
+    /// with this module's other symlink-aware checks — the leaf here is an
+    /// ordinary file either way.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_audit_file_for_append_creates_an_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("weft-audit-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let leaf = base.join("computer-audit.jsonl");
+
+        let file = open_audit_file_for_append(&leaf).await.unwrap();
+        drop(file);
+        let mode = std::fs::symlink_metadata(&leaf).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a fresh computer-audit.jsonl must be owner-only (0600), not the umask-survivable default"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // —— issue #160 round-10 P1 #F: bounded audit-log rotation ——
 
     /// The core property: a file already AT (or over) the threshold gets
@@ -3652,20 +4693,27 @@ mod tests {
     }
 
     /// End-to-end through the async path a real worker's `screenshot`/audit
-    /// call takes (`session_root` → `screenshot_out_dir`/`audit_log_path`): a
-    /// symlinked `.weft` inside a MATERIALIZED WORKTREE is refused by BOTH,
-    /// and neither writes through it. Deliberately a WORKER (not the lead
-    /// lane): `screenshot_out_dir` skips the `.weft/` layer entirely for the
-    /// lead's own scratch cwd (see that function's own doc), so only the
-    /// worker path actually exercises the screenshot half of this check —
-    /// the lead lane still gets the audit-log half (covered structurally by
-    /// `audit_log_path` running the SAME `refuse_symlinks` call for both
-    /// lanes, exercised directly in the leaf/dir tests above). Doesn't touch
-    /// `WEFT_HOME` at all, avoiding that env var's own process-wide hazard
-    /// (see `tests/computer_mcp.rs`'s own note on it).
+    /// call takes (`session_root` → `screenshot_out_dir`/`audit_log_path`).
+    /// issue #160 round-10 P1 #1 moved the worker lane's output OFF the
+    /// worktree entirely and into a dedicated directory under `weft_home` —
+    /// so this test's hazard is no longer "a worktree-writable `.weft`"
+    /// (there is no `.weft` in the worktree for this path anymore at all —
+    /// asserted below) but the residual one `refuse_symlinks`'s own doc now
+    /// names: a symlink planted directly at the Weft-managed output
+    /// directory (by some OTHER same-uid process) is still refused, as
+    /// defense in depth. Needs an ISOLATED `WEFT_HOME` (unlike this module's
+    /// other worktree-path tests, which deliberately avoid touching it) —
+    /// see `paths::ENV_LOCK`'s own doc for why every WEFT_HOME-touching test
+    /// must hold it.
     #[cfg(unix)]
     #[tokio::test]
-    async fn screenshot_and_audit_paths_both_refuse_a_symlinked_weft_dir_in_a_worktree() {
+    async fn screenshot_and_audit_paths_both_refuse_a_symlinked_weft_managed_output_dir() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let weft_home =
+            std::env::temp_dir().join(format!("weft-computer-srv-refuse-sym-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let repo_tmp = tempfile::tempdir().unwrap();
@@ -3685,23 +4733,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
         std::fs::create_dir_all(&wt_path).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, wt_path.join(".weft")).unwrap();
-        repo::record_worktree(&db, r.id, direction.id, "b", &wt_path.to_string_lossy(), true, true, "")
+        let wt = repo::record_worktree(&db, r.id, direction.id, "b", &wt_path.to_string_lossy(), true, true, "")
             .await
             .unwrap();
 
         let dir_s = direction.id.to_string();
+        // Plant the symlinks at the Weft-managed output directory THIS
+        // session resolves to — deliberately NOT inside the worktree, which
+        // this round moves output off of entirely.
+        let session_dir = crate::paths::computer_output_root()
+            .unwrap()
+            .join(thread.id.to_string())
+            .join(&dir_s)
+            .join(format!("wt-{}", wt.id));
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::os::unix::fs::symlink(&outside, session_dir.join("screenshots")).unwrap();
+        std::os::unix::fs::symlink(&outside, session_dir.join("computer-audit.jsonl")).unwrap();
+
         let screenshot_err = screenshot_out_dir(&db, thread.id, &dir_s, None).await.unwrap_err();
         assert!(screenshot_err.contains("symlink"), "{screenshot_err}");
         let audit_path = audit_log_path(&db, thread.id, &dir_s, None).await;
-        assert!(audit_path.is_none(), "a symlinked .weft must refuse the audit path too");
+        assert!(audit_path.is_none(), "a symlinked output dir must refuse the audit path too");
         assert!(
             !outside.join("computer-audit.jsonl").exists() && !outside.join("screenshots").exists(),
             "must never write through the symlink"
         );
 
+        // issue #160 round-10 P1 #1: the worker lane must never touch the
+        // worktree's own `.weft` at all anymore — there is nothing left to
+        // `git_exclude` there either (that call is gone).
+        assert!(
+            !wt_path.join(".weft").exists(),
+            "worker-lane computer-use output must never touch the worktree at all"
+        );
+
+        std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&wt_path);
         let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&weft_home);
     }
 
     // —— issue #160 round-2 P2 §4: parameter validation before the lease ——
@@ -3871,10 +4940,160 @@ mod tests {
         );
     }
 
+    // —— issue #160 round-10 P2 #4: key combo validated before the lease ——
+
+    /// End-to-end through `run_action`'s own "key" arm (Full-granted, so
+    /// `approve` decides silently): a malformed combo (`ctrl+a+b` — a
+    /// non-modifier in a non-final position, see `parse_key_combo`'s own
+    /// grammar) is rejected before EVER touching the control lease/throttle
+    /// or activating the target window — `computer::control_state()` must
+    /// stay `None` and the mock backend must never see a `key`/`activate`
+    /// call, exactly like `missing_coordinate_click_never_touches_the_
+    /// control_lease`'s own property for the click family.
+    #[tokio::test]
+    async fn run_action_rejects_a_malformed_key_combo_before_touching_the_control_lease() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 904_201,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true")
+            .await
+            .unwrap();
+        let asks = AskRegistry::new();
+        let thread = 904_201;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+
+        let mut window_id_out = None;
+        let mut image_out = None;
+        let err = run_action(
+            &db, &asks, thread, dir, None, "computer", "key",
+            &json!({"window": "notes", "text": "ctrl+a+b"}),
+            &mut window_id_out, &mut image_out,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("ctrl") || err.to_lowercase().contains("key"), "{err}");
+        assert!(
+            mock.actions.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "a malformed combo must never reach the backend, not even an activate call"
+        );
+        assert!(
+            computer::control_state().is_none(),
+            "a rejected malformed combo must never touch the control lease"
+        );
+        computer::clear_control();
+    }
+
+    // —— issue #160 round-10 P2 #5: check_suspended before opening a NEW card ——
+
+    /// The property this fix exists for: a session with an ALREADY-open,
+    /// unanswered permission card must reject a Write action BEFORE `approve`
+    /// ever opens a SECOND card for it — not just after (the pre-existing
+    /// in-arm `check_suspended` calls still catch a card racing in DURING
+    /// `approve`'s own await, but this call never reaches that point at all).
+    /// Deliberately UNGRANTED (no standing Full/Always grant): if `approve`
+    /// ran first here, it would open a real Needs-you card of its own before
+    /// this test could even answer it, hanging until `bus::server::ASK_WAIT`
+    /// expires. Asserts all three: the pre-existing ask is still the ONLY
+    /// open one (no second card), the backend was never touched, and no
+    /// grant was recorded for the rejected call.
+    #[tokio::test]
+    async fn run_action_rejects_a_write_action_before_opening_a_second_card() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 904_301,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true")
+            .await
+            .unwrap();
+        let asks = AskRegistry::new();
+        let thread = 904_301;
+        let dir = "lead";
+        // An unrelated card is already open for this EXACT (thread, dir) —
+        // standing in for some other tool's own permission request racing
+        // in first.
+        let (existing_ask_id, _rx) = asks.request(
+            thread, dir, "some_other_tool", "an unrelated permission request", "detail",
+            crate::ask::RiskLevel::Unknown, "[\"unrelated\"]",
+        );
+
+        let mut window_id_out = None;
+        let mut image_out = None;
+        let err = run_action(
+            &db, &asks, thread, dir, None, "computer", "left_click",
+            &json!({"window": "notes", "coordinate": [1, 1]}),
+            &mut window_id_out, &mut image_out,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("permission card"), "{err}");
+        assert_eq!(
+            asks.open().len(),
+            1,
+            "no SECOND card may open while the original one is still unanswered"
+        );
+        assert_eq!(asks.open()[0].id, existing_ask_id, "the surviving open ask must be the ORIGINAL one");
+        assert!(
+            mock.actions.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "the backend must never be touched"
+        );
+        assert!(
+            computer::control_state().is_none(),
+            "no control lease may be taken for a call rejected before approve"
+        );
+
+        assert!(asks.answer(existing_ask_id, crate::ask::Answer::Deny));
+        computer::clear_control();
+    }
+
     // —— issue #160 round-2 P2 §5: multi-worktree `wt` routing ——
 
+    /// issue #160 round-10 P1 #1: `session_root` no longer returns the
+    /// worktree's OWN path for the worker lane — it returns a dedicated
+    /// namespace under `weft_home/computer/<thread>/<dir>/wt-<id>` (see that
+    /// function's own doc). This test now needs an ISOLATED `WEFT_HOME` to
+    /// assert deterministic paths — see `paths::ENV_LOCK`'s own doc for why
+    /// every WEFT_HOME-touching test must hold it.
     #[tokio::test]
     async fn session_root_wt_pins_the_exact_worktree_and_a_foreign_one_fails_closed() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let weft_home = std::env::temp_dir()
+            .join(format!("weft-computer-srv-session-root-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let tmp_a = tempfile::tempdir().unwrap();
@@ -3905,15 +5124,31 @@ mod tests {
                 .await
                 .unwrap();
         let dir_s = direction.id.to_string();
+        let expected_root_for = |wt_id: i32| {
+            crate::paths::computer_output_root()
+                .unwrap()
+                .join(thread.id.to_string())
+                .join(&dir_s)
+                .join(format!("wt-{wt_id}"))
+        };
 
-        // An explicit `wt` pins the EXACT worktree, even though it was
-        // inserted SECOND.
+        // An explicit `wt` pins the EXACT worktree's OWN weft-managed
+        // namespace, even though it was inserted SECOND.
         let root = session_root(&db, thread.id, &dir_s, Some(wt_b.id)).await.unwrap();
-        assert_eq!(root, std::path::PathBuf::from(&wt_b.path));
+        assert_eq!(root, expected_root_for(wt_b.id));
 
-        // No `wt` at all: unchanged pre-existing "first worktree" fallback.
+        // No `wt` at all: unchanged pre-existing "first worktree" fallback —
+        // still resolves to wt_a's OWN namespace, keeping the SAME
+        // per-worktree isolation the old worktree-rooted path got for free
+        // (round-2 P2 §5): two worktrees of the same multi-repo direction
+        // never share an output namespace, whether `wt` came from an
+        // explicit pin or this fallback.
         let no_wt = session_root(&db, thread.id, &dir_s, None).await.unwrap();
-        assert_eq!(no_wt, std::path::PathBuf::from(&wt_a.path));
+        assert_eq!(no_wt, expected_root_for(wt_a.id));
+        assert_ne!(
+            root, no_wt,
+            "wt_a and wt_b must never resolve to the same output namespace"
+        );
 
         // A `wt` naming a worktree of a DIFFERENT direction is rejected
         // (closed-set validation) — round-8 P2 #7: this must now FAIL CLOSED
@@ -3921,7 +5156,7 @@ mod tests {
         // direction" as it used to. A worker session that explicitly pinned a
         // worktree that's since become invalid must never have its
         // screenshots/audit quietly redirected into a DIFFERENT repo's
-        // checkout in this multi-repo direction.
+        // namespace in this multi-repo direction.
         let other_direction = repo::create_direction(
             &db, thread.id, "task2", "claude", repo_a.id, "why", "impl-only", "main",
         )
@@ -3944,6 +5179,9 @@ mod tests {
         // at all, here) must fail closed the exact same way.
         let deleted = session_root(&db, thread.id, &dir_s, Some(999_999)).await;
         assert_eq!(deleted, None, "an explicit wt with no matching worktree row must fail closed");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&weft_home);
     }
 
     // —— issue #160 round-2 P2 §7: bounded preview registry ——

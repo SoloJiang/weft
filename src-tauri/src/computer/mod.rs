@@ -206,6 +206,17 @@ pub enum ComputerError {
     /// the desktop (issue #160 M2) — checked in `bus::computer_srv` before
     /// any input action runs.
     SuspendedPendingAsk,
+    /// The OS-level global Escape shortcut — the kill switch's redundant
+    /// layer for while a CONTROLLED app (not weft's own WebView) holds real
+    /// OS focus — could not be registered (issue #160 round-10 P1 #7): some
+    /// other app already claimed it, or the desktop/platform doesn't support
+    /// it. Fail-closed: [`acquire_control`] refuses to grant control at all
+    /// rather than let input proceed with no way for a human to Escape out
+    /// while the target app has focus. Never constructed when no
+    /// `tauri::AppHandle` subsystem exists at all (unit tests, a headless
+    /// build) — see [`register_global_escape`]'s own doc for that
+    /// distinction.
+    EscapeUnavailable,
 }
 
 impl std::fmt::Display for ComputerError {
@@ -243,6 +254,12 @@ impl std::fmt::Display for ComputerError {
             ComputerError::SuspendedPendingAsk => write!(
                 f,
                 "a permission card is waiting for the human — input is suspended until it is answered"
+            ),
+            ComputerError::EscapeUnavailable => write!(
+                f,
+                "the global emergency-stop shortcut (Escape) could not be registered — it's likely \
+                 already claimed by another app — so computer control is refused; release whatever \
+                 is holding Escape, or drive this from weft's own window instead"
             ),
         }
     }
@@ -543,6 +560,144 @@ pub fn map_to_physical(w: &WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), C
     let px = w.x + (f64::from(cx) / scale).round() as i32;
     let py = w.y + (f64::from(cy) / scale).round() as i32;
     Ok((px, py))
+}
+
+// —— issue #160 round-11 P1 #D: map by SAVED screenshot geometry, not the
+// window's CURRENT size ——
+//
+// [`map_to_physical`] above recomputes `display_scale` from `w`'s CURRENT
+// `width`/`height` on every call — correct for a window that only MOVED
+// since the screenshot an agent is reading coordinates off of, but wrong for
+// one that RESIZED: a coordinate read off a screenshot taken at, say,
+// 1280px wide is expressed in THAT image's own pixel grid, not "whatever
+// grid a FRESH scale computed from the window's current (possibly now
+// different) width would produce". Example the round-11 review named: a
+// 2000px window captured at scale 0.64 (1280px saved), then resized down to
+// 1000px BEFORE the next click — `map_to_physical`'s old math would treat
+// screenshot-space `x=640` as if it were still "0.64 of the window's
+// current width", landing on physical `x=640/0.64=1000` (the window's own
+// current right edge) instead of the correct mid-point (`x=500`, half of
+// the NOW-1000px-wide window — since 640 was the horizontal MIDPOINT of the
+// 1280px-wide screenshot the agent actually looked at).
+//
+// [`map_screenshot_coord`] fixes this by taking the screenshot's OWN saved
+// `shot_w`/`shot_h` as an explicit input (recorded at capture time — see
+// [`record_shot_dims`]/[`shot_dims`] below) instead of re-deriving a scale
+// from `current_w`'s present size, then mapping `(cx, cy)` as a FRACTION of
+// that screenshot's own dimensions onto `current_w`'s CURRENT rectangle.
+// Whatever `current_w` looks like NOW (moved, resized, or both since the
+// screenshot), the same relative position within the window is what gets
+// clicked — never a position derived from treating the screenshot as if it
+// were sized to match the window's present dimensions.
+pub fn map_screenshot_coord(
+    current_w: &WindowInfo,
+    shot_w: u32,
+    shot_h: u32,
+    cx: u32,
+    cy: u32,
+) -> Result<(i32, i32), ComputerError> {
+    // Bounds are judged against the SCREENSHOT's own space, not the current
+    // window's — an agent only ever saw pixels `0..shot_w` x `0..shot_h`, so
+    // that (not whatever the window's current size happens to be) is the
+    // honest range to reject outside of. This also makes `shot_w`/`shot_h`
+    // of `0` (never produced by a real `screenshot_window` capture, but not
+    // this function's job to assume) safely reject every coordinate rather
+    // than divide by zero below.
+    if cx >= shot_w || cy >= shot_h {
+        return Err(ComputerError::OutOfBounds {
+            x: cx,
+            y: cy,
+            max_x: shot_w.saturating_sub(1),
+            max_y: shot_h.saturating_sub(1),
+        });
+    }
+    let px = current_w.x + ((f64::from(cx) / f64::from(shot_w)) * f64::from(current_w.width)).round() as i32;
+    let py = current_w.y + ((f64::from(cy) / f64::from(shot_h)) * f64::from(current_w.height)).round() as i32;
+    Ok((px, py))
+}
+
+/// Process-level "most recent screenshot's OWN saved dimensions, per window"
+/// registry (issue #160 round-11 P1 #D) — keyed by the FULL `(thread, dir,
+/// window_id)` triple (not just `(thread, dir)`, unlike [`screenshot_previews`]
+/// above): an agent may screenshot more than one window for the same
+/// session, and a later input action against a DIFFERENT window than the
+/// most-recently-screenshotted one must never silently reuse that other
+/// window's dimensions. [`bus::computer_srv`]'s own screenshot arm calls
+/// [`record_shot_dims`] once per successful capture (with `Screenshot::
+/// width`/`height`/`window_id` — the SAVED image's own dimensions, already
+/// downscaled if `display_scale` applied one, and the id
+/// `screenshot_window` itself resolved and captured against); every
+/// coordinate-taking input arm calls [`shot_dims`] before mapping and fails
+/// CLOSED (never silently falls back to the window's current size) when
+/// nothing is on file — see [`map_screenshot_coord`]'s own doc for why
+/// reusing "current size" as a stand-in for "the screenshot's size" is
+/// exactly the bug this round closes, so falling back to it here would
+/// silently reopen it. In-memory only, like every other per-session
+/// registry in this module (`recent_clicks`, `screenshot_previews`) — a
+/// restart starting empty just means the FIRST input action after restart
+/// needs a fresh screenshot first, which is the correct, safe default
+/// anyway.
+fn recent_shot_dims() -> &'static Mutex<std::collections::HashMap<(i32, String, u32), (u32, u32, u64)>> {
+    static DIMS: OnceLock<Mutex<std::collections::HashMap<(i32, String, u32), (u32, u32, u64)>>> = OnceLock::new();
+    DIMS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// This registry's capacity — mirrors [`MAX_PREVIEWS`]'s own reasoning (an
+/// unbounded, never-evicted map is its own resource-exhaustion hazard once a
+/// session can screenshot indefinitely many distinct windows), just keyed
+/// one field wider (`window_id` included), so a single busy session
+/// screenshotting many different windows can occupy more of this table's
+/// capacity than it would of the coarser `(thread, dir)`-keyed one. Sized
+/// generously above any realistic number of DISTINCT (session, window) pairs
+/// simultaneously in flight.
+const MAX_SHOT_DIMS: usize = 128;
+
+/// Evict the single oldest entry (by insertion timestamp) if `map` is
+/// already at capacity — same shape as [`evict_oldest_if_full`] above, kept
+/// as its own function (rather than reusing that one) since the key/value
+/// shapes differ (a `window_id`-widened key, no preview payload).
+fn evict_oldest_shot_dims_if_full(map: &mut std::collections::HashMap<(i32, String, u32), (u32, u32, u64)>) {
+    if map.len() < MAX_SHOT_DIMS {
+        return;
+    }
+    if let Some(oldest_key) = map.iter().min_by_key(|(_, (_, _, ts))| *ts).map(|(k, _)| k.clone()) {
+        map.remove(&oldest_key);
+    }
+}
+
+/// Record `(width, height)` — a SAVED screenshot's own dimensions — for
+/// `(thread, dir, window_id)`, refreshing whatever was on file for that
+/// exact triple (issue #160 round-11 P1 #D). Called ONLY from
+/// `bus::computer_srv`'s screenshot arm, right after a capture actually
+/// succeeds — see [`recent_shot_dims`]'s own doc for the full contract.
+/// `#[doc(hidden)] pub`: `bus::computer_srv` is a sibling module (not a
+/// child of this one) and `tests/computer_mcp.rs` is a separate integration-
+/// test crate — both need to call this directly (production code calls it
+/// after a real capture; tests seed it directly to exercise an input
+/// action's mapping without driving an actual screenshot round-trip first)
+/// — mirrors `mock::MockBackend`'s own doc comment on why a cross-module/
+/// cross-crate test-visible item is `#[doc(hidden)] pub` rather than
+/// `pub(crate)`/`#[cfg(test)]`.
+#[doc(hidden)]
+pub fn record_shot_dims(thread: i32, dir: &str, window_id: u32, width: u32, height: u32) {
+    let mut g = recent_shot_dims().lock().unwrap_or_else(|e| e.into_inner());
+    let key = (thread, dir.to_string(), window_id);
+    if !g.contains_key(&key) {
+        evict_oldest_shot_dims_if_full(&mut g);
+    }
+    g.insert(key, (width, height, now_ms()));
+}
+
+/// The most recently recorded screenshot dimensions for `(thread, dir,
+/// window_id)`, if any (issue #160 round-11 P1 #D) — `None` when this exact
+/// window was never screenshotted for this session (or the record has since
+/// been evicted), which every coordinate-taking input arm in
+/// `bus::computer_srv` treats as a fail-CLOSED "take a screenshot of this
+/// window first" rejection — see [`map_screenshot_coord`]'s own doc.
+#[doc(hidden)]
+pub fn shot_dims(thread: i32, dir: &str, window_id: u32) -> Option<(u32, u32)> {
+    let g = recent_shot_dims().lock().unwrap_or_else(|e| e.into_inner());
+    g.get(&(thread, dir.to_string(), window_id)).map(|(w, h, _)| (*w, *h))
 }
 
 /// Process-level nonce appended to every screenshot's filename (issue #160
@@ -979,6 +1134,29 @@ pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
     // `register_global_escape()` call here would reopen.
     if sync_needed {
         sync_shortcut_state();
+        // issue #160 round-10 P1 #7 (Codex 1220): fail CLOSED if THIS fresh
+        // hold needed a real Escape registration and it didn't actually
+        // succeed — see `escape_guard_permits_control`'s own doc for the (no
+        // subsystem vs. subsystem-but-rejected) distinction it encodes. A
+        // renewal (`sync_needed == false`) skips this: it never attempted a
+        // NEW registration to begin with, and round-4 P2 §4's own design
+        // already assumes an already-registered shortcut stays registered
+        // for the life of a live lease.
+        let permitted = escape_guard_permits_control(
+            APP_HANDLE.get().is_some(),
+            ESCAPE_REGISTER_OK.load(Ordering::SeqCst),
+        );
+        if !permitted {
+            // Roll back: never grant control without a working kill switch
+            // once a real subsystem exists and it just failed to register.
+            // Only clears OUR OWN just-stored hold — if some other caller
+            // already raced in and overwrote it, this leaves that one alone.
+            let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(guard.as_ref(), Some(h) if h.thread == thread && h.dir == dir) {
+                *guard = None;
+            }
+            return Err(ComputerError::EscapeUnavailable);
+        }
     }
     Ok(())
 }
@@ -1187,19 +1365,22 @@ fn escape_shortcut() -> tauri_plugin_global_shortcut::Shortcut {
     tauri_plugin_global_shortcut::Shortcut::new(None, tauri_plugin_global_shortcut::Code::Escape)
 }
 
-/// Best-effort: register the OS-level global Escape shortcut. Silently
-/// no-ops when [`set_app_handle`] hasn't run yet (`APP_HANDLE` still `None`
-/// — the common case in `cargo test --lib`, which never builds a real Tauri
-/// app) — this function's whole contract is "try to add the redundant OS
-/// layer if we can", never "the kill switch depends on this". A registration
-/// failure (already grabbed by another app, unsupported platform/desktop
-/// environment, ...) is logged and swallowed the same way, for the same
-/// reason: the WebView's own Esc listener and the in-memory
-/// [`StopState::stopped`] latch are the mechanisms that actually have to
-/// work; this is upside only.
-fn register_global_escape() {
+/// Register the OS-level global Escape shortcut. `Ok(())` when
+/// [`set_app_handle`] hasn't run yet (`APP_HANDLE` still `None` — the common
+/// case in `cargo test --lib`, which never builds a real Tauri app, and any
+/// headless/no-GUI build that never reaches `lib.rs`'s `setup()`): there is
+/// no subsystem here at all to have failed, so [`sync_shortcut_state`]/
+/// [`acquire_control`] treat that as "nothing to fail on" — see
+/// [`escape_guard_permits_control`]'s own doc for the full (no subsystem vs.
+/// subsystem-but-rejected) split this feeds. `Err` (issue #160 round-10 P1
+/// #7, Codex 1220) ONLY when an app handle IS installed and the OS itself
+/// refused the registration (already grabbed by another app, unsupported
+/// platform/desktop environment, ...) — logged here (same as before this
+/// round) AND now propagated so [`acquire_control`] can fail CLOSED instead
+/// of silently granting control with no working kill switch.
+fn register_global_escape() -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
-    let Some(app) = APP_HANDLE.get() else { return };
+    let Some(app) = APP_HANDLE.get() else { return Ok(()) };
     let result = app.global_shortcut().on_shortcut(escape_shortcut(), |app, _shortcut, event| {
         if event.state != tauri_plugin_global_shortcut::ShortcutState::Pressed {
             return;
@@ -1215,9 +1396,10 @@ fn register_global_escape() {
             let _ = emergency_stop(&db).await;
         });
     });
-    if let Err(err) = result {
+    if let Err(err) = &result {
         eprintln!("[weft] register global Escape shortcut: {err}");
     }
+    result.map_err(|e| e.to_string())
 }
 
 /// Best-effort unregister — the [`register_global_escape`] counterpart,
@@ -1261,6 +1443,19 @@ static SHORTCUT_REGISTER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static SHORTCUT_UNREGISTER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the LAST time [`sync_shortcut_state`] attempted a registration
+/// (i.e. found a live holder), that attempt actually succeeded — issue #160
+/// round-10 P1 #7. `true` is also the resting/default value for the
+/// no-live-holder case (`sync_shortcut_state`'s `unregister` branch resets it
+/// there): with no lease held, there is nothing for a NEXT `acquire_control`
+/// to have inherited a stale failure from — that next acquire runs its OWN
+/// fresh registration attempt and sets this itself. Read by
+/// [`escape_guard_permits_control`] (via [`acquire_control`]), which also
+/// needs to know whether a real subsystem exists at all — see that
+/// function's own doc for why the two questions are kept separate rather
+/// than folded into one bit.
+static ESCAPE_REGISTER_OK: AtomicBool = AtomicBool::new(true);
+
 /// Bring the OS-level global Escape shortcut's registration in line with the
 /// control lease's CURRENT truth (issue #160 round-4 P2 §4) — the ONE choke
 /// point [`acquire_control`], [`control_state`], and [`clear_control`] all
@@ -1283,12 +1478,52 @@ fn sync_shortcut_state() {
     if holder_live {
         #[cfg(test)]
         SHORTCUT_REGISTER_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
-        register_global_escape();
+        let result = register_global_escape();
+        // issue #160 round-10 P1 #7: recorded regardless of whether THIS
+        // particular sync came from `acquire_control` — `control_state`'s
+        // lazy-expiry path and `clear_control` only ever call this when
+        // `holder_live` is false (their own holder just went away), so the
+        // `holder_live` branch here is, in practice, always reached via a
+        // fresh `acquire_control` hold.
+        ESCAPE_REGISTER_OK.store(result.is_ok(), Ordering::SeqCst);
     } else {
         #[cfg(test)]
         SHORTCUT_UNREGISTER_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
         unregister_global_escape();
+        // No live holder means nothing needs the Escape guarantee right now
+        // — reset to the permissive default so a stale failure can't outlive
+        // the lease it belonged to and wrongly block some LATER, unrelated
+        // acquire that hasn't attempted its own registration yet.
+        ESCAPE_REGISTER_OK.store(true, Ordering::SeqCst);
     }
+}
+
+/// Whether an acquire that just (re)synced the OS-level Escape shortcut may
+/// proceed granting control, given (a) whether a real `tauri::AppHandle`
+/// subsystem is even installed and (b) — only when it is — whether the
+/// actual registration attempt succeeded. issue #160 round-10 P1 #7 (Codex
+/// 1220). Pure/synchronous so this exact fail-closed judgment call is
+/// unit-testable without a real `tauri::AppHandle`/global-shortcut backend
+/// (`cargo test --lib` never has one — see [`register_global_escape`]'s own
+/// doc) — `acquire_control` composes it with `APP_HANDLE.get().is_some()` and
+/// [`ESCAPE_REGISTER_OK`] at its one real call site, which isn't itself
+/// practical to drive from a plain `#[test]` with an actually-failing OS
+/// registration.
+///
+///  - no subsystem installed (`has_app_handle == false`) — the common case in
+///    every unit test and any headless/no-GUI build that never reaches
+///    `lib.rs`'s `setup()` — always permits: `register_global_escape` itself
+///    no-ops in this case, so there was never a real kill-switch guarantee to
+///    begin with, and fail-closing every unit test in this crate would be a
+///    far worse regression than the gap this fixes.
+///  - a subsystem IS installed and its own registration attempt came back
+///    `Err` (grabbed by another app, unsupported desktop, ...) is the ONLY
+///    case that refuses: a real desktop session where the redundant OS-level
+///    Escape genuinely could not be wired up must not silently grant control
+///    anyway — the human would have no way to Escape out while a CONTROLLED
+///    app (not weft) holds real OS focus.
+fn escape_guard_permits_control(has_app_handle: bool, register_ok: bool) -> bool {
+    !has_app_handle || register_ok
 }
 
 fn throttle_mutex() -> &'static Mutex<Option<Instant>> {
@@ -2040,6 +2275,103 @@ mod tests {
         assert_eq!((px, py), (110, 70));
     }
 
+    // —— map_screenshot_coord / recent_shot_dims (issue #160 round-11 P1 #D) ——
+
+    /// The end-to-end property this fix exists for: a screenshot taken at
+    /// 1280x800, the window later resized DOWN to 1000x600 (only the SIZE
+    /// changed — `map_to_physical`'s old scale-from-current-size math would
+    /// mismap this; see this function's own doc) — a screenshot-space
+    /// coordinate maps to the SAME relative position in the window's CURRENT
+    /// rectangle, not a position derived from the window's now-stale
+    /// original size.
+    #[test]
+    fn map_screenshot_coord_scales_a_screenshot_coordinate_to_the_current_window_rect() {
+        let current = WindowInfo {
+            id: 1,
+            app: "x".into(),
+            title: "x".into(),
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 600,
+        };
+        // (640, 400) is the exact midpoint of a 1280x800 screenshot (0.5,
+        // 0.5) — must land at the midpoint of the CURRENT 1000x600 rect,
+        // (500, 300), regardless of the screenshot's own original size.
+        let (px, py) = map_screenshot_coord(&current, 1280, 800, 640, 400).unwrap();
+        assert_eq!((px, py), (500, 300));
+    }
+
+    /// Same as above, but the window also MOVED (non-zero origin) — the
+    /// origin offset must still be added on top of the proportional mapping.
+    #[test]
+    fn map_screenshot_coord_adds_the_current_windows_origin() {
+        let current = WindowInfo {
+            id: 1,
+            app: "x".into(),
+            title: "x".into(),
+            x: 200,
+            y: 100,
+            width: 1000,
+            height: 600,
+        };
+        let (px, py) = map_screenshot_coord(&current, 1280, 800, 640, 400).unwrap();
+        assert_eq!((px, py), (200 + 500, 100 + 300));
+    }
+
+    /// Out-of-bounds is judged against the SCREENSHOT's own dimensions, never
+    /// the current window's — a coordinate at/beyond the screenshot's own
+    /// edge is rejected even though the current window might be far larger
+    /// (and vice versa: this test's own current window is SMALLER than the
+    /// screenshot, so a naive "bounds = current window size" check would
+    /// reject valid screenshot-space coordinates that this correctly accepts).
+    #[test]
+    fn map_screenshot_coord_bounds_are_judged_by_screenshot_size_not_current_window_size() {
+        let current = WindowInfo {
+            id: 1,
+            app: "x".into(),
+            title: "x".into(),
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 100,
+        };
+        // In-bounds for a 1280x800 screenshot even though it's far bigger
+        // than the current (200x100) window.
+        assert!(map_screenshot_coord(&current, 1280, 800, 1279, 799).is_ok());
+        // Out of bounds for that SAME screenshot — rejected using the
+        // screenshot's own size, not the (smaller) current window's.
+        let err = map_screenshot_coord(&current, 1280, 800, 1280, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            ComputerError::OutOfBounds { x: 1280, y: 0, max_x: 1279, max_y: 799 }
+        ));
+    }
+
+    #[test]
+    fn shot_dims_round_trips_what_was_recorded_and_is_isolated_per_window_id() {
+        record_shot_dims(920_001, "lead", 7, 1280, 800);
+        record_shot_dims(920_001, "lead", 8, 640, 480);
+        assert_eq!(shot_dims(920_001, "lead", 7), Some((1280, 800)));
+        assert_eq!(shot_dims(920_001, "lead", 8), Some((640, 480)));
+        // A DIFFERENT (thread, dir, window_id) triple that was never recorded
+        // must fail closed with `None` — never fall back to some other
+        // window's dims.
+        assert_eq!(shot_dims(920_001, "lead", 9), None, "no record for window 9 must be None");
+        assert_eq!(shot_dims(920_002, "lead", 7), None, "a different thread must not see thread 920_001's record");
+    }
+
+    #[test]
+    fn shot_dims_refreshing_the_same_window_overwrites_rather_than_duplicates() {
+        record_shot_dims(920_003, "lead", 1, 1280, 800);
+        record_shot_dims(920_003, "lead", 1, 640, 480);
+        assert_eq!(
+            shot_dims(920_003, "lead", 1),
+            Some((640, 480)),
+            "a second screenshot of the SAME window must replace the earlier dims, not stack"
+        );
+    }
+
     // —— control lock (issue #160 M2) ——
 
     #[test]
@@ -2472,8 +2804,48 @@ mod tests {
         // stays `None` for the whole process — both calls must silently
         // no-op rather than panic (there is no live runtime-behavior test
         // possible here; see the task's own verification-scope note).
-        register_global_escape();
+        // issue #160 round-10 P1 #7: `register_global_escape` now returns a
+        // `Result` — the no-`APP_HANDLE` case must still be `Ok`, never an
+        // `Err` that would fail-close every single-threaded test in this
+        // crate closed (see `escape_guard_permits_control`'s own doc).
+        assert!(register_global_escape().is_ok());
         unregister_global_escape();
+    }
+
+    // —— issue #160 round-10 P1 #7: fail-closed Escape registration ——
+
+    #[test]
+    fn escape_guard_permits_control_only_fails_closed_when_a_real_subsystem_rejected_it() {
+        // No subsystem at all (every unit test, any headless/no-GUI build):
+        // always permits, regardless of what `register_ok` says — there was
+        // never a real registration attempt to have failed.
+        assert!(escape_guard_permits_control(false, true));
+        assert!(
+            escape_guard_permits_control(false, false),
+            "no subsystem installed must permit control even if `register_ok` were somehow false"
+        );
+        // A real subsystem exists: its own registration result decides.
+        assert!(escape_guard_permits_control(true, true));
+        assert!(
+            !escape_guard_permits_control(true, false),
+            "a real subsystem that rejected registration must fail closed"
+        );
+    }
+
+    #[test]
+    fn acquire_control_grants_when_no_app_handle_subsystem_exists() {
+        // `cargo test --lib` never installs a real `tauri::AppHandle`
+        // (`APP_HANDLE` stays `None` all binary long — see
+        // `register_and_unregister_global_escape_noop_without_an_app_handle`'s
+        // own note), so every `acquire_control` in this whole test binary
+        // exercises exactly this path: `escape_guard_permits_control(false,
+        // _)` always permits. This test names that property explicitly
+        // rather than leaving it merely implied by every OTHER
+        // `acquire_control`-touching test incidentally succeeding.
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_control();
+        assert!(acquire_control(920_001, "esc-no-handle").is_ok());
+        clear_control();
     }
 
     // —— key combo parsing (issue #160 M2) ——

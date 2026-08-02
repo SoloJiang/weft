@@ -41,10 +41,24 @@ fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
 /// pre-existing URL shape, so every caller that can't resolve a worktree id
 /// (the lead lane, which has no worktree at all; an ACP branch that hasn't
 /// wired one through yet) is unaffected.
+///
+/// `&key=<token>` (issue #160 round-11 P1 #A): EVERY `weft_computer` URL now
+/// also carries this session-scoped bearer — `bus::computer_srv::
+/// computer_session_token(thread, dir)`, an HMAC of the path's own identity
+/// under a process-lifetime secret that never leaves memory (see that
+/// function's own doc for the full rationale). This is the ONLY bus MCP URL
+/// that gets one: `mcp_url`/`planner_url`/`curator_url`/`global_url` above are
+/// all unauthenticated by design (see `bus::server`'s own top-of-file doc
+/// comment on that tradeoff) — `/computer` alone can capture the screen and
+/// inject input, so it alone needs a caller-side credential on top of the
+/// path-derived identity every OTHER bus endpoint relies on. Appended with
+/// `&` when `?wt=` is already present, `?` otherwise — still exactly ONE
+/// query string, never two separately-prefixed ones.
 fn computer_url(base: &str, thread: i32, dir: &str, wt: Option<i32>) -> String {
+    let key = crate::bus::computer_srv::computer_session_token(thread, dir);
     match wt {
-        Some(id) => format!("{base}/computer/{thread}/{dir}/mcp?wt={id}"),
-        None => format!("{base}/computer/{thread}/{dir}/mcp"),
+        Some(id) => format!("{base}/computer/{thread}/{dir}/mcp?wt={id}&key={key}"),
+        None => format!("{base}/computer/{thread}/{dir}/mcp?key={key}"),
     }
 }
 
@@ -453,6 +467,13 @@ mod tests {
         assert_eq!(inj.args[0], "--mcp-config");
         let cfg = std::fs::read_to_string(dir.join(".weft-computer.mcp.json")).unwrap();
         assert!(cfg.contains("weft_computer") && cfg.contains("/computer/1/10/mcp"));
+        // issue #160 round-11 P1 #A: the injected URL now also carries the
+        // EXACT per-session bearer `computer_session_token` would mint for
+        // this same (thread, dir).
+        assert!(
+            cfg.contains(&format!("key={}", crate::bus::computer_srv::computer_session_token(1, "10"))),
+            "{cfg}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -463,7 +484,10 @@ mod tests {
             inj.args,
             vec![
                 "-c".to_string(),
-                "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp".to_string()
+                format!(
+                    "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp?key={}",
+                    crate::bus::computer_srv::computer_session_token(1, "10")
+                ),
             ]
         );
     }
@@ -473,12 +497,14 @@ mod tests {
     /// config-override flag.
     #[test]
     fn computer_wt_appends_the_query_param_for_claude_and_codex() {
+        let key = crate::bus::computer_srv::computer_session_token(1, "10");
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-wt-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", &dir, Some(42));
         assert_eq!(inj.args[0], "--mcp-config");
         let cfg = std::fs::read_to_string(dir.join(".weft-computer.mcp.json")).unwrap();
         assert!(cfg.contains("/computer/1/10/mcp?wt=42"), "{cfg}");
+        assert!(cfg.contains(&format!("&key={key}")), "{cfg}");
         let _ = std::fs::remove_dir_all(&dir);
 
         let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Path::new("/tmp"), Some(42));
@@ -486,13 +512,51 @@ mod tests {
             inj.args,
             vec![
                 "-c".to_string(),
-                "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp?wt=42".to_string()
+                format!("mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp?wt=42&key={key}"),
             ]
+        );
+    }
+
+    // —— issue #160 round-11 P1 #A: computer_url mints a per-session `&key=` ——
+
+    /// `computer_url` itself, directly: the token it appends is EXACTLY
+    /// `computer_session_token(thread, dir)` for that same path's own
+    /// identity — never a different/derived value — and it's attached
+    /// correctly whether or not `?wt=` is already present (`&key=` vs
+    /// `?key=`, never two separately-prefixed query strings).
+    #[test]
+    fn computer_url_appends_exactly_the_session_token_for_this_thread_dir() {
+        let no_wt = computer_url("http://127.0.0.1:9", 3, "30", None);
+        assert_eq!(
+            no_wt,
+            format!(
+                "http://127.0.0.1:9/computer/3/30/mcp?key={}",
+                crate::bus::computer_srv::computer_session_token(3, "30")
+            )
+        );
+
+        let with_wt = computer_url("http://127.0.0.1:9", 3, "30", Some(9));
+        assert_eq!(
+            with_wt,
+            format!(
+                "http://127.0.0.1:9/computer/3/30/mcp?wt=9&key={}",
+                crate::bus::computer_srv::computer_session_token(3, "30")
+            )
+        );
+
+        // A DIFFERENT (thread, dir) mints a DIFFERENT token — this isn't a
+        // constant/global secret slapped on every URL.
+        let other = computer_url("http://127.0.0.1:9", 4, "40", None);
+        assert_ne!(
+            no_wt.split("key=").nth(1),
+            other.split("key=").nth(1),
+            "two different (thread, dir) pairs must never share the same token"
         );
     }
 
     #[test]
     fn acp_mcp_servers_include_computer_toggles_weft_computer() {
+        let key = crate::bus::computer_srv::computer_session_token(1, "10");
         let with_computer = acp_mcp_servers(
             "http://127.0.0.1:9",
             1,
@@ -505,7 +569,7 @@ mod tests {
             None,
         );
         assert!(with_computer.iter().any(|s| s.name == "weft_computer"
-            && s.url == "http://127.0.0.1:9/computer/1/10/mcp"));
+            && s.url == format!("http://127.0.0.1:9/computer/1/10/mcp?key={key}")));
 
         let without_computer = acp_mcp_servers(
             "http://127.0.0.1:9",
@@ -525,6 +589,7 @@ mod tests {
     /// `weft_computer` URL's `?wt=` query param for an ACP worker.
     #[test]
     fn acp_mcp_servers_computer_wt_pins_the_worktree_query_param() {
+        let key = crate::bus::computer_srv::computer_session_token(1, "10");
         let with_wt = acp_mcp_servers(
             "http://127.0.0.1:9",
             1,
@@ -537,7 +602,7 @@ mod tests {
             Some(7),
         );
         assert!(with_wt.iter().any(|s| s.name == "weft_computer"
-            && s.url == "http://127.0.0.1:9/computer/1/10/mcp?wt=7"));
+            && s.url == format!("http://127.0.0.1:9/computer/1/10/mcp?wt=7&key={key}")));
     }
 
     #[test]

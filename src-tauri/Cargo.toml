@@ -95,6 +95,12 @@ xcap = { version = "0.9.7", optional = true }
 # 传递依赖系统库本机同样缺失。同挂 `computer-os` feature(默认关),不影响默认构建。
 enigo = { version = "0.6", optional = true }
 sha2 = "0.10"
+# Session-scoped `/computer/:thread/:dir/mcp` auth token (issue #160 round-11
+# P1 #A): HMAC-SHA256(process secret, "{thread}/{dir}"), verified constant-
+# time via `Mac::verify_slice`. sha2 is already a dependency (see above); a
+# proper HMAC construction (not a hand-rolled sha256(secret||msg)) avoids a
+# length-extension footgun for the small cost of this one crate.
+hmac = "0.12"
 
 [features]
 # 见上面 xcap/enigo 依赖注释。默认关闭,不影响任何现有构建/CI。

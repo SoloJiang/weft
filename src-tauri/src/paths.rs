@@ -68,6 +68,29 @@ pub fn skills_home() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// ~/.weft/computer — Weft-managed computer-use session output (screenshots
+/// + the audit log), keyed by `(thread, dir[, worktree])` by each caller —
+/// see `bus::computer_srv::session_root`'s own doc. issue #160 round-10 P1 #1:
+/// this REPLACES writing a worker-lane session's output straight into
+/// `<worktree>/.weft/...`. A LINKED worktree's `git rev-parse --git-path
+/// info/exclude` resolves to the CANONICAL repo's own SHARED
+/// `.git/info/exclude` (worktrees share one gitdir's `info/` directory), so
+/// the old path's own `git::git_exclude(".weft/")` call permanently wrote a
+/// `.weft/` entry into the user's REAL repo metadata on the very first
+/// screenshot/audit line — a hard violation of "never wire Weft's own
+/// bookkeeping into a canonical repo" (see CLAUDE.md). Routing through here
+/// instead keeps every byte of computer-use output inside Weft's own home,
+/// never inside a worker's writable worktree at all — closing both that
+/// canonical-repo leak AND narrowing the "worker-writable parent dir gets
+/// swapped for a symlink" hazard `bus::computer_srv::refuse_symlinks` guards
+/// (a directory Weft itself creates here is no longer repository-controlled
+/// content a sandboxed agent's own approved writes could tamper with).
+pub fn computer_output_root() -> std::io::Result<PathBuf> {
+    let dir = weft_home()?.join("computer");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Process-global lock guarding the shared `WEFT_HOME` env var across lib
 /// tests. The lib-test binary runs tests on parallel threads sharing one
 /// process env, so a test that *sets* WEFT_HOME (e.g. materialize tests) and a
@@ -95,6 +118,7 @@ mod tests {
         assert!(db_path().unwrap().ends_with("weft.db"));
         assert!(worktree_home().unwrap().ends_with("worktrees"));
         assert!(skills_home().unwrap().ends_with("skills/sources"));
+        assert!(computer_output_root().unwrap().ends_with("computer"));
     }
 
     #[test]

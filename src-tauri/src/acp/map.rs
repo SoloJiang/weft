@@ -167,10 +167,16 @@ fn tool_call_update(update: &Value) -> UpdateOut {
     if id.is_empty() {
         return UpdateOut::Ignore;
     }
-    // Images run through the shared `cap_images` gate (single source with the
-    // claude dialect, proto.rs); any it drops are announced in `output`, the
-    // SAME place the equivalent claude-side note lands.
-    let (images, dropped) = crate::lead_chat::proto::cap_images(extract_tool_images(update));
+    // issue #160 round-10 P2 #6 (Codex 281): the count/size cap is applied
+    // WHILE `extract_tool_images` scans the source array now, not afterward
+    // via the shared claude-dialect `cap_images` gate — see that function's
+    // own doc for why the OLD "format everything, dedup everything, cap
+    // afterward" order let an oversized/excessive ACP result allocate
+    // hundreds of MB before a single image was ever dropped. Any it drops are
+    // announced in `output`, the SAME place the equivalent claude-side note
+    // (still driven by `cap_images` on ITS OWN dialect) lands — `note_omitted_
+    // images`'s wording doesn't care which gate produced the count.
+    let (images, dropped) = extract_tool_images(update);
     let output = crate::lead_chat::proto::note_omitted_images(
         crate::lead_chat::proto::cap_output(extract_tool_output(update)),
         dropped,
@@ -230,6 +236,11 @@ fn extract_tool_output(update: &Value) -> String {
 /// nested `.content` wrapper, mirroring how `extract_tool_output` tries both
 /// `item.text` and `item.content.text`) so an image sitting in either shape
 /// is found. `{"type":"image","data":d,"mimeType":m}` → `data:<m>;base64,<d>`.
+/// Returns `(kept, dropped)` — `dropped` counts every block this omitted for
+/// being oversized, an exact duplicate of an already-kept one, or in excess
+/// of the count cap (see [`cap_and_dedup_images`]'s own doc); the caller
+/// (`tool_call_update`) turns that into the SAME "(N image(s) omitted)" note
+/// the claude dialect's `cap_images` produces.
 ///
 /// This closes a real gap: before this function existed, an omp screenshot
 /// tool's image block was silently dropped — `extract_tool_output` only ever
@@ -241,55 +252,102 @@ fn extract_tool_output(update: &Value) -> String {
 /// least one ACP backend produces) would then carry it TWICE, doubling the
 /// payload for no new information. Now PRIORITIZED exactly like
 /// `extract_tool_output`'s own text extraction: `rawOutput.content` wins
-/// outright when it carries at least one image; `content[]` is only
-/// consulted as a fallback when `rawOutput.content` carried none at all —
-/// never merged. As a second, independent safety net (in case some OTHER
-/// backend shape still manages to repeat the identical image within ONE of
-/// those two sources), the final list is deduplicated by its exact data URI
-/// string, keeping the first occurrence's position.
-fn extract_tool_images(update: &Value) -> Vec<String> {
-    let raw_images: Vec<String> = update
-        .pointer("/rawOutput/content")
-        .and_then(|c| c.as_array())
-        .map(|arr| arr.iter().filter_map(image_block_data_uri).collect())
-        .unwrap_or_default();
-    let images = if !raw_images.is_empty() {
-        raw_images
-    } else {
-        update
-            .get("content")
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| {
-                        item.get("content")
-                            .and_then(image_block_data_uri)
-                            .or_else(|| image_block_data_uri(item))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    dedup_data_uris(images)
+/// outright when it carries at least one image (kept OR dropped — a source
+/// that carried nothing BUT oversized images still "carried an image" for
+/// this priority decision, exactly like the pre-round-10 behavior); `content[]`
+/// is only consulted as a fallback when `rawOutput.content` carried none at
+/// all — never merged.
+///
+/// issue #160 round-10 P2 #6 (Codex 281): the size/count cap used to apply
+/// AFTER this function had already formatted EVERY block into a full data
+/// URI string and cloned each distinct one into a `HashSet` for dedup — a
+/// malicious/broken ACP result with hundreds of near-2MB image blocks would
+/// allocate/copy hundreds of MB before a single one was ever dropped. The cap
+/// now applies WHILE scanning, via [`cap_and_dedup_images`] — see its own doc
+/// for how it bounds both the count of survivors AND the work spent getting
+/// there.
+fn extract_tool_images(update: &Value) -> (Vec<String>, usize) {
+    if let Some(arr) = update.pointer("/rawOutput/content").and_then(|c| c.as_array()) {
+        let (kept, dropped) = cap_and_dedup_images(arr.iter(), image_block_fields);
+        if !kept.is_empty() || dropped > 0 {
+            return (kept, dropped);
+        }
+    }
+    match update.get("content").and_then(|c| c.as_array()) {
+        Some(arr) => cap_and_dedup_images(arr.iter(), |item| {
+            item.get("content")
+                .and_then(image_block_fields)
+                .or_else(|| image_block_fields(item))
+        }),
+        None => (Vec::new(), 0),
+    }
 }
 
-/// Drop repeats of the exact same data URI, keeping each survivor's FIRST
-/// position — the second, independent safety net [`extract_tool_images`]'s
-/// own doc comment describes.
-fn dedup_data_uris(images: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    images.into_iter().filter(|uri| seen.insert(uri.clone())).collect()
+/// issue #160 round-10 P2 #6 (Codex 281): scan `blocks`, capping BOTH count
+/// (`MAX_COUNT`) and per-image size (`MAX_CHARS`) WHILE scanning — the SAME
+/// two limits `lead_chat::proto::cap_images` enforces for the claude dialect,
+/// just applied at the SOURCE instead of after the fact. `resolve` turns a
+/// raw block into its borrowed `(mime, data)` fields WITHOUT allocating (see
+/// [`image_block_fields`]) — dedup happens against THAT borrowed pair, so the
+/// `HashSet` used for it only ever holds references, never a clone of its
+/// own; only a block that is non-image-shaped, a size-cap victim, or an exact
+/// duplicate is cheap to reject. The moment `MAX_COUNT` survivors are already
+/// kept, scanning stops ENTIRELY — the next `blocks.next()` is never even
+/// called — so neither the cost of resolving nor of formatting is ever paid
+/// for anything beyond the cap, regardless of how many (or how large) more
+/// blocks the source array holds; `ExactSizeIterator::len` (O(1) for a slice
+/// iterator) accounts for that untouched remainder in `dropped` without
+/// having to visit it. This is the SAME final semantics the old
+/// "format everything, dedup everything, THEN cap" order produced (dedup
+/// among survivors, oversized/excess dropped) — just with memory/CPU bounded
+/// by the CAP instead of by the input's own size.
+fn cap_and_dedup_images<'a, I, F>(mut blocks: I, resolve: F) -> (Vec<String>, usize)
+where
+    I: Iterator<Item = &'a Value> + ExactSizeIterator,
+    F: Fn(&'a Value) -> Option<(&'a str, &'a str)>,
+{
+    const MAX_CHARS: usize = 2_000_000;
+    const MAX_COUNT: usize = 4;
+    let mut kept: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+    let mut dropped = 0usize;
+    while kept.len() < MAX_COUNT {
+        let Some(block) = blocks.next() else { break };
+        let Some((mime, data)) = resolve(block) else { continue };
+        if !seen.insert((mime, data)) {
+            // An exact duplicate of an already-kept image — matches
+            // `dedup_data_uris`'s old semantics: silently collapses, never
+            // counted as "omitted: too large" (it isn't — it's redundant).
+            continue;
+        }
+        // Data URIs are base64 (pure ASCII), so byte length == char count —
+        // matches `cap_images`'s own size check exactly, computed WITHOUT
+        // formatting the string first.
+        let approx_len = "data:".len() + mime.len() + ";base64,".len() + data.len();
+        if approx_len > MAX_CHARS {
+            dropped += 1;
+            continue;
+        }
+        kept.push(format!("data:{mime};base64,{data}"));
+    }
+    // Anything left once the count cap is already full is omitted too,
+    // WITHOUT ever being visited.
+    dropped += blocks.len();
+    (kept, dropped)
 }
 
-/// One content block → `data:<mime>;base64,<data>` if it's an
-/// `{"type":"image",…}` block carrying both `data` and `mimeType`, else `None`.
-fn image_block_data_uri(block: &Value) -> Option<String> {
+/// Borrowed `(mime, data)` fields for a `{"type":"image",…}` content block —
+/// the recognize-and-extract half of what used to be [`image_block_data_uri`]
+/// (now just the format step below), split out so [`cap_and_dedup_images`]
+/// can dedup/size-check BEFORE ever formatting/allocating the eventual owned
+/// data URI string (issue #160 round-10 P2 #6).
+fn image_block_fields(block: &Value) -> Option<(&str, &str)> {
     if block.get("type").and_then(|t| t.as_str()) != Some("image") {
         return None;
     }
     let mime = block.get("mimeType").and_then(|m| m.as_str())?;
     let data = block.get("data").and_then(|d| d.as_str())?;
-    Some(format!("data:{mime};base64,{data}"))
+    Some((mime, data))
 }
 
 fn commands(update: &Value) -> UpdateOut {
@@ -612,6 +670,104 @@ mod tests {
             }
             o => panic!("{o:?}"),
         }
+    }
+
+    /// issue #160 round-10 P2 #6 (Codex 281): a source carrying MORE than the
+    /// 4-image cap, where a 5th VALID (not oversized, not a duplicate) image
+    /// sits right after the cap already filled, must still cap at 4 — proving
+    /// the count cap is enforced by COUNT alone, not merely as a side effect
+    /// of size/dedup filtering.
+    #[test]
+    fn extract_tool_images_caps_by_count_even_when_every_block_is_small_and_distinct() {
+        let mut blocks: Vec<Value> = (0..4)
+            .map(|i| json!({"type":"image","mimeType":"image/png","data": format!("img{i}")}))
+            .collect();
+        blocks.push(json!({"type":"image","mimeType":"image/png","data":"img4-excess"}));
+        let update = json!({"rawOutput": {"content": blocks}});
+        let (images, dropped) = extract_tool_images(&update);
+        assert_eq!(
+            images,
+            vec![
+                "data:image/png;base64,img0",
+                "data:image/png;base64,img1",
+                "data:image/png;base64,img2",
+                "data:image/png;base64,img3",
+            ]
+        );
+        assert_eq!(dropped, 1);
+    }
+
+    /// A tiny counting wrapper around a slice iterator — used ONLY to prove
+    /// [`cap_and_dedup_images`] stops touching its source the INSTANT the
+    /// count cap is already full, rather than merely skipping (but still
+    /// visiting) every block beyond it. Holds an external `&Cell<usize>`
+    /// (not an owned counter) so the count survives after the wrapper itself
+    /// is consumed/dropped inside the function under test.
+    struct CountingIter<'a> {
+        inner: std::slice::Iter<'a, Value>,
+        count: &'a std::cell::Cell<usize>,
+    }
+    impl<'a> Iterator for CountingIter<'a> {
+        type Item = &'a Value;
+        fn next(&mut self) -> Option<Self::Item> {
+            self.count.set(self.count.get() + 1);
+            self.inner.next()
+        }
+    }
+    impl<'a> ExactSizeIterator for CountingIter<'a> {
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+    }
+
+    /// The property [`extract_tool_images_caps_by_count_even_when_every_
+    /// block_is_small_and_distinct`] alone can't distinguish: does the
+    /// implementation actually STOP scanning once the count cap is full, or
+    /// does it keep visiting (and cheaply rejecting) every remaining block?
+    /// Issue #160 round-10 P2 #6's whole point is bounding the WORK, not just
+    /// the final count — this proves the source is never even `.next()`-ed
+    /// again past the 4th kept image, regardless of how many more blocks
+    /// follow (here, 50 more).
+    #[test]
+    fn cap_and_dedup_images_stops_touching_the_source_once_the_count_cap_is_full() {
+        let mut blocks: Vec<Value> = (0..4)
+            .map(|i| json!({"type":"image","mimeType":"image/png","data": format!("img{i}")}))
+            .collect();
+        for _ in 0..50 {
+            blocks.push(json!({"type":"image","mimeType":"image/png","data":"more"}));
+        }
+        let counter = std::cell::Cell::new(0usize);
+        let iter = CountingIter {
+            inner: blocks.iter(),
+            count: &counter,
+        };
+        let (kept, dropped) = cap_and_dedup_images(iter, image_block_fields);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(
+            counter.get(),
+            4,
+            "must stop calling next() on the source the instant 4 are already kept — the \
+             remaining 50 blocks must never be visited at all"
+        );
+        assert_eq!(
+            dropped, 50,
+            "the untouched remainder is still accounted for via ExactSizeIterator::len, \
+             without ever being visited"
+        );
+    }
+
+    /// A single oversized block (over `cap_and_dedup_images`'s 2,000,000-char
+    /// threshold) is dropped without ever being kept — the size half of the
+    /// cap, independent of the count half covered above.
+    #[test]
+    fn extract_tool_images_drops_a_single_oversized_block() {
+        let big = "x".repeat(2_000_001);
+        let update = json!({"rawOutput": {"content": [
+            {"type":"image","mimeType":"image/png","data": big}
+        ]}});
+        let (images, dropped) = extract_tool_images(&update);
+        assert!(images.is_empty());
+        assert_eq!(dropped, 1);
     }
 
     #[test]

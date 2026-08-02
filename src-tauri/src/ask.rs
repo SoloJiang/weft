@@ -4599,6 +4599,36 @@ mod tests {
         );
     }
 
+    /// issue #160 round-11 P1 #B: `bus::computer_srv::approve` now folds the
+    /// resolved window's own `id` into a GUI action's key too (right after
+    /// the query string, before `app`/`title`) — a real `type` key is now 7
+    /// elements, not 4/6. `always_key_is_persistable` only ever inspects
+    /// `parts[0]`/`parts[1]` (`"gui"`/the action name), so this longer shape
+    /// must be judged EXACTLY the same way the shorter pre-round-11 shape
+    /// was: still non-persistable for `type` (the digest can still carry a
+    /// content hash), still persistable for every other GUI action.
+    #[test]
+    fn always_key_is_persistable_is_unaffected_by_round_11_s_window_id_insertion() {
+        assert!(
+            !always_key_is_persistable(&action_key(&[
+                "gui", "type", "notes", "1", "Notes", "Untitled", "deadbeef"
+            ])),
+            "a real (post-round-11, id-inclusive) type GUI key must still never be persistable"
+        );
+        assert!(
+            always_key_is_persistable(&action_key(&[
+                "gui", "left_click", "notes", "1", "Notes", "Untitled", "deadbeef"
+            ])),
+            "a real (post-round-11, id-inclusive) non-type GUI key must stay persistable"
+        );
+        assert!(
+            always_key_is_persistable(&action_key(&[
+                "gui", "screenshot", "notes", "1", "Notes", "Untitled", "deadbeef"
+            ])),
+            "screenshot now resolves+binds too (issue #160 round-11 P1 #C) — still persistable"
+        );
+    }
+
     /// The end-to-end property this fix exists for: seed one `type` GUI
     /// Always-grant, one non-`type` GUI Always-grant, and one ordinary tool
     /// Always-grant, all in the SAME (thread, dir) — the snapshot actually

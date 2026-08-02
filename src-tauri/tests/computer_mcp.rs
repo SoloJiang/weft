@@ -11,12 +11,23 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use weft::ask::{Answer, AskRegistry, FullGrant, GrantSnapshot, RiskLevel};
-use weft::bus::{server, BusRegistry};
+use weft::bus::{computer_srv, server, BusRegistry};
 use weft::computer::{self, backend, mock::MockBackend, CapturedImage, WindowInfo};
 use weft::store::{repo, Db};
 
+/// issue #160 round-11 P1 #A: every real call into `/computer/:thread/:dir/
+/// mcp` now needs `?key=<per-session token>` — built the SAME way
+/// `bus::inject::computer_url` itself would (`computer_srv::
+/// computer_session_token`, `#[doc(hidden)] pub` for exactly this reason).
+/// Centralized here so every scenario in this file that drives the endpoint
+/// through [`rpc`] gets it for free; the handful of call sites that build
+/// their own URL (the `?wt=` scenarios below) attach it explicitly.
+fn key_query(thread: i32, dir: &str) -> String {
+    format!("key={}", computer_srv::computer_session_token(thread, dir))
+}
+
 async fn rpc(base: &str, thread: i32, dir: &str, body: serde_json::Value) -> String {
-    let url = format!("{base}/computer/{thread}/{dir}/mcp");
+    let url = format!("{base}/computer/{thread}/{dir}/mcp?{}", key_query(thread, dir));
     rpc_url(&url, body).await
 }
 
@@ -111,6 +122,139 @@ async fn tools_list_exposes_exactly_one_computer_tool() {
     let tools = body["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 1, "expected exactly one tool, got: {out}");
     assert_eq!(tools[0]["name"], "computer");
+}
+
+// —— issue #160 round-11 P1 #A: per-session bearer on `/computer/:thread/:dir/mcp` ——
+
+/// The correct-key happy path, in isolation from every OTHER test in this
+/// file (which all get it for free via [`rpc`]/[`key_query`]): a request
+/// carrying the EXACT token `computer_session_token` would mint for this
+/// path's own `(thread, dir)` reaches the real handler and gets a normal
+/// `tools/list` response — proving the auth gate is not, itself, blocking a
+/// legitimately-keyed caller.
+#[tokio::test]
+async fn endpoint_auth_allows_the_correct_per_session_key() {
+    let reg = BusRegistry::new();
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let asks = AskRegistry::new();
+    let (base, _h) = server::serve(reg, db, asks).await.unwrap();
+
+    let url = format!("{base}/computer/1/10/mcp?{}", key_query(1, "10"));
+    let out = rpc_url(
+        &url,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+    )
+    .await;
+    let body = sse_json(&out);
+    assert_eq!(body["result"]["tools"][0]["name"], "computer", "{out}");
+}
+
+/// A request with NO `?key=` at all — standing in for the URL leaking to (or
+/// being guessed by) a caller with no access to the real per-session token —
+/// must be rejected outright, as a bare HTTP 401, never an SSE/JSON-RPC body
+/// of any shape (which would itself leak information about method/id
+/// handling to an unauthenticated caller).
+#[tokio::test]
+async fn endpoint_auth_rejects_a_request_with_no_key_at_all() {
+    let reg = BusRegistry::new();
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let asks = AskRegistry::new();
+    let (base, _h) = server::serve(reg, db, asks).await.unwrap();
+
+    let url = format!("{base}/computer/1/10/mcp");
+    let resp = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(&url)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED, "a keyless request must get a bare 401");
+}
+
+/// A `?key=` present but WRONG (neither empty nor the real token for this
+/// path) must be rejected the identical way a missing one is.
+#[tokio::test]
+async fn endpoint_auth_rejects_a_wrong_key() {
+    let reg = BusRegistry::new();
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let asks = AskRegistry::new();
+    let (base, _h) = server::serve(reg, db, asks).await.unwrap();
+
+    let url = format!("{base}/computer/1/10/mcp?key=0000000000000000000000000000000000000000000000000000000000000000");
+    let resp = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(&url)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED, "a wrong key must get a bare 401");
+}
+
+/// The exact hazard #A closes: a token minted for a DIFFERENT (thread, dir)
+/// — standing in for a same-uid process reading (or guessing) SOME other
+/// session's own injected URL — must not authorize THIS (thread, dir): the
+/// token is bound to the path's own identity, not just "a valid-looking
+/// token for SOME session".
+#[tokio::test]
+async fn endpoint_auth_rejects_a_key_minted_for_a_different_thread_dir() {
+    let reg = BusRegistry::new();
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let asks = AskRegistry::new();
+    let (base, _h) = server::serve(reg, db, asks).await.unwrap();
+
+    // A key that is VALID for (thread=1, dir="10")...
+    let foreign_key = computer_srv::computer_session_token(1, "10");
+    // ...used to call a DIFFERENT (thread=2, dir="20").
+    let url = format!("{base}/computer/2/20/mcp?key={foreign_key}");
+    let resp = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(&url)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a key minted for a DIFFERENT (thread, dir) must never authorize this one"
+    );
+}
+
+/// `computer_session_token` is exactly what [`inject::computer_url`] appends
+/// to the injected URL (proven directly in `bus::inject`'s own unit tests via
+/// the identical helper) — this proves the OTHER end of that contract: a
+/// `tools/call` carrying that EXACT token for its OWN path is authorized all
+/// the way through to a real (denied, for lack of a standing grant) gate
+/// card — never short-circuited by the auth check itself. A missing/garbage
+/// `wt` combined with a CORRECT key is exercised by the giant test's own
+/// section 14 above; this isolates the auth layer from the `wt`-parsing layer
+/// entirely (no `wt` at all here).
+#[tokio::test]
+async fn endpoint_auth_with_the_correct_key_still_reaches_the_real_approval_gate() {
+    let reg = BusRegistry::new();
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+    let asks = AskRegistry::new();
+    let asks_handle = asks.clone();
+    let (base, _h) = server::serve(reg, db, asks).await.unwrap();
+
+    let call = spawn_computer_call(&base, 909_901, "lead".to_string(), "left_click", "notes");
+    let card = wait_for_card(&asks_handle, "a correctly-keyed call must still reach the real gate").await;
+    assert_eq!(card.tool, "computer");
+    assert!(asks_handle.answer(card.id, Answer::Deny));
+    let out = call.await.unwrap();
+    assert!(out.contains("denied"), "{out}");
 }
 
 /// issue #160 M1: the setting gate blocks BEFORE any backend call, so this
@@ -506,10 +650,17 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // `#[doc(hidden)] pub` for exactly this) — or this grant would silently
     // stop matching and every `assert_screenshot_content` call below would
     // hang for up to an hour waiting on a card nobody is spawned to answer.
+    // issue #160 round-11 P1 #B/#C: `screenshot` now ALSO resolves its window
+    // and folds `id`/`app`/`title` into the key, exactly like a Write action
+    // (see `approve`'s own doc) — "notes" resolves to id 1 / app "Notes" /
+    // title "Untitled" per the `mock` window list above.
     let screenshot_notes_key = weft::ask::action_key(&[
         "gui",
         "screenshot",
         "notes",
+        "1",
+        "Notes",
+        "Untitled",
         &weft::bus::computer_srv::args_digest(&json!({"action": "screenshot", "window": "notes"})),
     ]);
     let grant_screenshot_notes = |thread: i32, dir: &str| {
@@ -623,6 +774,13 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // answer skips the card entirely and reaches the backend directly.
     let (gate_thread, gate_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
     let gate_dir_s = gate_dir.to_string();
+    // issue #160 round-11 P1 #D: an input action now maps its coordinate
+    // against a RECORDED screenshot's own dimensions (fail-closed with none
+    // on file) — this session never screenshotted "notes" (id 1) itself, so
+    // seed the record directly rather than driving a real `screenshot` call
+    // through the gate first just to satisfy this precondition (unrelated to
+    // what this section actually tests).
+    computer::record_shot_dims(gate_thread, &gate_dir_s, 1, width, height);
     let clicks_before = mock.actions.lock().unwrap().len();
 
     let call = spawn_computer_call(&base, gate_thread, gate_dir_s.clone(), "left_click", "notes");
@@ -746,6 +904,10 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         full: vec![FullGrant { thread: focus_thread, dir: focus_dir_s.clone() }],
         always: Vec::new(),
     });
+    // issue #160 round-11 P1 #D: 12b's `left_click` below reaches the real
+    // backend (Full-granted) — seed this session's "notes" (id 1) shot dims
+    // directly, same reasoning as section 10 above.
+    computer::record_shot_dims(focus_thread, &focus_dir_s, 1, width, height);
     // `clear_control` first: thread=1 (section 11) still holds the single
     // process-wide control lease; the sleep clears the throttle window.
     computer::clear_control();
@@ -825,6 +987,12 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
 
     let (refocus_thread, refocus_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
     let refocus_dir_s = refocus_dir.to_string();
+    // issue #160 round-11 P1 #D: every click/type below in this section
+    // reaches the real backend for "notes" (id 1) — seed this session's shot
+    // dims once, up front, same reasoning as sections 10/12 above (13b/13c's
+    // `type` calls don't need this — only coordinate-taking actions do — but
+    // 13a/13c's own `left_click`s do).
+    computer::record_shot_dims(refocus_thread, &refocus_dir_s, 1, width, height);
     computer::clear_control();
     tokio::time::sleep(Duration::from_millis(600)).await;
 
@@ -922,12 +1090,15 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // id 1 carries (see this test's own `mock` setup above), matching
     // EXACTLY what `approve` itself would resolve for `window: "notes"`, or
     // this grant silently stops matching and the call below hangs waiting on
-    // a card nobody is spawned to answer.
+    // a card nobody is spawned to answer. issue #160 round-11 P1 #B: the
+    // resolved window's own `id` ("1") is now ALSO folded in, right after the
+    // query string.
     let text_auto = "auto-no-refocus".to_string();
     let type_always_key = weft::ask::action_key(&[
         "gui",
         "type",
         "notes",
+        "1",
         "Notes",
         "Untitled",
         &weft::bus::computer_srv::args_digest(&json!({"action":"type","window":"notes","text":text_auto})),
@@ -1105,6 +1276,175 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // Clean up the unrelated ask so it can't leak into any later section.
     assert!(asks_handle.answer(new_ask_id, Answer::Deny));
     computer::clear_control();
+
+    // 14. issue #160 round-10 P1 #1 + P2 #2: multi-repo `wt` routing now
+    // resolves into a WEFT-MANAGED namespace under `weft_home/computer/
+    // <thread>/<dir>/wt-<id>` (no longer the worktree's own `.weft/`), and an
+    // EXPLICIT-but-non-numeric `wt` fails the WHOLE call closed rather than
+    // falling back to "first worktree" the way an ABSENT one still does.
+    // Lives HERE (this test's own giant function), not as a separate
+    // `#[tokio::test]`, because it now needs to know `WEFT_HOME` to predict
+    // the output path — this file's own doc comment on why only ONE test
+    // function may touch that env var applies just as much to this scenario
+    // post-migration as it always did to the lead-scratch-dir screenshot
+    // path above.
+    let repo_tmp_14a = tempfile::tempdir().unwrap();
+    let repo_tmp_14b = tempfile::tempdir().unwrap();
+    let repo_14a = repo::add_repo_ref(
+        &db_handle, ws.id, "wt14a", &repo_tmp_14a.path().to_string_lossy(), "main", "", true,
+    )
+    .await
+    .unwrap();
+    let repo_14b = repo::add_repo_ref(
+        &db_handle, ws.id, "wt14b", &repo_tmp_14b.path().to_string_lossy(), "main", "", true,
+    )
+    .await
+    .unwrap();
+    let thread_14 = repo::create_thread(&db_handle, ws.id, "wt14", "feature", "claude").await.unwrap();
+    let direction_14 = repo::create_direction(
+        &db_handle, thread_14.id, "task", "claude", repo_14a.id, "why", "impl-only", "main",
+    )
+    .await
+    .unwrap();
+
+    let wt_14a_path = std::env::temp_dir().join(format!("weft-computer-mcp-wt14-a-{}", std::process::id()));
+    let wt_14b_path = std::env::temp_dir().join(format!("weft-computer-mcp-wt14-b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&wt_14a_path);
+    let _ = std::fs::remove_dir_all(&wt_14b_path);
+    std::fs::create_dir_all(&wt_14a_path).unwrap();
+    std::fs::create_dir_all(&wt_14b_path).unwrap();
+    // Worktree A is recorded FIRST — the pre-existing "first worktree"
+    // fallback would always resolve here without an explicit `wt`.
+    let wt_14a = repo::record_worktree(
+        &db_handle, repo_14a.id, direction_14.id, "ba", &wt_14a_path.to_string_lossy(), true, true, "",
+    )
+    .await
+    .unwrap();
+    let wt_14b = repo::record_worktree(
+        &db_handle, repo_14b.id, direction_14.id, "bb", &wt_14b_path.to_string_lossy(), true, true, "",
+    )
+    .await
+    .unwrap();
+    asks_handle.seed_grants(GrantSnapshot {
+        full: vec![FullGrant { thread: thread_14.id, dir: direction_14.id.to_string() }],
+        always: Vec::new(),
+    });
+    let dir_14_s = direction_14.id.to_string();
+    let session_dir_for = |wt_id: i32| {
+        weft::paths::weft_home()
+            .unwrap()
+            .join("computer")
+            .join(thread_14.id.to_string())
+            .join(&dir_14_s)
+            .join(format!("wt-{wt_id}"))
+    };
+    let audit_14a = session_dir_for(wt_14a.id).join("computer-audit.jsonl");
+    let audit_14b = session_dir_for(wt_14b.id).join("computer-audit.jsonl");
+
+    // 14a. An explicit `?wt=` naming worktree B lands its audit line in B's
+    // OWN weft-managed namespace, NOT A's — and never touches wt_14b_path
+    // (the actual worktree CHECKOUT) at all: output no longer lives there.
+    let url = format!(
+        "{base}/computer/{}/{}/mcp?wt={}&{}",
+        thread_14.id, dir_14_s, wt_14b.id, key_query(thread_14.id, &dir_14_s)
+    );
+    let out = rpc_url(
+        &url,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"wait","duration_ms":1}}}),
+    )
+    .await;
+    assert!(out.contains("waited"), "{out}");
+    assert!(!audit_14a.exists(), "wt=B must never write into A's namespace: {out}");
+    assert!(audit_14b.exists(), "wt=B must write its audit line into B's OWN namespace");
+    assert!(
+        !wt_14a_path.join(".weft").exists() && !wt_14b_path.join(".weft").exists(),
+        "worker-lane computer-use output must never touch either worktree's own checkout at all"
+    );
+
+    // 14b. No `?wt=` at all: falls back to the first worktree (A)'s OWN
+    // namespace — the SAME per-worktree isolation the old worktree-rooted
+    // path gave for free.
+    let url_no_wt = format!(
+        "{base}/computer/{}/{}/mcp?{}",
+        thread_14.id, dir_14_s, key_query(thread_14.id, &dir_14_s)
+    );
+    let out = rpc_url(
+        &url_no_wt,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"wait","duration_ms":1}}}),
+    )
+    .await;
+    assert!(out.contains("waited"), "{out}");
+    assert!(audit_14a.exists(), "an absent wt must fall back to the first worktree's OWN namespace");
+
+    // 14c. A forged `wt` naming a worktree of a DIFFERENT direction must
+    // FAIL CLOSED (round-8 P2 #7) — never silently fall back to A's
+    // namespace, and never write into the foreign direction's own namespace
+    // either.
+    let other_direction_14 = repo::create_direction(
+        &db_handle, thread_14.id, "task2", "claude", repo_14a.id, "why", "impl-only", "main",
+    )
+    .await
+    .unwrap();
+    let foreign_path_14 =
+        std::env::temp_dir().join(format!("weft-computer-mcp-wt14-foreign-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&foreign_path_14);
+    std::fs::create_dir_all(&foreign_path_14).unwrap();
+    let foreign_14 = repo::record_worktree(
+        &db_handle, repo_14a.id, other_direction_14.id, "bf", &foreign_path_14.to_string_lossy(), true, true, "",
+    )
+    .await
+    .unwrap();
+    let lines_before_14c = std::fs::read_to_string(&audit_14a).unwrap().lines().count();
+    let url = format!(
+        "{base}/computer/{}/{}/mcp?wt={}&{}",
+        thread_14.id, dir_14_s, foreign_14.id, key_query(thread_14.id, &dir_14_s)
+    );
+    let out = rpc_url(
+        &url,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"wait","duration_ms":1}}}),
+    )
+    .await;
+    assert!(out.contains("waited"), "the action itself doesn't depend on a resolved worktree: {out}");
+    let lines_after_14c = std::fs::read_to_string(&audit_14a).unwrap().lines().count();
+    assert_eq!(
+        lines_after_14c, lines_before_14c,
+        "round-8 P2 #7: a forged wt from a different direction must NOT fall back to A's namespace"
+    );
+    assert!(
+        !session_dir_for(foreign_14.id).join("computer-audit.jsonl").exists(),
+        "must never write into the foreign direction's own namespace either"
+    );
+
+    // 14d. issue #160 round-10 P2 #2: an EXPLICIT but non-numeric `wt` must
+    // ALSO fail the WHOLE call closed — never silently fall back to "first
+    // worktree" the way an ABSENT `wt` does.
+    let lines_before_14d = std::fs::read_to_string(&audit_14a).unwrap().lines().count();
+    let url = format!(
+        "{base}/computer/{}/{}/mcp?wt=abc&{}",
+        thread_14.id, dir_14_s, key_query(thread_14.id, &dir_14_s)
+    );
+    let out = rpc_url(
+        &url,
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"computer","arguments":{"action":"wait","duration_ms":1}}}),
+    )
+    .await;
+    assert!(
+        !out.contains("waited"),
+        "a malformed wt must reject the WHOLE call, not just its audit write: {out}"
+    );
+    let lines_after_14d = std::fs::read_to_string(&audit_14a).unwrap().lines().count();
+    assert_eq!(
+        lines_after_14d, lines_before_14d,
+        "a malformed wt must never fall back to writing A's namespace either"
+    );
+
+    let _ = std::fs::remove_dir_all(&wt_14a_path);
+    let _ = std::fs::remove_dir_all(&wt_14b_path);
+    let _ = std::fs::remove_dir_all(&foreign_path_14);
 }
 
 /// issue #160 round-2 P1: with no standing grant, an input action surfaces a
@@ -1159,126 +1499,6 @@ async fn gate_denies_when_the_ask_is_cancelled_instead_of_answered() {
         "a cancelled/timed-out gate ask must resolve to an EXPLICIT deny, never hang or silently allow: {out}"
     );
     assert!(asks_handle.open().is_empty());
-}
-
-/// issue #160 round-2 P2 §5: a direction with MORE THAN ONE worktree (a
-/// multi-repo direction) routes computer-use output (here, the audit log —
-/// simplest to observe without a MockBackend/WEFT_HOME setup, which this
-/// binary's OTHER giant test owns exclusively per its own doc comment) to
-/// the EXACT worktree the calling worker resolved, via the `?wt=` query
-/// param — instead of always falling back to whichever worktree happens to
-/// be first. A forged `wt` naming a worktree of a DIFFERENT direction is
-/// rejected (closed-set validation) and falls back to the pre-existing
-/// "first worktree of this direction" behavior, never writing into the
-/// foreign worktree.
-#[tokio::test]
-async fn wt_query_param_routes_output_to_the_exact_worktree_in_a_multi_repo_direction() {
-    let reg = BusRegistry::new();
-    let db = Db::connect("sqlite::memory:").await.unwrap();
-    repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true")
-        .await
-        .unwrap();
-    let asks = AskRegistry::new();
-    let asks_handle = asks.clone();
-    let (base, _h) = server::serve(reg, db.clone(), asks).await.unwrap();
-
-    let ws = repo::create_workspace(&db, "ws").await.unwrap();
-    let repo_tmp_a = tempfile::tempdir().unwrap();
-    let repo_tmp_b = tempfile::tempdir().unwrap();
-    let repo_a = repo::add_repo_ref(&db, ws.id, "a", &repo_tmp_a.path().to_string_lossy(), "main", "", true)
-        .await
-        .unwrap();
-    let repo_b = repo::add_repo_ref(&db, ws.id, "b", &repo_tmp_b.path().to_string_lossy(), "main", "", true)
-        .await
-        .unwrap();
-    let thread = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
-    let direction = repo::create_direction(
-        &db, thread.id, "task", "claude", repo_a.id, "why", "impl-only", "main",
-    )
-    .await
-    .unwrap();
-
-    let wt_a_path = std::env::temp_dir().join(format!("weft-computer-mcp-wt5-a-{}", std::process::id()));
-    let wt_b_path = std::env::temp_dir().join(format!("weft-computer-mcp-wt5-b-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&wt_a_path);
-    let _ = std::fs::remove_dir_all(&wt_b_path);
-    std::fs::create_dir_all(&wt_a_path).unwrap();
-    std::fs::create_dir_all(&wt_b_path).unwrap();
-    // Worktree A is recorded FIRST — the pre-existing "first worktree"
-    // fallback would always resolve here without an explicit `wt`.
-    let _wt_a = repo::record_worktree(&db, repo_a.id, direction.id, "ba", &wt_a_path.to_string_lossy(), true, true, "")
-        .await
-        .unwrap();
-    let wt_b = repo::record_worktree(&db, repo_b.id, direction.id, "bb", &wt_b_path.to_string_lossy(), true, true, "")
-        .await
-        .unwrap();
-
-    asks_handle.seed_grants(GrantSnapshot {
-        full: vec![FullGrant { thread: thread.id, dir: direction.id.to_string() }],
-        always: Vec::new(),
-    });
-    let dir_s = direction.id.to_string();
-    let audit_a = wt_a_path.join(".weft").join("computer-audit.jsonl");
-    let audit_b = wt_b_path.join(".weft").join("computer-audit.jsonl");
-
-    // 1. An explicit `?wt=` naming worktree B lands its audit line in B, NOT A.
-    let url = format!("{base}/computer/{}/{}/mcp?wt={}", thread.id, dir_s, wt_b.id);
-    let out = rpc_url(
-        &url,
-        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-            "params":{"name":"computer","arguments":{"action":"wait","duration_ms":1}}}),
-    )
-    .await;
-    assert!(out.contains("waited"), "{out}");
-    assert!(!audit_a.exists(), "wt=B must never write into worktree A: {out}");
-    assert!(audit_b.exists(), "wt=B must write its audit line into worktree B");
-
-    // 2. A forged `wt` naming a worktree of a DIFFERENT direction must now
-    // FAIL CLOSED (issue #160 round-8 P2 #7) — it must NEVER silently fall
-    // back to "first worktree of THIS direction" (A) the way it used to: an
-    // explicit-but-invalid pin in a multi-repo direction must not have its
-    // audit line quietly redirected into a DIFFERENT repo's checkout. The
-    // "wait" action itself doesn't depend on a resolved worktree at all, so
-    // the call still succeeds — only its (best-effort) audit write is
-    // affected, and it must land NOWHERE, neither A nor the foreign worktree.
-    let other_direction = repo::create_direction(
-        &db, thread.id, "task2", "claude", repo_a.id, "why", "impl-only", "main",
-    )
-    .await
-    .unwrap();
-    let foreign_path = std::env::temp_dir().join(format!("weft-computer-mcp-wt5-foreign-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&foreign_path);
-    std::fs::create_dir_all(&foreign_path).unwrap();
-    let foreign = repo::record_worktree(&db, repo_a.id, other_direction.id, "bf", &foreign_path.to_string_lossy(), true, true, "")
-        .await
-        .unwrap();
-
-    // A fresh audit-a marker check needs a clean baseline: remove the file
-    // audit_a already picked up from step 1 above so this step's assertion
-    // is unambiguous about NOT writing a NEW line into it.
-    let _ = std::fs::remove_file(&audit_a);
-
-    let url = format!("{base}/computer/{}/{}/mcp?wt={}", thread.id, dir_s, foreign.id);
-    let out = rpc_url(
-        &url,
-        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"computer","arguments":{"action":"wait","duration_ms":1}}}),
-    )
-    .await;
-    assert!(out.contains("waited"), "the action itself doesn't depend on a resolved worktree: {out}");
-    assert!(
-        !audit_a.exists(),
-        "round-8 P2 #7: a forged wt from a different direction must NOT fall back to worktree A \
-         — fail closed instead: {out}"
-    );
-    assert!(
-        !foreign_path.join(".weft").join("computer-audit.jsonl").exists(),
-        "must never write into the foreign direction's worktree either"
-    );
-
-    let _ = std::fs::remove_dir_all(&wt_a_path);
-    let _ = std::fs::remove_dir_all(&wt_b_path);
-    let _ = std::fs::remove_dir_all(&foreign_path);
 }
 
 /// Exercises the REAL platform backend end-to-end (window enumeration +

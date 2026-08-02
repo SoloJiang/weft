@@ -2,7 +2,18 @@
 //! `event: message` carrying the JSON-RPC response. Identity is derived from
 //! the URL path, never agent input — so an agent can't spoof `from` via tool
 //! arguments. This does NOT stop a local process that forges the URL path
-//! itself (no auth; an accepted local-first tradeoff).
+//! itself (no auth; an accepted local-first tradeoff for these ordinary
+//! read/steer-a-session endpoints).
+//!
+//! `/computer/:thread/:dir/mcp` (routed below, handled entirely by
+//! `bus::computer_srv::handle_computer`) is the ONE exception to that
+//! tradeoff (issue #160 round-11 P1 #A): it can capture the human's real
+//! screen and inject real input, so a forged path alone is no longer
+//! sufficient — the handler additionally requires a per-session `?key=`
+//! bearer token (HMAC-bound to the path's own `(thread, dir)`, minted by
+//! `bus::inject::computer_url`) before it will even look at the request's
+//! `method`/`id`. This module never touches that token itself — it only
+//! mounts the route.
 
 use crate::ask::{AskRegistry, Decision};
 use crate::bus::builtin_allow;

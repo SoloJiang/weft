@@ -1063,8 +1063,66 @@ fn merge_tool_result_content(content: &mut serde_json::Value, item: &super::prot
     }
 }
 
+/// issue #160 round-10 P1 #9 (Codex 1062): how many of a session's most
+/// recent tool-result rows may keep their inline screenshot data URIs in
+/// `content.images` at once. Screenshot data URIs run from a few hundred KB
+/// to a couple MB each (see `lead_chat::proto::cap_images`'s own
+/// `MAX_CHARS`); an unthrottled screenshot loop — Full/Always-granted
+/// computer use, no per-call card left to slow it down — can otherwise
+/// persist hundreds of these into SQLite with NO bound at all: this
+/// module's own per-CALL cap (`cap_images`, `bus::computer_srv`'s
+/// `cap_and_dedup_images`, both ≤4 images per single result) does nothing to
+/// stop that ACROSS calls, and `history` load then hands the whole
+/// accumulated payload to the frontend on every reload. Kept SMALL: an
+/// older screenshot is still reachable by its file path, which lives in the
+/// SAME row's `output` text (issue #160 M3-B's own "text path is never
+/// dropped" rule) — this cap only prunes the redundant INLINE base64 copy
+/// once it's no longer among the most recent few, never the on-disk file or
+/// the row's own text, and never the CURRENT call's own inline image (see
+/// `merge_tool_results`'s own doc).
+const MAX_INLINE_IMAGE_ROWS: usize = 4;
+
+/// Push a newly-completed, image-bearing tool row onto `rows` (oldest first)
+/// and return the updated queue plus every entry that must be evicted to
+/// keep it at [`MAX_INLINE_IMAGE_ROWS`] or fewer (oldest evicted first).
+/// Pure/synchronous — no `Db`/`AppHandle` — so this exact retention decision
+/// is unit-testable directly; `merge_tool_results` is the only production
+/// caller, and owns applying each eviction as its own `repo::
+/// update_lead_message` rewrite (stripping `images` from that row's OWN
+/// already-persisted content, keeping its `output` text untouched).
+fn track_inline_image_row(
+    mut rows: std::collections::VecDeque<(i32, bool, serde_json::Value)>,
+    new_row: (i32, bool, serde_json::Value),
+) -> (
+    std::collections::VecDeque<(i32, bool, serde_json::Value)>,
+    Vec<(i32, bool, serde_json::Value)>,
+) {
+    rows.push_back(new_row);
+    let mut evicted = Vec::new();
+    while rows.len() > MAX_INLINE_IMAGE_ROWS {
+        if let Some(oldest) = rows.pop_front() {
+            evicted.push(oldest);
+        }
+    }
+    (rows, evicted)
+}
+
 /// Merge tool results into their running rows (claude tool_result / codex
 /// item.completed); a result for an untracked row is dropped.
+///
+/// issue #160 round-10 P1 #9: a result carrying inline images is tracked in
+/// `inner.inline_image_rows` (bounded, in-memory, this engine's own
+/// lifetime) AFTER it persists — [`track_inline_image_row`] then reports any
+/// OLDER row that must be pruned to stay at the cap, and each one has its
+/// `images` key stripped from its ALREADY-persisted content and rewritten,
+/// right here. This never touches the CURRENT item's own `content` (already
+/// written above, images intact) — M3-B's "this screenshot inlines for a
+/// capable engine" contract is unaffected; only OLDER rows' accumulated
+/// history is pruned. In-memory tracking means this bound applies to NEW
+/// writes made during this engine's own lifetime — a row written before this
+/// round, or by a session that hasn't reloaded since an app restart, isn't
+/// retroactively touched; a durable migration for that is a follow-up (see
+/// this function's own module-level issue notes).
 async fn merge_tool_results(
     app: &AppHandle,
     db: &Db,
@@ -1089,6 +1147,32 @@ async fn merge_tool_results(
                 status: status.into(),
             },
         );
+        if !item.images.is_empty() {
+            let rows = std::mem::take(&mut inner.inline_image_rows);
+            let (rows, evicted) = track_inline_image_row(rows, (row_id, item.is_error, content));
+            inner.inline_image_rows = rows;
+            for (old_row_id, old_is_error, mut old_content) in evicted {
+                if let Some(obj) = old_content.as_object_mut() {
+                    obj.remove("images");
+                }
+                let old_status = if old_is_error { "error" } else { "complete" };
+                let old_content_str = old_content.to_string();
+                if repo::update_lead_message(db, old_row_id, &old_content_str, old_status)
+                    .await
+                    .is_ok()
+                {
+                    let _ = app.emit(
+                        EVENT,
+                        Push::ToolResult {
+                            thread_id,
+                            message_id: old_row_id,
+                            content: old_content_str,
+                            status: old_status.into(),
+                        },
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1763,6 +1847,19 @@ pub struct EngineInner {
     /// its persisted `kind:"tool"` row id and content JSON, so the out-of-band
     /// result merges its output without re-reading the row. Cleared per turn.
     pub tool_rows: std::collections::HashMap<String, (i32, serde_json::Value)>,
+    /// issue #160 round-10 P1 #9: this session's most recent completed
+    /// tool-result rows that currently carry inline screenshot data URIs in
+    /// their persisted `content.images` — oldest first, `(row_id, is_error,
+    /// content)`. Capped at `MAX_INLINE_IMAGE_ROWS` by `merge_tool_results`,
+    /// which evicts the OLDEST entry's inline images (stripping `images`
+    /// from THAT row's own already-persisted content, keeping its `output`
+    /// text — the screenshot's file path — untouched) the moment a NEW
+    /// image-bearing row would push this past the cap. In-memory only,
+    /// scoped to THIS engine's own lifetime — see `merge_tool_results`'s own
+    /// doc for why that is an accepted, disclosed limitation rather than a
+    /// durable migration. Never cleared per-turn (unlike `tool_rows`): the
+    /// retention window spans the whole session, not one turn.
+    pub inline_image_rows: std::collections::VecDeque<(i32, bool, serde_json::Value)>,
     /// Explicit user/guard stop. Hidden plumbing must not resurrect stopped
     /// engines; explicit sends/ensure clear this and restart as needed.
     pub stopped: bool,
@@ -4300,6 +4397,31 @@ fn gui_kill_switch_denies(is_gui: bool, computer_use_enabled: bool) -> bool {
     is_gui && !computer_use_enabled
 }
 
+/// The single "must this ACP permission reply be forced to RejectOnce"
+/// verdict [`acp_consumer`]'s `SessionEvent::Permission` arm converges on,
+/// on the ONE path every branch (auto-grant, human-Allow, human-Deny,
+/// cancelled/timed-out) leaves through — issue #160 round-10 P1 #8 (Codex
+/// 4675). Two independently-sufficient reasons to reject, mirroring this
+/// function's sibling [`gui_kill_switch_denies`]'s own "either gate wins"
+/// shape:
+///  - `teardown` (stopped / interrupting / a reset-epoch mismatch) — the
+///    pre-existing "never allow after this engine tore down" invariant,
+///    unchanged by this round.
+///  - `gui_kill_switch_denies(is_gui, enabled_now)` — computer use's OWN
+///    kill switch, RESAMPLED right here rather than trusting whichever
+///    value was on hand before a (possibly hours-long) human-review await
+///    — round-9's own sample only ran ONCE, before that wait started; a
+///    human hitting Stop WHILE the card sat open never reached it. A
+///    non-GUI intent is completely unaffected either way, exactly like
+///    `gui_kill_switch_denies` itself.
+///
+/// Pure and synchronous so this exact decision is unit-testable without the
+/// surrounding async ACP event loop — mirrors `gui_kill_switch_denies`'s own
+/// split from its `AppHandle`-taking wrapper ([`computer_enabled_for_acp`]).
+fn permission_reply_must_reject(teardown: bool, is_gui: bool, computer_use_enabled_now: bool) -> bool {
+    teardown || gui_kill_switch_denies(is_gui, computer_use_enabled_now)
+}
+
 /// issue #160 round-10 P1 #E: `computer::enabled` for an ACP permission
 /// decision, from just the `AppHandle` this module already has in scope.
 /// Fail-CLOSED — `false` — when `crate::store::Db` isn't even mounted as
@@ -4750,9 +4872,26 @@ async fn acp_consumer(
                 // `reject_now` sample and the `auto_decision` verdict reached
                 // the wire as an allow — queued ahead of `session/cancel`,
                 // starting a tool after the user had stopped the turn.
+                //
+                // issue #160 round-10 P1 #8 (Codex 4675): this is ALSO where
+                // a GUI intent's `computer::enabled` gets its SECOND look —
+                // round-9's own sample (`computer_use_enabled` above) only
+                // ran ONCE, before the human-review `rx.await` in the `None`
+                // arm above even started; that await can sit for up to an
+                // hour. A human hitting Stop WHILE that card sits open never
+                // reached the original sample, so an Allow the human answers
+                // AFTER hitting Stop sailed straight through here before this
+                // fix — the funnel below only ever checked engine teardown,
+                // never computer-use's own kill switch a second time. See
+                // `permission_reply_must_reject`'s own doc for the combined
+                // (teardown OR gui-disabled-NOW) verdict this applies.
                 let want = {
-                    let g = eng.lock().await;
-                    if g.stopped || g.interrupting || g.reset_epoch != start_epoch {
+                    let teardown = {
+                        let g = eng.lock().await;
+                        g.stopped || g.interrupting || g.reset_epoch != start_epoch
+                    };
+                    let enabled_now = if is_gui { computer_enabled_for_acp(&app).await } else { true };
+                    if permission_reply_must_reject(teardown, is_gui, enabled_now) {
                         crate::acp::Want::RejectOnce
                     } else {
                         want
@@ -6898,6 +7037,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         probe_committed: 0,
         current_origin_tag: None,
         tool_rows: std::collections::HashMap::new(),
+        inline_image_rows: std::collections::VecDeque::new(),
         stopped: false,
         codex_client: None,
         acp_client: None,
@@ -9496,6 +9636,51 @@ mod tests {
         assert!(!gui_kill_switch_denies(false, true), "a non-GUI intent must never be affected");
     }
 
+    // —— issue #160 round-10 P1 #8: recheck the GUI kill-switch AFTER the
+    // human-review await, not just once before it ——
+
+    /// The end-to-end property this fix exists for: a GUI intent whose card
+    /// was answered Allow, but where computer use is now (at REPLY time, not
+    /// at the ORIGINAL pre-await sample) disabled, must still be forced to
+    /// reject — even with no teardown at all.
+    #[test]
+    fn permission_reply_must_reject_denies_a_gui_intent_disabled_after_the_await() {
+        assert!(
+            permission_reply_must_reject(false, true, false),
+            "a GUI intent whose kill switch flipped off after the human-review await must reject, \
+             even with the engine otherwise perfectly healthy"
+        );
+    }
+
+    /// The happy path this fix must not regress: a GUI intent, still enabled,
+    /// no teardown — proceeds as Allow (the funnel returns `false`, i.e.
+    /// "don't force a reject").
+    #[test]
+    fn permission_reply_must_reject_allows_a_healthy_gui_intent() {
+        assert!(!permission_reply_must_reject(false, true, true));
+    }
+
+    /// Teardown alone is still sufficient to reject, exactly as before this
+    /// round — independent of whether computer use is enabled, and
+    /// independent of `is_gui` (a non-GUI intent must reject on teardown
+    /// too, unlike the GUI-only kill switch half).
+    #[test]
+    fn permission_reply_must_reject_on_teardown_regardless_of_gui_or_enabled() {
+        assert!(permission_reply_must_reject(true, true, true), "teardown alone must still reject");
+        assert!(
+            permission_reply_must_reject(true, false, true),
+            "teardown must reject a non-GUI intent too"
+        );
+    }
+
+    /// A non-GUI intent is never affected by `computer_use_enabled_now`,
+    /// mirroring `gui_kill_switch_denies`'s own non-GUI guarantee.
+    #[test]
+    fn permission_reply_must_reject_never_affects_a_non_gui_intent_via_computer_use() {
+        assert!(!permission_reply_must_reject(false, false, false));
+        assert!(!permission_reply_must_reject(false, false, true));
+    }
+
     /// An image-only message is addressable in ACP and not in claude, and the
     /// rewind path has exactly one place that decides which rule applies.
     #[test]
@@ -9823,6 +10008,46 @@ mod tests {
         assert_eq!(content["is_error"], true);
         assert_eq!(content["collabThreads"], serde_json::json!(["sub-1"]));
         assert!(content.get("images").is_none());
+    }
+
+    // —— issue #160 round-10 P1 #9: bounded inline-image-row retention ——
+
+    fn inline_row(id: i32) -> (i32, bool, serde_json::Value) {
+        (id, false, serde_json::json!({"images": [format!("data:image/png;base64,img{id}")]}))
+    }
+
+    /// Pushing one row past the cap evicts exactly the OLDEST one, in FIFO
+    /// order — the surviving queue holds the `MAX_INLINE_IMAGE_ROWS` most
+    /// recent rows, oldest-of-survivors first.
+    #[test]
+    fn track_inline_image_row_evicts_the_oldest_once_over_the_cap() {
+        let mut rows = std::collections::VecDeque::new();
+        let mut evicted_ids = Vec::new();
+        for i in 0..(MAX_INLINE_IMAGE_ROWS as i32 + 2) {
+            let (next_rows, evicted) = track_inline_image_row(rows, inline_row(i));
+            rows = next_rows;
+            evicted_ids.extend(evicted.into_iter().map(|(id, _, _)| id));
+        }
+        assert_eq!(rows.len(), MAX_INLINE_IMAGE_ROWS);
+        assert_eq!(evicted_ids, vec![0, 1], "the two oldest (ids 0 and 1) must be evicted, in order");
+        let surviving_ids: Vec<i32> = rows.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(
+            surviving_ids,
+            (2..(MAX_INLINE_IMAGE_ROWS as i32 + 2)).collect::<Vec<_>>(),
+            "survivors are the MOST RECENT rows, in insertion order"
+        );
+    }
+
+    /// Under the cap, nothing is evicted at all.
+    #[test]
+    fn track_inline_image_row_evicts_nothing_under_the_cap() {
+        let mut rows = std::collections::VecDeque::new();
+        for i in 0..MAX_INLINE_IMAGE_ROWS as i32 {
+            let (next_rows, evicted) = track_inline_image_row(rows, inline_row(i));
+            rows = next_rows;
+            assert!(evicted.is_empty(), "must not evict while at or under the cap");
+        }
+        assert_eq!(rows.len(), MAX_INLINE_IMAGE_ROWS);
     }
 
     /// PersistedMeta roundtrip + tolerance: apply restores every last_* field,
@@ -11559,6 +11784,7 @@ mod tests {
             probe_committed: 0,
             current_origin_tag: None,
             tool_rows: std::collections::HashMap::new(),
+            inline_image_rows: std::collections::VecDeque::new(),
             stopped: false,
             codex_client: None,
             acp_client: None,
