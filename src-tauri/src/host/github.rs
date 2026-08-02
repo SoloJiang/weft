@@ -26,49 +26,99 @@ impl PrHost for GitHubHost {
         HostKind::GitHub
     }
 
+    /// ORDER IS LOAD-BEARING: threads are read FIRST, the scalar axes
+    /// (`reviewDecision`/`statusCheckRollup`/`mergeable`/`state`) LAST.
+    ///
+    /// Two calls cannot be one instant, so this snapshot always spans a
+    /// window, and `automerge::evaluate_row` acts on it immediately
+    /// afterwards. `--match-head-commit` closes the part of that window where
+    /// the HEAD moves, but a review submitted on an UNCHANGED head is
+    /// invisible to it — so whichever axis is read first is the one that can
+    /// go stale before the merge fires.
+    ///
+    /// Reading threads first puts the revocable axes last: a reviewer who
+    /// submits CHANGES_REQUESTED (or a check that flips red) while pagination
+    /// is still running is now caught by the `gh pr view` that follows, where
+    /// the previous order read APPROVED first and then spent the whole
+    /// pagination blind to it. The residual runs the other way and is
+    /// strictly smaller: a NEW thread opened during the single `gh pr view`
+    /// call (~one request) is missed, versus a full paginated walk (many, on
+    /// a PR with hundreds of threads). A review submission that opens threads
+    /// almost always moves `reviewDecision` too, which this order does see.
+    ///
+    /// Closing the window entirely would mean one atomic GraphQL query for
+    /// every axis — which for >100 threads still needs later pages, and would
+    /// mean hand-rolling the `statusCheckRollup` union that `gh pr view
+    /// --json` currently normalizes, on the exact path that authorizes an
+    /// irreversible merge. The server-side answer the Settings copy already
+    /// recommends (branch protection) is what actually makes this atomic;
+    /// this order minimizes the client-side exposure meanwhile.
     fn fetch_status(&self, target: &PrTarget) -> Result<PrSnapshot, HostError> {
-        // `super::qualified_repo_slug` folds `target.host_base` in (GitHub Enterprise support —
-        // Codex review, PR #159 repo.rs:3873: this call used to build a bare OWNER/REPO
-        // argument with no host at all, always querying `gh`'s own configured default instead
-        // of the recorded install) and refuses an embedded '/' in any of the three inputs
-        // before this can ever shell out — the confirmed SSRF this crate's `[HOST/]OWNER/REPO`
-        // grammar otherwise allows (see `parse_pr_url`'s doc).
-        let repo_slug = super::qualified_repo_slug(&target.host_base, &target.owner, &target.repo)
-            .map_err(|message| HostError::Other { message })?;
-        let out = Command::new("gh")
-            .args(["pr", "view", &target.number.to_string(), "--repo", &repo_slug, "--json", JSON_FIELDS])
-            // Checks run user tooling that a GUI launch's minimal PATH can't
-            // resolve (Homebrew/local installs of `gh`) — same reasoning as
-            // `check::run_check`.
-            .env("PATH", crate::detect::tool_path())
-            .output();
-        let out = match out {
-            Ok(o) => o,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(HostError::CliMissing { program: "gh".to_string() })
-            }
-            Err(e) => return Err(HostError::Other { message: e.to_string() }),
-        };
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(classify_gh_error(&stderr));
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let mut snapshot = parse_pr_json(&stdout).map_err(|message| HostError::Other { message })?;
-        // A SECOND call, because `gh pr view --json` has no field that
-        // exposes thread resolution at all — `reviewThreads` is GraphQL-only.
-        // Its failures are deliberately NOT promoted into a `HostError` for
-        // the whole probe: the other three axes were just read successfully,
-        // and discarding them would turn one unreadable axis into a
-        // `probe_fail_count` bump that eventually stops the monitor watching
-        // the row entirely. `ThreadStatus::Unknown` already blocks everything
-        // downstream (`judge` -> `Indeterminate`, and `gate` demands a
-        // positive `AllResolved`), so the honest, strictly-safer outcome is
-        // to record the three axes we DO know plus "we could not tell about
-        // threads".
-        snapshot.threads = fetch_review_threads(target);
-        Ok(snapshot)
+        fetch_status_ordered(target, fetch_review_threads, fetch_scalar_axes)
     }
+}
+
+/// Reader of the thread axis. A plain non-capturing `fn` pointer, the same
+/// seam shape `automerge::HostResolver` uses (and for the same stated
+/// reason: a property with no way to substitute a fake had zero regression
+/// coverage).
+type ThreadsReader = fn(&PrTarget) -> ThreadStatus;
+/// Reader of everything `gh pr view --json` answers.
+type ScalarReader = fn(&PrTarget) -> Result<PrSnapshot, HostError>;
+
+/// The order guarantee from [`GitHubHost::fetch_status`]'s doc, as the only
+/// statement of it — extracted so a test can assert it instead of trusting a
+/// comment. Restoring the old order (scalars first) makes
+/// `threads_are_read_before_the_revocable_axes` fail.
+fn fetch_status_ordered(
+    target: &PrTarget,
+    read_threads: ThreadsReader,
+    read_scalars: ScalarReader,
+) -> Result<PrSnapshot, HostError> {
+    let threads = read_threads(target);
+    // A scalar-read failure discards the thread reading with it, on purpose:
+    // the probe as a whole failed, and half a snapshot must never be
+    // persisted as if it were a reading.
+    let mut snapshot = read_scalars(target)?;
+    snapshot.threads = threads;
+    Ok(snapshot)
+}
+
+/// `gh pr view --json` — lifecycle, CI, review decision, conflict.
+///
+/// Leaves `threads` at whatever [`parse_pr_json`] defaults it to (`Unknown`);
+/// [`fetch_status_ordered`] overwrites it. A SECOND call is needed at all
+/// because this response has no field exposing thread resolution —
+/// `reviewThreads` is GraphQL-only.
+fn fetch_scalar_axes(target: &PrTarget) -> Result<PrSnapshot, HostError> {
+    // `super::qualified_repo_slug` folds `target.host_base` in (GitHub Enterprise support —
+    // Codex review, PR #159 repo.rs:3873: this call used to build a bare OWNER/REPO
+    // argument with no host at all, always querying `gh`'s own configured default instead
+    // of the recorded install) and refuses an embedded '/' in any of the three inputs
+    // before this can ever shell out — the confirmed SSRF this crate's `[HOST/]OWNER/REPO`
+    // grammar otherwise allows (see `parse_pr_url`'s doc).
+    let repo_slug = super::qualified_repo_slug(&target.host_base, &target.owner, &target.repo)
+        .map_err(|message| HostError::Other { message })?;
+    let out = Command::new("gh")
+        .args(["pr", "view", &target.number.to_string(), "--repo", &repo_slug, "--json", JSON_FIELDS])
+        // Checks run user tooling that a GUI launch's minimal PATH can't
+        // resolve (Homebrew/local installs of `gh`) — same reasoning as
+        // `check::run_check`.
+        .env("PATH", crate::detect::tool_path())
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(HostError::CliMissing { program: "gh".to_string() })
+        }
+        Err(e) => return Err(HostError::Other { message: e.to_string() }),
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(classify_gh_error(&stderr));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_pr_json(&stdout).map_err(|message| HostError::Other { message })
 }
 
 /// The paginated `reviewThreads` read. `first: 100` is GitHub's per-page
@@ -121,7 +171,7 @@ fn fetch_review_threads(target: &PrTarget) -> ThreadStatus {
         .env("PATH", crate::detect::tool_path());
     let out = match cmd.output() {
         Ok(o) => o,
-        Err(e) => return ThreadStatus::Unknown { reason: format!("无法执行 gh: {e}") },
+        Err(e) => return ThreadStatus::Unknown { reason: format!("could not run gh: {e}") },
     };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -216,7 +266,7 @@ fn parse_pr_json(raw: &str) -> Result<PrSnapshot, String> {
         // `fetch_review_threads` call would silently get an all-clear it
         // never earned. `fetch_status` overwrites this immediately.
         threads: ThreadStatus::Unknown {
-            reason: "还没有读取 review 讨论线程".to_string(),
+            reason: "review threads have not been read yet".to_string(),
         },
         conflict: conflict_of(&parsed.mergeable),
     })
@@ -357,25 +407,25 @@ fn parse_review_threads_json(raw: &str) -> Result<ThreadStatus, String> {
     let mut pages = 0usize;
     let mut last_has_next = false;
     for page in serde_json::Deserializer::from_str(raw).into_iter::<RawThreadsPage>() {
-        let page = page.map_err(|e| format!("第 {} 页 reviewThreads 响应无法解析: {e}", pages + 1))?;
+        let page = page.map_err(|e| format!("reviewThreads page {} did not parse: {e}", pages + 1))?;
         if let Some(first) = page.errors.first() {
-            return Err(format!("GraphQL 返回错误: {first}"));
+            return Err(format!("GraphQL returned an error: {first}"));
         }
         let threads = page
             .data
             .and_then(|d| d.repository)
             .and_then(|r| r.pull_request)
             .map(|p| p.review_threads)
-            .ok_or_else(|| format!("第 {} 页缺少 repository.pullRequest", pages + 1))?;
+            .ok_or_else(|| format!("reviewThreads page {} has no repository.pullRequest", pages + 1))?;
         unresolved += threads.nodes.iter().filter(|n| !n.is_resolved).count() as u32;
         last_has_next = threads.page_info.has_next_page;
         pages += 1;
     }
     if pages == 0 {
-        return Err("gh 没有返回任何 reviewThreads 分页".to_string());
+        return Err("gh returned no reviewThreads pages at all".to_string());
     }
     if last_has_next {
-        return Err("reviewThreads 分页在服务端还有下一页时就结束了,读到的线程不完整".to_string());
+        return Err("reviewThreads pagination ended while the server still reported another page — the read is incomplete".to_string());
     }
     if unresolved == 0 {
         Ok(ThreadStatus::AllResolved)
@@ -592,6 +642,80 @@ mod tests {
         }
     }
 
+    // --- read ordering ----------------------------------------------------
+
+    thread_local! {
+        /// Which reader ran, in order. Thread-local rather than a process
+        /// static so no serialization lock is needed between parallel tests.
+        static ORDER: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn recording_threads_reader(_: &PrTarget) -> ThreadStatus {
+        ORDER.with(|o| o.borrow_mut().push("threads"));
+        ThreadStatus::AllResolved
+    }
+
+    fn recording_scalar_reader(_: &PrTarget) -> Result<PrSnapshot, HostError> {
+        ORDER.with(|o| o.borrow_mut().push("scalars"));
+        parse_pr_json(OPEN_CLEAN_FIXTURE)
+            .map_err(|message| HostError::Other { message })
+    }
+
+    fn failing_scalar_reader(_: &PrTarget) -> Result<PrSnapshot, HostError> {
+        ORDER.with(|o| o.borrow_mut().push("scalars"));
+        Err(HostError::NotFound)
+    }
+
+    fn probe_target() -> PrTarget {
+        PrTarget {
+            host_base: String::new(),
+            owner: "acme".to_string(),
+            repo: "widgets".to_string(),
+            number: 1,
+        }
+    }
+
+    /// The safety property from `fetch_status`'s doc, asserted rather than
+    /// merely asserted-in-prose: the axes a reviewer can REVOKE
+    /// (`reviewDecision`, CI) are read LAST, so a revocation landing during
+    /// thread pagination is still seen before the merge decision. Two shell
+    /// calls cannot be one instant; this is what decides which side of the
+    /// window is exposed. Swap the two lines in `fetch_status_ordered` and
+    /// this goes red.
+    #[test]
+    fn threads_are_read_before_the_revocable_axes() {
+        ORDER.with(|o| o.borrow_mut().clear());
+        let snapshot =
+            fetch_status_ordered(&probe_target(), recording_threads_reader, recording_scalar_reader)
+                .unwrap();
+        assert_eq!(
+            ORDER.with(|o| o.borrow().clone()),
+            vec!["threads", "scalars"],
+            "reviewDecision/CI must be the freshest thing before the merge decision"
+        );
+        assert_eq!(
+            snapshot.threads,
+            ThreadStatus::AllResolved,
+            "the thread reading must survive onto the snapshot the scalar read produced"
+        );
+    }
+
+    /// A failed scalar read is a failed PROBE — the thread reading taken
+    /// moments earlier must not be persisted on its own as if it were a
+    /// snapshot.
+    #[test]
+    fn a_failed_scalar_read_discards_the_thread_reading_with_it() {
+        ORDER.with(|o| o.borrow_mut().clear());
+        let result =
+            fetch_status_ordered(&probe_target(), recording_threads_reader, failing_scalar_reader);
+        assert!(matches!(result, Err(HostError::NotFound)));
+        assert_eq!(
+            ORDER.with(|o| o.borrow().clone()),
+            vec!["threads", "scalars"],
+            "the thread read still happened first — it is its RESULT that is dropped"
+        );
+    }
+
     // --- reviewThreads: the pagination + parsing trap ---------------------
 
     /// Build a page exactly the way the live API returns one.
@@ -641,7 +765,7 @@ mod tests {
     fn a_final_page_still_reporting_has_next_page_is_unknown_not_a_count() {
         let stream = format!("{}{}", page(100, 0, true), page(51, 0, true));
         let err = parse_review_threads_json(&stream).unwrap_err();
-        assert!(err.contains("不完整"), "got: {err}");
+        assert!(err.contains("incomplete"), "got: {err}");
     }
 
     /// The PR #126 recurrence, reproduced: a page in the stream that will not
@@ -674,7 +798,7 @@ mod tests {
     fn an_empty_or_whitespace_stream_is_unknown_not_all_resolved() {
         for raw in ["", "   ", "\n"] {
             let err = parse_review_threads_json(raw).unwrap_err();
-            assert!(err.contains("没有返回"), "raw={raw:?} got: {err}");
+            assert!(err.contains("no reviewThreads pages"), "raw={raw:?} got: {err}");
         }
     }
 
