@@ -899,7 +899,7 @@ async fn call_tool(
             text_result("interface change announced".into())
         }
         "bus_inbox" => {
-            let mut msgs = reg.inbox(thread, me);
+            let local_msgs = reg.inbox(thread, me);
             let pending = match crate::store::repo::list_pending_human_answers_for_scope(
                 db, thread, me,
             )
@@ -907,30 +907,56 @@ async fn call_tool(
             {
                 Ok(pending) => pending,
                 Err(error) => {
-                    reg.restore_inbox(thread, me, msgs);
+                    reg.restore_inbox(thread, me, local_msgs);
                     return text_result(format!("error: could not read durable inbox: {error}"));
                 }
             };
-            let mut seen: HashSet<u64> = msgs
-                .iter()
-                .filter_map(|message| message.request_id)
-                .collect();
+            // Durable answers are the recovery source of truth. Put every
+            // still-unacknowledged answer ahead of process-local messages so
+            // a message that arrived after an earlier read cannot overtake an
+            // answer whose delivery was already observed but not acknowledged.
+            // When the same request is present in both sources, keep the
+            // process-local copy and omit its duplicate (idempotent replay).
+            let mut pending_ids = HashSet::new();
+            let mut local_indexes_by_request = HashMap::new();
+            for (index, message) in local_msgs.iter().enumerate() {
+                if let Some(request_id) = message.request_id {
+                    local_indexes_by_request.entry(request_id).or_insert(index);
+                }
+            }
+            let mut msgs = Vec::with_capacity(local_msgs.len() + pending.len());
+            let mut consumed_local_indexes = HashSet::new();
             for request in pending {
                 let Ok(request_id) = u64::try_from(request.id) else {
-                    reg.restore_inbox(thread, me, msgs);
+                    reg.restore_inbox(thread, me, local_msgs);
                     return text_result("error: invalid durable question id".into());
                 };
-                if !seen.insert(request_id) {
+                if !pending_ids.insert(request_id) {
                     continue;
                 }
-                msgs.push(crate::bus::Msg {
-                    from: crate::bus::HUMAN.to_string(),
-                    to: me.to_string(),
-                    text: request.answer,
-                    ts: 0,
-                    kind: "message".to_string(),
-                    request_id: Some(request_id),
-                });
+                if let Some(&index) = local_indexes_by_request.get(&request_id) {
+                    msgs.push(local_msgs[index].clone());
+                    consumed_local_indexes.insert(index);
+                } else {
+                    msgs.push(crate::bus::Msg {
+                        from: crate::bus::HUMAN.to_string(),
+                        to: me.to_string(),
+                        text: request.answer,
+                        ts: 0,
+                        kind: "message".to_string(),
+                        request_id: Some(request_id),
+                    });
+                }
+            }
+            for (index, message) in local_msgs.into_iter().enumerate() {
+                if consumed_local_indexes.contains(&index)
+                    || message
+                        .request_id
+                        .is_some_and(|request_id| pending_ids.contains(&request_id))
+                {
+                    continue;
+                }
+                msgs.push(message);
             }
             text_result(serde_json::to_string(&msgs).unwrap_or_else(|_| "[]".into()))
         }
@@ -2563,8 +2589,21 @@ mod tests {
             crate::store::repo::HUMAN_REQUEST_ANSWERED
         );
 
+        // A newer process-local message must not overtake the durable answer
+        // that the previous read observed but did not acknowledge.
+        let posted = bus_tool_text(
+            &base,
+            thread.id,
+            crate::bus::LEAD,
+            "bus_post",
+            json!({ "to": &scope, "text": "newer" }),
+        )
+        .await;
+        assert!(posted.contains("posted to"), "got: {posted}");
+
         // No ack: even though the in-memory inbox was drained, the DB outbox
-        // replays the same stable request id instead of losing the answer.
+        // replays the same stable request id instead of losing the answer, and
+        // it is ordered before the newer process-local message.
         let replay: Value = serde_json::from_str(
             &bus_tool_text_for_session(
                 &base,
@@ -2577,7 +2616,11 @@ mod tests {
             .await,
         )
         .unwrap();
+        assert_eq!(replay.as_array().unwrap().len(), 2);
         assert_eq!(replay[0]["request_id"], request.id);
+        assert_eq!(replay[0]["text"], "REST");
+        assert!(replay[1]["request_id"].is_null());
+        assert_eq!(replay[1]["text"], "newer");
 
         let wrong_route = bus_tool_text(
             &base,
