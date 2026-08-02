@@ -2148,6 +2148,31 @@ impl AskRegistry {
         let Some(ask) = g.open.iter().find(|a| a.id == id).cloned() else {
             return false;
         };
+        // issue #160 round-16 P1 (Codex computer_srv.rs:1357): a GUI ask
+        // answered while the computer-use stop latch is tripped is forced to
+        // Deny — decided HERE, under the registry lock, atomically with the
+        // grant recording below. The disable paths (Emergency Stop and the
+        // Settings toggle) run trip-latch → cancel_gui_asks, and
+        // `bus::computer_srv::approve` self-cancels a card published by a
+        // caller that straddled the transition — but that self-check and its
+        // `cancel` are SEPARATE lock acquisitions from this method, so an
+        // answer landing in the instant between them could still have minted
+        // an Always/Full grant for a world that was already stopped. Folding
+        // the latch read into answer() itself closes that: any answer that
+        // records a grant provably observed latch-clear under THIS lock. The
+        // trip happens-before every straddler's insert, and the latch can only
+        // clear via an explicit re-enable — by which point cancel_gui_asks and
+        // the self-check have already removed every stale GUI card — so a
+        // forced Deny here can never hit a card a human legitimately answered
+        // in an enabled world. Non-GUI asks are untouched: the latch is a
+        // computer-use kill switch, not a general approval freeze. Lock order
+        // (registry → stop-state) nests one way only; no path takes them in
+        // reverse, so this cannot deadlock.
+        let ans = if action_key_is_gui(&ask.action_key) && crate::computer::stop_latched() {
+            Answer::Deny
+        } else {
+            ans
+        };
         let key = (ask.thread, ask.dir.clone());
         // Whether this answer added a NEW standing grant (HashSet::insert is true
         // only on first insertion). Drives a single persist write — an idempotent
@@ -4702,6 +4727,44 @@ mod tests {
             2, "20", "computer", "s", "d", None, RiskLevel::ReadOnly, &gui_key(0), None, 2,
         );
         assert!(other.is_some(), "the cap is per-(thread, dir), not global");
+    }
+
+    /// issue #160 round-16 P1 (Codex computer_srv.rs:1357): while the
+    /// computer-use stop latch is tripped, answering a GUI ask `Always` is
+    /// forced to Deny under the registry lock — no grant is recorded, the
+    /// waiter sees Deny — while a non-GUI ask answered in the same window
+    /// still grants normally (the latch is not a general approval freeze).
+    #[tokio::test]
+    async fn answering_a_gui_ask_while_the_stop_latch_is_tripped_denies_and_mints_no_grant() {
+        let _guard = crate::computer::process_state_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+        let r = AskRegistry::new();
+
+        let gui_key = action_key(&["gui", "left_click", "notes"]);
+        let bash_key = action_key(&["bash", "ls"]);
+        let (gid, grx) = r.request(1, "10", "computer", "click", "d", RiskLevel::Write, &gui_key);
+        let (bid, _brx) = r.request(1, "10", "bash", "run", "ls", RiskLevel::Write, &bash_key);
+
+        crate::computer::trip_stop_latch();
+
+        // The GUI answer is forced to Deny: no grant, waiter sees Deny.
+        assert!(r.answer(gid, Answer::Always), "the ask is still found and resolved");
+        assert_eq!(grx.await, Ok(Decision::Deny), "the waiter must see Deny, never Allow");
+        assert!(
+            r.auto_decision_exact(1, "10", &gui_key).is_none(),
+            "no Always grant may be minted from a latched-world answer"
+        );
+
+        // A non-GUI answer in the same window grants normally.
+        assert!(r.answer(bid, Answer::Always));
+        assert!(
+            r.auto_decision(1, "10", RiskLevel::Write, &bash_key).is_some(),
+            "the latch must not freeze unrelated non-GUI approvals"
+        );
+
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
     }
 
     // ---- authorization persistence ------------------------------------------

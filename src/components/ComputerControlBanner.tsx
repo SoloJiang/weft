@@ -109,6 +109,30 @@ function bannerText(status: BannerStatus, state: ControlState | null, t: TFuncti
  * the server flag true in the first place — so a steady stream of `false`
  * polls must NOT be read as "resolved" and clear it out from under a still-
  * unretried local failure.
+ *
+ * issue #160 round-16 P2: round-15's transition still requires a fulfilled
+ * poll to have observed the server flag AT true before it can see the
+ * true -> false edge. The poll interval is 3s; if a human fixes a failed-to-
+ * persist Stop by jumping straight to Settings and re-enabling computer use,
+ * the whole true -> false round trip can complete between two ticks with no
+ * poll ever landing on `true` in between. `lastServerStopFailedRef` never
+ * sees a true, the transition never fires, and `localStopFailed` is stuck
+ * forever even though everything is actually fine again. Fixed by also
+ * polling `get_computer_use_enabled` every tick: the only backend path that
+ * can turn `computer_use_enabled` back to true is a human explicitly
+ * re-enabling it from Settings, and that path (`clear_emergency_stop`) is
+ * the SAME command that resets the backend's own persist-failed flag — so a
+ * fulfilled `enabled === true` poll is itself proof any prior persist
+ * failure has already been handled, and clears `localStopFailed` directly
+ * (mirroring `lastServerStopFailedRef` to `false` alongside it, so the two
+ * tracked flags don't disagree about what the server last confirmed).
+ * Round-15's transition check stays too — it still covers the case where
+ * enabled is already false (e.g. round-13's fail-safe below never treats an
+ * enabled poll as license to peek past a still-disabled state), and now
+ * mostly acts as a harmless second path to the same clear. Round-13's
+ * fail-safe applies here unchanged: a rejected enabled poll is a no-op, and
+ * `enabled === false` never clears anything — a disabled state means
+ * whatever local failure is recorded is still real.
  * Mounted once near the top of the shell, above the content area, alongside
  * `ProcessQuotaBar`.
  */
@@ -136,9 +160,10 @@ export function ComputerControlBanner() {
   useEffect(() => {
     let alive = true;
     const tick = async () => {
-      const [controlResult, persistResult] = await Promise.allSettled([
+      const [controlResult, persistResult, enabledResult] = await Promise.allSettled([
         api.getComputerControlState(),
         api.getComputerStopPersistFailed(),
+        api.getComputerUseEnabled(),
       ]);
       if (!alive) return;
       // issue #160 round-13 P1: a transient invoke rejection must NEVER hide the
@@ -147,6 +172,7 @@ export function ComputerControlBanner() {
       // have cleared. Only a SUCCESSFUL poll updates each piece of state; a
       // rejected one keeps the last known value, so the banner stays up until a
       // real poll confirms control and the persistence warning are both gone.
+      // This applies to the round-16 enabled poll too: a rejection is a no-op.
       if (controlResult.status === "fulfilled") setState(controlResult.value);
       if (persistResult.status === "fulfilled") {
         const next = persistResult.value;
@@ -155,6 +181,16 @@ export function ComputerControlBanner() {
         if (lastServerStopFailedRef.current && !next) setLocalStopFailed(false);
         lastServerStopFailedRef.current = next;
         setServerStopFailed(next);
+      }
+      // round-16 P2: a fulfilled poll landing on enabled === true means a human
+      // just re-enabled computer use from Settings, which is the same backend
+      // path that clears the persist-failed flag — so it's recovery confirmation
+      // on its own, independent of whether round-15's transition above ever saw
+      // the intervening `true`. enabled === false clears nothing here: a
+      // disabled state doesn't tell us a prior local failure was handled.
+      if (enabledResult.status === "fulfilled" && enabledResult.value) {
+        setLocalStopFailed(false);
+        lastServerStopFailedRef.current = false;
       }
     };
     void tick();

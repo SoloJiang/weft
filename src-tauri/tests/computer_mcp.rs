@@ -444,35 +444,43 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert!(out.contains("screenshot saved"), "{out}");
     assert!(out.contains(".png"), "{out}");
 
-    let expected_dir = weft::paths::weft_home()
+    // issue #160 round-15 P2 (Codex computer_srv.rs:2759) gave lead
+    // screenshots a dedicated subdirectory; round-16 P1 (Codex
+    // computer_srv.rs:2812) then moved the lead's WHOLE output root under
+    // Weft-managed storage (`<weft_home>/computer/<thread>/lead`, same shape
+    // as the worker lane's `wt-<id>` roots) — the agent-writable lead scratch
+    // cwd receives NOTHING computer-related at all anymore.
+    let lead_out_root = weft::paths::weft_home()
         .unwrap()
-        .join("leads")
-        .join(thread.to_string());
-    // issue #160 round-15 P2 (Codex computer_srv.rs:2759): lead screenshots
-    // land in a DEDICATED `.weft/screenshots` subdirectory, never in the
-    // shared scratch cwd root — retention pruning must only ever operate over
-    // files this module itself wrote.
-    let shots_dir = expected_dir.join(".weft").join("screenshots");
+        .join("computer")
+        .join(thread.to_string())
+        .join("lead");
+    let shots_dir = lead_out_root.join("screenshots");
     let has_png = std::fs::read_dir(&shots_dir)
         .unwrap_or_else(|e| panic!("expected {shots_dir:?} to exist: {e}"))
         .filter_map(|e| e.ok())
         .any(|e| e.path().extension().map(|ext| ext == "png").unwrap_or(false));
     assert!(has_png, "expected a .png under {shots_dir:?}");
-    let root_has_png = std::fs::read_dir(&expected_dir)
-        .unwrap_or_else(|e| panic!("expected {expected_dir:?} to exist: {e}"))
-        .filter_map(|e| e.ok())
-        .any(|e| e.path().extension().map(|ext| ext == "png").unwrap_or(false));
-    assert!(
-        !root_has_png,
-        "the lead's shared scratch cwd root must no longer receive screenshots"
-    );
+    let scratch_cwd = weft::paths::weft_home().unwrap().join("leads").join(thread.to_string());
+    if let Ok(rd) = std::fs::read_dir(&scratch_cwd) {
+        let scratch_has_computer_output = rd.filter_map(|e| e.ok()).any(|e| {
+            let p = e.path();
+            let is_png = p.extension().map(|ext| ext == "png").unwrap_or(false);
+            let is_weft_dir = p.file_name().map(|n| n == ".weft").unwrap_or(false);
+            is_png || is_weft_dir
+        });
+        assert!(
+            !scratch_has_computer_output,
+            "the agent-writable lead scratch cwd must receive no computer-use output at all"
+        );
+    }
 
     // —— M2: input actions, gates, and the audit log ——
     //
     // The screenshot call above already appended its own audit line, so the
     // audit-line counts below are 1-based from THAT call, not 0.
 
-    let audit_path = expected_dir.join(".weft").join("computer-audit.jsonl");
+    let audit_path = lead_out_root.join("computer-audit.jsonl");
 
     // Clear the throttle window before the first INPUT action (the
     // screenshot call above never touched it, since screenshot/list_windows

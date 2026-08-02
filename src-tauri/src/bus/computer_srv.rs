@@ -48,6 +48,38 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+// —— issue #160 round-16 P1 (Codex computer_srv.rs:605): move every synchronous OS/encode step off the async runtime ——
+
+/// issue #160 round-16 P1 (Codex 605): run one synchronous OS/encode step on
+/// tokio's blocking pool instead of directly on the async worker that called
+/// it. Before this round, EVERY OS-touching call this module makes —
+/// `computer::visible_windows`/`resolve_window` (xcap window enumeration),
+/// `screenshot_window` (capture + PNG encode), `encode_jpeg_data_uri` (JPEG
+/// re-encode, preview and MCP image alike), `activate_target` (a shell-out
+/// that can block for a real amount of wall-clock time), and every input
+/// backend call (`click`/`type_text`/`key`/`scroll`/`drag`/`move_cursor`, all
+/// backed by `enigo`) — ran straight on whichever Tokio worker thread picked
+/// up the request. A session holding a standing Full/Always grant could fire
+/// enough concurrent `list_windows`/input calls to occupy every worker in the
+/// runtime's pool at once; worse, since the Tauri `Stop` command and the
+/// global-Escape callback ALSO spawn onto that same pool, a single slow or
+/// wedged OS call anywhere on this path could leave the kill switch itself
+/// unable to get scheduled — exactly the failure mode a kill switch exists to
+/// never have. Routing each such step through `spawn_blocking` keeps the
+/// async workers free for Stop/Escape regardless of how long, how many, or
+/// how stuck the OS-facing calls get; the dedicated blocking pool is sized to
+/// grow for exactly this kind of workload. Failure here (`JoinError`, in
+/// practice only ever a panic inside `f` or the runtime shutting down) is
+/// mapped to a plain error string and propagated — fail closed, never a
+/// panic that could unwind past this boundary.
+async fn on_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("desktop backend task failed: {e}"))
+}
+
 fn text_result(s: String) -> Value {
     json!({ "content": [{ "type": "text", "text": s }] })
 }
@@ -601,8 +633,24 @@ async fn run_action(
     }
     match action {
         "list_windows" => {
+            // issue #160 round-16 P1 (Codex 605): acquire the SAME semaphore
+            // `screenshot` holds during capture (`screenshot_semaphore` — see
+            // its own doc, capacity 2) before this call's own OS enumeration
+            // — round-15 P2's `MAX_OPEN_OBSERVE_ASKS` only bounds how many
+            // observe Ask CARDS may sit open waiting on a human; a session
+            // already holding a standing Full/Always grant skips that gate
+            // entirely and previously had NO cap at all on how many
+            // concurrent `list_windows` calls it could fire, each one a
+            // synchronous `xcap` enumeration. Sharing the capture semaphore's
+            // budget gives the already-authorized path the same hard
+            // concurrency ceiling, rather than inventing a second one.
+            let _observe_permit = screenshot_semaphore().acquire().await.map_err(|e| e.to_string())?;
             let b = backend::backend();
-            computer::visible_windows(b.as_ref())
+            // issue #160 round-16 P1 (Codex 605): the enumeration itself
+            // moves onto tokio's blocking pool — see `on_blocking`'s own doc
+            // for why every OS-touching call here now does.
+            on_blocking(move || computer::visible_windows(b.as_ref()))
+                .await?
                 .map(|windows| serde_json::to_string(&windows).unwrap_or_else(|_| "[]".into()))
                 .map_err(|e| e.to_string())
         }
@@ -632,6 +680,14 @@ async fn run_action(
             // issue #160 round-12 P1 #I re-resolves and re-verifies a SECOND
             // time, right before the capture, and THAT result is what gets
             // used for the actual capture/record below.
+            // issue #160 round-16 P1 (Codex 605): this first resolve stays a
+            // direct (non-`on_blocking`) call — one single, argument-gated
+            // enumeration on a path that hasn't even awaited `screenshot_out_
+            // dir`/the capture semaphore yet, unlike `list_windows`' own
+            // unbounded-repeat hazard (see that arm's own round-16 comment).
+            // The SECOND resolve below, sitting immediately next to the
+            // actual capture, is where this arm's synchronous OS/encode work
+            // is concentrated and moved off the runtime.
             let _ = resolve_and_verify_target(window_query, &approved, window_id_out)?;
             let out_dir = screenshot_out_dir(db, thread, dir, wt).await?;
             // issue #160 round-12 P1 #5: acquire the process-wide capture
@@ -663,121 +719,170 @@ async fn run_action(
             if !computer::enabled(db).await {
                 return Err(ComputerError::Disabled.to_string());
             }
+            // issue #160 round-16 P1 (Codex 605): whether this call's owning
+            // engine accepts an inline MCP image is looked up now, on the
+            // runtime — `engine_accepts_mcp_image` awaits the db, but
+            // everything from here down (the second resolve through every
+            // encode/record) runs inside a SINGLE `on_blocking` closure below
+            // (see that helper's own doc), and a blocking-pool closure can't
+            // itself `.await` anything. The bool crosses that boundary as a
+            // plain owned value instead of the lookup itself moving in.
+            let want_mcp_image = engine_accepts_mcp_image(db, thread, dir).await;
             // issue #160 round-12 P1 #I: re-resolve + re-verify identity
-            // AGAIN, here, after EVERY await this arm takes since the first
-            // check above (`screenshot_out_dir`, then the capture semaphore
-            // itself) — with BOTH `SCREENSHOT_CONCURRENCY` permits already
-            // held by concurrent captures, the `acquire().await` just above
-            // can queue for arbitrarily long. `screenshot_window` below only
-            // re-resolves `window_query` for ITS OWN capture; it does not
-            // compare against `approved` at all. Without this second check,
-            // the ORIGINAL window could close during that queueing gap and a
-            // same-query REPLACEMENT window take its place, and
-            // `screenshot_window`'s internal re-resolve would then silently
-            // capture the REPLACEMENT's pixels under an approval that was
-            // only ever shown for the original — this is exactly the
-            // round-11 P1 #C gap, reopened by round-12 P1 #5's OWN semaphore
-            // queue. No further `.await` happens between this check and the
-            // capture call below, so — like every input arm's own second
-            // `resolve_and_verify_target` right before injection (round-8
-            // P1 #4/round-10 P1 #B) — this restores the "just verified"
-            // guarantee the comment below relies on. `w` (this SECOND
-            // resolve's result) is what gets used for the actual capture and
-            // for recording this capture's own window IDENTITY+GEOMETRY
-            // (round-12 P1 #2, round-12 P1 #C) below — every other line here
-            // still keys off `shot.window_id` instead (the id
-            // `screenshot_window` ITSELF resolved and captured against),
-            // matching this arm's own pre-existing "no second resolution to
-            // drift" discipline (see the `store_screenshot_preview` call
-            // below).
-            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
-            let b = backend::backend();
-            // `screenshot_window` re-resolves `window_query` internally —
-            // the SAME query just re-verified above, against the SAME
-            // unchanging backend state, with no await/OS call in between —
-            // so it captures the IDENTICAL window `w` just verified. This
-            // mirrors the accepted "resolve twice" pattern the click-family
-            // arms already use (`resolve_and_verify_target` itself is called
-            // twice per input action, once before/once after activation);
-            // here the gap is narrower still (no activation in between at
-            // all).
-            let shot = computer::screenshot_window(b.as_ref(), window_query, &out_dir)
-                .map_err(|e| e.to_string())?;
-            // issue #160 round-10 P2 #H: this confirmation text is shared by
-            // BOTH the plain-text-only result and `text_and_image_result`'s
-            // own text block (see that function's doc) — worded so it holds
-            // for either: a capable client (Claude, ACP/omp) also gets this
-            // screenshot inlined as an image block in the SAME result and can
-            // reason over it directly; any other client opens the path.
-            let text = format!(
-                "screenshot saved: {} ({}x{}, scale {:.2}) — inlined as an image in this result for \
-                 capable clients (Claude, ACP/omp), otherwise open the path with your own image \
-                 viewing tool",
-                shot.path.display(),
-                shot.width,
-                shot.height,
-                shot.scale
-            );
-            // Both the preview registry and the MCP image block need the raw
-            // pixels — read straight off `shot.pixels`, the SAME in-memory
-            // RGBA `screenshot_window` itself scaled and saved (issue #160
-            // round-7 P1), never re-opened from `shot.path`. This used to
-            // re-read the just-saved PNG back off disk (`read_captured_image`,
-            // now deleted): a worker-writable `out_dir` is repository-
-            // controlled content, and the gap between that PNG's own save and
-            // this re-open was an open TOCTOU/symlink window — a sandboxed
-            // background process could swap the freshly-saved file for a
-            // symlink to an arbitrary user-readable image in that gap, and
-            // Weft would follow it with its own permissions, inlining the
-            // substituted pixels to the model/human as if they were the real
-            // capture. Reading `shot.pixels` instead closes that window
-            // entirely rather than narrowing it — there is no second
-            // filesystem access left to race. `encode_jpeg_data_uri` can
-            // still fail on `shot.pixels` (encoding, not decoding, can
-            // theoretically error) — best-effort, same as before: a failure
-            // here must never fail a screenshot that already saved
-            // successfully, it just means no preview/image this call.
+            // AGAIN, after EVERY await this arm takes since the first check
+            // above (`screenshot_out_dir`, the capture semaphore itself, then
+            // the engine lookup just above) — with BOTH `SCREENSHOT_
+            // CONCURRENCY` permits already held by concurrent captures, the
+            // `acquire().await` above can queue for arbitrarily long.
+            // `screenshot_window` below only re-resolves `window_query` for
+            // ITS OWN capture; it does not compare against `approved` at all.
+            // Without this second check, the ORIGINAL window could close
+            // during that queueing gap and a same-query REPLACEMENT window
+            // take its place, and `screenshot_window`'s internal re-resolve
+            // would then silently capture the REPLACEMENT's pixels under an
+            // approval that was only ever shown for the original — this is
+            // exactly the round-11 P1 #C gap, reopened by round-12 P1 #5's OWN
+            // semaphore queue.
             //
-            // Keyed to `shot.window_id` — the id `computer::screenshot_window`
-            // ITSELF already resolved and captured against (issue #160
-            // round-6 review P2 #4) — rather than re-resolving `window_query`
-            // a second time here: a second resolution can land on a DIFFERENT
-            // window than the one actually captured if it closed, was
-            // renamed, or its id got reused in the gap between the two calls,
-            // silently mis-keying the preview (and any input approval card
-            // that later attaches it) to the WRONG window.
-            // `computer::Screenshot::window_id` closes that gap by
-            // construction — there is no second resolution left to drift.
-            if let Ok(preview) =
-                computer::encode_jpeg_data_uri(&shot.pixels, PREVIEW_LONG_EDGE, PREVIEW_QUALITY)
-            {
-                // issue #160 round-14 P1 (Codex computer_srv.rs:1466): store the
-                // FULL window identity (id + app + title) this capture came
-                // from, not the numeric id alone — `w` is the already-resolved,
-                // just-verified target (its `id` equals `shot.window_id` by that
-                // verification), so this reuses it rather than re-resolving. See
-                // [`PreviewWindowIdentity`] for the id-reuse hazard this closes.
-                store_screenshot_preview(thread, dir, preview, PreviewWindowIdentity::from_window(&w));
-            }
-            // issue #160 round-11 P1 #D: record THIS capture's own saved
-            // dimensions for (thread, dir, shot.window_id) — every
-            // coordinate-taking input arm below maps against whatever is on
-            // file here (see `computer::map_screenshot_coord`'s own doc),
-            // fail-closed if nothing is. Recorded unconditionally, on every
-            // successful capture, regardless of which engine is asking —
-            // matches `store_screenshot_preview`'s own "refresh every
-            // successful screenshot" rule right above.
-            computer::record_shot_dims(thread, dir, shot.window_id, shot.width, shot.height, &w);
-            // The MCP `image` content block is engine-gated — see
-            // `engine_accepts_mcp_image`'s doc table.
-            if engine_accepts_mcp_image(db, thread, dir).await {
-                if let Ok(uri) = computer::encode_jpeg_data_uri(
-                    &shot.pixels,
-                    MCP_IMAGE_LONG_EDGE,
-                    MCP_IMAGE_QUALITY,
+            // issue #160 round-16 P1 (Codex 605): this resolve, the capture,
+            // and every encode/record below now all run INSIDE one
+            // `on_blocking` closure — moved off the async runtime for the
+            // same reason `on_blocking`'s own doc gives (a slow/queued OS
+            // call here must never risk starving the Stop/Escape kill
+            // switch). The "no further `.await` happens between this check
+            // and the capture" guarantee this comment used to make still
+            // holds in spirit: the closure itself contains no `.await` at all
+            // (a plain sync closure — `spawn_blocking` requires that), and
+            // the resolve inside it runs immediately before the capture, on
+            // the SAME blocking-pool thread, with nothing else able to run in
+            // between — so the "just verified" identity guarantee (round-12
+            // P1 #I) is preserved exactly, just now separated from this check
+            // by a `spawn_blocking` scheduling boundary instead of sitting in
+            // the same async stack frame. `resolve_and_verify_target` takes
+            // `window_id_out` as `&mut Option<u32>` — a reference into THIS
+            // function's own stack frame, which can't cross into a `'static`
+            // blocking closure — so the closure below runs it against a
+            // throwaway LOCAL `Option<u32>` instead and returns that
+            // alongside its own result; written back into the real
+            // `window_id_out` immediately after `on_blocking` returns (below),
+            // preserving `resolve_and_verify_target`'s existing "record the
+            // id even when identity verification fails" semantics exactly.
+            let window_query_owned = window_query.to_string();
+            let approved_for_capture = approved.clone();
+            let dir_owned = dir.to_string();
+            let b = backend::backend();
+            let (resolved_id, capture) = on_blocking(move || {
+                let mut resolved_id: Option<u32> = None;
+                let w = match resolve_and_verify_target(
+                    &window_query_owned,
+                    &approved_for_capture,
+                    &mut resolved_id,
                 ) {
-                    *screenshot_image_b64_out = strip_data_uri_prefix(&uri).map(str::to_string);
+                    Ok(w) => w,
+                    Err(e) => return (resolved_id, Err(e)),
+                };
+                // `screenshot_window` re-resolves `window_query` internally —
+                // the SAME query just re-verified above, against the SAME
+                // unchanging backend state, with no scheduling point in
+                // between — so it captures the IDENTICAL window `w` just
+                // verified. This mirrors the accepted "resolve twice" pattern
+                // the click-family arms already use (`resolve_and_verify_
+                // target` itself is called twice per input action, once
+                // before/once after activation); here the gap is narrower
+                // still (no activation in between at all).
+                let shot = match computer::screenshot_window(b.as_ref(), &window_query_owned, &out_dir) {
+                    Ok(s) => s,
+                    Err(e) => return (resolved_id, Err(e.to_string())),
+                };
+                // issue #160 round-10 P2 #H: this confirmation text is shared
+                // by BOTH the plain-text-only result and `text_and_image_
+                // result`'s own text block (see that function's doc) —
+                // worded so it holds for either: a capable client (Claude,
+                // ACP/omp) also gets this screenshot inlined as an image
+                // block in the SAME result and can reason over it directly;
+                // any other client opens the path.
+                let text = format!(
+                    "screenshot saved: {} ({}x{}, scale {:.2}) — inlined as an image in this result for \
+                     capable clients (Claude, ACP/omp), otherwise open the path with your own image \
+                     viewing tool",
+                    shot.path.display(),
+                    shot.width,
+                    shot.height,
+                    shot.scale
+                );
+                // Both the preview registry and the MCP image block need the
+                // raw pixels — read straight off `shot.pixels`, the SAME
+                // in-memory RGBA `screenshot_window` itself scaled and saved
+                // (issue #160 round-7 P1), never re-opened from `shot.path`.
+                // This used to re-read the just-saved PNG back off disk
+                // (`read_captured_image`, now deleted): a worker-writable
+                // `out_dir` is repository-controlled content, and the gap
+                // between that PNG's own save and this re-open was an open
+                // TOCTOU/symlink window — a sandboxed background process
+                // could swap the freshly-saved file for a symlink to an
+                // arbitrary user-readable image in that gap, and Weft would
+                // follow it with its own permissions, inlining the
+                // substituted pixels to the model/human as if they were the
+                // real capture. Reading `shot.pixels` instead closes that
+                // window entirely rather than narrowing it — there is no
+                // second filesystem access left to race. `encode_jpeg_data_
+                // uri` can still fail on `shot.pixels` (encoding, not
+                // decoding, can theoretically error) — best-effort, same as
+                // before: a failure here must never fail a screenshot that
+                // already saved successfully, it just means no
+                // preview/image this call.
+                //
+                // Keyed to `shot.window_id` — the id `computer::
+                // screenshot_window` ITSELF already resolved and captured
+                // against (issue #160 round-6 review P2 #4) — rather than
+                // re-resolving `window_query` a second time here: a second
+                // resolution can land on a DIFFERENT window than the one
+                // actually captured if it closed, was renamed, or its id got
+                // reused in the gap between the two calls, silently
+                // mis-keying the preview (and any input approval card that
+                // later attaches it) to the WRONG window. `computer::
+                // Screenshot::window_id` closes that gap by construction —
+                // there is no second resolution left to drift.
+                if let Ok(preview) =
+                    computer::encode_jpeg_data_uri(&shot.pixels, PREVIEW_LONG_EDGE, PREVIEW_QUALITY)
+                {
+                    // issue #160 round-14 P1 (Codex computer_srv.rs:1466):
+                    // store the FULL window identity (id + app + title) this
+                    // capture came from, not the numeric id alone — `w` is
+                    // the already-resolved, just-verified target (its `id`
+                    // equals `shot.window_id` by that verification), so this
+                    // reuses it rather than re-resolving. See
+                    // [`PreviewWindowIdentity`] for the id-reuse hazard this
+                    // closes.
+                    store_screenshot_preview(thread, &dir_owned, preview, PreviewWindowIdentity::from_window(&w));
                 }
+                // issue #160 round-11 P1 #D: record THIS capture's own saved
+                // dimensions for (thread, dir, shot.window_id) — every
+                // coordinate-taking input arm below maps against whatever is
+                // on file here (see `computer::map_screenshot_coord`'s own
+                // doc), fail-closed if nothing is. Recorded unconditionally,
+                // on every successful capture, regardless of which engine is
+                // asking — matches `store_screenshot_preview`'s own "refresh
+                // every successful screenshot" rule right above.
+                computer::record_shot_dims(thread, &dir_owned, shot.window_id, shot.width, shot.height, &w);
+                // The MCP `image` content block is engine-gated — see
+                // `engine_accepts_mcp_image`'s doc table; `want_mcp_image`
+                // was already decided on the runtime, above, before this
+                // closure started (see that round-16 P1 comment).
+                let image_b64 = if want_mcp_image {
+                    computer::encode_jpeg_data_uri(&shot.pixels, MCP_IMAGE_LONG_EDGE, MCP_IMAGE_QUALITY)
+                        .ok()
+                        .and_then(|uri| strip_data_uri_prefix(&uri).map(str::to_string))
+                } else {
+                    None
+                };
+                (resolved_id, Ok((text, image_b64)))
+            })
+            .await?;
+            *window_id_out = resolved_id;
+            let (text, image_b64) = capture?;
+            if let Some(b64) = image_b64 {
+                *screenshot_image_b64_out = Some(b64);
             }
             Ok(text)
         }
@@ -826,7 +931,7 @@ async fn run_action(
             // `verify_approved_target`'s own doc. Checked BEFORE this window
             // is ever activated or clicked (`resolve_and_verify_target`
             // does both: resolve, record `window_id_out`, verify).
-            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             // issue #160 round-4 P1 §2 (broadened round-5 review P1 §6): reclaim
             // the foreground BEFORE this click reaches the OS, not after — see
             // `activate_target`'s own doc for why even the click family (not
@@ -844,10 +949,19 @@ async fn run_action(
             // WHILE that call runs. Re-resolve/re-verify AFTER it returns,
             // and map/inject against THIS fresh state — never the
             // pre-activation `w`, which may already be stale by now.
-            let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
-            backend::backend()
-                .click(px, py, button, count)
+            // issue #160 round-16 P1 (Codex 605): the injection itself moves
+            // onto tokio's blocking pool too (`enigo` is a synchronous OS
+            // call — see `on_blocking`'s own doc). No extra concurrency cap
+            // is needed here the way `list_windows`/`screenshot` needed one:
+            // `input_flight_guard`, acquired above, already serializes the
+            // ENTIRE process to one in-flight input action at a time — every
+            // OTHER input arm below shares this same reasoning without
+            // repeating it.
+            let b = backend::backend();
+            on_blocking(move || b.click(px, py, button, count))
+                .await?
                 .map_err(|e| e.to_string())?;
             // A click that actually reached the OS is presumed to have
             // handed this window OS focus — see `recent_clicks`'s doc. Only
@@ -872,13 +986,16 @@ async fn run_action(
             // (issue #160 round-10 P1 #B).
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir).await?;
-            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
             // issue #160 round-10 P1 #B: see the click-family arm above.
-            let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
-            backend::backend()
-                .move_cursor(px, py)
+            // issue #160 round-16 P1 (Codex 605): see the click-family arm
+            // above.
+            let b = backend::backend();
+            on_blocking(move || b.move_cursor(px, py))
+                .await?
                 .map_err(|e| e.to_string())?;
             Ok(format!(
                 "mouse_move to ({px}, {py}) in window {} done — take a screenshot to verify",
@@ -899,13 +1016,17 @@ async fn run_action(
             // round-10 P1 #B: that resolve now happens TWICE, before and
             // after activation — see the click-family arm above — and BOTH
             // endpoints are mapped against the SECOND (post-activation) `w2`.
-            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
-            let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let from = map_input_coord(thread, dir, &w2, sx, sy)?;
             let to = map_input_coord(thread, dir, &w2, ex, ey)?;
+            // issue #160 round-16 P1 (Codex 605): see the click-family arm
+            // above.
             let b = backend::backend();
-            b.drag(from, to).map_err(|e| e.to_string())?;
+            on_blocking(move || b.drag(from, to))
+                .await?
+                .map_err(|e| e.to_string())?;
             Ok(format!(
                 "left_click_drag from ({}, {}) to ({}, {}) in window {} done — take a screenshot to verify",
                 from.0, from.1, to.0, to.1, w2.id
@@ -919,13 +1040,16 @@ async fn run_action(
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir).await?;
-            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
             // issue #160 round-10 P1 #B: see the click-family arm above.
-            let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
-            backend::backend()
-                .scroll(px, py, dx, dy)
+            // issue #160 round-16 P1 (Codex 605): see the click-family arm
+            // above.
+            let b = backend::backend();
+            on_blocking(move || b.scroll(px, py, dx, dy))
+                .await?
                 .map_err(|e| e.to_string())?;
             Ok(format!(
                 "scroll at ({px}, {py}) dx={dx} dy={dy} in window {} done — take a screenshot to verify",
@@ -952,21 +1076,26 @@ async fn run_action(
             // round-2 P1 addendum) is unchanged in SPIRIT — see
             // `require_recent_focus`'s doc — just now checked against a
             // freshly-resolved id rather than a possibly-stale one.
-            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
             // issue #160 round-10 P1 #B: re-resolve/re-verify AFTER
             // activation, same as every other input arm — and check focus-
             // freshness against THIS fresh id (`w2.id`), not the
             // pre-activation one: the window `require_recent_focus` guards
             // is the SAME one about to receive the keystrokes.
-            let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             require_recent_focus(thread, dir, w2.id)?;
-            backend::backend()
-                .type_text(text)
+            let char_count = text.chars().count();
+            let text_owned = text.to_string();
+            // issue #160 round-16 P1 (Codex 605): see the click-family arm
+            // above — `text_owned` crosses into the blocking closure since
+            // `text` itself is borrowed from `args`, not `'static`.
+            let b = backend::backend();
+            on_blocking(move || b.type_text(&text_owned))
+                .await?
                 .map_err(|e| e.to_string())?;
             Ok(format!(
-                "typed {} char(s) in window {} done — take a screenshot to verify",
-                text.chars().count(),
+                "typed {char_count} char(s) in window {} done — take a screenshot to verify",
                 w2.id
             ))
         }
@@ -986,21 +1115,28 @@ async fn run_action(
             // and activated the target window, for a call that was always
             // going to fail. The parsed tokens are discarded here (`let _`)
             // — this exists ONLY to reject a malformed shape early; the
-            // combo's ACTUAL injection still goes through
-            // `backend::backend().key(combo)` below, unchanged (os.rs itself
-            // is not touched).
+            // combo's ACTUAL injection still goes through `b.key(combo)`
+            // below (issue #160 round-16 P1: now via `on_blocking` — see
+            // that helper's own doc — but still the SAME backend call,
+            // unchanged; os.rs itself is not touched here).
             let _ = computer::parse_key_combo(combo).map_err(|e| e.to_string())?;
             check_suspended(asks, thread, dir)?;
             acquire_and_throttle(thread, dir)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir).await?;
             // See the matching comment in the "type" arm above.
-            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
             // issue #160 round-10 P1 #B: see the "type" arm above.
-            let w2 = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             require_recent_focus(thread, dir, w2.id)?;
-            backend::backend().key(combo).map_err(|e| e.to_string())?;
+            let combo_owned = combo.to_string();
+            // issue #160 round-16 P1 (Codex 605): see the click-family arm
+            // above.
+            let b = backend::backend();
+            on_blocking(move || b.key(&combo_owned))
+                .await?
+                .map_err(|e| e.to_string())?;
             Ok(format!(
                 "key {combo} in window {} done — take a screenshot to verify",
                 w2.id
@@ -1008,10 +1144,20 @@ async fn run_action(
         }
         // No window, no control lock, no throttle — this reads the cursor's
         // current position without touching input devices.
-        "cursor_position" => backend::backend()
-            .cursor_position()
-            .map(|(x, y)| format!("cursor at ({x}, {y})"))
-            .map_err(|e| e.to_string()),
+        "cursor_position" => {
+            // issue #160 round-16 P1 (Codex 605): even this near-instant OS
+            // call moves onto tokio's blocking pool (see `on_blocking`'s own
+            // doc) so it never risks parking an async worker Stop/Escape
+            // needs — cheap enough that it doesn't need `screenshot_
+            // semaphore`'s concurrency budget (see that constant's own doc
+            // for what THAT protects against: buffered capture memory, not a
+            // quick position query).
+            let b = backend::backend();
+            on_blocking(move || b.cursor_position())
+                .await?
+                .map(|(x, y)| format!("cursor at ({x}, {y})"))
+                .map_err(|e| e.to_string())
+        }
         // No window, no control lock, no throttle — a pure timer.
         "wait" => {
             let ms = parse_duration_ms(args)?;
@@ -1485,6 +1631,37 @@ fn resolve_and_verify_target(
     Ok(w)
 }
 
+/// issue #160 round-16 P1 (Codex 605): the on-blocking-pool wrapper every
+/// input arm of [`run_action`] calls (instead of [`resolve_and_verify_
+/// target`] directly) both times it resolves a target window — window
+/// enumeration (`computer::resolve_window`, inside the wrapped call) is a
+/// synchronous OS call that must not run straight on the async worker (see
+/// [`on_blocking`]'s own doc for why). [`resolve_and_verify_target`] itself
+/// takes `window_id_out` as `&mut Option<u32>` — a reference into the
+/// CALLER's own stack frame, which can't cross into a `'static` blocking
+/// closure — so this runs it against a throwaway LOCAL `Option<u32>` inside
+/// the closure instead, and writes that back into the real `window_id_out`
+/// itself once `on_blocking` returns, preserving `resolve_and_verify_
+/// target`'s existing "record the id even when identity verification fails"
+/// semantics exactly. A drop-in replacement for every existing call site —
+/// same arguments, same `Result`, just `async` now.
+async fn resolve_and_verify_target_blocking(
+    window_query: &str,
+    approved: &Option<ApprovedWindow>,
+    window_id_out: &mut Option<u32>,
+) -> Result<computer::WindowInfo, String> {
+    let window_query = window_query.to_string();
+    let approved = approved.clone();
+    let (id, result) = on_blocking(move || {
+        let mut id = None;
+        let result = resolve_and_verify_target(&window_query, &approved, &mut id);
+        (id, result)
+    })
+    .await?;
+    *window_id_out = id;
+    result
+}
+
 /// Map an agent-given screenshot-space coordinate for `w` — the FRESHLY
 /// resolved (post-activation) window every coordinate-taking input arm
 /// already has on hand — to a physical on-screen point, using `(thread,
@@ -1912,6 +2089,17 @@ const SCREENSHOT_CONCURRENCY: usize = 2;
 /// that arm's block ends (including on an early `?` return from a failed
 /// capture — Rust drops the permit as part of normal scope unwinding, no
 /// manual guard-drop needed).
+///
+/// issue #160 round-16 P1 (Codex 605): the `list_windows` arm of `run_action`
+/// now ALSO acquires this same semaphore, before its own enumeration —
+/// deliberately sharing this one "OS observation" budget rather than minting
+/// a second, separate one. Round-15 P2's `MAX_OPEN_OBSERVE_ASKS` only bounds
+/// how many observe Ask CARDS may sit open waiting on a human; a session
+/// already holding a standing Full/Always grant skips card-opening entirely,
+/// and until this round had NO concurrency cap at all on the OS calls that
+/// path could fire. This is the hard ceiling for that already-authorized
+/// case — `MAX_OPEN_OBSERVE_ASKS` and this semaphore guard two different
+/// stages of the same lifecycle (before a grant exists, and after one does).
 fn screenshot_semaphore() -> &'static tokio::sync::Semaphore {
     static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
     SEM.get_or_init(|| tokio::sync::Semaphore::new(SCREENSHOT_CONCURRENCY))
@@ -2270,6 +2458,14 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
 /// returns, so a Stop that lands mid-activation is still honored before the
 /// backend ever sees the injection — the caller must `?` this and never
 /// fall through to its own backend call on an `Err` here.
+///
+/// issue #160 round-16 P1 (Codex 605): `activate_target` — the blocking
+/// shell-out this function's own doc above describes — now runs via
+/// [`on_blocking`] rather than directly on the async worker (see that
+/// helper's own doc for why: a slow/wedged activation call must never risk
+/// starving the Stop/Escape kill switch's own scheduling). `recheck_after_
+/// guard` stays a plain `.await` on the runtime, unchanged — it only touches
+/// `db`/in-memory registries, nothing OS-facing.
 async fn activate_and_recheck(
     db: &Db,
     asks: &AskRegistry,
@@ -2277,7 +2473,7 @@ async fn activate_and_recheck(
     dir: &str,
     window_id: u32,
 ) -> Result<(), String> {
-    activate_target(window_id)?;
+    on_blocking(move || activate_target(window_id)).await??;
     recheck_after_guard(db, asks, thread, dir).await
 }
 
@@ -2627,6 +2823,20 @@ fn rotate_audit_at_size(path: &std::path::Path, max_bytes: u64) {
         if rotated_meta.file_type().is_symlink() {
             return; // never rename onto a symlinked destination
         }
+        // issue #160 round-16 P2 (Codex computer_srv.rs:2631): remove the
+        // previous generation EXPLICITLY before the rename. On unix, `rename`
+        // replaces an existing destination atomically — but on Windows it
+        // FAILS instead, and since rotation is best-effort (the error was
+        // ignored), every rotation after the first silently no-op'd and the
+        // live log grew without bound. Removing first is portable; the cost is
+        // giving up unix's atomic replace, which is fine here: the whole
+        // check→rotate→append sequence is already serialized under
+        // [`audit_write_lock`], so no concurrent writer can observe (or race)
+        // the tiny remove→rename gap, and a crash inside it merely loses the
+        // OLD generation — the live log survives, which is the right
+        // best-effort trade for an audit trail. The symlink check above stays:
+        // a symlink at the destination is never removed OR renamed over.
+        let _ = std::fs::remove_file(&rotated);
     }
     let _ = std::fs::rename(path, &rotated);
 }
@@ -2710,13 +2920,26 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
 ///    same multi-repo direction still never share an output directory,
 ///    whether `id` came from an EXPLICIT pin or the first-worktree fallback
 ///    below.
-///  - lead lane (`dir == bus::LEAD`): UNCHANGED by this round — the lead's
-///    own scratch cwd, `<weft_home>/leads/<thread>` — same formula as
-///    `lead_chat::commands::ensure_lead_cwd`, duplicated here since that
-///    helper is private to its own module (see `builtin_allow.rs`'s doc
-///    comment on why a lead's cwd is this scratch dir and not one of its
-///    workspace's repos). Already Weft-managed storage before this round —
-///    it was never inside any worktree — so there was nothing to move.
+///  - lead lane (`dir == bus::LEAD`): `<weft_home>/computer/<thread>/lead` —
+///    issue #160 round-16 P1 (Codex computer_srv.rs:2812). This used to be
+///    the lead's own scratch cwd (`<weft_home>/leads/<thread>`), but that
+///    directory is a real working dir the LEAD AGENT ITSELF writes into: an
+///    agent (or any background process with the same access) could swap the
+///    `.weft`/`screenshots` PARENT directories for symlinks in the window
+///    between [`refuse_symlinks`]'s component walk and the later
+///    `create_dir_all`/open — the writers only apply `O_NOFOLLOW` to the
+///    LEAF, so a swapped parent would be silently followed and Weft (with its
+///    own privileges, not the sandboxed agent's) would write outside the
+///    session directory. Rather than re-plumbing every writer onto openat-
+///    style verified directory handles, the lead's output moves under the
+///    SAME Weft-managed root the worker lane already uses — a tree Weft
+///    creates for itself and never hands to any agent as a working
+///    directory — which removes the agent-writable-parent premise of the
+///    race by construction (the same reasoning round-10 P1 #1 used to move
+///    the WORKER lane off the worktree). `refuse_symlinks` stays as defense
+///    in depth on both lanes. Old audit/screenshot files left in the scratch
+///    cwd from before this round are simply orphaned (best-effort logs; never
+///    read back).
 ///
 /// `wt` (issue #160 round-2 P2 §5): the CALLER's own worktree id, when it
 /// could resolve one — see `inject::computer_url`'s doc for who sets this
@@ -2754,8 +2977,13 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
 /// their own soft-failure text rather than a 500.
 async fn session_root(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Option<std::path::PathBuf> {
     if dir == crate::bus::LEAD {
-        let home = crate::paths::weft_home().ok()?;
-        return Some(home.join("leads").join(thread.to_string()));
+        // issue #160 round-16 P1: Weft-managed, never agent-writable — see
+        // this function's own lead-lane doc above.
+        let root = crate::paths::computer_output_root()
+            .ok()?
+            .join(thread.to_string())
+            .join(crate::bus::LEAD);
+        return Some(root);
     }
     let direction_id = dir.parse::<i32>().ok()?;
     match repo::get_direction(db, direction_id).await {
@@ -2827,19 +3055,14 @@ fn refuse_symlinks(base: &std::path::Path, components: &[&str]) -> Result<std::p
 ///    was never inside a git-tracked worktree to begin with, so there is
 ///    nothing left to exclude FROM (and nothing left that could leak a
 ///    `.weft/` entry into a canonical repo's `info/exclude`).
-///  - lead lane: `<session_root>/.weft/screenshots` — issue #160 round-15 P2
-///    (Codex computer_srv.rs:2759). This used to be the lead's scratch cwd
-///    ITSELF (`<weft_home>/leads/<thread>`, no suffix), but that directory is
-///    a real, shared, git-init'd working dir other tooling (and the lead's
-///    own file writes) also lands in — and `computer::prune_old_screenshots`
-///    deletes ANY regular file there matching the generic
-///    `<digits>-<digits>-<digits>.png` naming once more than the retention
-///    cap exist. An unrelated image the lead (or any scratch-cwd tool)
-///    happened to create under a matching name could be mistaken for an old
-///    Weft screenshot and deleted. A dedicated subdirectory — under the
-///    lead's existing `.weft/` bookkeeping layer, next to its audit log —
-///    makes retention operate only over files this module itself wrote,
-///    exactly like the worker lane's own dedicated `screenshots/` dir.
+///  - lead lane: `<session_root>/screenshots` too — issue #160 round-15 P2
+///    (Codex computer_srv.rs:2759) first gave leads a dedicated subdirectory
+///    (so retention pruning never operates over unrelated files), and
+///    round-16 P1 (Codex computer_srv.rs:2812) then moved the lead's WHOLE
+///    session root under Weft-managed storage (see [`session_root`]'s
+///    lead-lane doc for the agent-writable-parent race that closed) — at
+///    which point the lead lane needs no special `.weft/` layer anymore and
+///    both lanes share ONE shape.
 ///
 /// `Err` (not silently `None`) on a resolution failure OR a refused symlink
 /// (issue #160 round-2 P2 §3, via [`refuse_symlinks`]) — callers surface the
@@ -2849,9 +3072,6 @@ async fn screenshot_out_dir(db: &Db, thread: i32, dir: &str, wt: Option<i32>) ->
     let root = session_root(db, thread, dir, wt)
         .await
         .ok_or_else(|| "no worktree for this session".to_string())?;
-    if dir == crate::bus::LEAD {
-        return refuse_symlinks(&root, &[".weft", "screenshots"]);
-    }
     refuse_symlinks(&root, &["screenshots"])
 }
 
@@ -2862,11 +3082,12 @@ async fn screenshot_out_dir(db: &Db, thread: i32, dir: &str, wt: Option<i32>) ->
 ///    directory is already private to this one session, and no
 ///    `git::git_exclude` call anymore for the SAME reason [`screenshot_out_dir`]
 ///    no longer needs one.
-///  - lead lane: `<session_root>/.weft/computer-audit.jsonl` — UNCHANGED by
-///    this round. The lead's scratch cwd is a real, git-init'd directory
-///    holding other content too (see `session_root`'s own doc), so its audit
-///    log keeps its own `.weft/` subfolder rather than colliding at the top
-///    level.
+///  - lead lane: `<session_root>/computer-audit.jsonl` too — issue #160
+///    round-16 P1 (Codex computer_srv.rs:2812) moved the lead's session root
+///    under Weft-managed storage (see [`session_root`]'s lead-lane doc), so
+///    the `.weft/` layer its scratch-cwd audit log used to hide behind is no
+///    longer needed: the whole directory is private to this one session, same
+///    as the worker lane, and both lanes share ONE shape.
 ///
 /// `None` (best-effort, per [`append_audit`]'s own doc) on a resolution
 /// failure OR a refused symlink (issue #160 round-2 P2 §3, via
@@ -2874,9 +3095,6 @@ async fn screenshot_out_dir(db: &Db, thread: i32, dir: &str, wt: Option<i32>) ->
 /// goes unlogged, same as any other audit-write failure.
 async fn audit_log_path(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Option<std::path::PathBuf> {
     let root = session_root(db, thread, dir, wt).await?;
-    if dir == crate::bus::LEAD {
-        return refuse_symlinks(&root, &[".weft", "computer-audit.jsonl"]).ok();
-    }
     refuse_symlinks(&root, &["computer-audit.jsonl"]).ok()
 }
 
@@ -5163,6 +5381,96 @@ mod tests {
             .is_none(),
             "a fail-closed capture must never record shot dims for the replacement window either"
         );
+
+        drop(held);
+    }
+
+    // —— issue #160 round-16 P1: list_windows shares the observe semaphore ——
+
+    /// issue #160 round-16 P1 (Codex computer_srv.rs:605): `list_windows` now
+    /// acquires the SAME `screenshot_semaphore` a `screenshot` capture does —
+    /// closing the "no cap at all on an already-authorized session's
+    /// concurrent enumeration" gap this round exists for. `MockBackend` (see
+    /// its own doc comment) has no delay-injection hook for `list_windows`
+    /// itself, so a genuine concurrent race can't be forced through
+    /// `run_action` the way `screenshot_re_verifies_after_the_capture_
+    /// semaphore_queue_before_capturing` forces one for capture (that test's
+    /// own doc explains the same limitation for `MockBackend.image`) — but
+    /// draining the semaphore's permits directly, exactly like
+    /// `screenshot_semaphore_caps_concurrent_capture_at_the_configured_limit`
+    /// does, reproduces the SAME observable effect without needing a new mock
+    /// hook: a `list_windows` call must queue behind those drained permits
+    /// rather than run unbounded, and complete successfully once one frees
+    /// up. Driven through the full `run_action` dispatch (not the bare
+    /// semaphore), so this also covers the "the observe path still returns
+    /// the right data through `on_blocking`" regression for this arm.
+    #[tokio::test]
+    async fn list_windows_queues_behind_the_shared_observe_semaphore_then_succeeds() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 916_001,
+            app: "Listed".into(),
+            title: "listed window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        let asks = AskRegistry::new();
+        let thread = 916_001;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+
+        // Drain every permit the shared observe semaphore has — standing in
+        // for `SCREENSHOT_CONCURRENCY` other observe calls already in
+        // flight, exactly like the capture-side semaphore test does.
+        let mut held = Vec::new();
+        for _ in 0..SCREENSHOT_CONCURRENCY {
+            held.push(screenshot_semaphore().acquire().await.expect("semaphore is never closed"));
+        }
+
+        let db_bg = db.clone();
+        let asks_bg = asks.clone();
+        let handle = tokio::spawn(async move {
+            let mut window_id_out = None;
+            let mut image_out = None;
+            run_action(
+                &db_bg, &asks_bg, thread, dir, None, "computer", "list_windows",
+                &json!({}), &mut window_id_out, &mut image_out,
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !handle.is_finished(),
+            "list_windows must queue behind the shared observe semaphore like screenshot does, \
+             never run unbounded against an already-authorized grant"
+        );
+
+        // Free exactly one permit so the queued call proceeds.
+        held.pop();
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        // `computer::WindowInfo` only derives `Serialize` (this is the ONE
+        // place it's ever sent back out as JSON — see this arm's own
+        // dispatch), so assert against the raw `Value` rather than round-
+        // tripping through a `Deserialize` this module has no other use for.
+        let windows: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        let windows = windows.as_array().expect("list_windows returns a JSON array");
+        assert_eq!(windows.len(), 1, "{windows:?}");
+        assert_eq!(windows[0]["id"], json!(916_001));
 
         drop(held);
     }

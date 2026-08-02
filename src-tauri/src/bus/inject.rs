@@ -592,14 +592,36 @@ fn sanitize_filename_component(s: &str) -> String {
 /// throughout this module), rather than a NEW way for this one check to
 /// refuse computer-use injection outright.
 fn opencode_json_is_tracked(cwd: &Path) -> bool {
-    std::process::Command::new("git")
+    // issue #160 round-16 P1 (Codex inject.rs:602): fail CLOSED on an
+    // indeterminate answer. This used to map ANY failure — git missing from
+    // PATH, a `safe.directory` refusal, a corrupt checkout — to "not tracked",
+    // which let the bearer-carrying merge proceed against a file that may very
+    // well be tracked: exactly the "session wiring + credential lands in the
+    // canonical repository's history" outcome the tracked check exists to
+    // prevent, silently re-opened by every environment where the check itself
+    // couldn't run. `git ls-files --error-unmatch` has exactly one exit code
+    // that POSITIVELY proves "untracked" (1, with git having run at all);
+    // only that proof may unlock the merge. Exit 0 is tracked; anything else
+    // (spawn failure, 128, a killed process with no code) is indeterminate and
+    // reads as tracked — the caller then withholds injection, degrading
+    // gracefully to "opencode gets no computer server this session" rather
+    // than gambling with the user's repo history. This deliberately diverges
+    // from this module's usual best-effort fail-open posture (see
+    // `merge_opencode_config`) because the downside here is not a missing
+    // feature but a committed credential — CLAUDE.md's "never write cross-repo
+    // wiring into canonical repositories" is a hard constraint, not a
+    // best-effort one.
+    match std::process::Command::new("git")
         .args(["ls-files", "--error-unmatch", "opencode.json"])
         .current_dir(cwd)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    {
+        Ok(s) if s.success() => true,
+        Ok(s) if s.code() == Some(1) => false,
+        _ => true,
+    }
 }
 
 /// OpenCode's computer-use MCP merge, issue #160 round-12 P1 #6 (Codex
@@ -1415,16 +1437,27 @@ mod tests {
 
     // —— issue #160 round-12 P1 #6: computer-use token never lands in a tracked opencode.json ——
 
-    /// The untracked/common case: no pre-existing `opencode.json` at all (or
-    /// one the sub-repo never committed) — the computer server's merge
-    /// proceeds exactly like `inject_mcp`'s generic merge does for
-    /// `weft_bus`, PLUS narrows the file to `0600` on unix (the token-bearing
-    /// difference `inject_computer_opencode` adds on top).
+    /// The untracked/common case: a real git checkout (a worker's cwd always
+    /// is one) with no pre-existing `opencode.json` at all (or one the
+    /// sub-repo never committed) — the computer server's merge proceeds
+    /// exactly like `inject_mcp`'s generic merge does for `weft_bus`, PLUS
+    /// narrows the file to `0600` on unix (the token-bearing difference
+    /// `inject_computer_opencode` adds on top). issue #160 round-16 P1: the
+    /// fixture MUST be a genuine git repo now — `opencode_json_is_tracked`
+    /// fails CLOSED on an indeterminate answer (a non-repo dir), so only a
+    /// positive `git ls-files` "untracked" proof unlocks the merge (the
+    /// non-repo case has its own dedicated withhold test below).
     #[test]
     fn computer_opencode_merges_and_narrows_permissions_when_untracked() {
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-oc-untracked-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
 
         let inj = inject_computer("http://127.0.0.1:9", 1, "10", "opencode", &dir, None);
         assert!(inj.args.is_empty(), "opencode has no launch-flag injection");
@@ -1457,6 +1490,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-oc-reinject-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // issue #160 round-16 P1: a genuine git repo, like every worker cwd —
+        // the fail-closed tracked check withholds the merge everywhere else.
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
         let cfg_path = dir.join("opencode.json");
 
         let _ = inject_computer("http://127.0.0.1:9", 2, "20", "opencode", &dir, None);
@@ -1535,6 +1576,39 @@ mod tests {
         let _ = inject("http://127.0.0.1:9", 1, "10", "opencode", &root);
         let cfg_after_bus = std::fs::read_to_string(root.join("opencode.json")).unwrap();
         assert!(cfg_after_bus.contains("weft_bus"), "{cfg_after_bus}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// issue #160 round-16 P1 (Codex inject.rs:602): when the tracked check
+    /// cannot POSITIVELY prove `opencode.json` is untracked — here, a
+    /// directory that is not a git repository at all, so `git ls-files` exits
+    /// 128 rather than the one exit code (1) that proves "untracked" — the
+    /// bearer-carrying merge is WITHHELD entirely. Indeterminate must never
+    /// read as "safe to write a credential into".
+    #[test]
+    fn computer_opencode_withholds_when_tracked_detection_is_indeterminate() {
+        let root =
+            std::env::temp_dir().join(format!("weft-inj-comp-oc-indet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // NOT a git repo — and a pre-existing opencode.json whose tracked
+        // status therefore cannot be determined.
+        std::fs::write(
+            root.join("opencode.json"),
+            r#"{"mcp":{"repo_own":{"type":"local","command":["x"]}}}"#,
+        )
+        .unwrap();
+
+        let token = crate::bus::computer_srv::computer_session_token(1, "10", None);
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "opencode", &root, None);
+        assert!(inj.args.is_empty());
+        let cfg = std::fs::read_to_string(root.join("opencode.json")).unwrap();
+        assert!(
+            !cfg.contains("weft_computer") && !cfg.contains(&token),
+            "an INDETERMINATE tracked status must withhold the computer merge: {cfg}"
+        );
+        assert!(cfg.contains("repo_own"), "pre-existing content untouched");
 
         let _ = std::fs::remove_dir_all(&root);
     }
