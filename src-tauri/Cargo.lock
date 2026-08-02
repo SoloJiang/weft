@@ -8957,6 +8957,8 @@ dependencies = [
  "toml_edit 0.22.27",
  "tower",
  "user-notify",
+ "windows 0.61.3",
+ "x11rb",
  "xcap",
 ]
 

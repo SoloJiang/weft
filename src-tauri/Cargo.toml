@@ -102,9 +102,35 @@ sha2 = "0.10"
 # length-extension footgun for the small cost of this one crate.
 hmac = "0.12"
 
+# issue #160 round-18 P1 (Codex inject.rs:500): owner-only ACL for the
+# bearer-bearing opencode.json on Windows — see `bus::inject::
+# restrict_handle_to_owner`. Windows-only (this whole block is ignored on unix
+# targets, so it never touches the Linux/macOS build or CI), and pinned to the
+# `0.61` line already resolved transitively (tauri/keyring), so it adds no new
+# crate version. Only the handful of Win32 modules the ACL calls need.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+] }
+
+# issue #160 round-18 P2 (Codex os.rs:418): in-process X11 window activation
+# (the EWMH `_NET_ACTIVE_WINDOW` client message) so a clean Linux desktop no
+# longer needs `wmctrl`/`xdotool` separately installed just to focus a window
+# before input — see `computer::os::activate_window_x11`. Optional + only in
+# `computer-os` (default off) and Linux-only, so it adds nothing to the default
+# build. `x11rb` is already resolved transitively via `xcap`'s own X11 backend,
+# so this pins to that same line and pulls no new crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", optional = true }
+
 [features]
 # 见上面 xcap/enigo 依赖注释。默认关闭,不影响任何现有构建/CI。
-computer-os = ["dep:xcap", "dep:enigo"]
+# x11rb (Linux 进程内窗口激活)同挂本 feature,仅在 Linux 目标存在,其余平台为空操作。
+computer-os = ["dep:xcap", "dep:enigo", "dep:x11rb"]
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

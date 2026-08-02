@@ -1162,29 +1162,44 @@ async fn enforce_durable_inline_image_cap_db(
     let Ok(messages) = repo::list_lead_messages(db, thread_id).await else {
         return Vec::new();
     };
-    // Oldest-first (matches `list_lead_messages`'s own order) ids of every
-    // persisted tool row that STILL carries an inline image, scoped to THIS
-    // session alone (`session_id` above) — a plain substring pre-check
-    // narrows the set before the real JSON parse below (this thread's
-    // non-tool/non-image rows never pay for one).
-    let image_bearing: Vec<&lead_message::Model> = messages
+    // Oldest-first (matches `list_lead_messages`'s own order) every persisted
+    // tool row that STILL carries an inline image, scoped to THIS session
+    // alone (`session_id` above), paired with its already-parsed JSON.
+    //
+    // issue #160 round-18 P2 (Codex engine.rs:1172): a row counts toward the
+    // retention limit ONLY when its parsed JSON has a genuine TOP-LEVEL
+    // `images` collection — NOT merely a `"images"` substring somewhere in the
+    // serialized content. A tool result can legitimately mention `"images"`
+    // below the top level (e.g. nested inside its own serialized input), and
+    // the strip below already refuses to touch such a row; but COUNTING it
+    // still inflated `keep_from` and could push a genuine older screenshot
+    // into the stripped slice even while fewer than `MAX_INLINE_IMAGE_ROWS`
+    // real image rows existed. Parsing up front and requiring a top-level key
+    // makes the boundary reflect real image rows only. The cheap `.contains`
+    // pre-check stays purely as a parse-avoidance fast path (this session's
+    // non-image rows never pay for a parse), NOT as the counting predicate.
+    let image_bearing: Vec<(&lead_message::Model, serde_json::Value)> = messages
         .iter()
-        .filter(|m| m.kind == "tool" && m.content.contains("\"images\"") && m.session_id == session_id)
+        .filter(|m| m.kind == "tool" && m.session_id == session_id && m.content.contains("\"images\""))
+        .filter_map(|m| {
+            let value = serde_json::from_str::<serde_json::Value>(&m.content).ok()?;
+            let has_top_level_images = value
+                .as_object()
+                .is_some_and(|obj| obj.contains_key("images"));
+            has_top_level_images.then_some((m, value))
+        })
         .collect();
     let keep_from = image_bearing.len().saturating_sub(MAX_INLINE_IMAGE_ROWS);
     let mut stripped = Vec::new();
-    for m in &image_bearing[..keep_from] {
-        let Ok(mut content) = serde_json::from_str::<serde_json::Value>(&m.content) else {
-            continue;
-        };
-        let Some(obj) = content.as_object_mut() else { continue };
+    for (m, mut value) in image_bearing.into_iter().take(keep_from) {
+        // Guaranteed an object with a top-level `images` key — that is exactly
+        // the filter `image_bearing` was built from — so `remove` here always
+        // strips a real inline-image collection.
+        let Some(obj) = value.as_object_mut() else { continue };
         if obj.remove("images").is_none() {
-            // The substring pre-check can (rarely) false-positive on a row
-            // whose `"images"` text sits somewhere other than an actual
-            // top-level key — never worth an unconditional write over.
             continue;
         }
-        let content_str = content.to_string();
+        let content_str = value.to_string();
         if repo::update_lead_message(db, m.id, &content_str, &m.status)
             .await
             .is_ok()
@@ -10091,6 +10106,73 @@ mod tests {
             first.content.contains("shot-0.png"),
             "the path reference must survive the strip: {}",
             first.content
+        );
+    }
+
+    /// issue #160 round-18 P2 (Codex engine.rs:1172): a tool row that merely
+    /// MENTIONS `"images"` below the top level (here inside its serialized
+    /// `input`) must NOT count toward the retention limit. Before the fix, the
+    /// bare-substring count inflated `keep_from` and could strip a genuine
+    /// older screenshot even while fewer than `MAX_INLINE_IMAGE_ROWS` real
+    /// image rows existed.
+    #[tokio::test]
+    async fn enforce_durable_inline_image_cap_db_ignores_non_top_level_images_mentions() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+
+        // Exactly MAX_INLINE_IMAGE_ROWS genuine screenshots (top-level
+        // `images`) — all belong under the cap and must be kept.
+        for i in 0..MAX_INLINE_IMAGE_ROWS {
+            let content = serde_json::json!({
+                "name": "computer",
+                "summary": "screenshot",
+                "input": {},
+                "output": format!("/tmp/real-{i}.png"),
+                "is_error": false,
+                "images": [format!("data:image/png;base64,real{i}")],
+            });
+            repo::insert_lead_message(&db, t.id, None, 1, "assistant", "tool", &content.to_string(), "complete")
+                .await
+                .unwrap();
+        }
+        // Two LATER rows that only MENTION "images" inside their `input` — no
+        // top-level `images` key, nothing to strip. Under the old substring
+        // count these padded the total to 6 → `keep_from` = 2 → the two OLDEST
+        // genuine screenshots got stripped even though only 4 real ones exist.
+        for i in 0..2 {
+            let content = serde_json::json!({
+                "name": "some_tool",
+                "summary": "unrelated",
+                "input": { "images": [format!("query-mention-{i}")] },
+                "output": "done",
+                "is_error": false,
+            });
+            repo::insert_lead_message(&db, t.id, None, 1, "assistant", "tool", &content.to_string(), "complete")
+                .await
+                .unwrap();
+        }
+
+        enforce_durable_inline_image_cap_db(&db, t.id, None).await;
+
+        let messages = repo::list_lead_messages(&db, t.id).await.unwrap();
+        let genuine_screenshots_kept = messages
+            .iter()
+            .filter(|m| {
+                serde_json::from_str::<serde_json::Value>(&m.content)
+                    .ok()
+                    .and_then(|v| v.as_object().map(|o| o.contains_key("images")))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            genuine_screenshots_kept, MAX_INLINE_IMAGE_ROWS,
+            "no genuine screenshot may be stripped when only non-top-level \"images\" mentions padded the count"
+        );
+        // The mention rows are left entirely untouched.
+        assert!(
+            messages.iter().any(|m| m.content.contains("query-mention-0")),
+            "a non-image row's own content must be left intact"
         );
     }
 

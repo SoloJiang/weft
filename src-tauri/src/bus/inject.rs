@@ -462,11 +462,18 @@ pub const COMPUTER_TOKEN_ENV_VAR: &str = "WEFT_COMPUTER_MCP_TOKEN";
 /// directory entry at `path` (never writes THROUGH a symlink sitting there),
 /// so the no-follow guarantee holds for the final path too.
 ///
-/// Non-unix keeps the pre-existing plain `write` (no owner-only concept
-/// there this crate can portably act on) — matches every other
-/// `#[cfg(unix)]` split in this codebase. Returns whether the write actually
-/// landed, so callers keep their existing best-effort
-/// `Injection::none()` fallback on failure.
+/// issue #160 round-18 P1 (Codex inject.rs:500): Windows gets an owner-only
+/// path too now — [`set_owner_only_windows`] creates the temp file, stamps it
+/// with a PROTECTED DACL that grants ONLY the current user's SID (breaking
+/// ACL inheritance from the — possibly world-traversable — checkout directory)
+/// BEFORE the bearer bytes are written, then atomically renames it into place.
+/// It is fail-CLOSED: if any ACL step fails it writes nothing and returns
+/// `false`, so the caller injects nothing rather than leaving the credential
+/// under an inherited, other-account-readable ACL. Any other non-unix target
+/// keeps the pre-existing plain `write` (no owner-only concept this crate can
+/// portably act on there). Returns whether the write actually landed, so
+/// callers keep their existing best-effort `Injection::none()` fallback on
+/// failure.
 fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> bool {
     #[cfg(unix)]
     {
@@ -495,9 +502,152 @@ fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> bool {
         }
         true
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        set_owner_only_windows(path, bytes)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::write(path, bytes).is_ok()
+    }
+}
+
+/// Windows owner-only atomic write (issue #160 round-18 P1, Codex
+/// inject.rs:500) — the `#[cfg(windows)]` counterpart of the unix
+/// `create_new(0o600)` path in [`write_owner_only_atomic`]. Writes to a
+/// pid-stamped temp beside `path`, applies an owner-only PROTECTED DACL to the
+/// open handle BEFORE any secret bytes land, writes+flushes, then atomically
+/// replaces `path`. Fail-CLOSED at every step: any failure removes the temp
+/// and returns `false` (the caller then injects nothing) so a bearer token is
+/// NEVER left on disk under the checkout directory's inherited ACL, which on a
+/// shared/traversable Windows checkout could otherwise be read by another
+/// local account.
+#[cfg(windows)]
+fn set_owner_only_windows(path: &Path, bytes: &[u8]) -> bool {
+    use std::io::Write as _;
+    use std::os::windows::io::AsRawHandle;
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let tmp = path.with_file_name(format!(".{name}.{}.weft-tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp); // best-effort: clear a stale temp from a crashed run
+    let Ok(file) = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) else {
+        return false;
+    };
+    // Lock the DACL down to the current user ONLY, before the bearer is
+    // written — if that can't be guaranteed, write nothing.
+    if !restrict_handle_to_owner(file.as_raw_handle()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    let mut w = std::io::BufWriter::new(file);
+    if w.write_all(bytes).is_err() || w.flush().is_err() {
+        drop(w);
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    drop(w);
+    // Atomic replace only after the temp holds the complete, flushed, already
+    // owner-locked bytes: any earlier failure above left `path` untouched.
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    true
+}
+
+/// Stamp an open file HANDLE with a PROTECTED DACL granting full control to
+/// ONLY the current process user's SID (issue #160 round-18 P1). The
+/// `PROTECTED_DACL_SECURITY_INFORMATION` flag also strips inherited ACEs, so a
+/// permissive parent-directory ACL on a shared checkout can't leave the file
+/// readable by other accounts. Returns `false` on ANY failure — the caller
+/// treats that as "could not secure the file" and writes nothing.
+#[cfg(windows)]
+fn restrict_handle_to_owner(handle: std::os::windows::io::RawHandle) -> bool {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS,
+        SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenUser, ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, PSID,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // SAFETY: each pointer below is either a live stack local or a heap buffer
+    // kept alive for the duration of the call that reads it; the process token
+    // handle and the ACL allocated by `SetEntriesInAclW` are released on every
+    // return path. Any Win32 failure short-circuits to `false`.
+    unsafe {
+        let mut token = HANDLE(core::ptr::null_mut());
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        // Two-call idiom: first sizes the TOKEN_USER buffer, then fills it.
+        let mut needed: u32 = 0;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        if needed == 0 {
+            let _ = CloseHandle(token);
+            return false;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let filled = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            needed,
+            &mut needed,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        if !filled {
+            return false;
+        }
+        // The SID points INTO `buf`, which must stay alive until after
+        // `SetEntriesInAclW` copies it into the new ACL below.
+        let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let sid: PSID = token_user.User.Sid;
+        if sid.0.is_null() {
+            return false;
+        }
+
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS.0,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: ACE_FLAGS(0), // NO_INHERITANCE
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: core::ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_USER,
+                // For TRUSTEE_IS_SID, `ptstrName` is reinterpreted as the SID
+                // pointer (documented Win32 idiom).
+                ptstrName: PWSTR(sid.0 as *mut u16),
+            },
+        };
+
+        let mut new_dacl: *mut ACL = core::ptr::null_mut();
+        if SetEntriesInAclW(Some(core::slice::from_ref(&ea)), None, &mut new_dacl).0 != 0
+            || new_dacl.is_null()
+        {
+            return false;
+        }
+
+        let set = SetSecurityInfo(
+            HANDLE(handle),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_dacl as *const ACL),
+            None,
+        );
+        let _ = LocalFree(Some(HLOCAL(new_dacl as *mut core::ffi::c_void)));
+        set.0 == 0
     }
 }
 

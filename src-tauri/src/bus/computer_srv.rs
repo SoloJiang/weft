@@ -691,15 +691,18 @@ async fn run_action(
             // issue #160 round-12 P1 #I re-resolves and re-verifies a SECOND
             // time, right before the capture, and THAT result is what gets
             // used for the actual capture/record below.
-            // issue #160 round-16 P1 (Codex 605): this first resolve stays a
-            // direct (non-`on_blocking`) call — one single, argument-gated
-            // enumeration on a path that hasn't even awaited `screenshot_out_
-            // dir`/the capture semaphore yet, unlike `list_windows`' own
-            // unbounded-repeat hazard (see that arm's own round-16 comment).
-            // The SECOND resolve below, sitting immediately next to the
-            // actual capture, is where this arm's synchronous OS/encode work
-            // is concentrated and moved off the runtime.
-            let _ = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            // issue #160 round-18 P1 (Codex computer_srv.rs:1343): this first
+            // (fail-fast) resolve now runs on the blocking pool too — one
+            // single, argument-gated enumeration, but still a synchronous
+            // `xcap` call that must never run inline on an async worker where
+            // concurrent captures could collectively starve the Stop/Escape
+            // kill-switch tasks (round-16 P1 kept it inline as "just one
+            // enumeration"; round-18 closes that residual runtime-occupancy
+            // gap — the same reason `approve`'s own authorization-time resolve
+            // moved off the runtime). The SECOND resolve below, sitting
+            // immediately next to the actual capture, already runs inside this
+            // arm's single capture `on_blocking` closure.
+            let _ = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let out_dir = screenshot_out_dir(db, thread, dir, wt).await?;
             // issue #160 round-12 P1 #5: acquire the process-wide capture
             // semaphore BEFORE the synchronous capture below — see
@@ -974,10 +977,18 @@ async fn run_action(
             // ENTIRE process to one in-flight input action at a time — every
             // OTHER input arm below shares this same reasoning without
             // repeating it.
+            // issue #160 round-18 P1 (Codex computer_srv.rs:967): the final
+            // stop/lease recheck runs INSIDE the closure, on the blocking
+            // thread, right before the backend call — see
+            // `recheck_stop_and_lease_before_backend`'s own doc for the gap
+            // (the `w2` resolve + the blocking-pool queue) it closes.
+            let dir_owned = dir.to_string();
             let b = backend::backend();
-            on_blocking(move || b.click(px, py, button, count))
-                .await?
-                .map_err(|e| e.to_string())?;
+            on_blocking(move || {
+                recheck_stop_and_lease_before_backend(thread, &dir_owned)?;
+                b.click(px, py, button, count).map_err(|e| e.to_string())
+            })
+            .await??;
             // A click that actually reached the OS is presumed to have
             // handed this window OS focus — see `recent_clicks`'s doc. Only
             // AFTER the backend call succeeds: a rejected/failed click never
@@ -1008,10 +1019,15 @@ async fn run_action(
             let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
             // issue #160 round-16 P1 (Codex 605): see the click-family arm
             // above.
+            // issue #160 round-18 P1: final in-closure stop/lease recheck —
+            // see the click-family arm above.
+            let dir_owned = dir.to_string();
             let b = backend::backend();
-            on_blocking(move || b.move_cursor(px, py))
-                .await?
-                .map_err(|e| e.to_string())?;
+            on_blocking(move || {
+                recheck_stop_and_lease_before_backend(thread, &dir_owned)?;
+                b.move_cursor(px, py).map_err(|e| e.to_string())
+            })
+            .await??;
             Ok(format!(
                 "mouse_move to ({px}, {py}) in window {} done — take a screenshot to verify",
                 w2.id
@@ -1038,10 +1054,15 @@ async fn run_action(
             let to = map_input_coord(thread, dir, &w2, ex, ey)?;
             // issue #160 round-16 P1 (Codex 605): see the click-family arm
             // above.
+            // issue #160 round-18 P1: final in-closure stop/lease recheck —
+            // see the click-family arm above.
+            let dir_owned = dir.to_string();
             let b = backend::backend();
-            on_blocking(move || b.drag(from, to))
-                .await?
-                .map_err(|e| e.to_string())?;
+            on_blocking(move || {
+                recheck_stop_and_lease_before_backend(thread, &dir_owned)?;
+                b.drag(from, to).map_err(|e| e.to_string())
+            })
+            .await??;
             Ok(format!(
                 "left_click_drag from ({}, {}) to ({}, {}) in window {} done — take a screenshot to verify",
                 from.0, from.1, to.0, to.1, w2.id
@@ -1062,10 +1083,15 @@ async fn run_action(
             let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
             // issue #160 round-16 P1 (Codex 605): see the click-family arm
             // above.
+            // issue #160 round-18 P1: final in-closure stop/lease recheck —
+            // see the click-family arm above.
+            let dir_owned = dir.to_string();
             let b = backend::backend();
-            on_blocking(move || b.scroll(px, py, dx, dy))
-                .await?
-                .map_err(|e| e.to_string())?;
+            on_blocking(move || {
+                recheck_stop_and_lease_before_backend(thread, &dir_owned)?;
+                b.scroll(px, py, dx, dy).map_err(|e| e.to_string())
+            })
+            .await??;
             Ok(format!(
                 "scroll at ({px}, {py}) dx={dx} dy={dy} in window {} done — take a screenshot to verify",
                 w2.id
@@ -1105,10 +1131,15 @@ async fn run_action(
             // issue #160 round-16 P1 (Codex 605): see the click-family arm
             // above — `text_owned` crosses into the blocking closure since
             // `text` itself is borrowed from `args`, not `'static`.
+            // issue #160 round-18 P1: final in-closure stop/lease recheck —
+            // see the click-family arm above.
+            let dir_owned = dir.to_string();
             let b = backend::backend();
-            on_blocking(move || b.type_text(&text_owned))
-                .await?
-                .map_err(|e| e.to_string())?;
+            on_blocking(move || {
+                recheck_stop_and_lease_before_backend(thread, &dir_owned)?;
+                b.type_text(&text_owned).map_err(|e| e.to_string())
+            })
+            .await??;
             Ok(format!(
                 "typed {char_count} char(s) in window {} done — take a screenshot to verify",
                 w2.id
@@ -1148,10 +1179,15 @@ async fn run_action(
             let combo_owned = combo.to_string();
             // issue #160 round-16 P1 (Codex 605): see the click-family arm
             // above.
+            // issue #160 round-18 P1: final in-closure stop/lease recheck —
+            // see the click-family arm above.
+            let dir_owned = dir.to_string();
             let b = backend::backend();
-            on_blocking(move || b.key(&combo_owned))
-                .await?
-                .map_err(|e| e.to_string())?;
+            on_blocking(move || {
+                recheck_stop_and_lease_before_backend(thread, &dir_owned)?;
+                b.key(&combo_owned).map_err(|e| e.to_string())
+            })
+            .await??;
             Ok(format!(
                 "key {combo} in window {} done — take a screenshot to verify",
                 w2.id
@@ -1339,8 +1375,25 @@ async fn approve(
     let resolved = if !window_query.trim().is_empty()
         && (risk == crate::ask::RiskLevel::Write || action == "screenshot")
     {
+        // issue #160 round-18 P1 (Codex computer_srv.rs:1343): this
+        // authorization-time window resolution is a synchronous `xcap`
+        // enumeration that runs for EVERY windowed Write action and every
+        // `screenshot`, BEFORE the observe-ask bound or the capture
+        // semaphore. Run it on the blocking pool, never inline on an async
+        // worker — otherwise concurrent authenticated `tools/call`s (grant-
+        // less or standing-granted alike) could each park a tokio worker in
+        // enumeration and collectively starve the Stop/Escape kill-switch
+        // tasks that MUST keep scheduling. Every other OS-touching call on
+        // this server already routes through `on_blocking` for exactly this
+        // reason; this approval-time resolve was the one that still ran
+        // inline.
         let b = backend::backend();
-        Some(computer::resolve_window(b.as_ref(), &window_query).map_err(|e| e.to_string())?)
+        let wq = window_query.to_string();
+        Some(
+            on_blocking(move || computer::resolve_window(b.as_ref(), &wq))
+                .await?
+                .map_err(|e| e.to_string())?,
+        )
     } else {
         None
     };
@@ -2477,6 +2530,42 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
     }
 }
 
+/// issue #160 round-18 P1 (Codex computer_srv.rs:967): the FINAL, purely
+/// SYNCHRONOUS kill-switch + control-lease recheck, run INSIDE an input arm's
+/// [`on_blocking`] closure — on the very blocking-pool thread that is about to
+/// call the OS injection backend, as its first statement immediately before
+/// the backend call.
+///
+/// Every input arm already clears [`recheck_after_guard`] twice (after the
+/// flight guard, and again inside [`activate_and_recheck`] right after
+/// activation). But BOTH of those run BEFORE this arm's final
+/// `resolve_and_verify_target_blocking` — itself an awaited OS enumeration
+/// scheduled onto the blocking pool — and before the injection closure below
+/// waits its own turn for a blocking-pool thread. A human hitting Emergency
+/// Stop (which trips [`computer::stop_latched`]) or global Escape (which
+/// clears the control lease) DURING that final resolve, or while the
+/// injection closure sits queued for a blocking thread, would otherwise go
+/// unseen and the click/type/key would still reach their real desktop AFTER
+/// the kill switch fired. Reading the stop latch and the control-lease holder
+/// are both lock-only, no `.await`/no db, so this can run at the last possible
+/// instant on the same thread as the backend call, closing that residual gap
+/// completely. Callers `?` this at the head of the closure and never fall
+/// through to the backend call on an `Err`.
+fn recheck_stop_and_lease_before_backend(thread: i32, dir: &str) -> Result<(), String> {
+    if computer::stop_latched() {
+        return Err(ComputerError::Disabled.to_string());
+    }
+    match computer::control_state() {
+        Some(holder) if holder.thread == thread && holder.dir == dir => Ok(()),
+        Some(holder) => Err(ComputerError::Busy { thread: holder.thread, dir: holder.dir }.to_string()),
+        None => Err(
+            "the control lease was lost just before injection (it may have expired, or been \
+             cleared by a kill switch) — retry"
+                .to_string(),
+        ),
+    }
+}
+
 /// The shared "reactivate, then recheck the kill switch/lease a SECOND
 /// time" tail every input branch of [`run_action`] runs, immediately after
 /// its own branch-specific fresh window resolution (and, for the mouse
@@ -3043,6 +3132,31 @@ async fn session_root(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Optio
         .join(dir)
         .join(format!("wt-{resolved_id}"));
     Some(root)
+}
+
+/// issue #160 round-18 P2 (Codex paths.rs:89): remove a thread's ENTIRE
+/// computer-use output subtree — `<weft_home>/computer/<thread>/`, which holds
+/// every lead/worker session's screenshots and rotated audit logs (see
+/// [`session_root`] for the layout underneath it) — as part of deleting the
+/// thread. Without this, the persistent per-thread tree these actions write
+/// outlives its thread indefinitely: the per-session retention limits only
+/// bound a LIVE session's own growth, and a deleted thread's sessions never
+/// run again to enforce anything, so repeatedly creating, using, and deleting
+/// threads would grow this directory without bound.
+///
+/// Best-effort: a failed/absent delete must never block the thread cascade
+/// (mirrors `materialize::cleanup_worktrees`'s own best-effort tail). Bounded
+/// to this thread's own subtree only — the single `join` is on `thread`, a
+/// plain integer with no path-separator/`..` component, so there is nothing to
+/// escape [`crate::paths::computer_output_root`] with.
+pub(crate) fn remove_computer_output_for_thread(thread: i32) {
+    let Ok(root) = crate::paths::computer_output_root() else {
+        return;
+    };
+    let dir = root.join(thread.to_string());
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Build `base/components[0]/components[1]/...`, refusing if ANY existing
@@ -5012,6 +5126,81 @@ mod tests {
         assert!(asks.answer(card.id, crate::ask::Answer::Deny));
         let err = handle.await.unwrap().unwrap_err();
         assert!(err.contains("denied"), "{err}");
+    }
+
+    /// issue #160 round-18 P1 (Codex computer_srv.rs:967): the FINAL,
+    /// SYNCHRONOUS stop/lease recheck each input arm runs INSIDE its
+    /// `on_blocking` closure right before the backend call. Touches the SAME
+    /// process-wide stop-latch/control-lease statics as every other lease test
+    /// here, so it shares `process_state_test_lock`. No `.await` — the whole
+    /// point is that it's a lock-only check runnable on a blocking thread.
+    #[test]
+    fn recheck_stop_and_lease_before_backend_covers_stop_lease_and_happy_path() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let thread = 906_301;
+        let dir = "lead";
+
+        // Clean baseline: clear any latch a prior test left (trip mints+returns
+        // a generation and clears the lease, so clear it right back), then take
+        // the lease for THIS (thread, dir).
+        let base_gen = computer::trip_stop_latch();
+        assert!(computer::clear_emergency_stop(base_gen));
+        computer::acquire_control(thread, dir).unwrap();
+        // Latch clear AND this exact (thread, dir) holds the lease — the only
+        // combination allowed to reach the injection backend.
+        assert!(recheck_stop_and_lease_before_backend(thread, dir).is_ok());
+
+        // Emergency Stop landing after the last async recheck (during the final
+        // resolve, or while the closure sat queued for a blocking thread) trips
+        // the latch — deny with the disabled message. `trip_stop_latch` ALSO
+        // clears the lease, so the stop check firing first is what this asserts.
+        let stop_gen = computer::trip_stop_latch();
+        let err = recheck_stop_and_lease_before_backend(thread, dir).unwrap_err();
+        assert!(err.to_lowercase().contains("disabled"), "{err}");
+        assert!(computer::clear_emergency_stop(stop_gen));
+
+        // Latch clear, but the lease is gone (Escape cleared it / it expired in
+        // that same window) — deny, and NOT with the disabled message.
+        computer::clear_control();
+        let err = recheck_stop_and_lease_before_backend(thread, dir).unwrap_err();
+        assert!(!err.to_lowercase().contains("disabled"), "{err}");
+
+        // A DIFFERENT (thread, dir) now holds the lease — deny (busy).
+        computer::acquire_control(999_999, "someone-else").unwrap();
+        let err = recheck_stop_and_lease_before_backend(thread, dir).unwrap_err();
+        assert!(err.contains("999999") || err.contains("someone-else"), "{err}");
+        computer::clear_control();
+    }
+
+    /// issue #160 round-18 P2 (Codex paths.rs:89): deleting a thread removes
+    /// ITS computer-output subtree only, never a sibling thread's.
+    #[test]
+    fn remove_computer_output_for_thread_drops_only_that_threads_subtree() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let weft_home =
+            std::env::temp_dir().join(format!("weft-computer-srv-rm-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let root = crate::paths::computer_output_root().unwrap();
+        // Thread 42 (lead lane): a screenshot plus a rotated-style audit log.
+        let shots_42 = root.join("42").join(crate::bus::LEAD).join("screenshots");
+        std::fs::create_dir_all(&shots_42).unwrap();
+        std::fs::write(shots_42.join("shot.png"), b"x").unwrap();
+        std::fs::write(root.join("42").join("computer-audit.jsonl"), b"{}").unwrap();
+        // Sibling thread 43 that must survive the delete untouched.
+        let shots_43 = root.join("43").join(crate::bus::LEAD).join("screenshots");
+        std::fs::create_dir_all(&shots_43).unwrap();
+        std::fs::write(shots_43.join("shot.png"), b"y").unwrap();
+
+        remove_computer_output_for_thread(42);
+
+        assert!(!root.join("42").exists(), "thread 42's whole subtree is removed");
+        assert!(root.join("43").exists(), "a sibling thread's subtree is untouched");
+        assert!(shots_43.join("shot.png").exists(), "the sibling's screenshot survives");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&weft_home);
     }
 
     // —— issue #160 round-3 P1 §2 (extended round-5 review P1 §2): recheck_after_guard ——

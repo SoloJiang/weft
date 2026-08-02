@@ -1447,6 +1447,13 @@ pub async fn delete_thread(
             crate::lead_chat::engine::stop(&app, &eng).await;
         }
     }
+    // issue #160 round-18 P2 (Codex paths.rs:89): drop this thread's computer-
+    // use output subtree (screenshots + rotated audit logs under
+    // `weft_home/computer/<thread>/`) as part of the delete cascade —
+    // otherwise that persistent per-thread tree outlives the thread with no
+    // retention path that could ever bound it. Best-effort, never gates the
+    // delete — see `computer_srv::remove_computer_output_for_thread`'s doc.
+    crate::bus::computer_srv::remove_computer_output_for_thread(thread_id);
     materialize::cleanup_worktrees(&db, &removed)
         .await
         .map_err(e)

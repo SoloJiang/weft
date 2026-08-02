@@ -398,22 +398,27 @@ fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
 
 #[cfg(target_os = "linux")]
 fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
-    // Shells out to whichever of `wmctrl`/`xdotool` is actually installed,
-    // rather than linking `libX11` directly: `xcap`'s own Linux backend
-    // talks to the X server via the pure-Rust `xcb` crate (see
-    // `xcap::linux::impl_window`), not `libX11.so`, so there is no guarantee
-    // that shared library is even linkable on every machine this runs on.
-    // These two command-line tools are the standard, widely-packaged way
-    // desktop scripts already raise/focus an X11 window by id — `wmctrl -i
-    // -a` sends the exact `_NET_ACTIVE_WINDOW` client message the round-4
-    // review names; `xdotool windowactivate` is the fallback when it isn't
-    // installed. Neither is guaranteed present (a hard requirement no NEW
-    // Cargo dependency could fix anyway on a Wayland desktop with neither
-    // tool packaged), so any failure here is `Unsupported`, never a panic or
-    // a silent no-op. `id` is the raw X11 window id `xcap`'s own Linux
-    // backend already hands back unchanged as `Window::id()` (see
-    // `xcap::linux::impl_window`), so both tools can address it directly —
-    // `wmctrl -i` wants it as a `0x`-prefixed hex string.
+    // issue #160 round-18 P2 (Codex os.rs:418): activate IN-PROCESS first —
+    // post the EWMH `_NET_ACTIVE_WINDOW` client message ourselves through
+    // `x11rb`, the same pure-Rust X protocol layer `xcap`'s own Linux backend
+    // already speaks (see `xcap::linux::impl_window`; we deliberately avoid
+    // linking `libX11`, which is not guaranteed present/linkable). This drops
+    // the old HARD runtime requirement that `wmctrl` or `xdotool` be
+    // SEPARATELY installed on the desktop merely to focus a window before
+    // input: on a clean Linux install with neither tool, window listing and
+    // screenshots worked but every click/scroll/drag/type/key failed right
+    // here, before reaching `enigo`. `id` is the raw X11 window id `xcap`
+    // hands back unchanged as `Window::id()`, so it addresses the window
+    // directly.
+    if activate_window_x11(id).is_ok() {
+        return Ok(());
+    }
+    // Fallback for the rare environment the in-process path can't serve — it
+    // connects via `$DISPLAY`, which a pure-Wayland session with no XWayland
+    // (or a headless run) does not provide. `wmctrl -i -a` sends the same
+    // `_NET_ACTIVE_WINDOW` message addressed by `0x`-prefixed hex id;
+    // `xdotool windowactivate` is the next fallback. Any failure is
+    // `Unsupported`, never a panic or a silent no-op.
     let hex_id = format!("0x{id:08x}");
     if let Ok(output) = std::process::Command::new("wmctrl").args(["-i", "-a", &hex_id]).output() {
         if output.status.success() {
@@ -429,11 +434,54 @@ fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
         }
     }
     Err(ComputerError::Unsupported(
-        "couldn't activate the window — neither `wmctrl` nor `xdotool` is available/succeeded; \
-         install one of them (e.g. `sudo apt install wmctrl` or `xdotool`) so weft can reactivate \
-         the target window before each input action"
+        "couldn't activate the window — in-process X11 activation failed (no reachable X server: \
+         a pure-Wayland session without XWayland, or a headless run) and neither `wmctrl` nor \
+         `xdotool` is available/succeeded as a fallback"
             .into(),
     ))
+}
+
+/// In-process X11 window activation (issue #160 round-18 P2, Codex os.rs:418):
+/// connect via `$DISPLAY`, intern `_NET_ACTIVE_WINDOW`, and post the EWMH
+/// client message that asks the window manager to raise + focus window `id`,
+/// addressed to the screen root with the SubstructureRedirect/Notify event
+/// mask EWMH requires for such requests. Returns `Err` — so
+/// [`activate_window_impl`] falls back to the CLI tools — whenever there is no
+/// reachable X server or the protocol round-trip fails; never panics.
+#[cfg(target_os = "linux")]
+fn activate_window_x11(id: u32) -> Result<(), ComputerError> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt, EventMask};
+
+    let err = |e: String| ComputerError::Unsupported(e);
+    let (conn, screen_num) = x11rb::connect(None).map_err(|e| err(e.to_string()))?;
+    let root = conn
+        .setup()
+        .roots
+        .get(screen_num)
+        .ok_or_else(|| err("no X screen for the current display".into()))?
+        .root;
+    let atom = conn
+        .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+        .map_err(|e| err(e.to_string()))?
+        .reply()
+        .map_err(|e| err(e.to_string()))?
+        .atom;
+    // EWMH `_NET_ACTIVE_WINDOW` message data (format 32):
+    //   data[0] = source indication (1 = a normal application),
+    //   data[1] = timestamp (0 = CurrentTime),
+    //   data[2] = requestor's currently active window (0 = none).
+    let data = [1u32, 0, 0, 0, 0];
+    let event = ClientMessageEvent::new(32, id, atom, data);
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+        event,
+    )
+    .map_err(|e| err(e.to_string()))?;
+    conn.flush().map_err(|e| err(e.to_string()))?;
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
