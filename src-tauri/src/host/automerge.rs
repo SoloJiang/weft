@@ -87,7 +87,8 @@
 //! file does not rely on `gh`'s own idempotency for that guarantee).
 
 use std::collections::HashMap;
-use std::io::{Error, ErrorKind, Read};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -762,9 +763,9 @@ fn lifecycle_state_tag(lifecycle: PrLifecycle) -> &'static str {
     }
 }
 
-/// Result of a bounded child invocation. Dedicated reader threads drain both
-/// pipes while the parent polls the child, so a verbose command cannot
-/// deadlock before the deadline.
+/// Result of a bounded child invocation. Regular temporary files capture both
+/// streams while the parent polls the child, so a descendant that inherits a
+/// handle cannot hold the helper hostage after the direct child exits.
 struct BoundedCommandOutput {
     output: Output,
     timed_out: bool,
@@ -772,29 +773,11 @@ struct BoundedCommandOutput {
     pid: u32,
 }
 
-/// Drain one optional child pipe on a dedicated thread. The parent must keep
-/// draining while it polls `try_wait`; otherwise a verbose child could block
-/// on a full stdout/stderr pipe before its deadline is reached.
-fn spawn_pipe_reader<R>(pipe: Option<R>) -> thread::JoinHandle<std::io::Result<Vec<u8>>>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut pipe) = pipe {
-            pipe.read_to_end(&mut bytes)?;
-        }
-        Ok(bytes)
-    })
-}
-
-fn join_pipe_reader(
-    reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
-) -> std::io::Result<Vec<u8>> {
-    match reader.join() {
-        Ok(result) => result,
-        Err(_) => Err(Error::new(ErrorKind::Other, "child output reader panicked")),
-    }
+fn read_capture(file: &mut File) -> std::io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Run a child with a real process-level deadline. The timeout is enforced by
@@ -824,15 +807,21 @@ fn run_bounded_command(
         }
     }
 
+    // Do not use pipes here: a descendant may inherit a pipe handle after
+    // the direct child exits, making any EOF-based reader wait past the
+    // deadline. Regular files let us read the bytes currently captured after
+    // wait/reap without depending on descendants closing their handles.
+    let mut stdout_file = tempfile::tempfile()?;
+    let stdout_child = stdout_file.try_clone()?;
+    let mut stderr_file = tempfile::tempfile()?;
+    let stderr_child = stderr_file.try_clone()?;
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::from(stdout_child))
+        .stderr(Stdio::from(stderr_child));
     let child = command.spawn()?;
     let pid = child.id();
     let mut child = child;
-    let stdout_reader = spawn_pipe_reader(child.stdout.take());
-    let stderr_reader = spawn_pipe_reader(child.stderr.take());
     let deadline = Instant::now() + timeout;
     let (status, timed_out) = loop {
         match child.try_wait() {
@@ -854,16 +843,15 @@ fn run_bounded_command(
                 // Do not leak a child if polling itself fails. Best-effort
                 // termination is followed by a wait/reap before returning the
                 // original polling error.
+                kill_bounded_process(pid);
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = join_pipe_reader(stdout_reader);
-                let _ = join_pipe_reader(stderr_reader);
                 return Err(error);
             }
         }
     };
-    let stdout = join_pipe_reader(stdout_reader)?;
-    let stderr = join_pipe_reader(stderr_reader)?;
+    let stdout = read_capture(&mut stdout_file)?;
+    let stderr = read_capture(&mut stderr_file)?;
     Ok(BoundedCommandOutput {
         output: Output {
             status,
@@ -1181,6 +1169,18 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn parent_exits_with_a_living_descendant(pid_path: &std::path::Path) -> Command {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s' \"$$\" > \"$1\"; (printf descendant-out; printf descendant-err >&2; sleep 30) & sleep 0.1; exit 0",
+            "sh",
+            pid_path.to_str().expect("the temporary pid path should be valid UTF-8"),
+        ]);
+        command
+    }
+
+    #[cfg(unix)]
     fn process_is_alive(pid: u32) -> bool {
         // `kill(pid, 0)` is a read-only existence check. `EPERM` still means
         // the process exists but is not signalable by this test user.
@@ -1219,6 +1219,46 @@ mod tests {
         assert!(result.output.status.success());
         assert_eq!(String::from_utf8_lossy(&result.output.stdout).trim(), "bounded-ok");
         assert_eq!(String::from_utf8_lossy(&result.output.stderr).trim(), "bounded-err");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_does_not_wait_for_a_descendant_that_inherits_output_handles() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_path = root.path().join("direct-child.pid");
+        let command = parent_exits_with_a_living_descendant(&pid_path);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let helper = thread::spawn(move || {
+            let result = run_bounded_command(command, Duration::from_secs(5));
+            let _ = result_tx.send(result);
+        });
+
+        let started = Instant::now();
+        let result = match result_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => result.expect("the parent-exit fixture should run"),
+            Err(error) => {
+                if let Some(pid) = std::fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<u32>().ok())
+                {
+                    kill_bounded_process(pid);
+                }
+                let _ = helper.join();
+                panic!("bounded helper waited on a descendant: {error}");
+            }
+        };
+        kill_bounded_process(result.pid);
+        helper
+            .join()
+            .expect("the bounded helper thread should terminate");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the direct child's exit must not turn into an EOF wait"
+        );
+        assert!(!result.timed_out);
+        assert!(result.output.status.success());
+        assert!(String::from_utf8_lossy(&result.output.stdout).contains("descendant-out"));
+        assert!(String::from_utf8_lossy(&result.output.stderr).contains("descendant-err"));
     }
 
     // --- build_merge_args: the head-consistency enforcement must actually

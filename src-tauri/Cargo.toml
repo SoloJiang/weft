@@ -74,7 +74,7 @@ fs2 = "0.4"
 # rustls refuse to auto-pick and panics at the first TLS handshake. Pin the
 # choice once at startup (lib.rs `run()`).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tempfile = "3"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
-tempfile = "3"
