@@ -58,6 +58,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0044EngineRoutingPin),
             Box::new(M0045PullRequest),
             Box::new(M0046DirectionUpstream),
+            Box::new(M0047PullRequestThreadStatus),
         ]
     }
 }
@@ -2057,6 +2058,61 @@ impl MigrationTrait for M0046DirectionUpstream {
     }
 }
 
+/// Issue #110: `pull_request.thread_status` — the review-discussion-thread
+/// axis (`crate::host::ThreadStatus`, JSON-serialized like the CI/review/
+/// conflict columns beside it). Until this column existed, "are there
+/// unresolved review threads" was not merely unchecked but unrepresentable,
+/// so the auto-merge gate could authorize a merge over an open review round.
+///
+/// Existing rows migrate to `""`, and that emptiness is load-bearing rather
+/// than incidental: `host::gate::parse_threads` maps it to
+/// `ThreadStatus::Unknown`, which blocks. An upgraded install therefore
+/// auto-merges NOTHING until `host::monitor`'s next successful sweep has
+/// actually read each row's threads — the opposite of the default a
+/// `NOT NULL DEFAULT 'all_resolved'` would have quietly created, which would
+/// have granted every pre-existing row a clean bill of health it never
+/// earned, at exactly the moment the checking code first shipped.
+pub struct M0047PullRequestThreadStatus;
+impl MigrationName for M0047PullRequestThreadStatus {
+    fn name(&self) -> &str {
+        "m0047_pull_request_thread_status"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0047PullRequestThreadStatus {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let result = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("pull_request"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("thread_status"))
+                            .text()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) if err.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("pull_request"))
+                    .drop_column(Alias::new("thread_status"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 pub struct M0045PullRequest;
 impl MigrationName for M0045PullRequest {
     fn name(&self) -> &str {
@@ -2100,7 +2156,10 @@ impl MigrationTrait for M0045PullRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest, M0046DirectionUpstream};
+    use super::{
+        gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest,
+        M0046DirectionUpstream, M0047PullRequestThreadStatus,
+    };
 
     #[test]
     fn gateway_tier_rewritten_to_backend() {
@@ -2534,6 +2593,86 @@ mod tests {
             .unwrap();
         let value: i32 = row.try_get("", "depends_on_direction_id").unwrap();
         assert_eq!(value, 1, "a rerun must not clobber an already-recorded upstream edge");
+    }
+
+    /// M0047 (issue #110): the same upgrade-path coverage M0046 gets, for the
+    /// review-thread column — and the assertion that matters most is about
+    /// what an EXISTING row gets, not that the column appeared.
+    ///
+    /// A row written before this migration has never had its review threads
+    /// read. It must come out `""`, which `host::gate::parse_threads` maps to
+    /// `ThreadStatus::Unknown`, which the auto-merge gate refuses. Any other
+    /// default — most temptingly a serialized `all_resolved`, which would
+    /// have made every existing row keep flowing through the gate unchanged —
+    /// would hand a clean bill of health to precisely the rows nobody has
+    /// ever checked, at the exact moment the checking code first ships.
+    #[tokio::test]
+    async fn m0047_thread_status_defaults_existing_rows_to_unknown_not_to_a_clear_value() {
+        use crate::host::{gate, ThreadStatus};
+        use sea_orm::{ConnectionTrait, Database, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        // Pre-M0047 shape: a `pull_request` table with the three sibling
+        // status columns but no `thread_status` at all.
+        db.execute(Statement::from_string(
+            backend,
+            "CREATE TABLE pull_request (id INTEGER PRIMARY KEY, ci_status TEXT NOT NULL DEFAULT '', \
+             review_status TEXT NOT NULL DEFAULT '', conflict_status TEXT NOT NULL DEFAULT '')"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_string(
+            backend,
+            "INSERT INTO pull_request (id, ci_status, review_status, conflict_status) \
+             VALUES (1, '{\"state\":\"passing\"}', '{\"state\":\"approved\"}', '{\"state\":\"clean\"}')"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+
+        M0047PullRequestThreadStatus.up(&SchemaManager::new(&db)).await.unwrap();
+
+        let read = |db: &sea_orm::DatabaseConnection| {
+            let stmt = Statement::from_string(
+                backend,
+                "SELECT thread_status FROM pull_request WHERE id = 1".to_owned(),
+            );
+            let db = db.clone();
+            async move {
+                let row = db.query_one(stmt).await.unwrap().unwrap();
+                row.try_get::<String>("", "thread_status").unwrap()
+            }
+        };
+
+        let stored = read(&db).await;
+        assert_eq!(stored, "", "an existing pre-M0047 row carries no thread reading at all");
+        assert!(
+            matches!(gate::parse_threads(&stored), ThreadStatus::Unknown { .. }),
+            "the migration default must decode to Unknown — a row nobody has checked must not \
+             read as clear, got {:?}",
+            gate::parse_threads(&stored)
+        );
+
+        // A real reading, written the way `apply_pull_request_snapshot` does.
+        let all_resolved = serde_json::to_string(&ThreadStatus::AllResolved).unwrap();
+        db.execute(Statement::from_string(
+            backend,
+            format!("UPDATE pull_request SET thread_status = '{all_resolved}' WHERE id = 1"),
+        ))
+        .await
+        .unwrap();
+
+        // A rerun (the "duplicate column" catch in `up()`) must succeed and
+        // must not reset an already-recorded reading back to the default.
+        M0047PullRequestThreadStatus.up(&SchemaManager::new(&db)).await.unwrap();
+        assert_eq!(
+            gate::parse_threads(&read(&db).await),
+            ThreadStatus::AllResolved,
+            "a rerun must not clobber a reading the monitor already took"
+        );
     }
 
     /// M0037: code_checkpoint exists after migration and round-trips a row.

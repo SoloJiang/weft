@@ -59,11 +59,17 @@ pub struct Model {
     /// JSON-serialized `crate::host::ReviewStatus`.
     #[sea_orm(default_value = "")]
     pub review_status: String,
+    /// JSON-serialized `crate::host::ThreadStatus` (M0047). "" = never
+    /// successfully checked yet — which every row in an install upgraded
+    /// across that migration starts as, and which `host::gate::parse_threads`
+    /// deliberately reads as `Unknown` rather than as any clear value.
+    #[sea_orm(default_value = "")]
+    pub thread_status: String,
     /// JSON-serialized `crate::host::ConflictStatus`.
     #[sea_orm(default_value = "")]
     pub conflict_status: String,
     /// JSON-serialized `crate::host::MergeReadiness` — always RECOMPUTED from
-    /// the three axes above on a successful sweep, never independently set.
+    /// the axes above on a successful sweep, never independently set.
     #[sea_orm(default_value = "")]
     pub merge_readiness: String,
     /// Unix seconds (as string, same convention as `created_at` elsewhere in

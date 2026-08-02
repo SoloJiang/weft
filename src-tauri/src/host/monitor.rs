@@ -45,7 +45,7 @@ const PR_SWEEP_DEFAULT_SECS: u64 = 60;
 /// is left in place when this fires — not retracted (that would falsely
 /// claim "resolved") — an honest "here's the last thing we knew, we've
 /// stopped checking" rather than a silent infinite retry loop.
-const MAX_CONSECUTIVE_PROBE_FAILURES: i32 = 10;
+pub(crate) const MAX_CONSECUTIVE_PROBE_FAILURES: i32 = 10;
 
 /// Which bus method should post a notice this module computed — mirrors the
 /// two NOTICE variants of `bus::AskKind` (this module never posts a
@@ -185,16 +185,65 @@ async fn apply_probe_result(
             // early. `direction_id == 0` (a legacy row) resolves to Unknown,
             // which is the honest answer for a PR whose task we cannot find.
             let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
-            let readiness =
-                judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict, &upstream);
+            let readiness = judge::merge_readiness(
+                &snapshot.ci,
+                &snapshot.review,
+                &snapshot.threads,
+                &snapshot.conflict,
+                &upstream,
+            );
             let changed = snapshot_changed(pr, snapshot, &readiness);
-            if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, snapshot, &readiness).await {
-                eprintln!("[weft][host] pr #{}: could not save snapshot: {e}", pr.id);
-            } else if changed {
+            let axis_error = snapshot.unreadable_axis_error();
+            let fail_count = match repo::apply_pull_request_snapshot(
+                db,
+                pr.id,
+                snapshot,
+                &readiness,
+                match axis_error {
+                    Some(reason) => repo::StreakUpdate::Extend(reason),
+                    None => repo::StreakUpdate::Clear,
+                },
+            )
+            .await
+            {
+                Ok(count) => Some(count),
+                Err(e) => {
+                    eprintln!("[weft][host] pr #{}: could not save snapshot: {e}", pr.id);
+                    None
+                }
+            };
+            // Only a PERSISTED change is announced. Restructuring this write
+            // to also return the failure count turned the original `if let
+            // Err … else if changed` into an unconditional emit, which would
+            // announce state the DB never accepted — the same "claiming
+            // something we could not confirm" this whole feature exists to
+            // stop. Found in self-review, not by a reviewer.
+            if fail_count.is_some() && changed {
                 emit_pr_changed(app, pr);
             }
+            let fail_count = fail_count.flatten();
             if snapshot.lifecycle != super::PrLifecycle::Open {
                 None // merged/closed — the readiness question is moot now
+            } else if let Some(reason) = axis_error {
+                // A PARTIAL read escalates on the same threshold a failed
+                // probe does — through the SAME `error_notice_text`, not a
+                // parallel copy of it. Without the escalation the row's
+                // notice would stay self-clearing forever, saying only
+                // "indeterminate", while the underlying request failed every
+                // sweep with nothing telling the human to go look.
+                //
+                // Reusing that function rather than composing new sentences
+                // is deliberate (Codex review round 3 P1): every user-facing
+                // string here is one Rust authors, which AGENTS.md reserves
+                // for the locale catalogs, so this feature adds none. It also
+                // means the self-clearing/action-required split is decided in
+                // exactly one place for both kinds of failure.
+                Some(error_notice_text(
+                    kind,
+                    pr.number,
+                    &super::HostError::Other { message: reason.to_string() },
+                    fail_count,
+                ))
             } else {
                 kind.and_then(|k| judge::notice_text(k, pr.number, &readiness))
                     .map(|text| (NoticeKind::SelfClearing, text))
@@ -369,12 +418,14 @@ fn emit_pr_changed(app: &AppHandle, pr: &pull_request::Model) {
 fn snapshot_changed(old: &pull_request::Model, snapshot: &PrSnapshot, readiness: &MergeReadiness) -> bool {
     let new_ci = serde_json::to_string(&snapshot.ci).unwrap_or_default();
     let new_review = serde_json::to_string(&snapshot.review).unwrap_or_default();
+    let new_threads = serde_json::to_string(&snapshot.threads).unwrap_or_default();
     let new_conflict = serde_json::to_string(&snapshot.conflict).unwrap_or_default();
     let new_readiness = serde_json::to_string(readiness).unwrap_or_default();
     old.head_sha != snapshot.head_sha
         || old.lifecycle != snapshot.lifecycle.as_str()
         || old.ci_status != new_ci
         || old.review_status != new_review
+        || old.thread_status != new_threads
         || old.conflict_status != new_conflict
         || old.merge_readiness != new_readiness
 }
@@ -382,7 +433,7 @@ fn snapshot_changed(old: &pull_request::Model, snapshot: &PrSnapshot, readiness:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{CiStatus, ConflictStatus, HostError, PrLifecycle, ReviewStatus};
+    use crate::host::{CiStatus, ConflictStatus, HostError, PrLifecycle, ReviewStatus, ThreadStatus};
 
     // --- P1-A: the give-up boundary must never strand a row silently -----
 
@@ -434,6 +485,66 @@ mod tests {
         assert_eq!(kind, NoticeKind::SelfClearing);
     }
 
+    // --- partial reads escalate (Codex review round 2 P2) -----------------
+
+    /// Below the threshold the notice self-clears; AT it, it becomes
+    /// action-required. Without the second half, a permanently unreadable
+    /// axis leaves the human with a "still checking" note forever while the
+    /// underlying request fails every single sweep.
+    ///
+    /// Goes through `error_notice_text` — the SAME function a failed probe
+    /// uses — because a partial read must not introduce a parallel set of
+    /// user-facing sentences (Codex review round 3 P1: every string Rust
+    /// authors here is one AGENTS.md reserves for the locale catalogs).
+    #[test]
+    fn a_partial_read_notice_escalates_to_action_required_at_the_give_up_threshold() {
+        let as_error = super::super::HostError::Other { message: "no access".to_string() };
+        let (kind, text) = error_notice_text(
+            Some(HostKind::GitHub),
+            9,
+            &as_error,
+            Some(MAX_CONSECUTIVE_PROBE_FAILURES - 1),
+        );
+        assert_eq!(kind, NoticeKind::SelfClearing, "still retrying: {text}");
+
+        let (kind, escalated) =
+            error_notice_text(Some(HostKind::GitHub), 9, &as_error, Some(MAX_CONSECUTIVE_PROBE_FAILURES));
+        assert_eq!(kind, NoticeKind::ActionRequired, "gave up: {escalated}");
+        assert_ne!(
+            text, escalated,
+            "byte-identical text would leave a human unable to tell \"still trying\" from \
+             \"stopped trying\" — the same honesty rule `give_up_text` already carries"
+        );
+        assert!(escalated.contains("no access"), "keeps the diagnostic: {escalated}");
+    }
+
+    /// Only a failed thread READ counts as partial. `ConflictStatus::Unknown`
+    /// is what GitHub reports for seconds after every push — treating it as a
+    /// probe failure would march healthy PRs to the give-up threshold, and
+    /// `Unchecked` means a backend does not implement the axis at all, which
+    /// retrying cannot fix.
+    #[test]
+    fn only_an_unreadable_thread_axis_makes_a_read_partial() {
+        let mut snap = base_snapshot();
+        assert_eq!(snap.unreadable_axis_error(), None);
+
+        snap.conflict = ConflictStatus::Unknown { reason: "not computed yet".to_string() };
+        assert_eq!(
+            snap.unreadable_axis_error(),
+            None,
+            "a transient mergeability window is not a probe failure"
+        );
+
+        snap.threads = crate::host::ThreadStatus::Unchecked;
+        assert_eq!(snap.unreadable_axis_error(), None, "an unimplemented axis is not a failure");
+
+        snap.threads = crate::host::ThreadStatus::Unresolved { count: 2 };
+        assert_eq!(snap.unreadable_axis_error(), None, "a successful count is not a failure");
+
+        snap.threads = crate::host::ThreadStatus::Unknown { reason: "boom".to_string() };
+        assert_eq!(snap.unreadable_axis_error(), Some("boom"));
+    }
+
     fn base_row() -> pull_request::Model {
         pull_request::Model {
             id: 1,
@@ -452,6 +563,7 @@ mod tests {
             lifecycle: "open".to_string(),
             ci_status: serde_json::to_string(&CiStatus::Passing).unwrap(),
             review_status: serde_json::to_string(&ReviewStatus::Approved).unwrap(),
+            thread_status: serde_json::to_string(&ThreadStatus::AllResolved).unwrap(),
             conflict_status: serde_json::to_string(&ConflictStatus::Clean).unwrap(),
             merge_readiness: serde_json::to_string(&MergeReadiness::Ready).unwrap(),
             last_checked_at: "100".to_string(),
@@ -470,6 +582,7 @@ mod tests {
             lifecycle: PrLifecycle::Open,
             ci: CiStatus::Passing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         }
     }
@@ -517,7 +630,7 @@ mod tests {
         // Same raw axes stored, but readiness recomputed differently (e.g. the
         // judgement function itself changed) must still be caught — this is
         // what keeps `snapshot_changed` honest about DERIVED state, not just
-        // the three raw axis columns.
+        // the raw axis columns.
         let old = base_row();
         let snap = base_snapshot();
         let readiness = MergeReadiness::Blocked { reasons: vec!["something".to_string()] };

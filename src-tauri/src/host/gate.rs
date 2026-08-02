@@ -34,7 +34,7 @@
 //! lines while an unrelated text-only change to that file is in flight
 //! elsewhere (see this PR's own notes on scope/territory).
 
-use super::{CiStatus, HostKind, MergeReadiness, PrLifecycle};
+use super::{CiStatus, HostKind, MergeReadiness, PrLifecycle, ThreadStatus};
 
 /// The verdict. `Merge` is the ONLY variant that authorizes the one mutating
 /// call in this feature (`automerge::run_gh_merge`) — every other outcome,
@@ -99,8 +99,21 @@ pub enum AutoMergeSkipReason {
     /// below, so a `Ready` verdict built on a `NotConfigured` CI axis is
     /// still refused here.
     CiNotPassing,
-    /// `judge::merge_readiness` says `Blocked` — CI/review/conflict are all
-    /// readable, at least one is a real blocker.
+    /// `threads` is not LITERALLY `ThreadStatus::AllResolved`. Checked
+    /// INDEPENDENTLY of `readiness` for exactly the reason `CiNotPassing` is:
+    /// `judge::thread_verdict` folds `Unchecked` into the same "Clear" bucket
+    /// as `AllResolved` — correct for a Needs-you notice (a backend that
+    /// doesn't check threads shouldn't make every PR read `Indeterminate`)
+    /// but wrong for an unattended, irreversible merge, where the only
+    /// acceptable input is a positive, fully-paginated confirmation that
+    /// nothing is open. A stored row written before this axis existed also
+    /// arrives here as `Unknown` (`parse_threads("")`), so an upgraded
+    /// install refuses to auto-merge anything until the monitor's next
+    /// successful sweep has actually looked — it fails closed, then heals
+    /// itself one sweep later.
+    ThreadsNotAllResolved,
+    /// `judge::merge_readiness` says `Blocked` — CI/review/threads/conflict
+    /// are all readable, at least one is a real blocker.
     MergeReadinessBlocked,
     /// `judge::merge_readiness` says `Indeterminate` — at least one axis was
     /// unreadable. This must NEVER be treated as mergeable; see
@@ -112,8 +125,8 @@ pub enum AutoMergeSkipReason {
 /// The gate itself. Every dimension is AND-ed — `Merge` requires ALL of: the
 /// opt-in switch on, a host this feature can actually act on, a RECOGNIZED
 /// open lifecycle, zero probe failures since the last success, a
-/// recent-enough last successful probe, CI literally `Passing`, AND
-/// `MergeReadiness::Ready`.
+/// recent-enough last successful probe, CI literally `Passing`, review
+/// threads literally `AllResolved`, AND `MergeReadiness::Ready`.
 ///
 /// `age_secs`/`max_age_secs` are handed in as plain values rather than read
 /// from a clock in here, so every boundary is a deterministic unit test with
@@ -128,30 +141,29 @@ pub enum AutoMergeSkipReason {
 /// between "we decided this was fine" and "the API call actually executes".
 /// See `automerge::run_gh_merge`'s doc.
 ///
-/// KNOWN, DELIBERATE GAP (review round 1 P1 / Codex P1, tracked rather than
-/// silently accepted): `MergeReadiness::Ready` reflects GitHub's own
-/// aggregate `reviewDecision` — it does NOT independently verify this
-/// repo's OWN CLAUDE.md conventions layered on top of that (zero unresolved
-/// review discussion threads; a specific bot's 👍/approving review). Those
-/// need paginated GraphQL `reviewThreads` reads this MVP does not have (see
-/// `ReviewStatus`'s own doc in `host/mod.rs`) plus a repo-specific,
-/// configurable notion of "which bot's sign-off counts" that would vary
-/// per-installation — building either correctly, under review pressure,
-/// risked exactly the "fixed one gap, shipped a new bug in the process" this
-/// repo's CLAUDE.md explicitly warns about (subtly wrong thread-pagination,
-/// or a hardcoded bot-login check that silently makes auto-merge NEVER fire
-/// for the vast majority of repos that don't run that specific bot). The
-/// honest mitigation available today: GitHub's OWN branch protection can
-/// enforce "Require conversation resolution before merging" and "Require
-/// review from Code Owners" / a specific required reviewer SERVER-SIDE —
-/// enable those on any branch this feature is allowed to touch, and `gh pr
+/// The unresolved-review-thread half of this gate's original KNOWN GAP
+/// (review round 1 P1 / Codex P1) is now CLOSED: `threads` is a real,
+/// independently-read axis (`github::fetch_review_threads`, over a fully
+/// paginated GraphQL read that fails loud rather than counting zero), and
+/// `ThreadsNotAllResolved` refuses anything short of a positive all-clear.
+///
+/// The REMAINING half is still a deliberate, documented gap: this gate does
+/// not implement a repo-specific notion of "which bot's sign-off counts" (a
+/// review bot's 👍 or its all-clear comment). That needs a per-installation,
+/// configurable convention — hardcoding one login would silently make
+/// auto-merge NEVER fire for the vast majority of repos that don't run that
+/// specific bot — and, unlike thread resolution, it has no host-neutral
+/// signal to read: a bot's all-clear is a comment whose meaning lives in
+/// prose. The honest mitigation available today is unchanged: GitHub's OWN
+/// branch protection can require a specific reviewer SERVER-SIDE, and `gh pr
 /// merge` will refuse exactly like it already does for `--match-head-commit`.
-/// The Settings toggle's own copy names this limitation explicitly.
+/// The Settings toggle's own copy names what is and isn't checked.
 pub fn decide_auto_merge(
     enabled: bool,
     host_kind: HostKind,
     lifecycle: Option<PrLifecycle>,
     ci: &CiStatus,
+    threads: &ThreadStatus,
     readiness: &MergeReadiness,
     probe_fail_count: i32,
     age_secs: i64,
@@ -182,6 +194,9 @@ pub fn decide_auto_merge(
     }
     if *ci != CiStatus::Passing {
         return AutoMergeDecision::Skip(AutoMergeSkipReason::CiNotPassing);
+    }
+    if *threads != ThreadStatus::AllResolved {
+        return AutoMergeDecision::Skip(AutoMergeSkipReason::ThreadsNotAllResolved);
     }
     match readiness {
         MergeReadiness::Ready => AutoMergeDecision::Merge,
@@ -230,6 +245,20 @@ pub fn parse_ci(s: &str) -> CiStatus {
     })
 }
 
+/// Parse the `pull_request.thread_status` JSON column back into
+/// [`ThreadStatus`]. Empty/malformed falls back to `Unknown`, never
+/// `AllResolved` OR `Unchecked` — BOTH of those read as clear downstream
+/// (`judge::thread_verdict`), so either would turn "this row predates the
+/// column, nobody has ever looked" into a silent all-clear. Every row in an
+/// install upgraded across M0047 starts exactly here, which is why the
+/// fallback direction is the whole point rather than a detail; see
+/// [`AutoMergeSkipReason::ThreadsNotAllResolved`].
+pub fn parse_threads(s: &str) -> ThreadStatus {
+    serde_json::from_str(s).unwrap_or_else(|_| ThreadStatus::Unknown {
+        reason: "尚未成功探测过 review 线程状态,或存储的状态无法解析".to_string(),
+    })
+}
+
 /// `now - last_checked_at`, both unix-seconds strings (`pull_request`'s own
 /// storage convention — see `repo::now_unix`). Unparseable or empty (a row
 /// that has never completed a successful probe leaves `last_checked_at`
@@ -257,6 +286,11 @@ mod tests {
         MergeReadiness::Indeterminate { reasons: vec!["x".to_string()] }
     }
 
+    /// Feeds the threads axis its one clear value so every pre-existing test
+    /// keeps isolating exactly the disqualifier it was written for. The
+    /// threads dimension has its own tests below, which call
+    /// `decide_auto_merge` directly — the hard-coded `AllResolved` here is
+    /// therefore never the only thing exercising that argument.
     #[allow(clippy::too_many_arguments)]
     fn decide(
         enabled: bool,
@@ -267,7 +301,17 @@ mod tests {
         probe_fail_count: i32,
         age_secs: i64,
     ) -> AutoMergeDecision {
-        decide_auto_merge(enabled, host_kind, lifecycle, ci, readiness, probe_fail_count, age_secs, MAX_AGE)
+        decide_auto_merge(
+            enabled,
+            host_kind,
+            lifecycle,
+            ci,
+            &ThreadStatus::AllResolved,
+            readiness,
+            probe_fail_count,
+            age_secs,
+            MAX_AGE,
+        )
     }
 
     fn ready_ci() -> CiStatus {
@@ -375,6 +419,103 @@ mod tests {
                 AutoMergeDecision::Skip(AutoMergeSkipReason::CiNotPassing),
                 "ci={ci:?}"
             );
+        }
+    }
+
+    // --- the review-thread dimension --------------------------------------
+
+    /// The threads analogue of `not_configured_ci_skips_even_though_merge_
+    /// readiness_treats_it_as_clear`, and the reason this dimension is
+    /// checked here at all rather than left to `readiness`: `judge::
+    /// thread_verdict` folds `Unchecked` into Clear, so a `Ready` verdict can
+    /// legitimately be built on top of a threads axis nobody ever read. An
+    /// unattended, irreversible merge must refuse that anyway.
+    #[test]
+    fn unchecked_threads_skip_even_though_merge_readiness_treats_them_as_clear() {
+        assert_eq!(
+            decide_auto_merge(
+                true,
+                HostKind::GitHub,
+                Some(PrLifecycle::Open),
+                &ready_ci(),
+                &ThreadStatus::Unchecked,
+                &MergeReadiness::Ready,
+                0,
+                0,
+                MAX_AGE,
+            ),
+            AutoMergeDecision::Skip(AutoMergeSkipReason::ThreadsNotAllResolved)
+        );
+    }
+
+    /// Everything that is not a positive all-clear refuses, including the
+    /// `Unknown` that `parse_threads("")` produces for every row in an
+    /// install upgraded across M0047 — which is what makes the upgrade fail
+    /// closed instead of granting a one-sweep window where nothing is checked
+    /// but everything looks ready.
+    #[test]
+    fn every_non_all_resolved_thread_status_refuses_the_merge() {
+        for threads in [
+            ThreadStatus::Unchecked,
+            ThreadStatus::Unknown { reason: "x".to_string() },
+            ThreadStatus::Unresolved { count: 1 },
+            parse_threads(""),
+        ] {
+            assert_eq!(
+                decide_auto_merge(
+                    true,
+                    HostKind::GitHub,
+                    Some(PrLifecycle::Open),
+                    &ready_ci(),
+                    &threads,
+                    &MergeReadiness::Ready,
+                    0,
+                    0,
+                    MAX_AGE,
+                ),
+                AutoMergeDecision::Skip(AutoMergeSkipReason::ThreadsNotAllResolved),
+                "threads={threads:?}"
+            );
+        }
+    }
+
+    /// The positive direction, so the test above cannot pass by refusing
+    /// everything unconditionally.
+    #[test]
+    fn all_resolved_threads_are_what_lets_the_merge_through() {
+        assert_eq!(
+            decide_auto_merge(
+                true,
+                HostKind::GitHub,
+                Some(PrLifecycle::Open),
+                &ready_ci(),
+                &ThreadStatus::AllResolved,
+                &MergeReadiness::Ready,
+                0,
+                0,
+                MAX_AGE,
+            ),
+            AutoMergeDecision::Merge
+        );
+    }
+
+    /// A stored column must never decode into a value that reads as clear.
+    #[test]
+    fn parse_threads_falls_back_to_unknown_never_to_a_clear_value() {
+        for stored in ["", "not json", "{}", r#"{"state":"future_variant"}"#] {
+            assert!(
+                matches!(parse_threads(stored), ThreadStatus::Unknown { .. }),
+                "stored={stored:?} must decode to Unknown, got {:?}",
+                parse_threads(stored)
+            );
+        }
+        // Round-trips of values this crate actually writes still decode.
+        for status in [
+            ThreadStatus::AllResolved,
+            ThreadStatus::Unresolved { count: 4 },
+            ThreadStatus::Unchecked,
+        ] {
+            assert_eq!(parse_threads(&serde_json::to_string(&status).unwrap()), status);
         }
     }
 
