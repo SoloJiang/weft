@@ -83,13 +83,14 @@ fn issue_id_arg(args: &Value) -> Option<i32> {
         .map(|x| x as i32)
 }
 
-const IM_CONTEXT_MUTATING_TOOLS: [&str; 6] = [
+const IM_CONTEXT_MUTATING_TOOLS: [&str; 7] = [
     "answer_permission",
     "answer_question",
     "message_lead",
     "create_issue_from_im",
     "ensure_issue_im_topic",
     "ensure_issue_topic",
+    "create_issue",
 ];
 
 /// Per-tool dispatch. Errors short-return via text_result so MCP clients see a
@@ -279,7 +280,13 @@ pub async fn call_global(
             if kind.trim().is_empty() {
                 return text_result("error: kind required".into());
             }
-            match create_issue(db, ws, &title, &kind, None).await {
+            if let Err(e) = require_active_im_context(db, args).await {
+                return text_result(format!("error: {e}"));
+            }
+            // Keep the same context through the final repository boundary;
+            // routing preparation above can await long enough for a stale
+            // Concierge turn to otherwise outlive its authority.
+            match create_issue(db, ws, &title, &kind, Some(args)).await {
                 Ok(v) => json_result(v),
                 Err(e) => text_result(format!("error: {e}")),
             }
@@ -872,10 +879,10 @@ pub fn global_specs() -> Value {
         },
         {
             "name": "create_issue",
-            "description": "File a new issue in a workspace. kind is required and must be chosen explicitly: feature|bugfix|refactor|spike.",
+            "description": "File a new issue in a workspace from the current IM conversation. kind is required and must be chosen explicitly: feature|bugfix|refactor|spike. Pass the unchanged current im_context so a retired provider, owner, or disabled bridge cannot create durable work.",
             "inputSchema": { "type": "object",
-                "properties": { "workspace_id": i(), "title": s(), "kind": s() },
-                "required": ["workspace_id", "title", "kind"] }
+                "properties": { "workspace_id": i(), "title": s(), "kind": s(), "im_context": im_context() },
+                "required": ["workspace_id", "title", "kind", "im_context"] }
         }
     ])
 }
@@ -1693,7 +1700,15 @@ mod tests {
             &asks,
             &bus,
             "create_issue",
-            &json!({ "workspace_id": w.id, "title": "new feature", "kind": "feature" }),
+            &json!({
+                "workspace_id": w.id,
+                "title": "new feature",
+                "kind": "feature",
+                "im_context": {
+                    "provider": "feishu",
+                    "conversation": { "sender_id": "owner" }
+                }
+            }),
         )
         .await;
         let parsed: Value =
@@ -1704,6 +1719,69 @@ mod tests {
         let ts = repo::list_threads(&db, w.id).await.unwrap();
         assert_eq!(ts.len(), 1);
         assert_eq!(ts[0].title, "new feature");
+    }
+
+    #[tokio::test]
+    async fn generic_create_issue_rejects_every_revoked_im_context() {
+        for revocation in ["provider", "owner", "disabled"] {
+            let db = mem_db().await;
+            let asks = AskRegistry::new();
+            let bus = BusRegistry::new();
+            let workspace = repo::create_workspace(&db, revocation).await.unwrap();
+            repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+                .await
+                .unwrap();
+            repo::set_setting(&db, crate::im::K_DINGTALK_ALLOW, "former_owner")
+                .await
+                .unwrap();
+
+            match revocation {
+                "provider" => repo::set_setting(&db, crate::im::K_PROVIDER, "feishu")
+                    .await
+                    .unwrap(),
+                "owner" => repo::set_setting(
+                    &db,
+                    crate::im::K_DINGTALK_ALLOW,
+                    "replacement_owner",
+                )
+                .await
+                .unwrap(),
+                "disabled" => {
+                    repo::set_setting(&db, crate::im::K_DINGTALK_ENABLED, "0")
+                        .await
+                        .unwrap()
+                }
+                _ => unreachable!(),
+            }
+
+            let result = call_global(
+                &db,
+                &asks,
+                &bus,
+                "create_issue",
+                &json!({
+                    "workspace_id": workspace.id,
+                    "title": "Must not exist",
+                    "kind": "feature",
+                    "im_context": {
+                        "provider": "dingtalk",
+                        "conversation": { "sender_id": "former_owner" }
+                    }
+                }),
+            )
+            .await;
+
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("stale IM context")),
+                "{revocation} revocation must reject legacy create_issue: {result}"
+            );
+            assert!(repo::list_threads(&db, workspace.id)
+                .await
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[tokio::test]
