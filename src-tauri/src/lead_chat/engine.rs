@@ -8,7 +8,7 @@
 
 use crate::store::entities::lead_message;
 use crate::store::{repo, Db};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
@@ -52,6 +52,11 @@ const STREAM_THROTTLE_MS: u128 = 150;
 /// [`write_user`]). Generous: a healthy child drains instantly, so this only
 /// trips on a wedged/dead child to keep the session from becoming unstoppable.
 const WRITE_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Bound the DB half of a hidden receipt while it owns the per-surface
+/// admission gate. A canceled/hung SQLite future must not strand the gate (or
+/// a shared receipt token after engine replacement) indefinitely.
+const HIDDEN_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 一条待发排队消息的前端视图。`images`/`files` 仅给个数（栈里显示角标用）。
 #[derive(Clone, serde::Serialize)]
@@ -500,6 +505,9 @@ fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> Option<Vec
     inner.turn.queue.clear();
     inner.current_origin_tag = None;
     inner.turn_user_row = None;
+    // Do not clear `hidden_receipt_inflight`: an activity receipt may already
+    // be waiting on the admission gate even though this hidden spawn rolled
+    // back. Its DB result must still linearize before a retry can replay it.
     inner.child = None;
     // Dropping `child` kills it (kill_on_drop), so its session_gate slot must go
     // with it — see `child_permit`'s doc for the leak this closes.
@@ -659,6 +667,14 @@ fn note_turn_activity(app: &AppHandle, db: &Db, eng: &EngineRef, inner: &mut Eng
     };
     if message_id < 0 {
         let delivery_id = -message_id;
+        // Register the receipt while still holding the engine mutex, before
+        // spawning the task that waits on the per-surface admission gate. A
+        // TurnEnd/EOF handler may retarget `turn_user_row` before that task is
+        // polled; the in-flight id is the durable reservation that keeps a
+        // concurrent visible admission from enqueueing the same pending row.
+        let Some(receipt_guard) = register_hidden_receipt(&mut *inner, delivery_id) else {
+            return;
+        };
         let admission_key = inner
             .session_id
             .map(i64::from)
@@ -666,25 +682,35 @@ fn note_turn_activity(app: &AppHandle, db: &Db, eng: &EngineRef, inner: &mut Eng
         let db = db.clone();
         let eng = eng.clone();
         tauri::async_runtime::spawn(async move {
+            let _receipt_guard = receipt_guard;
             // Durable consumption is another linearization point for the
             // hidden/visible admission pair. Serialize it with the same
             // per-surface gate before touching the DB: if admission wins, the
             // row is already represented by that hidden turn; if consumption
             // wins, the visible recheck observes `consumed` and skips it.
             let _serial = admission_gate_for_key(admission_key).lock_owned().await;
-            match repo::consume_lead_hidden_delivery(&db, delivery_id).await {
-                Ok(Some(_)) | Ok(None) => {
+            match tokio::time::timeout(
+                HIDDEN_RECEIPT_TIMEOUT,
+                repo::consume_lead_hidden_delivery(&db, delivery_id),
+            )
+            .await
+            {
+                Ok(Ok(Some(_))) | Ok(Ok(None)) => {
                     let mut i = eng.lock().await;
-                    if i.turn_user_row == Some(-delivery_id) {
-                        i.turn_user_row = None;
-                    }
+                    finish_hidden_receipt(&mut i, delivery_id, true);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     eprintln!("[weft] consume hidden delivery failed: {e}");
                     let mut i = eng.lock().await;
-                    if i.turn_user_row == Some(-delivery_id) {
-                        i.clock.rearm_consumed_gate();
-                    }
+                    finish_hidden_receipt(&mut i, delivery_id, false);
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[weft] consume hidden delivery timed out after {:?}",
+                        HIDDEN_RECEIPT_TIMEOUT
+                    );
+                    let mut i = eng.lock().await;
+                    finish_hidden_receipt(&mut i, delivery_id, false);
                 }
             }
         });
@@ -775,10 +801,65 @@ fn hidden_turn_admissible(inner: &EngineInner) -> bool {
 }
 
 fn hidden_delivery_is_duplicate(inner: &EngineInner, delivery_id: i32) -> bool {
-    inner.turn_user_row == Some(-delivery_id)
+    inner.hidden_receipt_inflight.contains(&delivery_id)
+        || inner.turn_user_row == Some(-delivery_id)
         || inner.turn.queue.iter().any(|out| {
             hidden_delivery_id_from_tag(out.origin_tag.as_deref()) == Some(delivery_id)
         })
+}
+
+/// Register the durable hidden-delivery receipt before its asynchronous DB
+/// transaction is scheduled. This must run under the engine mutex (the caller
+/// already owns it), so TurnEnd/EOF cannot clear the only marker between the
+/// activity observation and task creation. Returns false when an older receipt
+/// for the same delivery is already in flight; one DB consume is sufficient.
+struct HiddenReceiptGuard {
+    registry: Arc<DashSet<i32>>,
+    delivery_id: i32,
+}
+
+impl Drop for HiddenReceiptGuard {
+    fn drop(&mut self) {
+        // A receipt task can be canceled while waiting on the admission gate or
+        // during app shutdown. Synchronous DashSet cleanup in Drop prevents a
+        // canceled old engine from leaving a shared token that blocks its
+        // replacement forever.
+        self.registry.remove(&self.delivery_id);
+    }
+}
+
+fn register_hidden_receipt(
+    inner: &mut EngineInner,
+    delivery_id: i32,
+) -> Option<HiddenReceiptGuard> {
+    if !inner.hidden_receipt_inflight.insert(delivery_id) {
+        return None;
+    }
+    Some(HiddenReceiptGuard {
+        registry: inner.hidden_receipt_inflight.clone(),
+        delivery_id,
+    })
+}
+
+/// Finish a hidden-delivery receipt and release its admission reservation.
+///
+/// `consumed == true` covers both `consume_lead_hidden_delivery` success and
+/// the idempotent `Ok(None)` (the row was already consumed/deleted). Clear the
+/// in-memory marker only when it still names this delivery: a TurnEnd may have
+/// retargeted it to a queued visible/hidden turn in the meantime. On a DB
+/// failure, release the reservation so the next visible admission may retry;
+/// re-arm the one-shot activity gate only when this delivery is still the
+/// current turn, avoiding attribution to a later turn.
+fn finish_hidden_receipt(inner: &mut EngineInner, delivery_id: i32, consumed: bool) {
+    inner.hidden_receipt_inflight.remove(&delivery_id);
+    if inner.turn_user_row != Some(-delivery_id) {
+        return;
+    }
+    if consumed {
+        inner.turn_user_row = None;
+    } else {
+        inner.clock.rearm_consumed_gate();
+    }
 }
 
 async fn begin_hidden_turn(
@@ -1457,6 +1538,9 @@ async fn cleanup_disconnected_turn(
     inner.clock = TurnClock::default();
     inner.current_origin_tag = None;
     inner.turn_user_row = None;
+    // In-flight hidden receipt tasks outlive this STOP reset and release their
+    // own tokens after the durable consume succeeds/fails; clearing them here
+    // would reopen a duplicate window before that result is known.
     inner.stopped = true;
     // This reset carries STOP semantics (stopped=true, queued rows finalized), so
     // in-flight sends racing Phase 1→3 must die with it: bump the epoch, exactly
@@ -1814,6 +1898,13 @@ pub struct EngineInner {
     /// opened it. Written with the turn's native anchor at a clean TurnEnd
     /// (claude: `last_assistant_uuid`; codex app-server: the turn id).
     pub turn_user_row: Option<i32>,
+    /// Hidden delivery ids whose first activity has been observed and whose
+    /// durable consume transaction is still in flight. This is deliberately
+    /// independent of `turn_user_row`: TurnEnd/EOF can retarget that marker to
+    /// another queued turn while the receipt task waits on the admission gate.
+    /// Visible admission treats every id here as already represented, avoiding
+    /// a duplicate pending row; the task removes it after success or failure.
+    pub hidden_receipt_inflight: Arc<DashSet<i32>>,
     /// Last assistant-event uuid seen in the in-flight turn (claude only —
     /// other dialects report no transcript uuid).
     pub last_assistant_uuid: Option<String>,
@@ -2096,6 +2187,13 @@ static ENGINE_ADMISSION_GATES:
     std::sync::OnceLock<DashMap<i64, std::sync::Weak<tokio::sync::Mutex<()>>>> =
     std::sync::OnceLock::new();
 
+/// Per-surface hidden receipt reservations live outside [`EngineInner`] so an
+/// engine replacement cannot race an old receipt task waiting on the admission
+/// gate. The values are weak: once the old/new engine and all receipt tasks drop
+/// the shared set, the historical key is reclaimed on a later lookup.
+static ENGINE_HIDDEN_RECEIPTS: std::sync::OnceLock<DashMap<i64, std::sync::Weak<DashSet<i32>>>> =
+    std::sync::OnceLock::new();
+
 pub(crate) fn admission_gate_for_key(key: i64) -> Arc<tokio::sync::Mutex<()>> {
     let gates = ENGINE_ADMISSION_GATES.get_or_init(DashMap::new);
     // Weak values let an engine/session release its gate, but the map still
@@ -2126,6 +2224,34 @@ pub(crate) fn admission_gate_for_key(key: i64) -> Arc<tokio::sync::Mutex<()>> {
             let gate = Arc::new(tokio::sync::Mutex::new(()));
             entry.insert(Arc::downgrade(&gate));
             gate
+        }
+    }
+}
+
+pub(crate) fn hidden_receipt_registry_for_key(key: i64) -> Arc<DashSet<i32>> {
+    let registries = ENGINE_HIDDEN_RECEIPTS.get_or_init(DashMap::new);
+    let stale_keys = registries
+        .iter()
+        .filter_map(|entry| entry.value().upgrade().is_none().then_some(*entry.key()))
+        .collect::<Vec<_>>();
+    for stale_key in stale_keys {
+        // Recheck under the shard lock: a concurrent constructor may have
+        // replaced this dead Weak with a live registry after the scan.
+        let _ = registries.remove_if(&stale_key, |_key, weak| weak.upgrade().is_none());
+    }
+    match registries.entry(key) {
+        dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+            if let Some(receipts) = entry.get().upgrade() {
+                return receipts;
+            }
+            let receipts = Arc::new(DashSet::new());
+            entry.insert(Arc::downgrade(&receipts));
+            receipts
+        }
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            let receipts = Arc::new(DashSet::new());
+            entry.insert(Arc::downgrade(&receipts));
+            receipts
         }
     }
 }
@@ -2361,6 +2487,8 @@ async fn ensure_running_locked(
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
     inner.turn_user_row = None;
+    // A prior hidden activity receipt may still be waiting on the admission
+    // gate while the resident is respawned; its token remains authoritative.
     inner.current = None;
     inner.interrupting = false;
     Ok(Some((stdout, inner.generation, program)))
@@ -3015,9 +3143,12 @@ fn promote_queued_reservation(inner: &mut EngineInner, origin_tag: Option<String
 
 /// Retarget the two pieces of bookkeeping every EOF/TurnEnd handler must sync
 /// to whatever `TurnState::on_turn_end` just returned: `turn_user_row` (the
-/// rewind anchor AND the "consumed" receipt, issue #94, both key off it — see
-/// `note_turn_activity`) and `current_origin_tag` (rides the next turn's
-/// output frames). `None` (queue drained, engine goes idle) clears both.
+/// rewind anchor AND the current-turn "consumed" marker, issue #94) and
+/// `current_origin_tag` (rides the next turn's output frames). `None` (queue
+/// drained, engine goes idle) clears both. A hidden receipt whose DB task is
+/// already in flight is tracked separately in `hidden_receipt_inflight` and is
+/// deliberately preserved across this retarget, so clearing this marker cannot
+/// open a duplicate-admission window while that task waits on the gate.
 ///
 /// Every dialect's turn-end site MUST route through this rather than
 /// hand-rolling the same two lines: a hand-rolled copy is exactly how PR
@@ -6394,11 +6525,7 @@ async fn send_hidden_inner(
         }
     }
     if let Some(delivery_id) = hidden_delivery_id {
-        let queued = inner.turn.queue.iter().any(|out| {
-            hidden_delivery_id_from_tag(out.origin_tag.as_deref()) == Some(delivery_id)
-        });
-        let current = inner.turn_user_row == Some(-delivery_id);
-        if queued || current {
+        if hidden_delivery_is_duplicate(&inner, delivery_id) {
             return Ok(true);
         }
     }
@@ -6782,6 +6909,9 @@ fn reset_ignored_cancel_turn(inner: &mut EngineInner, turn_id: i32) -> Option<Ca
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
     inner.turn_user_row = None;
+    // Preserve hidden receipt reservations across connection teardown; the
+    // asynchronous consume task is independent of the child process and still
+    // owns the durable linearization point.
     inner.turn_saw_text = false;
     inner.interrupting = false;
     inner.current_origin_tag = None;
@@ -6942,6 +7072,8 @@ pub async fn stop_quiet(eng: &EngineRef) -> StopQuietOutcome {
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
     inner.turn_user_row = None;
+    // Keep any hidden receipt token alive across the hard stop; its detached
+    // consume task still owns the DB linearization point.
     // A hard stop ends the turn: clear the per-turn text marker, or the NEXT
     // turn inherits a stale true and a pre-output failure there would wrongly
     // suppress its error_before_output row.
@@ -8592,6 +8724,8 @@ fn spawn_reader(
             inner.turn = TurnState::default();
             inner.clock = TurnClock::default();
             inner.turn_user_row = None;
+            // A resident child crash does not cancel the async receipt task. Keep
+            // its token until the DB consume result releases the reservation.
             // The turn is unconditionally reset to idle here; persist that so a
             // resident-process death (incl. interrupt→kill) doesn't leave the row
             // stuck "running" and falsely revive an engine on the next boot.
@@ -8705,6 +8839,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         acp_client: None,
         acp_pending_asks: Vec::new(),
         turn_user_row: None,
+        hidden_receipt_inflight: Arc::new(DashSet::new()),
         last_assistant_uuid: None,
         rewinding: false,
         quota_failover_committing: false,
@@ -10315,6 +10450,8 @@ mod tests {
     }
 
     async fn durable_hidden_fixture(tool: &str) -> (Db, EngineRef, i32) {
+        static NEXT_TEST_SURFACE_KEY: std::sync::atomic::AtomicI32 =
+            std::sync::atomic::AtomicI32::new(900_000);
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let workspace = repo::create_workspace(&db, "admission-gate").await.unwrap();
         let thread = repo::create_thread(&db, workspace.id, "thread", "issue", tool)
@@ -10332,6 +10469,13 @@ mod tests {
         .unwrap();
         let mut inner = test_inner(tool);
         inner.thread_id = thread.id;
+        // Keep fixture admission gates disjoint from production-style lead_key
+        // values used by the rest of the parallel unit suite. The DB thread id
+        // remains the real fixture id so pending-row queries still exercise the
+        // production path.
+        inner.session_id = Some(
+            NEXT_TEST_SURFACE_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
         (
             db,
             std::sync::Arc::new(tokio::sync::Mutex::new(inner)),
@@ -10389,7 +10533,16 @@ mod tests {
     #[tokio::test]
     async fn durable_enqueue_waits_for_visible_admission_barrier() {
         let (db, eng, _old_id) = durable_hidden_fixture("codex").await;
-        let key = -eng.lock().await.thread_id as i64;
+        let (key, thread_id) = {
+            let inner = eng.lock().await;
+            (
+                inner
+                    .session_id
+                    .map(i64::from)
+                    .expect("fixture assigns an isolated surface key"),
+                inner.thread_id,
+            )
+        };
         let serial = admission_gate_for_key(key).lock_owned().await;
         let db_for_enqueue = db.clone();
         let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
@@ -10398,7 +10551,7 @@ mod tests {
                 let _ = started_tx.send(());
                 repo::enqueue_lead_hidden_delivery(
                     &db_for_enqueue,
-                    -key as i32,
+                    thread_id,
                     "plan_decision",
                     8,
                     "plan_decision:8",
@@ -10577,6 +10730,201 @@ mod tests {
                 "{tool}: durable row order"
             );
             assert_eq!(inner.turn.queue[1].queue_id, Some(99), "{tool}: visible follows");
+        }
+    }
+
+    /// A hidden turn can observe activity before its receipt task gets to run:
+    /// the task waits on the same admission gate as visible sends. TurnEnd is
+    /// intentionally not gated and may clear `turn_user_row` in that window,
+    /// but the synchronous in-flight token must still make the pending row a
+    /// duplicate until the consume transaction finishes.
+    #[tokio::test]
+    async fn inflight_hidden_receipt_survives_turn_end_and_blocks_replay() {
+        let (db, eng, delivery_id) = durable_hidden_fixture("codex").await;
+        let key = eng
+            .lock()
+            .await
+            .session_id
+            .map(i64::from)
+            .expect("fixture assigns an isolated surface key");
+        let serial = admission_gate_for_key(key).lock_owned().await;
+        let receipt_guard = {
+            let mut inner = eng.lock().await;
+            mark_hidden_turn_started_with_delivery(&mut inner, Some(delivery_id));
+            let receipt_guard = register_hidden_receipt(&mut inner, delivery_id)
+                .expect("receipt registration must claim the delivery");
+            let next = inner.turn.on_turn_end();
+            assert!(next.is_none(), "fixture has no queued follow-up");
+            advance_dequeued_turn(&mut inner, &next);
+            assert_eq!(inner.turn_user_row, None, "TurnEnd clears the marker");
+            assert!(
+                hidden_delivery_is_duplicate(&inner, delivery_id),
+                "the in-flight token is the durable admission reservation"
+            );
+            receipt_guard
+        };
+
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let db_for_receipt = db.clone();
+        let eng_for_receipt = eng.clone();
+        let receipt = tokio::spawn(async move {
+            let _receipt_guard = receipt_guard;
+            let _serial = admission_gate_for_key(key).lock_owned().await;
+            let _ = started_tx.send(());
+            let outcome = repo::consume_lead_hidden_delivery(&db_for_receipt, delivery_id).await;
+            let mut inner = eng_for_receipt.lock().await;
+            finish_hidden_receipt(&mut inner, delivery_id, outcome.is_ok());
+            outcome
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut started_rx)
+                .await
+                .is_err(),
+            "the receipt task must wait behind visible admission"
+        );
+
+        let inner = eng.lock().await;
+        assert!(hidden_delivery_is_duplicate(&inner, delivery_id));
+        let pending = pending_hidden_rows_at_admission(&db, &inner).await.unwrap();
+        assert_eq!(pending.len(), 1, "the durable row remains pending until consume");
+        drop(inner);
+        drop(serial);
+
+        receipt.await.unwrap().unwrap();
+        let inner = eng.lock().await;
+        assert!(!inner.hidden_receipt_inflight.contains(&delivery_id));
+        assert!(!hidden_delivery_is_duplicate(&inner, delivery_id));
+        assert!(pending_hidden_rows_at_admission(&db, &inner)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Registry replacement shares the per-surface receipt set with the old
+    /// engine while its task is alive, then the task's Drop guard releases the
+    /// token if runtime cancellation happens before the DB future completes.
+    #[tokio::test]
+    async fn hidden_receipt_registry_is_shared_across_engine_replacement() {
+        let key = -9_001_340_i64;
+        let registry = hidden_receipt_registry_for_key(key);
+        let replacement_registry = hidden_receipt_registry_for_key(key);
+        assert!(Arc::ptr_eq(&registry, &replacement_registry));
+
+        let mut old = test_inner("codex");
+        old.hidden_receipt_inflight = registry.clone();
+        mark_hidden_turn_started_with_delivery(&mut old, Some(37));
+        let receipt_guard = register_hidden_receipt(&mut old, 37)
+            .expect("old engine must claim the receipt before replacement");
+        drop(old);
+
+        let mut replacement = test_inner("codex");
+        replacement.hidden_receipt_inflight = replacement_registry.clone();
+        assert!(
+            hidden_delivery_is_duplicate(&replacement, 37),
+            "replacement must honor an old task's in-flight token"
+        );
+        drop(receipt_guard);
+        assert!(
+            !hidden_delivery_is_duplicate(&replacement, 37),
+            "task cancellation cleanup must release the shared token"
+        );
+
+        let concurrent_key = key + 10;
+        let handles: Vec<_> = (0..16)
+            .map(|_| tokio::spawn(async move {
+                hidden_receipt_registry_for_key(concurrent_key)
+            }))
+            .collect();
+        let registries: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|result| result.expect("registry lookup task must finish"))
+            .collect();
+        assert!(
+            registries
+                .windows(2)
+                .all(|pair| Arc::ptr_eq(&pair[0], &pair[1])),
+            "same-key concurrent constructors must share one registry"
+        );
+        drop(registries);
+
+        let stale_key = key + 11;
+        let stale = hidden_receipt_registry_for_key(stale_key);
+        drop(stale);
+        let _ = hidden_receipt_registry_for_key(key);
+        assert!(
+            !ENGINE_HIDDEN_RECEIPTS
+                .get()
+                .is_some_and(|registries| registries.contains_key(&stale_key)),
+            "expired receipt registry keys must be pruned"
+        );
+    }
+
+    /// A failed durable consume releases the admission reservation and rearms
+    /// only the current hidden turn's activity gate. The pending row can then
+    /// be retried instead of being permanently hidden behind a stale token.
+    #[test]
+    fn failed_hidden_receipt_releases_retry_token() {
+        let mut inner = test_inner("claude");
+        mark_hidden_turn_started_with_delivery(&mut inner, Some(17));
+        let _receipt_guard = register_hidden_receipt(&mut inner, 17)
+            .expect("receipt registration must claim the delivery");
+        assert!(inner.clock.mark_consumed_once());
+        finish_hidden_receipt(&mut inner, 17, false);
+        assert!(!inner.hidden_receipt_inflight.contains(&17));
+        assert_eq!(inner.turn_user_row, Some(-17));
+        assert!(inner.clock.mark_consumed_once(), "failure rearms this turn");
+        assert!(
+            hidden_delivery_is_duplicate(&inner, 17),
+            "the active hidden turn still represents this row"
+        );
+        let next = inner.turn.on_turn_end();
+        advance_dequeued_turn(&mut inner, &next);
+        assert!(!hidden_delivery_is_duplicate(&inner, 17));
+    }
+
+    /// No activity means no in-flight receipt token. A clean TurnEnd may clear
+    /// the hidden marker and the next visible admission is therefore allowed to
+    /// replay the still-pending durable row.
+    #[tokio::test]
+    async fn hidden_turn_end_without_activity_allows_pending_retry() {
+        let (db, eng, delivery_id) = durable_hidden_fixture("omp").await;
+        let mut inner = eng.lock().await;
+        mark_hidden_turn_started_with_delivery(&mut inner, Some(delivery_id));
+        let next = inner.turn.on_turn_end();
+        assert!(next.is_none());
+        advance_dequeued_turn(&mut inner, &next);
+        assert_eq!(inner.turn_user_row, None);
+        assert!(!hidden_delivery_is_duplicate(&inner, delivery_id));
+        assert_eq!(
+            pending_hidden_rows_at_admission(&db, &inner)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the pending durable row is eligible for retry"
+        );
+    }
+
+    /// The token is independent of transport shape: resident Claude, per-turn
+    /// Codex/OpenCode, and ACP connection sessions all use the same production
+    /// duplicate predicate after TurnEnd retargets the marker.
+    #[test]
+    fn inflight_hidden_receipt_blocks_replay_for_all_transports() {
+        for tool in ["claude", "codex", "opencode", "omp"] {
+            let mut inner = test_inner(tool);
+            mark_hidden_turn_started_with_delivery(&mut inner, Some(31));
+            let _receipt_guard = register_hidden_receipt(&mut inner, 31)
+                .expect("receipt registration must claim the delivery");
+            let next = inner.turn.on_turn_end();
+            advance_dequeued_turn(&mut inner, &next);
+            assert_eq!(inner.turn_user_row, None, "{tool}: marker retargeted");
+            assert!(
+                hidden_delivery_is_duplicate(&inner, 31),
+                "{tool}: receipt token survives marker clear"
+            );
+            finish_hidden_receipt(&mut inner, 31, true);
+            assert!(!hidden_delivery_is_duplicate(&inner, 31), "{tool}: token released");
         }
     }
 
@@ -11172,6 +11520,7 @@ mod tests {
             acp_client: None,
             acp_pending_asks: Vec::new(),
             turn_user_row: None,
+            hidden_receipt_inflight: Arc::new(DashSet::new()),
             last_assistant_uuid: None,
             rewinding: false,
             quota_failover_committing: false,
