@@ -1490,34 +1490,39 @@ impl GrantSnapshot {
     }
 }
 
-/// issue #160 round-8 P2 #5: whether an Always-grant's `action_key` is safe to
-/// WRITE TO DISK across a restart — `false` for exactly one key shape:
+/// issue #160 round-8 P2 #5 / round-24 P2 (Codex ask.rs:1520): whether an
+/// Always-grant's `action_key` is safe to WRITE TO DISK across a restart.
 /// `bus::computer_srv::approve` mints a GUI action's `action_key` as
-/// `["gui", action, window, digest]` (see that function's own doc for the
-/// full shape), and the ONLY action among those whose `digest` folds in
-/// something that can itself be a secret is `type` — `digest =
-/// sha256(text)`, via `computer_srv::args_digest`, so a human choosing
-/// "Always allow" on typing (say) a password or a PIN mints an Always-grant
-/// whose `action_key` is a PLAIN JSON array carrying that hash in the clear
-/// (`action_key` itself is never re-hashed — it's `serde_json::to_string`, see
-/// `action_key()`). Persisting that into the default-plaintext `auth_grants`
-/// row would let anyone with disk/DB access dictionary-attack a short
-/// secret/PIN/token against the digest at their leisure, long after the
-/// session that typed it is gone. Every OTHER GUI action's digest folds in a
-/// harmless coordinate/scroll-amount/duration/key-combo LABEL (never
-/// content), and every non-GUI tool's `action_key` has an entirely different
-/// shape — this only ever matches the EXACT `["gui", "type", ...]` shape;
-/// anything else (a different action, a non-GUI key, malformed/non-JSON text)
-/// returns `true` (persistable) rather than guessing — a narrow, closed-set
-/// carve-out, not a general content sniff that could misfire against a key
-/// shape it doesn't recognize.
+/// `["gui", action, window, digest]` (see that function's own doc for the full
+/// shape). Two independent reasons make a GUI key unsafe to persist, and BOTH
+/// reduce to "the key binds a specific WINDOW" (`parts[2]` non-empty):
+///
+/// 1. **Window-id reuse (round-24).** A window-bound key names its target only
+///    by OS window id / app / title. Window ids are reusable, so a grant
+///    re-seeded at boot could have `auto_decision_exact` silently authorize a
+///    screenshot / click / key against a same-app/same-title REPLACEMENT window
+///    that inherited the id — `approve` re-binds whatever the query resolves to
+///    NOW onto the persisted tuple. Input against an unapproved window is a
+///    permission-boundary break, so no window-bound GUI grant may persist.
+/// 2. **Typed-secret digest (round-8).** `type`'s `digest = sha256(text)`, so a
+///    persisted `["gui", "type", …]` key carries that hash in the clear in the
+///    default-plaintext `auth_grants` row, dictionary-attackable at leisure.
+///    `type` is always window-bound, so rule 1 already covers it.
+///
+/// A WINDOWLESS GUI grant (`list_windows` / `cursor_position` — empty window
+/// component) binds no reusable window and carries no content digest, so it
+/// stays persistable. Every non-GUI tool's `action_key` has an entirely
+/// different shape and returns `true` (persistable) rather than guessing — a
+/// narrow, closed-set carve-out, not a general content sniff.
 fn always_key_is_persistable(action_key: &str) -> bool {
     let Ok(parts) = serde_json::from_str::<Vec<String>>(action_key) else {
         return true;
     };
-    let is_gui_type = parts.first().map(String::as_str) == Some("gui")
-        && parts.get(1).map(String::as_str) == Some("type");
-    !is_gui_type
+    if parts.first().map(String::as_str) != Some("gui") {
+        return true;
+    }
+    let window_bound = parts.get(2).is_some_and(|window| !window.is_empty());
+    !window_bound
 }
 
 /// One session's read-only auto-allow scope, for the frontend's revoke UI
@@ -1659,19 +1664,19 @@ impl Inner {
         GrantSnapshot { full, always }
     }
 
-    /// issue #160 round-8 P2 #5: the snapshot actually handed to a
-    /// [`PersistMsg`] — [`Self::grant_snapshot`] with any secret-bearing
-    /// `type` Always-grant key dropped (see [`always_key_is_persistable`]'s
-    /// own doc for exactly which shape and why). This is the ONE choke point
-    /// both [`Self::emit_persist`] (every real grant change) and
-    /// [`AskRegistry::request_persist_ack`] (an explicit flush) build their
-    /// `PersistMsg` from — neither ever calls `grant_snapshot()` directly.
-    /// Deliberately NOT used by [`AskRegistry::snapshot_grants`] (the
-    /// frontend's revoke-UI view) or anywhere else that just READS the
-    /// current grants: those still see (and can still revoke) a `type`
-    /// Always-grant for the rest of THIS session — only the disk copy drops
-    /// it, so the human-facing behavior is "session-only for `type`
-    /// Always", never "silently un-granted".
+    /// issue #160 round-8 P2 #5 / round-24 P2: the snapshot actually handed to a
+    /// [`PersistMsg`] — [`Self::grant_snapshot`] with every WINDOW-BOUND GUI
+    /// Always-grant key dropped (see [`always_key_is_persistable`]'s own doc for
+    /// exactly which shape and why: window-id reuse plus the `type` digest). This
+    /// is the ONE choke point both [`Self::emit_persist`] (every real grant
+    /// change) and [`AskRegistry::request_persist_ack`] (an explicit flush) build
+    /// their `PersistMsg` from — neither ever calls `grant_snapshot()` directly.
+    /// Deliberately NOT used by [`AskRegistry::snapshot_grants`] (the frontend's
+    /// revoke-UI view) or anywhere else that just READS the current grants: those
+    /// still see (and can still revoke) a window-bound GUI Always-grant for the
+    /// rest of THIS session — only the disk copy drops it, so the human-facing
+    /// behavior is "session-only for window-bound GUI Always", never "silently
+    /// un-granted".
     fn persistable_grant_snapshot(&self) -> GrantSnapshot {
         let mut snap = self.grant_snapshot();
         snap.always.retain(|ag| always_key_is_persistable(&ag.action_key));
@@ -5039,21 +5044,26 @@ mod tests {
         );
     }
 
-    // —— issue #160 round-8 P2 #5: `type` Always-grants never reach persistence ——
+    // —— issue #160 round-8 P2 #5 / round-24 P2: window-bound GUI Always-grants
+    // never reach persistence (window-id reuse could authorize a replacement) ——
 
     #[test]
-    fn always_key_is_persistable_only_rejects_the_exact_gui_type_shape() {
+    fn always_key_is_persistable_rejects_every_window_bound_gui_shape() {
         assert!(
             !always_key_is_persistable(&action_key(&["gui", "type", "notes", "deadbeef"])),
-            "a type GUI key must never be persistable"
+            "a type GUI key (window-bound) must never be persistable"
         );
         assert!(
-            always_key_is_persistable(&action_key(&["gui", "left_click", "notes", "deadbeef"])),
-            "a non-type GUI key must stay persistable"
+            !always_key_is_persistable(&action_key(&["gui", "left_click", "notes", "deadbeef"])),
+            "a window-bound input GUI key must not be persistable (round-24: window-id reuse)"
         );
         assert!(
-            always_key_is_persistable(&action_key(&["gui", "screenshot", "notes", "deadbeef"])),
-            "an observe-only GUI key must stay persistable too"
+            !always_key_is_persistable(&action_key(&["gui", "screenshot", "notes", "deadbeef"])),
+            "a window-bound observe GUI key must not be persistable either"
+        );
+        assert!(
+            always_key_is_persistable(&action_key(&["gui", "list_windows", "", "deadbeef"])),
+            "a WINDOWLESS GUI key (empty window component) binds no reusable window — persistable"
         );
         assert!(
             always_key_is_persistable("Run: npm test"),
@@ -5065,53 +5075,44 @@ mod tests {
         );
         assert!(
             always_key_is_persistable(&action_key(&["type"])),
-            "a single-element array (not the gui/type PAIR) must not match"
+            "a non-gui single-element array must not match the gui shape"
         );
     }
 
-    /// issue #160 round-11 P1 #B: `bus::computer_srv::approve` now folds the
-    /// resolved window's own `id` into a GUI action's key too (right after
-    /// the query string, before `app`/`title`) — a real `type` key is now 7
-    /// elements, not 4/6. `always_key_is_persistable` only ever inspects
-    /// `parts[0]`/`parts[1]` (`"gui"`/the action name), so this longer shape
-    /// must be judged EXACTLY the same way the shorter pre-round-11 shape
-    /// was: still non-persistable for `type` (the digest can still carry a
-    /// content hash), still persistable for every other GUI action.
+    /// issue #160 round-11 P1 #B: `bus::computer_srv::approve` folds the resolved
+    /// window's own `id` into a GUI action's key too (right after the query
+    /// string, before `app`/`title`) — a real window-bound key is 7 elements,
+    /// not 4. round-24 P2: persistence is judged on `parts[2]` (the window query)
+    /// being non-empty, so every window-bound GUI action — `type`, `left_click`,
+    /// `screenshot` alike — is non-persistable in this longer shape too.
     #[test]
-    fn always_key_is_persistable_is_unaffected_by_round_11_s_window_id_insertion() {
-        assert!(
-            !always_key_is_persistable(&action_key(&[
-                "gui", "type", "notes", "1", "Notes", "Untitled", "deadbeef"
-            ])),
-            "a real (post-round-11, id-inclusive) type GUI key must still never be persistable"
-        );
-        assert!(
-            always_key_is_persistable(&action_key(&[
-                "gui", "left_click", "notes", "1", "Notes", "Untitled", "deadbeef"
-            ])),
-            "a real (post-round-11, id-inclusive) non-type GUI key must stay persistable"
-        );
-        assert!(
-            always_key_is_persistable(&action_key(&[
-                "gui", "screenshot", "notes", "1", "Notes", "Untitled", "deadbeef"
-            ])),
-            "screenshot now resolves+binds too (issue #160 round-11 P1 #C) — still persistable"
-        );
+    fn always_key_is_persistable_rejects_round_11_window_bound_keys() {
+        for action in ["type", "left_click", "screenshot"] {
+            assert!(
+                !always_key_is_persistable(&action_key(&[
+                    "gui", action, "notes", "1", "Notes", "Untitled", "deadbeef"
+                ])),
+                "a real (id-inclusive) window-bound {action} GUI key must not be persistable"
+            );
+        }
     }
 
-    /// The end-to-end property this fix exists for: seed one `type` GUI
-    /// Always-grant, one non-`type` GUI Always-grant, and one ordinary tool
-    /// Always-grant, all in the SAME (thread, dir) — the snapshot actually
-    /// shipped to the persistence writer must drop ONLY the `type` key, while
-    /// the in-memory registry (`snapshot_grants`, and `auto_decision` itself)
-    /// keeps honoring all three for the rest of this session.
+    /// The end-to-end property this fix exists for (issue #160 round-8 P2 #5 +
+    /// round-24 P2): seed a window-bound `type` GUI grant, a window-bound
+    /// `left_click` GUI grant, a WINDOWLESS `list_windows` GUI grant, and an
+    /// ordinary tool grant, all in the SAME (thread, dir) — the snapshot shipped
+    /// to the persistence writer must drop BOTH window-bound GUI keys (window-id
+    /// reuse could re-authorize a same-app/same-title replacement on reboot),
+    /// while keeping the windowless GUI grant and the tool grant. The in-memory
+    /// registry keeps honoring ALL of them for the rest of this session.
     #[tokio::test]
-    async fn persisted_snapshot_drops_a_type_always_grant_but_keeps_it_in_memory() {
+    async fn persisted_snapshot_drops_window_bound_gui_grants_but_keeps_them_in_memory() {
         let r = AskRegistry::new();
         let thread = 909_001;
         let dir = "10";
         let type_key = action_key(&["gui", "type", "notes", "deadbeef"]);
         let click_key = action_key(&["gui", "left_click", "notes", "deadbeef"]);
+        let list_key = action_key(&["gui", "list_windows", "", "deadbeef"]);
         let tool_key = "Run: npm test".to_string();
 
         r.seed_grants(GrantSnapshot {
@@ -5119,20 +5120,21 @@ mod tests {
             always: vec![
                 AlwaysGrant { thread, dir: dir.into(), action_key: type_key.clone() },
                 AlwaysGrant { thread, dir: dir.into(), action_key: click_key.clone() },
+                AlwaysGrant { thread, dir: dir.into(), action_key: list_key.clone() },
                 AlwaysGrant { thread, dir: dir.into(), action_key: tool_key.clone() },
             ],
         });
 
-        // In-memory behavior AND the frontend revoke-UI snapshot both still
-        // carry all three — persistence is the ONLY thing that narrows.
-        assert_eq!(r.auto_decision(thread, dir, RiskLevel::Unknown, &type_key), Some(Decision::Allow));
-        assert_eq!(r.auto_decision(thread, dir, RiskLevel::Unknown, &click_key), Some(Decision::Allow));
-        assert_eq!(r.auto_decision(thread, dir, RiskLevel::Unknown, &tool_key), Some(Decision::Allow));
+        // In-memory behavior AND the frontend revoke-UI snapshot carry ALL of
+        // them — persistence is the ONLY thing that narrows.
+        for k in [&type_key, &click_key, &list_key, &tool_key] {
+            assert_eq!(r.auto_decision(thread, dir, RiskLevel::Unknown, k), Some(Decision::Allow));
+        }
         let mem_keys: std::collections::HashSet<String> =
             r.snapshot_grants().always.into_iter().map(|ag| ag.action_key).collect();
-        assert!(mem_keys.contains(&type_key), "snapshot_grants (revoke UI) must still carry the type key");
-        assert!(mem_keys.contains(&click_key));
-        assert!(mem_keys.contains(&tool_key));
+        for k in [&type_key, &click_key, &list_key, &tool_key] {
+            assert!(mem_keys.contains(k), "snapshot_grants (revoke UI) must still carry {k}");
+        }
 
         // Now drive an explicit persist and inspect exactly what gets shipped
         // to the single writer.
@@ -5146,9 +5148,13 @@ mod tests {
             msg.snapshot.always.iter().map(|ag| ag.action_key.clone()).collect();
         assert!(
             !persisted_keys.contains(&type_key),
-            "a type Always-grant must NEVER reach the persistence writer: {persisted_keys:?}"
+            "a window-bound type grant must NEVER reach the writer: {persisted_keys:?}"
         );
-        assert!(persisted_keys.contains(&click_key), "a non-type GUI grant must still persist");
+        assert!(
+            !persisted_keys.contains(&click_key),
+            "a window-bound click grant must NEVER reach the writer (round-24): {persisted_keys:?}"
+        );
+        assert!(persisted_keys.contains(&list_key), "a windowless GUI grant must still persist");
         assert!(persisted_keys.contains(&tool_key), "an ordinary tool grant must still persist");
         let _ = msg.ack.expect("request_persist_ack always attaches an ack sender").send(Ok(()));
         ack_rx.await.unwrap().unwrap();

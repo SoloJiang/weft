@@ -866,6 +866,20 @@ async fn run_action(
                 if computer::stop_latched() {
                     return (resolved_id, Err(ComputerError::Disabled.to_string()));
                 }
+                // issue #160 round-24 P1 (Codex computer_srv.rs:775): the async
+                // liveness recheck ran BEFORE this closure was scheduled — and
+                // before the `enabled` await and the blocking-pool queue wait
+                // that follow it. A delete landing in that window can't be seen
+                // by an async `session_is_live` here (this is a SYNC blocking-
+                // pool closure), but the direction-precise revocation flag CAN be
+                // — the delete paths publish it before their cascade. Fail closed
+                // so a queued capture can't write pixels under the deleted
+                // identity or recreate the just-pruned output subtree. Direction-
+                // precise, so a `delete_repo` that left THIS direction live (only
+                // a sibling was removed) is unaffected.
+                if route_revoked_sync(thread, &dir_owned) {
+                    return (resolved_id, Err(SESSION_GONE_MSG.to_string()));
+                }
                 let shot = match computer::screenshot_resolved(b.as_ref(), &w, &out_dir) {
                     Ok(s) => s,
                     Err(e) => return (resolved_id, Err(e.to_string())),
@@ -1262,10 +1276,21 @@ async fn run_action(
             // for what THAT protects against: buffered capture memory, not a
             // quick position query).
             let b = backend::backend();
-            on_blocking(move || b.cursor_position())
-                .await?
-                .map(|(x, y)| format!("cursor at ({x}, {y})"))
-                .map_err(|e| e.to_string())
+            on_blocking(move || {
+                // issue #160 round-24 P2 (Codex computer_srv.rs:1265): recheck
+                // the Stop latch on THIS blocking thread, immediately before the
+                // OS read. The post-approval `enabled` check ran BEFORE this
+                // closure was scheduled; a Stop landing while it sat queued would
+                // otherwise still return desktop state. `cursor_position` holds
+                // no lease and no window, so only the latch applies — matching
+                // the `list_windows` / screenshot closures.
+                if computer::stop_latched() {
+                    return Err(ComputerError::Disabled.to_string());
+                }
+                b.cursor_position().map_err(|e| e.to_string())
+            })
+            .await?
+            .map(|(x, y)| format!("cursor at ({x}, {y})"))
         }
         // No window, no control lock, no throttle — a pure timer.
         "wait" => {
@@ -1501,10 +1526,11 @@ async fn approve(
     // of re-prompting once per window instance rather than once per
     // app+title (documented tradeoff, not a bug: see the top-of-file doc for
     // the a `type` Always-grant's own note on this same shape).
-    // `always_key_is_persistable` (ask.rs) only inspects `parts[0]`/`parts[1]`
-    // (`"gui"`/the action name) to decide whether a `type` grant is safe to
-    // persist — inserting `id` at position 3 (0-indexed) doesn't touch either
-    // of those, so that gate is unaffected by this shape change.
+    // `always_key_is_persistable` (ask.rs) decides whether a GUI grant is safe to
+    // persist from `parts[0]` (`"gui"`) and `parts[2]` (the window query — a
+    // window-bound grant is never persisted, round-24 P2). Inserting `id` at
+    // position 3 (0-indexed) leaves both untouched, so that gate is unaffected by
+    // this shape change.
     let action_key = match &resolved {
         Some(w) => crate::ask::action_key(&[
             "gui",
@@ -3326,6 +3352,33 @@ pub(crate) fn remove_computer_output_for_thread(thread: i32) {
     }
 }
 
+/// issue #160 round-24 P2 (Codex commands.rs:794): remove ONE worker direction's
+/// computer-output subtree — `<weft_home>/computer/<thread>/<direction_id>/`,
+/// holding that direction's per-worktree screenshots and rotated audit logs (see
+/// [`session_root`]'s worker layout). `commands::delete_repo` removes a repo's
+/// directions while the parent thread SURVIVES, so [`remove_computer_output_for_
+/// thread`] (whole-thread) would wrongly wipe the thread's surviving directions;
+/// this prunes only the deleted direction's tree, which `session_root` could
+/// never reach again once the direction row is gone.
+///
+/// Bounded: `dir` must parse as a plain direction id (a bare integer, no
+/// separator / `..`), matching [`session_root`]'s own `dir.parse::<i32>()` — any
+/// other shape (a lead lane, a malformed token) is IGNORED rather than joined,
+/// so there is nothing to escape [`crate::paths::computer_output_root`] with.
+/// Best-effort, never gates the delete.
+pub(crate) fn remove_computer_output_for_direction(thread: i32, dir: &str) {
+    if dir.parse::<i32>().is_err() {
+        return;
+    }
+    let Ok(root) = crate::paths::computer_output_root() else {
+        return;
+    };
+    let path = root.join(thread.to_string()).join(dir);
+    if path.exists() {
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
 /// issue #160 round-19 P1 (Codex computer_srv.rs:403): does `(thread, dir, wt)`
 /// STILL denote a live session? The per-session bearer stays valid for the
 /// whole process lifetime and each Axum request is independent of the engine,
@@ -3346,60 +3399,125 @@ pub(crate) fn remove_computer_output_for_thread(thread: i32) {
 const SESSION_GONE_MSG: &str =
     "this computer-use session no longer exists (its issue or direction was deleted) — refused";
 
-/// Process-global set of thread ids whose computer-use routes were REVOKED by a
-/// thread deletion (issue #160 round-19 P1, Codex computer_srv.rs:403).
-/// `commands::delete_thread` records a thread here (via [`revoke_computer_
-/// routes`]) as part of its cascade; the [`handle_computer`] entry gate and the
-/// [`recheck_after_guard`] pre-injection revalidation consult it.
+/// Per-thread computer-use route revocation state (issue #160 round-19 P1, Codex
+/// computer_srv.rs:403; refined round-24 P1, Codex computer_srv.rs:775). A whole-
+/// thread delete revokes EVERY route; a repo delete revokes only the specific
+/// worker directions it removes, leaving the thread's surviving directions (and
+/// its lead lane) live — so the state has to distinguish the two, or a repo
+/// delete would permanently strand a multi-repo thread's other directions.
 ///
-/// Why a revocation SET rather than a blanket DB-liveness check on every
-/// request: the per-session bearer is a process-lifetime HMAC the delete path
-/// can't rescind, and the Axum request is independent of the engine it stops,
-/// so a token minted before a delete stays cryptographically valid. Recording
-/// the deletion here revokes those tokens WITHOUT a DB round-trip on the
-/// overwhelmingly common live-session request — and without coupling every
-/// request (or the many synthetic-identity tests, which deliberately never set
-/// up matching DB rows) to a DB shape. Only a thread that was actually deleted
-/// is ever in this set, and such a request then pays ONE [`session_is_live`]
-/// check to tell a genuinely-deleted thread (refuse) from a REUSED thread id (a
-/// brand-new thread that happens to reuse the number — allow), so id reuse can
-/// never permanently strand a fresh session.
-fn revoked_computer_threads() -> &'static std::sync::Mutex<std::collections::HashSet<i32>> {
-    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
-        std::sync::OnceLock::new();
-    SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+/// Why a revocation MAP rather than a blanket DB-liveness check on every request:
+/// the per-session bearer is a process-lifetime HMAC the delete path can't
+/// rescind, and the Axum request is independent of the engine it stops, so a
+/// token minted before a delete stays cryptographically valid. Recording the
+/// deletion here revokes those tokens WITHOUT a DB round-trip on the common
+/// live-session request — and without coupling every request (or the many
+/// synthetic-identity tests, which deliberately never set up matching DB rows)
+/// to a DB shape. Only a genuinely-deleted route is ever in this map; such a
+/// request then pays ONE [`session_is_live`] check to tell a real deletion
+/// (refuse) from a REUSED id (allow), so id reuse can never strand a fresh
+/// session.
+#[derive(Clone)]
+enum RouteRevocation {
+    /// Whole thread gone (`delete_thread` / `delete_workspace`): every direction
+    /// and the lead lane are revoked.
+    Whole,
+    /// Only specific worker directions gone (`delete_repo` removed the repo that
+    /// owned them). Keyed by the route `dir` string (`direction_id.to_string()`).
+    Directions(std::collections::HashSet<String>),
 }
 
-/// Revoke every computer-use route for `thread` (issue #160 round-19 P1) — see
-/// [`revoked_computer_threads`]. Called from `commands::delete_thread`.
+fn revoked_computer_routes(
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, RouteRevocation>> {
+    static MAP: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<i32, RouteRevocation>>,
+    > = std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Revoke EVERY route for `thread` — `commands::delete_thread` /
+/// `delete_workspace_after_fence`. Supersedes any prior direction-level entry.
 pub(crate) fn revoke_computer_routes(thread: i32) {
-    revoked_computer_threads()
+    revoked_computer_routes()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(thread);
+        .insert(thread, RouteRevocation::Whole);
 }
 
-/// Undo a [`revoke_computer_routes`] — issue #160 round-23 P1 (Codex
-/// commands.rs:756). The delete paths now publish the revocation BEFORE their
-/// first destructive await; if the cascade then FAILS the owning rows still
-/// exist, so the thread must be un-revoked — otherwise the final
-/// [`recheck_stop_and_lease_before_backend`] guard (which refuses ANY revoked
-/// thread) would fail-close that still-live session's input forever.
-pub(crate) fn unrevoke_computer_routes(thread: i32) {
-    revoked_computer_threads()
+/// Revoke ONE worker direction of `thread` — `commands::delete_repo`, which
+/// removes a repo's directions while the thread itself survives. Adds to (never
+/// downgrades) the thread's entry: a pre-existing `Whole` stays `Whole`.
+pub(crate) fn revoke_computer_route_dir(thread: i32, dir: String) {
+    let mut map = revoked_computer_routes()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&thread);
+        .unwrap_or_else(|e| e.into_inner());
+    match map.get_mut(&thread) {
+        Some(RouteRevocation::Whole) => {}
+        Some(RouteRevocation::Directions(dirs)) => {
+            dirs.insert(dir);
+        }
+        None => {
+            let mut dirs = std::collections::HashSet::new();
+            dirs.insert(dir);
+            map.insert(thread, RouteRevocation::Directions(dirs));
+        }
+    }
 }
 
-/// Whether `thread`'s routes were revoked by a delete — a lock-only set lookup,
-/// `false` for every thread that was never deleted (so live sessions and the
-/// synthetic-identity tests never reach the [`session_is_live`] DB check).
+/// Prior revocation state for a set of threads, captured BEFORE a delete revokes
+/// them so a FAILED cascade can restore EXACTLY what was there — issue #160
+/// round-24 P2 (Codex commands.rs:803). A blanket un-revoke would drop a
+/// revocation that an EARLIER successful delete already published for the same
+/// thread, re-opening that stale route's bearer.
+pub(crate) struct RevocationSnapshot(Vec<(i32, Option<RouteRevocation>)>);
+
+pub(crate) fn snapshot_revocations(threads: &[i32]) -> RevocationSnapshot {
+    let map = revoked_computer_routes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    RevocationSnapshot(threads.iter().map(|&t| (t, map.get(&t).cloned())).collect())
+}
+
+pub(crate) fn restore_revocations(snapshot: RevocationSnapshot) {
+    let mut map = revoked_computer_routes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (thread, prior) in snapshot.0 {
+        match prior {
+            Some(state) => {
+                map.insert(thread, state);
+            }
+            None => {
+                map.remove(&thread);
+            }
+        }
+    }
+}
+
+/// Coarse: does `thread` have ANY revoked route? The async entry gate and
+/// [`recheck_after_guard`] use this to decide whether to run the direction-
+/// precise [`session_is_live`] DB check — a never-deleted thread skips it.
 fn computer_routes_revoked(thread: i32) -> bool {
-    revoked_computer_threads()
+    revoked_computer_routes()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(&thread)
+        .contains_key(&thread)
+}
+
+/// Sync + direction-precise: is THIS exact `(thread, dir)` route revoked? Used
+/// inside a blocking-pool closure (the screenshot capture) where an async
+/// [`session_is_live`] can't run but a coarse thread-level refuse would be wrong
+/// — `delete_repo` leaves the thread's sibling directions live.
+fn route_revoked_sync(thread: i32, dir: &str) -> bool {
+    match revoked_computer_routes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&thread)
+    {
+        Some(RouteRevocation::Whole) => true,
+        Some(RouteRevocation::Directions(dirs)) => dirs.contains(dir),
+        None => false,
+    }
 }
 
 async fn session_is_live(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> bool {
@@ -5498,6 +5616,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
+    /// issue #160 round-24 P2 (Codex commands.rs:794): a repo delete prunes ONLY
+    /// the removed direction's output subtree — a sibling direction and the lead
+    /// lane under the SAME surviving thread are untouched, and a non-integer dir
+    /// never touches the filesystem.
+    #[test]
+    fn remove_computer_output_for_direction_drops_only_that_direction() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let weft_home =
+            std::env::temp_dir().join(format!("weft-computer-srv-rm-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let root = crate::paths::computer_output_root().unwrap();
+        let thread = "77";
+        // Direction 10 (removed by a repo delete) with a worktree subtree.
+        let d10 = root.join(thread).join("10").join("wt-1").join("screenshots");
+        std::fs::create_dir_all(&d10).unwrap();
+        std::fs::write(d10.join("shot.png"), b"x").unwrap();
+        // Direction 11 and the lead lane both survive (they are not this repo's).
+        let d11 = root.join(thread).join("11").join("wt-2");
+        std::fs::create_dir_all(&d11).unwrap();
+        std::fs::write(d11.join("shot.png"), b"y").unwrap();
+        let lead = root.join(thread).join(crate::bus::LEAD);
+        std::fs::create_dir_all(&lead).unwrap();
+
+        remove_computer_output_for_direction(77, "10");
+        assert!(!root.join(thread).join("10").exists(), "the removed direction's subtree is gone");
+        assert!(root.join(thread).join("11").exists(), "a surviving sibling direction is untouched");
+        assert!(lead.exists(), "the lead lane is untouched");
+
+        // A non-integer dir is bounded out — never joined, never a path escape.
+        remove_computer_output_for_direction(77, "../evil");
+        assert!(root.join(thread).join("11").exists(), "a malformed dir touches nothing");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     /// issue #160 round-19 P1 (Codex computer_srv.rs:403): a request under a
     /// deleted thread/direction is refused — `session_is_live` is the admission
     /// gate that revokes the route once the delete cascade runs.
@@ -5538,17 +5694,64 @@ mod tests {
         assert!(!session_is_live(&db, thread.id, &dir_s, Some(wt.id)).await);
     }
 
-    /// issue #160 round-19 P1 (Codex computer_srv.rs:403): the revocation set is
-    /// empty until a delete (so no live session — nor any synthetic-identity
-    /// test — ever pays the `session_is_live` DB check); `revoke_computer_routes`
-    /// flags exactly the deleted thread.
+    /// issue #160 round-19 P1 (Codex computer_srv.rs:403) + round-24 P1: the
+    /// revocation map is empty until a delete (so no live session — nor any
+    /// synthetic-identity test — ever pays the `session_is_live` DB check), and
+    /// it distinguishes a WHOLE-thread delete from a per-DIRECTION (repo) delete
+    /// so the latter can't strand a multi-repo thread's surviving directions.
     #[test]
-    fn revoke_computer_routes_flags_only_the_deleted_thread() {
-        let t = 917_001;
-        assert!(!computer_routes_revoked(t), "a never-deleted thread is not revoked");
-        revoke_computer_routes(t);
-        assert!(computer_routes_revoked(t), "the deleted thread is revoked");
-        assert!(!computer_routes_revoked(t + 1), "revocation is per-thread");
+    fn revocation_map_distinguishes_whole_thread_from_per_direction() {
+        let whole = 917_001;
+        let repo_thread = 917_002;
+        let untouched = 917_003;
+        // Leave the process-global map exactly as found.
+        let restore = snapshot_revocations(&[whole, repo_thread, untouched]);
+
+        assert!(!computer_routes_revoked(untouched), "a never-deleted thread is not revoked");
+        assert!(!route_revoked_sync(untouched, "5"), "…and no direction is sync-revoked");
+
+        // Whole-thread revoke: coarse gate fires and EVERY dir is sync-revoked.
+        revoke_computer_routes(whole);
+        assert!(computer_routes_revoked(whole));
+        assert!(route_revoked_sync(whole, "5"), "a whole-thread delete revokes every worker dir");
+        assert!(route_revoked_sync(whole, crate::bus::LEAD), "…and the lead lane");
+
+        // Per-direction revoke: coarse gate fires (so `session_is_live` runs) but
+        // ONLY the removed direction is sync-revoked — siblings and lead survive.
+        revoke_computer_route_dir(repo_thread, "10".to_string());
+        assert!(computer_routes_revoked(repo_thread), "coarse gate fires so session_is_live runs");
+        assert!(route_revoked_sync(repo_thread, "10"), "the removed direction is refused");
+        assert!(!route_revoked_sync(repo_thread, "11"), "a surviving sibling direction is NOT refused");
+        assert!(!route_revoked_sync(repo_thread, crate::bus::LEAD), "the lead lane survives a repo delete");
+
+        restore_revocations(restore);
+        assert!(!computer_routes_revoked(whole), "cleanup restored the empty baseline");
+        assert!(!computer_routes_revoked(repo_thread));
+    }
+
+    /// issue #160 round-24 P2 (Codex commands.rs:803): a failed cascade's
+    /// rollback must restore EXACTLY the prior revocation state — never drop a
+    /// revocation that an earlier successful delete already published.
+    #[test]
+    fn revocation_snapshot_restore_preserves_a_prior_revocation() {
+        let thread = 917_010;
+        let cleanup = snapshot_revocations(&[thread]);
+
+        // An earlier repo delete already revoked direction "20".
+        revoke_computer_route_dir(thread, "20".to_string());
+        assert!(route_revoked_sync(thread, "20"));
+
+        // A later repo delete snapshots, revokes "21", then FAILS and restores.
+        let undo = snapshot_revocations(&[thread]);
+        revoke_computer_route_dir(thread, "21".to_string());
+        assert!(route_revoked_sync(thread, "21"));
+        restore_revocations(undo);
+
+        assert!(route_revoked_sync(thread, "20"), "a pre-existing revocation must survive the rollback");
+        assert!(!route_revoked_sync(thread, "21"), "the failed op's own revocation is rolled back");
+
+        restore_revocations(cleanup);
+        assert!(!computer_routes_revoked(thread));
     }
 
     // —— issue #160 round-3 P1 §2 (extended round-5 review P1 §2): recheck_after_guard ——

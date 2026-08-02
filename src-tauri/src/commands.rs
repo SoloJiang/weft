@@ -126,6 +126,20 @@ fn clear_control_if_doomed(doomed_threads: &[i32]) {
     }
 }
 
+/// Direction-precise counterpart of [`clear_control_if_doomed`] for `delete_repo`,
+/// which tears down specific worker directions while the thread survives. Clears
+/// the lease ONLY when its holder is one of the removed `(thread, dir)` routes —
+/// a coarse by-thread clear would spuriously drop a surviving sibling direction's
+/// lease.
+fn clear_control_if_route_doomed(doomed_routes: &std::collections::HashSet<(i32, String)>) {
+    let Some(holder) = crate::computer::control_state() else {
+        return;
+    };
+    if doomed_routes.contains(&(holder.thread, holder.dir.clone())) {
+        crate::computer::clear_control();
+    }
+}
+
 async fn delete_workspace_after_fence(
     app: tauri::AppHandle,
     db: &Db,
@@ -169,6 +183,11 @@ async fn delete_workspace_after_fence(
     // and the final `recheck_stop_and_lease_before_backend` skip it — and reaches
     // the desktop after its rows are gone. Roll the revocations back if the
     // cascade itself fails, so a still-live session isn't fail-closed forever.
+    // issue #160 round-24 P2 (Codex commands.rs:803): snapshot the prior
+    // revocation state so a failed cascade restores EXACTLY what was there — a
+    // blanket un-revoke would drop a revocation an earlier successful delete had
+    // already published for one of these threads.
+    let revocation_undo = crate::bus::computer_srv::snapshot_revocations(&doomed_threads);
     for thread_id in &doomed_threads {
         crate::bus::computer_srv::revoke_computer_routes(*thread_id);
     }
@@ -176,9 +195,7 @@ async fn delete_workspace_after_fence(
     let removed = match repo::delete_workspace_cascade(db, workspace_id).await {
         Ok(removed) => removed,
         Err(err) => {
-            for thread_id in &doomed_threads {
-                crate::bus::computer_srv::unrevoke_computer_routes(*thread_id);
-            }
+            crate::bus::computer_srv::restore_revocations(revocation_undo);
             return Err(e(err));
         }
     };
@@ -781,30 +798,51 @@ pub async fn delete_repo(
     // Forget before the cascade so any in-flight curator pass sees the deletion
     // as early as possible and does not publish stale running/done state.
     crate::curator::run_forget(repo_id);
-    // issue #160 round-22 P1 (Codex computer_srv.rs:385): revoke computer routes
-    // for every thread that owns a direction in this repo BEFORE the cascade
-    // removes those directions. The threads themselves survive, so their output
-    // subtree is NOT dropped (unlike the workspace delete); `session_is_live`
-    // refuses the removed directions while allowing each thread's surviving ones.
-    let doomed_threads = repo::thread_ids_for_repo(&db, repo_id).await.map_err(e)?;
-    // issue #160 round-23 P1 (Codex commands.rs:756): revoke BEFORE the cascade,
-    // roll back on failure — see `delete_workspace_after_fence`'s own note. The
-    // threads themselves survive a repo delete, so there is no output subtree to
-    // drop here (only the removed directions' routes need refusing, which
-    // `session_is_live` handles per-direction once the thread is revoked).
-    for thread_id in &doomed_threads {
-        crate::bus::computer_srv::revoke_computer_routes(*thread_id);
+    // issue #160 round-22 P1 (Codex computer_srv.rs:385) / round-24 P1
+    // (computer_srv.rs:775): revoke computer routes for every direction this repo
+    // owns BEFORE the cascade removes them. A repo delete leaves the parent
+    // threads (and their directions in OTHER repos) alive, so we revoke each
+    // removed direction PRECISELY — `dir = direction_id` — never the whole
+    // thread; a thread-level revoke would strand a multi-repo thread's surviving
+    // directions. The direction-precise flag is what the screenshot capture
+    // closure and `session_is_live` both consult.
+    let doomed_directions = repo::directions_for_repo(&db, repo_id).await.map_err(e)?;
+    let doomed_routes: std::collections::HashSet<(i32, String)> = doomed_directions
+        .iter()
+        .map(|d| (d.thread_id, d.id.to_string()))
+        .collect();
+    let doomed_threads: Vec<i32> = {
+        let mut threads: Vec<i32> = doomed_directions.iter().map(|d| d.thread_id).collect();
+        threads.sort_unstable();
+        threads.dedup();
+        threads
+    };
+    // issue #160 round-24 P2 (Codex commands.rs:803): snapshot prior revocation
+    // state so a failed cascade restores EXACTLY what was there (a blanket
+    // un-revoke would drop a revocation an earlier repo delete already published
+    // for one of these surviving threads).
+    let revocation_undo = crate::bus::computer_srv::snapshot_revocations(&doomed_threads);
+    for direction in &doomed_directions {
+        crate::bus::computer_srv::revoke_computer_route_dir(direction.thread_id, direction.id.to_string());
     }
-    clear_control_if_doomed(&doomed_threads);
+    clear_control_if_route_doomed(&doomed_routes);
     let removed = match repo::delete_repo_cascade(&db, repo_id).await {
         Ok(removed) => removed,
         Err(err) => {
-            for thread_id in &doomed_threads {
-                crate::bus::computer_srv::unrevoke_computer_routes(*thread_id);
-            }
+            crate::bus::computer_srv::restore_revocations(revocation_undo);
             return Err(e(err));
         }
     };
+    // issue #160 round-24 P2 (Codex commands.rs:794): prune each removed
+    // direction's computer-output subtree. `session_root` can only resolve LIVE
+    // directions/worktrees and `remove_computer_output_for_thread` deletes whole
+    // threads, so a surviving thread's deleted-direction output
+    // (`<WEFT_HOME>/computer/<thread>/<dir>/…`) would otherwise never be pruned —
+    // repeated repo replacements in one long-lived thread would accumulate stale
+    // screenshots and audit logs.
+    for (thread_id, dir) in &doomed_routes {
+        crate::bus::computer_srv::remove_computer_output_for_direction(*thread_id, dir);
+    }
     // Gate worktree removal on created_checkout (a reused pre-existing path must
     // survive) and branch deletion on created_branch (a pre-existing branch reused
     // by the -b fallback survives repo deletion). cleanup_worktrees cannot be used
@@ -1515,12 +1553,13 @@ pub async fn delete_thread(
     // revocation set until the revoke runs — and reach the desktop after its
     // rows are gone. Roll back if the cascade fails so a still-live session
     // isn't fail-closed forever.
+    let revocation_undo = crate::bus::computer_srv::snapshot_revocations(std::slice::from_ref(&thread_id));
     crate::bus::computer_srv::revoke_computer_routes(thread_id);
     clear_control_if_doomed(std::slice::from_ref(&thread_id));
     let removed = match repo::delete_thread_cascade(&db, thread_id).await {
         Ok(removed) => removed,
         Err(err) => {
-            crate::bus::computer_srv::unrevoke_computer_routes(thread_id);
+            crate::bus::computer_srv::restore_revocations(revocation_undo);
             return Err(e(err));
         }
     };
