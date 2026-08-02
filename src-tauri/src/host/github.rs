@@ -716,6 +716,45 @@ mod tests {
         );
     }
 
+    /// The SSRF guard on the THREADS path specifically.
+    ///
+    /// `fetch_status_refuses_an_embedded_slash_before_shelling_out` cannot
+    /// cover this: it asserts on the `Err` that `fetch_scalar_axes` produces,
+    /// so it passes whether or not `fetch_review_threads` checked anything —
+    /// and since the reorder, the threads read is the one that runs FIRST,
+    /// i.e. the first thing that could shell out with a smuggled host. Its
+    /// refusal is a silent `Unknown` rather than an `Err`, so it needs its
+    /// own assertion or the guard is only covered by `api_hostname`'s unit
+    /// test, never by the call site actually using it.
+    ///
+    /// Reaching `Command::new` here would run the operator's real `gh`.
+    #[test]
+    fn the_threads_read_refuses_an_embedded_slash_before_shelling_out() {
+        for (host_base, owner, repo) in [
+            ("evil.example.org/extra", "acme", "widgets"),
+            ("", "evil.example.org/acme", "widgets"),
+            ("", "acme", "evil.example.org/widgets"),
+        ] {
+            let target = PrTarget {
+                host_base: host_base.to_string(),
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                number: 1,
+            };
+            match fetch_review_threads(&target) {
+                ThreadStatus::Unknown { reason } => assert!(
+                    reason.contains("host override"),
+                    "must refuse for the guard's reason, not some incidental \
+                     failure that would also appear if it had shelled out: {reason}"
+                ),
+                other => panic!(
+                    "expected a refusal before any process spawned for \
+                     host_base={host_base:?} owner={owner:?} repo={repo:?}, got {other:?}"
+                ),
+            }
+        }
+    }
+
     // --- reviewThreads: the pagination + parsing trap ---------------------
 
     /// Build a page exactly the way the live API returns one.
