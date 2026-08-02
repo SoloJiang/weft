@@ -56,7 +56,7 @@ Weft 和你已经信任的工具、仓库一起工作。
 ### 3. 本地运行，远程可达，数据可恢复
 
 Agent 交付经常是长时间运行的桌面工作。Weft 可以在 session 运行时阻止系统空闲休眠；
-开启 IM 桥时保持远程待命，让飞书指令随时到达；也可以把本地 SQLite 状态库加密备份到
+开启 IM 桥时保持远程待命，让飞书或钉钉指令随时到达；也可以把本地 SQLite 状态库加密备份到
 私有 Git 远端，并单独导出 Recovery Key，方便换机或故障后恢复。
 
 ## 同类产品对比
@@ -66,7 +66,7 @@ Agent 交付经常是长时间运行的桌面工作。Weft 可以在 session 运
 
 你给一个需求，Weft 先替你想清楚要动哪些仓库、为什么动，等你确认才开工；多个 agent
 像一个小组那样彼此对齐，你全程只盯一个 issue；它卡住会主动问你，人离开电脑也能在
-飞书/Lark 上继续指挥；每一处改动都在隔离副本里完成，主分支始终干净、diff 一眼可
+飞书/Lark 或钉钉上继续指挥；每一处改动都在隔离副本里完成，主分支始终干净、diff 一眼可
 review，状态还能加密备份、换机即恢复。
 
 | 产品 | 它擅长什么 | Weft 的不同 |
@@ -100,20 +100,27 @@ review，状态还能加密备份、换机即恢复。
 ## 人不在电脑前，也能继续指挥
 
 <p align="center">
-  <img src="assets/diagrams/im-zh.svg" alt="IM 远程指挥：飞书卡片镜像权限请求和 agent 提问" width="940" />
+  <img src="assets/diagrams/im-zh.svg" alt="IM 远程指挥：镜像权限请求和 agent 提问" width="940" />
 </p>
 
-Worker 的权限请求和 agent 提问可以镜像到飞书/Lark 交互卡片。在移动端回复卡片，会更新桌面端的同一个请求；不论在哪一侧回答，另一侧都会同步到一致状态。
+Settings 中可以选择飞书/Lark 或钉钉；两套凭证分别保存在本机，同时只连接一个渠道。
+Worker 的权限请求和 agent 提问与桌面端使用同一份状态。飞书使用可回复卡片；钉钉通过
+Stream 模式接收消息，并使用显式的 `/allow`、`/deny`、`/always`、`/full` 和
+`/answer` 命令，避免依赖不稳定的引用消息元数据。
 
 你也可以把飞书/Lark 的 reply thread（话题）当作 Weft issue 的远程会话：在群里发送
 `/topic <issue-id>` 创建或复用 issue 话题，或在已有 reply thread 里发送
 `/bind <issue-id>` 绑定。之后，这个 reply thread 里的消息会回到对应 issue 的
-Lead 会话。
+Lead 会话。钉钉话题圈会提供稳定的 `openConvThreadId`：先创建或打开一个钉钉 thread，
+再在 thread 内 @机器人发送 `/bind <issue-id>`。之后该 thread 内 @机器人的消息进入
+对应 Lead，回复通过这条入站消息的临时 session webhook 返回同一 thread。钉钉主动群
+消息 API 只接受父群的 `openConversationId`，不接受 `openConvThreadId`；因此 Weft 不会
+把父群 ID 冒充 thread，也不会把 thread ID 错当成群 ID。
 
 当前桥接覆盖：
 
 - 权限请求与 agent 提问。
-- Issue 与飞书/Lark reply thread（话题）的绑定，让消息回到对应 Lead 会话。
+- 飞书/Lark 话题绑定与钉钉 `openConvThreadId` 绑定，让消息回到对应 Lead 会话。
 - 基于 `weft_global` MCP 工具的 Concierge 私聊入口。
 - 每次恢复在线时，对待处理 Needs-you 做一次摘要同步。
 
@@ -146,7 +153,7 @@ Rust 后端负责本地 SQLite 状态库、git worktree 生命周期、headless 
 - **多仓规划：** 添加、克隆或创建 workspace 仓库；Lead 基于 repo map 拆分工作，并解释每个仓库为什么需要改。
 - **原生执行：** 每个确认后的工作单元都会在目标仓库内创建 worktree 和 branch；Claude Code、Codex、OpenCode worker 以原生 CLI 会话运行。
 - **可控协作：** planner MCP、Ask Bridge、本地 MCP Bus、排队、打断、resume、slash commands 和附件都收束到同一个 issue。
-- **远程可达：** 飞书/Lark 卡片处理权限请求和 agent 提问；reply thread（话题）可以绑定 issue 会话，并把消息路由回 Lead。
+- **远程可达：** 飞书/Lark 或钉钉处理权限请求和 agent 提问；飞书话题与钉钉 thread 可以绑定 issue，并把消息路由回 Lead。
 - **Review 与检查：** 物化 worktree 的 diff、pre-PR checks，以及 Claude jsonl、Codex rollout jsonl、OpenCode SQLite 的 sidecar 观测。
 - **团队配置：** Git 托管 Skill 源、个人本地 Skills 保留、全局或 workspace 启用，以及每个仓库实际生效的 Skills/Rules 预览。
 - **长任务可靠性：** 防休眠、IM 远程待命，以及加密 `weft.db` 备份到私有 Git 远端；支持定时备份、退出时备份、恢复和 Recovery Key 导出。
@@ -180,7 +187,7 @@ src-tauri/src/
   lead_chat/            headless agent 会话引擎
     sentinels.rs        解析 <weft:action_card> / <weft:list_repos/> 控制符
     repo_state.rs       注入到 Lead prompt 的 <repo_state> 快照
-  im/                   IM 桥（Channel trait + 飞书适配器，ws + cards）
+  im/                   IM 桥（Channel trait + 飞书/钉钉适配器）
   store/                SQLite/SeaORM entities 与 migrations
   bus/                  本地 MCP/thread bus + human-ask notifier
   ask.rs                权限 Ask 注册中心（桌面 + IM 同源）

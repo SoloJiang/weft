@@ -435,19 +435,26 @@ export const api = {
     invoke<void>("flag_lead_skill_refresh", { threadId }),
   imGetSettings: () =>
     invoke<{
+      provider: "feishu" | "dingtalk";
       app_id: string;
       has_secret: boolean;
       bound: boolean;
       enabled: boolean;
       remote_standby: boolean;
     }>("im_get_settings"),
-  imSetSettings: (appId: string, appSecret: string) =>
-    invoke<void>("im_set_settings", { appId, appSecret }),
-  imSetEnabled: (enabled: boolean) =>
-    invoke<void>("im_set_enabled", { enabled }),
+  imSetProvider: (provider: "feishu" | "dingtalk") =>
+    invoke<void>("im_set_provider", { provider }),
+  imSetSettings: (provider: "feishu" | "dingtalk", appId: string, appSecret: string) =>
+    invoke<void>("im_set_settings", { provider, appId, appSecret }),
+  imSetEnabled: (provider: "feishu" | "dingtalk", enabled: boolean) =>
+    invoke<void>("im_set_enabled", { provider, enabled }),
+  imResetOwner: (provider: "feishu" | "dingtalk") =>
+    invoke<void>("im_reset_owner", { provider }),
   imSetRemoteStandby: (enabled: boolean) =>
     invoke<void>("im_set_remote_standby", { enabled }),
   imStatus: () => invoke<string>("im_status"),
+  imSetDingTalkCopy: (copy: DingTalkCopy) =>
+    invoke<void>("im_set_dingtalk_copy", { copy }),
   feishuScanBegin: () =>
     invoke<{ qr_data_uri: string; expire_secs: number; poll_interval_ms: number }>(
       "feishu_scan_begin",
@@ -511,3 +518,38 @@ export const api = {
     return [];
   },
 };
+
+export interface DingTalkCopy {
+  locale: "en" | "zh";
+  truncatedMarker: string;
+  permissionTitle: string;
+  permissionReplyCommand: string;
+  verdictAllowed: string;
+  verdictAlwaysAllowed: string;
+  verdictFullAccess: string;
+  verdictDenied: string;
+  verdictExpired: string;
+  verdictResolved: string;
+  humanQuestionTitle: string;
+  humanAnswerInstruction: string;
+  humanAnswerPlaceholder: string;
+  humanAnswered: string;
+  answerPrefix: string;
+  humanCancelled: string;
+  issueNotFound: string;
+  bindThreadPrefix: string;
+  permissionAlreadyHandled: string;
+  humanAlreadyAnswered: string;
+  permissionCommandUsage: string;
+  humanAnswerUsage: string;
+  threadRequired: string;
+  freeTextUnavailable: string;
+  unboundThread: string;
+  conciergeDmPrefix: string;
+  conciergeGroupPrefix: string;
+  leadPrefix: string;
+  resyncOne: string;
+  resyncMany: string;
+  resyncMore: string;
+  resyncHint: string;
+}

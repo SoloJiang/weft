@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 use weft::ask::{Answer, AskRegistry, Decision, RiskLevel};
 use weft::bus::BusRegistry;
-use weft::im::{self, inbound::Route, Channel};
+use weft::im::{self, inbound::Route, Channel, ImProvider};
 use weft::store::repo;
 use weft::store::Db;
 
@@ -175,6 +175,57 @@ async fn answer_human_route_lands_in_asker_inbox() {
 }
 
 #[tokio::test]
+async fn dingtalk_bind_route_persists_native_thread_channel() {
+    let db = mem_db().await;
+    let (asks, bus, ch) = (
+        AskRegistry::new(),
+        BusRegistry::new(),
+        FakeChannel::default(),
+    );
+    let workspace = repo::create_workspace(&db, "product").await.unwrap();
+    let issue = repo::create_thread(&db, workspace.id, "ship it", "feature", "codex")
+        .await
+        .unwrap();
+    let route = Route::BindIssueThread {
+        thread_id: issue.id,
+        chat_id: "cid_group".into(),
+        im_thread_ref: "convThreadEncrypted".into(),
+        seed_message_id: "msg_bind".into(),
+    };
+    let copy = im::outbound::DingTalkCopy {
+        locale: "zh".into(),
+        bind_thread_prefix: "已绑定钉钉 thread 到".into(),
+        ..Default::default()
+    };
+
+    im::execute_for_provider(
+        route,
+        &db,
+        &asks,
+        &bus,
+        &ch,
+        ImProvider::DingTalk,
+        Some(&copy),
+        "staff_owner",
+        "zh",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let bound = repo::im_route_of_thread(&db, issue.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bound.channel, "dingtalk");
+    assert_eq!(bound.chat_id, "cid_group");
+    assert_eq!(bound.im_thread_ref, "convThreadEncrypted");
+    assert_eq!(ch.replies.lock().unwrap()[0].0, "msg_bind");
+    assert!(ch.replies.lock().unwrap()[0].1.contains("钉钉 thread"));
+}
+
+#[tokio::test]
 async fn bind_route_appends_allowlist_without_legacy_confirmation() {
     let db = mem_db().await;
     let (asks, bus, ch) = (
@@ -185,6 +236,7 @@ async fn bind_route_appends_allowlist_without_legacy_confirmation() {
     let r = Route::Bind {
         open_id: "ou_me".into(),
         chat_id: "oc_dm".into(),
+        reply_to: "om_first".into(),
         text: "hello".into(),
     };
     im::execute(r, &db, &asks, &bus, &ch, "ou_me", "zh", None, None)
@@ -211,6 +263,7 @@ async fn bind_route_rechecks_allowlist_still_empty() {
     let r = Route::Bind {
         open_id: "ou_second".into(),
         chat_id: "oc_dm".into(),
+        reply_to: "om_second".into(),
         text: "hello".into(),
     };
     im::execute(r, &db, &asks, &bus, &ch, "ou_second", "zh", None, None)
@@ -419,6 +472,7 @@ async fn issue_message_route_unbound_thread_hints_without_creating_issue() {
         inbound_message_id: Some("om_in".into()),
         acks: Some(std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()))),
         reaction_tx: None,
+        replay_pending_tx: None,
     };
     let r = Route::IssueMessage {
         chat_id: "oc_g".into(),
@@ -458,6 +512,7 @@ async fn issue_message_with_ctx_adds_eyes_reaction() {
         inbound_message_id: Some("om_in_1".into()),
         acks: Some(acks.clone()),
         reaction_tx: None,
+        replay_pending_tx: None,
     };
     let r = Route::IssueMessage {
         chat_id: "oc_g".into(),
@@ -496,6 +551,7 @@ async fn issue_message_with_reaction_queue_does_not_wait_for_feishu_reaction_api
         inbound_message_id: Some("om_in_slow".into()),
         acks: Some(std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()))),
         reaction_tx: Some(reaction_tx),
+        replay_pending_tx: None,
     };
     let r = Route::IssueMessage {
         chat_id: "oc_g".into(),
@@ -547,7 +603,7 @@ async fn consume_lead_out_replies_and_drains_acks() {
         text: "搞定了一半".into(),
         origin_tag: None,
     };
-    im::consume_lead_out(out, &db, &ch, &acks, false).await;
+    im::consume_lead_out(out, &db, &ch, ImProvider::Feishu, &acks, false).await;
     // reply 一次：目标是最新入站 message_id，不是持久 topic id；body 带 Lead 前缀
     let replies = ch.replies.lock().unwrap();
     assert_eq!(replies.len(), 1);
@@ -575,7 +631,7 @@ async fn consume_lead_out_unbound_thread_is_noop() {
         text: "nope".into(),
         origin_tag: None,
     };
-    im::consume_lead_out(out, &db, &ch, &acks, false).await;
+    im::consume_lead_out(out, &db, &ch, ImProvider::Feishu, &acks, false).await;
     assert!(ch.replies.lock().unwrap().is_empty());
     assert!(ch.deletions.lock().unwrap().is_empty());
 }
@@ -583,13 +639,19 @@ async fn consume_lead_out_unbound_thread_is_noop() {
 #[tokio::test]
 async fn ensure_issue_topic_creates_feishu_root_and_binds_issue() {
     let db = mem_db().await;
+    repo::set_setting(&db, im::K_ALLOW, "owner")
+        .await
+        .unwrap();
+    repo::set_setting(&db, im::K_ENABLED, "1")
+        .await
+        .unwrap();
     let ch = FakeChannel::default();
     let ws = repo::create_workspace(&db, "ws").await.unwrap();
     let t = repo::create_thread(&db, ws.id, "issue-topic", "feature", "claude")
         .await
         .unwrap();
 
-    im::ensure_issue_topic(&db, &ch, t.id, "oc_g", Some("om_cmd"), "zh")
+    im::ensure_issue_topic(&db, &ch, t.id, "oc_g", "owner", Some("om_cmd"), "zh")
         .await
         .unwrap();
 
@@ -645,7 +707,7 @@ async fn consume_lead_out_concierge_replies_to_bound_dm_route() {
         origin_tag: None,
     };
 
-    im::consume_lead_out(out, &db, &ch, &acks, false).await;
+    im::consume_lead_out(out, &db, &ch, ImProvider::Feishu, &acks, false).await;
 
     let texts = ch.texts.lock().unwrap();
     assert_eq!(texts.len(), 1);
@@ -682,7 +744,7 @@ async fn consume_lead_out_concierge_replies_to_bound_group_route() {
         origin_tag: None,
     };
 
-    im::consume_lead_out(out, &db, &ch, &acks, false).await;
+    im::consume_lead_out(out, &db, &ch, ImProvider::Feishu, &acks, false).await;
 
     assert!(ch.texts.lock().unwrap().is_empty());
     let chat_texts = ch.chat_texts.lock().unwrap();
@@ -720,7 +782,7 @@ async fn consume_lead_out_concierge_replies_to_latest_group_message() {
         origin_tag: None,
     };
 
-    im::consume_lead_out(out, &db, &ch, &acks, false).await;
+    im::consume_lead_out(out, &db, &ch, ImProvider::Feishu, &acks, false).await;
 
     assert!(ch.texts.lock().unwrap().is_empty());
     assert!(ch.chat_texts.lock().unwrap().is_empty());

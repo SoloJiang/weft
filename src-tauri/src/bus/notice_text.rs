@@ -6,8 +6,8 @@
 //! a TOKEN, and each consumer renders it with the locale it actually has.
 //!
 //! The webview renders tokens through its own catalogs. This module exists for
-//! consumers that cannot reach them — today the IM bridge, which sends on its
-//! own fixed locale.
+//! consumers that cannot reach them — today the IM bridge, which resolves them
+//! using the provider locale synchronized from the WebView.
 //!
 //! The copy is AUTHORED in `src/i18n/{en,zh}.ts` like every other user-facing
 //! string (AGENTS.md), and `scripts/gen-notice-copy.mjs` mirrors the tokens

@@ -1,13 +1,15 @@
-//! IM 桥（spec: docs/superpowers/specs/2026-06-11-im-feishu-integration-design.md）。
+//! IM 桥（源设计：docs/superpowers/specs/2026-06-11-im-feishu-integration-design.md）。
 //! 通道无关核心：设置、卡片索引、Channel trait、入站执行、桥运行时。
-//! feishu/ 是第一个适配器。结构化动作全走确定性代码，LLM 不在路径上。
+//! feishu/ 与 dingtalk/ 是 provider adapter。结构化动作全走确定性代码，LLM 不在路径上。
 
+pub mod dingtalk;
 pub mod feishu;
 pub mod inbound;
 pub mod outbound;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+pub const K_PROVIDER: &str = "im.provider";
 pub const K_APP_ID: &str = "im.feishu.app_id";
 pub const K_APP_SECRET: &str = "im.feishu.app_secret";
 /// 白名单：逗号分隔的飞书 open_id；空 = 未绑定（首个私聊发送者自动绑定）。
@@ -15,6 +17,11 @@ pub const K_ALLOW: &str = "im.feishu.allow_open_ids";
 /// 启用开关：用户可不删凭证地断开桥。键从未写过时默认「双凭证齐全即开」，
 /// 保住升级前「凭证齐全即跑」的老用户不被这次改动断连。
 pub const K_ENABLED: &str = "im.feishu.enabled";
+pub const K_DINGTALK_APP_ID: &str = "im.dingtalk.client_id";
+pub const K_DINGTALK_APP_SECRET: &str = "im.dingtalk.client_secret";
+/// 钉钉白名单保存 senderStaffId；空时首个单聊发送者自动绑定。
+pub const K_DINGTALK_ALLOW: &str = "im.dingtalk.allow_user_ids";
+pub const K_DINGTALK_ENABLED: &str = "im.dingtalk.enabled";
 /// 远程待命：桥启用期间持有「防空闲休眠」断言（power.rs RemoteStandby）。
 /// 纯电源层标志——不影响桥连接本身。默认关。
 pub const K_REMOTE_STANDBY: &str = "im.remote_standby";
@@ -23,6 +30,72 @@ const INBOUND_ACK_EMOJI: &str = "MeMeMe";
 const CONCIERGE_WORKSPACE_NAME: &str = "Concierge";
 const CONCIERGE_INTERNAL_WORKSPACE_NAME: &str = "Concierge (internal)";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImProvider {
+    #[default]
+    Feishu,
+    DingTalk,
+}
+
+impl ImProvider {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "feishu" | "lark" => Ok(Self::Feishu),
+            "dingtalk" | "ding" => Ok(Self::DingTalk),
+            other => anyhow::bail!("unsupported IM provider: {other}"),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Feishu => "feishu",
+            Self::DingTalk => "dingtalk",
+        }
+    }
+
+    pub const fn app_id_key(self) -> &'static str {
+        match self {
+            Self::Feishu => K_APP_ID,
+            Self::DingTalk => K_DINGTALK_APP_ID,
+        }
+    }
+
+    pub const fn app_secret_key(self) -> &'static str {
+        match self {
+            Self::Feishu => K_APP_SECRET,
+            Self::DingTalk => K_DINGTALK_APP_SECRET,
+        }
+    }
+
+    pub const fn allow_key(self) -> &'static str {
+        match self {
+            Self::Feishu => K_ALLOW,
+            Self::DingTalk => K_DINGTALK_ALLOW,
+        }
+    }
+
+    pub const fn enabled_key(self) -> &'static str {
+        match self {
+            Self::Feishu => K_ENABLED,
+            Self::DingTalk => K_DINGTALK_ENABLED,
+        }
+    }
+
+    pub const fn route_channel(self) -> &'static str {
+        match self {
+            Self::Feishu => "feishu",
+            Self::DingTalk => "dingtalk",
+        }
+    }
+
+    pub const fn concierge_channel(self) -> &'static str {
+        match self {
+            Self::Feishu => "feishu_concierge",
+            Self::DingTalk => "dingtalk_concierge",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImProviderCapabilities {
     pub provider_id: &'static str,
@@ -30,6 +103,8 @@ pub struct ImProviderCapabilities {
     pub default_create_thread_for_new_issue: bool,
     pub can_create_thread_from_current_conversation: bool,
     pub can_reply_to_message: bool,
+    pub issue_conversation_binding_supported: bool,
+    pub can_bind_current_conversation: bool,
     pub terminology_zh: &'static str,
     pub terminology_en: &'static str,
 }
@@ -45,8 +120,34 @@ pub fn feishu_provider_capabilities(can_create_topic_here: bool) -> ImProviderCa
         default_create_thread_for_new_issue: can_create_topic_here,
         can_create_thread_from_current_conversation: can_create_topic_here,
         can_reply_to_message: true,
+        issue_conversation_binding_supported: true,
+        can_bind_current_conversation: can_create_topic_here,
         terminology_zh: "飞书 topic",
         terminology_en: "Feishu topic",
+    }
+}
+
+pub fn dingtalk_provider_capabilities(can_bind_here: bool) -> ImProviderCapabilities {
+    ImProviderCapabilities {
+        provider_id: "dingtalk",
+        issue_thread_supported: true,
+        default_create_thread_for_new_issue: false,
+        can_create_thread_from_current_conversation: false,
+        can_reply_to_message: true,
+        issue_conversation_binding_supported: true,
+        can_bind_current_conversation: can_bind_here,
+        terminology_zh: "钉钉 thread",
+        terminology_en: "DingTalk thread",
+    }
+}
+
+pub fn provider_capabilities(
+    provider: ImProvider,
+    can_use_group_route_here: bool,
+) -> ImProviderCapabilities {
+    match provider {
+        ImProvider::Feishu => feishu_provider_capabilities(can_use_group_route_here),
+        ImProvider::DingTalk => dingtalk_provider_capabilities(can_use_group_route_here),
     }
 }
 
@@ -56,10 +157,12 @@ pub fn format_im_user_message(
     im_thread_ref: &str,
     reply_to: Option<&str>,
     text: &str,
+    lang: &str,
     caps: &ImProviderCapabilities,
 ) -> String {
     let ctx = serde_json::json!({
         "provider": caps.provider_id,
+        "locale": if lang == "zh" { "zh" } else { "en" },
         "conversation": {
             "chat_id": chat_id,
             "topic_ref": im_thread_ref,
@@ -73,7 +176,12 @@ pub fn format_im_user_message(
                 "can_create_from_current_conversation": caps.can_create_thread_from_current_conversation,
                 "terminology": { "zh": caps.terminology_zh, "en": caps.terminology_en },
             },
-            "reply": { "supported": caps.can_reply_to_message }
+            "reply": { "supported": caps.can_reply_to_message },
+            "issue_conversation_binding": {
+                "supported": caps.issue_conversation_binding_supported,
+                "can_bind_current_conversation": caps.can_bind_current_conversation,
+                "command": "/bind <issue-id>"
+            }
         }
     });
     format!(
@@ -113,6 +221,7 @@ enum LeadOutboundTarget<'a> {
     },
     Chat {
         chat_id: &'a str,
+        issue_style: bool,
     },
 }
 
@@ -146,6 +255,31 @@ fn lead_outbound_target<'a>(
             } else {
                 chat_ref(&route.im_thread_ref).map(|_| LeadOutboundTarget::Chat {
                     chat_id: &route.chat_id,
+                    issue_style: false,
+                })
+            }
+        }
+        // A DingTalk topic-circle reply is valid only through the inbound
+        // message's live sessionWebhook. The documented proactive group API
+        // accepts the parent openConversationId, not openConvThreadId, so a
+        // desktop-driven/no-origin output must not misaddress the thread id as
+        // a group id or escape into the parent group.
+        "dingtalk" => reply_to.map(|message_id| LeadOutboundTarget::Reply {
+            message_id,
+            issue_style: true,
+        }),
+        "dingtalk_concierge" => {
+            if let Some(message_id) = reply_to {
+                Some(LeadOutboundTarget::Reply {
+                    message_id,
+                    issue_style: false,
+                })
+            } else if let Some(open_id) = dm_open_id_ref(&route.im_thread_ref) {
+                Some(LeadOutboundTarget::DirectMessage { open_id })
+            } else {
+                chat_ref(&route.im_thread_ref).map(|_| LeadOutboundTarget::Chat {
+                    chat_id: &route.chat_id,
+                    issue_style: false,
                 })
             }
         }
@@ -213,6 +347,7 @@ fn unique_concierge_workspace_name(
 
 #[derive(Clone, Default, PartialEq)]
 pub struct ImSettings {
+    pub provider: ImProvider,
     pub app_id: String,
     pub app_secret: String,
     pub allow_open_ids: Vec<String>,
@@ -225,6 +360,7 @@ pub struct ImSettings {
 impl std::fmt::Debug for ImSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImSettings")
+            .field("provider", &self.provider)
             .field("app_id", &self.app_id)
             .field(
                 "app_secret",
@@ -254,20 +390,96 @@ impl ImSettings {
             .collect()
     }
 
+    /// Read only the active-provider discriminant. Mutation fences use this
+    /// single-query check instead of loading every provider setting so the
+    /// validation sits as close as possible to the protected write/enqueue.
+    pub async fn active_provider(db: &crate::store::Db) -> anyhow::Result<ImProvider> {
+        match crate::store::repo::get_setting(db, K_PROVIDER).await? {
+            Some(value) => ImProvider::parse(&value),
+            None => Ok(ImProvider::Feishu),
+        }
+    }
+
+    /// Preserve the bridge's legacy enable default (credentials imply enabled
+    /// until the switch is explicitly stored) while exposing one fail-closed
+    /// check for stale Concierge mutation contexts.
+    pub async fn provider_enabled(
+        db: &crate::store::Db,
+        provider: ImProvider,
+    ) -> anyhow::Result<bool> {
+        use crate::store::repo::get_setting;
+        if let Some(value) = get_setting(db, provider.enabled_key()).await? {
+            return Ok(value == "1" || value == "true");
+        }
+        let app_id = get_setting(db, provider.app_id_key())
+            .await?
+            .unwrap_or_default();
+        let app_secret = get_setting(db, provider.app_secret_key())
+            .await?
+            .unwrap_or_default();
+        Ok(!app_id.is_empty() && !app_secret.is_empty())
+    }
+
+    /// Fail closed unless `sender_open_id` is still authorized for the active
+    /// provider. Concierge turns can outlive a provider switch or an owner
+    /// reset, so provider identity alone is not a sufficient mutation fence.
+    pub async fn require_active_owner(
+        db: &crate::store::Db,
+        provider: ImProvider,
+        sender_open_id: &str,
+    ) -> anyhow::Result<()> {
+        let active_provider = Self::active_provider(db).await?;
+        if provider != active_provider {
+            anyhow::bail!(
+                "stale IM context: active provider is {}, not {}",
+                active_provider.as_str(),
+                provider.as_str()
+            );
+        }
+        if !Self::provider_enabled(db, provider).await? {
+            anyhow::bail!(
+                "stale IM context: active {} provider is disabled",
+                provider.as_str()
+            );
+        }
+        let sender_open_id = sender_open_id.trim();
+        if sender_open_id.is_empty() {
+            anyhow::bail!("current IM sender context is required");
+        }
+        let allow = Self::parse_allow(
+            &crate::store::repo::get_setting(db, provider.allow_key())
+                .await?
+                .unwrap_or_default(),
+        );
+        if !allow.iter().any(|allowed| allowed == sender_open_id) {
+            anyhow::bail!(
+                "stale IM context: sender is no longer authorized for the active {} owner binding",
+                provider.as_str()
+            );
+        }
+        Ok(())
+    }
+
     /// 从 app_setting 读取设置。「键不存在」是默认值；DB 错误原样传播。
     /// Err 必须 fail-closed：桥侧把 Err 当连接错误处理，绝不当作未配置/空白名单
     /// （否则瞬时 DB 错误会清空白名单，导致首个私聊发送者被自动绑定）。
     pub async fn load(db: &crate::store::Db) -> anyhow::Result<Self> {
         use crate::store::repo::get_setting;
-        let g = |k: &'static str| async move {
-            anyhow::Ok(get_setting(db, k).await?.unwrap_or_default())
-        };
-        let app_id: String = g(K_APP_ID).await?;
-        let app_secret: String = g(K_APP_SECRET).await?;
-        let allow_open_ids = Self::parse_allow(&g(K_ALLOW).await?);
+        let provider = Self::active_provider(db).await?;
+        let app_id = get_setting(db, provider.app_id_key())
+            .await?
+            .unwrap_or_default();
+        let app_secret = get_setting(db, provider.app_secret_key())
+            .await?
+            .unwrap_or_default();
+        let allow_open_ids = Self::parse_allow(
+            &get_setting(db, provider.allow_key())
+                .await?
+                .unwrap_or_default(),
+        );
         // 键写过就用其值；从未写过则回落到「凭证齐全即开」——保住升级前老用户。
         let has_creds = !app_id.is_empty() && !app_secret.is_empty();
-        let enabled = match get_setting(db, K_ENABLED).await? {
+        let enabled = match get_setting(db, provider.enabled_key()).await? {
             Some(v) => v == "1" || v == "true",
             None => has_creds,
         };
@@ -276,6 +488,7 @@ impl ImSettings {
             Some("1") | Some("true")
         );
         Ok(Self {
+            provider,
             app_id,
             app_secret,
             allow_open_ids,
@@ -283,6 +496,13 @@ impl ImSettings {
             remote_standby,
         })
     }
+}
+
+/// Clear one provider's locally bound owner while preserving its credentials
+/// and enabled state. The next private message can then establish a replacement
+/// owner through the same first-bind path as a fresh profile.
+pub async fn reset_owner(db: &crate::store::Db, provider: ImProvider) -> anyhow::Result<()> {
+    crate::store::repo::set_setting(db, provider.allow_key(), "").await
 }
 
 /// 一张已发出的卡片背后等待的应答目标（回复路由用）。
@@ -299,6 +519,11 @@ pub struct CardIndex {
     /// 只带 id+answer，patch 终态卡（outbound::resolved_card）要 summary 从这取。
     perm_msg: HashMap<u64, (String, String)>,
     human_msg: HashMap<(i32, u64), String>,
+    /// Human asks already delivered in this bridge generation. Answerable asks
+    /// also have a `human_msg`; display-only notices deliberately do not, but
+    /// still need this identity set so a first-owner replay cannot duplicate a
+    /// queued `Asked` event.
+    delivered_human: HashSet<(i32, u64)>,
     by_message: HashMap<String, ReplyTarget>,
 }
 
@@ -314,6 +539,7 @@ impl CardIndex {
             .insert(message_id.to_string(), ReplyTarget::Perm { ask_id });
     }
     pub fn record_human(&mut self, thread: i32, ask_id: u64, message_id: &str) {
+        self.delivered_human.insert((thread, ask_id));
         if let Some(old) = self
             .human_msg
             .insert((thread, ask_id), message_id.to_string())
@@ -325,6 +551,15 @@ impl CardIndex {
             ReplyTarget::Human { thread, ask_id },
         );
     }
+    pub fn record_human_notice(&mut self, thread: i32, ask_id: u64) {
+        self.delivered_human.insert((thread, ask_id));
+    }
+    pub fn has_perm(&self, ask_id: u64) -> bool {
+        self.perm_msg.contains_key(&ask_id)
+    }
+    pub fn has_human(&self, thread: i32, ask_id: u64) -> bool {
+        self.delivered_human.contains(&(thread, ask_id))
+    }
     pub fn target_of(&self, message_id: &str) -> Option<ReplyTarget> {
         self.by_message.get(message_id).copied()
     }
@@ -335,6 +570,7 @@ impl CardIndex {
         Some((m, s))
     }
     pub fn take_human(&mut self, thread: i32, ask_id: u64) -> Option<String> {
+        self.delivered_human.remove(&(thread, ask_id));
         let m = self.human_msg.remove(&(thread, ask_id))?;
         self.by_message.remove(&m);
         Some(m)
@@ -349,8 +585,79 @@ pub trait Channel: Send + Sync {
     async fn send_card(&self, open_id: &str, card: serde_json::Value) -> anyhow::Result<String>;
     /// 把已发卡片 patch 成终态。
     async fn patch_card(&self, message_id: &str, card: serde_json::Value) -> anyhow::Result<()>;
+    /// Provider-neutral permission prompt. The default keeps the Feishu card
+    /// renderer; providers without editable cards can override the semantic
+    /// operation and send a deterministic command-based prompt instead.
+    async fn send_permission_card(
+        &self,
+        open_id: &str,
+        ask: &crate::ask::Ask,
+        lang: &str,
+    ) -> anyhow::Result<String> {
+        self.send_card(open_id, outbound::perm_card(ask, lang)).await
+    }
+    async fn resolve_permission_card(
+        &self,
+        message_id: &str,
+        summary: &str,
+        verdict: &str,
+        lang: &str,
+    ) -> anyhow::Result<()> {
+        self.patch_card(
+            message_id,
+            outbound::resolved_card(summary, verdict, lang),
+        )
+        .await
+    }
+    async fn send_human_question_card(
+        &self,
+        open_id: &str,
+        thread_id: i32,
+        ask_id: u64,
+        thread_title: &str,
+        from: &str,
+        text: &str,
+        lang: &str,
+    ) -> anyhow::Result<String> {
+        let _ = (thread_id, ask_id);
+        self.send_card(
+            open_id,
+            outbound::human_card(thread_title, from, text, lang),
+        )
+        .await
+    }
+    async fn resolve_human_question_card(
+        &self,
+        message_id: &str,
+        answer: &str,
+        lang: &str,
+    ) -> anyhow::Result<()> {
+        self.patch_card(
+            message_id,
+            outbound::human_resolved_card(answer, lang),
+        )
+        .await
+    }
+    async fn cancel_human_question_card(
+        &self,
+        message_id: &str,
+        lang: &str,
+    ) -> anyhow::Result<()> {
+        self.patch_card(message_id, outbound::human_cancelled_card(lang))
+            .await
+    }
     /// 发纯文本到用户（p2p）。
     async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()>;
+    /// Render an issue reply using provider-specific localized copy. Feishu's
+    /// established renderer remains the default; DingTalk overrides it with
+    /// the frontend-synchronized catalog bundle.
+    fn issue_reply_text(&self, lang: &str, text: &str) -> String {
+        outbound::issue_reply_text(lang, text)
+    }
+    /// Render the reconnect backlog summary with the same localization source.
+    fn resync_summary(&self, lang: &str, items: &[(i32, String)]) -> String {
+        outbound::resync_summary(lang, items)
+    }
     /// 发纯文本到群聊，返回根 message_id；非话题群 fallback 会用它。
     async fn send_chat_text(&self, _chat_id: &str, _text: &str) -> anyhow::Result<String> {
         anyhow::bail!("send_chat_text unsupported by this channel")
@@ -423,12 +730,22 @@ pub struct ExecuteCtx {
     pub inbound_message_id: Option<String>,
     pub acks: Option<Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>>,
     pub reaction_tx: Option<tokio::sync::mpsc::UnboundedSender<InboundAckJob>>,
+    /// Wake the bridge's single notifier consumer after the first owner is
+    /// persisted. Keeping replay on that queue preserves event ordering and
+    /// avoids delaying the inbound webhook acknowledgement on network sends.
+    pub replay_pending_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboundAckJob {
     pub thread_id: i32,
     pub message_id: String,
+}
+
+enum BridgeNotifyEvent {
+    Permission(crate::ask::AskEvent),
+    Human(crate::bus::state::HumanAskEvent),
+    ReplayPending,
 }
 
 /// Route execution requires an AppHandle when an issue message has to be fed
@@ -450,22 +767,77 @@ pub async fn execute(
     app: Option<&tauri::AppHandle>,
     ctx: Option<&ExecuteCtx>,
 ) -> anyhow::Result<()> {
+    execute_for_provider(
+        route,
+        db,
+        asks,
+        bus,
+        channel,
+        ImProvider::Feishu,
+        None,
+        sender,
+        lang,
+        app,
+        ctx,
+    )
+    .await
+}
+
+pub async fn execute_for_provider(
+    route: inbound::Route,
+    db: &crate::store::Db,
+    asks: &crate::ask::AskRegistry,
+    bus: &crate::bus::BusRegistry,
+    channel: &dyn Channel,
+    provider: ImProvider,
+    dingtalk_copy: Option<&outbound::DingTalkCopy>,
+    sender: &str,
+    lang: &str,
+    app: Option<&tauri::AppHandle>,
+    ctx: Option<&ExecuteCtx>,
+) -> anyhow::Result<()> {
     let t = |zh: &'static str, en: &'static str| if lang == "zh" { zh } else { en };
+    let dingtalk_copy = match provider {
+        ImProvider::Feishu => None,
+        ImProvider::DingTalk => Some(
+            dingtalk_copy
+                .ok_or_else(|| anyhow::anyhow!("DingTalk localized copy is unavailable"))?,
+        ),
+    };
     match route {
         inbound::Route::Ignore => {}
         inbound::Route::Bind {
             open_id,
             chat_id,
+            reply_to,
             text,
         } => {
+            // Owner establishment is the inverse of reset/replacement, so it
+            // participates in the same authority linearization gate. Release
+            // it immediately after persistence; the first Concierge enqueue
+            // below then uses the ordinary read-lease send path.
+            let authority = match app {
+                Some(app) => Some(app.state::<ImBridge>().authority_write_lease().await),
+                None => None,
+            };
             // Route 读的是 allow 快照；落库前重查仍为空（Route::Bind doc 的竞态契约）。
-            let cur = crate::store::repo::get_setting(db, K_ALLOW)
+            let cur = crate::store::repo::get_setting(db, provider.allow_key())
                 .await?
                 .unwrap_or_default();
             if !ImSettings::parse_allow(&cur).is_empty() {
                 return Ok(()); // 已有 owner：本次绑定静默放弃
             }
-            crate::store::repo::set_setting(db, K_ALLOW, &open_id).await?;
+            crate::store::repo::set_setting(db, provider.allow_key(), &open_id).await?;
+            drop(authority);
+            // Startup snapshots are consumed before an owner may exist and are
+            // intentionally skipped in that state. Wake the bridge's single
+            // notifier consumer now that delivery has a target; it re-reads the
+            // registries and replays every still-open permission/human ask.
+            if let Some(replay_tx) = ctx.and_then(|ctx| ctx.replay_pending_tx.as_ref()) {
+                if replay_tx.send(()).is_err() {
+                    eprintln!("[weft][im] pending-ask replay queue is unavailable");
+                }
+            }
             // 首条消息静默绑定后直接当成问题处理（不再单发「绑定成功」打断）：把本条
             // 文本喂给 Concierge，用户第一句就能得到回答。绑定本身已落库，后续消息照常。
             if let Some(app) = app {
@@ -478,10 +850,12 @@ pub async fn execute(
                         &open_id,
                         &chat_id,
                         &im_thread_ref,
-                        None,
+                        Some(&reply_to),
                         &text,
                         lang,
                         ctx,
+                        provider,
+                        dingtalk_copy,
                     )
                     .await
                     {
@@ -498,36 +872,66 @@ pub async fn execute(
         } => {
             let thread = crate::store::repo::get_thread(db, thread_id).await?;
             let Some(thread) = thread else {
-                if let Err(e) = channel
-                    .send_text(
-                        sender,
-                        &t("没有找到这个 issue。", "No issue with that id was found."),
-                    )
-                    .await
-                {
+                let message = match dingtalk_copy {
+                    Some(copy) => copy.issue_not_found.as_str(),
+                    None => t("没有找到这个 issue。", "No issue with that id was found."),
+                };
+                let sent = match provider {
+                    ImProvider::Feishu => channel.send_text(sender, message).await,
+                    // Keep a failed `/bind` in the exact topic-circle thread
+                    // where the command was issued. DingTalk's proactive
+                    // private-message endpoint would otherwise move the error
+                    // into the owner's DM and make the command look unanswered.
+                    ImProvider::DingTalk => channel
+                        .reply_text(&seed_message_id, message)
+                        .await
+                        .map(|_| ()),
+                };
+                if let Err(e) = sent {
                     eprintln!("[weft][im] bind-issue missing hint: {e}");
                 }
                 return Ok(());
             };
             crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-            crate::store::repo::bind_im_route(db, thread_id, "feishu", &chat_id, &im_thread_ref)
-                .await?;
+            crate::store::repo::bind_im_route(
+                db,
+                thread_id,
+                provider.route_channel(),
+                &chat_id,
+                &im_thread_ref,
+            )
+            .await?;
             // Record the /bind message as the topic's replyable seed (a member of
             // this topic), so a later desktop-driven / no-ack lead reply has a valid
             // om_ target rather than the non-replyable omt_ topic id.
-            set_issue_topic_seed(db, thread_id, &seed_message_id).await?;
-            if let Err(e) = channel
-                .send_text(
-                    sender,
-                    &format!(
-                        "{} #{} · {}",
-                        t("已绑定飞书话题到", "Bound this Feishu topic to"),
-                        thread.id,
-                        thread.title
-                    ),
-                )
-                .await
-            {
+            if provider == ImProvider::Feishu {
+                set_issue_topic_seed(db, thread_id, &seed_message_id).await?;
+            }
+            let confirmation = match provider {
+                ImProvider::Feishu => format!(
+                    "{} #{} · {}",
+                    t("已绑定飞书话题到", "Bound this Feishu topic to"),
+                    thread.id,
+                    thread.title
+                ),
+                ImProvider::DingTalk => {
+                    let prefix = dingtalk_copy
+                        .map(|copy| copy.bind_thread_prefix.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("DingTalk localized copy is unavailable"))?;
+                    format!("{prefix} #{} · {}", thread.id, thread.title)
+                }
+            };
+            let sent = match provider {
+                // Preserve the established Feishu confirmation path.
+                ImProvider::Feishu => channel.send_text(sender, &confirmation).await,
+                // DingTalk's sessionWebhook keeps this acknowledgement inside
+                // the exact topic-circle thread where `/bind` was sent.
+                ImProvider::DingTalk => channel
+                    .reply_text(&seed_message_id, &confirmation)
+                    .await
+                    .map(|_| ()),
+            };
+            if let Err(e) = sent {
                 eprintln!("[weft][im] bind-issue confirm: {e}");
             }
         }
@@ -536,20 +940,27 @@ pub async fn execute(
             chat_id,
             reply_to,
         } => {
-            ensure_issue_topic(db, channel, thread_id, &chat_id, Some(&reply_to), lang).await?;
+            ensure_issue_topic(
+                db,
+                channel,
+                thread_id,
+                &chat_id,
+                sender,
+                Some(&reply_to),
+                lang,
+            )
+            .await?;
         }
         inbound::Route::AnswerPerm { ask_id, answer } => {
             if !asks.answer(ask_id, answer) {
-                if let Err(e) = channel
-                    .send_text(
-                        sender,
-                        t(
-                            "这条权限请求已被处理或已过期。",
-                            "That permission ask was already handled or has expired.",
-                        ),
-                    )
-                    .await
-                {
+                let message = match dingtalk_copy {
+                    Some(copy) => copy.permission_already_handled.as_str(),
+                    None => t(
+                        "这条权限请求已被处理或已过期。",
+                        "That permission ask was already handled or has expired.",
+                    ),
+                };
+                if let Err(e) = channel.send_text(sender, message).await {
                     eprintln!("[weft][im] stale-perm hint: {e}");
                 }
             }
@@ -561,32 +972,49 @@ pub async fn execute(
             text,
         } => {
             if !bus.answer_ask(thread, ask_id, &text) {
-                if let Err(e) = channel
-                    .send_text(
-                        sender,
-                        t(
-                            "这个提问已被回答过了。",
-                            "That question was already answered.",
-                        ),
-                    )
-                    .await
-                {
+                let message = match dingtalk_copy {
+                    Some(copy) => copy.human_already_answered.as_str(),
+                    None => t(
+                        "这个提问已被回答过了。",
+                        "That question was already answered.",
+                    ),
+                };
+                if let Err(e) = channel.send_text(sender, message).await {
                     eprintln!("[weft][im] stale-human hint: {e}");
                 }
             }
         }
         inbound::Route::BadVerdict => {
-            if let Err(e) = channel
-                .send_text(
-                    sender,
-                    t(
-                        "没看懂。回复：允许 / 拒绝 / 总是 / 放行（或 1/2/3/4）。",
-                        "Didn't catch that. Reply: allow / deny / always / full (or 1/2/3/4).",
-                    ),
-                )
-                .await
-            {
+            let hint = match dingtalk_copy {
+                Some(copy) => copy.permission_command_usage.as_str(),
+                None => t(
+                    "没看懂。回复：允许 / 拒绝 / 总是 / 放行（或 1/2/3/4）。",
+                    "Didn't catch that. Reply: allow / deny / always / full (or 1/2/3/4).",
+                ),
+            };
+            if let Err(e) = channel.send_text(sender, hint).await {
                 eprintln!("[weft][im] verdict hint: {e}");
+            }
+        }
+        inbound::Route::BadHumanAnswer => {
+            let message = dingtalk_copy
+                .map(|copy| copy.human_answer_usage.as_str())
+                .unwrap_or_else(|| {
+                    t(
+                        "格式不对。请发送：/answer <issue-id> <ask-id> <回答>",
+                        "Invalid format. Send: /answer <issue-id> <ask-id> <answer>",
+                    )
+                });
+            if let Err(e) = channel.send_text(sender, message).await {
+                eprintln!("[weft][im] answer hint: {e}");
+            }
+        }
+        inbound::Route::IssueThreadRequired => {
+            let message = dingtalk_copy
+                .map(|copy| copy.thread_required.as_str())
+                .ok_or_else(|| anyhow::anyhow!("DingTalk localized copy is unavailable"))?;
+            if let Err(e) = channel.send_text(sender, message).await {
+                eprintln!("[weft][im] unsupported topic hint: {e}");
             }
         }
         inbound::Route::FreeText {
@@ -596,7 +1024,7 @@ pub async fn execute(
             reply_to,
             text,
         } => {
-            // 每个 IM 会话独立 Concierge：同一个飞书私聊/群聊复用自己的
+            // 每个 IM 会话独立 Concierge：同一个 provider 私聊/群聊复用自己的
             // concierge thread，不把不同 IM 上下文混进全局单例。
             let _ = (&sender_open_id, &chat_id, &im_thread_ref, &reply_to, &text);
             if let Some(app) = app {
@@ -611,6 +1039,8 @@ pub async fn execute(
                     &text,
                     lang,
                     ctx,
+                    provider,
+                    dingtalk_copy,
                 )
                 .await
                 {
@@ -619,10 +1049,14 @@ pub async fn execute(
             } else if let Err(e) = channel
                 .send_text(
                     sender,
-                    t(
-                        "自由对话（当前 IM 会话助理）需要桌面 app 运行上下文；当前路径无法处理，请回复卡片消息作答权限与提问。",
-                        "Free chat (this IM conversation's concierge) needs the desktop app context; this path cannot handle it, so reply to cards for asks.",
-                    ),
+                    dingtalk_copy
+                        .map(|copy| copy.free_text_unavailable.as_str())
+                        .unwrap_or_else(|| {
+                            t(
+                                "自由对话（当前 IM 会话助理）需要桌面 app 运行上下文；当前路径无法处理，请回复卡片消息作答权限与提问。",
+                                "Free chat (this IM conversation's concierge) needs the desktop app context; this path cannot handle it, so reply to cards for asks.",
+                            )
+                        }),
                 )
                 .await
             {
@@ -635,19 +1069,25 @@ pub async fn execute(
             sender_open_id,
             text,
         } => {
-            // 飞书话题/群会话里的消息 → 反查 im_route 命中 issue → 灌进 lead engine。
-            // 未绑定不自动创建 issue；issue 是主对象，topic 通过 `/topic <issue-id>`
-            // 或桌面绑定动作创建/绑定。
-            let r =
-                crate::store::repo::im_route_of_thread_ref(db, "feishu", &chat_id, &im_thread_ref)
-                    .await?;
+            // provider thread 里的消息 → 反查 im_route 命中 issue → 灌进 lead
+            // engine。未绑定不自动创建 issue；issue 是主对象，thread 通过
+            // provider-native 路径创建后再绑定。
+            let r = crate::store::repo::im_route_of_thread_ref(
+                db,
+                provider.route_channel(),
+                &chat_id,
+                &im_thread_ref,
+            )
+            .await?;
             let Some(route) = r else {
                 if let Some(ctx) = ctx {
                     if let Some(mid) = ctx.inbound_message_id.as_deref() {
                         if let Err(e) = channel
                             .reply_text(
                                 mid,
-                                "这段飞书话题还没有绑定 Weft issue。发送 /bind <issue-id> 绑定当前话题，或在群里发送 /topic <issue-id> 创建 issue topic。",
+                                dingtalk_copy
+                                    .map(|copy| copy.unbound_thread.as_str())
+                                    .unwrap_or("这段飞书话题还没有绑定 Weft issue。发送 /bind <issue-id> 绑定当前话题，或在群里发送 /topic <issue-id> 创建 issue topic。"),
                             )
                             .await
                         {
@@ -670,6 +1110,7 @@ pub async fn execute(
                 &sender_open_id,
                 &text,
                 lang,
+                provider,
             )
             .await
             {
@@ -733,8 +1174,26 @@ async fn drain_inbound_reactions(
 use std::sync::Arc;
 use tauri::Manager;
 
-/// IM 出站文案默认语言。后端无持久化 UI 语言设置（lang 是 lead/worker 的
-/// 逐命令入参），桥侧固定中文优先（项目主语言）。
+type DingTalkCopyState = Arc<std::sync::RwLock<outbound::DingTalkCopy>>;
+
+fn dingtalk_copy_snapshot(state: &DingTalkCopyState) -> outbound::DingTalkCopy {
+    state.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn bridge_lang(copy_state: Option<&DingTalkCopyState>) -> String {
+    copy_state
+        .map(|state| {
+            state
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .locale
+                .clone()
+        })
+        .unwrap_or_else(|| IM_LANG.to_string())
+}
+
+/// Providers without synchronized copy use the project-default Chinese locale.
+/// DingTalk carries the active WebView locale in `DingTalkCopy` instead.
 const IM_LANG: &str = "zh";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -756,11 +1215,29 @@ fn ws_loop_actions(sent_resync: bool) -> Vec<WsLoopAction> {
 #[derive(Default)]
 pub struct ImBridge {
     inner: Arc<std::sync::Mutex<BridgeInner>>,
+    /// Linearizes IM authority retirement against Concierge mutations.
+    /// A context-bearing global-tool mutation holds a read lease through its
+    /// final registry/DB/enqueue boundary; settings paths that replace or
+    /// disable the provider/owner hold the write lease through persistence +
+    /// generation bump. Thus a mutation is wholly before the retirement or
+    /// observes the retired DB state, never halfway across it.
+    authority_gate: Arc<tokio::sync::RwLock<()>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DingTalkCopyUpdate {
+    Unchanged,
+    Initialized,
+    Updated,
 }
 
 #[derive(Default)]
 struct BridgeInner {
     generation: u64,
+    /// Per-generation cancellation edge shared by every task that captures a
+    /// provider/channel. Replacing this sender in `bump` drops in-flight work
+    /// before a retired generation can perform another external side effect.
+    generation_cancel: Option<tokio::sync::watch::Sender<bool>>,
     /// "disabled" | "connecting" | "online" | "error: …"
     status: String,
     cards: Arc<tokio::sync::Mutex<CardIndex>>,
@@ -769,9 +1246,21 @@ struct BridgeInner {
     /// finalize 出站，桥侧把对应 thread 的所有挂账 reaction 全部清掉——队列
     /// 里挤压的多条 👀 一次性收回，回执语义诚实反映「轮到这条被回复」。
     pending_acks: Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
+    /// Authored by `src/i18n/{en,zh}.ts` and synchronized by the WebView. Active
+    /// channels share this state so locale changes do not retire broadcast
+    /// subscribers or create a window with hard-coded backend copy.
+    dingtalk_copy: Option<DingTalkCopyState>,
 }
 
 impl ImBridge {
+    pub async fn authority_read_lease(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.authority_gate.clone().read_owned().await
+    }
+
+    pub async fn authority_write_lease(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.authority_gate.clone().write_owned().await
+    }
+
     pub fn status(&self) -> String {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.status.is_empty() {
@@ -780,8 +1269,45 @@ impl ImBridge {
             g.status.clone()
         }
     }
-    fn set_status(&self, s: &str) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).status = s.to_string();
+    fn set_status_if_live(&self, generation: u64, status: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.generation != generation {
+            return false;
+        }
+        inner.status = status.to_string();
+        true
+    }
+    /// Run one synchronous installation step while holding the generation
+    /// guard. A newer `bump` cannot interleave between the liveness check and
+    /// the setter, so a stale startup can never overwrite a newer notifier.
+    fn with_live_generation<T>(&self, generation: u64, install: impl FnOnce() -> T) -> Option<T> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.generation != generation {
+            return None;
+        }
+        let installed = install();
+        drop(inner);
+        Some(installed)
+    }
+    pub fn set_dingtalk_copy(&self, copy: outbound::DingTalkCopy) -> DingTalkCopyUpdate {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(copy_state) = inner.dingtalk_copy.as_ref() else {
+            inner.dingtalk_copy = Some(Arc::new(std::sync::RwLock::new(copy)));
+            return DingTalkCopyUpdate::Initialized;
+        };
+        let mut current = copy_state.write().unwrap_or_else(|e| e.into_inner());
+        if *current == copy {
+            return DingTalkCopyUpdate::Unchanged;
+        }
+        *current = copy;
+        DingTalkCopyUpdate::Updated
+    }
+    fn dingtalk_copy_state(&self) -> Option<DingTalkCopyState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dingtalk_copy
+            .clone()
     }
     /// 起新一代：自增代际号、换一张干净的卡片索引（旧任务下次 live() 检查时退出）。
     fn bump(
@@ -790,12 +1316,22 @@ impl ImBridge {
         u64,
         Arc<tokio::sync::Mutex<CardIndex>>,
         Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
+        tokio::sync::watch::Receiver<bool>,
     ) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        if let Some(previous) = g.generation_cancel.replace(cancel_tx) {
+            let _ = previous.send(true);
+        }
         g.generation += 1;
         g.cards = Arc::new(tokio::sync::Mutex::new(CardIndex::default()));
         g.pending_acks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        (g.generation, g.cards.clone(), g.pending_acks.clone())
+        (
+            g.generation,
+            g.cards.clone(),
+            g.pending_acks.clone(),
+            cancel_rx,
+        )
     }
     fn live(&self, generation: u64) -> bool {
         self.inner
@@ -806,73 +1342,169 @@ impl ImBridge {
     }
 }
 
-/// 启动（或重启）桥：读设置→不 ready 则置 disabled；ready 则装通知器、起出站
-/// 消费与 ws 入站两个任务。设置变更后再次调用即可（代际号淘汰旧任务）。
+/// Await one broadcast item, then re-check the bridge generation before the
+/// caller can use its captured provider/channel. Checking only before `recv`
+/// leaves a race where a provider switch happens while the old task sleeps.
+async fn recv_for_live_generation<T: Clone>(
+    bridge: &ImBridge,
+    generation: u64,
+    rx: &mut tokio::sync::broadcast::Receiver<T>,
+) -> Result<Option<T>, tokio::sync::broadcast::error::RecvError> {
+    let item = rx.recv().await?;
+    Ok(bridge.live(generation).then_some(item))
+}
+
+/// Race any provider/channel operation against `ImBridge::bump`. Dropping the
+/// losing future cancels its remaining awaits; the biased cancellation branch
+/// wins when retirement and the next side-effect step become ready together.
+async fn run_until_generation_cancelled<F>(
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+    operation: F,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    if *cancel.borrow() {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        _ = cancel.changed() => None,
+        output = operation => Some(output),
+    }
+}
+
+/// 启动（或重启）桥：同步起新代并淘汰旧任务，再异步读设置；不 ready 则置
+/// disabled，ready 则装通知器、起出站消费与 ws 入站两个任务。
 /// 通知器在「不 ready 提前返回」前不安装——避免 disabled 时仍堆积事件。
 pub fn spawn(app: tauri::AppHandle) {
+    // Bump before scheduling so a settings command cannot return (or yield to
+    // another callback) while the provider it just retired is still live.
+    let (generation, cards, acks, mut generation_cancel) = {
+        let bridge = app.state::<ImBridge>();
+        bridge.bump()
+    };
     tauri::async_runtime::spawn(async move {
         let bridge = app.state::<ImBridge>();
-        let (generation, cards, acks) = bridge.bump();
         let db = app.state::<crate::store::Db>().inner().clone();
 
         let settings = match ImSettings::load(&db).await {
             Ok(s) => s,
             Err(e) => {
                 // fail-closed：DB/连接错误不当作未配置，置 error 并退出本代。
-                bridge.set_status(&format!("error: {e}"));
+                bridge.set_status_if_live(generation, &format!("error: {e}"));
                 eprintln!("[weft][im] load settings: {e}");
                 return;
             }
         };
+        if !bridge.live(generation) {
+            return;
+        }
         // 启动需「已启用 且 凭证齐全」。关开关 = 保留凭证但断开（status 回 disabled，
         // 旧代任务下次 live() 检查时退出）。
         if !(settings.enabled && settings.ready()) {
-            bridge.set_status("disabled");
-            crate::power::set_standby(&app, false);
+            bridge.set_status_if_live(generation, "disabled");
+            let _ = bridge.with_live_generation(generation, || {
+                crate::power::set_standby(&app, false);
+            });
             return;
         }
-        bridge.set_status("connecting");
+        bridge.set_status_if_live(generation, "connecting");
         // 远程待命跟随「已启用且凭证齐全」的意图——断线重连也需要机器醒着，
         // 所以不依赖瞬时连接状态。
-        crate::power::set_standby(&app, settings.remote_standby);
-
-        let channel: Arc<dyn Channel> =
-            match feishu::FeishuChannel::new(&settings.app_id, &settings.app_secret) {
-                Ok(c) => Arc::new(c),
-                Err(e) => {
-                    eprintln!("[weft][im] feishu client build: {e}");
-                    bridge.set_status("error");
-                    crate::power::set_standby(&app, false);
-                    return;
-                }
+        let _ = bridge.with_live_generation(generation, || {
+            crate::power::set_standby(&app, settings.remote_standby);
+        });
+        let provider = settings.provider;
+        let dingtalk_copy_state = if provider == ImProvider::DingTalk {
+            let Some(copy_state) = bridge.dingtalk_copy_state() else {
+                bridge.set_status_if_live(generation, "waiting_locale");
+                return;
             };
+            Some(copy_state)
+        } else {
+            None
+        };
+        let (channel, dingtalk_channel): (
+            Arc<dyn Channel>,
+            Option<Arc<dingtalk::DingTalkChannel>>,
+        ) = match provider {
+            ImProvider::Feishu => {
+                match feishu::FeishuChannel::new(&settings.app_id, &settings.app_secret) {
+                    Ok(channel) => (Arc::new(channel), None),
+                    Err(e) => {
+                        eprintln!("[weft][im] feishu client build: {e}");
+                        bridge.set_status_if_live(generation, "error");
+                        let _ = bridge.with_live_generation(generation, || {
+                            crate::power::set_standby(&app, false);
+                        });
+                        return;
+                    }
+                }
+            }
+            ImProvider::DingTalk => {
+                let Some(copy_state) = dingtalk_copy_state.clone() else {
+                    bridge.set_status_if_live(generation, "waiting_locale");
+                    return;
+                };
+                match dingtalk::DingTalkChannel::new_with_shared_copy(
+                    &settings.app_id,
+                    &settings.app_secret,
+                    copy_state,
+                ) {
+                    Ok(channel) => {
+                        let channel = Arc::new(channel);
+                        (channel.clone(), Some(channel))
+                    }
+                    Err(e) => {
+                        eprintln!("[weft][im] dingtalk client build: {e}");
+                        bridge.set_status_if_live(generation, "error");
+                        let _ = bridge.with_live_generation(generation, || {
+                            crate::power::set_standby(&app, false);
+                        });
+                        return;
+                    }
+                }
+            }
+        };
 
         // 入站 👀 reaction 是回执增强，不应挡住消息进入 lead engine。所有飞书
         // reaction REST 调用放到独立 worker 串行处理；失败只影响回执，不影响投递。
         let (reaction_tx, mut reaction_rx) =
             tokio::sync::mpsc::unbounded_channel::<InboundAckJob>();
         {
-            let (app_ack, ch_ack, acks_ack) = (app.clone(), channel.clone(), acks.clone());
+            let (ch_ack, acks_ack) = (channel.clone(), acks.clone());
+            let mut reaction_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
-                let bridge = app_ack.state::<ImBridge>();
-                while let Some(job) = reaction_rx.recv().await {
-                    if !bridge.live(generation) {
+                loop {
+                    let received =
+                        run_until_generation_cancelled(&mut reaction_cancel, reaction_rx.recv())
+                            .await;
+                    let Some(Some(job)) = received else {
                         return;
-                    }
-                    match ch_ack
-                        .add_reaction(&job.message_id, INBOUND_ACK_EMOJI)
-                        .await
-                    {
-                        Ok(rid) if !rid.is_empty() => {
-                            acks_ack
-                                .lock()
-                                .await
-                                .entry(job.thread_id)
-                                .or_default()
-                                .push((job.message_id, rid));
+                    };
+                    let operation = async {
+                        match ch_ack
+                            .add_reaction(&job.message_id, INBOUND_ACK_EMOJI)
+                            .await
+                        {
+                            Ok(rid) if !rid.is_empty() => {
+                                acks_ack
+                                    .lock()
+                                    .await
+                                    .entry(job.thread_id)
+                                    .or_default()
+                                    .push((job.message_id, rid));
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[weft][im] add reaction: {e}"),
                         }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("[weft][im] add reaction: {e}"),
+                    };
+                    if run_until_generation_cancelled(&mut reaction_cancel, operation)
+                        .await
+                        .is_none()
+                    {
+                        return;
                     }
                 }
             });
@@ -881,40 +1513,91 @@ pub fn spawn(app: tauri::AppHandle) {
         // —— 出站：registry 通知 → 发卡/patch ——
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel();
         let (hum_tx, mut hum_rx) = tokio::sync::mpsc::unbounded_channel();
-        // set_notifier 返回挂接瞬间已 open 的快照：桥重启时补发卡片（无 miss/dup）。
-        let snapshot = app.state::<crate::ask::AskRegistry>().set_notifier(ask_tx);
-        app.state::<crate::bus::BusRegistry>()
-            .set_ask_notifier(hum_tx);
+        let (replay_pending_tx, mut replay_pending_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Install both notifier edges under the same generation guard. This
+        // prevents an older startup future from replacing a newer generation's
+        // senders after an awaited settings/copy step completes out of order.
+        let installed = bridge.with_live_generation(generation, || {
+            // set_notifier 返回挂接瞬间已 open 的快照：桥重启时补发卡片（无 miss/dup）。
+            let permission_snapshot = app.state::<crate::ask::AskRegistry>().set_notifier(ask_tx);
+            // Human asks use the same snapshot+edge contract. This is critical
+            // for copy-gated DingTalk startup and revived agents.
+            let human_snapshot = app
+                .state::<crate::bus::BusRegistry>()
+                .set_ask_notifier(hum_tx);
+            (permission_snapshot, human_snapshot)
+        });
+        let Some((permission_snapshot, human_snapshot)) = installed else {
+            return;
+        };
+        let permission_registry = app.state::<crate::ask::AskRegistry>().inner().clone();
+        let human_registry = app.state::<crate::bus::BusRegistry>().inner().clone();
         {
-            let (app2, db2, ch, cards2) = (app.clone(), db.clone(), channel.clone(), cards.clone());
+            let (db2, ch, cards2, copy_state2) = (
+                db.clone(),
+                channel.clone(),
+                cards.clone(),
+                dingtalk_copy_state.clone(),
+            );
+            let mut notifier_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
-                let bridge = app2.state::<ImBridge>();
                 // 先补发快照里的已开 Ask（挂接前就 open 的，不会再有 Opened 事件）。
-                for ask in snapshot {
-                    if !bridge.live(generation) {
-                        return;
-                    }
-                    consume_ask_event(
-                        crate::ask::AskEvent::Opened(ask),
-                        &db2,
-                        ch.as_ref(),
-                        &cards2,
-                    )
-                    .await;
+                let lang = bridge_lang(copy_state2.as_ref());
+                let initial_replay = consume_pending_ask_snapshots(
+                    permission_snapshot,
+                    human_snapshot,
+                    &db2,
+                    ch.as_ref(),
+                    &cards2,
+                    &lang,
+                );
+                if run_until_generation_cancelled(&mut notifier_cancel, initial_replay)
+                    .await
+                    .is_none()
+                {
+                    return;
                 }
                 loop {
-                    if !bridge.live(generation) {
+                    let next = tokio::select! {
+                        biased;
+                        _ = notifier_cancel.changed() => return,
+                        ev = ask_rx.recv() => ev.map(BridgeNotifyEvent::Permission),
+                        ev = hum_rx.recv() => ev.map(BridgeNotifyEvent::Human),
+                        replay = replay_pending_rx.recv() => replay.map(|()| BridgeNotifyEvent::ReplayPending),
+                    };
+                    let Some(next) = next else {
                         return;
-                    }
-                    tokio::select! {
-                        ev = ask_rx.recv() => match ev {
-                            None => return,
-                            Some(ev) => consume_ask_event(ev, &db2, ch.as_ref(), &cards2).await,
-                        },
-                        ev = hum_rx.recv() => match ev {
-                            None => return,
-                            Some(ev) => consume_human_event(ev, &db2, ch.as_ref(), &cards2).await,
-                        },
+                    };
+                    let operation = async {
+                        match next {
+                            BridgeNotifyEvent::Permission(ev) => {
+                                consume_ask_event(ev, &db2, ch.as_ref(), &cards2).await;
+                            }
+                            BridgeNotifyEvent::Human(ev) => {
+                                let lang = bridge_lang(copy_state2.as_ref());
+                                consume_human_event(ev, &db2, ch.as_ref(), &cards2, &lang).await;
+                            }
+                            BridgeNotifyEvent::ReplayPending => {
+                                let permission_snapshot = permission_registry.open();
+                                let human_snapshot = human_registry.open_ask_snapshot();
+                                let lang = bridge_lang(copy_state2.as_ref());
+                                consume_pending_ask_snapshots(
+                                    permission_snapshot,
+                                    human_snapshot,
+                                    &db2,
+                                    ch.as_ref(),
+                                    &cards2,
+                                    &lang,
+                                )
+                                .await;
+                            }
+                        }
+                    };
+                    if run_until_generation_cancelled(&mut notifier_cancel, operation)
+                        .await
+                        .is_none()
+                    {
+                        return;
                     }
                 }
             });
@@ -923,71 +1606,99 @@ pub fn spawn(app: tauri::AppHandle) {
         // —— 入站：ws → 路由 → 执行 ——
         let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
         {
-            let (app2, db2, ch, cards2, acks2) = (
+            let (app2, db2, ch, cards2, acks2, copy_state2) = (
                 app.clone(),
                 db.clone(),
                 channel.clone(),
                 cards.clone(),
                 acks.clone(),
+                dingtalk_copy_state.clone(),
             );
+            let mut inbound_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
-                let bridge = app2.state::<ImBridge>();
-                while let Some(inb) = in_rx.recv().await {
-                    if !bridge.live(generation) {
+                loop {
+                    let received =
+                        run_until_generation_cancelled(&mut inbound_cancel, in_rx.recv()).await;
+                    let Some(Some(inb)) = received else {
                         return;
-                    }
-                    // 每条入站重读白名单（绑定后即时生效）；Err 丢弃该条（fail-closed）。
-                    let allow = match ImSettings::load(&db2).await {
-                        Ok(s) => s.allow_open_ids,
-                        Err(e) => {
-                            eprintln!("[weft][im] reload allowlist: {e}");
-                            continue;
+                    };
+                    let operation = async {
+                        // 每条入站重读白名单（绑定后即时生效）；Err 丢弃该条（fail-closed）。
+                        let allow = match ImSettings::load(&db2).await {
+                            Ok(s) => s.allow_open_ids,
+                            Err(e) => {
+                                eprintln!("[weft][im] reload allowlist: {e}");
+                                return;
+                            }
+                        };
+                        let (sender, in_mid) = match &inb {
+                            inbound::Inbound::Text {
+                                sender_open_id,
+                                message_id,
+                                ..
+                            } => (sender_open_id.clone(), Some(message_id.clone())),
+                            inbound::Inbound::Action {
+                                operator_open_id, ..
+                            } => (operator_open_id.clone(), None),
+                        };
+                        let r = {
+                            inbound::route_for_provider(
+                                &inb,
+                                &allow,
+                                &*cards2.lock().await,
+                                provider,
+                            )
+                        };
+                        let route_name = match &r {
+                            inbound::Route::Ignore => "ignore",
+                            inbound::Route::Bind { .. } => "bind",
+                            inbound::Route::BindIssueThread { .. } => "bind_issue_thread",
+                            inbound::Route::EnsureIssueTopic { .. } => "ensure_issue_topic",
+                            inbound::Route::AnswerPerm { .. } => "answer_perm",
+                            inbound::Route::AnswerHuman { .. } => "answer_human",
+                            inbound::Route::BadVerdict => "bad_verdict",
+                            inbound::Route::BadHumanAnswer => "bad_human_answer",
+                            inbound::Route::IssueThreadRequired => "issue_thread_required",
+                            inbound::Route::IssueMessage { .. } => "issue_message",
+                            inbound::Route::FreeText { .. } => "free_text",
+                        };
+                        eprintln!("[weft][im] route={route_name} sender={sender}");
+                        let asks = app2.state::<crate::ask::AskRegistry>();
+                        let bus = app2.state::<crate::bus::BusRegistry>();
+                        let ctx = ExecuteCtx {
+                            inbound_message_id: in_mid,
+                            acks: Some(acks2.clone()),
+                            reaction_tx: Some(reaction_tx.clone()),
+                            replay_pending_tx: Some(replay_pending_tx.clone()),
+                        };
+                        let active_copy = copy_state2.as_ref().map(dingtalk_copy_snapshot);
+                        let lang = active_copy
+                            .as_ref()
+                            .map(|copy| copy.locale.as_str())
+                            .unwrap_or(IM_LANG);
+                        if let Err(e) = execute_for_provider(
+                            r,
+                            &db2,
+                            &asks,
+                            &bus,
+                            ch.as_ref(),
+                            provider,
+                            active_copy.as_ref(),
+                            &sender,
+                            lang,
+                            Some(&app2),
+                            Some(&ctx),
+                        )
+                        .await
+                        {
+                            eprintln!("[weft][im] execute: {e}");
                         }
                     };
-                    let (sender, in_mid) = match &inb {
-                        inbound::Inbound::Text {
-                            sender_open_id,
-                            message_id,
-                            ..
-                        } => (sender_open_id.clone(), Some(message_id.clone())),
-                        inbound::Inbound::Action {
-                            operator_open_id, ..
-                        } => (operator_open_id.clone(), None),
-                    };
-                    let r = { inbound::route(&inb, &allow, &*cards2.lock().await) };
-                    let route_name = match &r {
-                        inbound::Route::Ignore => "ignore",
-                        inbound::Route::Bind { .. } => "bind",
-                        inbound::Route::BindIssueThread { .. } => "bind_issue_thread",
-                        inbound::Route::EnsureIssueTopic { .. } => "ensure_issue_topic",
-                        inbound::Route::AnswerPerm { .. } => "answer_perm",
-                        inbound::Route::AnswerHuman { .. } => "answer_human",
-                        inbound::Route::BadVerdict => "bad_verdict",
-                        inbound::Route::IssueMessage { .. } => "issue_message",
-                        inbound::Route::FreeText { .. } => "free_text",
-                    };
-                    eprintln!("[weft][im] route={route_name} sender={sender}");
-                    let asks = app2.state::<crate::ask::AskRegistry>();
-                    let bus = app2.state::<crate::bus::BusRegistry>();
-                    let ctx = ExecuteCtx {
-                        inbound_message_id: in_mid,
-                        acks: Some(acks2.clone()),
-                        reaction_tx: Some(reaction_tx.clone()),
-                    };
-                    if let Err(e) = execute(
-                        r,
-                        &db2,
-                        &asks,
-                        &bus,
-                        ch.as_ref(),
-                        &sender,
-                        IM_LANG,
-                        Some(&app2),
-                        Some(&ctx),
-                    )
-                    .await
+                    if run_until_generation_cancelled(&mut inbound_cancel, operation)
+                        .await
+                        .is_none()
                     {
-                        eprintln!("[weft][im] execute: {e}");
+                        return;
                     }
                 }
             });
@@ -999,16 +1710,33 @@ pub fn spawn(app: tauri::AppHandle) {
             let mut rx = hub.subscribe();
             let (db2, ch, acks2) = (db.clone(), channel.clone(), acks.clone());
             let app4 = app.clone();
+            let mut outbound_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
                 let bridge = app4.state::<ImBridge>();
                 loop {
                     if !bridge.live(generation) {
                         return;
                     }
-                    match rx.recv().await {
-                        Ok(out) => {
-                            consume_lead_out(out, &db2, ch.as_ref(), &acks2, true).await;
+                    let received = run_until_generation_cancelled(
+                        &mut outbound_cancel,
+                        recv_for_live_generation(&bridge, generation, &mut rx),
+                    )
+                    .await;
+                    let Some(received) = received else {
+                        return;
+                    };
+                    match received {
+                        Ok(Some(out)) => {
+                            let operation =
+                                consume_lead_out(out, &db2, ch.as_ref(), provider, &acks2, true);
+                            if run_until_generation_cancelled(&mut outbound_cancel, operation)
+                                .await
+                                .is_none()
+                            {
+                                return;
+                            }
                         }
+                        Ok(None) => return,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             // engine 产文本太快 / 桥太慢——容量 64 已远超单轮 finalize
                             // 量级，跑到这里多半是死锁前兆，只丢日志不退出。
@@ -1027,6 +1755,7 @@ pub fn spawn(app: tauri::AppHandle) {
             let mut rx = hub.subscribe();
             let (db2, ch, acks2) = (db.clone(), channel.clone(), acks.clone());
             let app5 = app.clone();
+            let mut delta_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
                 let bridge = app5.state::<ImBridge>();
                 // 每条 assistant 消息一张流式卡，按 message_id 归并帧。
@@ -1035,8 +1764,17 @@ pub fn spawn(app: tauri::AppHandle) {
                     if !bridge.live(generation) {
                         return;
                     }
-                    let d = match rx.recv().await {
-                        Ok(d) => d,
+                    let received = run_until_generation_cancelled(
+                        &mut delta_cancel,
+                        recv_for_live_generation(&bridge, generation, &mut rx),
+                    )
+                    .await;
+                    let Some(received) = received else {
+                        return;
+                    };
+                    let d = match received {
+                        Ok(Some(d)) => d,
+                        Ok(None) => return,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             eprintln!("[weft][im] lead-delta lagged: {n} dropped");
                             continue;
@@ -1055,8 +1793,23 @@ pub fn spawn(app: tauri::AppHandle) {
                         }
                     }
                     for frame in coalesce_delta_frames(d, pending) {
-                        consume_lead_delta_frame(frame, &db2, ch.as_ref(), &mut streams, &acks2)
-                            .await;
+                        if !bridge.live(generation) {
+                            return;
+                        }
+                        let operation = consume_lead_delta_frame(
+                            frame,
+                            &db2,
+                            ch.as_ref(),
+                            provider,
+                            &mut streams,
+                            &acks2,
+                        );
+                        if run_until_generation_cancelled(&mut delta_cancel, operation)
+                            .await
+                            .is_none()
+                        {
+                            return;
+                        }
                     }
                 }
             });
@@ -1079,7 +1832,8 @@ pub fn spawn(app: tauri::AppHandle) {
                 Ok(rt) => rt,
                 Err(e) => {
                     eprintln!("[weft][im] ws runtime: {e}");
-                    app3.state::<ImBridge>().set_status(&format!("error: {e}"));
+                    app3.state::<ImBridge>()
+                        .set_status_if_live(generation, &format!("error: {e}"));
                     return;
                 }
             };
@@ -1101,29 +1855,59 @@ pub fn spawn(app: tauri::AppHandle) {
                                 sent_resync = true;
                                 let app_summary = app3.clone();
                                 let ch_summary = ch_for_summary.clone();
+                                let mut resync_cancel = generation_cancel.clone();
                                 tauri::async_runtime::spawn(async move {
-                                    if !app_summary.state::<ImBridge>().live(generation) {
-                                        return;
-                                    }
                                     eprintln!("[weft][im] resync summary task start");
-                                    send_resync_summary(&app_summary, ch_summary.as_ref()).await;
+                                    let operation =
+                                        send_resync_summary(&app_summary, ch_summary.as_ref());
+                                    if run_until_generation_cancelled(&mut resync_cancel, operation)
+                                        .await
+                                        .is_none()
+                                    {
+                                        eprintln!("[weft][im] stale resync generation cancelled");
+                                    }
                                 });
                             }
                             WsLoopAction::OpenWs => {
                                 opened = true;
-                                bridge.set_status("online"); // 连接建立细节在 run_ws 内
+                                bridge.set_status_if_live(generation, "online");
                                 eprintln!("[weft][im] ws loop entering run_ws");
-                                match feishu::ws::run_ws(
-                                    app_id.clone(),
-                                    app_secret.clone(),
-                                    in_tx.clone(),
+                                let operation = async {
+                                    match provider {
+                                        ImProvider::Feishu => {
+                                            feishu::ws::run_ws(
+                                                app_id.clone(),
+                                                app_secret.clone(),
+                                                in_tx.clone(),
+                                            )
+                                            .await
+                                        }
+                                        ImProvider::DingTalk => match dingtalk_channel.as_ref() {
+                                            Some(channel) => {
+                                                dingtalk::ws::run_ws(channel.clone(), in_tx.clone())
+                                                    .await
+                                            }
+                                            None => Err(anyhow::anyhow!(
+                                                "dingtalk channel missing from bridge runtime"
+                                            )),
+                                        },
+                                    }
+                                };
+                                let Some(result) = run_until_generation_cancelled(
+                                    &mut generation_cancel,
+                                    operation,
                                 )
                                 .await
-                                {
+                                else {
+                                    eprintln!("[weft][im] stale ws generation cancelled");
+                                    return;
+                                };
+                                match result {
                                     Ok(()) => backoff = 1,
                                     Err(e) => {
-                                        bridge.set_status(&format!("error: {e}"));
-                                        eprintln!("[weft][im] ws: {e}");
+                                        bridge
+                                            .set_status_if_live(generation, &format!("error: {e}"));
+                                        eprintln!("[weft][im] {} ws: {e}", provider.as_str());
                                     }
                                 }
                             }
@@ -1135,12 +1919,41 @@ pub fn spawn(app: tauri::AppHandle) {
                     if !bridge.live(generation) {
                         return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    let sleep = tokio::time::sleep(std::time::Duration::from_secs(backoff));
+                    if run_until_generation_cancelled(&mut generation_cancel, sleep)
+                        .await
+                        .is_none()
+                    {
+                        return;
+                    }
                     backoff = (backoff * 2).min(60);
                 }
             });
         });
     });
+}
+
+async fn consume_pending_ask_snapshots(
+    permission_snapshot: Vec<crate::ask::Ask>,
+    human_snapshot: Vec<(i32, crate::bus::state::Ask)>,
+    db: &crate::store::Db,
+    ch: &dyn Channel,
+    cards: &tokio::sync::Mutex<CardIndex>,
+    lang: &str,
+) {
+    for ask in permission_snapshot {
+        consume_ask_event(crate::ask::AskEvent::Opened(ask), db, ch, cards).await;
+    }
+    for (thread, ask) in human_snapshot {
+        consume_human_event(
+            crate::bus::state::HumanAskEvent::Asked { thread, ask },
+            db,
+            ch,
+            cards,
+            lang,
+        )
+        .await;
+    }
 }
 
 /// 权限 Ask 事件 → 发卡（Opened，查 DB 富化 thread 标题/direction 名）/
@@ -1161,6 +1974,9 @@ async fn consume_ask_event(
     let Some(owner) = owner else { return }; // 未绑定不出站
     match ev {
         crate::ask::AskEvent::Opened(mut a) => {
+            if cards.lock().await.has_perm(a.id) {
+                return;
+            }
             if let Ok(Some(t)) = crate::store::repo::get_thread(db, a.thread).await {
                 a.thread_title = t.title;
             }
@@ -1170,23 +1986,27 @@ async fn consume_ask_event(
                 }
             }
             let summary = a.summary.clone();
-            match ch.send_card(&owner, outbound::perm_card(&a, IM_LANG)).await {
+            match ch.send_permission_card(&owner, &a, IM_LANG).await {
                 Ok(mid) => cards.lock().await.record_perm(a.id, &mid, &summary),
                 Err(e) => eprintln!("[weft][im] send perm card: {e}"),
             }
         }
         crate::ask::AskEvent::Resolved { ask, answer } => {
             if let Some((mid, summary)) = cards.lock().await.take_perm(ask.id) {
-                let card = outbound::resolved_card(&summary, answer.as_str(), IM_LANG);
-                if let Err(e) = ch.patch_card(&mid, card).await {
+                if let Err(e) = ch
+                    .resolve_permission_card(&mid, &summary, answer.as_str(), IM_LANG)
+                    .await
+                {
                     eprintln!("[weft][im] patch resolved card: {e}");
                 }
             }
         }
         crate::ask::AskEvent::Cancelled { id } => {
             if let Some((mid, summary)) = cards.lock().await.take_perm(id) {
-                let card = outbound::resolved_card(&summary, "cancelled", IM_LANG);
-                if let Err(e) = ch.patch_card(&mid, card).await {
+                if let Err(e) = ch
+                    .resolve_permission_card(&mid, &summary, "cancelled", IM_LANG)
+                    .await
+                {
                     eprintln!("[weft][im] patch cancelled card: {e}");
                 }
             }
@@ -1201,6 +2021,7 @@ async fn consume_human_event(
     db: &crate::store::Db,
     ch: &dyn Channel,
     cards: &tokio::sync::Mutex<CardIndex>,
+    lang: &str,
 ) {
     let owner = match ImSettings::load(db).await {
         Ok(s) => s.allow_open_ids.into_iter().next(),
@@ -1212,6 +2033,9 @@ async fn consume_human_event(
     let Some(owner) = owner else { return };
     match ev {
         crate::bus::state::HumanAskEvent::Asked { thread, ask } => {
+            if cards.lock().await.has_human(thread, ask.id) {
+                return;
+            }
             let title = crate::store::repo::get_thread(db, thread)
                 .await
                 .ok()
@@ -1240,24 +2064,24 @@ async fn consume_human_event(
                 // Background tasks post a stable token rather than prose (they
                 // have no locale); render it here, or a remote human receives
                 // the raw `acp.force_reset_notice`.
-                let body = crate::bus::notice_text::resolve(&ask.text, IM_LANG)
-                    .unwrap_or(ask.text.as_str());
+                let body =
+                    crate::bus::notice_text::resolve(&ask.text, lang).unwrap_or(ask.text.as_str());
                 let notice = format!("{title} · {from}\n{body}");
-                if let Err(e) = ch.send_text(&owner, &notice).await {
-                    eprintln!("[weft][im] send stall notice: {e}");
+                match ch.send_text(&owner, &notice).await {
+                    Ok(()) => cards.lock().await.record_human_notice(thread, ask.id),
+                    Err(e) => eprintln!("[weft][im] send stall notice: {e}"),
                 }
                 return;
             }
             match ch
-                .send_card(
+                .send_human_question_card(
                     &owner,
-                    outbound::human_card(
-                        &title,
-                        &from,
-                        crate::bus::notice_text::resolve(&ask.text, IM_LANG)
-                            .unwrap_or(ask.text.as_str()),
-                        IM_LANG,
-                    ),
+                    thread,
+                    ask.id,
+                    &title,
+                    &from,
+                    crate::bus::notice_text::resolve(&ask.text, lang).unwrap_or(ask.text.as_str()),
+                    lang,
                 )
                 .await
             {
@@ -1272,16 +2096,14 @@ async fn consume_human_event(
             ..
         } => {
             if let Some(mid) = cards.lock().await.take_human(thread, ask_id) {
-                let card = outbound::human_resolved_card(&text, IM_LANG);
-                if let Err(e) = ch.patch_card(&mid, card).await {
+                if let Err(e) = ch.resolve_human_question_card(&mid, &text, lang).await {
                     eprintln!("[weft][im] patch human resolved card: {e}");
                 }
             }
         }
         crate::bus::state::HumanAskEvent::Cancelled { thread, ask_id } => {
             if let Some(mid) = cards.lock().await.take_human(thread, ask_id) {
-                let card = outbound::human_cancelled_card(IM_LANG);
-                if let Err(e) = ch.patch_card(&mid, card).await {
+                if let Err(e) = ch.cancel_human_question_card(&mid, lang).await {
                     eprintln!("[weft][im] patch human cancelled card: {e}");
                 }
             }
@@ -1289,8 +2111,8 @@ async fn consume_human_event(
     }
 }
 
-/// M2-3: 把飞书话题里的一条消息灌进 issue 对应的 lead engine。
-/// 不感知前端 lang 设置——桥侧固定中文（spec：IM 出站默认 zh）。
+/// M2-3: 把 provider thread 里的消息灌进 issue 对应的 lead engine，并沿用
+/// 当前 provider 会话的活动语言。
 async fn feed_issue_message(
     app: &tauri::AppHandle,
     db: &crate::store::Db,
@@ -1301,6 +2123,7 @@ async fn feed_issue_message(
     sender_open_id: &str,
     text: &str,
     lang: &str,
+    provider: ImProvider,
 ) -> anyhow::Result<()> {
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, lang).await?;
     let framed = format_im_user_message(
@@ -1309,7 +2132,8 @@ async fn feed_issue_message(
         im_thread_ref,
         reply_to,
         text,
-        &feishu_provider_capabilities(true),
+        lang,
+        &provider_capabilities(provider, true),
     );
     // Each issue-topic turn carries its originating message id via origin_tag so the
     // response threads under that exact message; the pending ack is used only for
@@ -1331,9 +2155,11 @@ pub async fn ensure_issue_topic(
     ch: &dyn Channel,
     thread_id: i32,
     chat_id: &str,
+    sender_open_id: &str,
     reply_to: Option<&str>,
     lang: &str,
 ) -> anyhow::Result<()> {
+    ImSettings::require_active_owner(db, ImProvider::Feishu, sender_open_id).await?;
     let Some(thread) = crate::store::repo::get_thread(db, thread_id).await? else {
         if let Some(reply_to) = reply_to {
             if let Err(e) = ch
@@ -1354,7 +2180,10 @@ pub async fn ensure_issue_topic(
     };
     crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
 
-    if let Some(route) = crate::store::repo::im_route_of_thread(db, thread_id).await? {
+    if let Some(route) = crate::store::repo::im_route_of_thread(db, thread_id)
+        .await?
+        .filter(|route| route.channel == "feishu")
+    {
         if let Some(reply_to) = reply_to {
             if let Err(e) = ch
                 .reply_text(
@@ -1379,6 +2208,10 @@ pub async fn ensure_issue_topic(
         return Ok(());
     }
 
+    // A route owned by another provider is inactive for this Feishu handoff.
+    // Create the Feishu topic first, then bind_im_route atomically replaces the
+    // stale target; if topic creation fails, the old route remains untouched.
+
     let lead_intro = format!(
         "Weft issue #{} · {}\n这个飞书话题已连接到该 issue 的 Lead agent。后续在这里发消息，会直接进入对应 Lead。",
         thread.id, thread.title
@@ -1390,6 +2223,10 @@ pub async fn ensure_issue_topic(
     let topic_id = ch
         .create_chat_topic(chat_id, &seed_message_id, &lead_intro)
         .await?;
+    // Topic creation is an external await. If the user switched providers or
+    // reset/replaced the owner while it was in flight, leave the previous route
+    // intact instead of binding this retired turn's result.
+    ImSettings::require_active_owner(db, ImProvider::Feishu, sender_open_id).await?;
     crate::store::repo::bind_im_route(db, thread.id, "feishu", chat_id, &topic_id).await?;
     // Persist a replyable seed message id (an `om_*` member of the topic) for the
     // no-ack / no-origin_tag fallback (Finding C).
@@ -1428,14 +2265,24 @@ async fn send_delta_fallback(
             issue_style,
         } => {
             let body = if *issue_style {
-                outbound::issue_reply_text(IM_LANG, text)
+                ch.issue_reply_text(IM_LANG, text)
             } else {
                 text.to_string()
             };
             ch.reply_text(message_id, &body).await.map(|_| ())
         }
         LeadOutboundTarget::DirectMessage { open_id } => ch.send_text(open_id, text).await,
-        LeadOutboundTarget::Chat { chat_id } => ch.send_chat_text(chat_id, text).await.map(|_| ()),
+        LeadOutboundTarget::Chat {
+            chat_id,
+            issue_style,
+        } => {
+            let body = if *issue_style {
+                ch.issue_reply_text(IM_LANG, text)
+            } else {
+                text.to_string()
+            };
+            ch.send_chat_text(chat_id, &body).await.map(|_| ())
+        }
     }
 }
 
@@ -1461,24 +2308,25 @@ where
         .collect()
 }
 
+fn route_matches_provider(provider: ImProvider, channel: &str) -> bool {
+    channel == provider.route_channel() || channel == provider.concierge_channel()
+}
+
 async fn consume_lead_delta_frame(
     d: crate::lead_chat::delta_hub::LeadDelta,
     db: &crate::store::Db,
     ch: &dyn Channel,
+    provider: ImProvider,
     streams: &mut HashMap<i32, feishu::streaming::StreamSession>,
     acks: &Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
 ) {
     let route = match crate::store::repo::im_route_of_thread(db, d.thread_id).await {
-        Ok(Some(r)) if r.channel == "feishu_concierge" || r.channel == "feishu" => r,
+        Ok(Some(r)) if route_matches_provider(provider, &r.channel) => r,
         _ => return,
     };
-    let is_topic = route.channel == "feishu";
-    let content = if is_topic {
-        format!(
-            "{}{}",
-            if IM_LANG == "zh" { "Lead：" } else { "Lead: " },
-            d.accumulated
-        )
+    let is_issue_thread = matches!(route.channel.as_str(), "feishu" | "dingtalk");
+    let content = if is_issue_thread {
+        ch.issue_reply_text(IM_LANG, &d.accumulated)
     } else {
         d.accumulated.clone()
     };
@@ -1486,8 +2334,8 @@ async fn consume_lead_delta_frame(
     // message id), then the latest pending inbound ack, then the stored seed message
     // id; concierge uses the frame's own origin_tag. Reaction draining still uses the
     // ack map regardless — only the reply TARGET follows this chain.
-    let reply_to = if is_topic {
-        match d.origin_tag.clone() {
+    let reply_to = match route.channel.as_str() {
+        "feishu" => match d.origin_tag.clone() {
             Some(t) => Some(t),
             None => match latest_pending_ack_message(d.thread_id, acks).await {
                 Some(a) => Some(a),
@@ -1496,9 +2344,12 @@ async fn consume_lead_delta_frame(
                     .ok()
                     .flatten(),
             },
-        }
-    } else {
-        d.origin_tag.clone()
+        },
+        "dingtalk" => match d.origin_tag.clone() {
+            Some(t) => Some(t),
+            None => latest_pending_ack_message(d.thread_id, acks).await,
+        },
+        _ => d.origin_tag.clone(),
     };
     let Some(target) = lead_outbound_target(&route, reply_to.as_deref()) else {
         return;
@@ -1513,7 +2364,7 @@ async fn consume_lead_delta_frame(
             LeadOutboundTarget::DirectMessage { open_id } => {
                 ch.stream_begin("open_id", open_id).await
             }
-            LeadOutboundTarget::Chat { chat_id } => ch.stream_begin("chat_id", chat_id).await,
+            LeadOutboundTarget::Chat { chat_id, .. } => ch.stream_begin("chat_id", chat_id).await,
         };
         match begun {
             Ok(Some(s)) => {
@@ -1577,6 +2428,7 @@ pub async fn consume_lead_out(
     out: crate::lead_chat::out_hub::LeadOut,
     db: &crate::store::Db,
     ch: &dyn Channel,
+    provider: ImProvider,
     acks: &Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
     streaming: bool,
 ) {
@@ -1588,15 +2440,18 @@ pub async fn consume_lead_out(
             return;
         }
     };
-    if streaming && route.channel == "feishu_concierge" {
+    if !route_matches_provider(provider, &route.channel) {
         return;
     }
-    // feishu (issue topic) reply target prefers the frame's own origin_tag (the
-    // originating message id), then the latest pending inbound ack, then the stored
-    // seed message id; concierge uses the frame's own origin_tag. Reaction draining
-    // still uses the ack map regardless — only the reply TARGET follows this chain.
-    let reply_to = if route.channel == "feishu" {
-        match out.origin_tag.clone() {
+    if streaming && route.channel.ends_with("_concierge") {
+        return;
+    }
+    // Issue-thread replies prefer the originating message, then the latest
+    // pending inbound ack. Feishu additionally keeps a replyable topic seed;
+    // DingTalk requires a live inbound sessionWebhook and has no proactive
+    // openConvThreadId delivery fallback.
+    let reply_to = match route.channel.as_str() {
+        "feishu" => match out.origin_tag.clone() {
             Some(t) => Some(t),
             None => match latest_pending_ack_message(out.thread_id, acks).await {
                 Some(a) => Some(a),
@@ -1605,9 +2460,12 @@ pub async fn consume_lead_out(
                     .ok()
                     .flatten(),
             },
-        }
-    } else {
-        out.origin_tag.clone()
+        },
+        "dingtalk" => match out.origin_tag.clone() {
+            Some(t) => Some(t),
+            None => latest_pending_ack_message(out.thread_id, acks).await,
+        },
+        _ => out.origin_tag.clone(),
     };
     let Some(target) = lead_outbound_target(&route, reply_to.as_deref()) else {
         eprintln!(
@@ -1651,14 +2509,13 @@ async fn ensure_im_concierge_thread(
     sender_open_id: &str,
     chat_id: &str,
     im_thread_ref: &str,
+    provider: ImProvider,
+    dingtalk_copy: Option<&outbound::DingTalkCopy>,
 ) -> anyhow::Result<i32> {
-    let existing =
-        crate::store::repo::im_route_of_thread_ref(db, "feishu_concierge", chat_id, im_thread_ref)
-            .await?
-            .or(
-                crate::store::repo::im_route_of_channel_chat(db, "feishu_concierge", chat_id)
-                    .await?,
-            );
+    let channel = provider.concierge_channel();
+    let existing = crate::store::repo::im_route_of_thread_ref(db, channel, chat_id, im_thread_ref)
+        .await?
+        .or(crate::store::repo::im_route_of_channel_chat(db, channel, chat_id).await?);
     if let Some(route) = existing {
         if crate::store::repo::get_thread(db, route.thread_id)
             .await?
@@ -1670,10 +2527,19 @@ async fn ensure_im_concierge_thread(
     }
 
     let ws_id = ensure_concierge_workspace(db).await?;
-    let title = if im_thread_ref.starts_with("dm:") {
-        format!("飞书私聊 · {sender_open_id}")
-    } else {
-        format!("飞书群聊 · {chat_id}")
+    let is_dm = im_thread_ref.starts_with("dm:");
+    let title = match provider {
+        ImProvider::Feishu if is_dm => format!("飞书私聊 · {sender_open_id}"),
+        ImProvider::Feishu => format!("飞书群聊 · {chat_id}"),
+        ImProvider::DingTalk => {
+            let copy = dingtalk_copy
+                .ok_or_else(|| anyhow::anyhow!("DingTalk localized copy is unavailable"))?;
+            if is_dm {
+                format!("{} · {sender_open_id}", copy.concierge_dm_prefix)
+            } else {
+                format!("{} · {chat_id}", copy.concierge_group_prefix)
+            }
+        }
     };
     let legacy_tool = crate::tools::default_tool(db).await;
     let route = crate::engine_routing::resolve_for_db(
@@ -1690,8 +2556,7 @@ async fn ensure_im_concierge_thread(
     let thread = crate::store::repo::create_thread(db, ws_id, &title, "concierge", &tool).await?;
     crate::engine_routing::record_decision(db, thread.id, None, None, "concierge_start", &route)
         .await;
-    crate::store::repo::bind_im_route(db, thread.id, "feishu_concierge", chat_id, im_thread_ref)
-        .await?;
+    crate::store::repo::bind_im_route(db, thread.id, channel, chat_id, im_thread_ref).await?;
     Ok(thread.id)
 }
 
@@ -1707,24 +2572,41 @@ async fn consume_free_text(
     text: &str,
     lang: &str,
     ctx: Option<&ExecuteCtx>,
+    provider: ImProvider,
+    dingtalk_copy: Option<&outbound::DingTalkCopy>,
 ) -> anyhow::Result<()> {
-    let thread_id = ensure_im_concierge_thread(db, sender_open_id, chat_id, im_thread_ref).await?;
+    let thread_id = ensure_im_concierge_thread(
+        db,
+        sender_open_id,
+        chat_id,
+        im_thread_ref,
+        provider,
+        dingtalk_copy,
+    )
+    .await?;
     // The route's im_thread_ref stays the STABLE conversation ref (dm:/chat:) set
     // by ensure_im_concierge_thread. The per-message reply target rides the turn as
     // origin_tag — two rapid free-text messages each thread under their OWN message
     // instead of both binding the shared route to the latest reply ref.
     record_inbound_reaction(ctx, channel, thread_id).await;
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, lang).await?;
-    // Feishu topics can only be created from a group chat, never a DM — don't
-    // advertise topic creation to the lead/global tool on a DM Concierge turn.
-    let can_create_topic = !im_thread_ref.starts_with("dm:");
+    // Feishu can create a topic from an ordinary group. DingTalk can bind only
+    // when the inbound callback exposes a real openConvThreadId; `chat:*` is an
+    // ordinary group conversation and must not be advertised as a thread.
+    let can_use_group_route = match provider {
+        ImProvider::Feishu => !im_thread_ref.starts_with("dm:"),
+        ImProvider::DingTalk => {
+            !im_thread_ref.starts_with("dm:") && !im_thread_ref.starts_with("chat:")
+        }
+    };
     let framed = format_im_user_message(
         sender_open_id,
         chat_id,
         im_thread_ref,
         reply_to,
         text,
-        &feishu_provider_capabilities(can_create_topic),
+        lang,
+        &provider_capabilities(provider, can_use_group_route),
     );
     crate::lead_chat::engine::send(
         app,
@@ -1753,7 +2635,7 @@ async fn send_resync_summary(app: &tauri::AppHandle, ch: &dyn Channel) {
     };
     let Some(owner) = owner else { return };
     let items = build_resync_items(&db, asks.inner()).await;
-    let body = outbound::resync_summary(IM_LANG, &items);
+    let body = ch.resync_summary(IM_LANG, &items);
     if body.is_empty() {
         return; // 无积压：spec 明确「上线时无待办则不打扰」
     }
@@ -1790,6 +2672,7 @@ pub(crate) async fn build_resync_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn parse_allow_trims_and_drops_empties() {
@@ -1840,6 +2723,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_switch_provider_keeps_credentials_isolated() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_APP_ID, "cli_feishu")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_APP_SECRET, "feishu_secret")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "ou_owner")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_DINGTALK_APP_ID, "ding_app")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_DINGTALK_APP_SECRET, "ding_secret")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_DINGTALK_ALLOW, "staff_owner")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+
+        let ding = ImSettings::load(&db).await.unwrap();
+        assert_eq!(ding.provider, ImProvider::DingTalk);
+        assert_eq!(ding.app_id, "ding_app");
+        assert_eq!(ding.allow_open_ids, vec!["staff_owner"]);
+
+        crate::store::repo::set_setting(&db, K_PROVIDER, "feishu")
+            .await
+            .unwrap();
+        let feishu = ImSettings::load(&db).await.unwrap();
+        assert_eq!(feishu.provider, ImProvider::Feishu);
+        assert_eq!(feishu.app_id, "cli_feishu");
+        assert_eq!(feishu.allow_open_ids, vec!["ou_owner"]);
+    }
+
+    #[tokio::test]
+    async fn resetting_dingtalk_owner_allows_the_next_dm_to_replace_it() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_DINGTALK_ALLOW, "old_owner")
+            .await
+            .unwrap();
+
+        reset_owner(&db, ImProvider::DingTalk).await.unwrap();
+        let settings = ImSettings::load(&db).await.unwrap();
+        assert!(settings.allow_open_ids.is_empty());
+        let route = inbound::route_for_provider(
+            &inbound::Inbound::Text {
+                sender_open_id: "new_owner".into(),
+                chat_type: "p2p".into(),
+                chat_id: "cid_dm".into(),
+                thread_id: None,
+                message_id: "msg_rebind".into(),
+                parent_id: None,
+                text: String::new(),
+            },
+            &settings.allow_open_ids,
+            &CardIndex::default(),
+            ImProvider::DingTalk,
+        );
+        assert!(matches!(
+            route,
+            inbound::Route::Bind { ref open_id, .. } if open_id == "new_owner"
+        ));
+
+        execute_for_provider(
+            route,
+            &db,
+            &crate::ask::AskRegistry::new(),
+            &crate::bus::BusRegistry::new(),
+            &CountingChannel::default(),
+            ImProvider::DingTalk,
+            Some(&outbound::DingTalkCopy::default()),
+            "new_owner",
+            "en",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::store::repo::get_setting(&db, K_DINGTALK_ALLOW)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new_owner")
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_reject_unknown_provider_fail_closed() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_PROVIDER, "unknown")
+            .await
+            .unwrap();
+        assert!(ImSettings::load(&db).await.is_err());
+    }
+
+    #[tokio::test]
     async fn settings_load_propagates_db_errors() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         use sea_orm::ConnectionTrait;
@@ -1882,6 +2869,7 @@ mod tests {
             "chat:oc_chat",
             Some("om_msg"),
             "创建一个 issue",
+            "zh",
             &super::feishu_provider_capabilities(true),
         );
 
@@ -1907,10 +2895,36 @@ mod tests {
             "dm:ou_sender",
             None,
             "创建一个 issue",
+            "zh",
             &dm,
         );
         assert!(dm_frame.contains("\"default_on_create_issue\":false"));
         assert!(dm_frame.contains("\"can_create_from_current_conversation\":false"));
+    }
+
+    #[test]
+    fn dingtalk_context_advertises_existing_thread_binding_without_creation() {
+        let caps = super::dingtalk_provider_capabilities(true);
+        assert!(caps.issue_thread_supported);
+        assert!(!caps.default_create_thread_for_new_issue);
+        assert!(!caps.can_create_thread_from_current_conversation);
+        assert!(caps.can_reply_to_message);
+        assert!(caps.issue_conversation_binding_supported);
+        assert!(caps.can_bind_current_conversation);
+        let frame = super::format_im_user_message(
+            "staff_owner",
+            "cid_group",
+            "convThreadEncrypted",
+            Some("msg_1"),
+            "推进一下",
+            "en",
+            &caps,
+        );
+        assert!(frame.contains("\"provider\":\"dingtalk\""));
+        assert!(frame.contains("\"locale\":\"en\""));
+        assert!(frame.contains("\"issue_topic\":{\"can_create_from_current_conversation\":false"));
+        assert!(frame.contains("\"issue_conversation_binding\""));
+        assert!(frame.contains("/bind <issue-id>"));
     }
 
     #[test]
@@ -2034,9 +3048,16 @@ mod tests {
             .unwrap();
         let expected = crate::tools::default_tool(&db).await;
 
-        let thread_id = ensure_im_concierge_thread(&db, "ou_owner", "oc_dm", "dm:ou_owner")
-            .await
-            .unwrap();
+        let thread_id = ensure_im_concierge_thread(
+            &db,
+            "ou_owner",
+            "oc_dm",
+            "dm:ou_owner",
+            ImProvider::Feishu,
+            None,
+        )
+        .await
+        .unwrap();
 
         let thread = crate::store::repo::get_thread(&db, thread_id)
             .await
@@ -2046,10 +3067,39 @@ mod tests {
         assert_eq!(thread.lead_tool, expected);
     }
 
+    #[tokio::test]
+    async fn dingtalk_concierge_thread_title_uses_synchronized_copy() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let copy = outbound::DingTalkCopy {
+            locale: "en".into(),
+            concierge_dm_prefix: "DingTalk DM".into(),
+            concierge_group_prefix: "DingTalk group".into(),
+            ..Default::default()
+        };
+
+        let thread_id = ensure_im_concierge_thread(
+            &db,
+            "staff_owner",
+            "cid_dm",
+            "dm:staff_owner",
+            ImProvider::DingTalk,
+            Some(&copy),
+        )
+        .await
+        .unwrap();
+
+        let thread = crate::store::repo::get_thread(&db, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(thread.title, "DingTalk DM · staff_owner");
+    }
+
     #[derive(Default)]
     struct CountingChannel {
         cards: std::sync::atomic::AtomicUsize,
         texts: std::sync::atomic::AtomicUsize,
+        text_bodies: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -2061,8 +3111,9 @@ mod tests {
         async fn patch_card(&self, _m: &str, _c: serde_json::Value) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn send_text(&self, _o: &str, _t: &str) -> anyhow::Result<()> {
+        async fn send_text(&self, _o: &str, text: &str) -> anyhow::Result<()> {
             self.texts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.text_bodies.lock().unwrap().push(text.to_string());
             Ok(())
         }
         async fn send_chat_text(&self, _c: &str, _t: &str) -> anyhow::Result<String> {
@@ -2081,10 +3132,109 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn first_dingtalk_owner_bind_replays_preexisting_permission_and_human_asks() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "pending issue",
+            "feature",
+            "claude",
+        )
+        .await
+        .unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        let bus = crate::bus::BusRegistry::new();
+        let (permission_id, _permission_rx) = asks.request(
+            thread.id,
+            "10",
+            "claude",
+            "Run tests",
+            "cargo test",
+            crate::ask::RiskLevel::Unknown,
+            "cargo test",
+        );
+        let human_id = bus.ask_human(thread.id, "10", "Which release channel?");
+        let channel = CountingChannel::default();
+        let cards = tokio::sync::Mutex::new(CardIndex::default());
+        let (replay_pending_tx, mut replay_pending_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ExecuteCtx {
+            replay_pending_tx: Some(replay_pending_tx),
+            ..Default::default()
+        };
+
+        execute_for_provider(
+            inbound::Route::Bind {
+                open_id: "new_owner".into(),
+                chat_id: "cid_dm".into(),
+                reply_to: "msg_first".into(),
+                text: String::new(),
+            },
+            &db,
+            &asks,
+            &bus,
+            &channel,
+            ImProvider::DingTalk,
+            Some(&outbound::DingTalkCopy::default()),
+            "new_owner",
+            "en",
+            None,
+            Some(&ctx),
+        )
+        .await
+        .unwrap();
+
+        replay_pending_rx.recv().await.unwrap();
+        consume_pending_ask_snapshots(
+            asks.open(),
+            bus.open_ask_snapshot(),
+            &db,
+            &channel,
+            &cards,
+            "en",
+        )
+        .await;
+        assert_eq!(
+            crate::store::repo::get_setting(&db, K_DINGTALK_ALLOW)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new_owner")
+        );
+        assert_eq!(
+            channel.cards.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "both preexisting blockers must be replayed after first bind"
+        );
+        assert!(cards.lock().await.has_perm(permission_id));
+        assert!(cards.lock().await.has_human(thread.id, human_id));
+
+        // A queued Opened event can race the replay signal. The notifier is
+        // serial, and CardIndex identities make the second presentation a no-op.
+        consume_pending_ask_snapshots(
+            asks.open(),
+            bus.open_ask_snapshot(),
+            &db,
+            &channel,
+            &cards,
+            "en",
+        )
+        .await;
+        assert_eq!(channel.cards.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
     /// An answerable question goes through IM's answer-card pipeline; a
     /// display-only stall NOTICE reaches the remote human as plain TEXT instead
     /// (never an answer card, so no dead reply prompt or wrong "cancelled" patch),
-    /// and — verified below — is NOT recorded in CardIndex.
+    /// and — verified below — has no patchable message while its identity still
+    /// suppresses duplicate first-owner replay.
     #[tokio::test]
     async fn stall_notice_forwarded_as_text_to_im() {
         use crate::bus::state::{Ask, HumanAskEvent};
@@ -2125,6 +3275,7 @@ mod tests {
             &db,
             &ch,
             &cards,
+            IM_LANG,
         )
         .await;
         assert_eq!(cards_sent(), 1, "answerable → one answer card");
@@ -2138,21 +3289,57 @@ mod tests {
             &db,
             &ch,
             &cards,
+            IM_LANG,
         )
         .await;
         assert_eq!(cards_sent(), 1, "notice must not open an answer card");
         assert_eq!(texts_sent(), 1, "notice is delivered as plain text");
-        // And it is NOT recorded, so a later Answered/Cancelled patches nothing.
+        consume_human_event(
+            HumanAskEvent::Asked {
+                thread: th.id,
+                ask: mk(2, false),
+            },
+            &db,
+            &ch,
+            &cards,
+            IM_LANG,
+        )
+        .await;
+        assert_eq!(texts_sent(), 1, "replay must not duplicate a delivered notice");
+        // The identity is tracked for de-duplication, but there is no message to
+        // patch when the display-only notice later cancels itself.
         assert!(
             cards.lock().await.take_human(th.id, 2).is_none(),
-            "notice must not be recorded in CardIndex",
+            "notice must not have a patchable CardIndex message",
         );
+
+        let mut force_reset = mk(3, false);
+        force_reset.text = crate::lead_chat::engine::ACP_FORCE_RESET_NOTICE.to_string();
+        consume_human_event(
+            HumanAskEvent::Asked {
+                thread: th.id,
+                ask: force_reset,
+            },
+            &db,
+            &ch,
+            &cards,
+            "en",
+        )
+        .await;
+        let expected = crate::bus::notice_text::resolve(
+            crate::lead_chat::engine::ACP_FORCE_RESET_NOTICE,
+            "en",
+        )
+        .unwrap();
+        let bodies = ch.text_bodies.lock().unwrap();
+        assert!(bodies.last().is_some_and(|body| body.ends_with(expected)));
     }
 
     #[derive(Default)]
     struct TopicChannel {
         created_topics: std::sync::Mutex<Vec<(String, String)>>,
         replies: std::sync::Mutex<Vec<(String, String)>>,
+        direct_messages: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     #[async_trait::async_trait]
@@ -2173,7 +3360,11 @@ mod tests {
             Ok(())
         }
 
-        async fn send_text(&self, _open_id: &str, _text: &str) -> anyhow::Result<()> {
+        async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()> {
+            self.direct_messages
+                .lock()
+                .unwrap()
+                .push((open_id.to_string(), text.to_string()));
             Ok(())
         }
 
@@ -2208,8 +3399,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_dingtalk_bind_replies_in_the_originating_thread() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        let bus = crate::bus::BusRegistry::new();
+        let channel = TopicChannel::default();
+        let copy = outbound::DingTalkCopy {
+            issue_not_found: "No issue with that id was found.".into(),
+            ..Default::default()
+        };
+
+        execute_for_provider(
+            inbound::Route::BindIssueThread {
+                thread_id: 404,
+                chat_id: "cid_parent".into(),
+                im_thread_ref: "thread_1".into(),
+                seed_message_id: "msg_bind".into(),
+            },
+            &db,
+            &asks,
+            &bus,
+            &channel,
+            ImProvider::DingTalk,
+            Some(&copy),
+            "owner",
+            "en",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            channel.replies.lock().unwrap().as_slice(),
+            [("msg_bind".into(), "No issue with that id was found.".into())]
+        );
+        assert!(channel.direct_messages.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn ensure_issue_topic_binds_feishu_thread_id_not_plain_message_id() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "owner")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_ENABLED, "1")
+            .await
+            .unwrap();
         let ws = crate::store::repo::create_workspace(&db, "ws")
             .await
             .unwrap();
@@ -2218,7 +3454,15 @@ mod tests {
             .unwrap();
         let ch = TopicChannel::default();
 
-        ensure_issue_topic(&db, &ch, issue.id, "oc_chat", Some("om_request"), "zh")
+        ensure_issue_topic(
+            &db,
+            &ch,
+            issue.id,
+            "oc_chat",
+            "owner",
+            Some("om_request"),
+            "zh",
+        )
             .await
             .unwrap();
 
@@ -2234,6 +3478,128 @@ mod tests {
                 .any(|(_, body)| body.contains("Lead agent") || body.contains("Lead Agent")),
             "topic creation message should tell users this topic is connected to the issue Lead agent: {created:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_issue_topic_replaces_an_inactive_dingtalk_route() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "owner")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_ENABLED, "1")
+            .await
+            .unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "dingtalk", "cid_old", "ding-thread-old")
+            .await
+            .unwrap();
+        let ch = TopicChannel::default();
+
+        ensure_issue_topic(
+            &db,
+            &ch,
+            issue.id,
+            "oc_current",
+            "owner",
+            Some("om_request"),
+            "zh",
+        )
+            .await
+            .unwrap();
+
+        let route = crate::store::repo::im_route_of_thread(&db, issue.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.channel, "feishu");
+        assert_eq!(route.chat_id, "oc_current");
+        assert_eq!(route.im_thread_ref, "omt_created_topic");
+        assert_eq!(ch.created_topics.lock().unwrap().len(), 1);
+    }
+
+    struct ProviderSwitchingTopicChannel {
+        db: crate::store::Db,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ProviderSwitchingTopicChannel {
+        async fn send_card(
+            &self,
+            _open_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            Ok("om_card".into())
+        }
+
+        async fn patch_card(
+            &self,
+            _message_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send_text(&self, _open_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn create_chat_topic(
+            &self,
+            _chat_id: &str,
+            _seed_message_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<String> {
+            crate::store::repo::set_setting(&self.db, K_PROVIDER, "dingtalk").await?;
+            Ok("omt_orphaned_after_switch".into())
+        }
+
+        async fn reply_text(&self, _reply_to: &str, _text: &str) -> anyhow::Result<String> {
+            Ok("om_reply".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_switch_during_topic_creation_preserves_the_active_route() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "owner")
+            .await
+            .unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "dingtalk", "cid_live", "ding-live")
+            .await
+            .unwrap();
+        let ch = ProviderSwitchingTopicChannel { db: db.clone() };
+
+        let error = ensure_issue_topic(
+            &db,
+            &ch,
+            issue.id,
+            "oc_stale",
+            "owner",
+            Some("om_request"),
+            "zh",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("stale IM context"));
+        let route = crate::store::repo::im_route_of_thread(&db, issue.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.channel, "dingtalk");
+        assert_eq!(route.chat_id, "cid_live");
+        assert_eq!(route.im_thread_ref, "ding-live");
     }
 
     #[tokio::test]
@@ -2386,6 +3752,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -2407,6 +3774,7 @@ mod tests {
     struct TopicStreamFallbackChannel {
         stream_replies: std::sync::Mutex<Vec<String>>,
         replies: std::sync::Mutex<Vec<(String, String)>>,
+        chat_texts: std::sync::Mutex<Vec<(String, String)>>,
         deletions: std::sync::Mutex<Vec<(String, String)>>,
     }
 
@@ -2438,6 +3806,14 @@ mod tests {
                 .unwrap()
                 .push((reply_to.to_string(), text.to_string()));
             Ok("om_reply".into())
+        }
+
+        async fn send_chat_text(&self, chat_id: &str, text: &str) -> anyhow::Result<String> {
+            self.chat_texts
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), text.to_string()));
+            Ok("om_chat".into())
         }
 
         async fn delete_reaction(&self, message_id: &str, reaction_id: &str) -> anyhow::Result<()> {
@@ -2492,6 +3868,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -2544,6 +3921,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -2558,6 +3936,115 @@ mod tests {
             ch.replies.lock().unwrap().as_slice(),
             [("provider-topic-id".into(), "Lead：我查到了。".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn dingtalk_issue_output_without_session_is_not_sent_as_group_message() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(
+            &db,
+            issue.id,
+            "dingtalk",
+            "cid_parent_group",
+            "convThreadEncrypted",
+        )
+        .await
+        .unwrap();
+        let ch = TopicStreamFallbackChannel::default();
+        let mut streams = HashMap::new();
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: issue.id,
+                message_id: 12,
+                accumulated: "我查到了。".into(),
+                done: true,
+                origin_tag: None,
+            },
+            &db,
+            &ch,
+            ImProvider::DingTalk,
+            &mut streams,
+            &acks,
+        )
+        .await;
+
+        assert!(ch.stream_replies.lock().unwrap().is_empty());
+        assert!(ch.replies.lock().unwrap().is_empty());
+        assert!(ch.chat_texts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inactive_provider_routes_are_ignored_by_delta_and_final_consumers() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "provider switch",
+            "bugfix",
+            "claude",
+        )
+        .await
+        .unwrap();
+        crate::store::repo::bind_im_route(
+            &db,
+            issue.id,
+            "feishu",
+            "oc_old_provider",
+            "omt_old_provider",
+        )
+        .await
+        .unwrap();
+        let channel = TopicStreamFallbackChannel::default();
+        let mut streams = HashMap::new();
+        let acks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: issue.id,
+                message_id: 12,
+                accumulated: "must stay local".into(),
+                done: true,
+                origin_tag: None,
+            },
+            &db,
+            &channel,
+            ImProvider::DingTalk,
+            &mut streams,
+            &acks,
+        )
+        .await;
+        consume_lead_out(
+            crate::lead_chat::out_hub::LeadOut {
+                thread_id: issue.id,
+                message_id: 12,
+                text: "must stay local".into(),
+                origin_tag: None,
+            },
+            &db,
+            &channel,
+            ImProvider::DingTalk,
+            &acks,
+            false,
+        )
+        .await;
+
+        assert!(streams.is_empty());
+        assert!(channel.stream_replies.lock().unwrap().is_empty());
+        assert!(channel.replies.lock().unwrap().is_empty());
+        assert!(channel.chat_texts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2587,6 +4074,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &acks,
             false,
         )
@@ -2630,6 +4118,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -2645,6 +4134,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -2701,6 +4191,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -2724,9 +4215,16 @@ mod tests {
         crate::store::repo::create_workspace(&db, "Concierge")
             .await
             .unwrap();
-        let thread_id = ensure_im_concierge_thread(&db, "ou_owner", "oc_dm", "dm:ou_owner")
-            .await
-            .unwrap();
+        let thread_id = ensure_im_concierge_thread(
+            &db,
+            "ou_owner",
+            "oc_dm",
+            "dm:ou_owner",
+            ImProvider::Feishu,
+            None,
+        )
+        .await
+        .unwrap();
         // Route is bound to the stable conversation ref — no ;reply: suffix.
         let route = crate::store::repo::im_route_of_thread(&db, thread_id)
             .await
@@ -2751,6 +4249,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -2766,6 +4265,7 @@ mod tests {
             },
             &db,
             &ch,
+            ImProvider::Feishu,
             &mut streams,
             &acks,
         )
@@ -2829,6 +4329,213 @@ mod tests {
         assert!(frames[0].done);
         assert_eq!(frames[1].message_id, 20);
         assert_eq!(frames[1].accumulated, "x");
+    }
+
+    #[tokio::test]
+    async fn broadcast_wake_drops_item_after_generation_switch() {
+        let bridge = ImBridge::default();
+        let (generation, _, _, _) = bridge.bump();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+
+        let waiting = recv_for_live_generation(&bridge, generation, &mut rx);
+        let switch_provider = async {
+            tokio::task::yield_now().await;
+            let _ = bridge.bump();
+            assert_eq!(tx.send(7_u8).unwrap(), 1);
+        };
+        let (received, ()) = tokio::join!(waiting, switch_provider);
+
+        assert_eq!(received.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn authority_retirement_waits_for_an_active_lead_enqueue_lease() {
+        let bridge = Arc::new(ImBridge::default());
+        let enqueue = bridge.authority_read_lease().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (retired_tx, mut retired_rx) = tokio::sync::oneshot::channel();
+        let retiring_bridge = bridge.clone();
+        let retirement = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _retirement = retiring_bridge.authority_write_lease().await;
+            let _ = retired_tx.send(());
+        });
+
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut retired_rx)
+                .await
+                .is_err(),
+            "owner/provider retirement must not cross an active enqueue boundary"
+        );
+
+        drop(enqueue);
+        tokio::time::timeout(Duration::from_secs(1), &mut retired_rx)
+            .await
+            .expect("retirement should proceed after the enqueue lease is released")
+            .unwrap();
+        retirement.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabling_provider_waits_for_an_in_flight_im_tool_lease() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_DINGTALK_ENABLED, "1")
+            .await
+            .unwrap();
+        let bridge = Arc::new(ImBridge::default());
+        let tool_call = bridge.authority_read_lease().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (disabled_tx, mut disabled_rx) = tokio::sync::oneshot::channel();
+        let disabling_bridge = bridge.clone();
+        let disabling_db = db.clone();
+        let disable = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _retirement = disabling_bridge.authority_write_lease().await;
+            crate::store::repo::set_setting(&disabling_db, K_DINGTALK_ENABLED, "0")
+                .await
+                .unwrap();
+            let _ = disabled_tx.send(());
+        });
+
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut disabled_rx)
+                .await
+                .is_err(),
+            "disable must wait until the in-flight tool releases authority"
+        );
+        assert_eq!(
+            crate::store::repo::get_setting(&db, K_DINGTALK_ENABLED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+
+        drop(tool_call);
+        tokio::time::timeout(Duration::from_secs(1), &mut disabled_rx)
+            .await
+            .expect("disable should proceed after the tool lease is released")
+            .unwrap();
+        disable.await.unwrap();
+        assert_eq!(
+            crate::store::repo::get_setting(&db, K_DINGTALK_ENABLED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_bump_cancels_blocked_websocket_generation() {
+        let bridge = ImBridge::default();
+        let (_, _, _, mut cancel) = bridge.bump();
+
+        let blocked = run_until_generation_cancelled(
+            &mut cancel,
+            std::future::pending::<anyhow::Result<()>>(),
+        );
+        let restart = async {
+            tokio::task::yield_now().await;
+            let _ = bridge.bump();
+        };
+        let (result, ()) = tokio::join!(blocked, restart);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn dingtalk_copy_update_preserves_the_active_generation() {
+        let bridge = ImBridge::default();
+        let initial = outbound::DingTalkCopy {
+            locale: "zh".into(),
+            truncated_marker: "……（内容已截断）".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            bridge.set_dingtalk_copy(initial.clone()),
+            DingTalkCopyUpdate::Initialized
+        );
+        let (generation, _, _, cancel) = bridge.bump();
+
+        let updated = outbound::DingTalkCopy {
+            locale: "en".into(),
+            truncated_marker: "…(truncated)".into(),
+            ..initial
+        };
+        assert_eq!(
+            bridge.set_dingtalk_copy(updated),
+            DingTalkCopyUpdate::Updated
+        );
+        assert!(bridge.live(generation));
+        assert!(!*cancel.borrow());
+        let state = bridge.dingtalk_copy_state().unwrap();
+        assert_eq!(bridge_lang(Some(&state)), "en");
+    }
+
+    #[tokio::test]
+    async fn stale_startup_cannot_replace_newer_human_ask_notifier() {
+        let bridge = ImBridge::default();
+        let (older, _, _, _) = bridge.bump();
+        let (newer, _, _, _) = bridge.bump();
+        let bus = crate::bus::BusRegistry::new();
+
+        let (new_tx, mut new_rx) = tokio::sync::mpsc::unbounded_channel();
+        let installed = bridge.with_live_generation(newer, || bus.set_ask_notifier(new_tx));
+        assert!(installed.is_some_and(|snapshot| snapshot.is_empty()));
+
+        let (stale_tx, mut stale_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stale = bridge.with_live_generation(older, || bus.set_ask_notifier(stale_tx));
+        assert!(stale.is_none());
+
+        let ask_id = bus.ask_human(7, "42", "still routed to the new bridge");
+        assert!(matches!(
+            new_rx.recv().await,
+            Some(crate::bus::state::HumanAskEvent::Asked { thread: 7, ask })
+                if ask.id == ask_id
+        ));
+        assert!(stale_rx.try_recv().is_err());
+    }
+
+    async fn assert_bump_cancels_delayed_side_effect() {
+        let bridge = ImBridge::default();
+        let (_, _, _, mut cancel) = bridge.bump();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let side_effect = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let operation = {
+            let entered = entered.clone();
+            let release = release.clone();
+            let side_effect = side_effect.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                side_effect.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+        let guarded = run_until_generation_cancelled(&mut cancel, operation);
+        let retire = async {
+            entered.notified().await;
+            let _ = bridge.bump();
+            release.notify_one();
+        };
+        let (result, ()) = tokio::join!(guarded, retire);
+
+        assert!(result.is_none());
+        assert!(!side_effect.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn bridge_bump_cancels_dequeued_inbound_before_execution() {
+        assert_bump_cancels_delayed_side_effect().await;
+    }
+
+    #[tokio::test]
+    async fn bridge_bump_cancels_resync_before_send() {
+        assert_bump_cancels_delayed_side_effect().await;
     }
 
     #[test]

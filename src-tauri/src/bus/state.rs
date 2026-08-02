@@ -169,14 +169,40 @@ impl BusRegistry {
         }
     }
 
-    /// Install the channel the IM bridge listens on for human-ask events
-    /// (called once at startup). Mirrors `set_wake_sender`.
-    ///
-    /// 与 `AskRegistry::set_notifier` 不同，本方法不返回 open asks 快照
-    /// （M1 范围）；只投递安装之后的事件。须在任何 agent 跑起来之前安装——
-    /// 安装前已 open 的提问不会补发，registry 也没有跨 thread 枚举接口。
-    pub fn set_ask_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<HumanAskEvent>) {
+    /// Install the channel the IM bridge listens on for human-ask events and
+    /// atomically snapshot every open ask across threads. The lock order stays
+    /// `inner -> ask_notify`, matching `push_ask`, so an ask is represented
+    /// exactly once: either in this snapshot or as a later channel event.
+    pub fn set_ask_notifier(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<HumanAskEvent>,
+    ) -> Vec<(i32, Ask)> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         *self.ask_notify.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        Self::open_ask_snapshot_from(&inner)
+    }
+
+    fn open_ask_snapshot_from(inner: &HashMap<i32, ThreadBus>) -> Vec<(i32, Ask)> {
+        let mut snapshot = inner
+            .iter()
+            .flat_map(|(thread, bus)| {
+                bus.asks
+                    .iter()
+                    .filter(|ask| !ask.answered)
+                    .cloned()
+                    .map(|ask| (*thread, ask))
+            })
+            .collect::<Vec<_>>();
+        snapshot.sort_by_key(|(thread, ask)| (ask.ts, *thread, ask.id));
+        snapshot
+    }
+
+    /// Snapshot every currently open human ask without replacing the notifier.
+    /// Used when an IM bridge gains its first owner after startup snapshots were
+    /// intentionally skipped while no delivery target existed.
+    pub fn open_ask_snapshot(&self) -> Vec<(i32, Ask)> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::open_ask_snapshot_from(&inner)
     }
 
     /// Install the transcript-trail consumer's channel (called once at startup,
@@ -696,7 +722,7 @@ mod tests {
     async fn human_ask_notifier_fires_on_ask_and_answer() {
         let r = BusRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        r.set_ask_notifier(tx);
+        assert!(r.set_ask_notifier(tx).is_empty());
         r.join(1, "10");
         let id = r.ask_human(1, "10", "major or minor?");
         match rx.recv().await.unwrap() {
@@ -717,10 +743,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn human_ask_notifier_snapshots_preexisting_open_asks() {
+        let r = BusRegistry::new();
+        let first = r.ask_human(2, "20", "already open");
+        let answered = r.ask_human(1, "10", "already answered");
+        assert!(r.answer_ask(1, answered, "done"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let snapshot = r.set_ask_notifier(tx);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, 2);
+        assert_eq!(snapshot[0].1.id, first);
+
+        let later = r.ask_human(3, "30", "opened after install");
+        assert!(matches!(
+            rx.recv().await,
+            Some(HumanAskEvent::Asked { thread: 3, ask }) if ask.id == later
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "snapshot asks must not be emitted again"
+        );
+    }
+
+    #[tokio::test]
     async fn cancel_open_asks_marks_thread_asks_and_notifies() {
         let r = BusRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        r.set_ask_notifier(tx);
+        let _ = r.set_ask_notifier(tx);
         let first = r.ask_human(1, "10", "first?");
         let second = r.ask_human(1, "20", "second?");
         let keep = r.ask_human(2, "30", "keep?");
@@ -751,7 +801,7 @@ mod tests {
     async fn cancel_open_asks_from_marks_only_that_direction() {
         let r = BusRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        r.set_ask_notifier(tx);
+        let _ = r.set_ask_notifier(tx);
         let first = r.ask_human(1, "10", "first?");
         let keep_same_thread = r.ask_human(1, "20", "second?");
         let keep_other_thread = r.ask_human(2, "10", "keep?");
