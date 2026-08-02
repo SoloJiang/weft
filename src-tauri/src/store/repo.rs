@@ -5563,6 +5563,16 @@ pub(crate) struct RepoActionOsLock {
     _file: std::fs::File,
 }
 
+#[cfg(test)]
+impl Drop for RepoActionOsLock {
+    fn drop(&mut self) {
+        // Keep test lock handoffs deterministic on macOS: explicitly release
+        // the advisory lock before the descriptor is closed, so a parallel
+        // test cannot observe the old owner during the next immediate probe.
+        let _ = fs2::FileExt::unlock(&self._file);
+    }
+}
+
 fn repo_action_lock_home() -> Result<std::path::PathBuf> {
     #[cfg(test)]
     let home = std::env::temp_dir().join("weft-repo-action-test-locks");

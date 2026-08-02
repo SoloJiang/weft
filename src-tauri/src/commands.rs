@@ -4301,6 +4301,15 @@ mod tests {
         (workspace, thread, card)
     }
 
+    /// Make lock ownership handoff explicit before a test starts a phase that
+    /// reacquires the same execution token. The production lock remains
+    /// fail-fast; this probe only proves that the previous owner has dropped
+    /// its guard instead of relying on scheduler timing between awaits.
+    fn assert_repo_action_lock_handoff(execution_token: &str) {
+        let lock = acquire_repo_action_os_lock(execution_token).unwrap();
+        drop(lock);
+    }
+
     async fn materialize_unregistered_repo_action(
         db: &Db,
         root: &std::path::Path,
@@ -4337,7 +4346,9 @@ mod tests {
             .await
             .unwrap();
         let execution = admission.execution.clone();
+        let execution_token = admission.execution.execution_token.clone();
         drop(admission);
+        assert_repo_action_lock_handoff(&execution_token);
         (workspace, thread, card, execution, target)
     }
 
@@ -4552,12 +4563,45 @@ mod tests {
             )
             .await
         });
-        let first = first.await.unwrap().unwrap();
-        let second = second.await.unwrap().unwrap();
-        let outcomes = [first.outcome, second.outcome];
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        let mut completed = Vec::with_capacity(2);
+        let mut saw_in_progress = false;
+        for result in [first, second] {
+            match result {
+                Ok(result) => completed.push(result),
+                Err(error) if error == "action_card_in_progress" => saw_in_progress = true,
+                Err(error) => panic!("concurrent exact action failed unexpectedly: {error}"),
+            }
+        }
+        // A loser that reaches the OS lock while the winner is still mutating
+        // is a valid in-progress response. Once both owner tasks have joined,
+        // retry the exact invocation and observe the durable replay outcome.
+        if saw_in_progress {
+            let (workspace_id, name, path, thread_id, message_id, action_id, action_kind) = args();
+            completed.push(
+                add_repo_ref_inner(
+                    &db,
+                    workspace_id,
+                    name,
+                    path,
+                    thread_id,
+                    message_id,
+                    action_id,
+                    action_kind,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        assert_eq!(completed.len(), 2);
+        let outcomes = completed
+            .iter()
+            .map(|result| result.outcome)
+            .collect::<Vec<_>>();
         assert!(outcomes.contains(&RepoActionExecutionOutcome::FreshlyCompleted));
         assert!(outcomes.contains(&RepoActionExecutionOutcome::Replayed));
-        assert_eq!(first.repo.id, second.repo.id);
+        assert_eq!(completed[0].repo.id, completed[1].repo.id);
         assert_eq!(repo::list_repos(&db, workspace.id).await.unwrap().len(), 1);
 
         let message = repo::get_lead_message(&db, card.id)
@@ -4571,7 +4615,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(execution.status, repo::REPO_ACTION_COMPLETED);
-        assert_eq!(execution.repo_id, first.repo.id);
+        assert_eq!(execution.repo_id, completed[0].repo.id);
         assert_eq!(execution.feedback_state, repo::REPO_ACTION_FEEDBACK_PENDING);
 
         let deliveries = std::sync::Arc::new(AtomicUsize::new(0));
@@ -4692,7 +4736,9 @@ mod tests {
         .await
         .unwrap();
         cleanup_completed_action_target(&admission, &repo_ref).unwrap();
+        let execution_token = admission.execution.execution_token.clone();
         drop(admission);
+        assert_repo_action_lock_handoff(&execution_token);
 
         assert_eq!(repo::list_repos(&db, workspace.id).await.unwrap().len(), 1);
         let message = repo::get_lead_message(&db, card.id)
@@ -4967,6 +5013,11 @@ mod tests {
         .await
         .unwrap();
         let execution_id = completed.execution_id.unwrap();
+        let execution = repo::get_repo_action_execution_by_id(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_repo_action_lock_handoff(&execution.execution_token);
         let callback_count = std::sync::Arc::new(AtomicUsize::new(0));
         let callback_count_for_drain = callback_count.clone();
         assert!(!drain_repo_action_feedback_with(&db, execution_id, move |_, _| async move {
@@ -5386,6 +5437,11 @@ mod tests {
         db.0.execute_unprepared("DROP TRIGGER fail_action_finalize_for_delete")
             .await
             .unwrap();
+        let pending = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_repo_action_lock_handoff(&pending.execution_token);
 
         let locked = lock_repo_action_cleanups(
             &db,
@@ -7743,7 +7799,10 @@ mod tests {
         let execution = repo::mark_repo_action_materialized(&db, execution.id, &token)
             .await
             .unwrap();
-        let registered = repo::add_repo_ref(
+        // Hold the token lock explicitly across registration so the test's
+        // release→cleanup reacquisition has a visible owner boundary.
+        let registration_lock = acquire_repo_action_os_lock(&token).unwrap();
+        let registered = repo::add_repo_ref_with_action_lock(
             &db,
             workspace.id,
             "materialized-target",
@@ -7751,9 +7810,12 @@ mod tests {
             "main",
             "",
             true,
+            &registration_lock,
         )
         .await
         .unwrap();
+        drop(registration_lock);
+        assert_repo_action_lock_handoff(&token);
 
         let planned_ids = vec![target_message.id, card.id];
         let locked = lock_repo_action_cleanups(
