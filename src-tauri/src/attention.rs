@@ -134,10 +134,16 @@ fn parse_card(message: &lead_message::Model) -> serde_json::Value {
 }
 
 fn card_is_open(message: &lead_message::Model) -> bool {
-    parse_card(message)
-        .get("resolved")
-        .and_then(serde_json::Value::as_str)
-        .is_none_or(str::is_empty)
+    let value = parse_card(message);
+    let Some(resolved) = value.get("resolved") else {
+        return true;
+    };
+    match resolved {
+        serde_json::Value::Null => true,
+        serde_json::Value::Bool(value) => !value,
+        serde_json::Value::String(label) => label.trim().is_empty(),
+        _ => false,
+    }
 }
 
 fn card_title(message: &lead_message::Model) -> String {
@@ -540,40 +546,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn question_is_durable_scoped_and_occ_answered() {
+    async fn concurrent_questions_are_durable_scoped_and_occ_answered() {
         let (db, thread, direction) = fixture().await;
-        let (first, superseded) = repo::create_human_request(
+        let first = repo::create_human_request(
             &db,
             thread.workspace_id,
             thread.id,
             &direction.id.to_string(),
             direction.id,
             7,
+            0,
+            0,
             "Which API?",
         )
         .await
         .unwrap();
-        assert!(superseded.is_empty());
-        let (request, superseded) = repo::create_human_request(
+        let request = repo::create_human_request(
             &db,
             thread.workspace_id,
             thread.id,
             &direction.id.to_string(),
             direction.id,
             8,
+            0,
+            0,
             "REST or GraphQL?",
         )
         .await
         .unwrap();
-        assert_eq!(superseded, vec![first.id]);
-        assert_eq!(repo::get_human_request(&db, first.id).await.unwrap().unwrap().status, "superseded");
+        assert_eq!(
+            repo::get_human_request(&db, first.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            repo::HUMAN_REQUEST_OPEN
+        );
         // A fresh in-memory registry models a process restart: the DB row is
-        // still projected once, with the same stable id.
+        // still projected with the same stable id. Independent questions from
+        // one direction remain separately answerable.
         let snapshot = collect_snapshot(&db, &crate::ask::AskRegistry::new(), thread.workspace_id)
             .await
             .unwrap();
-        assert_eq!(snapshot.count, 1);
-        assert!(matches!(snapshot.items[0], AttentionItem::Question { request_id, .. } if request_id == request.id));
+        assert_eq!(snapshot.count, 2);
+        let request_ids: std::collections::HashSet<i32> = snapshot
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                AttentionItem::Question { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(request_ids, std::collections::HashSet::from([first.id, request.id]));
 
         assert!(repo::answer_human_request(&db, thread.workspace_id, request.id, 99, "REST")
             .await
@@ -587,6 +611,15 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        let open = repo::list_open_human_requests(&db, thread.workspace_id)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, first.id);
+        assert!(repo::answer_human_request(&db, thread.workspace_id, first.id, 1, "GraphQL")
+            .await
+            .unwrap()
+            .is_some());
         assert!(repo::list_open_human_requests(&db, thread.workspace_id)
             .await
             .unwrap()
@@ -596,18 +629,26 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_thread_withdraws_its_durable_questions() {
         let (db, thread, direction) = fixture().await;
-        let (request, _) = repo::create_human_request(
+        let request = repo::create_human_request(
             &db,
             thread.workspace_id,
             thread.id,
             &direction.id.to_string(),
             direction.id,
             1,
+            0,
+            0,
             "Continue?",
         )
         .await
         .unwrap();
-        assert_eq!(repo::cancel_open_human_requests_for_thread(&db, thread.id).await.unwrap(), 1);
+        assert_eq!(
+            repo::cancel_open_human_requests_for_thread(&db, thread.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(repo::get_human_request(&db, request.id).await.unwrap().unwrap().status, "cancelled");
         let snapshot = collect_snapshot(&db, &crate::ask::AskRegistry::new(), thread.workspace_id)
             .await
@@ -618,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_absorbs_plan_card_into_one_scope_item() {
         let (db, thread, _direction) = fixture().await;
-        repo::insert_lead_message(
+        let plan_card = repo::insert_lead_message(
             &db,
             thread.id,
             None,
@@ -648,6 +689,24 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(after.items.as_slice(), [AttentionItem::ScopeApproval { .. }]));
+        assert!(!repo::attention_card_is_actionable(
+            &db,
+            thread.id,
+            plan_card.id,
+            "plan_card",
+            false,
+        )
+        .await
+        .unwrap());
+        assert!(repo::attention_card_is_actionable(
+            &db,
+            thread.id,
+            plan_card.id,
+            "plan_card",
+            true,
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]
@@ -700,7 +759,7 @@ mod tests {
             .unwrap();
         assert!(settled.items.is_empty(), "an older unresolved card must not resurface");
 
-        repo::insert_lead_message(
+        let plan = repo::insert_lead_message(
             &db,
             thread.id,
             None,
@@ -712,6 +771,15 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(repo::attention_card_is_actionable(
+            &db,
+            thread.id,
+            plan.id,
+            "plan_card",
+            false,
+        )
+            .await
+            .unwrap());
         repo::insert_lead_message(
             &db,
             thread.id,
@@ -728,6 +796,40 @@ mod tests {
             .await
             .unwrap();
         assert!(revision.items.is_empty());
+        assert!(!repo::attention_card_is_actionable(
+            &db,
+            thread.id,
+            plan.id,
+            "plan_card",
+            false,
+        )
+            .await
+            .unwrap());
+
+        let settled_plan = repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            6,
+            "assistant",
+            "plan_card",
+            r#"{"title":"Settled plan"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        repo::resolve_action_card(&db, settled_plan.id, "Settled plan")
+            .await
+            .unwrap();
+        assert!(!repo::attention_card_is_actionable(
+            &db,
+            thread.id,
+            settled_plan.id,
+            "plan_card",
+            false,
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]
@@ -749,6 +851,8 @@ mod tests {
             "lead",
             0,
             1,
+            0,
+            0,
             "Which repository?",
         )
         .await
@@ -805,6 +909,8 @@ mod tests {
             "lead",
             0,
             1,
+            0,
+            0,
             "Ship now?",
         )
         .await
@@ -816,6 +922,8 @@ mod tests {
             &direction.id.to_string(),
             direction.id,
             1,
+            0,
+            0,
             "Use REST?",
         )
         .await
@@ -931,6 +1039,8 @@ mod tests {
             thread.id,
             &direction.id.to_string(),
             direction.id,
+            0,
+            0,
             0,
             "secret scope",
         )

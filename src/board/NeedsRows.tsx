@@ -138,7 +138,7 @@ function PlanApprovalRow({ item }: { item: Extract<AttentionItem, { kind: "plan_
     if (busy) return;
     setBusy(true);
     try {
-      await approvePlanCard(item.thread_id, item.message_id, item.title);
+      await approvePlanCard(item.thread_id, item.message_id);
       await refreshNeeds();
     } finally {
       setBusy(false);

@@ -186,13 +186,15 @@ async fn answer_human_route_lands_in_asker_inbox() {
     .await
     .unwrap();
     let scope = direction.id.to_string();
-    let (request, _) = repo::create_human_request(
+    let request = repo::create_human_request(
         &db,
         workspace.id,
         thread.id,
         &scope,
         direction.id,
         1,
+        0,
+        0,
         "major or minor?",
     )
     .await
@@ -216,7 +218,7 @@ async fn answer_human_route_lands_in_asker_inbox() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(stored.status, "resolved");
+    assert_eq!(stored.status, repo::HUMAN_REQUEST_ANSWERED);
 }
 
 #[tokio::test]

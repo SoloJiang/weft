@@ -2,6 +2,7 @@ pub mod app_setting;
 pub mod backup_config;
 pub mod code_checkpoint;
 pub mod direction;
+pub mod human_card_terminal_outbox;
 pub mod human_request;
 pub mod im_route;
 pub mod lead_message;

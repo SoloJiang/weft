@@ -1,16 +1,16 @@
 //! All DB reads/writes go through here. Keeps SeaORM specifics out of commands.
 
 use super::entities::{
-    app_setting, code_checkpoint, direction, human_request, im_route, lead_message, plan,
-    pull_request, repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread,
-    workspace, worktree,
+    app_setting, code_checkpoint, direction, human_card_terminal_outbox, human_request, im_route,
+    lead_message, plan, pull_request, repo_profile, repo_ref, session, skill_enable, skill_source,
+    test_plan, thread, workspace, worktree,
 };
 use super::Db;
 use crate::slug::unique_slug;
 use anyhow::Result;
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ColumnTrait, EntityTrait, NotSet, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    sea_query::{Alias, Expr, OnConflict}, ActiveModelTrait, ColumnTrait, ConnectionTrait,
+    EntityTrait, NotSet, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
     TryIntoModel,
 };
 use std::collections::HashMap;
@@ -27,9 +27,231 @@ pub struct InitialDirectionRoutePin {
     pub tool: String,
 }
 
-/// Create one durable free-text question and supersede older open questions
-/// from the exact same bus scope. Returns the new row plus superseded ids so
-/// the in-memory bus/IM mirrors can close their old cards.
+pub const HUMAN_REQUEST_OPEN: &str = "open";
+pub const HUMAN_REQUEST_ANSWERED: &str = "answered";
+pub const HUMAN_REQUEST_RESOLVED: &str = "resolved";
+pub const HUMAN_REQUEST_CANCELLED: &str = "cancelled";
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HumanRequestImRoute {
+    pub channel: String,
+    pub account: String,
+    pub owner: String,
+    pub message_id: String,
+    /// Last human_request revision whose terminal card was successfully
+    /// patched on this provider route. Missing on legacy JSON => 0/retry.
+    #[serde(default)]
+    pub terminal_revision: i32,
+}
+
+async fn upsert_human_card_terminal_outbox_on<C: ConnectionTrait>(
+    connection: &C,
+    request_id: i32,
+    thread_id: i32,
+    route: &HumanRequestImRoute,
+    terminal_status: &str,
+    answer: &str,
+    terminal_revision: i32,
+    delivered: bool,
+) -> Result<()> {
+    if route.message_id.trim().is_empty()
+        || route.channel.trim().is_empty()
+        || route.account.trim().is_empty()
+        || route.owner.trim().is_empty()
+        || terminal_revision <= 0
+    {
+        return Ok(());
+    }
+    let timestamp = now();
+    human_card_terminal_outbox::Entity::insert(human_card_terminal_outbox::ActiveModel {
+        id: NotSet,
+        request_id: Set(request_id),
+        thread_id: Set(thread_id),
+        channel: Set(route.channel.clone()),
+        account: Set(route.account.clone()),
+        owner: Set(route.owner.clone()),
+        message_id: Set(route.message_id.clone()),
+        terminal_status: Set(terminal_status.to_string()),
+        answer: Set(answer.to_string()),
+        terminal_revision: Set(terminal_revision),
+        delivered: Set(delivered),
+        created_at: Set(timestamp.clone()),
+        updated_at: Set(timestamp),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            human_card_terminal_outbox::Column::Channel,
+            human_card_terminal_outbox::Column::Account,
+            human_card_terminal_outbox::Column::Owner,
+            human_card_terminal_outbox::Column::MessageId,
+        ])
+        .update_columns([
+            human_card_terminal_outbox::Column::RequestId,
+            human_card_terminal_outbox::Column::ThreadId,
+            human_card_terminal_outbox::Column::TerminalStatus,
+            human_card_terminal_outbox::Column::Answer,
+            human_card_terminal_outbox::Column::TerminalRevision,
+            human_card_terminal_outbox::Column::Delivered,
+            human_card_terminal_outbox::Column::UpdatedAt,
+        ])
+        .action_and_where(
+            Expr::col((
+                Alias::new("excluded"),
+                human_card_terminal_outbox::Column::TerminalRevision,
+            ))
+            .gt(Expr::col((
+                Alias::new("human_card_terminal_outbox"),
+                human_card_terminal_outbox::Column::TerminalRevision,
+            )))
+            .or(
+                Expr::col((
+                    Alias::new("excluded"),
+                    human_card_terminal_outbox::Column::TerminalRevision,
+                ))
+                .eq(Expr::col((
+                    Alias::new("human_card_terminal_outbox"),
+                    human_card_terminal_outbox::Column::TerminalRevision,
+                )))
+                .and(
+                    Expr::col((
+                        Alias::new("human_card_terminal_outbox"),
+                        human_card_terminal_outbox::Column::Delivered,
+                    ))
+                    .eq(false),
+                ),
+            ),
+        )
+        .to_owned(),
+    )
+    .exec_without_returning(connection)
+    .await?;
+    Ok(())
+}
+
+pub async fn queue_human_card_terminal_outbox(
+    db: &Db,
+    request_id: i32,
+    thread_id: i32,
+    route: &HumanRequestImRoute,
+    terminal_status: &str,
+    answer: &str,
+    terminal_revision: i32,
+) -> Result<()> {
+    upsert_human_card_terminal_outbox_on(
+        &db.0,
+        request_id,
+        thread_id,
+        route,
+        terminal_status,
+        answer,
+        terminal_revision,
+        false,
+    )
+    .await
+}
+
+pub async fn list_human_card_terminal_outbox(
+    db: &Db,
+    channel: &str,
+    account: &str,
+    owner: &str,
+) -> Result<Vec<human_card_terminal_outbox::Model>> {
+    Ok(human_card_terminal_outbox::Entity::find()
+        .filter(human_card_terminal_outbox::Column::Channel.eq(channel))
+        .filter(human_card_terminal_outbox::Column::Account.eq(account))
+        .filter(human_card_terminal_outbox::Column::Owner.eq(owner))
+        .order_by_asc(human_card_terminal_outbox::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn list_pending_human_card_terminal_outbox(
+    db: &Db,
+    channel: &str,
+    account: &str,
+    owner: &str,
+) -> Result<Vec<human_card_terminal_outbox::Model>> {
+    Ok(list_human_card_terminal_outbox(db, channel, account, owner)
+        .await?
+        .into_iter()
+        .filter(|row| !row.delivered)
+        .collect())
+}
+
+pub async fn get_human_card_terminal_outbox_for_route(
+    db: &Db,
+    route: &HumanRequestImRoute,
+) -> Result<Option<human_card_terminal_outbox::Model>> {
+    Ok(human_card_terminal_outbox::Entity::find()
+        .filter(human_card_terminal_outbox::Column::Channel.eq(&route.channel))
+        .filter(human_card_terminal_outbox::Column::Account.eq(&route.account))
+        .filter(human_card_terminal_outbox::Column::Owner.eq(&route.owner))
+        .filter(human_card_terminal_outbox::Column::MessageId.eq(&route.message_id))
+        .one(&db.0)
+        .await?)
+}
+
+pub async fn mark_human_card_terminal_outbox_delivered(
+    db: &Db,
+    outbox_id: i32,
+    terminal_status: &str,
+    terminal_revision: i32,
+) -> Result<bool> {
+    let updated = human_card_terminal_outbox::Entity::update_many()
+        .col_expr(
+            human_card_terminal_outbox::Column::Delivered,
+            Expr::value(true),
+        )
+        .col_expr(
+            human_card_terminal_outbox::Column::Answer,
+            Expr::value(""),
+        )
+        .col_expr(
+            human_card_terminal_outbox::Column::UpdatedAt,
+            Expr::value(now()),
+        )
+        .filter(human_card_terminal_outbox::Column::Id.eq(outbox_id))
+        .filter(human_card_terminal_outbox::Column::TerminalStatus.eq(terminal_status))
+        .filter(human_card_terminal_outbox::Column::TerminalRevision.eq(terminal_revision))
+        .filter(human_card_terminal_outbox::Column::Delivered.eq(false))
+        .exec(&db.0)
+        .await?;
+    Ok(updated.rows_affected == 1)
+}
+
+fn same_human_request_im_route(left: &HumanRequestImRoute, right: &HumanRequestImRoute) -> bool {
+    left.channel == right.channel
+        && left.account == right.account
+        && left.owner == right.owner
+        && left.message_id == right.message_id
+}
+
+async fn human_request_source_matches(
+    db: &Db,
+    thread_id: i32,
+    turn_id: i32,
+    source_message_id: i32,
+    source_session_id: i32,
+) -> Result<bool> {
+    if source_message_id == 0 {
+        return Ok(true);
+    }
+    let mut query = lead_message::Entity::find_by_id(source_message_id)
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::TurnId.eq(turn_id))
+        .filter(lead_message::Column::Role.eq("user"))
+        .filter(lead_message::Column::Status.eq("complete"));
+    query = if source_session_id == 0 {
+        query.filter(lead_message::Column::SessionId.is_null())
+    } else {
+        query.filter(lead_message::Column::SessionId.eq(source_session_id))
+    };
+    Ok(query.one(&db.0).await?.is_some())
+}
+
+/// Create one durable free-text question. Questions from the same agent scope
+/// are independent unless a future transport supplies an explicit retry key;
+/// creating a second question must never make the first one unanswerable.
 pub async fn create_human_request(
     db: &Db,
     workspace_id: i32,
@@ -37,10 +259,10 @@ pub async fn create_human_request(
     direction_scope: &str,
     direction_id: i32,
     turn_id: i32,
+    source_message_id: i32,
+    source_session_id: i32,
     question: &str,
-) -> Result<(human_request::Model, Vec<i32>)> {
-    use sea_orm::TransactionTrait;
-
+) -> Result<human_request::Model> {
     if question.trim().is_empty() {
         anyhow::bail!("human question cannot be empty");
     }
@@ -50,6 +272,7 @@ pub async fn create_human_request(
     if thread.workspace_id != workspace_id {
         anyhow::bail!("thread {thread_id} does not belong to workspace {workspace_id}");
     }
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     if direction_id == 0 {
         if !matches!(direction_scope, "" | "lead") {
             anyhow::bail!("invalid lead question scope '{direction_scope}'");
@@ -64,30 +287,18 @@ pub async fn create_human_request(
             );
         }
     }
-
-    let txn = db.0.begin().await?;
-    let superseded: Vec<i32> = human_request::Entity::find()
-        .select_only()
-        .column(human_request::Column::Id)
-        .filter(human_request::Column::ThreadId.eq(thread_id))
-        .filter(human_request::Column::DirectionScope.eq(direction_scope))
-        .filter(human_request::Column::Status.eq("open"))
-        .into_tuple()
-        .all(&txn)
-        .await?;
-    if !superseded.is_empty() {
-        human_request::Entity::update_many()
-            .col_expr(human_request::Column::Status, Expr::value("superseded"))
-            .col_expr(
-                human_request::Column::Revision,
-                Expr::col(human_request::Column::Revision).add(1),
-            )
-            .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
-            .filter(human_request::Column::Id.is_in(superseded.clone()))
-            .filter(human_request::Column::Status.eq("open"))
-            .exec(&txn)
-            .await?;
+    if !human_request_source_matches(
+        db,
+        thread_id,
+        turn_id,
+        source_message_id,
+        source_session_id,
+    )
+    .await?
+    {
+        anyhow::bail!("source turn for human question no longer exists");
     }
+
     let stamp = now();
     let inserted = human_request::ActiveModel {
         id: NotSet,
@@ -96,17 +307,80 @@ pub async fn create_human_request(
         direction_id: Set(direction_id),
         direction_scope: Set(direction_scope.to_string()),
         turn_id: Set(turn_id),
+        source_message_id: Set(source_message_id),
+        source_session_id: Set(source_session_id),
         question: Set(question.trim().to_string()),
-        status: Set("open".to_string()),
+        status: Set(HUMAN_REQUEST_OPEN.to_string()),
         answer: Set(String::new()),
+        im_routes: Set("[]".to_string()),
         revision: Set(1),
         created_at: Set(stamp.clone()),
         updated_at: Set(stamp),
     }
-    .insert(&txn)
+    .insert(&db.0)
     .await?;
-    txn.commit().await?;
-    Ok((inserted, superseded))
+    let accepted = match ensure_thread_workspace_accepts_writes(db, thread_id).await {
+        Ok(_) => {
+            human_request_source_matches(
+                db,
+                thread_id,
+                turn_id,
+                source_message_id,
+                source_session_id,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    match accepted {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = human_request::Entity::delete_by_id(inserted.id)
+                .exec(&db.0)
+                .await;
+            anyhow::bail!("source turn for human question no longer exists");
+        }
+        Err(error) => {
+            let _ = human_request::Entity::delete_by_id(inserted.id)
+                .exec(&db.0)
+                .await;
+            return Err(error);
+        }
+    }
+    Ok(inserted)
+}
+
+/// Resolve the completed user row that opened the agent turn currently calling
+/// ask_human. A queued mid-turn revision is deliberately excluded: it belongs
+/// to the next turn and must not become the rewind identity of this request.
+pub async fn latest_human_request_source(
+    db: &Db,
+    thread_id: i32,
+    direction_id: i32,
+) -> Result<Option<lead_message::Model>> {
+    use sea_orm::Order;
+
+    let session_id = if direction_id == 0 {
+        None
+    } else {
+        let Some(session) = latest_session_for_direction(db, direction_id).await? else {
+            return Ok(None);
+        };
+        Some(session.id)
+    };
+    let mut query = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Role.eq("user"))
+        .filter(lead_message::Column::Status.eq("complete"));
+    query = match session_id {
+        Some(session_id) => query.filter(lead_message::Column::SessionId.eq(session_id)),
+        None => query.filter(lead_message::Column::SessionId.is_null()),
+    };
+    Ok(query
+        .order_by(Expr::cust("COALESCE(seq, id)"), Order::Desc)
+        .order_by_desc(lead_message::Column::Id)
+        .one(&db.0)
+        .await?)
 }
 
 pub async fn list_open_human_requests(
@@ -115,7 +389,7 @@ pub async fn list_open_human_requests(
 ) -> Result<Vec<human_request::Model>> {
     Ok(human_request::Entity::find()
         .filter(human_request::Column::WorkspaceId.eq(workspace_id))
-        .filter(human_request::Column::Status.eq("open"))
+        .filter(human_request::Column::Status.eq(HUMAN_REQUEST_OPEN))
         .order_by_asc(human_request::Column::CreatedAt)
         .order_by_asc(human_request::Column::Id)
         .all(&db.0)
@@ -124,8 +398,63 @@ pub async fn list_open_human_requests(
 
 pub async fn list_all_open_human_requests(db: &Db) -> Result<Vec<human_request::Model>> {
     Ok(human_request::Entity::find()
-        .filter(human_request::Column::Status.eq("open"))
+        .filter(human_request::Column::Status.eq(HUMAN_REQUEST_OPEN))
         .order_by_asc(human_request::Column::CreatedAt)
+        .order_by_asc(human_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+/// Questions that must be reconstructed into the in-memory bus at startup:
+/// open rows become answerable asks; answered rows become pending inbox
+/// messages until an explicit `bus_ack` acknowledges delivery.
+pub async fn list_pending_human_requests(db: &Db) -> Result<Vec<human_request::Model>> {
+    Ok(human_request::Entity::find()
+        .filter(
+            human_request::Column::Status
+                .is_in([HUMAN_REQUEST_OPEN, HUMAN_REQUEST_ANSWERED]),
+        )
+        .filter(Expr::cust(
+            "EXISTS (SELECT 1 FROM thread WHERE thread.id = human_request.thread_id)",
+        ))
+        .order_by_asc(human_request::Column::CreatedAt)
+        .order_by_asc(human_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+/// Answered rows are replayed into the transcript trail at boot with an
+/// ask-id dedupe guard. Include delivered rows too: the process may have died
+/// after the agent consumed the inbox but before the async trail insert landed.
+pub async fn list_answered_human_requests(db: &Db) -> Result<Vec<human_request::Model>> {
+    Ok(human_request::Entity::find()
+        .filter(
+            human_request::Column::Status
+                .is_in([HUMAN_REQUEST_ANSWERED, HUMAN_REQUEST_RESOLVED]),
+        )
+        .filter(human_request::Column::Answer.ne(""))
+        .filter(Expr::cust(
+            "EXISTS (SELECT 1 FROM thread WHERE thread.id = human_request.thread_id)",
+        ))
+        .order_by_asc(human_request::Column::CreatedAt)
+        .order_by_asc(human_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+/// At-least-once outbox read for one authenticated bus route. `bus_inbox`
+/// merges these rows with its process-local inbox on every call; only an
+/// explicit `bus_ack` removes them from durable replay.
+pub async fn list_pending_human_answers_for_scope(
+    db: &Db,
+    thread_id: i32,
+    direction_scope: &str,
+) -> Result<Vec<human_request::Model>> {
+    Ok(human_request::Entity::find()
+        .filter(human_request::Column::ThreadId.eq(thread_id))
+        .filter(human_request::Column::DirectionScope.eq(direction_scope))
+        .filter(human_request::Column::Status.eq(HUMAN_REQUEST_ANSWERED))
+        .order_by_asc(human_request::Column::UpdatedAt)
         .order_by_asc(human_request::Column::Id)
         .all(&db.0)
         .await?)
@@ -138,8 +467,117 @@ pub async fn get_human_request(
     Ok(human_request::Entity::find_by_id(request_id).one(&db.0).await?)
 }
 
-/// OCC transition for an answer. `None` means stale, wrong workspace, or no
-/// longer open; no bus message should be delivered in that case.
+pub async fn list_human_request_im_routes(db: &Db) -> Result<Vec<human_request::Model>> {
+    Ok(human_request::Entity::find()
+        .filter(human_request::Column::ImRoutes.ne("[]"))
+        .filter(human_request::Column::ImRoutes.ne(""))
+        .filter(Expr::cust(
+            "EXISTS (SELECT 1 FROM thread WHERE thread.id = human_request.thread_id)",
+        ))
+        .order_by_asc(human_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn record_human_request_im_route(
+    db: &Db,
+    request_id: i32,
+    route: &HumanRequestImRoute,
+) -> Result<bool> {
+    if route.message_id.trim().is_empty()
+        || route.channel.trim().is_empty()
+        || route.account.trim().is_empty()
+        || route.owner.trim().is_empty()
+    {
+        return Ok(false);
+    }
+    for _ in 0..4 {
+        let Some(request) = get_human_request(db, request_id).await? else {
+            return Ok(false);
+        };
+        let mut routes = serde_json::from_str::<Vec<HumanRequestImRoute>>(&request.im_routes)
+            .unwrap_or_default();
+        if routes
+            .iter()
+            .any(|existing| same_human_request_im_route(existing, route))
+        {
+            return Ok(true);
+        }
+        routes.push(route.clone());
+        let encoded = serde_json::to_string(&routes)?;
+        let updated = human_request::Entity::update_many()
+            .col_expr(human_request::Column::ImRoutes, Expr::value(encoded))
+            .filter(human_request::Column::Id.eq(request_id))
+            .filter(human_request::Column::Revision.eq(request.revision))
+            .filter(human_request::Column::ImRoutes.eq(request.im_routes))
+            .exec(&db.0)
+            .await?;
+        if updated.rows_affected == 1 {
+            return Ok(true);
+        }
+    }
+    anyhow::bail!("human question IM routes changed too many times concurrently")
+}
+
+/// Record the provider receipt only after a terminal card patch succeeds. The
+/// JSON CAS composes with concurrent route delivery and other patch receipts;
+/// a crash before this write leaves the older revision in place so startup
+/// retries exactly that route.
+pub async fn mark_human_request_im_route_terminal(
+    db: &Db,
+    request_id: i32,
+    message_id: &str,
+    terminal_revision: i32,
+) -> Result<bool> {
+    if message_id.trim().is_empty() || terminal_revision <= 0 {
+        return Ok(false);
+    }
+    for _ in 0..4 {
+        let Some(request) = get_human_request(db, request_id).await? else {
+            return Ok(false);
+        };
+        if request.revision != terminal_revision {
+            return Ok(false);
+        }
+        let mut routes = serde_json::from_str::<Vec<HumanRequestImRoute>>(&request.im_routes)
+            .unwrap_or_default();
+        let mut found = false;
+        let mut changed = false;
+        for route in &mut routes {
+            if route.message_id != message_id {
+                continue;
+            }
+            found = true;
+            if route.terminal_revision < terminal_revision {
+                route.terminal_revision = terminal_revision;
+                changed = true;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+        if !changed {
+            return Ok(true);
+        }
+        let encoded = serde_json::to_string(&routes)?;
+        let updated = human_request::Entity::update_many()
+            .col_expr(human_request::Column::ImRoutes, Expr::value(encoded))
+            .filter(human_request::Column::Id.eq(request_id))
+            .filter(human_request::Column::Revision.eq(terminal_revision))
+            .filter(human_request::Column::ImRoutes.eq(request.im_routes))
+            .exec(&db.0)
+            .await?;
+        if updated.rows_affected == 1 {
+            return Ok(true);
+        }
+    }
+    anyhow::bail!("human question IM terminal receipts changed too many times concurrently")
+}
+
+/// OCC transition for an answer. `answered` means the text is durably stored
+/// but remains pending until the asking agent consumes it through `bus_inbox`.
+/// `None` means stale, wrong workspace, or no longer open; no bus message
+/// should be delivered in that case.
 pub async fn answer_human_request(
     db: &Db,
     workspace_id: i32,
@@ -151,7 +589,10 @@ pub async fn answer_human_request(
         anyhow::bail!("human answer cannot be empty");
     }
     let updated = human_request::Entity::update_many()
-        .col_expr(human_request::Column::Status, Expr::value("resolved"))
+        .col_expr(
+            human_request::Column::Status,
+            Expr::value(HUMAN_REQUEST_ANSWERED),
+        )
         .col_expr(human_request::Column::Answer, Expr::value(answer.trim()))
         .col_expr(
             human_request::Column::Revision,
@@ -160,7 +601,7 @@ pub async fn answer_human_request(
         .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
         .filter(human_request::Column::Id.eq(request_id))
         .filter(human_request::Column::WorkspaceId.eq(workspace_id))
-        .filter(human_request::Column::Status.eq("open"))
+        .filter(human_request::Column::Status.eq(HUMAN_REQUEST_OPEN))
         .filter(human_request::Column::Revision.eq(expected_revision))
         .exec(&db.0)
         .await?;
@@ -170,37 +611,148 @@ pub async fn answer_human_request(
     Ok(human_request::Entity::find_by_id(request_id).one(&db.0).await?)
 }
 
-pub async fn cancel_open_human_requests_for_thread(db: &Db, thread_id: i32) -> Result<u64> {
+/// Receipt written by `bus_ack` after the agent has incorporated durable answer
+/// messages. Until this succeeds the database stays `answered`, so every inbox
+/// read and process restart can replay them.
+pub async fn mark_human_answers_delivered(
+    db: &Db,
+    thread_id: i32,
+    direction_scope: &str,
+    request_ids: &[i32],
+) -> Result<u64> {
+    if request_ids.is_empty() {
+        return Ok(0);
+    }
     let updated = human_request::Entity::update_many()
-        .col_expr(human_request::Column::Status, Expr::value("cancelled"))
+        .col_expr(
+            human_request::Column::Status,
+            Expr::value(HUMAN_REQUEST_RESOLVED),
+        )
         .col_expr(
             human_request::Column::Revision,
             Expr::col(human_request::Column::Revision).add(1),
         )
         .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
+        .filter(human_request::Column::Id.is_in(request_ids.iter().copied()))
         .filter(human_request::Column::ThreadId.eq(thread_id))
-        .filter(human_request::Column::Status.eq("open"))
+        .filter(human_request::Column::DirectionScope.eq(direction_scope))
+        .filter(human_request::Column::Status.eq(HUMAN_REQUEST_ANSWERED))
         .exec(&db.0)
         .await?;
     Ok(updated.rows_affected)
 }
 
+#[derive(Clone, Copy)]
+enum HumanRequestCancelScope {
+    Thread(i32),
+    Direction(i32),
+}
+
+async fn cancel_human_requests_in_scope(
+    db: &Db,
+    scope: HumanRequestCancelScope,
+) -> Result<Vec<i32>> {
+    let txn = db.0.begin().await?;
+    let candidates = match scope {
+        HumanRequestCancelScope::Thread(thread_id) => human_request::Entity::find()
+            .filter(human_request::Column::ThreadId.eq(thread_id)),
+        HumanRequestCancelScope::Direction(direction_id) => human_request::Entity::find()
+            .filter(human_request::Column::DirectionId.eq(direction_id)),
+    }
+    .filter(human_request::Column::Status.is_in([
+        HUMAN_REQUEST_OPEN,
+        HUMAN_REQUEST_ANSWERED,
+        HUMAN_REQUEST_RESOLVED,
+    ]))
+    .order_by_asc(human_request::Column::Id)
+    .all(&txn)
+    .await?;
+    let mut cancelled = Vec::new();
+    for request in candidates {
+        let routes = serde_json::from_str::<Vec<HumanRequestImRoute>>(&request.im_routes)
+            .unwrap_or_default();
+        if request.status == HUMAN_REQUEST_RESOLVED {
+            // A resolved card needs no deletion repaint, but its provider
+            // message id must outlive the request row. Persist an already-
+            // delivered tombstone when the preceding answered revision has a
+            // provider receipt. Otherwise preserve a pending resolved patch;
+            // its answer is scrubbed as soon as delivery succeeds. Either row
+            // keeps historical replies on the stale-answer path after restart.
+            for route in routes {
+                let delivered = route.terminal_revision > 0
+                    && route.terminal_revision.saturating_add(1) >= request.revision;
+                let answer = if delivered {
+                    ""
+                } else {
+                    request.answer.as_str()
+                };
+                upsert_human_card_terminal_outbox_on(
+                    &txn,
+                    request.id,
+                    request.thread_id,
+                    &route,
+                    HUMAN_REQUEST_RESOLVED,
+                    answer,
+                    request.revision,
+                    delivered,
+                )
+                .await?;
+            }
+            continue;
+        }
+        let terminal_revision = request.revision.saturating_add(1);
+        let updated = human_request::Entity::update_many()
+            .col_expr(
+                human_request::Column::Status,
+                Expr::value(HUMAN_REQUEST_CANCELLED),
+            )
+            .col_expr(
+                human_request::Column::Revision,
+                Expr::value(terminal_revision),
+            )
+            .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
+            .filter(human_request::Column::Id.eq(request.id))
+            .filter(human_request::Column::Revision.eq(request.revision))
+            .filter(
+                human_request::Column::Status
+                    .is_in([HUMAN_REQUEST_OPEN, HUMAN_REQUEST_ANSWERED]),
+            )
+            .exec(&txn)
+            .await?;
+        if updated.rows_affected != 1 {
+            continue;
+        }
+        for route in routes {
+            upsert_human_card_terminal_outbox_on(
+                &txn,
+                request.id,
+                request.thread_id,
+                &route,
+                HUMAN_REQUEST_CANCELLED,
+                "",
+                terminal_revision,
+                false,
+            )
+            .await?;
+        }
+        cancelled.push(request.id);
+    }
+    txn.commit().await?;
+    Ok(cancelled)
+}
+
+pub async fn cancel_open_human_requests_for_thread(
+    db: &Db,
+    thread_id: i32,
+) -> Result<Vec<i32>> {
+    cancel_human_requests_in_scope(db, HumanRequestCancelScope::Thread(thread_id)).await
+}
+
 pub async fn cancel_open_human_requests_for_direction(
     db: &Db,
     direction_id: i32,
-) -> Result<u64> {
-    let updated = human_request::Entity::update_many()
-        .col_expr(human_request::Column::Status, Expr::value("cancelled"))
-        .col_expr(
-            human_request::Column::Revision,
-            Expr::col(human_request::Column::Revision).add(1),
-        )
-        .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
-        .filter(human_request::Column::DirectionId.eq(direction_id))
-        .filter(human_request::Column::Status.eq("open"))
-        .exec(&db.0)
-        .await?;
-    Ok(updated.rows_affected)
+) -> Result<Vec<i32>> {
+    cancel_human_requests_in_scope(db, HumanRequestCancelScope::Direction(direction_id)).await
 }
 
 /// Test-only DB-write failure injection.
@@ -1610,6 +2162,10 @@ pub async fn list_directions(db: &Db, thread_id: i32) -> Result<Vec<direction::M
 /// a half-created direction when materialize fails, so a corrected retry starts clean.
 pub async fn delete_direction(db: &Db, direction_id: i32) -> Result<()> {
     cancel_open_human_requests_for_direction(db, direction_id).await?;
+    human_request::Entity::delete_many()
+        .filter(human_request::Column::DirectionId.eq(direction_id))
+        .exec(&db.0)
+        .await?;
     worktree::Entity::delete_many()
         .filter(worktree::Column::DirectionId.eq(direction_id))
         .exec(&db.0)
@@ -2282,6 +2838,10 @@ pub async fn delete_repo_cascade(
         .all(&db.0)
         .await?;
     for d in &dirs {
+        human_request::Entity::delete_many()
+            .filter(human_request::Column::DirectionId.eq(d.id))
+            .exec(&db.0)
+            .await?;
         session::Entity::delete_many()
             .filter(session::Column::DirectionId.eq(d.id))
             .exec(&db.0)
@@ -2375,6 +2935,10 @@ pub async fn delete_workspace_cascade(
     }
 
     for thread_id in &thread_ids {
+        human_request::Entity::delete_many()
+            .filter(human_request::Column::ThreadId.eq(*thread_id))
+            .exec(&db.0)
+            .await?;
         im_route::Entity::delete_many()
             .filter(im_route::Column::ThreadId.eq(*thread_id))
             .exec(&db.0)
@@ -2521,6 +3085,10 @@ pub async fn delete_thread_cascade(
         .await?;
     test_plan::Entity::delete_many()
         .filter(test_plan::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
+    human_request::Entity::delete_many()
+        .filter(human_request::Column::ThreadId.eq(thread_id))
         .exec(&txn)
         .await?;
     // issue #110 T3 review: a tracked PR/MR row (`register_pr` /
@@ -2968,9 +3536,10 @@ pub async fn truncate_code_checkpoints(
 }
 
 /// Conversation rewind's persistence in ONE transaction: timeline truncation,
-/// the code-checkpoint sweep, and the fork's native id (worker session row or
-/// lead meta row). Any failure rolls ALL of it back — never a truncated
-/// timeline still pointing at the old native history (review P1).
+/// the code-checkpoint sweep, cancellation of durable questions from the
+/// abandoned agent scope, and the fork's native id (worker session row or lead
+/// meta row). Any failure rolls ALL of it back — never a truncated timeline
+/// that can resurrect a stale question or still points at old native history.
 pub async fn rewind_persist(
     db: &Db,
     thread_id: i32,
@@ -2978,12 +3547,77 @@ pub async fn rewind_persist(
     from_message_id: i32,
     worktree_id: Option<i32>,
     native_id: Option<&str>,
-) -> Result<Vec<i32>> {
+) -> Result<(Vec<i32>, Vec<i32>)> {
     use sea_orm::TransactionTrait;
     let txn = db.0.begin().await?;
     let deleted_ids = truncate_lead_messages(&txn, thread_id, session_id, from_message_id).await?;
     if let Some(w) = worktree_id {
         truncate_code_checkpoints(&txn, w, &deleted_ids).await?;
+    }
+    let cancelled_requests = if deleted_ids.is_empty() {
+        Vec::new()
+    } else {
+        human_request::Entity::find()
+            .filter(human_request::Column::ThreadId.eq(thread_id))
+            .filter(
+                human_request::Column::SourceMessageId.is_in(deleted_ids.iter().copied()),
+            )
+            .filter(
+                human_request::Column::Status
+                    .is_in([
+                        HUMAN_REQUEST_OPEN,
+                        HUMAN_REQUEST_ANSWERED,
+                        HUMAN_REQUEST_RESOLVED,
+                    ]),
+            )
+            .order_by_asc(human_request::Column::Id)
+            .all(&txn)
+            .await?
+    };
+    let mut cancelled_request_ids = Vec::new();
+    for request in cancelled_requests {
+        let terminal_revision = request.revision.saturating_add(1);
+        let updated = human_request::Entity::update_many()
+            .col_expr(
+                human_request::Column::Status,
+                Expr::value(HUMAN_REQUEST_CANCELLED),
+            )
+            .col_expr(
+                human_request::Column::Revision,
+                Expr::value(terminal_revision),
+            )
+            .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
+            .filter(human_request::Column::Id.eq(request.id))
+            .filter(human_request::Column::Revision.eq(request.revision))
+            .filter(
+                human_request::Column::Status
+                    .is_in([
+                        HUMAN_REQUEST_OPEN,
+                        HUMAN_REQUEST_ANSWERED,
+                        HUMAN_REQUEST_RESOLVED,
+                    ]),
+            )
+            .exec(&txn)
+            .await?;
+        if updated.rows_affected != 1 {
+            continue;
+        }
+        let routes = serde_json::from_str::<Vec<HumanRequestImRoute>>(&request.im_routes)
+            .unwrap_or_default();
+        for route in routes {
+            upsert_human_card_terminal_outbox_on(
+                &txn,
+                request.id,
+                request.thread_id,
+                &route,
+                HUMAN_REQUEST_CANCELLED,
+                "",
+                terminal_revision,
+                false,
+            )
+            .await?;
+        }
+        cancelled_request_ids.push(request.id);
     }
     match session_id {
         Some(sid) => {
@@ -2996,7 +3630,7 @@ pub async fn rewind_persist(
         None => set_lead_native_id_txn(&txn, thread_id, native_id).await?,
     }
     txn.commit().await?;
-    Ok(deleted_ids)
+    Ok((deleted_ids, cancelled_request_ids))
 }
 
 /// The lead native-id write inside [`rewind_persist`]'s transaction — mirrors
@@ -3274,6 +3908,98 @@ pub async fn list_lead_messages(db: &Db, thread_id: i32) -> Result<Vec<lead_mess
         .await?)
 }
 
+pub async fn get_lead_message(db: &Db, message_id: i32) -> Result<Option<lead_message::Model>> {
+    Ok(lead_message::Entity::find_by_id(message_id)
+        .one(&db.0)
+        .await?)
+}
+
+/// Atomically insert one durable human-answer trail row if the request still
+/// belongs to a live source conversation. The status/source/session checks and
+/// request-id dedupe share the INSERT statement with the write, so rewind or
+/// cascade deletion either happens entirely before it (insert refused) or
+/// entirely after it (the cascade/truncation removes the inserted row).
+pub async fn insert_human_answer_trail(
+    db: &Db,
+    thread_id: i32,
+    request_id: i32,
+    session_id: Option<i32>,
+    content: &str,
+) -> Result<Option<lead_message::Model>> {
+    use sea_orm::ConnectionTrait;
+
+    let inserted = db
+        .0
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO lead_message \
+             (thread_id, session_id, turn_id, role, kind, content, status, created_at) \
+             SELECT ?, ?, \
+                    MAX(1, COALESCE((SELECT MAX(turn_id) FROM lead_message WHERE thread_id = ?), 0)), \
+                    'system', 'settled', ?, 'complete', ? \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM human_request hr \
+                 WHERE hr.id = ? \
+                   AND hr.thread_id = ? \
+                   AND hr.status IN (?, ?) \
+                   AND ( \
+                       (hr.direction_id = 0 AND ? IS NULL) \
+                       OR (hr.direction_id > 0 AND ? IS NOT NULL AND EXISTS ( \
+                           SELECT 1 FROM session s \
+                           JOIN direction d ON d.id = s.direction_id \
+                           WHERE s.id = ? \
+                             AND s.direction_id = hr.direction_id \
+                             AND d.thread_id = hr.thread_id \
+                       )) \
+                   ) \
+                   AND (hr.source_message_id = 0 OR EXISTS ( \
+                       SELECT 1 FROM lead_message source \
+                       WHERE source.id = hr.source_message_id \
+                         AND source.thread_id = hr.thread_id \
+                         AND source.role = 'user' \
+                         AND source.status = 'complete' \
+                         AND source.turn_id = hr.turn_id \
+                         AND ( \
+                             (hr.source_session_id = 0 AND source.session_id IS NULL) \
+                             OR source.session_id = hr.source_session_id \
+                         ) \
+                   )) \
+             ) \
+               AND EXISTS (SELECT 1 FROM thread WHERE id = ?) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM lead_message \
+                   WHERE thread_id = ? \
+                     AND kind = 'settled' \
+                     AND json_valid(content) \
+                     AND json_extract(content, '$.request_id') = ? \
+               )",
+            [
+                thread_id.into(),
+                session_id.into(),
+                thread_id.into(),
+                content.into(),
+                now().into(),
+                request_id.into(),
+                thread_id.into(),
+                HUMAN_REQUEST_ANSWERED.into(),
+                HUMAN_REQUEST_RESOLVED.into(),
+                session_id.into(),
+                session_id.into(),
+                session_id.into(),
+                thread_id.into(),
+                thread_id.into(),
+                i64::from(request_id).into(),
+            ],
+        ))
+        .await?;
+    if inserted.rows_affected() == 0 {
+        return Ok(None);
+    }
+    let id = i32::try_from(inserted.last_insert_id())
+        .map_err(|_| anyhow::anyhow!("human-answer trail id overflow"))?;
+    Ok(lead_message::Entity::find_by_id(id).one(&db.0).await?)
+}
+
 /// Return the single lead-timeline card that can still be acted on from a
 /// global attention surface. This mirrors ChatTimeline's read-only guards
 /// without loading the complete transcript on every Needs refresh:
@@ -3339,6 +4065,47 @@ pub async fn latest_actionable_attention_card(
         }
     }
     Ok(Some(candidate))
+}
+
+/// Action-time guard for plan/repo-card callbacks. Polling can leave a stale
+/// row enabled for a few seconds, so the backend must re-check both timeline
+/// position and the card's persisted resolved bit immediately before handing
+/// feedback to the agent.
+pub async fn attention_card_is_actionable(
+    db: &Db,
+    thread_id: i32,
+    message_id: i32,
+    expected_kind: &str,
+    allow_proposed_scope: bool,
+) -> Result<bool> {
+    let Some(message) = latest_actionable_attention_card(db, thread_id).await? else {
+        return Ok(false);
+    };
+    if message.id != message_id
+        || message.kind != expected_kind
+        || message.role != "assistant"
+        || message.session_id.is_some()
+    {
+        return Ok(false);
+    }
+    if expected_kind == "plan_card" {
+        let has_proposed_scope = get_plan(db, thread_id)
+            .await?
+            .is_some_and(|plan| plan.status == "proposed" && !plan.proposal.trim().is_empty());
+        if has_proposed_scope != allow_proposed_scope {
+            return Ok(false);
+        }
+    }
+    let resolved = serde_json::from_str::<serde_json::Value>(&message.content)
+        .ok()
+        .and_then(|value| value.get("resolved").cloned())
+        .is_some_and(|value| match value {
+            serde_json::Value::Bool(resolved) => resolved,
+            serde_json::Value::String(label) => !label.trim().is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        });
+    Ok(!resolved)
 }
 
 /// The next turn number for a thread's timeline (1-based).
@@ -5087,10 +5854,31 @@ mod tests {
         insert_lead_message(&db, t.id, None, 1, "assistant", "text", "{\"text\":\"hi\"}", "complete")
             .await
             .unwrap();
+        let request = create_human_request(
+            &db,
+            ws.id,
+            t.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "keep history?",
+        )
+        .await
+        .unwrap();
+        answer_human_request(&db, ws.id, request.id, request.revision, "yes")
+            .await
+            .unwrap()
+            .unwrap();
+        mark_human_answers_delivered(&db, t.id, "lead", &[request.id])
+            .await
+            .unwrap();
         delete_thread_cascade(&db, t.id).await.unwrap();
         assert!(get_test_plan(&db, t.id).await.unwrap().is_none());
         assert!(list_lead_messages(&db, t.id).await.unwrap().is_empty());
         assert!(get_thread(&db, t.id).await.unwrap().is_none());
+        assert!(get_human_request(&db, request.id).await.unwrap().is_none());
         // The write fence: a late save/sentinel can't recreate an orphan row.
         assert!(
             upsert_test_plan(&db, t.id, "# late\n- x\n", "user").await.is_err(),
@@ -5477,7 +6265,7 @@ mod tests {
     #[tokio::test]
     async fn rewind_persist_is_atomic_and_complete() {
         let db = mem().await;
-        let (_ws, r, _t, d) = worker_fixture(&db).await;
+        let (ws, r, _t, d) = worker_fixture(&db).await;
         let s = create_session(&db, d.id, r.id, "claude", "/tmp/cwd")
             .await
             .unwrap();
@@ -5485,12 +6273,115 @@ mod tests {
             .await
             .unwrap();
         let t = d.thread_id;
+        let m0 = insert_lead_message(&db, t, Some(s.id), 0, "user", "text", "{}", "complete")
+            .await
+            .unwrap();
         let m1 = insert_lead_message(&db, t, Some(s.id), 1, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        insert_lead_message(&db, t, Some(s.id), 2, "user", "text", "{}", "complete")
+        let m2 = insert_lead_message(&db, t, Some(s.id), 2, "user", "text", "{}", "complete")
             .await
             .unwrap();
+        let kept_request = create_human_request(
+            &db,
+            ws.id,
+            t,
+            &d.id.to_string(),
+            d.id,
+            m0.turn_id,
+            m0.id,
+            s.id,
+            "kept question",
+        )
+        .await
+        .unwrap();
+        let cancelled_open = create_human_request(
+            &db,
+            ws.id,
+            t,
+            &d.id.to_string(),
+            d.id,
+            m1.turn_id,
+            m1.id,
+            s.id,
+            "abandoned open question",
+        )
+        .await
+        .unwrap();
+        let cancelled_answered = create_human_request(
+            &db,
+            ws.id,
+            t,
+            &d.id.to_string(),
+            d.id,
+            m2.turn_id,
+            m2.id,
+            s.id,
+            "abandoned answered question",
+        )
+        .await
+        .unwrap();
+        let cancelled_resolved = create_human_request(
+            &db,
+            ws.id,
+            t,
+            &d.id.to_string(),
+            d.id,
+            m2.turn_id,
+            m2.id,
+            s.id,
+            "abandoned delivered question",
+        )
+        .await
+        .unwrap();
+        answer_human_request(
+            &db,
+            ws.id,
+            cancelled_answered.id,
+            cancelled_answered.revision,
+            "answer",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        answer_human_request(
+            &db,
+            ws.id,
+            cancelled_resolved.id,
+            cancelled_resolved.revision,
+            "delivered answer",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mark_human_answers_delivered(
+                &db,
+                t,
+                &d.id.to_string(),
+                &[cancelled_resolved.id],
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let resolved_trail = serde_json::json!({
+            "variant": "ask",
+            "request_id": cancelled_resolved.id,
+            "text": cancelled_resolved.question,
+            "answer": "delivered answer",
+        })
+        .to_string();
+        assert!(insert_human_answer_trail(
+            &db,
+            t,
+            cancelled_resolved.id,
+            Some(s.id),
+            &resolved_trail,
+        )
+        .await
+        .unwrap()
+        .is_some());
         insert_code_checkpoint(&db, 11, s.id, m1.id, 1, "sha-1", "head-1", "[]", "idx-1")
             .await
             .unwrap();
@@ -5499,11 +6390,61 @@ mod tests {
             .await
             .unwrap();
 
-        let deleted = rewind_persist(&db, t, Some(s.id), m1.id, Some(11), Some("new-native"))
+        let (deleted, cancelled_requests) = rewind_persist(
+            &db,
+            t,
+            Some(s.id),
+            m1.id,
+            Some(11),
+            Some("new-native"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted.len(), 3, "future timeline rows and answer trail deleted");
+        assert_eq!(
+            std::collections::HashSet::<i32>::from_iter(cancelled_requests),
+            std::collections::HashSet::from([
+                cancelled_open.id,
+                cancelled_answered.id,
+                cancelled_resolved.id,
+            ])
+        );
+        assert_eq!(
+            get_human_request(&db, kept_request.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            HUMAN_REQUEST_OPEN
+        );
+        for request_id in [
+            cancelled_open.id,
+            cancelled_answered.id,
+            cancelled_resolved.id,
+        ] {
+            assert_eq!(
+                get_human_request(&db, request_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                HUMAN_REQUEST_CANCELLED
+            );
+        }
+        assert_eq!(list_lead_messages(&db, t).await.unwrap(), vec![m0]);
+        assert!(
+            insert_human_answer_trail(
+                &db,
+                t,
+                cancelled_resolved.id,
+                Some(s.id),
+                &resolved_trail,
+            )
             .await
-            .unwrap();
-        assert_eq!(deleted.len(), 2, "both timeline rows deleted");
-        assert!(list_lead_messages(&db, t).await.unwrap().is_empty());
+            .unwrap()
+            .is_none(),
+            "a late queued answer event cannot resurrect rewound trail"
+        );
         assert!(
             code_checkpoint_for(&db, 11, m1.id).await.unwrap().is_none(),
             "abandoned turn's checkpoint swept"
@@ -5789,6 +6730,41 @@ mod tests {
         assert_eq!(list_workspaces(&db).await.unwrap().len(), 1); // ws survives
         assert_eq!(list_threads(&db, ws.id).await.unwrap().len(), 0);
         assert_eq!(list_worktrees(&db, None).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_direction_removes_durable_question_history() {
+        let db = mem().await;
+        let (ws, _repo, _thread, direction) = worker_fixture(&db).await;
+        let request = create_human_request(
+            &db,
+            ws.id,
+            direction.thread_id,
+            &direction.id.to_string(),
+            direction.id,
+            0,
+            0,
+            0,
+            "retain this worker?",
+        )
+        .await
+        .unwrap();
+        answer_human_request(&db, ws.id, request.id, request.revision, "no")
+            .await
+            .unwrap()
+            .unwrap();
+        mark_human_answers_delivered(
+            &db,
+            direction.thread_id,
+            &direction.id.to_string(),
+            &[request.id],
+        )
+        .await
+        .unwrap();
+
+        delete_direction(&db, direction.id).await.unwrap();
+
+        assert!(get_human_request(&db, request.id).await.unwrap().is_none());
     }
 
     /// issue #110 T3 review: a tracked PR/MR row has no FK to the thread that

@@ -31,6 +31,30 @@ pub fn spawn(app: AppHandle) {
     let db = app.state::<Db>().inner().clone();
 
     tauri::async_runtime::spawn(async move {
+        // Recover the narrow crash window between persisting a human answer and
+        // this async consumer inserting its transcript row. The request id in
+        // each row makes the replay idempotent, including answers the agent
+        // already consumed before the previous process died.
+        match repo::list_answered_human_requests(&db).await {
+            Ok(requests) => {
+                for request in requests {
+                    let Ok(ask_id) = u64::try_from(request.id) else {
+                        continue;
+                    };
+                    record_human_answer(
+                        &app,
+                        &db,
+                        request.thread_id,
+                        &request.direction_scope,
+                        ask_id,
+                        &request.question,
+                        &request.answer,
+                    )
+                    .await;
+                }
+            }
+            Err(error) => eprintln!("[weft] recover human-answer trail: {error}"),
+        }
         loop {
             tokio::select! {
                 ev = ask_rx.recv() => match ev {
@@ -50,14 +74,17 @@ pub fn spawn(app: AppHandle) {
                     None => break,
                 },
                 ev = hum_rx.recv() => match ev {
-                    Some(HumanAskEvent::Answered { thread, from, question, text, .. }) => {
-                        let content = serde_json::json!({
-                            "variant": "ask",
-                            "text": question,
-                            "answer": text,
-                        })
-                        .to_string();
-                        record(&app, &db, thread, &from, content).await;
+                    Some(HumanAskEvent::Answered { thread, ask_id, from, question, text }) => {
+                        record_human_answer(
+                            &app,
+                            &db,
+                            thread,
+                            &from,
+                            ask_id,
+                            &question,
+                            &text,
+                        )
+                        .await;
                     }
                     Some(_) => {}
                     None => break,
@@ -67,10 +94,64 @@ pub fn spawn(app: AppHandle) {
     });
 }
 
+async fn record_human_answer(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    dir: &str,
+    ask_id: u64,
+    question: &str,
+    answer: &str,
+) {
+    let Ok(request_id) = i32::try_from(ask_id) else {
+        return;
+    };
+    let content = serde_json::json!({
+        "variant": "ask",
+        "request_id": request_id,
+        "text": question,
+        "answer": answer,
+    })
+    .to_string();
+    let session_id = match repo::get_human_request(db, request_id).await {
+        Ok(Some(request)) if request.source_session_id > 0 => Some(request.source_session_id),
+        Ok(Some(request)) if request.direction_id == 0 => None,
+        _ => session_for_dir(db, dir).await,
+    };
+    let Ok(Some(message)) = repo::insert_human_answer_trail(
+        db,
+        thread_id,
+        request_id,
+        session_id,
+        &content,
+    )
+    .await
+    else {
+        return;
+    };
+    let _ = app.emit(
+        crate::lead_chat::engine::EVENT,
+        crate::lead_chat::engine::Push::Message {
+            thread_id,
+            message,
+        },
+    );
+}
+
 /// Persist one settled row into the asking direction's transcript and push it
 /// live. Best-effort: a failed insert never breaks the (already completed) answer.
 async fn record(app: &AppHandle, db: &Db, thread_id: i32, dir: &str, content: String) {
     let session_id = session_for_dir(db, dir).await;
+    record_in_session(app, db, thread_id, session_id, content).await;
+}
+
+async fn record_in_session(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    content: String,
+) {
     let turn = repo::next_turn_id(db, thread_id)
         .await
         .unwrap_or(1)

@@ -28,7 +28,7 @@ pub const STATUS_STOPPED: &str = "stopped";
 /// One `bus_inbox` call reads every unread message, so a single read covers any
 /// number of coalesced wakes (see `TurnState::request_bus_read`).
 pub const BUS_WAKE_PROMPT: &str =
-    "You have new messages on the thread bus. Call the bus_inbox tool to read them.";
+    "You have new messages on the thread bus. Call bus_inbox to read them. After incorporating any durable human answers that carry request_id, call bus_ack with those ids.";
 
 /// Persist the turn-activity status for whichever surface this engine drives:
 /// a worker session row (`Some`) or the lead's per-thread meta row (`None`).
@@ -84,6 +84,16 @@ pub(crate) fn queue_items(turn: &TurnState) -> Vec<QueuedItem> {
 /// Hidden plumbing deliveries (queue_id == None) are excluded.
 fn visible_queued(turn: &TurnState) -> usize {
     turn.queue.iter().filter(|o| o.queue_id.is_some()).count()
+}
+
+fn plan_approval_turn_idle(turn: &TurnState) -> bool {
+    !turn.busy && turn.queue.is_empty() && turn.bus_read_pos.is_none()
+}
+
+fn plan_approval_admissible(inner: &EngineInner) -> bool {
+    !inner.rewinding
+        && !inner.quota_failover_committing
+        && plan_approval_turn_idle(&inner.turn)
 }
 
 /// Incremental pushes to the frontend. snake_case-tagged to match the TS side.
@@ -5552,7 +5562,9 @@ pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> any
 /// racing user send can't slip a turn in ahead of the read — even when the
 /// resident process has to be spawned first.
 pub async fn nudge_bus_read(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
-    send_hidden_inner(app, db, eng, BUS_WAKE_PROMPT.to_string(), true, true).await
+    send_hidden_inner(app, db, eng, BUS_WAKE_PROMPT.to_string(), true, true, None)
+        .await
+        .map(|_| ())
 }
 
 /// Deliver invisible plumbing to an existing engine. Unlike [`nudge`], this
@@ -5565,7 +5577,35 @@ pub async fn send_hidden_existing(
     eng: &EngineRef,
     text: String,
 ) -> anyhow::Result<()> {
-    send_hidden_inner(app, db, eng, text, false, false).await
+    send_hidden_inner(app, db, eng, text, false, false, None)
+        .await
+        .map(|_| ())
+}
+
+/// Deliver a plan approval only if the same card is still actionable at the
+/// exact engine-admission boundary. The engine mutex stays held from the final
+/// DB validation through an optional stopped-lead revive, process ensure, and
+/// hidden-turn reservation. A stale click therefore cannot revive the lead as
+/// a side effect before being rejected.
+pub async fn send_plan_approval_existing(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    text: String,
+    thread_id: i32,
+    message_id: i32,
+    allow_proposed_scope: bool,
+) -> anyhow::Result<bool> {
+    send_hidden_inner(
+        app,
+        db,
+        eng,
+        text,
+        false,
+        true,
+        Some((thread_id, message_id, allow_proposed_scope)),
+    )
+    .await
 }
 
 /// Shared body of [`send_hidden_existing`] and [`nudge_bus_read`]. The single
@@ -5581,24 +5621,47 @@ async fn send_hidden_inner(
     text: String,
     bus_read: bool,
     ensure: bool,
-) -> anyhow::Result<()> {
+    plan_guard: Option<(i32, i32, bool)>,
+) -> anyhow::Result<bool> {
     if let Err(err) = crate::process_quota::admit_new_work(app) {
         if bus_read {
-            return Ok(());
+            return Ok(false);
         }
         return Err(err);
     }
     let mut inner = eng.lock().await;
     // Same reservation the visible path honours via `send_reservation_valid`,
-    // which hidden delivery does not go through. A bus wake skipped here is not
-    // lost — the coordinator re-delivers it on the next sweep — whereas one
-    // admitted mid-teardown has its turn reset out from under it.
-    if !hidden_turn_admissible(&inner) {
+    // which hidden delivery does not go through. A guarded plan approval may
+    // revive a stopped lead, but only AFTER the exact card has passed the final
+    // DB check below. Every other hidden delivery still refuses stopped state.
+    let guarded_plan = plan_guard.is_some();
+    let revivable_stopped_plan = guarded_plan && inner.stopped && !inner.tearing_down;
+    if !hidden_turn_admissible(&inner) && !revivable_stopped_plan {
         drop(inner);
         if bus_read {
-            return Ok(());
+            return Ok(false);
         }
         return Err(anyhow::anyhow!("engine is tearing down"));
+    }
+    if let Some((thread_id, message_id, allow_proposed_scope)) = plan_guard {
+        if inner.thread_id != thread_id || !plan_approval_admissible(&inner) {
+            return Ok(false);
+        }
+        if !repo::attention_card_is_actionable(
+            db,
+            thread_id,
+            message_id,
+            "plan_card",
+            allow_proposed_scope,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        // Explicit approval is user intent to continue a stopped lead. Keep
+        // this mutation after validation and under the same lock as ensure +
+        // turn reservation, so a rejected stale click has zero run-state effect.
+        inner.stopped = false;
     }
     if ensure {
         // Spawn the resident process under THIS lock, never releasing it before
@@ -5632,7 +5695,7 @@ async fn send_hidden_inner(
     ) {
         HiddenDelivery::Noop => {
             if bus_read {
-                return Ok(()); // a bus wake is best-effort; don't error
+                return Ok(false); // a bus wake is best-effort; don't error
             }
             anyhow::bail!("lead engine is not accepting hidden input");
         }
@@ -5645,7 +5708,7 @@ async fn send_hidden_inner(
             } else {
                 queue_hidden_delivery(app, &mut inner, out);
             }
-            Ok(())
+            Ok(true)
         }
         HiddenDelivery::WriteResident => {
             let turn_id = begin_hidden_turn(app, db, &mut inner).await;
@@ -5654,7 +5717,7 @@ async fn send_hidden_inner(
                 rollback_failed_turn(app, db, eng, turn_id, "error").await;
                 return Err(e);
             }
-            Ok(())
+            Ok(true)
         }
         HiddenDelivery::SpawnTurn => {
             // codex on app-server must stay on app-server even for hidden turns
@@ -5694,7 +5757,7 @@ async fn send_hidden_inner(
                 rollback_failed_turn(app, db, eng, turn_id, "error").await;
                 return Err(e);
             }
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -6257,7 +6320,6 @@ async fn rewind_reserved(
             extra_args: inner.extra_args.clone(),
             cwd: inner.cwd.clone(),
             native_id: inner.native_id.clone(),
-            ask_dir: inner.ask_dir.clone(),
             system_prompt: inner.system_prompt.clone(),
             codex_client: inner.codex_client.clone(),
             acp_client: inner.acp_client.clone(),
@@ -6496,7 +6558,7 @@ async fn rewind_reserved(
     // compensated by rolling the worktree back to its pre-restore state.
     let persist = async {
         stop_quiet(eng).await;
-        let deleted_ids = repo::rewind_persist(
+        let (deleted_ids, cancelled_request_ids) = repo::rewind_persist(
             db,
             snap.thread_id,
             snap.session_id,
@@ -6506,10 +6568,10 @@ async fn rewind_reserved(
         )
         .await?;
         eng.lock().await.native_id = new_native.clone();
-        Ok::<Vec<i32>, anyhow::Error>(deleted_ids)
+        Ok::<(Vec<i32>, Vec<i32>), anyhow::Error>((deleted_ids, cancelled_request_ids))
     };
-    let deleted_ids = match persist.await {
-        Ok(ids) => ids,
+    let (deleted_ids, cancelled_request_ids) = match persist.await {
+        Ok(outcome) => outcome,
         Err(e) => {
             if let Some((p, s, receipt)) = compensation {
                 // spawn_blocking gives Result<Result<()>, JoinError> — check
@@ -6560,7 +6622,14 @@ async fn rewind_reserved(
     .await;
     // A dangling ask from the abandoned turns would sit unanswered forever.
     if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
-        bus.cancel_open_asks_from(snap.thread_id, &snap.ask_dir);
+        let durable_ids: Vec<u64> = cancelled_request_ids
+            .iter()
+            .filter_map(|request_id| u64::try_from(*request_id).ok())
+            .collect();
+        for request_id in &durable_ids {
+            bus.cancel_open_asks_by_id(snap.thread_id, *request_id);
+        }
+        bus.discard_durable_answers(snap.thread_id, &durable_ids);
     }
     let _ = app.emit(
         EVENT,
@@ -6843,7 +6912,6 @@ struct RewindSnap {
     extra_args: Vec<String>,
     cwd: std::path::PathBuf,
     native_id: Option<String>,
-    ask_dir: String,
     /// The prepend the FIRST ACP user turn carries (`{system}\n\n{user}`).
     /// Needed to strip it exactly during a rewind match — guessing the split
     /// by blank line mis-handles multi-paragraph prompts.
@@ -7730,6 +7798,46 @@ mod tests {
 
         inner.stopped = false;
         assert!(hidden_turn_admissible(&inner), "and accepts again afterwards");
+    }
+
+    #[test]
+    fn plan_approval_requires_a_completely_idle_turn_boundary() {
+        let mut inner = test_inner("omp");
+        assert!(plan_approval_admissible(&inner));
+
+        inner.turn.busy = true;
+        assert!(!plan_approval_admissible(&inner), "an active turn refuses approval");
+
+        inner.turn.busy = false;
+        inner.turn.queue.push_back(Outgoing {
+            text: "revise the plan first".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            !plan_approval_admissible(&inner),
+            "queued user intent must run before approval"
+        );
+
+        inner.turn.queue.clear();
+        inner.turn.bus_read_pos = Some(0);
+        assert!(
+            !plan_approval_admissible(&inner),
+            "a reserved bus wake is already the next turn"
+        );
+
+        inner.turn.bus_read_pos = None;
+        inner.rewinding = true;
+        assert!(
+            !plan_approval_admissible(&inner),
+            "a native/timeline rewind reservation refuses approval"
+        );
+
+        inner.rewinding = false;
+        inner.quota_failover_committing = true;
+        assert!(
+            !plan_approval_admissible(&inner),
+            "an engine failover commit refuses approval"
+        );
     }
 
     /// The teardown window's gate. Bumping the epoch stops work reserved

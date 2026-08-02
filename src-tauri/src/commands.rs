@@ -115,12 +115,6 @@ async fn delete_workspace_after_fence(
     stop_workspace_engines(&app, db, workspace_id).await?;
     cancel_workspace_asks(db, app.state::<crate::ask::AskRegistry>().inner(), workspace_id)
         .await?;
-    cancel_workspace_human_asks(
-        db,
-        app.state::<crate::bus::BusRegistry>().inner(),
-        workspace_id,
-    )
-    .await?;
     let mut repo_paths: std::collections::HashMap<i32, String> = repo::list_repos(db, workspace_id)
         .await
         .map_err(e)?
@@ -130,9 +124,20 @@ async fn delete_workspace_after_fence(
     for repo_id in repo_paths.keys() {
         crate::curator::run_forget(*repo_id);
     }
-    let removed = repo::delete_workspace_cascade(db, workspace_id)
-        .await
-        .map_err(e)?;
+    let bus = app.state::<crate::bus::BusRegistry>();
+    let closing_threads = cancel_workspace_human_asks(db, &bus, workspace_id).await?;
+    let removed = match repo::delete_workspace_cascade(db, workspace_id).await {
+        Ok(removed) => removed,
+        Err(error) => {
+            for thread_id in closing_threads {
+                bus.rollback_thread_close(thread_id);
+            }
+            return Err(e(error));
+        }
+    };
+    for thread_id in closing_threads {
+        bus.commit_thread_close(thread_id);
+    }
     extend_removed_repo_paths(db, &mut repo_paths, &removed).await?;
     for (wt_id, repo_id, path, branch, created_branch, created_checkout) in &removed {
         // The worktree's code-checkpoint shadow repo goes with it (its rows
@@ -174,29 +179,61 @@ async fn extend_removed_repo_paths(
     Ok(())
 }
 
+fn human_cancel_event_ids(in_memory: Vec<u64>, durable: &[i32]) -> Vec<u64> {
+    let mut ids = in_memory.into_iter().collect::<std::collections::BTreeSet<_>>();
+    ids.extend(
+        durable
+            .iter()
+            .filter_map(|request_id| u64::try_from(*request_id).ok()),
+    );
+    ids.into_iter().collect()
+}
+
 async fn cancel_workspace_human_asks(
     db: &Db,
     bus: &crate::bus::BusRegistry,
     workspace_id: i32,
-) -> R<()> {
+) -> R<Vec<i32>> {
     let scope = workspace_ask_scope(db, workspace_id).await?;
+    let mut closing_threads = Vec::new();
     for thread_id in &scope.thread_ids {
-        repo::cancel_open_human_requests_for_thread(db, *thread_id)
-            .await
-            .map_err(e)?;
-        bus.cancel_open_asks(*thread_id);
+        // Fence first so an answer that won DB OCC just before deletion cannot
+        // deliver/recreate the bus while durable cancellation is in flight.
+        // Emit card cancellation only after cancellation + terminal outbox land.
+        let (_, cancelled_asks) = bus.begin_thread_close(*thread_id);
+        let durable_cancelled = match repo::cancel_open_human_requests_for_thread(db, *thread_id).await {
+            Ok(cancelled) => cancelled,
+            Err(error) => {
+                bus.rollback_thread_close(*thread_id);
+                for closing_thread in closing_threads {
+                    bus.rollback_thread_close(closing_thread);
+                }
+                return Err(e(error));
+            }
+        };
+        bus.apply_thread_human_cancellation(*thread_id);
+        let event_ids = human_cancel_event_ids(cancelled_asks, &durable_cancelled);
+        bus.notify_cancelled_asks(*thread_id, &event_ids);
+        closing_threads.push(*thread_id);
     }
     for (thread_id, from) in &scope.direction_routes {
         if !scope.thread_ids.contains(thread_id) {
             if let Ok(direction_id) = from.parse::<i32>() {
-                repo::cancel_open_human_requests_for_direction(db, direction_id)
+                let durable_cancelled = repo::cancel_open_human_requests_for_direction(db, direction_id)
                     .await
-                    .map_err(e)?;
+                    .map_err(|error| {
+                        for closing_thread in &closing_threads {
+                            bus.rollback_thread_close(*closing_thread);
+                        }
+                        e(error)
+                    })?;
+                let event_ids = human_cancel_event_ids(Vec::new(), &durable_cancelled);
+                bus.notify_cancelled_asks(*thread_id, &event_ids);
             }
             bus.cancel_open_asks_from(*thread_id, from);
         }
     }
-    Ok(())
+    Ok(closing_threads)
 }
 
 /// Clear this workspace's entire footprint in the AskRegistry: cancel its open
@@ -742,9 +779,11 @@ pub async fn delete_repo(
     }
     let bus = app.state::<crate::bus::BusRegistry>();
     for (thread_id, direction_id) in &human_routes {
-        repo::cancel_open_human_requests_for_direction(&db, *direction_id)
+        let durable_cancelled = repo::cancel_open_human_requests_for_direction(&db, *direction_id)
             .await
             .map_err(e)?;
+        let event_ids = human_cancel_event_ids(Vec::new(), &durable_cancelled);
+        bus.notify_cancelled_asks(*thread_id, &event_ids);
         bus.cancel_open_asks_from(*thread_id, &direction_id.to_string());
     }
     // Purge the AskRegistry footprint (open asks + standing grants) of the directions
@@ -1460,14 +1499,29 @@ pub async fn delete_thread(
     // either: set_lead_status fences its meta-row insert on the thread still
     // existing, and per-session status updates no-op on deleted rows.
     let keys = thread_engine_keys(&db, thread_id).await?;
-    repo::cancel_open_human_requests_for_thread(&db, thread_id)
-        .await
-        .map_err(e)?;
-    app.state::<crate::bus::BusRegistry>()
-        .cancel_open_asks(thread_id);
-    let removed = repo::delete_thread_cascade(&db, thread_id)
-        .await
-        .map_err(e)?;
+    let bus = app.state::<crate::bus::BusRegistry>();
+    // Install the reversible process-local fence before the DB await. A
+    // concurrently answered command can win OCC before durable cancellation,
+    // but its later delivery sees `closing` and cannot recreate the bus.
+    let (_, cancelled_asks) = bus.begin_thread_close(thread_id);
+    let durable_cancelled = match repo::cancel_open_human_requests_for_thread(&db, thread_id).await {
+        Ok(cancelled) => cancelled,
+        Err(error) => {
+            bus.rollback_thread_close(thread_id);
+            return Err(e(error));
+        }
+    };
+    bus.apply_thread_human_cancellation(thread_id);
+    let event_ids = human_cancel_event_ids(cancelled_asks, &durable_cancelled);
+    bus.notify_cancelled_asks(thread_id, &event_ids);
+    let removed = match repo::delete_thread_cascade(&db, thread_id).await {
+        Ok(removed) => removed,
+        Err(error) => {
+            bus.rollback_thread_close(thread_id);
+            return Err(e(error));
+        }
+    };
+    bus.commit_thread_close(thread_id);
     // Purge the issue's WHOLE AskRegistry footprint: cancel its still-open asks
     // (else a lingering card, answered Full/Always after the rows are gone, would
     // persist a fresh grant for the deleted id) AND revoke its standing grants, so

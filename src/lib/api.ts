@@ -69,6 +69,12 @@ export const api = {
    *  ignored it (stopped/dead engine) so callers can keep follow-up UI honest. */
   postLeadToolResult: (threadId: number, payload: unknown, lang: string) =>
     invoke<boolean>("post_lead_tool_result", { threadId, payload, lang }),
+  approvePlanCard: (
+    threadId: number,
+    messageId: number,
+    lang: string,
+    allowProposedScope = false,
+  ) => invoke<boolean>("approve_plan_card", { threadId, messageId, lang, allowProposedScope }),
   /** The issue's test-case document (null = never derived). */
   getTestPlan: (threadId: number) =>
     invoke<TestPlan | null>("get_test_plan", { threadId }),

@@ -3029,14 +3029,78 @@ pub async fn flag_lead_skill_refresh(
     Ok(())
 }
 
-/// Frontend callback after a repo onboarding action card finishes (add /
-/// new / clone). Wraps the payload in `<weft:repo_action>…</weft:repo_action>`
-/// and delivers it as an invisible user turn so the agent can react without
-/// the result polluting the visible timeline. Respects the turn machine:
-/// mid-turn clicks get queued and flush at the next boundary instead of
-/// shoving JSON between in-flight protocol lines. Best-effort by design:
-/// stopped leads ignore this hidden feedback, while non-stopped missing
-/// engines are recreated so fast empty-state clicks can still close the loop.
+/// Atomically approve the latest actionable plan card. The engine mutex keeps
+/// final validation and hidden-turn reservation in one admission boundary, so
+/// stale cards, revisions, queued user intent, and in-flight turns all refuse
+/// the click instead of delivering an obsolete approval.
+#[tauri::command]
+pub async fn approve_plan_card(
+    app: AppHandle,
+    db: State<'_, Db>,
+    thread_id: i32,
+    message_id: i32,
+    lang: Option<String>,
+    allow_proposed_scope: bool,
+) -> Result<bool, String> {
+    let Some(message) = repo::get_lead_message(&db, message_id)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    if message.thread_id != thread_id || message.kind != "plan_card" {
+        return Ok(false);
+    }
+    let title = serde_json::from_str::<serde_json::Value>(&message.content)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let delivered = post_lead_tool_result_inner(
+        &app,
+        &db,
+        thread_id,
+        serde_json::json!({
+            "tool": "plan_decision",
+            "status": "approved",
+            "title": title,
+            "message_id": message_id,
+            "allow_proposed_scope": allow_proposed_scope,
+        }),
+        lang.as_deref().unwrap_or("en"),
+    )
+    .await?;
+    if !delivered {
+        return Ok(false);
+    }
+    let resolved_label = if title.trim().is_empty() {
+        "Plan"
+    } else {
+        title.as_str()
+    };
+    let Some(resolved) = repo::resolve_action_card(&db, message_id, resolved_label)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    let _ = app.emit(
+        engine::EVENT,
+        engine::Push::ToolResult {
+            thread_id: resolved.thread_id,
+            message_id: resolved.id,
+            content: resolved.content,
+            status: resolved.status,
+        },
+    );
+    let _ = app.emit("needs-you://changed", resolved.thread_id);
+    Ok(true)
+}
+
 #[tauri::command]
 pub async fn post_lead_tool_result(
     app: AppHandle,
@@ -3110,10 +3174,37 @@ async fn post_lead_tool_result_inner(
     app: &AppHandle,
     db: &Db,
     thread_id: i32,
-    payload: serde_json::Value,
+    mut payload: serde_json::Value,
     lang: &str,
 ) -> Result<bool, String> {
     let revives = payload.get("tool").and_then(|v| v.as_str()) == Some("plan_decision");
+    let plan_message_id = if revives {
+        let message_id = payload
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
+        let Some(message_id) = message_id else {
+            log_hidden_feedback_ignored(thread_id, "plan decision missing message_id");
+            return Ok(false);
+        };
+        // message_id is an action-time OCC token for Weft, not agent input.
+        // Strip it before delivery so the historical plan_decision payload
+        // presented to the lead stays stable. The engine consumes the saved id
+        // as its final admission guard below.
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("message_id");
+        }
+        Some(message_id)
+    } else {
+        None
+    };
+    let allow_proposed_scope = payload
+        .get("allow_proposed_scope")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("allow_proposed_scope");
+    }
     let text = match hidden_feedback_text(&payload) {
         Ok(text) => text,
         Err(e) => {
@@ -3146,10 +3237,11 @@ async fn post_lead_tool_result_inner(
             }
         }
     };
-    // A revive clears the stopped flag (like `send`) so the engine accepts the
-    // hidden input; a non-revive only ensures an already-live engine is running.
+    // Plan approval validates the exact card before clearing stopped or
+    // starting a process; send_plan_approval_existing owns that single locked
+    // boundary. Other feedback only ensures an already-live engine.
     let ensured = if revives {
-        engine::ensure_running_for_send(app, db, &eng).await
+        Ok(())
     } else {
         engine::ensure_running(app, db, &eng).await
     };
@@ -3157,11 +3249,34 @@ async fn post_lead_tool_result_inner(
         log_hidden_feedback_ignored(thread_id, &e.to_string());
         return Ok(false);
     }
-    if let Err(e) = engine::send_hidden_existing(app, db, &eng, text).await {
-        log_hidden_feedback_ignored(thread_id, &e.to_string());
-        return Ok(false);
+    let delivered = match plan_message_id {
+        Some(message_id) => {
+            engine::send_plan_approval_existing(
+                app,
+                db,
+                &eng,
+                text,
+                thread_id,
+                message_id,
+                allow_proposed_scope,
+            )
+            .await
+        }
+        None => engine::send_hidden_existing(app, db, &eng, text)
+            .await
+            .map(|_| true),
+    };
+    match delivered {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            log_hidden_feedback_ignored(thread_id, "plan card is no longer actionable");
+            Ok(false)
+        }
+        Err(error) => {
+            log_hidden_feedback_ignored(thread_id, &error.to_string());
+            Ok(false)
+        }
     }
-    Ok(true)
 }
 
 #[cfg(test)]

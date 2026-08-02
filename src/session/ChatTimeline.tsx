@@ -785,16 +785,11 @@ function TimelineRow({
       // Feedback first, and only collapse the card once the lead actually
       // accepted the delivery — a stopped lead silently drops hidden input, and
       // a card stamped "approved" with no split coming would mislead.
-      const delivered = await api.postLeadToolResult(
-        tid,
-        { tool: "plan_decision", status: "approved", title },
-        currentLang(),
-      );
+      const delivered = await api.approvePlanCard(tid, m.id, currentLang());
       if (!delivered) {
         toast(t("planCard.deliverFailed"));
         return;
       }
-      await api.resolveActionCard(m.id, title || t("planCard.label"));
     };
     // The product thesis (cases inform the plan) is otherwise invisible: link
     // the plan card to the issue's test cases when the issue has derived any.

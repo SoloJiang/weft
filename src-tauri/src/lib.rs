@@ -159,6 +159,10 @@ pub fn run() {
     // Wire the coordinator: bus wakes -> nudge the target direction's session.
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<bus::Wake>();
     bus.set_wake_sender(wake_tx);
+    // The bus server restored answered-but-unconsumed durable questions before
+    // binding its listener. Their inbox messages were intentionally silent;
+    // wake them now that the coordinator channel can buffer the nudges.
+    bus.wake_pending_inboxes();
 
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -229,8 +233,8 @@ pub fn run() {
             }
             gc::spawn_periodic(app.handle().clone());
             skills::spawn_periodic(app.handle().clone());
-            im::spawn(app.handle().clone());
             trail::spawn(app.handle().clone());
+            im::spawn(app.handle().clone());
             backup::scheduler::spawn(backup_svc.clone());
             {
                 // APP_HANDLE is set above; access the managed Db via Manager.
@@ -323,6 +327,7 @@ pub fn run() {
             lead_chat::commands::list_live_worker_slots,
             lead_chat::commands::auto_verify_check,
             lead_chat::commands::discover_slash,
+            lead_chat::commands::approve_plan_card,
             lead_chat::commands::post_lead_tool_result,
             lead_chat::commands::get_test_plan,
             lead_chat::commands::save_test_plan,

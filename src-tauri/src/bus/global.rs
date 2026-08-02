@@ -143,12 +143,12 @@ pub async fn call_global(
                 return text_result("error: ask_id required".into());
             };
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            if bus.answer_ask(tid, ask_id, text) {
-                text_result(format!("answered ask #{ask_id} on issue {tid}"))
-            } else {
-                text_result(format!(
+            match answer_durable_question(db, bus, tid, ask_id, text).await {
+                Ok(true) => text_result(format!("answered ask #{ask_id} on issue {tid}")),
+                Ok(false) => text_result(format!(
                     "ask #{ask_id} on issue {tid} was already answered or no longer exists"
-                ))
+                )),
+                Err(error) => text_result(format!("error: {error}")),
             }
         }
         "message_lead" => {
@@ -353,6 +353,49 @@ async fn pending_needs_you(db: &Db, asks: &AskRegistry) -> anyhow::Result<Value>
         })
         .collect();
     Ok(Value::Array(arr))
+}
+
+/// Resolve a durable free-text question from the global/Concierge tool with
+/// the same OCC + persisted-answer path used by desktop and IM. The bus event
+/// closes cards/trail; its request-tagged inbox message remains replayable
+/// until the asking agent explicitly acknowledges it through `bus_ack`.
+async fn answer_durable_question(
+    db: &Db,
+    bus: &BusRegistry,
+    thread_id: i32,
+    ask_id: u64,
+    text: &str,
+) -> anyhow::Result<bool> {
+    let Ok(request_id) = i32::try_from(ask_id) else {
+        return Ok(false);
+    };
+    let Some(request) = repo::get_human_request(db, request_id).await? else {
+        return Ok(false);
+    };
+    if request.thread_id != thread_id || request.status != repo::HUMAN_REQUEST_OPEN {
+        return Ok(false);
+    }
+    let Some(updated) = repo::answer_human_request(
+        db,
+        request.workspace_id,
+        request.id,
+        request.revision,
+        text,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    if !bus.answer_ask(thread_id, ask_id, &updated.answer) {
+        bus.deliver_durable_answer(
+            thread_id,
+            ask_id,
+            &updated.direction_scope,
+            &updated.question,
+            &updated.answer,
+        );
+    }
+    Ok(true)
 }
 
 /// Push a message into the lead engine of `thread_id` from outside (Concierge).

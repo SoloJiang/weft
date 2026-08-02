@@ -16,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 /// Shared state for the local server: the in-memory thread bus, the DB (the
@@ -242,6 +242,7 @@ const AUTO_APPROVED_INTERNAL_TOOLS: &[(&str, &str)] = &[
     ("weft_bus", "bus_post"),
     ("weft_bus", "bus_broadcast"),
     ("weft_bus", "bus_inbox"),
+    ("weft_bus", "bus_ack"),
     ("weft_bus", "ask_human"),
     ("weft_bus", "thread_state_get"),
     ("weft_bus", "thread_state_set"),
@@ -557,7 +558,7 @@ async fn handle(
                 let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 ask_human_tool(&db, &reg, thread, &dir, text).await
             } else {
-                call_tool(&reg, thread, &dir, name, &args)
+                call_tool(&db, &reg, thread, &dir, name, &args).await
             }
         }
         _ => json!({}),
@@ -579,27 +580,57 @@ async fn ask_human_tool(
         Err(err) => return text_result(format!("error: {err}")),
     };
     let direction_id = direction_scope.parse::<i32>().unwrap_or(0);
+    let source = match crate::store::repo::latest_human_request_source(
+        db,
+        thread_id,
+        direction_id,
+    )
+    .await
+    {
+        Ok(source) => source,
+        Err(error) => return text_result(format!("error: {error}")),
+    };
+    let (turn_id, source_message_id, source_session_id) = source
+        .map(|message| {
+            (
+                message.turn_id,
+                message.id,
+                message.session_id.unwrap_or_default(),
+            )
+        })
+        .unwrap_or((0, 0, 0));
     match crate::store::repo::create_human_request(
         db,
         thread.workspace_id,
         thread_id,
         direction_scope,
         direction_id,
-        0,
+        turn_id,
+        source_message_id,
+        source_session_id,
         text,
     )
     .await
     {
-        Ok((request, superseded)) => {
-            for id in superseded {
-                if let Ok(id) = u64::try_from(id) {
-                    bus.cancel_open_asks_by_id(thread_id, id);
-                }
-            }
+        Ok(request) => {
             let Ok(id) = u64::try_from(request.id) else {
                 return text_result("error: invalid durable question id".to_string());
             };
             bus.ask_human_with_id(thread_id, direction_scope, &request.question, id);
+            let still_open = match crate::store::repo::get_human_request(db, request.id).await {
+                Ok(Some(current)) => current.status == crate::store::repo::HUMAN_REQUEST_OPEN,
+                Ok(None) => false,
+                Err(error) => {
+                    bus.cancel_open_asks_by_id(thread_id, id);
+                    return text_result(format!("error: could not verify durable question: {error}"));
+                }
+            };
+            if !still_open {
+                bus.cancel_open_asks_by_id(thread_id, id);
+                return text_result(
+                    "error: source turn was rewound before the question opened".to_string(),
+                );
+            }
             text_result(format!(
                 "asked the human (ask #{}); their answer will arrive in your bus_inbox — keep working and check it",
                 request.id
@@ -686,7 +717,14 @@ fn text_result(s: String) -> Value {
     json!({ "content": [{ "type": "text", "text": s }] })
 }
 
-fn call_tool(reg: &BusRegistry, thread: i32, me: &str, name: &str, args: &Value) -> Value {
+async fn call_tool(
+    db: &Db,
+    reg: &BusRegistry,
+    thread: i32,
+    me: &str,
+    name: &str,
+    args: &Value,
+) -> Value {
     let s = |k: &str| {
         args.get(k)
             .and_then(|v| v.as_str())
@@ -707,8 +745,80 @@ fn call_tool(reg: &BusRegistry, thread: i32, me: &str, name: &str, args: &Value)
             text_result("interface change announced".into())
         }
         "bus_inbox" => {
-            let msgs = reg.inbox(thread, me);
+            let mut msgs = reg.inbox(thread, me);
+            let pending = match crate::store::repo::list_pending_human_answers_for_scope(
+                db, thread, me,
+            )
+            .await
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    reg.restore_inbox(thread, me, msgs);
+                    return text_result(format!("error: could not read durable inbox: {error}"));
+                }
+            };
+            let mut seen: HashSet<u64> = msgs
+                .iter()
+                .filter_map(|message| message.request_id)
+                .collect();
+            for request in pending {
+                let Ok(request_id) = u64::try_from(request.id) else {
+                    reg.restore_inbox(thread, me, msgs);
+                    return text_result("error: invalid durable question id".into());
+                };
+                if !seen.insert(request_id) {
+                    continue;
+                }
+                msgs.push(crate::bus::Msg {
+                    from: crate::bus::HUMAN.to_string(),
+                    to: me.to_string(),
+                    text: request.answer,
+                    ts: 0,
+                    kind: "message".to_string(),
+                    request_id: Some(request_id),
+                });
+            }
             text_result(serde_json::to_string(&msgs).unwrap_or_else(|_| "[]".into()))
+        }
+        "bus_ack" => {
+            let mut request_ids: Vec<i32> = args
+                .get("request_ids")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_i64)
+                .filter_map(|request_id| i32::try_from(request_id).ok())
+                .collect();
+            if let Some(request_id) = args
+                .get("request_id")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|request_id| i32::try_from(request_id).ok())
+            {
+                request_ids.push(request_id);
+            }
+            request_ids.sort_unstable();
+            request_ids.dedup();
+            if request_ids.is_empty() {
+                return text_result("error: request_ids required".into());
+            }
+            match crate::store::repo::mark_human_answers_delivered(
+                db,
+                thread,
+                me,
+                &request_ids,
+            )
+            .await
+            {
+                Ok(acknowledged) => {
+                    let durable_ids: Vec<u64> = request_ids
+                        .iter()
+                        .filter_map(|request_id| u64::try_from(*request_id).ok())
+                        .collect();
+                    reg.discard_durable_answers_for_scope(thread, me, &durable_ids);
+                    text_result(format!("acknowledged {acknowledged} durable answer(s)"))
+                }
+                Err(error) => text_result(format!("error: could not persist inbox ack: {error}")),
+            }
         }
         "thread_state_get" => text_result(reg.state_get(thread).to_string()),
         "thread_state_set" => {
@@ -1265,8 +1375,16 @@ fn tool_specs() -> Value {
         },
         {
             "name": "bus_inbox",
-            "description": "Read and clear your unread messages from other tasks. Call this whenever you are told there are new messages; do not assume silence means nothing happened.",
+            "description": "Read your unread messages from other tasks. Durable human answers include request_id and are replayed until acknowledged. After you have incorporated those answers, call bus_ack with their request_ids. Call this whenever you are told there are new messages; do not assume silence means nothing happened.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "bus_ack",
+            "description": "Acknowledge durable human-answer messages only after you received and incorporated them. Idempotent; request_ids are the integers returned by bus_inbox.",
+            "inputSchema": { "type": "object",
+                "properties": {
+                    "request_ids": { "type": "array", "items": { "type": "integer" } }
+                }, "required": ["request_ids"] }
         },
         {
             "name": "ask_human",
@@ -1315,6 +1433,9 @@ pub async fn serve(
     db: Db,
     asks: AskRegistry,
 ) -> std::io::Result<(String, tokio::task::JoinHandle<()>)> {
+    restore_durable_human_requests(&db, &bus)
+        .await
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let base = format!("http://127.0.0.1:{}", addr.port());
@@ -1323,6 +1444,32 @@ pub async fn serve(
         let _ = axum::serve(listener, app).await;
     });
     Ok((base, handle))
+}
+
+/// Rebuild the process-local half of the durable question state before the
+/// MCP listener accepts traffic. Open rows become answerable asks; answered
+/// rows become inbox messages and stay durable until an explicit `bus_ack`.
+async fn restore_durable_human_requests(db: &Db, bus: &BusRegistry) -> anyhow::Result<()> {
+    for request in crate::store::repo::list_pending_human_requests(db).await? {
+        let id = u64::try_from(request.id)
+            .map_err(|_| anyhow::anyhow!("invalid durable question id {}", request.id))?;
+        if request.status == crate::store::repo::HUMAN_REQUEST_OPEN {
+            bus.restore_human_request(
+                request.thread_id,
+                &request.direction_scope,
+                &request.question,
+                id,
+            );
+        } else if request.status == crate::store::repo::HUMAN_REQUEST_ANSWERED {
+            bus.restore_durable_answer(
+                request.thread_id,
+                id,
+                &request.direction_scope,
+                &request.answer,
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1334,6 +1481,278 @@ mod tests {
     use crate::ask::RiskLevel;
     use crate::store::Db;
     use serde_json::{json, Value};
+
+    async fn bus_tool_text(
+        base: &str,
+        thread: i32,
+        direction: &str,
+        name: &str,
+        arguments: Value,
+    ) -> String {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/bus/{thread}/{direction}/mcp"))
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body = response.text().await.unwrap();
+        let data = body
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("SSE data line");
+        let envelope: Value = serde_json::from_str(data).unwrap();
+        envelope["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn durable_answer_replays_until_explicit_bus_ack() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = crate::store::repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "Issue",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let direction = crate::store::repo::create_direction(
+            &db,
+            thread.id,
+            "Task",
+            "codex",
+            repo_ref.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let scope = direction.id.to_string();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            &scope,
+            direction.id,
+            1,
+            0,
+            0,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+        crate::store::repo::answer_human_request(
+            &db,
+            workspace.id,
+            request.id,
+            request.revision,
+            "REST",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // A fresh registry is the process-restart boundary under review.
+        let bus = crate::bus::BusRegistry::new();
+        let (base, _handle) = serve(bus, db.clone(), crate::ask::AskRegistry::new())
+            .await
+            .unwrap();
+
+        let first: Value = serde_json::from_str(
+            &bus_tool_text(&base, thread.id, &scope, "bus_inbox", json!({})).await,
+        )
+        .unwrap();
+        assert_eq!(first.as_array().unwrap().len(), 1);
+        assert_eq!(first[0]["request_id"], request.id);
+        assert_eq!(first[0]["text"], "REST");
+        assert_eq!(
+            crate::store::repo::get_human_request(&db, request.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::store::repo::HUMAN_REQUEST_ANSWERED
+        );
+
+        // No ack: even though the in-memory inbox was drained, the DB outbox
+        // replays the same stable request id instead of losing the answer.
+        let replay: Value = serde_json::from_str(
+            &bus_tool_text(&base, thread.id, &scope, "bus_inbox", json!({})).await,
+        )
+        .unwrap();
+        assert_eq!(replay[0]["request_id"], request.id);
+
+        let wrong_route = bus_tool_text(
+            &base,
+            thread.id,
+            "lead",
+            "bus_ack",
+            json!({ "request_ids": [request.id] }),
+        )
+        .await;
+        assert!(wrong_route.contains("acknowledged 0"));
+        assert_eq!(
+            crate::store::repo::get_human_request(&db, request.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::store::repo::HUMAN_REQUEST_ANSWERED
+        );
+
+        let ack = bus_tool_text(
+            &base,
+            thread.id,
+            &scope,
+            "bus_ack",
+            json!({ "request_ids": [request.id] }),
+        )
+        .await;
+        assert!(ack.contains("acknowledged 1"));
+        assert_eq!(
+            crate::store::repo::get_human_request(&db, request.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::store::repo::HUMAN_REQUEST_RESOLVED
+        );
+        let empty: Value = serde_json::from_str(
+            &bus_tool_text(&base, thread.id, &scope, "bus_inbox", json!({})).await,
+        )
+        .unwrap();
+        assert!(empty.as_array().unwrap().is_empty());
+
+        // Ack is idempotent and route-scoped.
+        let duplicate = bus_tool_text(
+            &base,
+            thread.id,
+            &scope,
+            "bus_ack",
+            json!({ "request_ids": [request.id] }),
+        )
+        .await;
+        assert!(duplicate.contains("acknowledged 0"));
+    }
+
+    #[tokio::test]
+    async fn ask_human_persists_the_exact_completed_source_turn() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = crate::store::repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "Issue",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let direction = crate::store::repo::create_direction(
+            &db,
+            thread.id,
+            "Task",
+            "codex",
+            repo_ref.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = crate::store::repo::create_session(
+            &db,
+            direction.id,
+            repo_ref.id,
+            "codex",
+            "/tmp/cwd",
+        )
+        .await
+        .unwrap();
+        let source = crate::store::repo::insert_lead_message(
+            &db,
+            thread.id,
+            Some(session.id),
+            7,
+            "user",
+            "text",
+            r#"{"text":"current turn"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        crate::store::repo::insert_lead_message(
+            &db,
+            thread.id,
+            Some(session.id),
+            8,
+            "user",
+            "text",
+            r#"{"text":"queued revision"}"#,
+            "queued",
+        )
+        .await
+        .unwrap();
+
+        let scope = direction.id.to_string();
+        let (base, _handle) = serve(
+            crate::bus::BusRegistry::new(),
+            db.clone(),
+            crate::ask::AskRegistry::new(),
+        )
+        .await
+        .unwrap();
+        let result = bus_tool_text(
+            &base,
+            thread.id,
+            &scope,
+            "ask_human",
+            json!({ "text": "Which API?" }),
+        )
+        .await;
+        assert!(result.contains("asked the human"));
+
+        let requests = crate::store::repo::list_open_human_requests(&db, workspace.id)
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].turn_id, source.turn_id);
+        assert_eq!(requests[0].source_message_id, source.id);
+        assert_eq!(requests[0].source_session_id, session.id);
+    }
 
     /// Issue #89: a Claude/opencode multi-line command truncates `summary` to
     /// its first line for display, but `action_key` must carry the FULL command
@@ -1477,6 +1896,7 @@ mod tests {
         assert!(is_weft_internal_tool("mcp__weft_planner__get_task"));
         assert!(is_weft_internal_tool("mcp__weft_planner__propose_directions"));
         assert!(is_weft_internal_tool("mcp__weft_bus__bus_inbox"));
+        assert!(is_weft_internal_tool("mcp__weft_bus__bus_ack"));
         assert!(is_weft_internal_tool("mcp__weft_bus__set_task_status"));
         assert!(is_weft_internal_tool("mcp__weft_curator__get_repo_map"));
         assert!(is_weft_internal_tool("mcp__weft_global__list_workspaces"));
@@ -1504,6 +1924,7 @@ mod tests {
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
             .collect();
         assert!(names.contains(&"register_pr"), "tool_specs: {names:?}");
+        assert!(names.contains(&"bus_ack"), "tool_specs: {names:?}");
     }
 
     fn tool_text(result: &Value) -> &str {

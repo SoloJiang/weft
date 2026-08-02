@@ -481,7 +481,11 @@ interface Store {
    *  ScopeReview confirm (issue #104, confirmation-chain compression) — one
    *  submission path, two entry points. Resolves false (and toasts) when the lead
    *  never received it, so a chained caller can stop before touching the proposal. */
-  approvePlanCard: (threadId: number, messageId: number, title: string) => Promise<boolean>;
+  approvePlanCard: (
+    threadId: number,
+    messageId: number,
+    allowProposedScope?: boolean,
+  ) => Promise<boolean>;
 
   /** Workspace board: per-thread roll-ups for the portfolio view. */
   overview: ThreadOverview[];
@@ -3029,22 +3033,26 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [activeThreadId, loadThreadChildren, dispatchDirection, refreshProposal]);
 
   const approvePlanCard = useCallback(
-    async (threadId: number, messageId: number, title: string): Promise<boolean> => {
+    async (
+      threadId: number,
+      messageId: number,
+      allowProposedScope = false,
+    ): Promise<boolean> => {
       // Feedback first, and only persist the settled state once the lead actually
       // accepted the delivery — a stopped lead silently drops hidden input, and a
       // card stamped "approved" with no split coming would mislead. Verbatim the chat
       // plan_card's own submission (ChatTimeline's inline onApprove) so approving from
       // the merged ScopeReview screen (issue #104) is the SAME action, not a new one.
-      const delivered = await api.postLeadToolResult(
+      const delivered = await api.approvePlanCard(
         threadId,
-        { tool: "plan_decision", status: "approved", title },
+        messageId,
         currentLang(),
+        allowProposedScope,
       );
       if (!delivered) {
         toast(i18n.t("planCard.deliverFailed"), "danger");
         return false;
       }
-      await api.resolveActionCard(messageId, title || i18n.t("planCard.label"));
       return true;
     },
     [],

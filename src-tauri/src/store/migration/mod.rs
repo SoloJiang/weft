@@ -1,7 +1,7 @@
 use crate::store::entities::{
-    app_setting, backup_config, code_checkpoint, direction, human_request, im_route, lead_message,
-    plan, pull_request, repo_profile, repo_ref, session, skill_enable, skill_source, test_plan,
-    thread, workspace, worktree,
+    app_setting, backup_config, code_checkpoint, direction, human_card_terminal_outbox,
+    human_request, im_route, lead_message, plan, pull_request, repo_profile, repo_ref, session,
+    skill_enable, skill_source, test_plan, thread, workspace, worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -59,6 +59,9 @@ impl MigratorTrait for Migrator {
             Box::new(M0045PullRequest),
             Box::new(M0046DirectionUpstream),
             Box::new(M0047HumanRequest),
+            Box::new(M0048HumanRequestSourceMessage),
+            Box::new(M0049HumanRequestImRoutes),
+            Box::new(M0050HumanCardTerminalOutbox),
         ]
     }
 }
@@ -2107,6 +2110,163 @@ impl MigrationTrait for M0047HumanRequest {
             .await
     }
 }
+
+/// Add an exact lead_message anchor for rewind-safe durable-question
+/// cancellation. New databases already receive the column from M0047's entity
+/// schema; duplicate-column tolerance keeps reruns and partially upgraded DBs
+/// safe.
+pub struct M0048HumanRequestSourceMessage;
+impl MigrationName for M0048HumanRequestSourceMessage {
+    fn name(&self) -> &str {
+        "m0048_human_request_source_message"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0048HumanRequestSourceMessage {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in ["source_message_id", "source_session_id"] {
+            let result = manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new("human_request"))
+                        .add_column(
+                            ColumnDef::new(Alias::new(column))
+                                .integer()
+                                .not_null()
+                                .default(0),
+                        )
+                        .to_owned(),
+                )
+                .await;
+            match result {
+                Ok(()) => {}
+                Err(error)
+                    if error.to_string().to_lowercase().contains("duplicate column") => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in ["source_session_id", "source_message_id"] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new("human_request"))
+                        .drop_column(Alias::new(column))
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Persist every provider message id used for a durable human-question card,
+/// so replies to pre-restart and replayed cards remain tied to the request.
+pub struct M0049HumanRequestImRoutes;
+impl MigrationName for M0049HumanRequestImRoutes {
+    fn name(&self) -> &str {
+        "m0049_human_request_im_routes"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0049HumanRequestImRoutes {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let result = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("human_request"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("im_routes"))
+                            .text()
+                            .not_null()
+                            .default("[]"),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("human_request"))
+                    .drop_column(Alias::new("im_routes"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Durable provider PATCH work must not disappear with the source question.
+/// There is intentionally no FK: thread/workspace deletion removes the source
+/// content while a pending row retains only the answer needed for its final
+/// provider PATCH; its delivery receipt scrubs that answer and leaves an
+/// opaque route tombstone.
+pub struct M0050HumanCardTerminalOutbox;
+impl MigrationName for M0050HumanCardTerminalOutbox {
+    fn name(&self) -> &str {
+        "m0050_human_card_terminal_outbox"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0050HumanCardTerminalOutbox {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut statement = schema.create_table_from_entity(human_card_terminal_outbox::Entity);
+        statement.if_not_exists();
+        manager.create_table(statement).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_human_card_terminal_route")
+                    .table(Alias::new("human_card_terminal_outbox"))
+                    .col(Alias::new("channel"))
+                    .col(Alias::new("account"))
+                    .col(Alias::new("owner"))
+                    .col(Alias::new("message_id"))
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_human_card_terminal_pending")
+                    .table(Alias::new("human_card_terminal_outbox"))
+                    .col(Alias::new("channel"))
+                    .col(Alias::new("account"))
+                    .col(Alias::new("owner"))
+                    .col(Alias::new("delivered"))
+                    .col(Alias::new("id"))
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("human_card_terminal_outbox"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
 #[async_trait::async_trait]
 impl MigrationTrait for M0045PullRequest {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -2146,7 +2306,8 @@ impl MigrationTrait for M0045PullRequest {
 mod tests {
     use super::{
         gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest,
-        M0046DirectionUpstream, M0047HumanRequest,
+        M0046DirectionUpstream, M0047HumanRequest, M0048HumanRequestSourceMessage,
+        M0049HumanRequestImRoutes, M0050HumanCardTerminalOutbox,
     };
 
     #[test]
@@ -2595,18 +2756,19 @@ mod tests {
         let thread = repo::create_thread(&db, workspace.id, "Issue", "feature", "codex")
             .await
             .unwrap();
-        let (request, superseded) = repo::create_human_request(
+        let request = repo::create_human_request(
             &db,
             workspace.id,
             thread.id,
             "lead",
             0,
             7,
+            0,
+            0,
             "Ship it?",
         )
         .await
         .unwrap();
-        assert!(superseded.is_empty());
         assert_eq!(request.status, "open");
         assert_eq!(request.revision, 1);
         assert!(request.answer.is_empty());
@@ -2614,6 +2776,14 @@ mod tests {
         // Migrations are expected to be safely repeatable in hand-repaired or
         // partially-upgraded databases.
         M0047HumanRequest
+            .up(&SchemaManager::new(&db.0))
+            .await
+            .unwrap();
+        M0048HumanRequestSourceMessage
+            .up(&SchemaManager::new(&db.0))
+            .await
+            .unwrap();
+        M0049HumanRequestImRoutes
             .up(&SchemaManager::new(&db.0))
             .await
             .unwrap();
@@ -2632,14 +2802,88 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert!(indexes.contains("idx_human_request_workspace_status"));
         assert!(indexes.contains("idx_human_request_scope_status"));
-        assert_eq!(
-            repo::get_human_request(&db, request.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            "open"
-        );
+        let columns = db
+            .0
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "PRAGMA table_info(human_request)".to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(columns.contains("source_message_id"));
+        assert!(columns.contains("source_session_id"));
+        assert!(columns.contains("im_routes"));
+
+        let restored = repo::get_human_request(&db, request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.status, "open");
+        assert_eq!(restored.source_message_id, 0);
+        assert_eq!(restored.source_session_id, 0);
+        assert_eq!(restored.im_routes, "[]");
+    }
+
+    #[tokio::test]
+    async fn m0050_terminal_outbox_is_rerunnable_and_has_no_source_foreign_key() {
+        use crate::store::repo::{self, HumanRequestImRoute, HUMAN_REQUEST_CANCELLED};
+        use crate::store::Db;
+        use sea_orm::{ConnectionTrait, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        M0050HumanCardTerminalOutbox
+            .up(&SchemaManager::new(&db.0))
+            .await
+            .unwrap();
+        let route = HumanRequestImRoute {
+            channel: "feishu".to_string(),
+            account: "cli_test".to_string(),
+            owner: "ou_owner".to_string(),
+            message_id: "om_orphan_safe".to_string(),
+            terminal_revision: 0,
+        };
+        repo::queue_human_card_terminal_outbox(
+            &db,
+            999,
+            42,
+            &route,
+            HUMAN_REQUEST_CANCELLED,
+            "",
+            2,
+        )
+        .await
+        .unwrap();
+
+        let rows = repo::list_pending_human_card_terminal_outbox(
+            &db,
+            &route.channel,
+            &route.account,
+            &route.owner,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_id, 999);
+        assert_eq!(rows[0].thread_id, 42);
+        let indexes = db
+            .0
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND \
+                 tbl_name = 'human_card_terminal_outbox'"
+                    .to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(indexes.contains("idx_human_card_terminal_route"));
+        assert!(indexes.contains("idx_human_card_terminal_pending"));
     }
 
     /// M0037: code_checkpoint exists after migration and round-trips a row.
