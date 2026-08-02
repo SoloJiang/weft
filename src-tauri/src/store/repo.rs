@@ -4334,6 +4334,9 @@ pub enum StreakUpdate<'a> {
 ///
 /// Returns the row's resulting `probe_fail_count` so the monitor can apply
 /// the same give-up escalation `mark_pull_request_probe_error`'s callers do.
+/// Under [`StreakUpdate::Leave`] that is the value this call OBSERVED and
+/// deliberately did not write — a concurrent monitor increment may already
+/// have moved it, which is exactly why `Leave` does not write it back.
 pub async fn apply_pull_request_snapshot(
     db: &Db,
     id: i32,
@@ -4344,11 +4347,28 @@ pub async fn apply_pull_request_snapshot(
     let Some(row) = pull_request::Entity::find_by_id(id).one(&db.0).await? else {
         return Ok(None);
     };
-    let next_fail_count = match streak {
-        StreakUpdate::Clear => 0,
-        StreakUpdate::Extend(_) => row.probe_fail_count.saturating_add(1),
-        StreakUpdate::Leave => row.probe_fail_count,
-    };
+    let (a, next_fail_count) = build_snapshot_update(row, snapshot, readiness, streak);
+    a.update(&db.0).await?;
+    Ok(Some(next_fail_count))
+}
+
+/// The pure half of [`apply_pull_request_snapshot`]: which columns the UPDATE
+/// will carry, and the resulting failure count.
+///
+/// Split out so the property that matters most about `StreakUpdate::Leave` is
+/// directly assertable — that it leaves the streak columns `NotSet`, so the
+/// statement does not mention them AT ALL. Writing back the value the read
+/// observed would look like a no-op and is not one: the monitor runs on its
+/// own loop and can increment between the two, and the stale write would
+/// silently undo it (Codex review round 4 P2). A race is not deterministically
+/// testable; "this column is absent from the UPDATE" is.
+fn build_snapshot_update(
+    row: pull_request::Model,
+    snapshot: &crate::host::PrSnapshot,
+    readiness: &crate::host::MergeReadiness,
+    streak: StreakUpdate<'_>,
+) -> (pull_request::ActiveModel, i32) {
+    let observed_fail_count = row.probe_fail_count;
     let mut a: pull_request::ActiveModel = row.into();
     a.head_sha = Set(snapshot.head_sha.clone());
     a.base_ref = Set(snapshot.base_ref.clone());
@@ -4389,9 +4409,19 @@ pub async fn apply_pull_request_snapshot(
         StreakUpdate::Clear => a.last_error = Set(String::new()),
         StreakUpdate::Leave => {}
     }
-    a.probe_fail_count = Set(next_fail_count);
-    a.update(&db.0).await?;
-    Ok(Some(next_fail_count))
+    let next_fail_count = match streak {
+        StreakUpdate::Clear => {
+            a.probe_fail_count = Set(0);
+            0
+        }
+        StreakUpdate::Extend(_) => {
+            let next = observed_fail_count.saturating_add(1);
+            a.probe_fail_count = Set(next);
+            next
+        }
+        StreakUpdate::Leave => observed_fail_count,
+    };
+    (a, next_fail_count)
 }
 
 /// Record a failed probe attempt without touching the last known snapshot,
@@ -9382,6 +9412,67 @@ mod tests {
                 "reason={blank:?} must not leave the column reading as \"no error\""
             );
         }
+    }
+
+    /// Codex review round 4 P2: under `Leave`, a monitor increment that lands
+    /// between this call's read and its write must SURVIVE.
+    ///
+    /// The original `Leave` read `probe_fail_count` and wrote the same value
+    /// back. That looks like a no-op and is not one — the monitor runs on its
+    /// own loop, so a concurrent increment would be silently undone and a
+    /// persistently failing query would never reach the give-up threshold:
+    /// the exact bug `Leave` was introduced to prevent, through a narrower
+    /// window.
+    ///
+    /// The race is made deterministic by splitting the read from the write
+    /// (`build_snapshot_update` is the pure half) and performing the
+    /// "concurrent" increment in between. Asserting on the `ActiveValue`
+    /// variant instead would prove nothing: `Model::into()` yields
+    /// `Unchanged`, and whether SeaORM omits `Unchanged` from the SET clause
+    /// is precisely the fact under test — so this exercises it against a real
+    /// database rather than restating an assumption about the ORM.
+    #[tokio::test]
+    async fn a_concurrent_increment_survives_a_leave_write() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let pr = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 11, "", "",
+        )
+        .await
+        .unwrap();
+        mark_pull_request_probe_error(&db, pr.id, "monitor failure 1").await.unwrap();
+        let row = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(row.probe_fail_count, 1);
+
+        // The auto-merge loop reads the row...
+        let mut snapshot = partial_snapshot("ignored under Leave");
+        snapshot.head_sha = "landed_anyway".to_string();
+        let (a, reported) = build_snapshot_update(
+            row,
+            &snapshot,
+            &crate::host::MergeReadiness::Ready,
+            StreakUpdate::Leave,
+        );
+        assert_eq!(reported, 1, "it reports the count it observed");
+
+        // ...the monitor increments while that write is in flight...
+        mark_pull_request_probe_error(&db, pr.id, "monitor failure 2").await.unwrap();
+        assert_eq!(get_pull_request(&db, pr.id).await.unwrap().unwrap().probe_fail_count, 2);
+
+        // ...and the write lands.
+        a.update(&db.0).await.unwrap();
+
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.probe_fail_count, 2,
+            "the monitor's increment must survive — writing back the observed 1 would undo it \
+             and the give-up threshold would never be reached"
+        );
+        assert_eq!(
+            reloaded.last_error, "monitor failure 2",
+            "and the monitor's newer diagnostic must survive too"
+        );
+        assert_eq!(reloaded.head_sha, "landed_anyway", "while the axes still land");
     }
 
     /// `StreakUpdate::Leave` is what keeps the monitor the SOLE owner of the
