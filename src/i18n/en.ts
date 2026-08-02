@@ -934,8 +934,14 @@ export const en = {
     imPermsHint: "",
     imPermsCopy: "Copy scopes",
     imPermsCopied: "Copied",
-    imBound: "Bound — message the bot once to re-bind another account",
+    imBound: "Owner bound.",
     imUnbound: "Not bound — send the bot any message to bind your account",
+    imDingTalkOwnerTitle: "Bound DingTalk owner",
+    imDingTalkOwnerResetHint:
+      "Reset the current owner before changing accounts. After reset, the first account to DM the bot becomes the new owner.",
+    imDingTalkOwnerReset: "Reset owner",
+    imDingTalkOwnerResetConfirm:
+      "Reset the bound DingTalk owner? Until the replacement account sends the bot a DM, the first DingTalk account to do so can become the new owner.",
     imConnect: "Save & connect",
     imReconnect: "Save & reconnect",
     imRoutesGroup: "IM conversation bindings",

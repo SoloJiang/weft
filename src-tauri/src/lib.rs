@@ -388,6 +388,7 @@ pub fn run() {
             commands::im_set_provider,
             commands::im_set_settings,
             commands::im_set_enabled,
+            commands::im_reset_owner,
             commands::im_set_remote_standby,
             commands::im_status,
             commands::im_set_dingtalk_copy,

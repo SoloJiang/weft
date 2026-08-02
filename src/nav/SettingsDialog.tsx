@@ -959,6 +959,7 @@ type ImProviderId = "feishu" | "dingtalk";
 type ImConnectionPhase = "offline" | "connecting" | "online" | "error";
 type ImCredentialMode = "scan" | "manual";
 type ImManualSetup = "feishu-permissions" | "dingtalk-steps";
+type ImOwnerReset = "none" | "dingtalk";
 
 type ImProviderView = {
   kind: ImProviderId;
@@ -973,6 +974,7 @@ type ImProviderView = {
   secretLabelKey: string;
   secretHintKey: string;
   manualSetup: ImManualSetup;
+  ownerReset: ImOwnerReset;
   routesHintKey: string;
 };
 
@@ -990,6 +992,7 @@ const IM_PROVIDER_VIEWS = {
     secretLabelKey: "settings.imAppSecret",
     secretHintKey: "settings.imAppSecretHint",
     manualSetup: "feishu-permissions",
+    ownerReset: "none",
     routesHintKey: "settings.imRoutesHint",
   },
   dingtalk: {
@@ -1005,6 +1008,7 @@ const IM_PROVIDER_VIEWS = {
     secretLabelKey: "settings.imDingTalkClientSecret",
     secretHintKey: "settings.imDingTalkClientSecretHint",
     manualSetup: "dingtalk-steps",
+    ownerReset: "dingtalk",
     routesHintKey: "settings.imRoutesHintDingtalk",
   },
 } as const satisfies Record<ImProviderId, ImProviderView>;
@@ -1158,6 +1162,18 @@ function ImSettings() {
     } catch (err) {
       setStatus(prevStatus);
       throw err;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function resetOwner() {
+    if (saving || !window.confirm(t("settings.imDingTalkOwnerResetConfirm"))) return;
+    setSaving(true);
+    try {
+      await api.imResetOwner(provider);
+      applySettings(await api.imGetSettings());
+      setStatus(await api.imStatus());
     } finally {
       setSaving(false);
     }
@@ -1375,6 +1391,27 @@ function ImSettings() {
                 }}
               />
             )}
+          </div>
+        )}
+        {providerState.ownerReset === "dingtalk" && bound && (
+          <div className="flex items-start justify-between gap-4 border-t border-border px-4 py-3.5">
+            <div className="min-w-0">
+              <div className="text-[12.5px] font-medium text-ink">
+                {t("settings.imDingTalkOwnerTitle")}
+              </div>
+              <p className="mt-1 max-w-[54ch] text-[11.5px] leading-relaxed text-ink-faint">
+                {t("settings.imDingTalkOwnerResetHint")}
+              </p>
+            </div>
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={saving}
+              onClick={() => void resetOwner()}
+              className="shrink-0"
+            >
+              {t("settings.imDingTalkOwnerReset")}
+            </Button>
           </div>
         )}
       </div>

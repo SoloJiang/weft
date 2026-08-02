@@ -7,7 +7,7 @@ pub mod feishu;
 pub mod inbound;
 pub mod outbound;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const K_PROVIDER: &str = "im.provider";
 pub const K_APP_ID: &str = "im.feishu.app_id";
@@ -438,6 +438,13 @@ impl ImSettings {
     }
 }
 
+/// Clear one provider's locally bound owner while preserving its credentials
+/// and enabled state. The next private message can then establish a replacement
+/// owner through the same first-bind path as a fresh profile.
+pub async fn reset_owner(db: &crate::store::Db, provider: ImProvider) -> anyhow::Result<()> {
+    crate::store::repo::set_setting(db, provider.allow_key(), "").await
+}
+
 /// 一张已发出的卡片背后等待的应答目标（回复路由用）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ReplyTarget {
@@ -452,6 +459,11 @@ pub struct CardIndex {
     /// 只带 id+answer，patch 终态卡（outbound::resolved_card）要 summary 从这取。
     perm_msg: HashMap<u64, (String, String)>,
     human_msg: HashMap<(i32, u64), String>,
+    /// Human asks already delivered in this bridge generation. Answerable asks
+    /// also have a `human_msg`; display-only notices deliberately do not, but
+    /// still need this identity set so a first-owner replay cannot duplicate a
+    /// queued `Asked` event.
+    delivered_human: HashSet<(i32, u64)>,
     by_message: HashMap<String, ReplyTarget>,
 }
 
@@ -467,6 +479,7 @@ impl CardIndex {
             .insert(message_id.to_string(), ReplyTarget::Perm { ask_id });
     }
     pub fn record_human(&mut self, thread: i32, ask_id: u64, message_id: &str) {
+        self.delivered_human.insert((thread, ask_id));
         if let Some(old) = self
             .human_msg
             .insert((thread, ask_id), message_id.to_string())
@@ -478,6 +491,15 @@ impl CardIndex {
             ReplyTarget::Human { thread, ask_id },
         );
     }
+    pub fn record_human_notice(&mut self, thread: i32, ask_id: u64) {
+        self.delivered_human.insert((thread, ask_id));
+    }
+    pub fn has_perm(&self, ask_id: u64) -> bool {
+        self.perm_msg.contains_key(&ask_id)
+    }
+    pub fn has_human(&self, thread: i32, ask_id: u64) -> bool {
+        self.delivered_human.contains(&(thread, ask_id))
+    }
     pub fn target_of(&self, message_id: &str) -> Option<ReplyTarget> {
         self.by_message.get(message_id).copied()
     }
@@ -488,6 +510,7 @@ impl CardIndex {
         Some((m, s))
     }
     pub fn take_human(&mut self, thread: i32, ask_id: u64) -> Option<String> {
+        self.delivered_human.remove(&(thread, ask_id));
         let m = self.human_msg.remove(&(thread, ask_id))?;
         self.by_message.remove(&m);
         Some(m)
@@ -647,6 +670,10 @@ pub struct ExecuteCtx {
     pub inbound_message_id: Option<String>,
     pub acks: Option<Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>>,
     pub reaction_tx: Option<tokio::sync::mpsc::UnboundedSender<InboundAckJob>>,
+    /// Wake the bridge's single notifier consumer after the first owner is
+    /// persisted. Keeping replay on that queue preserves event ordering and
+    /// avoids delaying the inbound webhook acknowledgement on network sends.
+    pub replay_pending_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -658,6 +685,7 @@ pub struct InboundAckJob {
 enum BridgeNotifyEvent {
     Permission(crate::ask::AskEvent),
     Human(crate::bus::state::HumanAskEvent),
+    ReplayPending,
 }
 
 /// Route execution requires an AppHandle when an issue message has to be fed
@@ -732,6 +760,15 @@ pub async fn execute_for_provider(
                 return Ok(()); // 已有 owner：本次绑定静默放弃
             }
             crate::store::repo::set_setting(db, provider.allow_key(), &open_id).await?;
+            // Startup snapshots are consumed before an owner may exist and are
+            // intentionally skipped in that state. Wake the bridge's single
+            // notifier consumer now that delivery has a target; it re-reads the
+            // registries and replays every still-open permission/human ask.
+            if let Some(replay_tx) = ctx.and_then(|ctx| ctx.replay_pending_tx.as_ref()) {
+                if replay_tx.send(()).is_err() {
+                    eprintln!("[weft][im] pending-ask replay queue is unavailable");
+                }
+            }
             // 首条消息静默绑定后直接当成问题处理（不再单发「绑定成功」打断）：把本条
             // 文本喂给 Concierge，用户第一句就能得到回答。绑定本身已落库，后续消息照常。
             if let Some(app) = app {
@@ -1372,6 +1409,7 @@ pub fn spawn(app: tauri::AppHandle) {
         // —— 出站：registry 通知 → 发卡/patch ——
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel();
         let (hum_tx, mut hum_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replay_pending_tx, mut replay_pending_rx) = tokio::sync::mpsc::unbounded_channel();
         // Install both notifier edges under the same generation guard. This
         // prevents an older startup future from replacing a newer generation's
         // senders after an awaited settings/copy step completes out of order.
@@ -1388,6 +1426,8 @@ pub fn spawn(app: tauri::AppHandle) {
         let Some((permission_snapshot, human_snapshot)) = installed else {
             return;
         };
+        let permission_registry = app.state::<crate::ask::AskRegistry>().inner().clone();
+        let human_registry = app.state::<crate::bus::BusRegistry>().inner().clone();
         {
             let (db2, ch, cards2, copy_state2) = (
                 db.clone(),
@@ -1398,35 +1438,20 @@ pub fn spawn(app: tauri::AppHandle) {
             let mut notifier_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
                 // 先补发快照里的已开 Ask（挂接前就 open 的，不会再有 Opened 事件）。
-                for ask in permission_snapshot {
-                    let operation = consume_ask_event(
-                        crate::ask::AskEvent::Opened(ask),
-                        &db2,
-                        ch.as_ref(),
-                        &cards2,
-                    );
-                    if run_until_generation_cancelled(&mut notifier_cancel, operation)
-                        .await
-                        .is_none()
-                    {
-                        return;
-                    }
-                }
-                for (thread, ask) in human_snapshot {
-                    let lang = bridge_lang(copy_state2.as_ref());
-                    let operation = consume_human_event(
-                        crate::bus::state::HumanAskEvent::Asked { thread, ask },
-                        &db2,
-                        ch.as_ref(),
-                        &cards2,
-                        &lang,
-                    );
-                    if run_until_generation_cancelled(&mut notifier_cancel, operation)
-                        .await
-                        .is_none()
-                    {
-                        return;
-                    }
+                let lang = bridge_lang(copy_state2.as_ref());
+                let initial_replay = consume_pending_ask_snapshots(
+                    permission_snapshot,
+                    human_snapshot,
+                    &db2,
+                    ch.as_ref(),
+                    &cards2,
+                    &lang,
+                );
+                if run_until_generation_cancelled(&mut notifier_cancel, initial_replay)
+                    .await
+                    .is_none()
+                {
+                    return;
                 }
                 loop {
                     let next = tokio::select! {
@@ -1434,6 +1459,7 @@ pub fn spawn(app: tauri::AppHandle) {
                         _ = notifier_cancel.changed() => return,
                         ev = ask_rx.recv() => ev.map(BridgeNotifyEvent::Permission),
                         ev = hum_rx.recv() => ev.map(BridgeNotifyEvent::Human),
+                        replay = replay_pending_rx.recv() => replay.map(|()| BridgeNotifyEvent::ReplayPending),
                     };
                     let Some(next) = next else {
                         return;
@@ -1446,6 +1472,20 @@ pub fn spawn(app: tauri::AppHandle) {
                             BridgeNotifyEvent::Human(ev) => {
                                 let lang = bridge_lang(copy_state2.as_ref());
                                 consume_human_event(ev, &db2, ch.as_ref(), &cards2, &lang).await;
+                            }
+                            BridgeNotifyEvent::ReplayPending => {
+                                let permission_snapshot = permission_registry.open();
+                                let human_snapshot = human_registry.open_ask_snapshot();
+                                let lang = bridge_lang(copy_state2.as_ref());
+                                consume_pending_ask_snapshots(
+                                    permission_snapshot,
+                                    human_snapshot,
+                                    &db2,
+                                    ch.as_ref(),
+                                    &cards2,
+                                    &lang,
+                                )
+                                .await;
                             }
                         }
                     };
@@ -1525,6 +1565,7 @@ pub fn spawn(app: tauri::AppHandle) {
                             inbound_message_id: in_mid,
                             acks: Some(acks2.clone()),
                             reaction_tx: Some(reaction_tx.clone()),
+                            replay_pending_tx: Some(replay_pending_tx.clone()),
                         };
                         let active_copy = copy_state2.as_ref().map(dingtalk_copy_snapshot);
                         let lang = active_copy
@@ -1788,6 +1829,29 @@ pub fn spawn(app: tauri::AppHandle) {
     });
 }
 
+async fn consume_pending_ask_snapshots(
+    permission_snapshot: Vec<crate::ask::Ask>,
+    human_snapshot: Vec<(i32, crate::bus::state::Ask)>,
+    db: &crate::store::Db,
+    ch: &dyn Channel,
+    cards: &tokio::sync::Mutex<CardIndex>,
+    lang: &str,
+) {
+    for ask in permission_snapshot {
+        consume_ask_event(crate::ask::AskEvent::Opened(ask), db, ch, cards).await;
+    }
+    for (thread, ask) in human_snapshot {
+        consume_human_event(
+            crate::bus::state::HumanAskEvent::Asked { thread, ask },
+            db,
+            ch,
+            cards,
+            lang,
+        )
+        .await;
+    }
+}
+
 /// 权限 Ask 事件 → 发卡（Opened，查 DB 富化 thread 标题/direction 名）/
 /// patch 终态（Resolved 带真实判决；Cancelled = 过期回落）。未绑定不出站。
 async fn consume_ask_event(
@@ -1806,6 +1870,9 @@ async fn consume_ask_event(
     let Some(owner) = owner else { return }; // 未绑定不出站
     match ev {
         crate::ask::AskEvent::Opened(mut a) => {
+            if cards.lock().await.has_perm(a.id) {
+                return;
+            }
             if let Ok(Some(t)) = crate::store::repo::get_thread(db, a.thread).await {
                 a.thread_title = t.title;
             }
@@ -1862,6 +1929,9 @@ async fn consume_human_event(
     let Some(owner) = owner else { return };
     match ev {
         crate::bus::state::HumanAskEvent::Asked { thread, ask } => {
+            if cards.lock().await.has_human(thread, ask.id) {
+                return;
+            }
             let title = crate::store::repo::get_thread(db, thread)
                 .await
                 .ok()
@@ -1893,8 +1963,9 @@ async fn consume_human_event(
                 let body =
                     crate::bus::notice_text::resolve(&ask.text, lang).unwrap_or(ask.text.as_str());
                 let notice = format!("{title} · {from}\n{body}");
-                if let Err(e) = ch.send_text(&owner, &notice).await {
-                    eprintln!("[weft][im] send stall notice: {e}");
+                match ch.send_text(&owner, &notice).await {
+                    Ok(()) => cards.lock().await.record_human_notice(thread, ask.id),
+                    Err(e) => eprintln!("[weft][im] send stall notice: {e}"),
                 }
                 return;
             }
@@ -2589,6 +2660,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resetting_dingtalk_owner_allows_the_next_dm_to_replace_it() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_DINGTALK_ALLOW, "old_owner")
+            .await
+            .unwrap();
+
+        reset_owner(&db, ImProvider::DingTalk).await.unwrap();
+        let settings = ImSettings::load(&db).await.unwrap();
+        assert!(settings.allow_open_ids.is_empty());
+        let route = inbound::route_for_provider(
+            &inbound::Inbound::Text {
+                sender_open_id: "new_owner".into(),
+                chat_type: "p2p".into(),
+                chat_id: "cid_dm".into(),
+                thread_id: None,
+                message_id: "msg_rebind".into(),
+                parent_id: None,
+                text: String::new(),
+            },
+            &settings.allow_open_ids,
+            &CardIndex::default(),
+            ImProvider::DingTalk,
+        );
+        assert!(matches!(
+            route,
+            inbound::Route::Bind { ref open_id, .. } if open_id == "new_owner"
+        ));
+
+        execute_for_provider(
+            route,
+            &db,
+            &crate::ask::AskRegistry::new(),
+            &crate::bus::BusRegistry::new(),
+            &CountingChannel::default(),
+            ImProvider::DingTalk,
+            Some(&outbound::DingTalkCopy::default()),
+            "new_owner",
+            "en",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::store::repo::get_setting(&db, K_DINGTALK_ALLOW)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new_owner")
+        );
+    }
+
+    #[tokio::test]
     async fn settings_reject_unknown_provider_fail_closed() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         crate::store::repo::set_setting(&db, K_PROVIDER, "unknown")
@@ -2903,10 +3030,109 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn first_dingtalk_owner_bind_replays_preexisting_permission_and_human_asks() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "pending issue",
+            "feature",
+            "claude",
+        )
+        .await
+        .unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        let bus = crate::bus::BusRegistry::new();
+        let (permission_id, _permission_rx) = asks.request(
+            thread.id,
+            "10",
+            "claude",
+            "Run tests",
+            "cargo test",
+            crate::ask::RiskLevel::Unknown,
+            "cargo test",
+        );
+        let human_id = bus.ask_human(thread.id, "10", "Which release channel?");
+        let channel = CountingChannel::default();
+        let cards = tokio::sync::Mutex::new(CardIndex::default());
+        let (replay_pending_tx, mut replay_pending_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ExecuteCtx {
+            replay_pending_tx: Some(replay_pending_tx),
+            ..Default::default()
+        };
+
+        execute_for_provider(
+            inbound::Route::Bind {
+                open_id: "new_owner".into(),
+                chat_id: "cid_dm".into(),
+                reply_to: "msg_first".into(),
+                text: String::new(),
+            },
+            &db,
+            &asks,
+            &bus,
+            &channel,
+            ImProvider::DingTalk,
+            Some(&outbound::DingTalkCopy::default()),
+            "new_owner",
+            "en",
+            None,
+            Some(&ctx),
+        )
+        .await
+        .unwrap();
+
+        replay_pending_rx.recv().await.unwrap();
+        consume_pending_ask_snapshots(
+            asks.open(),
+            bus.open_ask_snapshot(),
+            &db,
+            &channel,
+            &cards,
+            "en",
+        )
+        .await;
+        assert_eq!(
+            crate::store::repo::get_setting(&db, K_DINGTALK_ALLOW)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new_owner")
+        );
+        assert_eq!(
+            channel.cards.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "both preexisting blockers must be replayed after first bind"
+        );
+        assert!(cards.lock().await.has_perm(permission_id));
+        assert!(cards.lock().await.has_human(thread.id, human_id));
+
+        // A queued Opened event can race the replay signal. The notifier is
+        // serial, and CardIndex identities make the second presentation a no-op.
+        consume_pending_ask_snapshots(
+            asks.open(),
+            bus.open_ask_snapshot(),
+            &db,
+            &channel,
+            &cards,
+            "en",
+        )
+        .await;
+        assert_eq!(channel.cards.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
     /// An answerable question goes through IM's answer-card pipeline; a
     /// display-only stall NOTICE reaches the remote human as plain TEXT instead
     /// (never an answer card, so no dead reply prompt or wrong "cancelled" patch),
-    /// and — verified below — is NOT recorded in CardIndex.
+    /// and — verified below — has no patchable message while its identity still
+    /// suppresses duplicate first-owner replay.
     #[tokio::test]
     async fn stall_notice_forwarded_as_text_to_im() {
         use crate::bus::state::{Ask, HumanAskEvent};
@@ -2966,10 +3192,23 @@ mod tests {
         .await;
         assert_eq!(cards_sent(), 1, "notice must not open an answer card");
         assert_eq!(texts_sent(), 1, "notice is delivered as plain text");
-        // And it is NOT recorded, so a later Answered/Cancelled patches nothing.
+        consume_human_event(
+            HumanAskEvent::Asked {
+                thread: th.id,
+                ask: mk(2, false),
+            },
+            &db,
+            &ch,
+            &cards,
+            IM_LANG,
+        )
+        .await;
+        assert_eq!(texts_sent(), 1, "replay must not duplicate a delivered notice");
+        // The identity is tracked for de-duplication, but there is no message to
+        // patch when the display-only notice later cancels itself.
         assert!(
             cards.lock().await.take_human(th.id, 2).is_none(),
-            "notice must not be recorded in CardIndex",
+            "notice must not have a patchable CardIndex message",
         );
 
         let mut force_reset = mk(3, false);

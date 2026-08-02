@@ -179,6 +179,10 @@ impl BusRegistry {
     ) -> Vec<(i32, Ask)> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         *self.ask_notify.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        Self::open_ask_snapshot_from(&inner)
+    }
+
+    fn open_ask_snapshot_from(inner: &HashMap<i32, ThreadBus>) -> Vec<(i32, Ask)> {
         let mut snapshot = inner
             .iter()
             .flat_map(|(thread, bus)| {
@@ -191,6 +195,14 @@ impl BusRegistry {
             .collect::<Vec<_>>();
         snapshot.sort_by_key(|(thread, ask)| (ask.ts, *thread, ask.id));
         snapshot
+    }
+
+    /// Snapshot every currently open human ask without replacing the notifier.
+    /// Used when an IM bridge gains its first owner after startup snapshots were
+    /// intentionally skipped while no delivery target existed.
+    pub fn open_ask_snapshot(&self) -> Vec<(i32, Ask)> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::open_ask_snapshot_from(&inner)
     }
 
     /// Install the transcript-trail consumer's channel (called once at startup,

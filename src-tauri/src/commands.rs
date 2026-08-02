@@ -2720,6 +2720,26 @@ pub async fn im_set_enabled(
     Ok(())
 }
 
+/// Clear a provider's locally bound owner without deleting credentials. The
+/// active bridge is restarted so in-memory prompt-recipient/card mappings for
+/// the retired owner cannot suppress or leak status updates after rebind.
+#[tauri::command]
+pub async fn im_reset_owner(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    provider: String,
+) -> R<()> {
+    let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    let active_provider = crate::im::ImSettings::active_provider(&db)
+        .await
+        .map_err(e)?;
+    crate::im::reset_owner(&db, provider).await.map_err(e)?;
+    if active_provider == provider {
+        crate::im::spawn(app);
+    }
+    Ok(())
+}
+
 /// 远程待命：桥启用期间持有「防空闲休眠」断言，保证飞书指令随时可达。
 /// 纯电源层开关——不重启桥、不断 WS；写库后立即收敛 PowerGuard。
 #[tauri::command]

@@ -129,6 +129,9 @@ pub async fn call_global(
                     "error: unknown verdict '{verdict}' (use allow/deny/always/full)"
                 ));
             };
+            if let Err(e) = require_active_im_provider(db, args).await {
+                return text_result(format!("error: {e}"));
+            }
             if asks.answer(ask_id, ans) {
                 text_result(format!("answered ask #{ask_id} as {verdict}"))
             } else {
@@ -143,6 +146,9 @@ pub async fn call_global(
                 return text_result("error: ask_id required".into());
             };
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if let Err(e) = require_active_im_provider(db, args).await {
+                return text_result(format!("error: {e}"));
+            }
             if bus.answer_ask(tid, ask_id, text) {
                 text_result(format!("answered ask #{ask_id} on issue {tid}"))
             } else {
@@ -247,7 +253,7 @@ pub async fn call_global(
             if kind.trim().is_empty() {
                 return text_result("error: kind required".into());
             }
-            match create_issue(db, ws, &title, &kind).await {
+            match create_issue(db, ws, &title, &kind, None).await {
                 Ok(v) => json_result(v),
                 Err(e) => text_result(format!("error: {e}")),
             }
@@ -468,7 +474,7 @@ async fn create_issue_from_im(
 ) -> anyhow::Result<Value> {
     let active_provider = require_active_im_provider(db, args).await?;
     let provider = active_provider.as_str();
-    let issue = create_issue(db, ws, title, kind).await?;
+    let issue = create_issue(db, ws, title, kind, Some(args)).await?;
     let thread_id = issue["issue_id"].as_i64().unwrap_or_default() as i32;
     let can_create = im_can_create_topic_here(args);
     let open_hint = if active_provider == crate::im::ImProvider::DingTalk {
@@ -597,7 +603,12 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
     }))
 }
 
-async fn create_issue(db: &Db, ws: i32, title: &str, kind: &str) -> anyhow::Result<Value> {
+struct PreparedIssue {
+    route: crate::engine_routing::RouteDecision,
+    tool: String,
+}
+
+async fn prepare_issue(db: &Db) -> PreparedIssue {
     let legacy_tool = crate::tools::default_tool(db).await;
     let route = crate::engine_routing::resolve_for_db(
         db,
@@ -610,6 +621,24 @@ async fn create_issue(db: &Db, ws: i32, title: &str, kind: &str) -> anyhow::Resu
         .selected()
         .map(|selected| selected.as_str().to_string())
         .unwrap_or(legacy_tool);
+    PreparedIssue { route, tool }
+}
+
+async fn persist_prepared_issue(
+    db: &Db,
+    ws: i32,
+    title: &str,
+    kind: &str,
+    prepared: PreparedIssue,
+    im_args: Option<&Value>,
+) -> anyhow::Result<Value> {
+    let PreparedIssue { route, tool } = prepared;
+    // Default-tool and routing resolution above can await. An IM Concierge turn
+    // may be retired during those reads, so validate at the final repository
+    // boundary as well as at tool entry before creating any durable issue.
+    if let Some(args) = im_args {
+        require_active_im_provider(db, args).await?;
+    }
     let t = repo::create_thread(db, ws, title, kind, &tool).await?;
     crate::engine_routing::record_decision(db, t.id, None, None, "new_issue", &route).await;
     Ok(json!({
@@ -618,6 +647,17 @@ async fn create_issue(db: &Db, ws: i32, title: &str, kind: &str) -> anyhow::Resu
         "title": t.title,
         "kind": t.kind,
     }))
+}
+
+async fn create_issue(
+    db: &Db,
+    ws: i32,
+    title: &str,
+    kind: &str,
+    im_args: Option<&Value>,
+) -> anyhow::Result<Value> {
+    let prepared = prepare_issue(db).await;
+    persist_prepared_issue(db, ws, title, kind, prepared, im_args).await
 }
 
 async fn ensure_issue_topic(db: &Db, thread_id: i32, chat_id: &str) -> anyhow::Result<Value> {
@@ -685,17 +725,17 @@ pub fn global_specs() -> Value {
         },
         {
             "name": "answer_permission",
-            "description": "Answer a permission ask on behalf of the human. verdict ∈ allow|deny|always|full. always = remember this exact action for the asking task; full = grant the task full access (skips future asks).",
+            "description": "Answer a permission ask on behalf of the human from the current IM conversation. verdict ∈ allow|deny|always|full. always = remember this exact action for the asking task; full = grant the task full access (skips future asks). Pass the current im_context so a retired provider turn cannot mutate the registry.",
             "inputSchema": { "type": "object",
-                "properties": { "ask_id": u(), "verdict": s() },
-                "required": ["ask_id", "verdict"] }
+                "properties": { "ask_id": u(), "verdict": s(), "im_context": { "type": "object" } },
+                "required": ["ask_id", "verdict", "im_context"] }
         },
         {
             "name": "answer_question",
-            "description": "Reply to an agent's open question (ask_human). The text is delivered into that task's bus inbox.",
+            "description": "Reply to an agent's open question (ask_human) from the current IM conversation. The text is delivered into that task's bus inbox only while that im_context provider is still active.",
             "inputSchema": { "type": "object",
-                "properties": { "issue_id": i(), "ask_id": u(), "text": s() },
-                "required": ["issue_id", "ask_id", "text"] }
+                "properties": { "issue_id": i(), "ask_id": u(), "text": s(), "im_context": { "type": "object" } },
+                "required": ["issue_id", "ask_id", "text", "im_context"] }
         },
         {
             "name": "message_lead",
@@ -837,7 +877,11 @@ mod tests {
             &asks,
             &bus,
             "answer_permission",
-            &json!({ "ask_id": id, "verdict": "allow" }),
+            &json!({
+                "ask_id": id,
+                "verdict": "allow",
+                "im_context": { "provider": "feishu" }
+            }),
         )
         .await;
         assert!(v["content"][0]["text"]
@@ -845,6 +889,64 @@ mod tests {
             .unwrap()
             .contains("answered"));
         assert_eq!(rx.await.unwrap(), crate::ask::Decision::Allow);
+    }
+
+    #[tokio::test]
+    async fn stale_im_context_cannot_answer_permission_or_human_question() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let (permission_id, _permission_rx) = asks.request(
+            1,
+            "10",
+            "claude",
+            "Run tests",
+            "cargo test",
+            RiskLevel::Unknown,
+            "cargo test",
+        );
+        let human_id = bus.ask_human(1, "10", "Which release channel?");
+        let stale_context = json!({ "provider": "feishu" });
+        // Both asks were opened by a Feishu Concierge turn. The user switched
+        // to DingTalk before that turn reached either mutating global tool.
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+
+        let permission = call_global(
+            &db,
+            &asks,
+            &bus,
+            "answer_permission",
+            &json!({
+                "ask_id": permission_id,
+                "verdict": "full",
+                "im_context": stale_context.clone()
+            }),
+        )
+        .await;
+        let question = call_global(
+            &db,
+            &asks,
+            &bus,
+            "answer_question",
+            &json!({
+                "issue_id": 1,
+                "ask_id": human_id,
+                "text": "stable",
+                "im_context": stale_context
+            }),
+        )
+        .await;
+
+        assert!(permission["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("stale IM context")));
+        assert!(question["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("stale IM context")));
+        assert!(asks.open().iter().any(|ask| ask.id == permission_id));
+        assert!(bus.open_asks(1).iter().any(|ask| ask.id == human_id));
     }
 
     #[tokio::test]
@@ -901,6 +1003,24 @@ mod tests {
             .collect();
         assert!(names.contains(&"create_issue_from_im".to_string()));
         assert!(names.contains(&"ensure_issue_im_topic".to_string()));
+    }
+
+    #[test]
+    fn mutating_answer_tools_require_im_context() {
+        let specs = global_specs();
+        for name in ["answer_permission", "answer_question"] {
+            let spec = specs
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|spec| spec["name"] == name)
+                .unwrap();
+            assert!(spec["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|required| required == "im_context"));
+        }
     }
 
     #[test]
@@ -965,6 +1085,37 @@ mod tests {
         assert_eq!(parsed["issue"]["title"], "New task");
         assert_eq!(parsed["im"]["topic_created"], false);
         assert_eq!(parsed["im"]["open_hint"], format!("/bind {issue_id}"));
+    }
+
+    #[tokio::test]
+    async fn provider_switch_after_issue_preparation_prevents_database_creation() {
+        let db = mem_db().await;
+        let workspace = repo::create_workspace(&db, "alpha").await.unwrap();
+        let stale_args = json!({ "im_context": { "provider": "feishu" } });
+
+        // Model the exact await window in create_issue_from_im: tool/routing
+        // preparation completed under Feishu, then the provider changed before
+        // the final repo::create_thread boundary.
+        let prepared = prepare_issue(&db).await;
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        let error = persist_prepared_issue(
+            &db,
+            workspace.id,
+            "Must not exist",
+            "feature",
+            prepared,
+            Some(&stale_args),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("stale IM context"));
+        assert!(repo::list_threads(&db, workspace.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

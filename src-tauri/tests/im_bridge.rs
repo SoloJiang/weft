@@ -472,6 +472,7 @@ async fn issue_message_route_unbound_thread_hints_without_creating_issue() {
         inbound_message_id: Some("om_in".into()),
         acks: Some(std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()))),
         reaction_tx: None,
+        replay_pending_tx: None,
     };
     let r = Route::IssueMessage {
         chat_id: "oc_g".into(),
@@ -511,6 +512,7 @@ async fn issue_message_with_ctx_adds_eyes_reaction() {
         inbound_message_id: Some("om_in_1".into()),
         acks: Some(acks.clone()),
         reaction_tx: None,
+        replay_pending_tx: None,
     };
     let r = Route::IssueMessage {
         chat_id: "oc_g".into(),
@@ -549,6 +551,7 @@ async fn issue_message_with_reaction_queue_does_not_wait_for_feishu_reaction_api
         inbound_message_id: Some("om_in_slow".into()),
         acks: Some(std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()))),
         reaction_tx: Some(reaction_tx),
+        replay_pending_tx: None,
     };
     let r = Route::IssueMessage {
         chat_id: "oc_g".into(),

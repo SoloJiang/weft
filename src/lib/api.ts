@@ -448,6 +448,8 @@ export const api = {
     invoke<void>("im_set_settings", { provider, appId, appSecret }),
   imSetEnabled: (provider: "feishu" | "dingtalk", enabled: boolean) =>
     invoke<void>("im_set_enabled", { provider, enabled }),
+  imResetOwner: (provider: "feishu" | "dingtalk") =>
+    invoke<void>("im_reset_owner", { provider }),
   imSetRemoteStandby: (enabled: boolean) =>
     invoke<void>("im_set_remote_standby", { enabled }),
   imStatus: () => invoke<string>("im_status"),

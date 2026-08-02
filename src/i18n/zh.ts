@@ -900,8 +900,14 @@ export const zh = {
     imPermsHint: "",
     imPermsCopy: "复制权限点",
     imPermsCopied: "已复制",
-    imBound: "已绑定——再次私聊 bot 可重新绑定其他账号",
+    imBound: "已绑定 owner。",
     imUnbound: "未绑定——给 bot 发任意一句话即可绑定你的账号",
+    imDingTalkOwnerTitle: "已绑定的钉钉 owner",
+    imDingTalkOwnerResetHint:
+      "更换账号前先重置当前 owner。重置后，第一个私聊机器人的钉钉账号会成为新 owner。",
+    imDingTalkOwnerReset: "重置 owner",
+    imDingTalkOwnerResetConfirm:
+      "要重置已绑定的钉钉 owner 吗？新账号私聊机器人完成绑定前，第一个发起私聊的钉钉账号都可能成为新 owner。",
     imConnect: "保存并连接",
     imReconnect: "保存并重连",
     imRoutesGroup: "IM 会话绑定",
