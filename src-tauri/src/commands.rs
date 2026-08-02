@@ -1710,9 +1710,25 @@ pub async fn get_computer_control_state() -> R<Option<crate::computer::ControlHo
 /// fail-closed even when the DB write below fails — but that write error is
 /// still surfaced to the frontend (not swallowed) so a human sees the
 /// half-persisted state instead of believing the kill switch fully landed.
+///
+/// issue #160 round-12 P1 #1: also cancels every open `weft_computer` ask
+/// (`AskRegistry::cancel_computer_asks`) right after the stop itself lands —
+/// see that method's own doc for the stale-card race this closes (a human
+/// answering an already-open GUI card `Always`/`Full` right after Stop would
+/// otherwise still record a standing grant, since `answer()` records it
+/// before the calling endpoint's own post-await kill-switch recheck ever
+/// runs). `computer::emergency_stop(db)` itself has no `AskRegistry` to
+/// reach and keeps its existing signature (it has other, non-command
+/// callers — the OS-level global Escape shortcut in `computer::mod.rs` —
+/// that would otherwise all need to grow one too) — the cancellation is
+/// deliberately done here, at each entry point that already holds (or can
+/// reach) one, not inside `emergency_stop` itself. See `computer::mod.rs`'s
+/// own Escape callback for this command's sibling entry point.
 #[tauri::command]
-pub async fn computer_emergency_stop(db: State<'_, Db>) -> R<()> {
-    crate::computer::emergency_stop(&db).await
+pub async fn computer_emergency_stop(db: State<'_, Db>, asks: State<'_, crate::ask::AskRegistry>) -> R<()> {
+    let result = crate::computer::emergency_stop(&db).await;
+    asks.cancel_computer_asks();
+    result
 }
 
 /// issue #160 round-6 review P2 #6: whether the MOST RECENT emergency stop

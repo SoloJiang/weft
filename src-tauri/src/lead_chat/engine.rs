@@ -1107,6 +1107,84 @@ fn track_inline_image_row(
     (rows, evicted)
 }
 
+/// issue #160 round-12 P2 #3: the DURABLE, restart-safe half of the inline-
+/// image retention cap. `inner.inline_image_rows` above only ever sees rows
+/// written during THIS process's own lifetime — a restart starts that queue
+/// empty, so a session that keeps napping computer-use screenshots across
+/// restarts could silently re-accumulate past `MAX_INLINE_IMAGE_ROWS` inline
+/// images in SQLite forever: nothing before this round closed the gap
+/// between "capped for one process's lifetime" and "capped, full stop", and
+/// `history` loads read straight off the store (`repo::list_lead_messages`,
+/// the SAME query this uses), so an unbounded on-disk backlog was handed to
+/// the frontend on every reload regardless of how recently the app itself
+/// restarted.
+///
+/// Queries this thread's OWN persisted `kind:"tool"` rows fresh — ascending
+/// by id/seq, matching `history`'s own order — every time a NEW inline image
+/// is about to be written, and strips `images` from every row beyond the
+/// `MAX_INLINE_IMAGE_ROWS` most recent, DURABLY, in the SAME store `history`
+/// reads from. Since the row just written is always the newest by id order,
+/// it can never itself land in the stripped slice as long as the cap is at
+/// least 1 — nothing here needs to special-case "never touch the row this
+/// very call just wrote". `inner.inline_image_rows`'s in-memory pass (in
+/// `merge_tool_results`, right after this call) stays as an additional
+/// (redundant but harmless — stripping an already-stripped row's absent
+/// `images` key is a no-op) fast path; THIS is now the authoritative one.
+///
+/// Split from the `&AppHandle`-taking wrapper below ([`enforce_durable_
+/// inline_image_cap`]) purely so this exact DB-mutating decision is
+/// unit-testable directly: this crate's `AppHandle` is the concrete `Wry`
+/// runtime with no `tauri::test::mock_app` path (see `post_stall_notice_via`'s
+/// own doc for the identical wall), so a function taking `&AppHandle` is
+/// unreachable from any test. Returns every `(row_id, content, status)` this
+/// call actually stripped and durably rewrote, so the wrapper can push each
+/// as a `Push::ToolResult` after this returns.
+async fn enforce_durable_inline_image_cap_db(db: &Db, thread_id: i32) -> Vec<(i32, String, String)> {
+    let Ok(messages) = repo::list_lead_messages(db, thread_id).await else {
+        return Vec::new();
+    };
+    // Oldest-first (matches `list_lead_messages`'s own order) ids of every
+    // persisted tool row that STILL carries an inline image. A plain
+    // substring pre-check narrows the set before the real JSON parse below
+    // (this thread's non-tool/non-image rows never pay for one).
+    let image_bearing: Vec<&lead_message::Model> = messages
+        .iter()
+        .filter(|m| m.kind == "tool" && m.content.contains("\"images\""))
+        .collect();
+    let keep_from = image_bearing.len().saturating_sub(MAX_INLINE_IMAGE_ROWS);
+    let mut stripped = Vec::new();
+    for m in &image_bearing[..keep_from] {
+        let Ok(mut content) = serde_json::from_str::<serde_json::Value>(&m.content) else {
+            continue;
+        };
+        let Some(obj) = content.as_object_mut() else { continue };
+        if obj.remove("images").is_none() {
+            // The substring pre-check can (rarely) false-positive on a row
+            // whose `"images"` text sits somewhere other than an actual
+            // top-level key — never worth an unconditional write over.
+            continue;
+        }
+        let content_str = content.to_string();
+        if repo::update_lead_message(db, m.id, &content_str, &m.status)
+            .await
+            .is_ok()
+        {
+            stripped.push((m.id, content_str, m.status.clone()));
+        }
+    }
+    stripped
+}
+
+/// The live wrapper: runs [`enforce_durable_inline_image_cap_db`] and pushes
+/// a `Push::ToolResult` for each row it actually stripped, so an open
+/// frontend timeline reflects the durable trim immediately rather than only
+/// on the next reload.
+async fn enforce_durable_inline_image_cap(app: &AppHandle, db: &Db, thread_id: i32) {
+    for (message_id, content, status) in enforce_durable_inline_image_cap_db(db, thread_id).await {
+        let _ = app.emit(EVENT, Push::ToolResult { thread_id, message_id, content, status });
+    }
+}
+
 /// Merge tool results into their running rows (claude tool_result / codex
 /// item.completed); a result for an untracked row is dropped.
 ///
@@ -1118,11 +1196,10 @@ fn track_inline_image_row(
 /// right here. This never touches the CURRENT item's own `content` (already
 /// written above, images intact) — M3-B's "this screenshot inlines for a
 /// capable engine" contract is unaffected; only OLDER rows' accumulated
-/// history is pruned. In-memory tracking means this bound applies to NEW
-/// writes made during this engine's own lifetime — a row written before this
-/// round, or by a session that hasn't reloaded since an app restart, isn't
-/// retroactively touched; a durable migration for that is a follow-up (see
-/// this function's own module-level issue notes).
+/// history is pruned. issue #160 round-12 P2 #3: the AUTHORITATIVE cap is no
+/// longer this in-memory pass — see [`enforce_durable_inline_image_cap`],
+/// called right after it, for the restart-safe, DB-sourced enforcement that
+/// now bounds this regardless of how many times the app has restarted since.
 async fn merge_tool_results(
     app: &AppHandle,
     db: &Db,
@@ -1172,6 +1249,11 @@ async fn merge_tool_results(
                     );
                 }
             }
+            // issue #160 round-12 P2 #3: the DB-write-path cap runs on every
+            // new inline image regardless of the in-memory pass above — see
+            // `enforce_durable_inline_image_cap`'s own doc for why this one,
+            // not the in-memory queue, is the authoritative bound.
+            enforce_durable_inline_image_cap(app, db, thread_id).await;
         }
     }
 }
@@ -3675,10 +3757,22 @@ async fn spawn_acp_turn(
         .try_state::<crate::BusBase>()
         .map(|b| b.0.clone())
         .unwrap_or_default();
-    // issue #160: opt-in computer-use MCP. Concierge/curator never get it;
-    // issue lead and workers do, gated on the same setting as the non-ACP
-    // injection points in lead_chat/commands.rs.
-    let computer = crate::computer::enabled(&db).await;
+    // issue #160 round-12 P2 #7: `weft_computer` is now injected
+    // UNCONDITIONALLY for every issue-lead/worker engine (concierge/curator
+    // still never get it) — the setting/kill-switch is enforced dynamically,
+    // server-side, on every single call by `bus::computer_srv::run_action`'s
+    // own `computer::enabled` gate (fail-closed with a "disabled in weft
+    // settings" result). This used to re-check `computer::enabled(&db)` here
+    // and pass that as `include_computer`, which meant an engine spawned (or
+    // an ACP session opened) BEFORE the human turned the setting on would
+    // simply never present the tool at all on this per-turn path either.
+    // Always injecting means the human flipping the setting takes effect
+    // immediately, on the NEXT tool call, without needing to rebuild
+    // anything — see `lead_chat::commands.rs`'s own three non-ACP injection
+    // points for the identical change, and `bus::inject::inject_computer`'s
+    // doc for why the endpoint itself was always designed to be always-safe
+    // to hand out (the description also says it needs enabling in Settings,
+    // and the server denies every call otherwise).
     let mcp = if base.is_empty() {
         vec![]
     } else if sid.is_none() {
@@ -3698,17 +3792,18 @@ async fn spawn_acp_turn(
             "curator" => crate::bus::inject::acp_mcp_servers(
                 &base, thread_id_i, crate::bus::LEAD, true, false, false, true, false, None,
             ),
-            // Issue lead: planner + bus (+ computer when enabled). No
-            // worktree of its own (issue #160 round-2 P2 §5) — always `None`.
+            // Issue lead: planner + bus + computer (always injected, gated
+            // server-side). No worktree of its own (issue #160 round-2 P2
+            // §5) — always `None`.
             _ => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, crate::bus::LEAD, true, true, false, false, computer, None,
+                &base, thread_id_i, crate::bus::LEAD, true, true, false, false, true, None,
             ),
         }
     } else {
-        // Worker: bus only under direction id (+ computer, pinned to this
-        // worker's OWN worktree, when enabled — issue #160 round-2 P2 §5).
+        // Worker: bus under direction id + computer (always injected,
+        // pinned to this worker's OWN worktree — issue #160 round-2 P2 §5).
         crate::bus::inject::acp_mcp_servers(
-            &base, thread_id_i, &ask_dir, true, false, false, false, computer, worktree_id,
+            &base, thread_id_i, &ask_dir, true, false, false, false, true, worktree_id,
         )
     };
 
@@ -10048,6 +10143,77 @@ mod tests {
             assert!(evicted.is_empty(), "must not evict while at or under the cap");
         }
         assert_eq!(rows.len(), MAX_INLINE_IMAGE_ROWS);
+    }
+
+    /// issue #160 round-12 P2 #3: the DB-write-path cap is what actually
+    /// bounds persisted inline images — unlike `inner.inline_image_rows`
+    /// (this engine's own in-memory queue, empty again on every restart),
+    /// `enforce_durable_inline_image_cap_db` is called with NO in-memory
+    /// state carried between iterations here at all, standing in for a
+    /// fresh engine (empty queue) running after every single write — i.e. a
+    /// "restart" between every screenshot. The persisted count must still
+    /// never exceed `MAX_INLINE_IMAGE_ROWS`.
+    #[tokio::test]
+    async fn enforce_durable_inline_image_cap_db_bounds_persisted_inline_images_across_a_simulated_restart() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+
+        let n = MAX_INLINE_IMAGE_ROWS + 2;
+        for i in 0..n {
+            let content = serde_json::json!({
+                "name": "computer",
+                "summary": "screenshot",
+                "input": {},
+                "output": format!("/tmp/shot-{i}.png"),
+                "is_error": false,
+                "images": [format!("data:image/png;base64,img{i}")],
+            });
+            repo::insert_lead_message(
+                &db,
+                t.id,
+                None,
+                1,
+                "assistant",
+                "tool",
+                &content.to_string(),
+                "complete",
+            )
+            .await
+            .unwrap();
+            // No in-memory queue passed in at all — each call here is as
+            // independent as if a brand-new engine (empty `inline_image_rows`)
+            // ran after every single write, i.e. a "restart" in between each.
+            enforce_durable_inline_image_cap_db(&db, t.id).await;
+        }
+
+        let messages = repo::list_lead_messages(&db, t.id).await.unwrap();
+        assert_eq!(messages.len(), n, "no row is ever deleted, only its images key stripped");
+        let with_images: Vec<&lead_message::Model> =
+            messages.iter().filter(|m| m.content.contains("\"images\"")).collect();
+        assert_eq!(
+            with_images.len(),
+            MAX_INLINE_IMAGE_ROWS,
+            "persisted inline images must stay at the cap no matter how many restarts happen in between"
+        );
+        // The most recent write must still carry its own inline image.
+        let last = messages.last().unwrap();
+        assert!(
+            last.content.contains("\"images\""),
+            "the current call's own screenshot must stay inline: {}",
+            last.content
+        );
+        // An older, evicted row keeps its `output` path text intact — only
+        // the inline data URI is stripped, never the on-disk reference.
+        let first = &messages[0];
+        assert!(!first.content.contains("\"images\""));
+        assert!(
+            first.content.contains("shot-0.png"),
+            "the path reference must survive the strip: {}",
+            first.content
+        );
     }
 
     /// PersistedMeta roundtrip + tolerance: apply restores every last_* field,

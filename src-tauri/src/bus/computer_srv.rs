@@ -353,7 +353,7 @@ fn computer_tool_specs() -> Value {
     json!([
         {
             "name": "computer",
-            "description": format!("Observe AND control the human's screen — OS-level window listing/screenshot plus mouse/keyboard input injection. `action=list_windows` lists visible on-screen windows (Weft's own window and terminal-emulator apps are excluded, so you can never see yourself or the terminal you're running inside). `action=screenshot` captures ONE window — never the whole desktop — and returns a PNG FILE PATH; for clients that accept an inline MCP image (Claude, and ACP/omp sessions) the same result ALSO carries the screenshot inlined as an image block, so you can reason over it directly with no need to open the path yourself — other clients should open that file path with their own image-viewing tool. Every action except `list_windows`, `cursor_position`, and `wait` needs `window` (same id/substring rule as screenshot) and drives that window's input: `left_click`/`right_click`/`double_click`/`triple_click`/`mouse_move` need `coordinate` [x, y]; `left_click_drag` needs `start_coordinate` AND `coordinate` (end point); `scroll` needs `coordinate` plus `scroll_direction`; `type`/`key` need `text` (literal text to type, or a combo like \"cmd+s\"/\"ctrl+shift+t\"/\"Return\"/\"f5\" for `key`). ALL coordinates are in the pixel space of the MOST RECENT screenshot of that window — you MUST screenshot a window before clicking/dragging/scrolling/moving the mouse in it, or the call is rejected (there is no screenshot on file yet to map coordinates against); a coordinate maps proportionally onto the window's CURRENT position and size even if it moved or resized since that screenshot, and an out-of-range coordinate (judged against the screenshot's own dimensions) is rejected rather than guessed at. `type`/`key` additionally require a `left_click`/`right_click`/`double_click`/`triple_click` on that SAME window within the last {FOCUS_FRESHNESS_SECS}s — click inside the target window first to focus it, then type/key within {FOCUS_FRESHNESS_SECS}s, or the call is rejected. Every call — observation or input — may pause for a human's permission card (Needs-you) before it runs; an input action can additionally come back `Busy` (another session currently has it) or fail while a DIFFERENT permission card is still waiting on the human — retry after a moment. Input actions are also rate-limited to roughly 2 per second."),
+            "description": format!("Observe AND control the human's screen — OS-level window listing/screenshot plus mouse/keyboard input injection. `action=list_windows` lists visible on-screen windows (Weft's own window and terminal-emulator apps are excluded, so you can never see yourself or the terminal you're running inside). `action=screenshot` captures ONE window — never the whole desktop — and returns a PNG FILE PATH; for clients that accept an inline MCP image (Claude, and ACP/omp sessions) the same result ALSO carries the screenshot inlined as an image block, so you can reason over it directly with no need to open the path yourself — other clients should open that file path with their own image-viewing tool. Every action except `list_windows`, `cursor_position`, and `wait` needs `window` (same id/substring rule as screenshot) and drives that window's input: `left_click`/`right_click`/`double_click`/`triple_click`/`mouse_move` need `coordinate` [x, y]; `left_click_drag` needs `start_coordinate` AND `coordinate` (end point); `scroll` needs `coordinate` plus `scroll_direction`; `type`/`key` need `text` (literal text to type, or a combo like \"cmd+s\"/\"ctrl+shift+t\"/\"Return\"/\"f5\" for `key`). ALL coordinates are in the pixel space of the MOST RECENT screenshot of that window — you MUST screenshot a window before clicking/dragging/scrolling/moving the mouse in it, or the call is rejected (there is no screenshot on file yet to map coordinates against); a coordinate maps proportionally onto the window's CURRENT position and size even if it moved or resized since that screenshot, and an out-of-range coordinate (judged against the screenshot's own dimensions) is rejected rather than guessed at. `type`/`key` additionally require a `left_click`/`right_click`/`double_click`/`triple_click` on that SAME window within the last {FOCUS_FRESHNESS_SECS}s — click inside the target window first to focus it, then type/key within {FOCUS_FRESHNESS_SECS}s, or the call is rejected. Every call — observation or input — may pause for a human's permission card (Needs-you) before it runs; an input action can additionally come back `Busy` (another session currently has it) or fail while a DIFFERENT permission card is still waiting on the human — retry after a moment. Input actions are also rate-limited to roughly 2 per second. This tool is only ever ACTIVE once the human has turned on \"Computer Use\" in weft's Settings; while it's off, every call here fails with a `disabled` result explaining that — this tool being LISTED does not by itself mean it can be used yet."),
             "inputSchema": { "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": VALID_ACTIONS,
@@ -552,19 +552,30 @@ async fn run_action(
             // THIS call". Also records `window_id_out` for the audit line,
             // even on the failure path (matches every input arm's own
             // ordering — see that helper's doc).
-            // `_w` is used only for the verification above — every line
-            // below this keys off `shot.window_id` instead (the id
-            // `screenshot_window` ITSELF resolved and captured against),
-            // matching this arm's own pre-existing "no second resolution to
-            // drift" discipline (see the `store_screenshot_preview` call
-            // below).
-            let _w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            // `w` is used for the verification above AND (round-12 P1 #2)
+            // to record this capture's own window IDENTITY alongside its
+            // dimensions below — every other line here still keys off
+            // `shot.window_id` instead (the id `screenshot_window` ITSELF
+            // resolved and captured against), matching this arm's own
+            // pre-existing "no second resolution to drift" discipline (see
+            // the `store_screenshot_preview` call below).
+            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
             let out_dir = screenshot_out_dir(db, thread, dir, wt).await?;
+            // issue #160 round-12 P1 #5: acquire the process-wide capture
+            // semaphore BEFORE the synchronous capture below — see
+            // `screenshot_semaphore`'s own doc for why (a Full/Always-granted
+            // worker could otherwise fire arbitrarily many concurrent
+            // `screenshot` calls, each holding its own full-resolution RGBA
+            // buffer plus PNG/JPEG encode buffers at once, with no cap
+            // anywhere on this path). Held across capture AND every encode
+            // this call does; dropped when this arm's block ends (including
+            // on an early `?` return from the capture itself).
+            let _capture_permit = screenshot_semaphore().acquire().await.map_err(|e| e.to_string())?;
             let b = backend::backend();
             // `screenshot_window` re-resolves `window_query` internally —
             // the SAME query just verified above, against the SAME
             // unchanging backend state, with no await/OS call in between —
-            // so it captures the IDENTICAL window `_w` just verified. This
+            // so it captures the IDENTICAL window `w` just verified. This
             // mirrors the accepted "resolve twice" pattern the click-family
             // arms already use (`resolve_and_verify_target` itself is called
             // twice per input action, once before/once after activation);
@@ -630,7 +641,7 @@ async fn run_action(
             // successful capture, regardless of which engine is asking —
             // matches `store_screenshot_preview`'s own "refresh every
             // successful screenshot" rule right above.
-            computer::record_shot_dims(thread, dir, shot.window_id, shot.width, shot.height);
+            computer::record_shot_dims(thread, dir, shot.window_id, shot.width, shot.height, &w.app, &w.title);
             // The MCP `image` content block is engine-gated — see
             // `engine_accepts_mcp_image`'s doc table.
             if engine_accepts_mcp_image(db, thread, dir).await {
@@ -1295,7 +1306,13 @@ fn resolve_and_verify_target(
 /// click", a good practice this round is happy to require outright rather
 /// than merely encourage.
 fn map_input_coord(thread: i32, dir: &str, w: &computer::WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), String> {
-    let (shot_w, shot_h) = computer::shot_dims(thread, dir, w.id).ok_or_else(|| {
+    // issue #160 round-12 P1 #2: `shot_dims_for` (not the old id-only
+    // `shot_dims`) also verifies `w`'s CURRENT app+title against whatever was
+    // recorded at capture time — an id the OS reused for a different window
+    // since that screenshot now reads as no record at all, the same
+    // fail-closed message below, rather than a stale hit against the OLD
+    // window's saved geometry. See that function's own doc.
+    let (shot_w, shot_h) = computer::shot_dims_for(thread, dir, w).ok_or_else(|| {
         format!(
             "no recent screenshot of window {} to map this coordinate against — take a screenshot of \
              it first, then read coordinates off THAT screenshot",
@@ -1652,6 +1669,37 @@ const MCP_IMAGE_QUALITY: u8 = 75;
 /// payload is the right tradeoff.
 const PREVIEW_LONG_EDGE: u32 = 640;
 const PREVIEW_QUALITY: u8 = 60;
+
+/// issue #160 round-12 P1 #5: process-wide cap on CONCURRENT screenshot
+/// capture+encode. A `screenshot` call synchronously captures a full RGBA
+/// frame, PNG-encodes it to disk, then may ALSO JPEG-encode it up to twice
+/// more (the preview thumbnail above, and — engine-gated — the MCP inline
+/// image) — with no throttle/semaphore/flight-guard anywhere on this path
+/// before this round. Full access or a matching Always grant lets a worker
+/// fire arbitrarily many concurrent `screenshot` calls, each one holding its
+/// own full-resolution RGBA buffer (tens of MB for a 4K display) plus
+/// PNG/JPEG encode buffers, all resident in memory at once — a
+/// straightforward memory/thread-exhaustion vector.
+///
+/// `N = 2`: generous enough that one legitimate in-flight capture never
+/// queues behind an unrelated session's for long (this is an occasional,
+/// human-paced action, not a hot loop), small enough that the worst case is
+/// bounded to a couple of full-frame buffers rather than however many
+/// concurrent MCP calls a worker cares to fire. A queued caller beyond the
+/// cap waits its turn rather than allocating its own buffers alongside the
+/// others.
+const SCREENSHOT_CONCURRENCY: usize = 2;
+
+/// The semaphore [`SCREENSHOT_CONCURRENCY`] backs — acquired by the
+/// `screenshot` arm of `run_action` immediately before the synchronous
+/// capture, held across every encode that same call does, released when
+/// that arm's block ends (including on an early `?` return from a failed
+/// capture — Rust drops the permit as part of normal scope unwinding, no
+/// manual guard-drop needed).
+fn screenshot_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(SCREENSHOT_CONCURRENCY))
+}
 
 /// Strip the `data:image/jpeg;base64,` prefix `encode_jpeg_data_uri` always
 /// adds — the MCP `image` content type wants the RAW base64 payload with no
@@ -2429,6 +2477,23 @@ async fn audit_log_path(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Opt
 mod tests {
     use super::*;
 
+    // —— issue #160 round-12 P2 #7: always-inject + server-side disabled gate ——
+
+    /// The static tool description must itself say this needs enabling in
+    /// Settings — since round-12 P2 #7 makes injection unconditional
+    /// (`weft_computer` is now handed to every issue-lead/worker engine
+    /// regardless of the setting), an agent must not have to guess why every
+    /// call comes back `disabled` the first time it tries.
+    #[test]
+    fn tool_description_says_it_needs_enabling_in_settings() {
+        let specs = computer_tool_specs();
+        let desc = specs[0]["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.to_lowercase().contains("settings"),
+            "the tool description must mention enabling this in Settings: {desc}"
+        );
+    }
+
     // —— issue #160 round-10 P2 #2: `?wt=` three-state parsing ——
 
     #[test]
@@ -3063,7 +3128,7 @@ mod tests {
         // record directly (standing in for "this session already
         // screenshotted this window") since the CURRENT size is what this
         // test's own window origin/size started at, at 1:1 scale.
-        computer::record_shot_dims(thread, dir, 906_301, 800, 600);
+        computer::record_shot_dims(thread, dir, 906_301, 800, 600, "Baz", "Baz");
 
         // Prime the global input throttle well ahead of time so the real
         // click below isn't itself rejected as rate-limited.
@@ -3246,7 +3311,7 @@ mod tests {
         // screenshot dims (its size never changes in this scenario, only its
         // origin does — see the hook below) so the click's coordinate mapping
         // doesn't fail closed for want of a screenshot on file.
-        computer::record_shot_dims(thread, dir, 910_401, 800, 600);
+        computer::record_shot_dims(thread, dir, 910_401, 800, 600, "Moving", "moving window");
 
         let _ = computer::throttle_input();
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
@@ -3506,7 +3571,7 @@ mod tests {
         // issue #160 round-11 P1 #D: seed this window's recorded screenshot
         // dims (unchanged for this scenario) so the click's coordinate
         // mapping doesn't fail closed for want of a screenshot on file.
-        computer::record_shot_dims(thread, dir, 907_501, 800, 600);
+        computer::record_shot_dims(thread, dir, 907_501, 800, 600, "Steady", "steady window");
 
         let _ = computer::throttle_input();
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
@@ -3992,7 +4057,20 @@ mod tests {
             "must fail closed with the re-approve message, never silently capture the replacement: {err}"
         );
         assert!(
-            computer::shot_dims(thread, dir, 911_102).is_none(),
+            computer::shot_dims_for(
+                thread,
+                dir,
+                &computer::WindowInfo {
+                    id: 911_102,
+                    app: "Different App".into(),
+                    title: "shifty window".into(),
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 600,
+                }
+            )
+            .is_none(),
             "a fail-closed capture must never record shot dims for the replacement window either"
         );
     }
@@ -4326,7 +4404,7 @@ mod tests {
         });
         // The screenshot this agent is reading coordinates off of was saved
         // at 1280x800 — BEFORE the window resized down to 1000x600 above.
-        computer::record_shot_dims(thread, dir, 912_101, 1280, 800);
+        computer::record_shot_dims(thread, dir, 912_101, 1280, 800, "Resizable", "resizable window");
 
         // Clear the global input throttle window so this call isn't itself
         // rejected as rate-limited.
@@ -4352,6 +4430,57 @@ mod tests {
         );
         drop(actions);
         computer::clear_control();
+    }
+
+    // —— issue #160 round-12 P1 #5: screenshot capture/encode concurrency cap ——
+
+    /// The mechanism itself: `SCREENSHOT_CONCURRENCY` permits total, so
+    /// draining that many exhausts the semaphore and a further acquire must
+    /// queue (not resolve) until one of the held permits is released — the
+    /// exact property `run_action`'s `screenshot` arm relies on to keep at
+    /// most `SCREENSHOT_CONCURRENCY` captures resident at once. Tested
+    /// directly against the semaphore rather than through a full end-to-end
+    /// `run_action` call: `shared_mock`'s `MockBackend.image` is fixed at
+    /// construction (`None`, per its own doc — no test in this module can
+    /// configure a delayed/blocking capture), so a real concurrent-capture
+    /// race can't be reproduced through the mock; the semaphore this arm
+    /// acquires BEFORE ever touching the backend is the actual unit
+    /// enforcing the cap, and is what this test exercises.
+    #[tokio::test]
+    async fn screenshot_semaphore_caps_concurrent_capture_at_the_configured_limit() {
+        let mut held = Vec::new();
+        for _ in 0..SCREENSHOT_CONCURRENCY {
+            held.push(
+                screenshot_semaphore()
+                    .acquire()
+                    .await
+                    .expect("semaphore is never closed"),
+            );
+        }
+        assert_eq!(
+            screenshot_semaphore().available_permits(),
+            0,
+            "every permit must be held once SCREENSHOT_CONCURRENCY captures are in flight"
+        );
+
+        // A queued (N+1)th caller must not proceed while every permit is held.
+        let queued = tokio::spawn(async {
+            let _permit = screenshot_semaphore()
+                .acquire()
+                .await
+                .expect("semaphore is never closed");
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !queued.is_finished(),
+            "a capture beyond the concurrency cap must queue, never run alongside the others already in flight"
+        );
+
+        // Releasing ONE held permit lets the queued caller through.
+        held.pop();
+        queued
+            .await
+            .expect("the queued capture must complete once a permit frees up");
     }
 
     // —— issue #160 round-2 P2 §2: args_digest / Always-grant action_key ——

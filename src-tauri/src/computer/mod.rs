@@ -637,8 +637,15 @@ pub fn map_screenshot_coord(
 /// restart starting empty just means the FIRST input action after restart
 /// needs a fresh screenshot first, which is the correct, safe default
 /// anyway.
-fn recent_shot_dims() -> &'static Mutex<std::collections::HashMap<(i32, String, u32), (u32, u32, u64)>> {
-    static DIMS: OnceLock<Mutex<std::collections::HashMap<(i32, String, u32), (u32, u32, u64)>>> = OnceLock::new();
+/// issue #160 round-12 P1 #2: the stored value now ALSO carries the window's
+/// own `app`+`title` at capture time (`(width, height, app, title, ts)`), not
+/// just its dimensions — see [`shot_dims_for`]'s own doc for why a bare
+/// `window_id` key is not enough on its own to answer "is this still the
+/// window that screenshot was taken of".
+fn recent_shot_dims(
+) -> &'static Mutex<std::collections::HashMap<(i32, String, u32), (u32, u32, String, String, u64)>> {
+    static DIMS: OnceLock<Mutex<std::collections::HashMap<(i32, String, u32), (u32, u32, String, String, u64)>>> =
+        OnceLock::new();
     DIMS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -656,48 +663,73 @@ const MAX_SHOT_DIMS: usize = 128;
 /// already at capacity — same shape as [`evict_oldest_if_full`] above, kept
 /// as its own function (rather than reusing that one) since the key/value
 /// shapes differ (a `window_id`-widened key, no preview payload).
-fn evict_oldest_shot_dims_if_full(map: &mut std::collections::HashMap<(i32, String, u32), (u32, u32, u64)>) {
+fn evict_oldest_shot_dims_if_full(
+    map: &mut std::collections::HashMap<(i32, String, u32), (u32, u32, String, String, u64)>,
+) {
     if map.len() < MAX_SHOT_DIMS {
         return;
     }
-    if let Some(oldest_key) = map.iter().min_by_key(|(_, (_, _, ts))| *ts).map(|(k, _)| k.clone()) {
+    if let Some(oldest_key) = map.iter().min_by_key(|(_, (_, _, _, _, ts))| *ts).map(|(k, _)| k.clone()) {
         map.remove(&oldest_key);
     }
 }
 
-/// Record `(width, height)` — a SAVED screenshot's own dimensions — for
-/// `(thread, dir, window_id)`, refreshing whatever was on file for that
-/// exact triple (issue #160 round-11 P1 #D). Called ONLY from
-/// `bus::computer_srv`'s screenshot arm, right after a capture actually
-/// succeeds — see [`recent_shot_dims`]'s own doc for the full contract.
-/// `#[doc(hidden)] pub`: `bus::computer_srv` is a sibling module (not a
-/// child of this one) and `tests/computer_mcp.rs` is a separate integration-
-/// test crate — both need to call this directly (production code calls it
-/// after a real capture; tests seed it directly to exercise an input
-/// action's mapping without driving an actual screenshot round-trip first)
-/// — mirrors `mock::MockBackend`'s own doc comment on why a cross-module/
-/// cross-crate test-visible item is `#[doc(hidden)] pub` rather than
+/// Record `(width, height, app, title)` — a SAVED screenshot's own dimensions
+/// AND the window identity it was captured against — for `(thread, dir,
+/// window_id)`, refreshing whatever was on file for that exact triple (issue
+/// #160 round-11 P1 #D; `app`/`title` added round-12 P1 #2 — see
+/// [`shot_dims_for`]'s own doc). Called ONLY from `bus::computer_srv`'s
+/// screenshot arm, right after a capture actually succeeds — see
+/// [`recent_shot_dims`]'s own doc for the full contract. `#[doc(hidden)]
+/// pub`: `bus::computer_srv` is a sibling module (not a child of this one)
+/// and `tests/computer_mcp.rs` is a separate integration-test crate — both
+/// need to call this directly (production code calls it after a real
+/// capture; tests seed it directly to exercise an input action's mapping
+/// without driving an actual screenshot round-trip first) — mirrors
+/// `mock::MockBackend`'s own doc comment on why a cross-module/cross-crate
+/// test-visible item is `#[doc(hidden)] pub` rather than
 /// `pub(crate)`/`#[cfg(test)]`.
 #[doc(hidden)]
-pub fn record_shot_dims(thread: i32, dir: &str, window_id: u32, width: u32, height: u32) {
+pub fn record_shot_dims(thread: i32, dir: &str, window_id: u32, width: u32, height: u32, app: &str, title: &str) {
     let mut g = recent_shot_dims().lock().unwrap_or_else(|e| e.into_inner());
     let key = (thread, dir.to_string(), window_id);
     if !g.contains_key(&key) {
         evict_oldest_shot_dims_if_full(&mut g);
     }
-    g.insert(key, (width, height, now_ms()));
+    g.insert(key, (width, height, app.to_string(), title.to_string(), now_ms()));
 }
 
-/// The most recently recorded screenshot dimensions for `(thread, dir,
-/// window_id)`, if any (issue #160 round-11 P1 #D) — `None` when this exact
-/// window was never screenshotted for this session (or the record has since
-/// been evicted), which every coordinate-taking input arm in
-/// `bus::computer_srv` treats as a fail-CLOSED "take a screenshot of this
-/// window first" rejection — see [`map_screenshot_coord`]'s own doc.
+/// The most recently recorded screenshot dimensions for `w` under `(thread,
+/// dir, w.id)`, if any AND if the recorded capture's own `app`+`title` still
+/// match `w`'s CURRENT identity — issue #160 round-12 P1 #2 (Codex 1298):
+/// before this, the registry was keyed by `(thread, dir, window_id)` alone,
+/// so once a window closed and the OS/window manager reused its numeric id
+/// for an entirely unrelated window, a coordinate-taking input arm would
+/// silently look up (and map against) the OLD window's saved dimensions —
+/// bypassing the "screenshot this window first" fail-closed rule and mapping
+/// the agent's screenshot-space coordinate onto the WRONG window's geometry.
+/// Verifying `app`+`title` here (the same two fields `bus::computer_srv::
+/// ApprovedWindow`/`verify_approved_target` already use to detect an id-reuse
+/// swap at the approval layer — see that struct's own doc) closes the
+/// identical gap at the coordinate-mapping layer: an id match with a
+/// DIFFERENT app/title reads as "no record at all" (`None`), the exact
+/// fail-closed outcome a window that was never screenshotted gets, rather
+/// than a stale hit. `None` for every case `shot_dims`'s old contract already
+/// covered (never screenshotted this session, evicted) PLUS this new one
+/// (screenshotted, but a DIFFERENT window now holds that id) — every
+/// coordinate-taking input arm in `bus::computer_srv` treats any `None` the
+/// same way, so this is a strict narrowing of what counts as a hit, never a
+/// behavior change for the common case (see [`map_screenshot_coord`]'s own
+/// doc).
 #[doc(hidden)]
-pub fn shot_dims(thread: i32, dir: &str, window_id: u32) -> Option<(u32, u32)> {
+pub fn shot_dims_for(thread: i32, dir: &str, w: &WindowInfo) -> Option<(u32, u32)> {
     let g = recent_shot_dims().lock().unwrap_or_else(|e| e.into_inner());
-    g.get(&(thread, dir.to_string(), window_id)).map(|(w, h, _)| (*w, *h))
+    let (width, height, app, title, _) = g.get(&(thread, dir.to_string(), w.id))?;
+    if *app == w.app && *title == w.title {
+        Some((*width, *height))
+    } else {
+        None
+    }
 }
 
 /// Process-level nonce appended to every screenshot's filename (issue #160
@@ -1028,6 +1060,54 @@ pub struct ControlHolder {
 /// explicitly (see [`acquire_control`]'s doc comment).
 const CONTROL_LEASE_MS: u64 = 30_000;
 
+/// True while [`input_flight_guard`]'s returned guard is held — i.e. an input
+/// action is ACTIVELY injecting via the real backend right now (issue #160
+/// round-12 P1 #4). A bare `AtomicBool`, not a counter: `input_flight_guard`
+/// is backed by a single global `tokio::sync::Mutex<()>`, so at most one
+/// caller can ever hold it at a time — there is no multi-holder overlap to
+/// count.
+static INPUT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Whether an input action is, RIGHT NOW, actively injecting via
+/// [`input_flight_guard`]'s guard. Read by [`holder_is_live`] — see that
+/// function's own doc for why this must keep a control-lease holder from
+/// reading as expired while true.
+fn input_in_flight() -> bool {
+    INPUT_IN_FLIGHT.load(Ordering::SeqCst)
+}
+
+/// Whether a control-lease holder recorded at `expires_at_ms` should still be
+/// treated as live at `now` — issue #160 round-12 P1 #4 (Codex 1198).
+/// Normally just "hasn't hit its `CONTROL_LEASE_MS` sliding-window expiry
+/// yet", but ALSO true, regardless of `expires_at_ms`, whenever
+/// [`input_in_flight`] is true: a synchronous injection (a long `type`, or a
+/// blocking OS backend call) can legitimately run past `CONTROL_LEASE_MS`
+/// while still actively driving the desktop, and treating that as "expired"
+/// mid-injection is exactly the bug this round closes — the lease would read
+/// as abandoned, [`sync_shortcut_state`] would unregister the OS-level Escape
+/// kill switch, and the Settings banner (which polls [`control_state`]) would
+/// read "no holder" — BOTH Stop surfaces vanishing while an action is still
+/// actively running, the one moment a human is most likely to want them.
+/// The ONE place all three call sites that judge liveness
+/// ([`acquire_control`]'s own is-it-busy check, [`control_state_detect_and_
+/// clear_if_expired`], and [`sync_shortcut_state`]'s own `holder_live`) make
+/// this judgment, so they can never drift apart on what "live" means.
+///
+/// KNOWN, ACCEPTED residual (documented here and at [`input_flight_guard`]'s
+/// own call sites in `bus::computer_srv`): this keeps the KILL-SWITCH
+/// SURFACES alive for the FULL duration of an in-flight injection — it does
+/// NOT make the injection itself interruptible. `enigo` (the real backend)
+/// has no cancellation hook, so the one synchronous call already in flight
+/// when a human hits Stop still runs to completion; what this closes is
+/// "Stop's own UI vanishes and the lease looks abandoned while that's
+/// happening", not "make an in-progress `type` stoppable mid-keystroke" —
+/// that would need the backend's own input calls broken into cancellable
+/// chunks, a larger change tracked separately (see round-5's own notes on
+/// this).
+fn holder_is_live(expires_at_ms: u64, now: u64) -> bool {
+    expires_at_ms > now || input_in_flight()
+}
+
 fn control_mutex() -> &'static Mutex<Option<ControlHolderState>> {
     static CONTROL: OnceLock<Mutex<Option<ControlHolderState>>> = OnceLock::new();
     CONTROL.get_or_init(|| Mutex::new(None))
@@ -1099,7 +1179,7 @@ pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
         match guard.as_ref() {
             Some(holder) => {
                 let is_same_holder = holder.thread == thread && holder.dir == dir;
-                let is_live = holder.expires_at_ms > now;
+                let is_live = holder_is_live(holder.expires_at_ms, now);
                 if is_live && !is_same_holder {
                     return Err(ComputerError::Busy {
                         thread: holder.thread,
@@ -1185,7 +1265,7 @@ fn control_state_detect_and_clear_if_expired() -> (Option<ControlHolder>, bool) 
     let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
     let now = now_ms();
     match guard.as_ref() {
-        Some(h) if h.expires_at_ms > now => (
+        Some(h) if holder_is_live(h.expires_at_ms, now) => (
             Some(ControlHolder {
                 thread: h.thread,
                 dir: h.dir.clone(),
@@ -1394,6 +1474,14 @@ fn register_global_escape() -> Result<(), String> {
             // fallible DB write, so the kill switch has already taken effect
             // even on an `Err` here — see that function's doc comment.
             let _ = emergency_stop(&db).await;
+            // issue #160 round-12 P1 #1: this is the OS-level global Escape's
+            // own entry point into the same cancellation `commands::
+            // computer_emergency_stop` performs — see `AskRegistry::
+            // cancel_computer_asks`'s own doc for the stale-card-then-Always
+            // race this closes. Reached via the app handle (this callback has
+            // no `State` extraction the way a `#[tauri::command]` does).
+            let asks = app.state::<crate::ask::AskRegistry>().inner().clone();
+            asks.cancel_computer_asks();
         });
     });
     if let Err(err) = &result {
@@ -1473,7 +1561,7 @@ fn sync_shortcut_state() {
     let now = now_ms();
     let holder_live = {
         let guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-        matches!(guard.as_ref(), Some(h) if h.expires_at_ms > now)
+        matches!(guard.as_ref(), Some(h) if holder_is_live(h.expires_at_ms, now))
     };
     if holder_live {
         #[cfg(test)]
@@ -1574,9 +1662,32 @@ pub fn throttle_input() -> Result<(), ComputerError> {
 /// and let it drop only after that call returns (not just around the gate
 /// checks that precede it). Two `tools/call`s racing for the SAME
 /// `(thread, dir)` then serialize on this mutex instead of interleaving.
-pub async fn input_flight_guard() -> tokio::sync::MutexGuard<'static, ()> {
+pub async fn input_flight_guard() -> InputFlightGuard {
     static FLIGHT: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    FLIGHT.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
+    let inner = FLIGHT.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    // issue #160 round-12 P1 #4: flip the in-flight latch the INSTANT this
+    // guard is actually acquired (not merely requested) — see
+    // `holder_is_live`'s own doc for what this keeps alive while true.
+    INPUT_IN_FLIGHT.store(true, Ordering::SeqCst);
+    InputFlightGuard { _inner: inner }
+}
+
+/// The guard [`input_flight_guard`] returns — wraps the underlying
+/// `tokio::sync::MutexGuard` purely so `Drop` can clear [`INPUT_IN_FLIGHT`]
+/// the instant the caller's injection finishes (issue #160 round-12 P1 #4),
+/// symmetric with the `store(true, ..)` in `input_flight_guard` itself. Every
+/// existing caller (`bus::computer_srv`'s input arms, this module's own
+/// tests) only ever binds this to a `let _guard = ...` / `let held = ...`
+/// and lets it drop — nothing depended on the old bare `MutexGuard` type
+/// itself, so this is a transparent replacement.
+pub struct InputFlightGuard {
+    _inner: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for InputFlightGuard {
+    fn drop(&mut self) {
+        INPUT_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
 }
 
 // —— key combo grammar (issue #160 M2) ——
@@ -2348,27 +2459,64 @@ mod tests {
         ));
     }
 
+    /// Minimal `WindowInfo` for `shot_dims_for` identity tests — only
+    /// `id`/`app`/`title` matter to that lookup; the geometry fields are
+    /// irrelevant filler.
+    fn shot_win(id: u32, app: &str, title: &str) -> WindowInfo {
+        WindowInfo { id, app: app.into(), title: title.into(), x: 0, y: 0, width: 0, height: 0 }
+    }
+
     #[test]
     fn shot_dims_round_trips_what_was_recorded_and_is_isolated_per_window_id() {
-        record_shot_dims(920_001, "lead", 7, 1280, 800);
-        record_shot_dims(920_001, "lead", 8, 640, 480);
-        assert_eq!(shot_dims(920_001, "lead", 7), Some((1280, 800)));
-        assert_eq!(shot_dims(920_001, "lead", 8), Some((640, 480)));
+        record_shot_dims(920_001, "lead", 7, 1280, 800, "Notes", "Untitled");
+        record_shot_dims(920_001, "lead", 8, 640, 480, "Other", "Untitled");
+        assert_eq!(shot_dims_for(920_001, "lead", &shot_win(7, "Notes", "Untitled")), Some((1280, 800)));
+        assert_eq!(shot_dims_for(920_001, "lead", &shot_win(8, "Other", "Untitled")), Some((640, 480)));
         // A DIFFERENT (thread, dir, window_id) triple that was never recorded
         // must fail closed with `None` — never fall back to some other
         // window's dims.
-        assert_eq!(shot_dims(920_001, "lead", 9), None, "no record for window 9 must be None");
-        assert_eq!(shot_dims(920_002, "lead", 7), None, "a different thread must not see thread 920_001's record");
+        assert_eq!(
+            shot_dims_for(920_001, "lead", &shot_win(9, "Notes", "Untitled")),
+            None,
+            "no record for window 9 must be None"
+        );
+        assert_eq!(
+            shot_dims_for(920_002, "lead", &shot_win(7, "Notes", "Untitled")),
+            None,
+            "a different thread must not see thread 920_001's record"
+        );
     }
 
     #[test]
     fn shot_dims_refreshing_the_same_window_overwrites_rather_than_duplicates() {
-        record_shot_dims(920_003, "lead", 1, 1280, 800);
-        record_shot_dims(920_003, "lead", 1, 640, 480);
+        record_shot_dims(920_003, "lead", 1, 1280, 800, "Steady", "steady window");
+        record_shot_dims(920_003, "lead", 1, 640, 480, "Steady", "steady window");
         assert_eq!(
-            shot_dims(920_003, "lead", 1),
+            shot_dims_for(920_003, "lead", &shot_win(1, "Steady", "steady window")),
             Some((640, 480)),
             "a second screenshot of the SAME window must replace the earlier dims, not stack"
+        );
+    }
+
+    /// issue #160 round-12 P1 #2: the exact property this round closes — an
+    /// id REUSED by a different window (same numeric id, different app/title)
+    /// must read as no record at all, fail-closed, never a stale hit against
+    /// the OLD window's saved geometry.
+    #[test]
+    fn shot_dims_for_fails_closed_when_the_window_id_was_reused_by_a_different_window() {
+        record_shot_dims(920_004, "lead", 5, 1280, 800, "Original App", "Original Title");
+        // Same (thread, dir, id) — a DIFFERENT app+title, standing in for the
+        // OS reusing a closed window's id for an unrelated new window.
+        let replaced = shot_win(5, "Different App", "Different Title");
+        assert_eq!(
+            shot_dims_for(920_004, "lead", &replaced),
+            None,
+            "an id reused by a different window must never return the old window's dims"
+        );
+        // The ORIGINAL identity still hits, unaffected by the check above.
+        assert_eq!(
+            shot_dims_for(920_004, "lead", &shot_win(5, "Original App", "Original Title")),
+            Some((1280, 800))
         );
     }
 
@@ -2793,6 +2941,69 @@ mod tests {
             1,
             "the two tasks must never hold the guard at the same time — later one waits for the first to drop it"
         );
+    }
+
+    /// issue #160 round-12 P1 #4: the property this round exists for — while
+    /// `input_flight_guard`'s guard is held, a control lease whose own timer
+    /// already lapsed must keep reporting as live (both to `control_state`'s
+    /// own poll, the Settings banner's source, AND to the OS-level Escape
+    /// shortcut's own sync decision), and must go back to ordinary expiry
+    /// judgment the instant the injection finishes.
+    #[tokio::test]
+    async fn control_lease_and_escape_registration_stay_live_while_an_input_is_in_flight() {
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_control();
+        acquire_control(1, "10").unwrap();
+
+        // Force the lease's own timer into the past — standing in for a
+        // synchronous injection that ran past CONTROL_LEASE_MS, exactly like
+        // `control_lock_busy_expiry_release_and_clear`'s own manufactured
+        // expiry above (no real 30s sleep).
+        {
+            let mut g = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(h) = g.as_mut() {
+                h.expires_at_ms = now_ms().saturating_sub(1);
+            }
+        }
+
+        let flight = input_flight_guard().await;
+
+        // The control-state poll (the Settings banner's own source) must
+        // still report the holder — never "no holder" — while the injection
+        // is in flight, even though the lease's own timer already lapsed.
+        let held = control_state().unwrap();
+        assert_eq!((held.thread, held.dir.as_str()), (1, "10"));
+
+        // The OS-level Escape shortcut's own sync decision must ALSO still
+        // see a live holder while in flight — observed via
+        // `sync_shortcut_state`'s own attempt counters (no real `AppHandle`
+        // in `cargo test --lib`, so the underlying OS call itself always
+        // no-ops regardless — see `register_global_escape`'s own doc — but
+        // the DECISION of which branch to take is exactly what this round
+        // changed).
+        let unregister_before = SHORTCUT_UNREGISTER_ATTEMPTS.load(Ordering::SeqCst);
+        sync_shortcut_state();
+        assert_eq!(
+            SHORTCUT_UNREGISTER_ATTEMPTS.load(Ordering::SeqCst),
+            unregister_before,
+            "an in-flight injection must never let the Escape shortcut be unregistered, even past the lease's own expiry"
+        );
+
+        // Releasing the guard restores ordinary expiry judgment for the SAME
+        // already-lapsed timer — `control_state`'s own lazy-cleanup path
+        // detects the true expiry and unregisters the shortcut.
+        drop(flight);
+        assert!(
+            control_state().is_none(),
+            "once the injection finishes, the SAME already-expired lease must go back to reading as expired"
+        );
+        assert_eq!(
+            SHORTCUT_UNREGISTER_ATTEMPTS.load(Ordering::SeqCst),
+            unregister_before + 1,
+            "once no longer in flight, the now-truly-expired lease must let the Escape shortcut unregister"
+        );
+
+        clear_control();
     }
 
     // —— OS-level global Escape (issue #160 review R1 #5) ——

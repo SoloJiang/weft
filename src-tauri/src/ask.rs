@@ -2103,6 +2103,46 @@ impl AskRegistry {
         }
     }
 
+    /// Cancel every open `weft_computer` ask (issue #160 round-12 P1 #1):
+    /// emergency-stop's own kill switch (`computer::emergency_stop`) only
+    /// ever tears down the control lease and disables the setting — it does
+    /// NOT touch any GUI approval card already sitting in Needs-you. Without
+    /// this, a human hitting Stop while a `computer` action's card is still
+    /// open could keep answering that STALE card with `Always`/`Full` right
+    /// after — `answer()` records the standing grant BEFORE the caller's own
+    /// post-await kill-switch recheck ever runs (see `bus::computer_srv::
+    /// approve`'s own doc on that recheck), so the grant lands regardless,
+    /// and silently auto-approves every future matching action once the
+    /// human re-enables computer use. Both emergency-stop entry points
+    /// (`commands::computer_emergency_stop`, which holds an `AskRegistry`
+    /// handle directly, and the OS-level global Escape callback in
+    /// `computer::mod.rs`, which reaches one via the app handle) call this
+    /// immediately after `computer::emergency_stop` returns — see their own
+    /// call sites for why the cancellation happens there rather than inside
+    /// `computer::emergency_stop` itself (that function has no `AskRegistry`
+    /// to reach, and its existing callers' signatures stay unchanged).
+    ///
+    /// Cancelling (not denying) mirrors `cancel_for`'s own semantics: the
+    /// waiter's receiver errors, which `bus::computer_srv::approve` already
+    /// treats as a fail-closed deny — so a stop-in-flight card reads to the
+    /// calling agent exactly like a timed-out one, never a silent no-op.
+    /// Scoped to `tool == "computer"` alone — an ordinary shell/file ask from
+    /// a ChatGPT/Claude/Codex session has nothing to do with the GUI kill
+    /// switch and must keep waiting for its own human answer.
+    pub fn cancel_computer_asks(&self) {
+        let ids: Vec<u64> = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.open
+                .iter()
+                .filter(|a| a.tool == "computer")
+                .map(|a| a.id)
+                .collect()
+        };
+        for id in ids {
+            self.cancel(id);
+        }
+    }
+
     /// Install the transcript-trail consumer's channel (called once at startup,
     /// independent of the IM bridge's `set_notifier`). No snapshot: the trail
     /// only records future resolutions, never replays still-open asks.
@@ -4226,6 +4266,53 @@ mod tests {
         // scope) is what would error these, not `cancel_for`.
         drop(rx_sibling_dir);
         drop(rx_sibling_thread);
+    }
+
+    #[tokio::test]
+    async fn cancel_computer_asks_cancels_only_computer_tool_asks_and_blocks_a_stale_always_answer() {
+        // issue #160 round-12 P1 #1: emergency-stop must cancel any open
+        // `weft_computer` card BEFORE a human can answer it Always/Full and
+        // silently mint a standing grant that outlives the stop — this is
+        // the registry-level half of that fix (the two emergency-stop entry
+        // points that call it live in `commands.rs`/`computer::mod.rs`).
+        let r = AskRegistry::new();
+        let (computer_id, computer_rx) = r.request(
+            1,
+            "10",
+            "computer",
+            "computer: type",
+            "{\"action\":\"type\"}",
+            RiskLevel::Write,
+            "[\"gui\",\"type\",\"\",\"d\"]",
+        );
+        let (other_id, other_rx) =
+            r.request(1, "10", "claude", "Run: a", "a", RiskLevel::Unknown, "Run: a");
+
+        r.cancel_computer_asks();
+
+        let open_ids: std::collections::HashSet<u64> = r.open().iter().map(|a| a.id).collect();
+        assert!(!open_ids.contains(&computer_id), "the computer card must be cancelled");
+        assert!(open_ids.contains(&other_id), "a non-computer ask must survive untouched");
+        assert!(
+            computer_rx.await.is_err(),
+            "the cancelled computer ask's waiter must error, never resolve Allow"
+        );
+        drop(other_rx);
+
+        // The cancelled ask can never be Answered afterward — `answer`
+        // returns false for an id no longer in `open`, so a "stale card,
+        // human clicks Always right after Stop" race can never record a
+        // standing grant.
+        assert!(!r.answer(computer_id, Answer::Always));
+        assert_eq!(
+            r.snapshot_grants()
+                .always
+                .iter()
+                .filter(|g| g.thread == 1 && g.dir == "10")
+                .count(),
+            0,
+            "no Always grant may exist for the cancelled computer ask's action_key"
+        );
     }
 
     #[tokio::test]

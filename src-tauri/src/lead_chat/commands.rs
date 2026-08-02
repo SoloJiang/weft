@@ -264,25 +264,28 @@ pub async fn lead_engine(
         extra.extend(
             crate::bus::inject::inject(&base, thread_id, crate::bus::LEAD, &t.lead_tool, &cwd).args,
         );
-        // issue #160: opt-in computer-use MCP, issue-lead only (never
-        // concierge/curator). Gated on the setting so an unconfigured install
-        // never grows an extra MCP server unasked.
-        if crate::computer::enabled(db).await {
-            extra.extend(
-                crate::bus::inject::inject_computer(
-                    &base,
-                    thread_id,
-                    crate::bus::LEAD,
-                    &t.lead_tool,
-                    &cwd,
-                    // issue #160 round-2 P2 §5: the lead lane has no
-                    // worktree at all (it runs out of its own scratch cwd),
-                    // so it never has a `wt` to pin — always `None`.
-                    None,
-                )
-                .args,
-            );
-        }
+        // issue #160 round-12 P2 #7: computer-use MCP is now injected
+        // UNCONDITIONALLY for the issue lead (never concierge/curator) —
+        // the setting/kill-switch is enforced dynamically, server-side, on
+        // every call by `bus::computer_srv::run_action`'s own
+        // `computer::enabled` gate. Injecting regardless means turning the
+        // setting on/off from Settings takes effect immediately, without
+        // needing to rebuild this already-running engine — see
+        // `bus::inject::inject_computer`'s own doc.
+        extra.extend(
+            crate::bus::inject::inject_computer(
+                &base,
+                thread_id,
+                crate::bus::LEAD,
+                &t.lead_tool,
+                &cwd,
+                // issue #160 round-2 P2 §5: the lead lane has no
+                // worktree at all (it runs out of its own scratch cwd),
+                // so it never has a `wt` to pin — always `None`.
+                None,
+            )
+            .args,
+        );
     }
     push_model_arg(&mut extra, t.lead_model.as_deref());
     let system_prompt = if is_concierge {
@@ -1491,25 +1494,25 @@ pub(crate) async fn chat_open_worker_impl(
     }
     let mut extra = ask.args;
     extra.extend(inj.args);
-    // issue #160: opt-in computer-use MCP for workers, same fail-closed gate
-    // as the lead branch — off unless the setting is explicitly enabled.
-    if crate::computer::enabled(db).await {
-        extra.extend(
-            crate::bus::inject::inject_computer(
-                &base,
-                dir.thread_id,
-                &direction_id.to_string(),
-                &session_tool,
-                &cwd,
-                // issue #160 round-2 P2 §5: this worker's OWN worktree
-                // (`wt`, resolved above for this EXACT direction+repo pair)
-                // — not "the first worktree of this direction" a
-                // multi-repo direction would otherwise fall back to.
-                Some(wt.id),
-            )
-            .args,
-        );
-    }
+    // issue #160 round-12 P2 #7: computer-use MCP is now injected
+    // UNCONDITIONALLY for workers too, same as the lead branch above — the
+    // setting/kill-switch is enforced dynamically, server-side, on every
+    // call (see that branch's own doc for why).
+    extra.extend(
+        crate::bus::inject::inject_computer(
+            &base,
+            dir.thread_id,
+            &direction_id.to_string(),
+            &session_tool,
+            &cwd,
+            // issue #160 round-2 P2 §5: this worker's OWN worktree
+            // (`wt`, resolved above for this EXACT direction+repo pair)
+            // — not "the first worktree of this direction" a
+            // multi-repo direction would otherwise fall back to.
+            Some(wt.id),
+        )
+        .args,
+    );
     push_model_arg(&mut extra, sess.model.as_deref());
 
     let key = sess.id as i64;
@@ -1664,21 +1667,21 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         .ok()
         .flatten()
         .map(|w| w.id);
-    // issue #160: opt-in computer-use MCP, same fail-closed gate as the
-    // first-spawn path above — this is the worker resume/rebuild path.
-    if crate::computer::enabled(db).await {
-        extra.extend(
-            crate::bus::inject::inject_computer(
-                &base,
-                dir.thread_id,
-                &sess.direction_id.to_string(),
-                &sess.tool,
-                &cwd,
-                worktree_id,
-            )
-            .args,
-        );
-    }
+    // issue #160 round-12 P2 #7: computer-use MCP is now injected
+    // UNCONDITIONALLY, same as the first-spawn path above — this is the
+    // worker resume/rebuild path; the setting/kill-switch is enforced
+    // dynamically, server-side, on every call.
+    extra.extend(
+        crate::bus::inject::inject_computer(
+            &base,
+            dir.thread_id,
+            &sess.direction_id.to_string(),
+            &sess.tool,
+            &cwd,
+            worktree_id,
+        )
+        .args,
+    );
     push_model_arg(&mut extra, sess.model.as_deref());
     let mut inner = engine::EngineInner {
         thread_id: dir.thread_id,

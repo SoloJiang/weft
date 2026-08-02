@@ -319,11 +319,27 @@ pub fn inject_curator(base: &str, thread: i32, tool: &str, cwd: &Path) -> Inject
 }
 
 /// Build the computer-use MCP injection (issue #160) for a session, per
-/// thread/direction. Same additive mechanism as the bus — claude gets its own
-/// `.weft-computer.mcp.json`, codex a `-c mcp_servers.weft_computer.url=...`
-/// override, opencode a deep-merge, ACP tools nothing (see `acp_mcp_servers`).
+/// thread/direction. Round-12 P1 #6 (Codex round-11 finding): unlike every
+/// OTHER injected server (`weft_bus`/`weft_planner`/`weft_curator`/
+/// `weft_global`, all unauthenticated by design — see their own URL
+/// builders' doc comments), this URL embeds a per-session bearer
+/// (`computer_url`'s own `&key=`), so this does NOT go through the shared,
+/// generic [`inject_mcp`] the others use — that helper writes claude's
+/// config INSIDE the worktree and opencode's merge into the worktree's own
+/// (possibly git-tracked) `opencode.json`, neither of which this endpoint's
+/// token can safely land in. See [`inject_computer_claude`] and
+/// [`inject_computer_opencode`]'s own doc comments for each tool's
+/// dedicated, token-safe path. Codex needs neither: its own injection is
+/// already a bare `-c` CLI flag with no file at all (unchanged, same as
+/// every other codex injection in this module).
+///
 /// Callers MUST gate this on `crate::computer::enabled(db)` themselves — this
-/// function injects unconditionally.
+/// function injects unconditionally. issue #160 round-12 P2 #7: as of this
+/// round every production call site injects UNCONDITIONALLY instead
+/// (concierge/curator excluded) — the setting is enforced server-side, on
+/// every call, by `bus::computer_srv::run_action`'s own `computer::enabled`
+/// gate; this function's own behavior (inject regardless) hasn't changed,
+/// only who calls it.
 ///
 /// `wt` (issue #160 round-2 P2 §5): the calling worker's own worktree id —
 /// see [`computer_url`]'s doc. Every worker call site can resolve this (its
@@ -331,13 +347,152 @@ pub fn inject_curator(base: &str, thread: i32, tool: &str, cwd: &Path) -> Inject
 /// function); the lead call site always passes `None` (a lead has no
 /// worktree — it runs out of its own scratch cwd).
 pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path, wt: Option<i32>) -> Injection {
-    inject_mcp(
-        "weft_computer",
-        "computer",
-        &computer_url(base, thread, dir, wt),
-        tool,
-        cwd,
-    )
+    if crate::acp::backend_for(tool).is_some() {
+        // MCP is supplied on session/new|resume, not via launch flags/files —
+        // same rule `inject_mcp` applies for every other server.
+        return Injection { args: vec![] };
+    }
+    let url = computer_url(base, thread, dir, wt);
+    match tool {
+        "claude" => inject_computer_claude(thread, dir, &url),
+        "codex" => Injection {
+            args: vec!["-c".into(), format!("mcp_servers.weft_computer.url={url}")],
+        },
+        "opencode" => {
+            inject_computer_opencode(cwd, &url);
+            Injection { args: vec![] }
+        }
+        _ => Injection { args: vec![] },
+    }
+}
+
+/// Claude's computer-use MCP config, issue #160 round-12 P1 #6 (Codex
+/// round-11 finding): `inject_mcp`'s generic claude branch writes
+/// `.weft-<stem>.mcp.json` INSIDE the worktree (`cwd`), relying on
+/// `git::git_exclude` to keep it out of `git status`/commits — fine for
+/// `weft_bus`/`weft_planner`/`weft_curator`/`weft_global`, none of which
+/// carry a secret, but this URL embeds a per-session bearer token
+/// (`computer_url`'s own `&key=`). `git_exclude` only ever hides a path from
+/// git's OWN status/diff view; it does nothing about filesystem
+/// PERMISSIONS, and it can never protect against a human's own `git add -A`
+/// sweeping the whole worktree (CLAUDE.md: stage explicit paths only — but
+/// this file existing at all inside a repo-visible path is itself the
+/// exposure this closes, not just the commit). On a shared or traversable
+/// checkout, a DEFAULT-umask file sitting inside the worktree is readable by
+/// any other account that can reach the path at all.
+///
+/// This writes the config to a Weft-managed, OUT-OF-REPO location instead —
+/// under `paths::weft_home()`, never inside `cwd` — narrowed to `0600` on
+/// unix so only this user's own account can read the bearer even on a
+/// shared machine, and named per `(thread, dir)` so concurrent sessions each
+/// get their own file. There is no repo path here for the token to ever
+/// land in a commit, so — unlike the claude branch of `inject_mcp` — this
+/// never calls `git::git_exclude` at all (nothing to exclude: canonical
+/// repos must never see Weft's own bookkeeping, and now there is none to
+/// see). Best-effort: an unwritable `weft_home`/config dir falls back to no
+/// injection (`Injection { args: vec![] }`) rather than erroring the whole
+/// session, matching `inject_mcp`'s own best-effort contract.
+fn inject_computer_claude(thread: i32, dir: &str, url: &str) -> Injection {
+    let Ok(home) = crate::paths::weft_home() else {
+        return Injection { args: vec![] };
+    };
+    let mcp_dir = home.join("computer-mcp");
+    if std::fs::create_dir_all(&mcp_dir).is_err() {
+        return Injection { args: vec![] };
+    }
+    let file = mcp_dir.join(format!(
+        "{thread}-{}.mcp.json",
+        sanitize_filename_component(dir)
+    ));
+    let json = serde_json::json!({
+        "mcpServers": { "weft_computer": { "type": "http", "url": url } }
+    });
+    if std::fs::write(&file, serde_json::to_vec_pretty(&json).unwrap_or_default()).is_err() {
+        return Injection { args: vec![] };
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+    }
+    Injection {
+        args: vec!["--mcp-config".into(), file.to_string_lossy().to_string()],
+    }
+}
+
+/// Keep only characters safe as a bare filename component — everything else
+/// (a `dir` should always be a plain numeric direction id or "lead", but this
+/// stays defensive rather than trusting that) becomes `_`. Used by
+/// [`inject_computer_claude`] to name its per-`(thread, dir)` config file.
+fn sanitize_filename_component(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// Whether `cwd`'s `opencode.json` is a git-TRACKED file — issue #160
+/// round-12 P1 #6 (Codex round-11 finding). `merge_opencode_config`'s own
+/// `git_exclude` call only ever hides an UNTRACKED file from `git status`;
+/// it can never un-track a file the sub-repo already committed. Merging the
+/// computer server's session-scoped bearer token into an ALREADY-TRACKED
+/// `opencode.json` would persist Weft's own credential wiring straight into
+/// the user's repo history the next time they commit — a hard CLAUDE.md
+/// violation ("never write cross-repo wiring into canonical repositories"),
+/// not merely a same-machine readability concern the way an untracked file
+/// with lax permissions is. `git ls-files --error-unmatch` is the standard
+/// "is this path tracked" check; any error (not a git repo at all, the
+/// binary is missing, some other git failure) reads as "not tracked" — the
+/// SAME fail-open-to-"attempt the merge" default `merge_opencode_config`
+/// already has for every other failure mode on this path (best-effort
+/// throughout this module), rather than a NEW way for this one check to
+/// refuse computer-use injection outright.
+fn opencode_json_is_tracked(cwd: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["ls-files", "--error-unmatch", "opencode.json"])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// OpenCode's computer-use MCP merge, issue #160 round-12 P1 #6 (Codex
+/// round-11 finding): a SEPARATE path from `inject_mcp`'s generic
+/// `merge_opencode_config` (used by `weft_bus`/`weft_planner`/
+/// `weft_curator`/`weft_global`, none of which carry a secret) precisely
+/// because `url` here embeds a per-session bearer token. Two protections
+/// the generic merge doesn't need:
+///
+/// 1. NEVER merges into an ALREADY-TRACKED `opencode.json`
+///    ([`opencode_json_is_tracked`]) — the computer-use tool simply isn't
+///    offered to this OpenCode worker in that one case, rather than risking
+///    Weft's own credential wiring landing in the user's next commit. This
+///    is the ONE tool this round is willing to withhold to hold the "never
+///    write cross-repo wiring into a canonical repo" line; every other MCP
+///    server keeps `merge_opencode_config`'s pre-existing accepted
+///    limitation (it still merges into a tracked file — harmless, since none
+///    of them carry a secret).
+/// 2. `#[cfg(unix)]` narrows the file to `0600` right after writing — the
+///    bearer token must not be left world/group-readable on a shared or
+///    traversable checkout, mirroring the SAME protection
+///    [`inject_computer_claude`] applies to Claude's own config.
+///
+/// KNOWN, ACCEPTED residual (documented here, and in the round's own report):
+/// same-uid processes can still read this file/env regardless (existing §9
+/// residual) — what this closes is the token landing in a TRACKED repo file,
+/// not same-machine, same-account visibility.
+fn inject_computer_opencode(cwd: &Path, url: &str) {
+    if opencode_json_is_tracked(cwd) {
+        return;
+    }
+    merge_opencode_config(cwd, "weft_computer", url);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = cwd.join("opencode.json");
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 /// Build the global-MCP injection for the Concierge engine (M3-2). Not
@@ -459,22 +614,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// issue #160 round-12 P1 #6: Claude's computer-use config now lives
+    /// OUT OF the worktree entirely, under a Weft-managed `weft_home()`
+    /// subdirectory, narrowed to `0600` on unix — see
+    /// `inject_computer_claude`'s own doc for why. Needs an ISOLATED
+    /// `WEFT_HOME` (this test writes into it) — see `paths::ENV_LOCK`'s own
+    /// doc for why every WEFT_HOME-touching test must hold it.
     #[test]
     fn computer_claude_writes_its_own_config() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let weft_home =
+            std::env::temp_dir().join(format!("weft-inj-comp-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", &dir, None);
         assert_eq!(inj.args[0], "--mcp-config");
-        let cfg = std::fs::read_to_string(dir.join(".weft-computer.mcp.json")).unwrap();
+        let cfg_path = std::path::PathBuf::from(&inj.args[1]);
+        assert!(
+            !cfg_path.starts_with(&dir),
+            "the computer MCP config must live OUTSIDE the worktree entirely, got {cfg_path:?}"
+        );
+        assert!(
+            !dir.join(".weft-computer.mcp.json").exists(),
+            "must never write anything computer-related inside cwd at all"
+        );
+        let cfg = std::fs::read_to_string(&cfg_path).unwrap();
         assert!(cfg.contains("weft_computer") && cfg.contains("/computer/1/10/mcp"));
-        // issue #160 round-11 P1 #A: the injected URL now also carries the
+        // issue #160 round-11 P1 #A: the injected URL still carries the
         // EXACT per-session bearer `computer_session_token` would mint for
         // this same (thread, dir).
         assert!(
             cfg.contains(&format!("key={}", crate::bus::computer_srv::computer_session_token(1, "10"))),
             "{cfg}"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the bearer-token-bearing config must be 0600, got {mode:o}");
+        }
+
+        std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&weft_home);
     }
 
     #[test]
@@ -494,18 +679,31 @@ mod tests {
 
     /// issue #160 round-2 P2 §5: a resolved `wt` appends `?wt=<id>` to the
     /// injected URL, for both the claude file-based injection and codex's
-    /// config-override flag.
+    /// config-override flag. Needs an ISOLATED `WEFT_HOME` for the claude half
+    /// (round-12 P1 #6 moved that config out of the worktree) — see
+    /// `paths::ENV_LOCK`'s own doc.
     #[test]
     fn computer_wt_appends_the_query_param_for_claude_and_codex() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let weft_home =
+            std::env::temp_dir().join(format!("weft-inj-comp-wt-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
         let key = crate::bus::computer_srv::computer_session_token(1, "10");
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-wt-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", &dir, Some(42));
         assert_eq!(inj.args[0], "--mcp-config");
-        let cfg = std::fs::read_to_string(dir.join(".weft-computer.mcp.json")).unwrap();
+        let cfg_path = std::path::PathBuf::from(&inj.args[1]);
+        assert!(!cfg_path.starts_with(&dir), "must live outside the worktree, got {cfg_path:?}");
+        let cfg = std::fs::read_to_string(&cfg_path).unwrap();
         assert!(cfg.contains("/computer/1/10/mcp?wt=42"), "{cfg}");
         assert!(cfg.contains(&format!("&key={key}")), "{cfg}");
+
+        std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&weft_home);
 
         let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Path::new("/tmp"), Some(42));
         assert_eq!(
@@ -911,6 +1109,94 @@ mod tests {
             !s.contains(".weft-bus.mcp.json"),
             "injected file must be git-excluded, got: {s}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // —— issue #160 round-12 P1 #6: computer-use token never lands in a tracked opencode.json ——
+
+    /// The untracked/common case: no pre-existing `opencode.json` at all (or
+    /// one the sub-repo never committed) — the computer server's merge
+    /// proceeds exactly like `inject_mcp`'s generic merge does for
+    /// `weft_bus`, PLUS narrows the file to `0600` on unix (the token-bearing
+    /// difference `inject_computer_opencode` adds on top).
+    #[test]
+    fn computer_opencode_merges_and_narrows_permissions_when_untracked() {
+        let dir = std::env::temp_dir().join(format!("weft-inj-comp-oc-untracked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "opencode", &dir, None);
+        assert!(inj.args.is_empty(), "opencode has no launch-flag injection");
+        let cfg_path = dir.join("opencode.json");
+        let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(cfg.contains("weft_computer") && cfg.contains("/computer/1/10/mcp"), "{cfg}");
+        assert!(
+            cfg.contains(&format!("key={}", crate::bus::computer_srv::computer_session_token(1, "10"))),
+            "{cfg}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the bearer-token-bearing opencode.json must be 0600, got {mode:o}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The protected case: the sub-repo ships (and has COMMITTED) its own
+    /// `opencode.json` — merging the computer server's per-session bearer
+    /// token into it would persist Weft's own credential wiring straight into
+    /// the user's repo history the next time they commit. This must refuse
+    /// the merge outright (the tool simply isn't offered to this worker),
+    /// never write the token into that tracked file. `weft_bus`'s OWN merge
+    /// (via `inject`, unaffected by this round) is exercised alongside to
+    /// confirm this restriction is scoped to the computer server alone — the
+    /// other servers keep their pre-existing "still merges into a tracked
+    /// file, accepted limitation" behavior since they carry no secret.
+    #[test]
+    fn computer_opencode_never_merges_into_an_already_tracked_opencode_json() {
+        use std::process::Command;
+        let root = std::env::temp_dir().join(format!("weft-inj-comp-oc-tracked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sh = |dir: &Path, args: &[&str]| {
+            assert!(Command::new(args[0])
+                .args(&args[1..])
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success());
+        };
+        sh(&root, &["git", "init", "-q"]);
+        sh(&root, &["git", "config", "user.email", "t@t.t"]);
+        sh(&root, &["git", "config", "user.name", "t"]);
+        std::fs::write(
+            root.join("opencode.json"),
+            r#"{"mcp":{"repo_own":{"type":"local","command":["x"]}}}"#,
+        )
+        .unwrap();
+        sh(&root, &["git", "add", "-A"]);
+        sh(&root, &["git", "commit", "-q", "-m", "init"]);
+
+        let token = crate::bus::computer_srv::computer_session_token(1, "10");
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "opencode", &root, None);
+        assert!(inj.args.is_empty());
+        let cfg = std::fs::read_to_string(root.join("opencode.json")).unwrap();
+        assert!(
+            !cfg.contains("weft_computer") && !cfg.contains(&token),
+            "a TRACKED opencode.json must never gain the computer server or its token: {cfg}"
+        );
+        // The repo's own pre-existing content is untouched.
+        assert!(cfg.contains("repo_own"));
+
+        // Sanity: `weft_bus` (no secret) still merges into this SAME tracked
+        // file — confirming the refusal above is specific to the computer
+        // server, not a blanket "never touch a tracked opencode.json" that
+        // would also silently break the bus.
+        let _ = inject("http://127.0.0.1:9", 1, "10", "opencode", &root);
+        let cfg_after_bus = std::fs::read_to_string(root.join("opencode.json")).unwrap();
+        assert!(cfg_after_bus.contains("weft_bus"), "{cfg_after_bus}");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
