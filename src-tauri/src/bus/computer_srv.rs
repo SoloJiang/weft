@@ -3100,7 +3100,26 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
     options.custom_flags(libc::O_NOFOLLOW);
     #[cfg(unix)]
     options.mode(0o600);
-    options.open(path).await
+    // issue #160 round-21 P2 (Codex computer_srv.rs:3052): on Windows, a freshly
+    // CREATED audit file (the first append, or the new live file after each
+    // rotation) must get the same owner-only protection unix gets from `0o600`
+    // above — otherwise it inherits a permissive `WEFT_HOME` directory ACL and
+    // exposes window titles/actions/coordinates/outcomes to other local
+    // accounts. Detect creation up front so the ACL is applied ONCE (re-stamping
+    // it on every append would be pure overhead); on a `try_exists` error, treat
+    // it as new and apply anyway (fail toward protecting).
+    #[cfg(windows)]
+    let is_new = !tokio::fs::try_exists(path).await.unwrap_or(false);
+    let file = options.open(path).await?;
+    #[cfg(windows)]
+    if is_new {
+        use std::os::windows::io::AsRawHandle;
+        // Best-effort, matching this function's own contract: a failure to lock
+        // the file down does not fail the audit append (unlike the secret-config
+        // writer, which fails closed — an audit line is not itself a secret).
+        let _ = crate::bus::inject::restrict_handle_to_owner(file.as_raw_handle());
+    }
+    Ok(file)
 }
 
 /// The session's own Weft-managed output root for `(thread, dir[, wt])`,

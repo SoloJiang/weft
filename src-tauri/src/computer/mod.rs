@@ -1081,11 +1081,44 @@ pub fn screenshot_resolved(
             w.flush().map_err(|e| ComputerError::Io(e.to_string()))
         })?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // round-14 P2: `save` both creates and writes in one call, so a
-        // failure here may still have left an empty/truncated file behind —
-        // same `cleanup_on_err` guarantee as the unix branch above.
+        use std::os::windows::io::AsRawHandle;
+        // issue #160 round-20 P2 (Codex computer/mod.rs:1089): create the PNG
+        // with an owner-only DACL BEFORE any pixels are written — the Windows
+        // analog of the unix `0o600` create above. Otherwise `image.save`
+        // creates it under the (possibly permissive) inherited directory ACL,
+        // leaving captured mail/browser/password-manager pixels readable by
+        // other local accounts on a shared/traversable `WEFT_HOME`. Fail-CLOSED:
+        // if the file can't be locked down, remove it and error rather than
+        // leave an unprotected capture on disk.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| ComputerError::Io(e.to_string()))?;
+        if !crate::bus::inject::restrict_handle_to_owner(file.as_raw_handle()) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(ComputerError::Io(
+                "could not apply an owner-only ACL to the screenshot file".into(),
+            ));
+        }
+        let mut w = std::io::BufWriter::new(file);
+        // Same `cleanup_on_err` + explicit-flush guarantee as the unix branch.
+        cleanup_on_err(&path, || {
+            image
+                .write_to(&mut w, image::ImageFormat::Png)
+                .map_err(|e| ComputerError::Io(e.to_string()))?;
+            use std::io::Write as _;
+            w.flush().map_err(|e| ComputerError::Io(e.to_string()))
+        })?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // `save` both creates and writes in one call, so a failure here may
+        // still have left an empty/truncated file behind — same
+        // `cleanup_on_err` guarantee as the branches above.
         cleanup_on_err(&path, || image.save(&path).map_err(|e| ComputerError::Io(e.to_string())))?;
     }
     // round-7 P1: keep the just-saved pixels in memory instead of ever having

@@ -859,7 +859,18 @@ function AutomationSettings() {
     try {
       await api.setComputerUseEnabled(on);
     } catch (err) {
-      setComputerUseState(prev);
+      // issue #160 round-21 P2 (Codex SettingsDialog.tsx:863): a FAILED disable
+      // still trips the backend's in-memory stop latch, so Computer Use stays
+      // disabled even though persistence failed — the requested/`prev` state is
+      // NOT authoritative (restoring `true` would show an "on" toggle that
+      // every call rejects, and clicking it would send another disable). Refresh
+      // the real enabled state from the backend; fall back to `prev` only if
+      // that read also fails.
+      try {
+        setComputerUseState(await api.getComputerUseEnabled());
+      } catch {
+        setComputerUseState(prev);
+      }
       throw err;
     }
   }

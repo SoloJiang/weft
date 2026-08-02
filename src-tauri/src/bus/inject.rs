@@ -590,9 +590,15 @@ fn windows_replace_existing(from: &Path, to: &Path) -> bool {
 /// `PROTECTED_DACL_SECURITY_INFORMATION` flag also strips inherited ACEs, so a
 /// permissive parent-directory ACL on a shared checkout can't leave the file
 /// readable by other accounts. Returns `false` on ANY failure — the caller
-/// treats that as "could not secure the file" and writes nothing.
+/// treats that as "could not secure the file" and acts accordingly.
+///
+/// `pub(crate)` because it is the ONE Windows owner-only-file primitive shared
+/// across every place unix uses a `0o600` create: the secret-config writer
+/// here, plus the screenshot save (`computer::screenshot_resolved`, issue #160
+/// round-20 P2) and the audit log (`bus::computer_srv::open_audit_file_for_
+/// append`, issue #160 round-21 P2).
 #[cfg(windows)]
-fn restrict_handle_to_owner(handle: std::os::windows::io::RawHandle) -> bool {
+pub(crate) fn restrict_handle_to_owner(handle: std::os::windows::io::RawHandle) -> bool {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
     use windows::Win32::Security::Authorization::{
