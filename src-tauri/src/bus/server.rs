@@ -401,19 +401,32 @@ fn session_servers_for_kind(kind: &str) -> &'static [&'static str] {
 /// session while the setting was on — including a concierge/curator lead
 /// that never actually had this server injected — which would wave through
 /// any same-named shadow MCP server (a repo's own `weft_computer`) a
-/// concierge/curator session happened to load, with no card at all. Fixed to
-/// mirror the REAL injection rule:
-///  - the setting must be on (unchanged — `computer::enabled` itself fails
-///    closed: a DB error/missing row/anything but the literal "true" reads
-///    disabled);
-///  - a WORKER lane (`dir` parses as a direction id) always qualifies once
-///    the setting is on — `include_computer` gates every worker call site
-///    purely on `computer::enabled`, for ANY direction, so — unlike
+/// concierge/curator session happened to load, with no card at all. The rule
+/// mirrors the REAL injection lanes:
+///  - a WORKER lane (`dir` parses as a direction id) always qualifies —
+///    every worker call site injects for ANY direction, so — unlike
 ///    `weft_bus` above — no direction-ownership DB lookup is needed here
 ///    either;
 ///  - the LEAD lane needs the thread's `kind`: `concierge`/`curator` never
 ///    qualify (mirrors the hard-coded `false` those two kinds get at every
 ///    real injection call site); any other kind (an issue lead) does.
+///
+/// issue #160 round-17 P1 (Codex server.rs:435): the `computer::enabled`
+/// check that used to sit in FRONT of those lane rules is GONE. Since
+/// round-12 P2 #7 the server is injected UNCONDITIONALLY (the setting is
+/// enforced live, per call, by `bus::computer_srv::run_action`'s own gates),
+/// so "setting off" no longer means "this session doesn't have the server" —
+/// but this function still returned `false` for it, which dropped a disabled
+/// call into the ORDINARY hook approval path: a redundant Needs-you card for
+/// a call the MCP endpoint was always going to answer with disabled-text
+/// anyway. A human answering that pointless card `Always`/`Full` minted a
+/// REAL standing/task-wide grant off a no-op — inherited later by re-enabled
+/// computer calls (and, for Full, by unrelated tools). Auto-approving the
+/// hook layer regardless of the setting closes that: the hook's verdict was
+/// never the real authorization (see the paragraph below), and the
+/// server-side gate both reports the disabled state AND runs the one genuine
+/// approval flow when enabled — no second card, no grant minted from a call
+/// that never did anything.
 ///
 /// As explained on `AUTO_APPROVED_INTERNAL_TOOLS`'s own doc, this check does
 /// not itself gate whether the `computer` action actually runs — the
@@ -431,9 +444,10 @@ fn session_servers_for_kind(kind: &str) -> &'static [&'static str] {
 /// server, not something this hook silently grants on its own.
 async fn session_injected(db: &Db, thread: i32, dir: &str, server: &str) -> bool {
     if server == "weft_computer" {
-        if !crate::computer::enabled(db).await {
-            return false;
-        }
+        // No `computer::enabled` read here — deliberately, as of round-17 P1
+        // (see this function's own doc above): the server-side gate owns the
+        // setting, and a hook-layer `false` while disabled only manufactured
+        // a grant-minting card for a guaranteed no-op call.
         if dir != crate::bus::LEAD {
             return dir.parse::<i32>().is_ok();
         }
@@ -2103,26 +2117,56 @@ mod tests {
         );
     }
 
-    /// The fail-closed twin of the test above: computer_use is OFF (the
-    /// default), so `session_injected`'s `weft_computer` branch — which
-    /// mirrors the SAME `computer::enabled` check the server-side gate
-    /// itself relies on — reports "not injected" and this endpoint falls
-    /// through to a real card instead of trusting the hook payload.
+    /// issue #160 round-17 P1 (Codex server.rs:435): while computer_use is
+    /// OFF, the hook layer STILL auto-approves a `weft_computer` ask for a
+    /// qualifying lane — opening NO card — because the server-side gate both
+    /// owns the setting (the MCP call just gets the disabled text) and runs
+    /// the one genuine approval flow when enabled. The old behavior
+    /// (disabled → hook card) let a human answer that redundant card
+    /// `Always`/`Full`, minting a real grant off a call that never did
+    /// anything. Lane rules still fail closed: the missing-thread case below
+    /// proves an unresolvable lead still gets a card, disabled or not.
     #[tokio::test]
-    async fn weft_computer_hook_ask_surfaces_a_card_while_disabled() {
+    async fn weft_computer_hook_ask_auto_approves_without_a_card_even_while_disabled() {
         use crate::ask::{Answer, AskRegistry};
         use crate::bus::BusRegistry;
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
         // Deliberately never enables computer_use.
+        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
         let asks = AskRegistry::new();
         let (base, _h) = serve(BusRegistry::new(), db, asks.clone()).await.unwrap();
 
-        let url = format!("{base}/ask/1/{}?tool=claude", crate::bus::LEAD);
+        let url = format!("{base}/ask/{}/{}?tool=claude", thread.id, crate::bus::LEAD);
         let body = json!({
             "tool_name": "mcp__weft_computer__computer",
             "tool_input": { "action": "left_click", "window": "notes" }
         });
+        let out: Value = reqwest::Client::new()
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            out["hookSpecificOutput"]["permissionDecision"], "allow",
+            "disabled must NOT manufacture a redundant, grant-mintable hook card: {out}"
+        );
+        assert!(
+            asks.open().is_empty(),
+            "no card may open — the MCP endpoint itself reports the disabled state"
+        );
+
+        // Fail-closed twin, unchanged by round-17: a lead whose THREAD can't
+        // be resolved still surfaces a real card (lane identity, not the
+        // setting, is what fails closed at this layer).
+        let url = format!("{base}/ask/999999/{}?tool=claude", crate::bus::LEAD);
         let (resp, ()) = tokio::join!(
             async {
                 reqwest::Client::new()

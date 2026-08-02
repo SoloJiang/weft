@@ -1677,23 +1677,39 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         .ok()
         .flatten()
         .map(|w| w.id);
-    // issue #160 round-12 P2 #7: computer-use MCP is now injected
-    // UNCONDITIONALLY, same as the first-spawn path above — this is the
-    // worker resume/rebuild path; the setting/kill-switch is enforced
-    // dynamically, server-side, on every call.
-    // issue #160 round-15 P1: keep BOTH halves of the computer injection —
-    // args on argv, the codex bearer via the child's env (see
+    // issue #160 round-12 P2 #7: computer-use MCP is injected on this worker
+    // resume/rebuild path too (the setting/kill-switch is enforced
+    // dynamically, server-side, on every call), and round-15 P1 keeps BOTH
+    // halves — args on argv, the codex bearer via the child's env (see
     // `bus::inject::Injection::env`).
-    let comp = crate::bus::inject::inject_computer(
-        &base,
-        dir.thread_id,
-        &sess.direction_id.to_string(),
-        &sess.tool,
-        &cwd,
-        worktree_id,
-    );
-    extra.extend(comp.args);
-    let extra_env = comp.env;
+    //
+    // issue #160 round-17 P2 (Codex commands.rs:1679): but ONLY with a
+    // POSITIVELY resolved worktree. A worker session always has exactly one
+    // worktree; `worktree_for` collapsing a DB error or a missing row to
+    // `None` used to flow straight into `inject_computer` as the absent-`wt`
+    // case — which `session_root` deliberately resolves to "the first
+    // worktree of this direction", so a worker in one repo of a multi-repo
+    // direction could route its screenshots/audit into a SIBLING's namespace
+    // (and mint a bearer for it). The absent case is legitimate ONLY for the
+    // lead lane; for a worker it is an unresolved identity, and identity
+    // must fail closed: skip the computer injection entirely — this session
+    // simply has no computer tool until a rebuild resolves its worktree —
+    // rather than gambling on whichever worktree happens to sort first.
+    let (comp_args, extra_env) = match worktree_id {
+        Some(_) => {
+            let comp = crate::bus::inject::inject_computer(
+                &base,
+                dir.thread_id,
+                &sess.direction_id.to_string(),
+                &sess.tool,
+                &cwd,
+                worktree_id,
+            );
+            (comp.args, comp.env)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    extra.extend(comp_args);
     push_model_arg(&mut extra, sess.model.as_deref());
     let mut inner = engine::EngineInner {
         thread_id: dir.thread_id,

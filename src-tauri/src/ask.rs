@@ -2157,18 +2157,28 @@ impl AskRegistry {
         // caller that straddled the transition — but that self-check and its
         // `cancel` are SEPARATE lock acquisitions from this method, so an
         // answer landing in the instant between them could still have minted
-        // an Always/Full grant for a world that was already stopped. Folding
-        // the latch read into answer() itself closes that: any answer that
-        // records a grant provably observed latch-clear under THIS lock. The
-        // trip happens-before every straddler's insert, and the latch can only
-        // clear via an explicit re-enable — by which point cancel_gui_asks and
-        // the self-check have already removed every stale GUI card — so a
-        // forced Deny here can never hit a card a human legitimately answered
-        // in an enabled world. Non-GUI asks are untouched: the latch is a
+        // an Always/Full grant for a world that was already stopped.
+        //
+        // issue #160 round-17 P1 (Codex ask.rs:2174): the latch is now read
+        // through a guard HELD UNTIL THIS METHOD RETURNS (see the explicit
+        // `drop` before the final `true`), not a one-shot `stop_latched()`
+        // read — the round-16 shape released the stop mutex before the grant
+        // was inserted, so a Stop tripping in that gap (then blocking on the
+        // registry lock in `cancel_gui_asks`) still let this answer record a
+        // grant "concurrently with" the stop. With the guard held through
+        // insertion, `trip_stop_latch` cannot complete until this answer has
+        // fully recorded and resolved: a grant-minting answer now STRICTLY
+        // PRECEDES any stop — the legitimate "human answered, then stopped"
+        // ordering (execution is still halted by the post-approve enabled
+        // rechecks; the grant itself was minted in a provably-enabled world).
+        // No `.await` exists anywhere in this method, so the sync guard is
+        // safe to hold throughout. Non-GUI asks are untouched: the latch is a
         // computer-use kill switch, not a general approval freeze. Lock order
-        // (registry → stop-state) nests one way only; no path takes them in
-        // reverse, so this cannot deadlock.
-        let ans = if action_key_is_gui(&ask.action_key) && crate::computer::stop_latched() {
+        // (registry → stop-state) nests one way only; nothing anywhere takes
+        // the registry lock while holding the stop lock, so this cannot
+        // deadlock.
+        let stop_guard = crate::computer::hold_stop_state();
+        let ans = if action_key_is_gui(&ask.action_key) && stop_guard.latched() {
             Answer::Deny
         } else {
             ans
@@ -2233,6 +2243,11 @@ impl AskRegistry {
         if granted {
             g.emit_persist();
         }
+        // issue #160 round-17 P1: released only now — after the grant (and its
+        // persist emit) have fully landed — so a concurrently-tripping Stop
+        // orders strictly after this whole answer. See the guard's own comment
+        // at the top of this method.
+        drop(stop_guard);
         // Success = the ask was found AND answered (an unfound/already-answered ask
         // returned false above). Whether a waiter was still around to wake is a
         // separate race — a cancelled approval request drops its waiter, but the

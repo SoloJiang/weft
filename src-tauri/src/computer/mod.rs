@@ -118,6 +118,35 @@ pub fn stop_latched() -> bool {
     stop_state().lock().unwrap_or_else(|e| e.into_inner()).stopped
 }
 
+/// A held lock on the stop state (issue #160 round-17 P1, Codex ask.rs:2174)
+/// — for the ONE caller that must make "observe the latch, then act on that
+/// observation" ATOMIC against a concurrently-tripping Stop:
+/// `AskRegistry::answer`'s grant recording. [`stop_latched`] releases the
+/// stop mutex the instant it returns, so a Stop could trip in the gap between
+/// that read and the grant insertion it gated; holding THIS guard across the
+/// insertion means [`trip_stop_latch`] cannot complete until the answer has
+/// fully recorded — the answer then strictly precedes the Stop, which is the
+/// legitimate "human answered, then stopped" ordering, never a grant minted
+/// concurrently with (or after) the stop it should have been blocked by.
+/// Callers must NEVER hold this across an `.await` (it is a sync
+/// `MutexGuard`), and lock ordering is one-way — a caller may take this
+/// while holding the ask-registry lock, but nothing anywhere takes the
+/// registry lock while holding this — so no deadlock is possible.
+pub struct StopLatchGuard(std::sync::MutexGuard<'static, StopState>);
+
+impl StopLatchGuard {
+    /// Whether the latch is tripped, read under the held lock — stable for
+    /// the guard's whole lifetime.
+    pub fn latched(&self) -> bool {
+        self.0.stopped
+    }
+}
+
+/// Acquire the stop-state lock and hold it — see [`StopLatchGuard`].
+pub fn hold_stop_state() -> StopLatchGuard {
+    StopLatchGuard(stop_state().lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// Clear the emergency-stop latch (issue #160 review R1 #1; generation check
 /// added round-6 review P1 #1 — see [`StopState`]'s own doc for why a lone
 /// `AtomicBool`/`AtomicU64` pair could not make this fully race-safe). The
@@ -973,6 +1002,27 @@ pub fn screenshot_window(
     out_dir: &Path,
 ) -> Result<Screenshot, ComputerError> {
     let matched = resolve_window(backend, query)?;
+    screenshot_resolved(backend, &matched, out_dir)
+}
+
+/// Capture an ALREADY-RESOLVED window — issue #160 round-17 P1 (Codex
+/// computer_srv.rs:793). [`screenshot_window`] above resolves its query
+/// itself, which was one resolution too many for `bus::computer_srv`'s
+/// screenshot arm: that caller had ALREADY resolved and identity-verified its
+/// target (`resolve_and_verify_target`) an instant earlier, and handing this
+/// module the raw QUERY back meant a second, independent enumeration — a
+/// window closing and a same-query replacement appearing between those two
+/// enumerations would be captured under an approval shown only for the
+/// original. Taking the verified [`WindowInfo`] instead pins the capture to
+/// the exact id the caller verified: there is no re-resolution left to
+/// drift, and if that window is gone by capture time,
+/// `backend.capture_window(id)` fails closed rather than falling back to a
+/// lookalike.
+pub fn screenshot_resolved(
+    backend: &dyn backend::ComputerBackend,
+    matched: &WindowInfo,
+    out_dir: &Path,
+) -> Result<Screenshot, ComputerError> {
     let captured = backend.capture_window(matched.id)?;
     // round-7 P2: derive the recorded scale from THIS frame (`captured`), not
     // from `matched`'s own pre-capture geometry — see this function's own doc

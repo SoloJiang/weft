@@ -645,6 +645,17 @@ async fn run_action(
             // budget gives the already-authorized path the same hard
             // concurrency ceiling, rather than inventing a second one.
             let _observe_permit = screenshot_semaphore().acquire().await.map_err(|e| e.to_string())?;
+            // issue #160 round-17 P1 (Codex computer_srv.rs:647): recheck the
+            // kill switch AFTER the permit queue — with both permits held, a
+            // standing-granted caller can sit in `acquire().await` across a
+            // Stop/disable, and the only `enabled` read it ever passed was
+            // `run_action`'s top gate, long before the queue. Same shape as
+            // the screenshot arm's own post-semaphore recheck (round-14 P1);
+            // this is the arm's LAST await before the enumeration is
+            // scheduled.
+            if !computer::enabled(db).await {
+                return Err(ComputerError::Disabled.to_string());
+            }
             let b = backend::backend();
             // issue #160 round-16 P1 (Codex 605): the enumeration itself
             // moves onto tokio's blocking pool — see `on_blocking`'s own doc
@@ -700,34 +711,37 @@ async fn run_action(
             // this call does; dropped when this arm's block ends (including
             // on an early `?` return from the capture itself).
             let _capture_permit = screenshot_semaphore().acquire().await.map_err(|e| e.to_string())?;
-            // issue #160 round-14 P1 (Codex computer_srv.rs:583): recheck the
-            // kill switch AFTER the two awaits this arm took since the last
-            // `enabled` check up top — `screenshot_out_dir`, then the capture
-            // semaphore's own `acquire().await`, which can queue arbitrarily
-            // long when both `SCREENSHOT_CONCURRENCY` permits are already held.
-            // Without this, a human hitting Stop / disabling Computer Use while
-            // this call sat queued on the semaphore would still capture once a
-            // permit freed (the only post-await checks left were the window-
-            // identity re-verifies, which never look at `enabled`) — a
-            // Full/Always-granted caller could leave many captures queued to
-            // fire AFTER Stop. Placed BEFORE the second `resolve_and_verify_
-            // target` below (not right before `screenshot_window`) on purpose:
-            // this is the arm's LAST `.await`, so the resolve→capture→record
-            // sequence after it stays await-free and keeps its "just verified"
-            // identity guarantee (round-12 P1 #I) — a window that changed during
-            // THIS await is still caught fail-closed by that re-resolve.
-            if !computer::enabled(db).await {
-                return Err(ComputerError::Disabled.to_string());
-            }
             // issue #160 round-16 P1 (Codex 605): whether this call's owning
             // engine accepts an inline MCP image is looked up now, on the
             // runtime — `engine_accepts_mcp_image` awaits the db, but
-            // everything from here down (the second resolve through every
-            // encode/record) runs inside a SINGLE `on_blocking` closure below
+            // everything past the recheck below (the second resolve through
+            // every encode/record) runs inside a SINGLE `on_blocking` closure
             // (see that helper's own doc), and a blocking-pool closure can't
             // itself `.await` anything. The bool crosses that boundary as a
             // plain owned value instead of the lookup itself moving in.
+            //
+            // issue #160 round-17 P1 (Codex computer_srv.rs:730): this lookup
+            // sits BEFORE the enabled recheck below, not after it — round-16's
+            // refactor briefly had it after, which re-opened the exact gap the
+            // recheck exists to close: a Stop landing while THIS db await was
+            // in flight went unseen, and the capture was scheduled anyway. The
+            // recheck must be the arm's genuinely LAST await.
             let want_mcp_image = engine_accepts_mcp_image(db, thread, dir).await;
+            // issue #160 round-14 P1 (Codex computer_srv.rs:583): recheck the
+            // kill switch AFTER every await this arm took since the last
+            // `enabled` check up top — `screenshot_out_dir`, the capture
+            // semaphore's own `acquire().await` (which can queue arbitrarily
+            // long when both `SCREENSHOT_CONCURRENCY` permits are already
+            // held), and the engine lookup just above. Without this, a human
+            // hitting Stop / disabling Computer Use while this call sat queued
+            // would still capture once a permit freed — a Full/Always-granted
+            // caller could leave many captures queued to fire AFTER Stop.
+            // This is the arm's LAST `.await` (round-17 P1 re-established
+            // that invariant — see the lookup's comment above): nothing runs
+            // between it and scheduling the blocking capture below.
+            if !computer::enabled(db).await {
+                return Err(ComputerError::Disabled.to_string());
+            }
             // issue #160 round-12 P1 #I: re-resolve + re-verify identity
             // AGAIN, after EVERY await this arm takes since the first check
             // above (`screenshot_out_dir`, the capture semaphore itself, then
@@ -781,16 +795,17 @@ async fn run_action(
                     Ok(w) => w,
                     Err(e) => return (resolved_id, Err(e)),
                 };
-                // `screenshot_window` re-resolves `window_query` internally —
-                // the SAME query just re-verified above, against the SAME
-                // unchanging backend state, with no scheduling point in
-                // between — so it captures the IDENTICAL window `w` just
-                // verified. This mirrors the accepted "resolve twice" pattern
-                // the click-family arms already use (`resolve_and_verify_
-                // target` itself is called twice per input action, once
-                // before/once after activation); here the gap is narrower
-                // still (no activation in between at all).
-                let shot = match computer::screenshot_window(b.as_ref(), &window_query_owned, &out_dir) {
+                // issue #160 round-17 P1 (Codex computer_srv.rs:793): capture
+                // the EXACT window `w` just verified — `computer::screenshot_
+                // resolved` takes the already-resolved `WindowInfo` instead of
+                // the raw query, so there is NO third enumeration left for a
+                // same-query replacement to slip into between verify and
+                // capture (the old `screenshot_window(query, ..)` call
+                // re-resolved internally; two OS enumerations back-to-back
+                // are still two). If `w` closed in the instant since the
+                // verify above, `capture_window(w.id)` fails closed rather
+                // than ever falling back to a lookalike.
+                let shot = match computer::screenshot_resolved(b.as_ref(), &w, &out_dir) {
                     Ok(s) => s,
                     Err(e) => return (resolved_id, Err(e.to_string())),
                 };
@@ -852,9 +867,9 @@ async fn run_action(
                     // the already-resolved, just-verified target (its `id`
                     // equals `shot.window_id` by that verification), so this
                     // reuses it rather than re-resolving. See
-                    // [`PreviewWindowIdentity`] for the id-reuse hazard this
+                    // [`VerifiedWindowIdentity`] for the id-reuse hazard this
                     // closes.
-                    store_screenshot_preview(thread, &dir_owned, preview, PreviewWindowIdentity::from_window(&w));
+                    store_screenshot_preview(thread, &dir_owned, preview, VerifiedWindowIdentity::from_window(&w));
                 }
                 // issue #160 round-11 P1 #D: record THIS capture's own saved
                 // dimensions for (thread, dir, shot.window_id) — every
@@ -968,7 +983,7 @@ async fn run_action(
             // AFTER the backend call succeeds: a rejected/failed click never
             // touched the real window and must not seed a false freshness
             // record for a later `type`/`key`.
-            record_click_focus(thread, dir, w2.id);
+            record_click_focus(thread, dir, &w2);
             Ok(format!(
                 "{action} at ({px}, {py}) in window {} done — take a screenshot to verify",
                 w2.id
@@ -1084,7 +1099,7 @@ async fn run_action(
             // pre-activation one: the window `require_recent_focus` guards
             // is the SAME one about to receive the keystrokes.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            require_recent_focus(thread, dir, w2.id)?;
+            require_recent_focus(thread, dir, &w2)?;
             let char_count = text.chars().count();
             let text_owned = text.to_string();
             // issue #160 round-16 P1 (Codex 605): see the click-family arm
@@ -1129,7 +1144,7 @@ async fn run_action(
             activate_and_recheck(db, asks, thread, dir, w.id).await?;
             // issue #160 round-10 P1 #B: see the "type" arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            require_recent_focus(thread, dir, w2.id)?;
+            require_recent_focus(thread, dir, &w2)?;
             let combo_owned = combo.to_string();
             // issue #160 round-16 P1 (Codex 605): see the click-family arm
             // above.
@@ -1798,7 +1813,7 @@ fn preview_for_action(
     }
     // issue #160 round-14 P1 (Codex computer_srv.rs:1466): match on the FULL
     // window identity (id + app + title), not the numeric id alone — see
-    // [`PreviewWindowIdentity`]'s own doc for the id-reuse hazard an id-only
+    // [`VerifiedWindowIdentity`]'s own doc for the id-reuse hazard an id-only
     // comparison left open.
     let target = resolve_target_window_identity(window_query)?;
     let (data_uri, stored) = last_screenshot_preview(thread, dir)?;
@@ -1811,14 +1826,14 @@ fn preview_for_action(
 /// "should we attach a preview" decision, not the real validation
 /// ([`required_window`] / the per-action dispatch) that actually rejects a
 /// malformed call.
-fn resolve_target_window_identity(window_query: &str) -> Option<PreviewWindowIdentity> {
+fn resolve_target_window_identity(window_query: &str) -> Option<VerifiedWindowIdentity> {
     if window_query.trim().is_empty() {
         return None;
     }
     let b = backend::backend();
     computer::resolve_window(b.as_ref(), window_query)
         .ok()
-        .map(|w| PreviewWindowIdentity::from_window(&w))
+        .map(|w| VerifiedWindowIdentity::from_window(&w))
 }
 
 /// A window-scoped action's `window` argument, validated BEFORE it ever
@@ -1937,9 +1952,17 @@ const FOCUS_FRESHNESS_SECS: u64 = FOCUS_FRESHNESS_MS / 1000;
 /// process-local and monotonic, which is exactly what this check is: a
 /// process-local freshness heuristic. (The audit log's `ts_ms` stays wall
 /// clock — that's a human-readable record, not a gate.)
-fn recent_clicks() -> &'static Mutex<HashMap<(i32, String), (u32, std::time::Instant)>> {
-    static CLICKS: OnceLock<Mutex<HashMap<(i32, String), (u32, std::time::Instant)>>> =
-        OnceLock::new();
+/// issue #160 round-17 P2 (Codex computer_srv.rs:1943): the value carries the
+/// clicked window's FULL [`VerifiedWindowIdentity`] now, not its bare id — an
+/// id reused within the 15s freshness window used to let the REPLACEMENT
+/// window read as "recently clicked", and under a Full grant a `type`/`key`
+/// would then activate and inject into it with neither a card nor a genuine
+/// click. Identity comparison fails that closed, same as the preview and
+/// shot-dims registries already do.
+fn recent_clicks() -> &'static Mutex<HashMap<(i32, String), (VerifiedWindowIdentity, std::time::Instant)>> {
+    static CLICKS: OnceLock<
+        Mutex<HashMap<(i32, String), (VerifiedWindowIdentity, std::time::Instant)>>,
+    > = OnceLock::new();
     CLICKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1948,28 +1971,34 @@ fn recent_clicks() -> &'static Mutex<HashMap<(i32, String), (u32, std::time::Ins
 /// backend call itself returned `Ok`: a rejected/failed click never actually
 /// touched the real window, so it must not seed a false freshness record for
 /// a later `type`/`key`.
-fn record_click_focus(thread: i32, dir: &str, window_id: u32) {
+fn record_click_focus(thread: i32, dir: &str, w: &computer::WindowInfo) {
     let mut g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
-    g.insert((thread, dir.to_string()), (window_id, std::time::Instant::now()));
+    g.insert(
+        (thread, dir.to_string()),
+        (VerifiedWindowIdentity::from_window(w), std::time::Instant::now()),
+    );
 }
 
 /// `type`/`key`'s pre-execution gate: reject unless a click on THIS EXACT
 /// resolved `window_id`, for THIS `(thread, dir)`, landed within the last
 /// [`FOCUS_FRESHNESS_MS`] — see this section's own doc comment for what this
 /// is (and is not) verifying.
-fn require_recent_focus(thread: i32, dir: &str, window_id: u32) -> Result<(), String> {
+fn require_recent_focus(thread: i32, dir: &str, w: &computer::WindowInfo) -> Result<(), String> {
     let g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
+    let target = VerifiedWindowIdentity::from_window(w);
     // issue #160 round-15 P2: `Instant::elapsed` is monotonic — a wall-clock
-    // rollback can no longer stretch one click's freshness window (see
-    // [`recent_clicks`]'s own doc).
+    // rollback can no longer stretch one click's freshness window. issue #160
+    // round-17 P2: the FULL identity must match, not just the id (see
+    // [`recent_clicks`]'s own doc for the id-reuse hazard).
     let fresh = matches!(
         g.get(&(thread, dir.to_string())),
-        Some((clicked, ts)) if *clicked == window_id
+        Some((clicked, ts)) if *clicked == target
             && ts.elapsed() <= std::time::Duration::from_millis(FOCUS_FRESHNESS_MS)
     );
     if fresh {
         return Ok(());
     }
+    let window_id = w.id;
     Err(format!(
         "window {window_id} doesn't appear to have OS focus yet — click inside the target window \
          first to focus it, then type/key within {FOCUS_FRESHNESS_SECS}s"
@@ -2179,30 +2208,38 @@ async fn engine_accepts_mcp_image(db: &Db, thread: i32, dir: &str) -> bool {
 /// evicted. [`MAX_PREVIEWS`] caps it; the value's third element is the
 /// insertion timestamp [`store_screenshot_preview`] needs to find (and evict)
 /// the single oldest entry once the map is full — see [`evict_oldest_if_full`].
-/// The FULL identity of the window a stored preview was captured from (issue
-/// #160 round-14 P1, Codex computer_srv.rs:1466) — `id` ALONE is not enough:
-/// an OS window id is reusable, so if the last-screenshotted window closes and
-/// its numeric id is handed to a DIFFERENT window (different app/title), an
-/// id-only match would attach the OLD window's pixels to an approval card for
-/// the REPLACEMENT, letting a human approve an input action against a preview
-/// of a window `approve` never resolved. Comparing `app`+`title` alongside
-/// `id` fails that match closed instead — the SAME id-reuse defense
-/// `computer::shot_dims_for` already applies to recorded screenshot geometry.
+/// The FULL identity of a window one of this module's per-session registries
+/// recorded — `id` ALONE is never enough: an OS window id is reusable, so a
+/// closed window's number can be handed to a DIFFERENT window (different
+/// app/title) moments later, and an id-only match would silently transfer
+/// whatever the registry vouches for onto that replacement. Comparing
+/// `app`+`title` alongside `id` fails such a match closed instead — the SAME
+/// id-reuse defense `computer::shot_dims_for` applies to recorded screenshot
+/// geometry. Two registries key off this:
+///  - the Ask-card preview registry (issue #160 round-14 P1, Codex
+///    computer_srv.rs:1466) — so a stale preview can't be attached to a card
+///    for a window that merely reused the captured window's number;
+///  - the click-focus registry (issue #160 round-17 P2, Codex
+///    computer_srv.rs:1943) — so a `type`/`key` within the freshness window
+///    can't ride a click recorded against a window that closed and had its
+///    id reused (under a Full grant that would have meant injecting
+///    keystrokes into the replacement with neither a card nor a real click
+///    on it).
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PreviewWindowIdentity {
+struct VerifiedWindowIdentity {
     id: u32,
     app: String,
     title: String,
 }
 
-impl PreviewWindowIdentity {
+impl VerifiedWindowIdentity {
     fn from_window(w: &computer::WindowInfo) -> Self {
         Self { id: w.id, app: w.app.clone(), title: w.title.clone() }
     }
 }
 
-fn screenshot_previews() -> &'static Mutex<HashMap<(i32, String), (String, PreviewWindowIdentity, u64)>> {
-    static PREVIEWS: OnceLock<Mutex<HashMap<(i32, String), (String, PreviewWindowIdentity, u64)>>> =
+fn screenshot_previews() -> &'static Mutex<HashMap<(i32, String), (String, VerifiedWindowIdentity, u64)>> {
+    static PREVIEWS: OnceLock<Mutex<HashMap<(i32, String), (String, VerifiedWindowIdentity, u64)>>> =
         OnceLock::new();
     PREVIEWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -2225,7 +2262,7 @@ const MAX_PREVIEWS: usize = 32;
 /// about to be written already exists (an UPDATE never grows the map, so it
 /// never needs to evict anything to make room for itself) — see this
 /// function's one caller for that guard.
-fn evict_oldest_if_full(map: &mut HashMap<(i32, String), (String, PreviewWindowIdentity, u64)>) {
+fn evict_oldest_if_full(map: &mut HashMap<(i32, String), (String, VerifiedWindowIdentity, u64)>) {
     if map.len() < MAX_PREVIEWS {
         return;
     }
@@ -2238,7 +2275,7 @@ fn evict_oldest_if_full(map: &mut HashMap<(i32, String), (String, PreviewWindowI
     }
 }
 
-fn store_screenshot_preview(thread: i32, dir: &str, preview: String, identity: PreviewWindowIdentity) {
+fn store_screenshot_preview(thread: i32, dir: &str, preview: String, identity: VerifiedWindowIdentity) {
     let mut g = screenshot_previews().lock().unwrap_or_else(|e| e.into_inner());
     let key = (thread, dir.to_string());
     // Only evict to make room for a genuinely NEW key — refreshing an
@@ -2256,7 +2293,7 @@ fn store_screenshot_preview(thread: i32, dir: &str, preview: String, identity: P
 /// from [`preview_for_action`] within this same module now (the round-2 P1
 /// server-side gate owns preview attachment; `bus::server::handle_ask` no
 /// longer does — see this module's own top doc comment).
-fn last_screenshot_preview(thread: i32, dir: &str) -> Option<(String, PreviewWindowIdentity)> {
+fn last_screenshot_preview(thread: i32, dir: &str) -> Option<(String, VerifiedWindowIdentity)> {
     let g = screenshot_previews().lock().unwrap_or_else(|e| e.into_inner());
     g.get(&(thread, dir.to_string()))
         .map(|(preview, identity, _ts)| (preview.clone(), identity.clone()))
@@ -3677,17 +3714,31 @@ mod tests {
     // parallel (the default for `cargo test`) without racing each other on
     // the shared process-level `recent_clicks()` registry.
 
+    /// A minimal window fixture for the focus tests — round-17 P2 made the
+    /// registry identity-keyed, so the tests pass full `WindowInfo`s now.
+    fn focus_win(id: u32) -> computer::WindowInfo {
+        computer::WindowInfo {
+            id,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }
+    }
+
     #[test]
     fn require_recent_focus_passes_right_after_a_click_on_the_same_window() {
         let thread = 900_001;
-        record_click_focus(thread, "lead", 7);
-        assert!(require_recent_focus(thread, "lead", 7).is_ok());
+        record_click_focus(thread, "lead", &focus_win(7));
+        assert!(require_recent_focus(thread, "lead", &focus_win(7)).is_ok());
     }
 
     #[test]
     fn require_recent_focus_rejects_with_no_prior_click_at_all() {
         let thread = 900_002;
-        let err = require_recent_focus(thread, "lead", 7).unwrap_err();
+        let err = require_recent_focus(thread, "lead", &focus_win(7)).unwrap_err();
         assert!(err.contains("focus"), "{err}");
         assert!(err.contains("click"), "{err}");
     }
@@ -3695,20 +3746,38 @@ mod tests {
     #[test]
     fn require_recent_focus_rejects_a_click_on_a_different_window() {
         let thread = 900_003;
-        record_click_focus(thread, "lead", 7); // clicked window A (id 7)
-        let err = require_recent_focus(thread, "lead", 8).unwrap_err(); // typing into B (id 8)
+        record_click_focus(thread, "lead", &focus_win(7)); // clicked window A (id 7)
+        let err = require_recent_focus(thread, "lead", &focus_win(8)).unwrap_err(); // typing into B (id 8)
         assert!(err.contains("8"), "error should name the window that lacks focus: {err}");
+    }
+
+    /// issue #160 round-17 P2 (Codex computer_srv.rs:1943): a REUSED numeric
+    /// id must not satisfy the freshness check — the clicked window closed
+    /// and a different app/title took its number within the 15s window.
+    #[test]
+    fn require_recent_focus_rejects_a_reused_id_with_a_different_identity() {
+        let thread = 900_007;
+        record_click_focus(thread, "lead", &focus_win(7));
+        let mut imposter = focus_win(7);
+        imposter.app = "Mail".into();
+        imposter.title = "inbox".into();
+        assert!(
+            require_recent_focus(thread, "lead", &imposter).is_err(),
+            "the SAME id with a different app/title must not read as recently clicked"
+        );
+        // The genuine identity still passes.
+        assert!(require_recent_focus(thread, "lead", &focus_win(7)).is_ok());
     }
 
     #[test]
     fn require_recent_focus_is_scoped_per_thread_dir() {
         let thread_a = 900_004;
         let thread_b = 900_005;
-        record_click_focus(thread_a, "lead", 7);
+        record_click_focus(thread_a, "lead", &focus_win(7));
         // A click recorded for a DIFFERENT (thread, dir) must not satisfy
         // this one's focus check — the registry is per-session, not global.
-        assert!(require_recent_focus(thread_b, "lead", 7).is_err());
-        assert!(require_recent_focus(thread_a, "10", 7).is_err());
+        assert!(require_recent_focus(thread_b, "lead", &focus_win(7)).is_err());
+        assert!(require_recent_focus(thread_a, "10", &focus_win(7)).is_err());
     }
 
     #[test]
@@ -3729,9 +3798,12 @@ mod tests {
         };
         {
             let mut g = recent_clicks().lock().unwrap();
-            g.insert((thread, "lead".to_string()), (7, stale));
+            g.insert(
+                (thread, "lead".to_string()),
+                (VerifiedWindowIdentity::from_window(&focus_win(7)), stale),
+            );
         }
-        assert!(require_recent_focus(thread, "lead", 7).is_err());
+        assert!(require_recent_focus(thread, "lead", &focus_win(7)).is_err());
     }
 
     // —— issue #160 round-4 P1 §2, broadened round-5 review P1 §6: activate_target ——
@@ -3974,7 +4046,15 @@ mod tests {
         // window first (see `require_recent_focus`) — seed it directly
         // rather than driving a real `left_click` through the whole gate a
         // second time just to satisfy this precondition.
-        record_click_focus(thread, dir, 906_201);
+        record_click_focus(thread, dir, &computer::WindowInfo {
+            id: 906_201,
+            app: "Bar".into(),
+            title: "Bar".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        });
 
         // Prime + clear the global input throttle so the real call below
         // isn't itself rejected as rate-limited.
@@ -4151,7 +4231,15 @@ mod tests {
             full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
             always: Vec::new(),
         });
-        record_click_focus(thread, dir, 910_501);
+        record_click_focus(thread, dir, &computer::WindowInfo {
+            id: 910_501,
+            app: "Swappy".into(),
+            title: "swappy window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        });
 
         let _ = computer::throttle_input();
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
@@ -6554,17 +6642,17 @@ mod tests {
 
     // —— issue #160 round-2 P2 §7: bounded preview registry ——
 
-    /// A throwaway [`PreviewWindowIdentity`] for tests that only exercise the
+    /// A throwaway [`VerifiedWindowIdentity`] for tests that only exercise the
     /// registry's capacity/timestamp behavior, where the window identity itself
     /// is irrelevant (issue #160 round-14 P1 changed the stored value to carry
     /// the full identity).
-    fn pid(id: u32) -> PreviewWindowIdentity {
-        PreviewWindowIdentity { id, app: String::new(), title: String::new() }
+    fn pid(id: u32) -> VerifiedWindowIdentity {
+        VerifiedWindowIdentity { id, app: String::new(), title: String::new() }
     }
 
     #[test]
     fn evict_oldest_if_full_removes_only_the_single_oldest_entry_at_capacity() {
-        let mut map: HashMap<(i32, String), (String, PreviewWindowIdentity, u64)> = HashMap::new();
+        let mut map: HashMap<(i32, String), (String, VerifiedWindowIdentity, u64)> = HashMap::new();
         for i in 0..MAX_PREVIEWS as i32 {
             map.insert((i, "d".to_string()), (format!("p{i}"), pid(i as u32), i as u64));
         }
@@ -6592,7 +6680,7 @@ mod tests {
 
     #[test]
     fn evict_oldest_if_full_is_a_no_op_below_capacity() {
-        let mut map: HashMap<(i32, String), (String, PreviewWindowIdentity, u64)> = HashMap::new();
+        let mut map: HashMap<(i32, String), (String, VerifiedWindowIdentity, u64)> = HashMap::new();
         map.insert((1, "d".to_string()), ("p".to_string(), pid(1), 100));
         evict_oldest_if_full(&mut map);
         assert_eq!(map.len(), 1, "must not evict anything below capacity");
@@ -6628,8 +6716,8 @@ mod tests {
     /// comparison left open.
     #[test]
     fn screenshot_preview_stores_and_matches_the_full_window_identity() {
-        let captured = PreviewWindowIdentity { id: 5, app: "Notes".into(), title: "todo".into() };
-        let id_reused = PreviewWindowIdentity { id: 5, app: "Mail".into(), title: "inbox".into() };
+        let captured = VerifiedWindowIdentity { id: 5, app: "Notes".into(), title: "todo".into() };
+        let id_reused = VerifiedWindowIdentity { id: 5, app: "Mail".into(), title: "inbox".into() };
         assert_ne!(
             captured, id_reused,
             "the SAME numeric id with a different app/title must NOT compare equal"
