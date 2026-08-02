@@ -390,15 +390,22 @@ impl ImSettings {
             .collect()
     }
 
+    /// Read only the active-provider discriminant. Mutation fences use this
+    /// single-query check instead of loading every provider setting so the
+    /// validation sits as close as possible to the protected write/enqueue.
+    pub async fn active_provider(db: &crate::store::Db) -> anyhow::Result<ImProvider> {
+        match crate::store::repo::get_setting(db, K_PROVIDER).await? {
+            Some(value) => ImProvider::parse(&value),
+            None => Ok(ImProvider::Feishu),
+        }
+    }
+
     /// 从 app_setting 读取设置。「键不存在」是默认值；DB 错误原样传播。
     /// Err 必须 fail-closed：桥侧把 Err 当连接错误处理，绝不当作未配置/空白名单
     /// （否则瞬时 DB 错误会清空白名单，导致首个私聊发送者被自动绑定）。
     pub async fn load(db: &crate::store::Db) -> anyhow::Result<Self> {
         use crate::store::repo::get_setting;
-        let provider = match get_setting(db, K_PROVIDER).await? {
-            Some(value) => ImProvider::parse(&value)?,
-            None => ImProvider::Feishu,
-        };
+        let provider = Self::active_provider(db).await?;
         let app_id = get_setting(db, provider.app_id_key())
             .await?
             .unwrap_or_default();
@@ -714,6 +721,7 @@ pub async fn execute_for_provider(
         inbound::Route::Bind {
             open_id,
             chat_id,
+            reply_to,
             text,
         } => {
             // Route 读的是 allow 快照；落库前重查仍为空（Route::Bind doc 的竞态契约）。
@@ -736,7 +744,7 @@ pub async fn execute_for_provider(
                         &open_id,
                         &chat_id,
                         &im_thread_ref,
-                        None,
+                        Some(&reply_to),
                         &text,
                         lang,
                         ctx,
@@ -1975,6 +1983,9 @@ pub async fn ensure_issue_topic(
     reply_to: Option<&str>,
     lang: &str,
 ) -> anyhow::Result<()> {
+    if ImSettings::active_provider(db).await? != ImProvider::Feishu {
+        anyhow::bail!("Feishu is not the active IM provider");
+    }
     let Some(thread) = crate::store::repo::get_thread(db, thread_id).await? else {
         if let Some(reply_to) = reply_to {
             if let Err(e) = ch
@@ -2038,6 +2049,12 @@ pub async fn ensure_issue_topic(
     let topic_id = ch
         .create_chat_topic(chat_id, &seed_message_id, &lead_intro)
         .await?;
+    // Topic creation is an external await. If the user switched providers while
+    // it was in flight, leave the previous route intact instead of binding this
+    // now-inactive Feishu result over the active provider.
+    if ImSettings::active_provider(db).await? != ImProvider::Feishu {
+        anyhow::bail!("active IM provider changed before Feishu topic binding");
+    }
     crate::store::repo::bind_im_route(db, thread.id, "feishu", chat_id, &topic_id).await?;
     // Persist a replyable seed message id (an `om_*` member of the topic) for the
     // no-ack / no-origin_tag fallback (Finding C).
@@ -3090,6 +3107,84 @@ mod tests {
         assert_eq!(route.chat_id, "oc_current");
         assert_eq!(route.im_thread_ref, "omt_created_topic");
         assert_eq!(ch.created_topics.lock().unwrap().len(), 1);
+    }
+
+    struct ProviderSwitchingTopicChannel {
+        db: crate::store::Db,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ProviderSwitchingTopicChannel {
+        async fn send_card(
+            &self,
+            _open_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            Ok("om_card".into())
+        }
+
+        async fn patch_card(
+            &self,
+            _message_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send_text(&self, _open_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn create_chat_topic(
+            &self,
+            _chat_id: &str,
+            _seed_message_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<String> {
+            crate::store::repo::set_setting(&self.db, K_PROVIDER, "dingtalk").await?;
+            Ok("omt_orphaned_after_switch".into())
+        }
+
+        async fn reply_text(&self, _reply_to: &str, _text: &str) -> anyhow::Result<String> {
+            Ok("om_reply".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_switch_during_topic_creation_preserves_the_active_route() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "dingtalk", "cid_live", "ding-live")
+            .await
+            .unwrap();
+        let ch = ProviderSwitchingTopicChannel { db: db.clone() };
+
+        let error = ensure_issue_topic(
+            &db,
+            &ch,
+            issue.id,
+            "oc_stale",
+            Some("om_request"),
+            "zh",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("active IM provider changed"));
+        let route = crate::store::repo::im_route_of_thread(&db, issue.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.channel, "dingtalk");
+        assert_eq!(route.chat_id, "cid_live");
+        assert_eq!(route.im_thread_ref, "ding-live");
     }
 
     #[tokio::test]

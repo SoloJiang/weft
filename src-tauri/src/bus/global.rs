@@ -218,7 +218,7 @@ pub async fn call_global(
             if chat_id.is_empty() {
                 return text_result("error: chat_id required".into());
             }
-            match ensure_issue_topic(db, tid, chat_id).await {
+            match ensure_issue_topic_from_im(db, tid, chat_id, args).await {
                 Ok(v) => json_result(v),
                 Err(e) => text_result(format!("error: {e}")),
             }
@@ -363,10 +363,7 @@ async fn message_lead_origin(
     thread_id: i32,
     args: &Value,
 ) -> anyhow::Result<Option<String>> {
-    let provider = im_provider(args);
-    if provider.is_empty() {
-        anyhow::bail!("message_lead requires the current IM provider context");
-    }
+    let provider = require_active_im_provider(db, args).await?.as_str();
     let reply_to = im_reply_to(args);
     let route = repo::im_route_of_thread(db, thread_id)
         .await?
@@ -393,11 +390,15 @@ async fn message_lead(db: &Db, thread_id: i32, text: &str, args: &Value) -> anyh
     // Resolve the delivery target before starting the engine. DingTalk issue
     // output cannot fall back to a stable topic message, so a no-origin turn
     // would run successfully while silently discarding its response.
-    let origin = message_lead_origin(db, thread_id, args).await?;
+    message_lead_origin(db, thread_id, args).await?;
     let app = crate::APP_HANDLE
         .get()
         .ok_or_else(|| anyhow::anyhow!("app handle not initialized"))?;
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, im_lang(args)).await?;
+    // Engine lookup can await process setup. Revalidate at the final enqueue
+    // boundary so a provider switch during that await cannot leak an old turn
+    // into the newly active bridge.
+    let origin = message_lead_origin(db, thread_id, args).await?;
     crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new(), origin).await
 }
 
@@ -405,6 +406,26 @@ fn im_provider(args: &Value) -> &str {
     args.pointer("/im_context/provider")
         .and_then(|v| v.as_str())
         .unwrap_or("")
+}
+
+async fn require_active_im_provider(
+    db: &Db,
+    args: &Value,
+) -> anyhow::Result<crate::im::ImProvider> {
+    let context_provider = im_provider(args);
+    if context_provider.is_empty() {
+        anyhow::bail!("current IM provider context is required");
+    }
+    let context_provider = crate::im::ImProvider::parse(context_provider)?;
+    let active_provider = crate::im::ImSettings::active_provider(db).await?;
+    if context_provider != active_provider {
+        anyhow::bail!(
+            "stale IM context: active provider is {}, not {}",
+            active_provider.as_str(),
+            context_provider.as_str()
+        );
+    }
+    Ok(active_provider)
 }
 
 fn im_lang(args: &Value) -> &str {
@@ -445,37 +466,54 @@ async fn create_issue_from_im(
     kind: &str,
     args: &Value,
 ) -> anyhow::Result<Value> {
+    let active_provider = require_active_im_provider(db, args).await?;
+    let provider = active_provider.as_str();
     let issue = create_issue(db, ws, title, kind).await?;
     let thread_id = issue["issue_id"].as_i64().unwrap_or_default() as i32;
-    let provider = im_provider(args);
     let can_create = im_can_create_topic_here(args);
+    let open_hint = if active_provider == crate::im::ImProvider::DingTalk {
+        format!("/bind {thread_id}")
+    } else {
+        "provider does not support issue topic in this conversation".to_string()
+    };
     let mut im = json!({
         "provider": provider,
         "topic_exists": false,
         "topic_created": false,
         "topic_ref": null,
-        "open_hint": "provider does not support issue topic in this conversation"
+        "open_hint": open_hint
     });
     if provider == "feishu" && can_create {
         if let Some(chat_id) = im_chat_id(args) {
-            match ensure_issue_topic(db, thread_id, chat_id).await {
-                Ok(v) => {
-                    im = json!({
-                        "provider": provider,
-                        "topic_exists": true,
-                        "topic_created": v.get("created").and_then(|x| x.as_bool()).unwrap_or(false),
-                        "topic_ref": v.get("topic_ref").cloned().unwrap_or(Value::Null),
-                        "chat_id": v.get("chat_id").cloned().unwrap_or(Value::Null),
-                        "open_hint": "已创建或复用飞书 topic，请进入该 topic 继续讨论"
-                    });
-                }
+            match require_active_im_provider(db, args).await {
+                Ok(_) => match ensure_issue_topic(db, thread_id, chat_id).await {
+                    Ok(v) => {
+                        im = json!({
+                            "provider": provider,
+                            "topic_exists": true,
+                            "topic_created": v.get("created").and_then(|x| x.as_bool()).unwrap_or(false),
+                            "topic_ref": v.get("topic_ref").cloned().unwrap_or(Value::Null),
+                            "chat_id": v.get("chat_id").cloned().unwrap_or(Value::Null),
+                            "open_hint": "已创建或复用飞书 topic，请进入该 topic 继续讨论"
+                        });
+                    }
+                    Err(e) => {
+                        im = json!({
+                            "provider": provider,
+                            "topic_exists": false,
+                            "topic_created": false,
+                            "topic_ref": null,
+                            "open_hint": format!("issue created, but IM topic was not created: {e}")
+                        });
+                    }
+                },
                 Err(e) => {
                     im = json!({
                         "provider": provider,
                         "topic_exists": false,
                         "topic_created": false,
                         "topic_ref": null,
-                        "open_hint": format!("issue created, but IM topic was not created: {e}")
+                        "open_hint": format!("issue created, but the IM provider changed before topic creation: {e}")
                     });
                 }
             }
@@ -484,10 +522,11 @@ async fn create_issue_from_im(
     Ok(json!({ "issue": issue, "im": im }))
 }
 async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow::Result<Value> {
+    let active_provider = require_active_im_provider(db, args).await?;
     let issue = repo::get_thread(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("issue {thread_id} not found"))?;
-    let provider = im_provider(args);
+    let provider = active_provider.as_str();
     let can_create = im_can_create_topic_here(args);
     let initial_message = args
         .get("initial_message")
@@ -521,6 +560,7 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
         });
     } else if provider == "feishu" && can_create {
         if let Some(chat_id) = im_chat_id(args) {
+            require_active_im_provider(db, args).await?;
             let v = ensure_issue_topic(db, thread_id, chat_id).await?;
             im = json!({
                 "provider": provider,
@@ -584,6 +624,9 @@ async fn ensure_issue_topic(db: &Db, thread_id: i32, chat_id: &str) -> anyhow::R
     let before = repo::im_route_of_thread(db, thread_id).await?;
     let created = before.as_ref().map(|route| route.channel.as_str()) != Some("feishu");
     let settings = crate::im::ImSettings::load(db).await?;
+    if settings.provider != crate::im::ImProvider::Feishu {
+        anyhow::bail!("Feishu is not the active IM provider");
+    }
     if !settings.ready() {
         anyhow::bail!("Feishu app credentials are not configured");
     }
@@ -598,6 +641,19 @@ async fn ensure_issue_topic(db: &Db, thread_id: i32, chat_id: &str) -> anyhow::R
         "topic_ref": after.im_thread_ref,
         "created": created,
     }))
+}
+
+async fn ensure_issue_topic_from_im(
+    db: &Db,
+    thread_id: i32,
+    chat_id: &str,
+    args: &Value,
+) -> anyhow::Result<Value> {
+    let provider = require_active_im_provider(db, args).await?;
+    if provider != crate::im::ImProvider::Feishu {
+        anyhow::bail!("the active IM provider cannot create a Feishu topic");
+    }
+    ensure_issue_topic(db, thread_id, chat_id).await
 }
 
 // ───────────────────── tool specs ─────────────────────
@@ -666,8 +722,8 @@ pub fn global_specs() -> Value {
             "name": "ensure_issue_topic",
             "description": "Ensure an existing issue has a Feishu topic in chat_id. Use only when the user semantically asks to create/open/continue an issue-specific Feishu topic; do not call for ordinary chat.",
             "inputSchema": { "type": "object",
-                "properties": { "issue_id": i(), "chat_id": s() },
-                "required": ["issue_id", "chat_id"] }
+                "properties": { "issue_id": i(), "chat_id": s(), "im_context": { "type": "object" } },
+                "required": ["issue_id", "chat_id", "im_context"] }
         },
         {
             "name": "create_issue",
@@ -883,27 +939,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_issue_from_im_without_thread_support_creates_issue_only() {
+    async fn create_issue_from_dingtalk_returns_bind_hint() {
         let db = mem_db().await;
         let asks = AskRegistry::new();
         let bus = BusRegistry::new();
         let ws = repo::create_workspace(&db, "alpha").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
         let args = json!({
             "workspace_id": ws.id,
             "title": "New task",
             "kind": "feature",
             "im_context": {
-                "provider": "none",
+                "provider": "dingtalk",
                 "conversation": { "chat_id": "c" },
                 "capabilities": { "issue_topic": { "supported": false } }
             }
         });
 
         let result = call_global(&db, &asks, &bus, "create_issue_from_im", &args).await;
-        let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("New task"));
-        assert!(text.contains("topic_created"));
-        assert!(text.contains("false"));
+        let parsed: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        let issue_id = parsed["issue"]["issue_id"].as_i64().unwrap();
+        assert_eq!(parsed["issue"]["title"], "New task");
+        assert_eq!(parsed["im"]["topic_created"], false);
+        assert_eq!(parsed["im"]["open_hint"], format!("/bind {issue_id}"));
     }
 
     #[tokio::test]
@@ -942,6 +1003,9 @@ mod tests {
         let issue = repo::create_thread(&db, ws.id, "Existing", "feature", "claude")
             .await
             .unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
         repo::bind_im_route(&db, issue.id, "feishu", "oc_old", "omt_old")
             .await
             .unwrap();
@@ -970,9 +1034,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_feishu_tool_call_cannot_replace_route_after_provider_switch() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let ws = repo::create_workspace(&db, "alpha").await.unwrap();
+        let issue = repo::create_thread(&db, ws.id, "Existing", "feature", "claude")
+            .await
+            .unwrap();
+        repo::bind_im_route(
+            &db,
+            issue.id,
+            "dingtalk",
+            "cid_current",
+            "ding-thread-current",
+        )
+        .await
+        .unwrap();
+        let stale_args = json!({
+            "issue_id": issue.id,
+            "im_context": {
+                "provider": "feishu",
+                "conversation": { "chat_id": "oc_stale" },
+                "capabilities": {
+                    "issue_topic": { "supported": true, "can_create_from_current_conversation": true }
+                }
+            }
+        });
+        // The turn captured Feishu above, then the user switched providers
+        // before its global-tool call reached this process.
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+
+        let result = call_global(&db, &asks, &bus, "ensure_issue_im_topic", &stale_args).await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("stale IM context"));
+        let route = repo::im_route_of_thread(&db, issue.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.channel, "dingtalk");
+        assert_eq!(route.im_thread_ref, "ding-thread-current");
+    }
+
+    #[tokio::test]
     async fn message_lead_origin_uses_the_current_dingtalk_reply_target() {
         let db = mem_db().await;
         let ws = repo::create_workspace(&db, "alpha").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
         let issue = repo::create_thread(&db, ws.id, "Existing", "feature", "claude")
             .await
             .unwrap();

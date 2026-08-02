@@ -236,6 +236,7 @@ async fn bind_route_appends_allowlist_without_legacy_confirmation() {
     let r = Route::Bind {
         open_id: "ou_me".into(),
         chat_id: "oc_dm".into(),
+        reply_to: "om_first".into(),
         text: "hello".into(),
     };
     im::execute(r, &db, &asks, &bus, &ch, "ou_me", "zh", None, None)
@@ -262,6 +263,7 @@ async fn bind_route_rechecks_allowlist_still_empty() {
     let r = Route::Bind {
         open_id: "ou_second".into(),
         chat_id: "oc_dm".into(),
+        reply_to: "om_second".into(),
         text: "hello".into(),
     };
     im::execute(r, &db, &asks, &bus, &ch, "ou_second", "zh", None, None)

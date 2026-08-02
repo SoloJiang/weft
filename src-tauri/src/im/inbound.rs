@@ -34,6 +34,7 @@ pub enum Route {
     Bind {
         open_id: String,
         chat_id: String,
+        reply_to: String,
         text: String,
     },
     /// 已绑定 owner 在 provider thread 里发送 `/bind <thread_id>`，把当前
@@ -315,6 +316,7 @@ pub fn route_for_provider(
                 return Route::Bind {
                     open_id: sender_open_id.clone(),
                     chat_id: chat_id.clone(),
+                    reply_to: message_id.clone(),
                     text: text.clone(),
                 };
             }
@@ -388,13 +390,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_allowlist_binds_first_p2p_sender() {
+    fn dingtalk_empty_allowlist_binds_first_dm_with_reply_target() {
         assert_eq!(
-            route(&text("ou_x", None, "hi"), &[], &cards()),
+            route_for_provider(
+                &text("staff_x", None, "继续 issue"),
+                &[],
+                &cards(),
+                ImProvider::DingTalk,
+            ),
             Route::Bind {
-                open_id: "ou_x".into(),
+                open_id: "staff_x".into(),
                 chat_id: "oc_dm".into(),
-                text: "hi".into(),
+                reply_to: "om_in".into(),
+                text: "继续 issue".into(),
             }
         );
     }
