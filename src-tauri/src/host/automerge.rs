@@ -30,8 +30,9 @@
 //!      an earlier row in the same sweep pass). Only a `Merge` verdict here
 //!      proceeds — step 1's verdict never directly authorizes anything.
 //!   6. [`run_gh_merge`] — `gh pr merge --squash --match-head-commit <sha>`,
-//!      off the async runtime (`spawn_blocking`). The ONE new `Command::new`
-//!      in this entire feature, using the head_sha from step 4's fresh read.
+//!      off the async runtime (`spawn_blocking`) through the bounded process
+//!      helper. The ONE new `Command::new` in this entire feature, using the
+//!      head_sha from step 4's fresh read.
 //!      `--match-head-commit` makes GitHub itself refuse the merge if the
 //!      head has moved AGAIN since step 4, closing the last sliver of gap
 //!      between "we just confirmed this" and "the API call executes".
@@ -86,7 +87,10 @@
 //! file does not rely on `gh`'s own idempotency for that guarantee).
 
 use std::collections::HashMap;
-use std::process::Command;
+use std::io::{Error, ErrorKind, Read};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -133,6 +137,12 @@ const MAX_READY_AGE_SECS: i64 = 600;
 /// a human clicking the Needs-you "Retry" button (`commands::
 /// retry_pr_tracking_core`).
 const MAX_MERGE_ATTEMPTS_PER_HEAD: u32 = 3;
+
+/// Hard deadline for the one mutating host command. This is intentionally a
+/// transport bound, not an agent wall-time/watchdog policy: a stuck `gh pr
+/// merge` must release Weft's lifecycle/admission locks, while agent turns keep
+/// their own independent budgets.
+const MERGE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Cloneable handle to the per-(row, head_sha) merge-FAILURE backoff table
 /// (step 3, this module's doc) — Tauri-managed state (`.manage(...)` in
@@ -752,11 +762,143 @@ fn lifecycle_state_tag(lifecycle: PrLifecycle) -> &'static str {
     }
 }
 
+/// Result of a bounded child invocation. Dedicated reader threads drain both
+/// pipes while the parent polls the child, so a verbose command cannot
+/// deadlock before the deadline.
+struct BoundedCommandOutput {
+    output: Output,
+    timed_out: bool,
+    #[cfg(test)]
+    pid: u32,
+}
+
+/// Drain one optional child pipe on a dedicated thread. The parent must keep
+/// draining while it polls `try_wait`; otherwise a verbose child could block
+/// on a full stdout/stderr pipe before its deadline is reached.
+fn spawn_pipe_reader<R>(pipe: Option<R>) -> thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            pipe.read_to_end(&mut bytes)?;
+        }
+        Ok(bytes)
+    })
+}
+
+fn join_pipe_reader(
+    reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> std::io::Result<Vec<u8>> {
+    match reader.join() {
+        Ok(result) => result,
+        Err(_) => Err(Error::new(ErrorKind::Other, "child output reader panicked")),
+    }
+}
+
+/// Run a child with a real process-level deadline. The timeout is enforced by
+/// polling the actual child, not by timing out the `spawn_blocking` future: the
+/// latter would only abandon the Rust waiter while leaving the `gh` child
+/// alive and the lifecycle guard held. On Unix the child is its own process
+/// group so helpers spawned by `gh` die with it; Windows always kills and waits
+/// for the direct child. In every case this function waits/reaps that child
+/// before it returns.
+fn run_bounded_command(
+    mut command: Command,
+    timeout: Duration,
+) -> std::io::Result<BoundedCommandOutput> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // Safety: `setpgid` runs in the child between fork and exec, before
+        // it can share any application state with another thread.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn()?;
+    let pid = child.id();
+    let mut child = child;
+    let stdout_reader = spawn_pipe_reader(child.stdout.take());
+    let stderr_reader = spawn_pipe_reader(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    let (status, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status, false),
+            Ok(None) if Instant::now() >= deadline => {
+                // On Unix this first kills the complete process group. The
+                // direct-child kill below is still required on Windows and is
+                // harmless if the group kill already removed the child.
+                kill_bounded_process(pid);
+                let _ = child.kill();
+                let status = child.wait()?;
+                break (status, true);
+            }
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(error) => {
+                // Do not leak a child if polling itself fails. Best-effort
+                // termination is followed by a wait/reap before returning the
+                // original polling error.
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_pipe_reader(stdout_reader);
+                let _ = join_pipe_reader(stderr_reader);
+                return Err(error);
+            }
+        }
+    };
+    let stdout = join_pipe_reader(stdout_reader)?;
+    let stderr = join_pipe_reader(stderr_reader)?;
+    Ok(BoundedCommandOutput {
+        output: Output {
+            status,
+            stdout,
+            stderr,
+        },
+        timed_out,
+        #[cfg(test)]
+        pid,
+    })
+}
+
+#[cfg(unix)]
+fn kill_bounded_process(pid: u32) {
+    // Negative PID targets the process group created by `setpgid` above.
+    unsafe {
+        let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+        // Keep a direct-child fallback in case a platform rejected setpgid.
+        let _ = libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_bounded_process(_pid: u32) {
+    // Windows has no process-group signal equivalent exposed by std. The
+    // caller's direct `Child::kill` + `Child::wait` is the bounded guarantee;
+    // deliberately avoid an unbounded `taskkill` subprocess in the deadline
+    // path.
+}
+
 /// The ONE mutating call in this entire feature — `gh pr merge`. Nothing in
 /// `host::monitor` / `host::github` / `host::judge` / `host::gate` ever calls
 /// this, and this file only calls it (via `spawn_blocking` — review round 1
-/// Codex P2: a synchronous `Command::output()` call directly on the async
-/// runtime would occupy a Tokio worker for the whole `gh` round trip) from
+/// Codex P2: synchronous child I/O directly on the async runtime would occupy
+/// a Tokio worker for the whole `gh` round trip) from
 /// `maybe_merge_one`, gated by TWO `gate::decide_auto_merge` calls (both in
 /// `evaluate_row`), the second against data read immediately before this
 /// call.
@@ -777,6 +919,17 @@ fn lifecycle_state_tag(lifecycle: PrLifecycle) -> &'static str {
 /// (review round 1 Codex P1; Codex review, PR #159 repo.rs:3873 — the status-fetch path used
 /// to skip this entirely).
 fn run_gh_merge(host_base: &str, owner: &str, repo: &str, number: i32, head_sha: &str) -> Result<(), String> {
+    run_gh_merge_with_timeout(host_base, owner, repo, number, head_sha, MERGE_COMMAND_TIMEOUT)
+}
+
+fn run_gh_merge_with_timeout(
+    host_base: &str,
+    owner: &str,
+    repo: &str,
+    number: i32,
+    head_sha: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let repo_arg = super::qualified_repo_slug(host_base, owner, repo)?;
     // A `Ready` verdict can only ever be produced from a SUCCESSFUL snapshot
     // (which always sets a real `head_sha`), so this should be unreachable
@@ -785,22 +938,28 @@ fn run_gh_merge(host_base: &str, owner: &str, repo: &str, number: i32, head_sha:
     if head_sha.is_empty() {
         return Err("refusing to merge: no confirmed head_sha on record".to_string());
     }
-    let out = Command::new("gh")
+    let mut command = Command::new("gh");
+    command
         .args(build_merge_args(&repo_arg, number, head_sha))
         // Checks run user tooling that a GUI launch's minimal PATH can't
         // resolve (Homebrew/local installs of `gh`) — same reasoning as
         // `github::GitHubHost::fetch_status` / `check::run_check`.
-        .env("PATH", crate::detect::tool_path())
-        .output();
-    let out = match out {
-        Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        .env("PATH", crate::detect::tool_path());
+    let bounded = match run_bounded_command(command, timeout) {
+        Ok(result) => result,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err("gh is not installed".to_string())
         }
-        Err(e) => return Err(e.to_string()),
+        Err(error) => return Err(error.to_string()),
     };
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    if bounded.timed_out {
+        return Err(format!(
+            "gh pr merge timed out after {}s",
+            timeout.as_secs()
+        ));
+    }
+    if !bounded.output.status.success() {
+        let stderr = String::from_utf8_lossy(&bounded.output.stderr);
         return Err(stderr.trim().to_string());
     }
     Ok(())
@@ -1004,6 +1163,62 @@ mod tests {
             Err(message) => assert!(message.contains("head_sha"), "got: {message}"),
             Ok(()) => panic!("expected the empty-head_sha guard to fire"),
         }
+    }
+
+    fn hanging_command() -> Command {
+        #[cfg(unix)]
+        {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            command
+        }
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("ping");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        // `kill(pid, 0)` is a read-only existence check. `EPERM` still means
+        // the process exists but is not signalable by this test user.
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[test]
+    fn bounded_command_kills_and_reaps_a_hanging_child() {
+        let started = Instant::now();
+        let result = run_bounded_command(hanging_command(), Duration::from_millis(100))
+            .expect("the bounded helper should return the killed child's status");
+        assert!(result.timed_out, "the deadline must be reported to the caller");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a bounded command must not wait for the fixture's full sleep"
+        );
+        assert!(!result.output.status.success());
+        #[cfg(unix)]
+        assert!(!process_is_alive(result.pid), "the timed-out child must be reaped and gone");
+    }
+
+    #[test]
+    fn bounded_command_drains_and_preserves_normal_output() {
+        #[cfg(unix)]
+        let mut command = Command::new("sh");
+        #[cfg(windows)]
+        let mut command = Command::new("cmd");
+        #[cfg(unix)]
+        command.args(["-c", "printf bounded-ok; printf bounded-err >&2"]);
+        #[cfg(windows)]
+        command.args(["/C", "echo bounded-ok & echo bounded-err 1>&2"]);
+        let result = run_bounded_command(command, Duration::from_secs(1))
+            .expect("the normal command should complete");
+        assert!(!result.timed_out);
+        assert!(result.output.status.success());
+        assert_eq!(String::from_utf8_lossy(&result.output.stdout).trim(), "bounded-ok");
+        assert_eq!(String::from_utf8_lossy(&result.output.stderr).trim(), "bounded-err");
     }
 
     // --- build_merge_args: the head-consistency enforcement must actually
@@ -1577,6 +1792,189 @@ mod tests {
 
         assert!(evaluate.await.unwrap().is_none());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A real timed-out merge must release the thread lifecycle fence before
+    /// returning. Exercise the production lock order around that call at the
+    /// same time: delete takes global write -> lifecycle, while a visible send
+    /// takes surface -> global read. Keep delete held after it reaches the
+    /// lifecycle and verify that send only completes once the global writer
+    /// releases, then reacquire every guard to prove no lock leaked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn timed_out_merge_releases_lifecycle_and_admission_guards() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("automerge-timeout-locks.sqlite");
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        let pr = seam_fixture(&db).await;
+        let thread_id = pr.thread_id;
+
+        // Keep this surface key unique across the parallel crate test suite;
+        // the lock choreography itself still uses the exact production gate.
+        static NEXT_TEST_ADMISSION_KEY: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(-10_000);
+        let admission_key = NEXT_TEST_ADMISSION_KEY.fetch_sub(
+            1,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let bus = std::sync::Arc::new(crate::bus::BusRegistry::new());
+        let engine_state = std::sync::Arc::new(crate::lead_chat::engine::LeadChatState::default());
+        let backoff = MergeBackoffState::default();
+
+        let (runner_started_tx, runner_started_rx) = tokio::sync::oneshot::channel();
+        let runner_started = std::sync::Arc::new(std::sync::Mutex::new(Some(runner_started_tx)));
+        let runner_started_for_call = runner_started.clone();
+        let runner: MergeRunner = std::sync::Arc::new(move |_, _, _, _, _| {
+            let signal = runner_started_for_call
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(signal) = signal {
+                let _ = signal.send(());
+            }
+            let bounded = run_bounded_command(hanging_command(), Duration::from_millis(500))
+                .map_err(|error| error.to_string())?;
+            if bounded.timed_out {
+                return Err("gh pr merge timed out after 500ms".to_string());
+            }
+            if bounded.output.status.success() {
+                Ok(())
+            } else {
+                Err("bounded merge fixture exited unsuccessfully".to_string())
+            }
+        });
+
+        let evaluate_db = db.clone();
+        let evaluate_bus = bus.clone();
+        let evaluate_backoff = backoff.clone();
+        let evaluate_runner = runner.clone();
+        let evaluate_pr = pr.clone();
+        let evaluate = tokio::spawn(async move {
+            evaluate_and_execute_merge(
+                &evaluate_db,
+                &evaluate_bus,
+                evaluate_pr,
+                &evaluate_backoff,
+                resolver_fresh_fully_ready,
+                HostKind::GitHub,
+                &evaluate_runner,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), runner_started_rx)
+            .await
+            .expect("the merge runner should start while holding lifecycle")
+            .expect("the runner-start signal should remain connected");
+
+        let surface_hold = crate::lead_chat::engine::admission_gate_for_key(admission_key)
+            .lock_owned()
+            .await;
+
+        let (send_done_tx, mut send_done_rx) = tokio::sync::oneshot::channel();
+        let send_state = engine_state.clone();
+        let send_task = tokio::spawn(async move {
+            let _surface = crate::lead_chat::engine::admission_gate_for_key(admission_key)
+                .lock_owned()
+                .await;
+            let _read = send_state.engine_admission_read().await;
+            let _ = send_done_tx.send(());
+        });
+
+        let (delete_write_tx, mut delete_write_rx) = tokio::sync::oneshot::channel();
+        let (delete_lifecycle_tx, mut delete_lifecycle_rx) = tokio::sync::oneshot::channel();
+        let (delete_release_tx, delete_release_rx) = tokio::sync::oneshot::channel();
+        let delete_db = db.clone();
+        let delete_state = engine_state.clone();
+        let delete_bus = bus.clone();
+        let delete_task = tokio::spawn(async move {
+            repo::mark_thread_deleting(&delete_db, thread_id)
+                .await
+                .unwrap();
+            let _write = delete_state.engine_admission_write().await;
+            let _ = delete_write_tx.send(());
+            let _lifecycle = delete_bus.thread_lifecycle_gate(thread_id).lock_owned().await;
+            let _ = delete_lifecycle_tx.send(());
+            let _ = delete_release_rx.await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), &mut delete_write_rx)
+            .await
+            .expect("delete should acquire global write before lifecycle")
+            .expect("delete write signal should remain connected");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut delete_lifecycle_rx)
+                .await
+                .is_err(),
+            "delete must wait on the merge lifecycle gate"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send_done_rx)
+                .await
+                .is_err(),
+            "send must wait on the held surface gate"
+        );
+
+        let execution = tokio::time::timeout(Duration::from_secs(2), evaluate)
+            .await
+            .expect("the real bounded merge runner must finish before its fixture sleeps")
+            .expect("the evaluation task should not panic")
+            .expect("the ready row should produce a merge execution");
+        let merge_error = execution
+            .merge_result
+            .expect_err("the hanging fixture must report a timeout failure");
+        assert!(merge_error.contains("timed out"), "got: {merge_error}");
+
+        tokio::time::timeout(Duration::from_secs(1), &mut delete_lifecycle_rx)
+            .await
+            .expect("the lifecycle guard must release after the timeout")
+            .expect("delete lifecycle signal should remain connected");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send_done_rx)
+                .await
+                .is_err(),
+            "send should still wait while delete owns global write"
+        );
+
+        drop(surface_hold);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send_done_rx)
+                .await
+                .is_err(),
+            "send must wait on delete's global write even after surface release"
+        );
+
+        delete_release_tx
+            .send(())
+            .expect("delete should still be holding its write/lifecycle guards");
+        tokio::time::timeout(Duration::from_secs(1), &mut send_done_rx)
+            .await
+            .expect("send should acquire surface and global read after delete")
+            .expect("send completion signal should remain connected");
+        delete_task.await.unwrap();
+        send_task.await.unwrap();
+
+        let _surface = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::lead_chat::engine::admission_gate_for_key(admission_key).lock_owned(),
+        )
+        .await
+        .expect("surface admission must be released");
+        let read = tokio::time::timeout(Duration::from_secs(1), engine_state.engine_admission_read())
+            .await
+            .expect("global read admission must be released");
+        drop(read);
+        let write = tokio::time::timeout(Duration::from_secs(1), engine_state.engine_admission_write())
+            .await
+            .expect("global write admission must be released");
+        drop(write);
+        let _lifecycle = tokio::time::timeout(
+            Duration::from_secs(1),
+            bus.thread_lifecycle_gate(thread_id).lock_owned(),
+        )
+        .await
+        .expect("lifecycle admission must be released");
     }
 
     /// THE FIX (Codex review, PR #159 automerge.rs:395): between `evaluate_row`'s upstream
