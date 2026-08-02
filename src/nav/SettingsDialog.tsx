@@ -957,14 +957,85 @@ const FEISHU_SCOPES = [
 
 type ImProviderId = "feishu" | "dingtalk";
 type ImConnectionPhase = "offline" | "connecting" | "online" | "error";
+type ImCredentialMode = "scan" | "manual";
+type ImManualSetup = "feishu-permissions" | "dingtalk-steps";
 
-const IM_PROVIDER_OPTIONS: ReadonlyArray<{
-  id: ImProviderId;
-  labelKey: "settings.imProviderFeishu" | "settings.imProviderDingtalk";
-}> = [
-  { id: "feishu", labelKey: "settings.imProviderFeishu" },
-  { id: "dingtalk", labelKey: "settings.imProviderDingtalk" },
-];
+type ImProviderView = {
+  kind: ImProviderId;
+  defaultMode: ImCredentialMode;
+  labelKey: string;
+  manualHintKey: string;
+  platformLabelKey: string;
+  platformUrl: string;
+  appIdLabelKey: string;
+  appIdHintKey: string;
+  appIdPlaceholderKey: string;
+  secretLabelKey: string;
+  secretHintKey: string;
+  manualSetup: ImManualSetup;
+  routesHintKey: string;
+};
+
+const IM_PROVIDER_VIEWS = {
+  feishu: {
+    kind: "feishu",
+    defaultMode: "scan",
+    labelKey: "settings.imProviderFeishu",
+    manualHintKey: "settings.imManualModeHint",
+    platformLabelKey: "settings.imOpenPlatform",
+    platformUrl: "https://open.feishu.cn/app",
+    appIdLabelKey: "settings.imAppId",
+    appIdHintKey: "settings.imAppIdHint",
+    appIdPlaceholderKey: "settings.imAppIdPlaceholder",
+    secretLabelKey: "settings.imAppSecret",
+    secretHintKey: "settings.imAppSecretHint",
+    manualSetup: "feishu-permissions",
+    routesHintKey: "settings.imRoutesHint",
+  },
+  dingtalk: {
+    kind: "dingtalk",
+    defaultMode: "manual",
+    labelKey: "settings.imProviderDingtalk",
+    manualHintKey: "settings.imDingTalkManualModeHint",
+    platformLabelKey: "settings.imDingTalkOpenPlatform",
+    platformUrl: "https://open-dev.dingtalk.com/",
+    appIdLabelKey: "settings.imDingTalkClientId",
+    appIdHintKey: "settings.imDingTalkClientIdHint",
+    appIdPlaceholderKey: "settings.imDingTalkClientIdPlaceholder",
+    secretLabelKey: "settings.imDingTalkClientSecret",
+    secretHintKey: "settings.imDingTalkClientSecretHint",
+    manualSetup: "dingtalk-steps",
+    routesHintKey: "settings.imRoutesHintDingtalk",
+  },
+} as const satisfies Record<ImProviderId, ImProviderView>;
+
+const IM_PROVIDER_OPTIONS = Object.values(IM_PROVIDER_VIEWS);
+
+type ImProviderUiState = ImProviderView & {
+  panel: ImCredentialMode;
+  showModeSelector: boolean;
+  showScanDialog: boolean;
+};
+
+function assertNeverImProvider(value: never): never {
+  throw new Error(`Unhandled IM provider: ${String(value)}`);
+}
+
+function imProviderUiState(
+  provider: ImProviderId,
+  mode: ImCredentialMode,
+): ImProviderUiState {
+  const view = IM_PROVIDER_VIEWS[provider];
+  const kind = view.kind;
+  switch (kind) {
+    case "feishu":
+      return { ...view, panel: mode, showModeSelector: true, showScanDialog: true };
+    case "dingtalk":
+      return { ...view, panel: "manual", showModeSelector: false, showScanDialog: false };
+    default:
+      return assertNeverImProvider(kind);
+  }
+}
 
 const IM_STATUS_STYLE: Record<ImConnectionPhase, { dot: string; tone: string }> = {
   offline: { dot: "bg-ink-faint", tone: "border-border bg-bg text-ink-faint" },
@@ -994,7 +1065,7 @@ function ImSettings() {
   const [copied, setCopied] = useState(false);
   const [scanOpen, setScanOpen] = useState(false);
   // 两种接入模式:扫码创建新 PersonalAgent,或手填凭证绑定已有应用/机器人。
-  const [mode, setMode] = useState<"scan" | "manual">("scan");
+  const [mode, setMode] = useState<ImCredentialMode>("scan");
   // The toggles default to `false`. Without this flag we'd render the
   // off-state for one tick before `api.imGetSettings()` resolves, producing
   // a visible "off → on" flash for users whose IM was already enabled.
@@ -1016,7 +1087,7 @@ function ImSettings() {
     setHasSecret(s.has_secret);
     setBound(s.bound);
     setEnabled(s.enabled);
-    setMode(s.provider === "feishu" ? "scan" : "manual");
+    setMode(IM_PROVIDER_VIEWS[s.provider].defaultMode);
     setLoaded(true);
   }
 
@@ -1110,44 +1181,8 @@ function ImSettings() {
     reconnectLabel = t("settings.imReconnect");
   }
 
-  const providerView = {
-    feishu: {
-      label: t("settings.imProviderFeishu"),
-      manualHint: t("settings.imManualModeHint"),
-      platformLabel: t("settings.imOpenPlatform"),
-      platformUrl: "https://open.feishu.cn/app",
-      appIdLabel: t("settings.imAppId"),
-      appIdHint: t("settings.imAppIdHint"),
-      appIdPlaceholder: t("settings.imAppIdPlaceholder"),
-      secretLabel: t("settings.imAppSecret"),
-      secretHint: t("settings.imAppSecretHint"),
-    },
-    dingtalk: {
-      label: t("settings.imProviderDingtalk"),
-      manualHint: t("settings.imDingTalkManualModeHint"),
-      platformLabel: t("settings.imDingTalkOpenPlatform"),
-      platformUrl: "https://open-dev.dingtalk.com/",
-      appIdLabel: t("settings.imDingTalkClientId"),
-      appIdHint: t("settings.imDingTalkClientIdHint"),
-      appIdPlaceholder: t("settings.imDingTalkClientIdPlaceholder"),
-      secretLabel: t("settings.imDingTalkClientSecret"),
-      secretHint: t("settings.imDingTalkClientSecretHint"),
-    },
-  } satisfies Record<
-    ImProviderId,
-    {
-      label: string;
-      manualHint: string;
-      platformLabel: string;
-      platformUrl: string;
-      appIdLabel: string;
-      appIdHint: string;
-      appIdPlaceholder: string;
-      secretLabel: string;
-      secretHint: string;
-    }
-  >;
-  const activeProviderView = providerView[provider];
+  const providerState = imProviderUiState(provider, mode);
+  const providerLabel = t(providerState.labelKey);
 
   return (
     <div className="flex flex-col gap-10">
@@ -1159,7 +1194,7 @@ function ImSettings() {
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <span className="text-[13px] font-semibold text-ink">{t("settings.imProvider")}</span>
-              <span className="text-[11.5px] text-ink-faint">{activeProviderView.label}</span>
+              <span className="text-[11.5px] text-ink-faint">{providerLabel}</span>
               {enabled && (
                 <span
                   className={cn(
@@ -1178,7 +1213,7 @@ function ImSettings() {
             <Toggle
               on={enabled}
               onChange={(v) => void toggle(v)}
-              label={activeProviderView.label}
+              label={providerLabel}
             />
           ) : (
             <div
@@ -1192,13 +1227,13 @@ function ImSettings() {
           <div className="flex gap-1 rounded-[var(--radius-md)] bg-bg p-1">
             {IM_PROVIDER_OPTIONS.map((option) => (
               <button
-                key={option.id}
+                key={option.kind}
                 type="button"
                 disabled={!loaded || saving}
-                onClick={() => void selectProvider(option.id)}
+                onClick={() => void selectProvider(option.kind)}
                 className={cn(
                   "flex flex-1 items-center justify-center rounded-[var(--radius-sm)] px-3 py-1.5 text-[12px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-                  provider === option.id
+                  provider === option.kind
                     ? "bg-surface text-ink shadow-sm"
                     : "text-ink-faint hover:text-ink-muted",
                 )}
@@ -1214,7 +1249,7 @@ function ImSettings() {
 
         {enabled && (
           <div className="flex flex-col gap-4 border-t border-border px-4 py-4">
-            {provider === "feishu" && (
+            {providerState.showModeSelector && (
               <div className="flex gap-1 rounded-[var(--radius-md)] bg-bg p-1">
                 {(["scan", "manual"] as const).map((m) => (
                   <button
@@ -1235,7 +1270,7 @@ function ImSettings() {
               </div>
             )}
 
-            {provider === "feishu" && mode === "scan" ? (
+            {providerState.panel === "scan" ? (
               <div className="flex flex-col gap-3">
                 <p className="text-[12px] leading-relaxed text-ink-faint">
                   {t("settings.imScanModeHint")}
@@ -1249,26 +1284,32 @@ function ImSettings() {
               <div className="flex flex-col gap-4">
                 <div className="flex items-start justify-between gap-3">
                   <p className="text-[12px] leading-relaxed text-ink-faint">
-                    {activeProviderView.manualHint}
+                    {t(providerState.manualHintKey)}
                   </p>
                   <button
                     type="button"
-                    onClick={() => void api.openUrl(activeProviderView.platformUrl)}
+                    onClick={() => void api.openUrl(providerState.platformUrl)}
                     className="inline-flex shrink-0 items-center gap-1 text-[12px] font-medium text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
                   >
-                    {activeProviderView.platformLabel}
+                    {t(providerState.platformLabelKey)}
                     <ExternalLink size={12} />
                   </button>
                 </div>
-                <ImField label={activeProviderView.appIdLabel} hint={activeProviderView.appIdHint}>
+                <ImField
+                  label={t(providerState.appIdLabelKey)}
+                  hint={t(providerState.appIdHintKey)}
+                >
                   <Input
                     value={appId}
-                    placeholder={activeProviderView.appIdPlaceholder}
+                    placeholder={t(providerState.appIdPlaceholderKey)}
                     onChange={(e) => setAppId(e.currentTarget.value)}
                     className="h-8 w-full bg-bg/80 font-mono text-[12px]"
                   />
                 </ImField>
-                <ImField label={activeProviderView.secretLabel} hint={activeProviderView.secretHint}>
+                <ImField
+                  label={t(providerState.secretLabelKey)}
+                  hint={t(providerState.secretHintKey)}
+                >
                   <Input
                     type="password"
                     value={secret}
@@ -1277,7 +1318,7 @@ function ImSettings() {
                     className="h-8 w-full bg-bg/80 font-mono text-[12px]"
                   />
                 </ImField>
-                {provider === "feishu" ? (
+                {providerState.manualSetup === "feishu-permissions" ? (
                   <ImField label={t("settings.imPermsLabel")} hint={t("settings.imPermsHint")}>
                     <div className="flex items-start gap-2">
                       <code className="flex-1 whitespace-pre rounded-[var(--radius-md)] border border-border bg-bg/80 px-2.5 py-2 font-mono text-[11.5px] leading-relaxed text-ink-muted">
@@ -1317,7 +1358,7 @@ function ImSettings() {
                 </div>
               </div>
             )}
-            {provider === "feishu" && (
+            {providerState.showScanDialog && (
               <FeishuScanDialog
                 open={scanOpen}
                 onOpenChange={setScanOpen}
@@ -1330,7 +1371,7 @@ function ImSettings() {
           </div>
         )}
       </div>
-      <ImRoutes provider={provider} />
+      <ImRoutes provider={provider} hint={t(providerState.routesHintKey)} />
     </div>
   );
 }
@@ -1461,7 +1502,7 @@ function FeishuScanDialog({
 }
 
 /** 已绑定的 issue ↔ provider conversation 映射；Settings 提供查看与解绑。 */
-function ImRoutes({ provider }: { provider: ImProviderId }) {
+function ImRoutes({ provider, hint }: { provider: ImProviderId; hint: string }) {
   const { t } = useTranslation();
   const [rows, setRows] = useState<import("../lib/types").ImRoute[]>([]);
   const [loading, setLoading] = useState(false);
@@ -1522,9 +1563,7 @@ function ImRoutes({ provider }: { provider: ImProviderId }) {
             {t("settings.imRoutesLabel")}
           </div>
           <p className="mt-1 max-w-[58ch] text-[12px] leading-relaxed text-ink-faint">
-            {provider === "feishu"
-              ? t("settings.imRoutesHint")
-              : t("settings.imRoutesHintDingtalk")}
+            {hint}
           </p>
         </div>
         <div className="flex flex-col gap-1.5">{content}</div>

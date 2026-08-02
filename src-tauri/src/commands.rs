@@ -2594,8 +2594,7 @@ pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
     })
 }
 
-async fn apply_im_credentials(
-    app: &tauri::AppHandle,
+async fn persist_im_credentials(
     db: &Db,
     provider: crate::im::ImProvider,
     app_id: &str,
@@ -2603,7 +2602,6 @@ async fn apply_im_credentials(
     enable: bool,
     owner_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    repo::set_setting(db, crate::im::K_PROVIDER, provider.as_str()).await?;
     repo::set_setting(db, provider.app_id_key(), app_id.trim()).await?;
     if !app_secret.is_empty() {
         repo::set_setting(db, provider.app_secret_key(), app_secret.trim()).await?;
@@ -2617,32 +2615,41 @@ async fn apply_im_credentials(
     if enable {
         repo::set_setting(db, provider.enabled_key(), "1").await?;
     }
+    Ok(())
+}
+
+async fn apply_im_credentials(
+    app: &tauri::AppHandle,
+    db: &Db,
+    provider: crate::im::ImProvider,
+    app_id: &str,
+    app_secret: &str,
+    enable: bool,
+    owner_id: Option<&str>,
+) -> anyhow::Result<()> {
+    repo::set_setting(db, crate::im::K_PROVIDER, provider.as_str()).await?;
+    persist_im_credentials(db, provider, app_id, app_secret, enable, owner_id).await?;
     crate::im::spawn(app.clone());
     Ok(())
 }
 
-/// 写飞书凭证并重启桥。secret 空 = 保持原值(不覆盖已存密钥)。`enable=true` 时同时置
-/// `im.feishu.enabled`(扫码接入即启用);手填保存走 `enable=false`,enabled 仍由开关 /
-/// 默认决定。`owner_open_id=Some` 时把该 open_id 设为白名单——扫码创建的新机器人用它
-/// 让授权者立即可对话,并覆盖旧应用遗留的白名单(那些 open_id 属于旧 app、对新 bot 无效,
-/// 留着反而会让新 owner 被 `inbound::route` 忽略);手填路径传 `None`,不动既有白名单。
-/// 扫码注册成功路径与本函数共用,保证「落库 + 重连」单一实现。
-async fn apply_feishu_credentials(
-    app: &tauri::AppHandle,
+/// Persist a completed Feishu scan without selecting Feishu. A callback can
+/// finish after the user has switched to DingTalk; keeping `K_PROVIDER`
+/// untouched makes that newer choice authoritative while retaining the scanned
+/// credentials for a later switch back.
+async fn persist_feishu_scan_credentials(
     db: &Db,
     app_id: &str,
     app_secret: &str,
-    enable: bool,
-    owner_open_id: Option<&str>,
+    owner_open_id: &str,
 ) -> anyhow::Result<()> {
-    apply_im_credentials(
-        app,
+    persist_im_credentials(
         db,
         crate::im::ImProvider::Feishu,
         app_id,
         app_secret,
-        enable,
-        owner_open_id,
+        true,
+        Some(owner_open_id),
     )
     .await
 }
@@ -2784,8 +2791,13 @@ pub async fn feishu_scan_begin(
         let app = app_cb.clone();
         Box::pin(async move {
             let db = app.state::<Db>().inner().clone();
-            apply_feishu_credentials(&app, &db, &client_id, &client_secret, true, Some(&open_id))
-                .await
+            persist_feishu_scan_credentials(&db, &client_id, &client_secret, &open_id).await?;
+            let selected = repo::get_setting(&db, crate::im::K_PROVIDER).await?;
+            let selected = crate::im::ImProvider::parse(selected.as_deref().unwrap_or_default())?;
+            if selected == crate::im::ImProvider::Feishu {
+                crate::im::spawn(app);
+            }
+            Ok(())
         }) as futures::future::BoxFuture<'static, anyhow::Result<()>>
     });
     let transport = std::sync::Arc::new(ReqwestTransport::default());
@@ -2946,6 +2958,47 @@ pub async fn db_change_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn late_feishu_scan_credentials_keep_newer_dingtalk_selection() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+
+        persist_feishu_scan_credentials(&db, "cli_feishu", "sec_feishu", "ou_owner")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_PROVIDER)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("dingtalk")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_APP_ID)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cli_feishu")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_ALLOW)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ou_owner")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_ENABLED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
 
     fn sh(dir: &std::path::Path, args: &[&str]) {
         let status = std::process::Command::new(args[0])

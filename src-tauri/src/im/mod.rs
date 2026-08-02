@@ -1061,6 +1061,11 @@ pub struct ImBridge {
 #[derive(Default)]
 struct BridgeInner {
     generation: u64,
+    /// Per-generation cancellation edge for the long-lived websocket future.
+    /// Replacing this sender in `bump` wakes the previous generation even when
+    /// it is blocked inside `run_ws`, so the stale socket is dropped before it
+    /// can ACK a callback that its retired inbound consumer would discard.
+    ws_cancel: Option<tokio::sync::watch::Sender<bool>>,
     /// "disabled" | "connecting" | "online" | "error: …"
     status: String,
     cards: Arc<tokio::sync::Mutex<CardIndex>>,
@@ -1109,12 +1114,22 @@ impl ImBridge {
         u64,
         Arc<tokio::sync::Mutex<CardIndex>>,
         Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
+        tokio::sync::watch::Receiver<bool>,
     ) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        if let Some(previous) = g.ws_cancel.replace(cancel_tx) {
+            let _ = previous.send(true);
+        }
         g.generation += 1;
         g.cards = Arc::new(tokio::sync::Mutex::new(CardIndex::default()));
         g.pending_acks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        (g.generation, g.cards.clone(), g.pending_acks.clone())
+        (
+            g.generation,
+            g.cards.clone(),
+            g.pending_acks.clone(),
+            cancel_rx,
+        )
     }
     fn live(&self, generation: u64) -> bool {
         self.inner
@@ -1137,13 +1152,33 @@ async fn recv_for_live_generation<T: Clone>(
     Ok(bridge.live(generation).then_some(item))
 }
 
+/// Race a generation-scoped operation against `ImBridge::bump`. Dropping the
+/// losing websocket future closes its transport; the biased cancellation branch
+/// wins when a socket frame and a restart become ready in the same poll.
+async fn run_until_bridge_cancelled<F>(
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+    operation: F,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    if *cancel.borrow() {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        _ = cancel.changed() => None,
+        output = operation => Some(output),
+    }
+}
+
 /// 启动（或重启）桥：读设置→不 ready 则置 disabled；ready 则装通知器、起出站
 /// 消费与 ws 入站两个任务。设置变更后再次调用即可（代际号淘汰旧任务）。
 /// 通知器在「不 ready 提前返回」前不安装——避免 disabled 时仍堆积事件。
 pub fn spawn(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         let bridge = app.state::<ImBridge>();
-        let (generation, cards, acks) = bridge.bump();
+        let (generation, cards, acks, mut ws_cancel) = bridge.bump();
         let db = app.state::<crate::store::Db>().inner().clone();
 
         let settings = match ImSettings::load(&db).await {
@@ -1518,24 +1553,32 @@ pub fn spawn(app: tauri::AppHandle) {
                                 opened = true;
                                 bridge.set_status("online"); // 连接建立细节在 run_ws 内
                                 eprintln!("[weft][im] ws loop entering run_ws");
-                                let result = match provider {
-                                    ImProvider::Feishu => {
-                                        feishu::ws::run_ws(
-                                            app_id.clone(),
-                                            app_secret.clone(),
-                                            in_tx.clone(),
-                                        )
-                                        .await
-                                    }
-                                    ImProvider::DingTalk => match dingtalk_channel.as_ref() {
-                                        Some(channel) => {
-                                            dingtalk::ws::run_ws(channel.clone(), in_tx.clone())
-                                                .await
+                                let operation = async {
+                                    match provider {
+                                        ImProvider::Feishu => {
+                                            feishu::ws::run_ws(
+                                                app_id.clone(),
+                                                app_secret.clone(),
+                                                in_tx.clone(),
+                                            )
+                                            .await
                                         }
-                                        None => Err(anyhow::anyhow!(
-                                            "dingtalk channel missing from bridge runtime"
-                                        )),
-                                    },
+                                        ImProvider::DingTalk => match dingtalk_channel.as_ref() {
+                                            Some(channel) => {
+                                                dingtalk::ws::run_ws(channel.clone(), in_tx.clone())
+                                                    .await
+                                            }
+                                            None => Err(anyhow::anyhow!(
+                                                "dingtalk channel missing from bridge runtime"
+                                            )),
+                                        },
+                                    }
+                                };
+                                let Some(result) =
+                                    run_until_bridge_cancelled(&mut ws_cancel, operation).await
+                                else {
+                                    eprintln!("[weft][im] stale ws generation cancelled");
+                                    return;
                                 };
                                 match result {
                                     Ok(()) => backoff = 1,
@@ -3541,7 +3584,7 @@ mod tests {
     #[tokio::test]
     async fn broadcast_wake_drops_item_after_generation_switch() {
         let bridge = ImBridge::default();
-        let (generation, _, _) = bridge.bump();
+        let (generation, _, _, _) = bridge.bump();
         let (tx, mut rx) = tokio::sync::broadcast::channel(1);
 
         let waiting = recv_for_live_generation(&bridge, generation, &mut rx);
@@ -3553,6 +3596,22 @@ mod tests {
         let (received, ()) = tokio::join!(waiting, switch_provider);
 
         assert_eq!(received.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn bridge_bump_cancels_blocked_websocket_generation() {
+        let bridge = ImBridge::default();
+        let (_, _, _, mut cancel) = bridge.bump();
+
+        let blocked =
+            run_until_bridge_cancelled(&mut cancel, std::future::pending::<anyhow::Result<()>>());
+        let restart = async {
+            tokio::task::yield_now().await;
+            let _ = bridge.bump();
+        };
+        let (result, ()) = tokio::join!(blocked, restart);
+
+        assert!(result.is_none());
     }
 
     #[test]
