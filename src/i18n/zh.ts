@@ -366,6 +366,7 @@ export const zh = {
     retryTracking: "重试",
     retryTrackingStarted: "已请求重试，Weft 会尽快重新检查。",
     retryTrackingFailed: "重试失败，请稍后再试。",
+    answerFailed: "回答发送失败，草稿已保留，请重试。",
   },
   tool: {
     input: "输入",
@@ -1130,6 +1131,7 @@ export const zh = {
     failedToast: "失败：{{message}}",
     staleCard: "这条仓库操作已失效",
     noWorkspaceToast: "无法准备工作区",
+    completedWithoutRepository: "仓库操作已完成，但没有返回仓库信息。",
   },
   slashLocal: {
     testCases: "推导测试用例",

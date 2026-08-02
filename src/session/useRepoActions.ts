@@ -163,7 +163,7 @@ async function dispatch(
     if (!dir || typeof dir !== "string") return { status: "cancelled" };
     try {
       const r = await api.addRepoRef(workspaceId, basename(dir), dir, guard);
-      return ok(r);
+      return ok(r, t);
     } catch (e) {
       return repoActionError(e, t);
     }
@@ -179,7 +179,7 @@ async function dispatch(
     if (!name) return { status: "cancelled" };
     try {
       const r = await api.createRepo(workspaceId, name, parent, guard);
-      return ok(r);
+      return ok(r, t);
     } catch (e) {
       return repoActionError(e, t);
     }
@@ -202,7 +202,7 @@ async function dispatch(
   if (!name) return { status: "cancelled" };
   try {
     const r = await api.cloneRepo(workspaceId, url, parent, name, guard);
-    return ok(r);
+    return ok(r, t);
   } catch (e) {
     return repoActionError(e, t);
   }
@@ -216,13 +216,13 @@ function repoActionError(error: unknown, t: Translate): RepoActionResult {
   return { status: "error", message };
 }
 
-function ok(result: RepoActionCommandResult): RepoActionResult {
+function ok(result: RepoActionCommandResult, t: Translate): RepoActionResult {
   if (result.execution_outcome === "in_progress") {
     return { status: "in_progress" };
   }
   const r = result.repo;
   if (!r) {
-    return { status: "error", message: "repository action completed without a repository" };
+    return { status: "error", message: t("repoActions.completedWithoutRepository") };
   }
   return {
     status: "ok",

@@ -3111,9 +3111,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (!text.trim()) return;
       const workspaceId = activeWorkspaceIdRef.current;
       if (workspaceId == null) return;
-      // Optimistic by stable identity; OCC rejects a stale duplicate answer.
-      setAttentionItems((current) => current.filter((candidate) => candidate.id !== item.id));
-      setNeeds((current) => current.filter((candidate) => candidate.id !== item.id));
       try {
         await api.answerHumanRequest(
           workspaceId,
@@ -3121,9 +3118,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           Number(item.revision),
           text.trim(),
         );
-      } finally {
-        await refreshNeeds();
+      } catch (error) {
+        // Keep the item mounted so QuestionRow retains its local draft after a
+        // transient transport/OCC failure; the user can retry in place.
+        console.error(error);
+        toast(i18n.t("needs.answerFailed"), "danger");
+        return;
       }
+      // Remove only after the backend accepted the answer. Until then the
+      // stable item identity keeps the row (and its draft) visible.
+      setAttentionItems((current) => current.filter((candidate) => candidate.id !== item.id));
+      setNeeds((current) => current.filter((candidate) => candidate.id !== item.id));
+      await refreshNeeds();
     },
     [refreshNeeds],
   );

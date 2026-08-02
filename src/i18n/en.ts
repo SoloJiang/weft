@@ -378,6 +378,7 @@ export const en = {
     retryTracking: "Retry",
     retryTrackingStarted: "Retry requested — Weft will re-check shortly.",
     retryTrackingFailed: "Couldn't retry tracking. Try again in a moment.",
+    answerFailed: "Couldn't send the answer. Your draft was kept; try again.",
   },
   tool: {
     input: "Input",
@@ -1178,6 +1179,7 @@ export const en = {
     failedToast: "Failed: {{message}}",
     staleCard: "This repository action is no longer current",
     noWorkspaceToast: "Could not prepare workspace",
+    completedWithoutRepository: "Repository action completed without a repository.",
   },
   slashLocal: {
     testCases: "Derive test cases",
