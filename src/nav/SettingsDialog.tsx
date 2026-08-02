@@ -951,8 +951,109 @@ const FEISHU_SCOPES = [
   "im:message.group_msg:readonly",
 ] as const;
 
+type ImProviderId = "feishu" | "dingtalk";
+type ImConnectionPhase = "offline" | "connecting" | "online" | "error";
+type ImCredentialMode = "scan" | "manual";
+type ImManualSetup = "feishu-permissions" | "dingtalk-steps";
+type ImOwnerReset = "none" | "dingtalk";
+
+type ImProviderView = {
+  kind: ImProviderId;
+  defaultMode: ImCredentialMode;
+  labelKey: string;
+  manualHintKey: string;
+  platformLabelKey: string;
+  platformUrl: string;
+  appIdLabelKey: string;
+  appIdHintKey: string;
+  appIdPlaceholderKey: string;
+  secretLabelKey: string;
+  secretHintKey: string;
+  manualSetup: ImManualSetup;
+  ownerReset: ImOwnerReset;
+  routesHintKey: string;
+};
+
+const IM_PROVIDER_VIEWS = {
+  feishu: {
+    kind: "feishu",
+    defaultMode: "scan",
+    labelKey: "settings.imProviderFeishu",
+    manualHintKey: "settings.imManualModeHint",
+    platformLabelKey: "settings.imOpenPlatform",
+    platformUrl: "https://open.feishu.cn/app",
+    appIdLabelKey: "settings.imAppId",
+    appIdHintKey: "settings.imAppIdHint",
+    appIdPlaceholderKey: "settings.imAppIdPlaceholder",
+    secretLabelKey: "settings.imAppSecret",
+    secretHintKey: "settings.imAppSecretHint",
+    manualSetup: "feishu-permissions",
+    ownerReset: "none",
+    routesHintKey: "settings.imRoutesHint",
+  },
+  dingtalk: {
+    kind: "dingtalk",
+    defaultMode: "manual",
+    labelKey: "settings.imProviderDingtalk",
+    manualHintKey: "settings.imDingTalkManualModeHint",
+    platformLabelKey: "settings.imDingTalkOpenPlatform",
+    platformUrl: "https://open-dev.dingtalk.com/",
+    appIdLabelKey: "settings.imDingTalkClientId",
+    appIdHintKey: "settings.imDingTalkClientIdHint",
+    appIdPlaceholderKey: "settings.imDingTalkClientIdPlaceholder",
+    secretLabelKey: "settings.imDingTalkClientSecret",
+    secretHintKey: "settings.imDingTalkClientSecretHint",
+    manualSetup: "dingtalk-steps",
+    ownerReset: "dingtalk",
+    routesHintKey: "settings.imRoutesHintDingtalk",
+  },
+} as const satisfies Record<ImProviderId, ImProviderView>;
+
+const IM_PROVIDER_OPTIONS = Object.values(IM_PROVIDER_VIEWS);
+
+type ImProviderUiState = ImProviderView & {
+  panel: ImCredentialMode;
+  showModeSelector: boolean;
+  showScanDialog: boolean;
+};
+
+function assertNeverImProvider(value: never): never {
+  throw new Error(`Unhandled IM provider: ${String(value)}`);
+}
+
+function imProviderUiState(
+  provider: ImProviderId,
+  mode: ImCredentialMode,
+): ImProviderUiState {
+  const view = IM_PROVIDER_VIEWS[provider];
+  const kind = view.kind;
+  switch (kind) {
+    case "feishu":
+      return { ...view, panel: mode, showModeSelector: true, showScanDialog: true };
+    case "dingtalk":
+      return { ...view, panel: "manual", showModeSelector: false, showScanDialog: false };
+    default:
+      return assertNeverImProvider(kind);
+  }
+}
+
+const IM_STATUS_STYLE: Record<ImConnectionPhase, { dot: string; tone: string }> = {
+  offline: { dot: "bg-ink-faint", tone: "border-border bg-bg text-ink-faint" },
+  connecting: { dot: "bg-waiting", tone: "border-waiting/30 bg-waiting/15 text-waiting" },
+  online: { dot: "bg-success", tone: "border-success/30 bg-success/15 text-success" },
+  error: { dot: "bg-danger", tone: "border-danger/30 bg-danger/15 text-danger" },
+};
+
+function imConnectionPhase(status: string): ImConnectionPhase {
+  if (status.startsWith("online")) return "online";
+  if (status.startsWith("connecting")) return "connecting";
+  if (status.startsWith("error")) return "error";
+  return "offline";
+}
+
 function ImSettings() {
   const { t } = useTranslation();
+  const [provider, setProvider] = useState<ImProviderId>("feishu");
   const [appId, setAppId] = useState("");
   const [savedAppId, setSavedAppId] = useState("");
   const [secret, setSecret] = useState("");
@@ -964,7 +1065,7 @@ function ImSettings() {
   const [copied, setCopied] = useState(false);
   const [scanOpen, setScanOpen] = useState(false);
   // 两种接入模式:扫码创建新 PersonalAgent,或手填凭证绑定已有应用/机器人。
-  const [mode, setMode] = useState<"scan" | "manual">("scan");
+  const [mode, setMode] = useState<ImCredentialMode>("scan");
   // The toggles default to `false`. Without this flag we'd render the
   // off-state for one tick before `api.imGetSettings()` resolves, producing
   // a visible "off → on" flash for users whose IM was already enabled.
@@ -977,6 +1078,18 @@ function ImSettings() {
     },
     [],
   );
+
+  function applySettings(s: Awaited<ReturnType<typeof api.imGetSettings>>) {
+    setProvider(s.provider);
+    setAppId(s.app_id);
+    setSavedAppId(s.app_id);
+    setSecret("");
+    setHasSecret(s.has_secret);
+    setBound(s.bound);
+    setEnabled(s.enabled);
+    setMode(IM_PROVIDER_VIEWS[s.provider].defaultMode);
+    setLoaded(true);
+  }
 
   // 一键复制需开通的权限点：换行分隔，方便逐条粘进开放平台「权限管理」搜索框。
   async function copyPerms() {
@@ -991,29 +1104,40 @@ function ImSettings() {
   }
 
   useEffect(() => {
-    void api.imGetSettings().then((s) => {
-      setAppId(s.app_id);
-      setSavedAppId(s.app_id);
-      setHasSecret(s.has_secret);
-      setBound(s.bound);
-      setEnabled(s.enabled);
-      setLoaded(true);
-    });
+    void api.imGetSettings().then(applySettings);
     void api.imStatus().then(setStatus);
     const id = setInterval(() => void api.imStatus().then(setStatus), 3000);
     return () => clearInterval(id);
   }, []);
 
+  async function selectProvider(next: ImProviderId) {
+    if (next === provider || saving) return;
+    setSaving(true);
+    setLoaded(false);
+    try {
+      await api.imSetProvider(next);
+      applySettings(await api.imGetSettings());
+      setStatus(await api.imStatus());
+    } finally {
+      setLoaded(true);
+      setSaving(false);
+    }
+  }
+
   // 开关 = 启用/断开。乐观翻转：展开/收起即时响应，后台再落库重启桥。
   async function toggle(on: boolean) {
+    if (saving) return;
     const prev = enabled;
+    setSaving(true);
     setEnabled(on);
     try {
-      await api.imSetEnabled(on);
+      await api.imSetEnabled(provider, on);
       void api.imStatus().then(setStatus);
     } catch (err) {
       setEnabled(prev);
       throw err;
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -1021,11 +1145,12 @@ function ImSettings() {
   const dirty = appId.trim() !== savedAppId.trim() || secret.length > 0;
 
   async function reconnect() {
+    if (saving) return;
     const prevStatus = status;
     setSaving(true);
     setStatus("connecting");
     try {
-      await api.imSetSettings(appId, secret);
+      await api.imSetSettings(provider, appId, secret);
       setSavedAppId(appId);
       if (secret.length > 0) setHasSecret(true);
       setSecret("");
@@ -1038,25 +1163,26 @@ function ImSettings() {
     }
   }
 
-  const online = status.startsWith("online");
-  const connecting = status.startsWith("connecting");
-  const errored = status.startsWith("error");
-  let dot = "bg-ink-faint";
-  let statusTone = "border-border bg-bg text-ink-faint";
-  let statusText = t("settings.imOffline");
-  if (online) {
-    dot = "bg-success";
-    statusTone = "border-success/30 bg-success/15 text-success";
-    statusText = t("settings.imOnline");
-  } else if (connecting) {
-    dot = "bg-waiting";
-    statusTone = "border-waiting/30 bg-waiting/15 text-waiting";
-    statusText = t("settings.imConnecting");
-  } else if (errored) {
-    dot = "bg-danger";
-    statusTone = "border-danger/30 bg-danger/15 text-danger";
-    statusText = t("settings.imError");
+  async function resetOwner() {
+    if (saving || !window.confirm(t("settings.imDingTalkOwnerResetConfirm"))) return;
+    setSaving(true);
+    try {
+      await api.imResetOwner(provider);
+      applySettings(await api.imGetSettings());
+      setStatus(await api.imStatus());
+    } finally {
+      setSaving(false);
+    }
   }
+
+  const connectionPhase = imConnectionPhase(status);
+  const statusStyle = IM_STATUS_STYLE[connectionPhase];
+  const statusText = {
+    offline: t("settings.imOffline"),
+    connecting: t("settings.imConnecting"),
+    online: t("settings.imOnline"),
+    error: t("settings.imError"),
+  } satisfies Record<ImConnectionPhase, string>;
 
   let helperText = " ";
   if (loaded && enabled && bound) {
@@ -1070,9 +1196,12 @@ function ImSettings() {
   let reconnectLabel = t("settings.imConnect");
   if (saving) {
     reconnectLabel = t("settings.imConnecting");
-  } else if (online) {
+  } else if (connectionPhase === "online") {
     reconnectLabel = t("settings.imReconnect");
   }
+
+  const providerState = imProviderUiState(provider, mode);
+  const providerLabel = t(providerState.labelKey);
 
   return (
     <div className="flex flex-col gap-10">
@@ -1084,22 +1213,27 @@ function ImSettings() {
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <span className="text-[13px] font-semibold text-ink">{t("settings.imProvider")}</span>
+              <span className="text-[11.5px] text-ink-faint">{providerLabel}</span>
               {enabled && (
                 <span
                   className={cn(
                     "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium tabular-nums",
-                    statusTone,
+                    statusStyle.tone,
                   )}
                 >
-                  <span className={cn("h-1.5 w-1.5 rounded-full", dot)} />
-                  {statusText}
+                  <span className={cn("h-1.5 w-1.5 rounded-full", statusStyle.dot)} />
+                  {statusText[connectionPhase]}
                 </span>
               )}
             </div>
             <p className="mt-0.5 text-[12px] text-ink-faint">{helperText}</p>
           </div>
           {loaded ? (
-            <Toggle on={enabled} onChange={(v) => void toggle(v)} label={t("settings.imProvider")} />
+            <Toggle
+              on={enabled}
+              onChange={(v) => void toggle(v)}
+              label={providerLabel}
+            />
           ) : (
             <div
               aria-hidden
@@ -1108,28 +1242,54 @@ function ImSettings() {
           )}
         </div>
 
+        <div className="border-t border-border px-4 py-3">
+          <div className="flex gap-1 rounded-[var(--radius-md)] bg-bg p-1">
+            {IM_PROVIDER_OPTIONS.map((option) => (
+              <button
+                key={option.kind}
+                type="button"
+                disabled={!loaded || saving}
+                onClick={() => void selectProvider(option.kind)}
+                className={cn(
+                  "flex flex-1 items-center justify-center rounded-[var(--radius-sm)] px-3 py-1.5 text-[12px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+                  provider === option.kind
+                    ? "bg-surface text-ink shadow-sm"
+                    : "text-ink-faint hover:text-ink-muted",
+                )}
+              >
+                {t(option.labelKey)}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-[11.5px] leading-relaxed text-ink-faint">
+            {t("settings.imProviderSwitchHint")}
+          </p>
+        </div>
+
         {enabled && (
           <div className="flex flex-col gap-4 border-t border-border px-4 py-4">
-            <div className="flex gap-1 rounded-[var(--radius-md)] bg-bg p-1">
-              {(["scan", "manual"] as const).map((m) => (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => setMode(m)}
-                  className={cn(
-                    "flex flex-1 items-center justify-center gap-1.5 rounded-[var(--radius-sm)] px-3 py-1.5 text-[12px] font-medium transition-colors",
-                    mode === m
-                      ? "bg-surface text-ink shadow-sm"
-                      : "text-ink-faint hover:text-ink-muted",
-                  )}
-                >
-                  {m === "scan" ? <QrCode size={13} /> : <KeyRound size={13} />}
-                  {m === "scan" ? t("settings.imModeScan") : t("settings.imModeManual")}
-                </button>
-              ))}
-            </div>
+            {providerState.showModeSelector && (
+              <div className="flex gap-1 rounded-[var(--radius-md)] bg-bg p-1">
+                {(["scan", "manual"] as const).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setMode(m)}
+                    className={cn(
+                      "flex flex-1 items-center justify-center gap-1.5 rounded-[var(--radius-sm)] px-3 py-1.5 text-[12px] font-medium transition-colors",
+                      mode === m
+                        ? "bg-surface text-ink shadow-sm"
+                        : "text-ink-faint hover:text-ink-muted",
+                    )}
+                  >
+                    {m === "scan" ? <QrCode size={13} /> : <KeyRound size={13} />}
+                    {m === "scan" ? t("settings.imModeScan") : t("settings.imModeManual")}
+                  </button>
+                ))}
+              </div>
+            )}
 
-            {mode === "scan" ? (
+            {providerState.panel === "scan" ? (
               <div className="flex flex-col gap-3">
                 <p className="text-[12px] leading-relaxed text-ink-faint">
                   {t("settings.imScanModeHint")}
@@ -1143,26 +1303,32 @@ function ImSettings() {
               <div className="flex flex-col gap-4">
                 <div className="flex items-start justify-between gap-3">
                   <p className="text-[12px] leading-relaxed text-ink-faint">
-                    {t("settings.imManualModeHint")}
+                    {t(providerState.manualHintKey)}
                   </p>
                   <button
                     type="button"
-                    onClick={() => void api.openUrl("https://open.feishu.cn/app")}
+                    onClick={() => void api.openUrl(providerState.platformUrl)}
                     className="inline-flex shrink-0 items-center gap-1 text-[12px] font-medium text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
                   >
-                    {t("settings.imOpenPlatform")}
+                    {t(providerState.platformLabelKey)}
                     <ExternalLink size={12} />
                   </button>
                 </div>
-                <ImField label={t("settings.imAppId")} hint={t("settings.imAppIdHint")}>
+                <ImField
+                  label={t(providerState.appIdLabelKey)}
+                  hint={t(providerState.appIdHintKey)}
+                >
                   <Input
                     value={appId}
-                    placeholder={t("settings.imAppIdPlaceholder")}
+                    placeholder={t(providerState.appIdPlaceholderKey)}
                     onChange={(e) => setAppId(e.currentTarget.value)}
                     className="h-8 w-full bg-bg/80 font-mono text-[12px]"
                   />
                 </ImField>
-                <ImField label={t("settings.imAppSecret")} hint={t("settings.imAppSecretHint")}>
+                <ImField
+                  label={t(providerState.secretLabelKey)}
+                  hint={t(providerState.secretHintKey)}
+                >
                   <Input
                     type="password"
                     value={secret}
@@ -1171,22 +1337,35 @@ function ImSettings() {
                     className="h-8 w-full bg-bg/80 font-mono text-[12px]"
                   />
                 </ImField>
-                <ImField label={t("settings.imPermsLabel")} hint={t("settings.imPermsHint")}>
-                  <div className="flex items-start gap-2">
-                    <code className="flex-1 whitespace-pre rounded-[var(--radius-md)] border border-border bg-bg/80 px-2.5 py-2 font-mono text-[11.5px] leading-relaxed text-ink-muted">
-                      {FEISHU_SCOPES.join("\n")}
-                    </code>
-                    <Button
-                      variant="default"
-                      size="sm"
-                      onClick={() => void copyPerms()}
-                      className="shrink-0"
-                    >
-                      {copied ? <Check size={13} /> : <Copy size={13} />}
-                      {copied ? t("settings.imPermsCopied") : t("settings.imPermsCopy")}
-                    </Button>
+                {providerState.manualSetup === "feishu-permissions" ? (
+                  <ImField label={t("settings.imPermsLabel")} hint={t("settings.imPermsHint")}>
+                    <div className="flex items-start gap-2">
+                      <code className="flex-1 whitespace-pre rounded-[var(--radius-md)] border border-border bg-bg/80 px-2.5 py-2 font-mono text-[11.5px] leading-relaxed text-ink-muted">
+                        {FEISHU_SCOPES.join("\n")}
+                      </code>
+                      <Button
+                        variant="default"
+                        size="sm"
+                        onClick={() => void copyPerms()}
+                        className="shrink-0"
+                      >
+                        {copied ? <Check size={13} /> : <Copy size={13} />}
+                        {copied ? t("settings.imPermsCopied") : t("settings.imPermsCopy")}
+                      </Button>
+                    </div>
+                  </ImField>
+                ) : (
+                  <div className="rounded-[var(--radius-md)] border border-border bg-bg/60 px-3 py-2.5">
+                    <div className="text-[12px] font-medium text-ink">
+                      {t("settings.imDingTalkSetupTitle")}
+                    </div>
+                    <ol className="mt-1.5 list-decimal space-y-1 pl-4 text-[11.5px] leading-relaxed text-ink-faint">
+                      <li>{t("settings.imDingTalkSetupStep1")}</li>
+                      <li>{t("settings.imDingTalkSetupStep2")}</li>
+                      <li>{t("settings.imDingTalkSetupStep3")}</li>
+                    </ol>
                   </div>
-                </ImField>
+                )}
                 <div className="flex justify-end">
                   <Button
                     variant="primary"
@@ -1198,15 +1377,41 @@ function ImSettings() {
                 </div>
               </div>
             )}
-            <FeishuScanDialog
-              open={scanOpen}
-              onOpenChange={setScanOpen}
-              onConnected={() => void api.imStatus().then(setStatus)}
-            />
+            {providerState.showScanDialog && (
+              <FeishuScanDialog
+                open={scanOpen}
+                onOpenChange={setScanOpen}
+                onConnected={() => {
+                  void api.imGetSettings().then(applySettings);
+                  void api.imStatus().then(setStatus);
+                }}
+              />
+            )}
+          </div>
+        )}
+        {providerState.ownerReset === "dingtalk" && bound && (
+          <div className="flex items-start justify-between gap-4 border-t border-border px-4 py-3.5">
+            <div className="min-w-0">
+              <div className="text-[12.5px] font-medium text-ink">
+                {t("settings.imDingTalkOwnerTitle")}
+              </div>
+              <p className="mt-1 max-w-[54ch] text-[11.5px] leading-relaxed text-ink-faint">
+                {t("settings.imDingTalkOwnerResetHint")}
+              </p>
+            </div>
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={saving}
+              onClick={() => void resetOwner()}
+              className="shrink-0"
+            >
+              {t("settings.imDingTalkOwnerReset")}
+            </Button>
           </div>
         )}
       </div>
-      <ImRoutes />
+      <ImRoutes provider={provider} hint={t(providerState.routesHintKey)} />
     </div>
   );
 }
@@ -1336,9 +1541,8 @@ function FeishuScanDialog({
   );
 }
 
-/** 已绑定的 issue ↔ 飞书话题映射；绑定动作走「在飞书话题里
- *  发 `/bind <thread_id>` 给 bot」的入站协议；Settings 提供查看与解绑。 */
-function ImRoutes() {
+/** 已绑定的 issue ↔ provider conversation 映射；Settings 提供查看与解绑。 */
+function ImRoutes({ provider, hint }: { provider: ImProviderId; hint: string }) {
   const { t } = useTranslation();
   const [rows, setRows] = useState<import("../lib/types").ImRoute[]>([]);
   const [loading, setLoading] = useState(false);
@@ -1361,15 +1565,17 @@ function ImRoutes() {
     await refresh();
   }
 
+  const visibleRows = rows.filter((row) => row.channel === provider);
+
   let content: ReactNode;
-  if (loading && rows.length === 0) {
+  if (loading && visibleRows.length === 0) {
     content = (
       <span className="text-[12px] text-ink-faint">{t("settings.imRoutesLoading")}</span>
     );
-  } else if (rows.length === 0) {
+  } else if (visibleRows.length === 0) {
     content = <span className="text-[12px] text-ink-faint">{t("settings.imRoutesEmpty")}</span>;
   } else {
-    content = rows.map((r) => (
+    content = visibleRows.map((r) => (
       <div
         key={r.thread_id}
         className="flex items-center justify-between gap-3 rounded-md border border-border bg-bg/40 px-2.5 py-1.5"
@@ -1397,7 +1603,7 @@ function ImRoutes() {
             {t("settings.imRoutesLabel")}
           </div>
           <p className="mt-1 max-w-[58ch] text-[12px] leading-relaxed text-ink-faint">
-            {t("settings.imRoutesHint")}
+            {hint}
           </p>
         </div>
         <div className="flex flex-col gap-1.5">{content}</div>

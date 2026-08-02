@@ -21,6 +21,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
+use tauri::Manager;
 
 fn text_result(s: String) -> Value {
     json!({ "content": [{ "type": "text", "text": s }] })
@@ -82,6 +83,16 @@ fn issue_id_arg(args: &Value) -> Option<i32> {
         .map(|x| x as i32)
 }
 
+const IM_CONTEXT_MUTATING_TOOLS: [&str; 7] = [
+    "answer_permission",
+    "answer_question",
+    "message_lead",
+    "create_issue_from_im",
+    "ensure_issue_im_topic",
+    "ensure_issue_topic",
+    "create_issue",
+];
+
 /// Per-tool dispatch. Errors short-return via text_result so MCP clients see a
 /// friendly message instead of a transport failure (mirrors `call_planner`).
 pub async fn call_global(
@@ -91,6 +102,22 @@ pub async fn call_global(
     name: &str,
     args: &Value,
 ) -> Value {
+    // Every tool that mutates on behalf of an IM conversation shares the same
+    // read lease. Provider/owner/enable changes take the write side through
+    // persistence + bridge retirement, so ask answers, DB writes, and the
+    // actual lead enqueue are each linearized wholly before or after a revoke.
+    let _authority = if IM_CONTEXT_MUTATING_TOOLS.contains(&name) {
+        match crate::APP_HANDLE.get() {
+            Some(app) => Some(
+                app.state::<crate::im::ImBridge>()
+                    .authority_read_lease()
+                    .await,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
     match name {
         "list_workspaces" => match list_workspaces(db).await {
             Ok(v) => json_result(v),
@@ -129,6 +156,9 @@ pub async fn call_global(
                     "error: unknown verdict '{verdict}' (use allow/deny/always/full)"
                 ));
             };
+            if let Err(e) = require_active_im_context(db, args).await {
+                return text_result(format!("error: {e}"));
+            }
             if asks.answer(ask_id, ans) {
                 text_result(format!("answered ask #{ask_id} as {verdict}"))
             } else {
@@ -143,6 +173,9 @@ pub async fn call_global(
                 return text_result("error: ask_id required".into());
             };
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if let Err(e) = require_active_im_context(db, args).await {
+                return text_result(format!("error: {e}"));
+            }
             match answer_durable_question(db, bus, tid, ask_id, text).await {
                 Ok(true) => text_result(format!("answered ask #{ask_id} on issue {tid}")),
                 Ok(false) => text_result(format!(
@@ -163,7 +196,7 @@ pub async fn call_global(
             if text.trim().is_empty() {
                 return text_result("error: text required".into());
             }
-            match message_lead(db, tid, &text).await {
+            match message_lead(db, tid, &text, args).await {
                 Ok(()) => text_result(format!("delivered to lead of issue {tid}")),
                 Err(e) => text_result(format!("error: {e}")),
             }
@@ -218,7 +251,7 @@ pub async fn call_global(
             if chat_id.is_empty() {
                 return text_result("error: chat_id required".into());
             }
-            match ensure_issue_topic(db, tid, chat_id).await {
+            match ensure_issue_topic_from_im(db, tid, chat_id, args).await {
                 Ok(v) => json_result(v),
                 Err(e) => text_result(format!("error: {e}")),
             }
@@ -247,7 +280,13 @@ pub async fn call_global(
             if kind.trim().is_empty() {
                 return text_result("error: kind required".into());
             }
-            match create_issue(db, ws, &title, &kind).await {
+            if let Err(e) = require_active_im_context(db, args).await {
+                return text_result(format!("error: {e}"));
+            }
+            // Keep the same context through the final repository boundary;
+            // routing preparation above can await long enough for a stale
+            // Concierge turn to otherwise outlive its authority.
+            match create_issue(db, ws, &title, &kind, Some(args)).await {
                 Ok(v) => json_result(v),
                 Err(e) => text_result(format!("error: {e}")),
             }
@@ -385,18 +424,75 @@ async fn answer_durable_question(
 /// Push a message into the lead engine of `thread_id` from outside (Concierge).
 /// Pulls the global `AppHandle` from the `OnceLock` set in `setup()` — by the
 /// time an MCP request lands, the Tauri builder is long past that point.
-async fn message_lead(db: &Db, thread_id: i32, text: &str) -> anyhow::Result<()> {
+async fn message_lead_origin(
+    db: &Db,
+    thread_id: i32,
+    args: &Value,
+) -> anyhow::Result<Option<String>> {
+    let provider = require_active_im_context(db, args).await?.as_str();
+    let reply_to = im_reply_to(args);
+    let route = repo::im_route_of_thread(db, thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("issue {thread_id} has no active IM topic"))?;
+    if route.channel != provider {
+        anyhow::bail!(
+            "issue {thread_id} is bound to {}, not the active {provider} conversation",
+            route.channel
+        );
+    }
+    if route.channel == "dingtalk" {
+        let reply_to = reply_to.ok_or_else(|| {
+            anyhow::anyhow!("dingtalk lead delivery requires the current conversation reply target")
+        })?;
+        return Ok(Some(reply_to.to_string()));
+    }
+    // Feishu issue routes retain their stable topic/seed fallback. The current
+    // Concierge message can be outside that topic and must not become its reply
+    // parent merely because both conversations use the same provider.
+    Ok(None)
+}
+
+async fn message_lead(db: &Db, thread_id: i32, text: &str, args: &Value) -> anyhow::Result<()> {
     let app = crate::APP_HANDLE
         .get()
         .ok_or_else(|| anyhow::anyhow!("app handle not initialized"))?;
-    let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, "zh").await?;
-    crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new(), None).await
+    // Resolve the delivery target before starting the engine. DingTalk issue
+    // output cannot fall back to a stable topic message, so a no-origin turn
+    // would run successfully while silently discarding its response.
+    message_lead_origin(db, thread_id, args).await?;
+    let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, im_lang(args)).await?;
+    // Revalidate after engine lookup while call_global's authority lease
+    // remains held; `engine::send` cannot straddle a reset/switch/disable.
+    let origin = message_lead_origin(db, thread_id, args).await?;
+    crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new(), origin).await
 }
 
 fn im_provider(args: &Value) -> &str {
     args.pointer("/im_context/provider")
         .and_then(|v| v.as_str())
         .unwrap_or("")
+}
+
+async fn require_active_im_context(
+    db: &Db,
+    args: &Value,
+) -> anyhow::Result<crate::im::ImProvider> {
+    let context_provider = im_provider(args);
+    if context_provider.is_empty() {
+        anyhow::bail!("current IM provider context is required");
+    }
+    let context_provider = crate::im::ImProvider::parse(context_provider)?;
+    let sender_open_id = im_sender_id(args)
+        .ok_or_else(|| anyhow::anyhow!("current IM sender context is required"))?;
+    crate::im::ImSettings::require_active_owner(db, context_provider, sender_open_id).await?;
+    Ok(context_provider)
+}
+
+fn im_lang(args: &Value) -> &str {
+    match args.pointer("/im_context/locale").and_then(Value::as_str) {
+        Some("en") => "en",
+        _ => "zh",
+    }
 }
 
 /// Whether a topic can be created from the CURRENT conversation — not merely
@@ -416,6 +512,20 @@ fn im_chat_id(args: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+fn im_reply_to(args: &Value) -> Option<&str> {
+    args.pointer("/im_context/conversation/reply_to")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn im_sender_id(args: &Value) -> Option<&str> {
+    args.pointer("/im_context/conversation/sender_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 async fn create_issue_from_im(
     db: &Db,
     ws: i32,
@@ -423,37 +533,54 @@ async fn create_issue_from_im(
     kind: &str,
     args: &Value,
 ) -> anyhow::Result<Value> {
-    let issue = create_issue(db, ws, title, kind).await?;
+    let active_provider = require_active_im_context(db, args).await?;
+    let provider = active_provider.as_str();
+    let issue = create_issue(db, ws, title, kind, Some(args)).await?;
     let thread_id = issue["issue_id"].as_i64().unwrap_or_default() as i32;
-    let provider = im_provider(args);
     let can_create = im_can_create_topic_here(args);
+    let open_hint = if active_provider == crate::im::ImProvider::DingTalk {
+        format!("/bind {thread_id}")
+    } else {
+        "provider does not support issue topic in this conversation".to_string()
+    };
     let mut im = json!({
         "provider": provider,
         "topic_exists": false,
         "topic_created": false,
         "topic_ref": null,
-        "open_hint": "provider does not support issue topic in this conversation"
+        "open_hint": open_hint
     });
     if provider == "feishu" && can_create {
         if let Some(chat_id) = im_chat_id(args) {
-            match ensure_issue_topic(db, thread_id, chat_id).await {
-                Ok(v) => {
-                    im = json!({
-                        "provider": provider,
-                        "topic_exists": true,
-                        "topic_created": v.get("created").and_then(|x| x.as_bool()).unwrap_or(false),
-                        "topic_ref": v.get("topic_ref").cloned().unwrap_or(Value::Null),
-                        "chat_id": v.get("chat_id").cloned().unwrap_or(Value::Null),
-                        "open_hint": "已创建或复用飞书 topic，请进入该 topic 继续讨论"
-                    });
-                }
+            match require_active_im_context(db, args).await {
+                Ok(_) => match ensure_issue_topic(db, thread_id, chat_id, args).await {
+                    Ok(v) => {
+                        im = json!({
+                            "provider": provider,
+                            "topic_exists": true,
+                            "topic_created": v.get("created").and_then(|x| x.as_bool()).unwrap_or(false),
+                            "topic_ref": v.get("topic_ref").cloned().unwrap_or(Value::Null),
+                            "chat_id": v.get("chat_id").cloned().unwrap_or(Value::Null),
+                            "open_hint": "已创建或复用飞书 topic，请进入该 topic 继续讨论"
+                        });
+                    }
+                    Err(e) => {
+                        im = json!({
+                            "provider": provider,
+                            "topic_exists": false,
+                            "topic_created": false,
+                            "topic_ref": null,
+                            "open_hint": format!("issue created, but IM topic was not created: {e}")
+                        });
+                    }
+                },
                 Err(e) => {
                     im = json!({
                         "provider": provider,
                         "topic_exists": false,
                         "topic_created": false,
                         "topic_ref": null,
-                        "open_hint": format!("issue created, but IM topic was not created: {e}")
+                        "open_hint": format!("issue created, but the IM provider changed before topic creation: {e}")
                     });
                 }
             }
@@ -462,24 +589,34 @@ async fn create_issue_from_im(
     Ok(json!({ "issue": issue, "im": im }))
 }
 async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow::Result<Value> {
+    let active_provider = require_active_im_context(db, args).await?;
     let issue = repo::get_thread(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("issue {thread_id} not found"))?;
-    let provider = im_provider(args);
+    let provider = active_provider.as_str();
     let can_create = im_can_create_topic_here(args);
     let initial_message = args
         .get("initial_message")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim();
+    let open_hint = if provider == "dingtalk" {
+        format!("/bind {thread_id}")
+    } else {
+        "provider does not support issue topic in this conversation".to_string()
+    };
     let mut im = json!({
         "provider": provider,
         "topic_exists": false,
         "topic_created": false,
         "topic_ref": null,
-        "open_hint": "provider does not support issue topic in this conversation"
+        "open_hint": open_hint
     });
-    if let Some(route) = repo::im_route_of_thread(db, thread_id).await? {
+    let existing_route = repo::im_route_of_thread(db, thread_id).await?;
+    if let Some(route) = existing_route
+        .as_ref()
+        .filter(|route| route.channel == provider)
+    {
         im = json!({
             "provider": route.channel,
             "topic_exists": true,
@@ -490,7 +627,8 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
         });
     } else if provider == "feishu" && can_create {
         if let Some(chat_id) = im_chat_id(args) {
-            let v = ensure_issue_topic(db, thread_id, chat_id).await?;
+            require_active_im_context(db, args).await?;
+            let v = ensure_issue_topic(db, thread_id, chat_id, args).await?;
             im = json!({
                 "provider": provider,
                 "topic_exists": true,
@@ -508,7 +646,9 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let delivered = if has_topic && !initial_message.is_empty() {
-        message_lead(db, thread_id, initial_message).await.is_ok()
+        message_lead(db, thread_id, initial_message, args)
+            .await
+            .is_ok()
     } else {
         false
     };
@@ -524,7 +664,12 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
     }))
 }
 
-async fn create_issue(db: &Db, ws: i32, title: &str, kind: &str) -> anyhow::Result<Value> {
+struct PreparedIssue {
+    route: crate::engine_routing::RouteDecision,
+    tool: String,
+}
+
+async fn prepare_issue(db: &Db) -> PreparedIssue {
     let legacy_tool = crate::tools::default_tool(db).await;
     let route = crate::engine_routing::resolve_for_db(
         db,
@@ -537,6 +682,24 @@ async fn create_issue(db: &Db, ws: i32, title: &str, kind: &str) -> anyhow::Resu
         .selected()
         .map(|selected| selected.as_str().to_string())
         .unwrap_or(legacy_tool);
+    PreparedIssue { route, tool }
+}
+
+async fn persist_prepared_issue(
+    db: &Db,
+    ws: i32,
+    title: &str,
+    kind: &str,
+    prepared: PreparedIssue,
+    im_args: Option<&Value>,
+) -> anyhow::Result<Value> {
+    let PreparedIssue { route, tool } = prepared;
+    // Default-tool and routing resolution above can await. An IM Concierge turn
+    // may be retired during those reads, so validate at the final repository
+    // boundary as well as at tool entry before creating any durable issue.
+    if let Some(args) = im_args {
+        require_active_im_context(db, args).await?;
+    }
     let t = repo::create_thread(db, ws, title, kind, &tool).await?;
     crate::engine_routing::record_decision(db, t.id, None, None, "new_issue", &route).await;
     Ok(json!({
@@ -547,14 +710,45 @@ async fn create_issue(db: &Db, ws: i32, title: &str, kind: &str) -> anyhow::Resu
     }))
 }
 
-async fn ensure_issue_topic(db: &Db, thread_id: i32, chat_id: &str) -> anyhow::Result<Value> {
+async fn create_issue(
+    db: &Db,
+    ws: i32,
+    title: &str,
+    kind: &str,
+    im_args: Option<&Value>,
+) -> anyhow::Result<Value> {
+    let prepared = prepare_issue(db).await;
+    persist_prepared_issue(db, ws, title, kind, prepared, im_args).await
+}
+
+async fn ensure_issue_topic(
+    db: &Db,
+    thread_id: i32,
+    chat_id: &str,
+    args: &Value,
+) -> anyhow::Result<Value> {
     let before = repo::im_route_of_thread(db, thread_id).await?;
+    let created = before.as_ref().map(|route| route.channel.as_str()) != Some("feishu");
     let settings = crate::im::ImSettings::load(db).await?;
+    if settings.provider != crate::im::ImProvider::Feishu {
+        anyhow::bail!("Feishu is not the active IM provider");
+    }
     if !settings.ready() {
         anyhow::bail!("Feishu app credentials are not configured");
     }
+    let sender_open_id = im_sender_id(args)
+        .ok_or_else(|| anyhow::anyhow!("current IM sender context is required"))?;
     let ch = crate::im::feishu::FeishuChannel::new(&settings.app_id, &settings.app_secret)?;
-    crate::im::ensure_issue_topic(db, &ch, thread_id, chat_id, None, "zh").await?;
+    crate::im::ensure_issue_topic(
+        db,
+        &ch,
+        thread_id,
+        chat_id,
+        sender_open_id,
+        None,
+        "zh",
+    )
+    .await?;
     let after = repo::im_route_of_thread(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("topic route was not created"))?;
@@ -562,8 +756,21 @@ async fn ensure_issue_topic(db: &Db, thread_id: i32, chat_id: &str) -> anyhow::R
         "issue_id": after.thread_id,
         "chat_id": after.chat_id,
         "topic_ref": after.im_thread_ref,
-        "created": before.is_none(),
+        "created": created,
     }))
+}
+
+async fn ensure_issue_topic_from_im(
+    db: &Db,
+    thread_id: i32,
+    chat_id: &str,
+    args: &Value,
+) -> anyhow::Result<Value> {
+    let provider = require_active_im_context(db, args).await?;
+    if provider != crate::im::ImProvider::Feishu {
+        anyhow::bail!("the active IM provider cannot create a Feishu topic");
+    }
+    ensure_issue_topic(db, thread_id, chat_id, args).await
 }
 
 // ───────────────────── tool specs ─────────────────────
@@ -572,6 +779,68 @@ pub fn global_specs() -> Value {
     let s = || json!({ "type": "string" });
     let i = || json!({ "type": "integer" });
     let u = || json!({ "type": "integer", "minimum": 0 });
+    let im_context = || {
+        json!({
+            "type": "object",
+            "properties": {
+                "provider": { "type": "string", "enum": ["feishu", "dingtalk"] },
+                "locale": { "type": "string", "enum": ["zh", "en"] },
+                "conversation": {
+                    "type": "object",
+                    "properties": {
+                        "chat_id": { "type": "string" },
+                        "topic_ref": { "type": "string" },
+                        "reply_to": { "type": ["string", "null"] },
+                        "sender_id": { "type": "string" }
+                    },
+                    "required": ["chat_id", "topic_ref", "reply_to", "sender_id"]
+                },
+                "capabilities": {
+                    "type": "object",
+                    "properties": {
+                        "issue_topic": {
+                            "type": "object",
+                            "properties": {
+                                "supported": { "type": "boolean" },
+                                "default_on_create_issue": { "type": "boolean" },
+                                "can_create_from_current_conversation": { "type": "boolean" },
+                                "terminology": {
+                                    "type": "object",
+                                    "properties": {
+                                        "zh": { "type": "string" },
+                                        "en": { "type": "string" }
+                                    },
+                                    "required": ["zh", "en"]
+                                }
+                            },
+                            "required": [
+                                "supported",
+                                "default_on_create_issue",
+                                "can_create_from_current_conversation",
+                                "terminology"
+                            ]
+                        },
+                        "reply": {
+                            "type": "object",
+                            "properties": { "supported": { "type": "boolean" } },
+                            "required": ["supported"]
+                        },
+                        "issue_conversation_binding": {
+                            "type": "object",
+                            "properties": {
+                                "supported": { "type": "boolean" },
+                                "can_bind_current_conversation": { "type": "boolean" },
+                                "command": { "type": "string" }
+                            },
+                            "required": ["supported", "can_bind_current_conversation", "command"]
+                        }
+                    },
+                    "required": ["issue_topic", "reply", "issue_conversation_binding"]
+                }
+            },
+            "required": ["provider", "locale", "conversation", "capabilities"]
+        })
+    };
     json!([
         {
             "name": "list_workspaces",
@@ -595,52 +864,52 @@ pub fn global_specs() -> Value {
         },
         {
             "name": "answer_permission",
-            "description": "Answer a permission ask on behalf of the human. verdict ∈ allow|deny|always|full. always = remember this exact action for the asking task; full = grant the task full access (skips future asks).",
+            "description": "Answer a permission ask on behalf of the human from the current IM conversation. verdict ∈ allow|deny|always|full. always = remember this exact action for the asking task; full = grant the task full access (skips future asks). Pass the unchanged current im_context so a retired provider or owner turn cannot mutate the registry.",
             "inputSchema": { "type": "object",
-                "properties": { "ask_id": u(), "verdict": s() },
-                "required": ["ask_id", "verdict"] }
+                "properties": { "ask_id": u(), "verdict": s(), "im_context": im_context() },
+                "required": ["ask_id", "verdict", "im_context"] }
         },
         {
             "name": "answer_question",
-            "description": "Reply to an agent's open question (ask_human). The text is delivered into that task's bus inbox.",
+            "description": "Reply to an agent's open question (ask_human) from the current IM conversation. The text is delivered into that task's bus inbox only while that im_context provider and sender are still active.",
             "inputSchema": { "type": "object",
-                "properties": { "issue_id": i(), "ask_id": u(), "text": s() },
-                "required": ["issue_id", "ask_id", "text"] }
+                "properties": { "issue_id": i(), "ask_id": u(), "text": s(), "im_context": im_context() },
+                "required": ["issue_id", "ask_id", "text", "im_context"] }
         },
         {
             "name": "message_lead",
-            "description": "Send a message into an issue's lead engine, as if the human typed it in the desktop. Use when the human wants to nudge a specific issue's lead from IM.",
+            "description": "Send a message into an issue's lead engine, as if the human typed it in the desktop. Use when the human wants to nudge a specific issue's lead from IM; pass the current im_context so the lead preserves the active locale and reply target.",
             "inputSchema": { "type": "object",
-                "properties": { "issue_id": i(), "text": s() },
-                "required": ["issue_id", "text"] }
+                "properties": { "issue_id": i(), "text": s(), "im_context": im_context() },
+                "required": ["issue_id", "text", "im_context"] }
         },
         {
             "name": "create_issue_from_im",
             "description": "Create a Weft issue from the current IM conversation. If the provider supports issue topics in this conversation, create or bind one by default so the user continues in the issue-specific discussion location.",
             "inputSchema": { "type": "object",
-                "properties": { "workspace_id": i(), "title": s(), "kind": s(), "im_context": { "type": "object" } },
+                "properties": { "workspace_id": i(), "title": s(), "kind": s(), "im_context": im_context() },
                 "required": ["workspace_id", "title", "kind", "im_context"] }
         },
         {
             "name": "ensure_issue_im_topic",
             "description": "Ensure an existing issue has a provider-native IM topic and guide the user there. Use when the user wants to open, enter, intervene in, or continue an issue from IM. initial_message is optional and should be set only when the user gave concrete text to relay to the lead.",
             "inputSchema": { "type": "object",
-                "properties": { "issue_id": i(), "im_context": { "type": "object" }, "initial_message": s() },
+                "properties": { "issue_id": i(), "im_context": im_context(), "initial_message": s() },
                 "required": ["issue_id", "im_context"] }
         },
         {
             "name": "ensure_issue_topic",
             "description": "Ensure an existing issue has a Feishu topic in chat_id. Use only when the user semantically asks to create/open/continue an issue-specific Feishu topic; do not call for ordinary chat.",
             "inputSchema": { "type": "object",
-                "properties": { "issue_id": i(), "chat_id": s() },
-                "required": ["issue_id", "chat_id"] }
+                "properties": { "issue_id": i(), "chat_id": s(), "im_context": im_context() },
+                "required": ["issue_id", "chat_id", "im_context"] }
         },
         {
             "name": "create_issue",
-            "description": "File a new issue in a workspace. kind is required and must be chosen explicitly: feature|bugfix|refactor|spike.",
+            "description": "File a new issue in a workspace from the current IM conversation. kind is required and must be chosen explicitly: feature|bugfix|refactor|spike. Pass the unchanged current im_context so a retired provider, owner, or disabled bridge cannot create durable work.",
             "inputSchema": { "type": "object",
-                "properties": { "workspace_id": i(), "title": s(), "kind": s() },
-                "required": ["workspace_id", "title", "kind"] }
+                "properties": { "workspace_id": i(), "title": s(), "kind": s(), "im_context": im_context() },
+                "required": ["workspace_id", "title", "kind", "im_context"] }
         }
     ])
 }
@@ -652,7 +921,17 @@ mod tests {
     use crate::store::Db;
 
     async fn mem_db() -> Db {
-        Db::connect("sqlite::memory:").await.unwrap()
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, crate::im::K_ALLOW, "owner")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::im::K_ENABLED, "1")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::im::K_DINGTALK_ENABLED, "1")
+            .await
+            .unwrap();
+        db
     }
 
     #[tokio::test]
@@ -747,7 +1026,14 @@ mod tests {
             &asks,
             &bus,
             "answer_permission",
-            &json!({ "ask_id": id, "verdict": "allow" }),
+            &json!({
+                "ask_id": id,
+                "verdict": "allow",
+                "im_context": {
+                    "provider": "feishu",
+                    "conversation": { "sender_id": "owner" }
+                }
+            }),
         )
         .await;
         assert!(v["content"][0]["text"]
@@ -755,6 +1041,241 @@ mod tests {
             .unwrap()
             .contains("answered"));
         assert_eq!(rx.await.unwrap(), crate::ask::Decision::Allow);
+    }
+
+    #[tokio::test]
+    async fn stale_im_context_cannot_answer_permission_or_human_question() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let (permission_id, _permission_rx) = asks.request(
+            1,
+            "10",
+            "claude",
+            "Run tests",
+            "cargo test",
+            RiskLevel::Unknown,
+            "cargo test",
+        );
+        let human_id = bus.ask_human(1, "10", "Which release channel?");
+        let stale_context = json!({
+            "provider": "feishu",
+            "conversation": { "sender_id": "owner" }
+        });
+        // Both asks were opened by a Feishu Concierge turn. The user switched
+        // to DingTalk before that turn reached either mutating global tool.
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+
+        let permission = call_global(
+            &db,
+            &asks,
+            &bus,
+            "answer_permission",
+            &json!({
+                "ask_id": permission_id,
+                "verdict": "full",
+                "im_context": stale_context.clone()
+            }),
+        )
+        .await;
+        let question = call_global(
+            &db,
+            &asks,
+            &bus,
+            "answer_question",
+            &json!({
+                "issue_id": 1,
+                "ask_id": human_id,
+                "text": "stable",
+                "im_context": stale_context
+            }),
+        )
+        .await;
+
+        assert!(permission["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("stale IM context")));
+        assert!(question["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("stale IM context")));
+        assert!(asks.open().iter().any(|ask| ask.id == permission_id));
+        assert!(bus.open_asks(1).iter().any(|ask| ask.id == human_id));
+    }
+
+    #[tokio::test]
+    async fn owner_reset_invalidates_in_flight_dingtalk_mutations() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let workspace = repo::create_workspace(&db, "alpha").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::im::K_DINGTALK_ALLOW, "former_owner")
+            .await
+            .unwrap();
+        let former_context = json!({
+            "provider": "dingtalk",
+            "conversation": { "sender_id": "former_owner" }
+        });
+        let (permission_id, _permission_rx) = asks.request(
+            1,
+            "10",
+            "claude",
+            "Run tests",
+            "cargo test",
+            RiskLevel::Unknown,
+            "cargo test",
+        );
+        let human_id = bus.ask_human(1, "10", "Which release channel?");
+
+        // Model an issue tool already in flight when the owner is reset: its
+        // asynchronous preparation completed for the former owner. A different
+        // account then binds before the old turn reaches any final mutation.
+        let prepared = prepare_issue(&db).await;
+        crate::im::reset_owner(&db, crate::im::ImProvider::DingTalk)
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::im::K_DINGTALK_ALLOW, "replacement_owner")
+            .await
+            .unwrap();
+
+        let permission = call_global(
+            &db,
+            &asks,
+            &bus,
+            "answer_permission",
+            &json!({
+                "ask_id": permission_id,
+                "verdict": "full",
+                "im_context": former_context.clone()
+            }),
+        )
+        .await;
+        let question = call_global(
+            &db,
+            &asks,
+            &bus,
+            "answer_question",
+            &json!({
+                "issue_id": 1,
+                "ask_id": human_id,
+                "text": "stale answer",
+                "im_context": former_context.clone()
+            }),
+        )
+        .await;
+        let create_args = json!({ "im_context": former_context });
+        let create_error = persist_prepared_issue(
+            &db,
+            workspace.id,
+            "Must not exist",
+            "feature",
+            prepared,
+            Some(&create_args),
+        )
+        .await
+        .unwrap_err();
+
+        for result in [permission, question] {
+            assert!(result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("stale IM context")));
+        }
+        assert!(create_error.to_string().contains("stale IM context"));
+        assert!(asks.open().iter().any(|ask| ask.id == permission_id));
+        assert!(bus.open_asks(1).iter().any(|ask| ask.id == human_id));
+        assert!(repo::list_threads(&db, workspace.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabling_active_provider_invalidates_in_flight_im_mutations() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let workspace = repo::create_workspace(&db, "alpha").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::im::K_DINGTALK_ALLOW, "owner")
+            .await
+            .unwrap();
+        let context = json!({
+            "provider": "dingtalk",
+            "conversation": { "sender_id": "owner" }
+        });
+        let (permission_id, _permission_rx) = asks.request(
+            1,
+            "10",
+            "claude",
+            "Run tests",
+            "cargo test",
+            RiskLevel::Unknown,
+            "cargo test",
+        );
+        let human_id = bus.ask_human(1, "10", "Which release channel?");
+
+        // Model a tool call whose asynchronous preparation began while remote
+        // control was enabled, then the active provider was disabled before
+        // its final registry/DB mutation boundary.
+        let prepared = prepare_issue(&db).await;
+        repo::set_setting(&db, crate::im::K_DINGTALK_ENABLED, "0")
+            .await
+            .unwrap();
+
+        let permission = call_global(
+            &db,
+            &asks,
+            &bus,
+            "answer_permission",
+            &json!({
+                "ask_id": permission_id,
+                "verdict": "full",
+                "im_context": context.clone()
+            }),
+        )
+        .await;
+        let question = call_global(
+            &db,
+            &asks,
+            &bus,
+            "answer_question",
+            &json!({
+                "issue_id": 1,
+                "ask_id": human_id,
+                "text": "stale answer",
+                "im_context": context.clone()
+            }),
+        )
+        .await;
+        let create_error = persist_prepared_issue(
+            &db,
+            workspace.id,
+            "Must not exist",
+            "feature",
+            prepared,
+            Some(&json!({ "im_context": context })),
+        )
+        .await
+        .unwrap_err();
+
+        for result in [permission, question] {
+            assert!(result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("provider is disabled")));
+        }
+        assert!(create_error.to_string().contains("provider is disabled"));
+        assert!(asks.open().iter().any(|ask| ask.id == permission_id));
+        assert!(bus.open_asks(1).iter().any(|ask| ask.id == human_id));
+        assert!(repo::list_threads(&db, workspace.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -814,6 +1335,96 @@ mod tests {
     }
 
     #[test]
+    fn mutating_tools_declare_the_complete_im_context() {
+        let specs = global_specs();
+        for name in IM_CONTEXT_MUTATING_TOOLS {
+            let spec = specs
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|spec| spec["name"] == name)
+                .unwrap();
+            assert!(spec["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|required| required == "im_context"));
+            let context = &spec["inputSchema"]["properties"]["im_context"];
+            assert_eq!(
+                context["required"],
+                json!(["provider", "locale", "conversation", "capabilities"]),
+                "{name} must preserve the complete framed context"
+            );
+            assert_eq!(
+                context["properties"]["conversation"]["required"],
+                json!(["chat_id", "topic_ref", "reply_to", "sender_id"]),
+                "{name} must preserve every conversation delivery field"
+            );
+            assert_eq!(
+                context["properties"]["capabilities"]["required"],
+                json!(["issue_topic", "reply", "issue_conversation_binding"]),
+                "{name} must preserve provider capabilities"
+            );
+            assert!(context["properties"]["capabilities"]["properties"]["issue_topic"]
+                ["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|required| required == "can_create_from_current_conversation"));
+        }
+    }
+
+    #[test]
+    fn im_context_schema_covers_every_field_in_the_framed_bus_context() {
+        fn assert_declared(schema: &Value, value: &Value, path: &str) {
+            let Some(object) = value.as_object() else {
+                return;
+            };
+            let properties = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("schema properties missing at {path}"));
+            let required = schema["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("schema required missing at {path}"));
+            for (key, child) in object {
+                let child_schema = properties
+                    .get(key)
+                    .unwrap_or_else(|| panic!("framed field {path}.{key} is undeclared"));
+                assert!(
+                    required.iter().any(|required| required == key),
+                    "framed field {path}.{key} is optional in the tool schema"
+                );
+                assert_declared(child_schema, child, &format!("{path}.{key}"));
+            }
+        }
+
+        let frame = crate::im::format_im_user_message(
+            "ou_owner",
+            "oc_chat",
+            "chat:oc_chat",
+            Some("om_reply"),
+            "continue",
+            "en",
+            &crate::im::feishu_provider_capabilities(true),
+        );
+        let context_json = frame
+            .strip_prefix("<weft:im_context>")
+            .and_then(|rest| rest.split_once("</weft:im_context>"))
+            .map(|(context, _)| context)
+            .expect("framed IM context");
+        let context: Value = serde_json::from_str(context_json).unwrap();
+        let specs = global_specs();
+        let schema = &specs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|spec| spec["name"] == "message_lead")
+            .unwrap()["inputSchema"]["properties"]["im_context"];
+
+        assert_declared(schema, &context, "im_context");
+    }
+
+    #[test]
     fn global_specs_expose_issue_id_not_thread_id() {
         let specs = global_specs();
         let text = specs.to_string();
@@ -849,27 +1460,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_issue_from_im_without_thread_support_creates_issue_only() {
+    async fn create_issue_from_dingtalk_returns_bind_hint() {
         let db = mem_db().await;
         let asks = AskRegistry::new();
         let bus = BusRegistry::new();
         let ws = repo::create_workspace(&db, "alpha").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::im::K_DINGTALK_ALLOW, "owner")
+            .await
+            .unwrap();
         let args = json!({
             "workspace_id": ws.id,
             "title": "New task",
             "kind": "feature",
             "im_context": {
-                "provider": "none",
-                "conversation": { "chat_id": "c" },
+                "provider": "dingtalk",
+                "conversation": { "chat_id": "c", "sender_id": "owner" },
                 "capabilities": { "issue_topic": { "supported": false } }
             }
         });
 
         let result = call_global(&db, &asks, &bus, "create_issue_from_im", &args).await;
-        let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("New task"));
-        assert!(text.contains("topic_created"));
-        assert!(text.contains("false"));
+        let parsed: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        let issue_id = parsed["issue"]["issue_id"].as_i64().unwrap();
+        assert_eq!(parsed["issue"]["title"], "New task");
+        assert_eq!(parsed["im"]["topic_created"], false);
+        assert_eq!(parsed["im"]["open_hint"], format!("/bind {issue_id}"));
+    }
+
+    #[tokio::test]
+    async fn provider_switch_after_issue_preparation_prevents_database_creation() {
+        let db = mem_db().await;
+        let workspace = repo::create_workspace(&db, "alpha").await.unwrap();
+        let stale_args = json!({
+            "im_context": {
+                "provider": "feishu",
+                "conversation": { "sender_id": "owner" }
+            }
+        });
+
+        // Model the exact await window in create_issue_from_im: tool/routing
+        // preparation completed under Feishu, then the provider changed before
+        // the final repo::create_thread boundary.
+        let prepared = prepare_issue(&db).await;
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        let error = persist_prepared_issue(
+            &db,
+            workspace.id,
+            "Must not exist",
+            "feature",
+            prepared,
+            Some(&stale_args),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("stale IM context"));
+        assert!(repo::list_threads(&db, workspace.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -888,7 +1543,7 @@ mod tests {
             "issue_id": issue.id,
             "im_context": {
                 "provider": "feishu",
-                "conversation": { "chat_id": "oc_chat" },
+                "conversation": { "chat_id": "oc_chat", "sender_id": "owner" },
                 "capabilities": { "issue_topic": { "supported": true } }
             }
         });
@@ -897,6 +1552,137 @@ mod tests {
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("om_root"));
         assert!(text.contains("\"topic_created\":false"));
+    }
+
+    #[tokio::test]
+    async fn ensure_issue_im_topic_rejects_an_inactive_provider_route() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let ws = repo::create_workspace(&db, "alpha").await.unwrap();
+        let issue = repo::create_thread(&db, ws.id, "Existing", "feature", "claude")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::im::K_DINGTALK_ALLOW, "owner")
+            .await
+            .unwrap();
+        repo::bind_im_route(&db, issue.id, "feishu", "oc_old", "omt_old")
+            .await
+            .unwrap();
+        let args = json!({
+            "issue_id": issue.id,
+            "initial_message": "继续推进",
+            "im_context": {
+                "provider": "dingtalk",
+                "locale": "zh",
+                "conversation": { "chat_id": "cid_current", "sender_id": "owner" },
+                "capabilities": {
+                    "issue_topic": { "supported": true, "can_create_from_current_conversation": false }
+                }
+            }
+        });
+
+        let result = call_global(&db, &asks, &bus, "ensure_issue_im_topic", &args).await;
+        let parsed: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["im"]["provider"], "dingtalk");
+        assert_eq!(parsed["im"]["topic_exists"], false);
+        assert_eq!(parsed["lead_message_delivered"], false);
+        assert!(parsed["im"]["open_hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains(&format!("/bind {}", issue.id))));
+    }
+
+    #[tokio::test]
+    async fn stale_feishu_tool_call_cannot_replace_route_after_provider_switch() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let ws = repo::create_workspace(&db, "alpha").await.unwrap();
+        let issue = repo::create_thread(&db, ws.id, "Existing", "feature", "claude")
+            .await
+            .unwrap();
+        repo::bind_im_route(
+            &db,
+            issue.id,
+            "dingtalk",
+            "cid_current",
+            "ding-thread-current",
+        )
+        .await
+        .unwrap();
+        let stale_args = json!({
+            "issue_id": issue.id,
+            "im_context": {
+                "provider": "feishu",
+                "conversation": { "chat_id": "oc_stale", "sender_id": "owner" },
+                "capabilities": {
+                    "issue_topic": { "supported": true, "can_create_from_current_conversation": true }
+                }
+            }
+        });
+        // The turn captured Feishu above, then the user switched providers
+        // before its global-tool call reached this process.
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::im::K_DINGTALK_ALLOW, "owner")
+            .await
+            .unwrap();
+
+        let result = call_global(&db, &asks, &bus, "ensure_issue_im_topic", &stale_args).await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("stale IM context"));
+        let route = repo::im_route_of_thread(&db, issue.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.channel, "dingtalk");
+        assert_eq!(route.im_thread_ref, "ding-thread-current");
+    }
+
+    #[tokio::test]
+    async fn message_lead_origin_uses_the_current_dingtalk_reply_target() {
+        let db = mem_db().await;
+        let ws = repo::create_workspace(&db, "alpha").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+        repo::set_setting(&db, crate::im::K_DINGTALK_ALLOW, "owner")
+            .await
+            .unwrap();
+        let issue = repo::create_thread(&db, ws.id, "Existing", "feature", "claude")
+            .await
+            .unwrap();
+        repo::bind_im_route(
+            &db,
+            issue.id,
+            "dingtalk",
+            "cid_current",
+            "ding-thread-current",
+        )
+        .await
+        .unwrap();
+        let args = json!({
+            "im_context": {
+                "provider": "dingtalk",
+                "conversation": { "reply_to": "msg-current", "sender_id": "owner" }
+            }
+        });
+
+        let origin = message_lead_origin(&db, issue.id, &args).await.unwrap();
+        assert_eq!(origin.as_deref(), Some("msg-current"));
+
+        let missing = json!({
+            "im_context": {
+                "provider": "dingtalk",
+                "conversation": { "reply_to": "", "sender_id": "owner" }
+            }
+        });
+        assert!(message_lead_origin(&db, issue.id, &missing).await.is_err());
     }
 
     #[tokio::test]
@@ -941,7 +1727,15 @@ mod tests {
             &asks,
             &bus,
             "create_issue",
-            &json!({ "workspace_id": w.id, "title": "new feature", "kind": "feature" }),
+            &json!({
+                "workspace_id": w.id,
+                "title": "new feature",
+                "kind": "feature",
+                "im_context": {
+                    "provider": "feishu",
+                    "conversation": { "sender_id": "owner" }
+                }
+            }),
         )
         .await;
         let parsed: Value =
@@ -952,6 +1746,69 @@ mod tests {
         let ts = repo::list_threads(&db, w.id).await.unwrap();
         assert_eq!(ts.len(), 1);
         assert_eq!(ts[0].title, "new feature");
+    }
+
+    #[tokio::test]
+    async fn generic_create_issue_rejects_every_revoked_im_context() {
+        for revocation in ["provider", "owner", "disabled"] {
+            let db = mem_db().await;
+            let asks = AskRegistry::new();
+            let bus = BusRegistry::new();
+            let workspace = repo::create_workspace(&db, revocation).await.unwrap();
+            repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+                .await
+                .unwrap();
+            repo::set_setting(&db, crate::im::K_DINGTALK_ALLOW, "former_owner")
+                .await
+                .unwrap();
+
+            match revocation {
+                "provider" => repo::set_setting(&db, crate::im::K_PROVIDER, "feishu")
+                    .await
+                    .unwrap(),
+                "owner" => repo::set_setting(
+                    &db,
+                    crate::im::K_DINGTALK_ALLOW,
+                    "replacement_owner",
+                )
+                .await
+                .unwrap(),
+                "disabled" => {
+                    repo::set_setting(&db, crate::im::K_DINGTALK_ENABLED, "0")
+                        .await
+                        .unwrap()
+                }
+                _ => unreachable!(),
+            }
+
+            let result = call_global(
+                &db,
+                &asks,
+                &bus,
+                "create_issue",
+                &json!({
+                    "workspace_id": workspace.id,
+                    "title": "Must not exist",
+                    "kind": "feature",
+                    "im_context": {
+                        "provider": "dingtalk",
+                        "conversation": { "sender_id": "former_owner" }
+                    }
+                }),
+            )
+            .await;
+
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("stale IM context")),
+                "{revocation} revocation must reject legacy create_issue: {result}"
+            );
+            assert!(repo::list_threads(&db, workspace.id)
+                .await
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[tokio::test]

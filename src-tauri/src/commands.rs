@@ -3587,6 +3587,7 @@ pub fn bus_post_human(
 /// IM 设置视图：secret 只回是否已设置，不回明文（与 ImSettings::Debug 同纪律）。
 #[derive(serde::Serialize)]
 pub struct ImSettingsView {
+    pub provider: String,
     pub app_id: String,
     pub has_secret: bool,
     pub bound: bool,
@@ -3599,6 +3600,7 @@ pub struct ImSettingsView {
 pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
     let s = crate::im::ImSettings::load(&db).await.map_err(e)?;
     Ok(ImSettingsView {
+        provider: s.provider.as_str().to_string(),
         app_id: s.app_id,
         has_secret: !s.app_secret.is_empty(),
         bound: !s.allow_open_ids.is_empty(),
@@ -3607,33 +3609,133 @@ pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
     })
 }
 
-/// 写飞书凭证并重启桥。secret 空 = 保持原值(不覆盖已存密钥)。`enable=true` 时同时置
-/// `im.feishu.enabled`(扫码接入即启用);手填保存走 `enable=false`,enabled 仍由开关 /
-/// 默认决定。`owner_open_id=Some` 时把该 open_id 设为白名单——扫码创建的新机器人用它
-/// 让授权者立即可对话,并覆盖旧应用遗留的白名单(那些 open_id 属于旧 app、对新 bot 无效,
-/// 留着反而会让新 owner 被 `inbound::route` 忽略);手填路径传 `None`,不动既有白名单。
-/// 扫码注册成功路径与本函数共用,保证「落库 + 重连」单一实现。
-async fn apply_feishu_credentials(
-    app: &tauri::AppHandle,
+async fn persist_im_credentials(
     db: &Db,
+    provider: crate::im::ImProvider,
     app_id: &str,
     app_secret: &str,
     enable: bool,
-    owner_open_id: Option<&str>,
+    owner_id: Option<&str>,
+    select_provider: bool,
 ) -> anyhow::Result<()> {
-    repo::set_setting(db, crate::im::K_APP_ID, app_id.trim()).await?;
-    if !app_secret.is_empty() {
-        repo::set_setting(db, crate::im::K_APP_SECRET, app_secret.trim()).await?;
+    let app_id = app_id.trim();
+    let app_secret = app_secret.trim();
+    let owner_id = owner_id.map(str::trim).filter(|owner| !owner.is_empty());
+    let mut settings = Vec::with_capacity(5);
+    if select_provider {
+        settings.push((crate::im::K_PROVIDER, provider.as_str()));
     }
-    if let Some(oid) = owner_open_id {
-        let oid = oid.trim();
-        if !oid.is_empty() {
-            repo::set_setting(db, crate::im::K_ALLOW, oid).await?;
-        }
+    settings.push((provider.app_id_key(), app_id));
+    if !app_secret.is_empty() {
+        settings.push((provider.app_secret_key(), app_secret));
+    }
+    if let Some(owner_id) = owner_id {
+        settings.push((provider.allow_key(), owner_id));
     }
     if enable {
-        repo::set_setting(db, crate::im::K_ENABLED, "1").await?;
+        settings.push((provider.enabled_key(), "1"));
     }
+    repo::set_settings_atomic(db, &settings).await
+}
+
+async fn apply_im_credentials(
+    app: &tauri::AppHandle,
+    db: &Db,
+    provider: crate::im::ImProvider,
+    app_id: &str,
+    app_secret: &str,
+    enable: bool,
+    owner_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let bridge = app.state::<crate::im::ImBridge>();
+    let _authority = bridge.authority_write_lease().await;
+    persist_im_credentials(
+        db,
+        provider,
+        app_id,
+        app_secret,
+        enable,
+        owner_id,
+        true,
+    )
+    .await?;
+    crate::im::spawn(app.clone());
+    Ok(())
+}
+
+/// Persist a completed Feishu scan without selecting Feishu. A callback can
+/// finish after the user has switched to DingTalk; keeping `K_PROVIDER`
+/// untouched makes that newer choice authoritative while retaining the scanned
+/// credentials for a later switch back.
+async fn persist_feishu_scan_credentials(
+    db: &Db,
+    app_id: &str,
+    app_secret: &str,
+    owner_open_id: &str,
+) -> anyhow::Result<()> {
+    persist_im_credentials(
+        db,
+        crate::im::ImProvider::Feishu,
+        app_id,
+        app_secret,
+        true,
+        Some(owner_open_id),
+        false,
+    )
+    .await
+}
+
+async fn persist_im_enabled(
+    db: &Db,
+    provider: crate::im::ImProvider,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    repo::set_setting(db, provider.enabled_key(), if enabled { "1" } else { "0" }).await
+}
+
+async fn apply_im_enabled(
+    app: &tauri::AppHandle,
+    db: &Db,
+    provider: crate::im::ImProvider,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    let bridge = app.state::<crate::im::ImBridge>();
+    // A disable is an authority retirement. Keep the write lease through both
+    // persistence and generation bump so an in-flight lead enqueue is wholly
+    // before the disable or validates against the disabled state afterward.
+    let _authority = bridge.authority_write_lease().await;
+    persist_im_enabled(db, provider, enabled).await?;
+    crate::im::spawn(app.clone());
+    Ok(())
+}
+
+async fn reset_im_owner(
+    app: &tauri::AppHandle,
+    db: &Db,
+    provider: crate::im::ImProvider,
+) -> anyhow::Result<()> {
+    let bridge = app.state::<crate::im::ImBridge>();
+    let _authority = bridge.authority_write_lease().await;
+    let active_provider = crate::im::ImSettings::active_provider(db).await?;
+    crate::im::reset_owner(db, provider).await?;
+    if active_provider == provider {
+        crate::im::spawn(app.clone());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn im_set_provider(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    provider: String,
+) -> R<()> {
+    let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    let bridge = app.state::<crate::im::ImBridge>();
+    let _authority = bridge.authority_write_lease().await;
+    repo::set_setting(&db, crate::im::K_PROVIDER, provider.as_str())
+        .await
+        .map_err(e)?;
     crate::im::spawn(app.clone());
     Ok(())
 }
@@ -3644,23 +3746,67 @@ async fn apply_feishu_credentials(
 pub async fn im_set_settings(
     app: tauri::AppHandle,
     db: State<'_, Db>,
+    registration: State<'_, crate::im::feishu::registration::RegistrationService>,
+    provider: String,
     app_id: String,
     app_secret: String,
 ) -> R<()> {
-    apply_feishu_credentials(&app, &db, &app_id, &app_secret, false, None)
-        .await
-        .map_err(e)
+    let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    let apply = apply_im_credentials(&app, &db, provider, &app_id, &app_secret, false, None);
+    let result = if provider == crate::im::ImProvider::Feishu {
+        registration.supersede_with(apply).await
+    } else {
+        apply.await
+    };
+    result.map_err(e)
 }
 
 /// 开关桥：写 enabled 标志并重启。off = 断开但保留凭证；on = 凭证齐全则连接
 /// （缺凭证时置 disabled，等用户在已展开的表单里补齐再保存）。
 #[tauri::command]
-pub async fn im_set_enabled(app: tauri::AppHandle, db: State<'_, Db>, enabled: bool) -> R<()> {
-    repo::set_setting(&db, crate::im::K_ENABLED, if enabled { "1" } else { "0" })
-        .await
-        .map_err(e)?;
-    crate::im::spawn(app);
-    Ok(())
+pub async fn im_set_enabled(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    registration: State<'_, crate::im::feishu::registration::RegistrationService>,
+    provider: String,
+    enabled: bool,
+) -> R<()> {
+    let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    // Toggling a named provider must not select it. A delayed toggle can race a
+    // newer provider choice; keeping K_PROVIDER untouched makes that newer
+    // choice authoritative while still preserving this provider's enabled bit.
+    // Feishu's registration apply gate stays outermost, matching credentials,
+    // scan completion, and owner reset; this prevents lock-order inversion.
+    let apply = apply_im_enabled(&app, &db, provider, enabled);
+    if provider == crate::im::ImProvider::Feishu {
+        registration.supersede_with(apply).await
+    } else {
+        apply.await
+    }
+    .map_err(e)
+}
+
+/// Clear a provider's locally bound owner without deleting credentials. The
+/// active bridge is restarted so in-memory prompt-recipient/card mappings for
+/// the retired owner cannot suppress or leak status updates after rebind.
+#[tauri::command]
+pub async fn im_reset_owner(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    registration: State<'_, crate::im::feishu::registration::RegistrationService>,
+    provider: String,
+) -> R<()> {
+    let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    // Feishu keeps the registration apply gate outermost, matching manual and
+    // scan credential paths. The authority gate is acquired inside `reset` so
+    // concurrent registration callbacks cannot deadlock on inverted lock order.
+    let reset = reset_im_owner(&app, &db, provider);
+    if provider == crate::im::ImProvider::Feishu {
+        registration.supersede_with(reset).await
+    } else {
+        reset.await
+    }
+    .map_err(e)
 }
 
 /// 远程待命：桥启用期间持有「防空闲休眠」断言，保证飞书指令随时可达。
@@ -3688,6 +3834,36 @@ pub fn im_status(bridge: State<'_, crate::im::ImBridge>) -> R<String> {
     Ok(bridge.status())
 }
 
+fn dingtalk_copy_should_start_bridge(
+    update: crate::im::DingTalkCopyUpdate,
+    bridge_status: &str,
+) -> bool {
+    update == crate::im::DingTalkCopyUpdate::Initialized || bridge_status == "waiting_locale"
+}
+
+/// Synchronize DingTalk's fixed user-facing copy from the frontend i18n
+/// catalogs. Active channels share this memory-only bundle, so locale changes
+/// update rendering in place without retiring output subscribers. The first
+/// bundle still starts a selected DingTalk bridge that was waiting for copy.
+#[tauri::command]
+pub async fn im_set_dingtalk_copy(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    bridge: State<'_, crate::im::ImBridge>,
+    copy: crate::im::outbound::DingTalkCopy,
+) -> R<()> {
+    copy.validate().map_err(e)?;
+    let update = bridge.set_dingtalk_copy(copy);
+    if !dingtalk_copy_should_start_bridge(update, &bridge.status()) {
+        return Ok(());
+    }
+    let settings = crate::im::ImSettings::load(&db).await.map_err(e)?;
+    if settings.provider == crate::im::ImProvider::DingTalk {
+        crate::im::spawn(app);
+    }
+    Ok(())
+}
+
 // ───────────────────────── 飞书扫码接入(device-flow）─────────────────────────
 
 #[derive(serde::Serialize)]
@@ -3712,14 +3888,35 @@ pub async fn feishu_scan_begin(
 ) -> R<ScanBeginView> {
     use crate::im::feishu::registration::{OnSuccess, ReqwestTransport};
     let app_cb = app.clone();
-    let on_success: OnSuccess = std::sync::Arc::new(move |client_id, client_secret, open_id| {
-        let app = app_cb.clone();
-        Box::pin(async move {
-            let db = app.state::<Db>().inner().clone();
-            apply_feishu_credentials(&app, &db, &client_id, &client_secret, true, Some(&open_id))
-                .await
-        }) as futures::future::BoxFuture<'static, anyhow::Result<()>>
-    });
+    let registration_cb = svc.inner().clone();
+    let on_success: OnSuccess = std::sync::Arc::new(
+        move |generation, client_id, client_secret, open_id| {
+            let app = app_cb.clone();
+            let registration = registration_cb.clone();
+            Box::pin(async move {
+                registration
+                    .apply_if_live(generation, async move {
+                        let db = app.state::<Db>().inner().clone();
+                        let bridge = app.state::<crate::im::ImBridge>();
+                        let _authority = bridge.authority_write_lease().await;
+                        persist_feishu_scan_credentials(
+                            &db,
+                            &client_id,
+                            &client_secret,
+                            &open_id,
+                        )
+                        .await?;
+                        let selected = crate::im::ImSettings::active_provider(&db).await?;
+                        if selected == crate::im::ImProvider::Feishu {
+                            crate::im::spawn(app.clone());
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                Ok(())
+            }) as futures::future::BoxFuture<'static, anyhow::Result<()>>
+        },
+    );
     let transport = std::sync::Arc::new(ReqwestTransport::default());
     let begin = svc.begin(transport, on_success).await.map_err(e)?;
     Ok(ScanBeginView {
@@ -3750,10 +3947,10 @@ pub fn feishu_scan_status(
 
 /// 取消扫码(关闭 dialog / 卸载时调用),停止后台轮询。
 #[tauri::command]
-pub fn feishu_scan_cancel(
+pub async fn feishu_scan_cancel(
     svc: State<'_, crate::im::feishu::registration::RegistrationService>,
 ) -> R<()> {
-    svc.cancel();
+    svc.cancel().await;
     Ok(())
 }
 
@@ -3878,6 +4075,159 @@ pub async fn db_change_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_dingtalk_bridge_retries_after_copy_was_already_initialized() {
+        assert!(dingtalk_copy_should_start_bridge(
+            crate::im::DingTalkCopyUpdate::Unchanged,
+            "waiting_locale"
+        ));
+        assert!(dingtalk_copy_should_start_bridge(
+            crate::im::DingTalkCopyUpdate::Updated,
+            "waiting_locale"
+        ));
+        assert!(!dingtalk_copy_should_start_bridge(
+            crate::im::DingTalkCopyUpdate::Updated,
+            "online"
+        ));
+    }
+
+    #[tokio::test]
+    async fn toggling_named_im_provider_does_not_select_it() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+
+        persist_im_enabled(&db, crate::im::ImProvider::Feishu, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_PROVIDER)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("dingtalk")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_ENABLED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_feishu_scan_credentials_keep_newer_dingtalk_selection() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+
+        persist_feishu_scan_credentials(&db, "cli_feishu", "sec_feishu", "ou_owner")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_PROVIDER)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("dingtalk")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_APP_ID)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cli_feishu")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_ALLOW)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ou_owner")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_ENABLED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_scan_generation_cannot_overwrite_newer_manual_feishu_credentials() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let registration =
+            crate::im::feishu::registration::RegistrationService::default();
+
+        registration
+            .supersede_with(persist_im_credentials(
+                &db,
+                crate::im::ImProvider::Feishu,
+                "cli_manual",
+                "sec_manual",
+                false,
+                None,
+                true,
+            ))
+            .await
+            .unwrap();
+        let applied = registration
+            .apply_if_live(
+                0,
+                persist_feishu_scan_credentials(&db, "cli_scan", "sec_scan", "ou_scan"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!applied, "superseded scan callback must not write");
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_APP_ID)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cli_manual")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_APP_SECRET)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("sec_manual")
+        );
+        assert!(repo::get_setting(&db, crate::im::K_ALLOW)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo::get_setting(&db, crate::im::K_ENABLED)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn fresh_profile_scan_uses_default_feishu_provider() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        persist_feishu_scan_credentials(&db, "cli_feishu", "sec_feishu", "ou_owner")
+            .await
+            .unwrap();
+
+        assert!(repo::get_setting(&db, crate::im::K_PROVIDER)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            crate::im::ImSettings::active_provider(&db).await.unwrap(),
+            crate::im::ImProvider::Feishu
+        );
+    }
 
     fn sh(dir: &std::path::Path, args: &[&str]) {
         let status = std::process::Command::new(args[0])

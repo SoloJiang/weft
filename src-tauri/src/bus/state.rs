@@ -176,21 +176,21 @@ impl BusRegistry {
         }
     }
 
-    /// Install the channel the IM bridge listens on for human-ask events
-    /// (called once at startup). Mirrors `set_wake_sender`.
-    ///
-    /// Mirrors `AskRegistry::set_notifier`: install the edge-event sender and
-    /// atomically return every currently open ask for IM card replay.
+    /// Install the channel the IM bridge listens on for human-ask events and
+    /// atomically snapshot every open ask across threads. The lock order stays
+    /// `inner -> ask_notify`, matching `push_ask`, so an ask is represented
+    /// exactly once: either in this snapshot or as a later channel event.
     pub fn set_ask_notifier(
         &self,
         tx: tokio::sync::mpsc::UnboundedSender<HumanAskEvent>,
     ) -> Vec<(i32, Ask)> {
-        // Same lock order as push_ask_with_id: inner -> ask_notify. Taking the
-        // snapshot while installing the sender gives IM restart replay a clean
-        // no-miss/no-duplicate boundary.
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         *self.ask_notify.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
-        let mut snapshot: Vec<(i32, Ask)> = g
+        Self::open_ask_snapshot_from(&inner)
+    }
+
+    fn open_ask_snapshot_from(inner: &HashMap<i32, ThreadBus>) -> Vec<(i32, Ask)> {
+        let mut snapshot = inner
             .iter()
             .flat_map(|(thread, bus)| {
                 if bus.unavailable() {
@@ -204,7 +204,7 @@ impl BusRegistry {
                     .collect::<Vec<_>>()
                     .into_iter()
             })
-            .collect();
+            .collect::<Vec<_>>();
         snapshot.sort_by(|left, right| {
             left.0
                 .cmp(&right.0)
@@ -212,6 +212,14 @@ impl BusRegistry {
                 .then_with(|| left.1.id.cmp(&right.1.id))
         });
         snapshot
+    }
+
+    /// Snapshot every currently open human ask without replacing the notifier.
+    /// Used when an IM bridge gains its first owner after startup snapshots were
+    /// intentionally skipped while no delivery target existed.
+    pub fn open_ask_snapshot(&self) -> Vec<(i32, Ask)> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::open_ask_snapshot_from(&inner)
     }
 
     /// Install the transcript-trail consumer's channel (called once at startup,
@@ -1208,6 +1216,30 @@ mod tests {
         assert!(r.inbox(7, "10").is_empty());
         assert!(r.log(7).is_empty());
         assert!(r.open_asks(7).is_empty());
+    }
+
+    #[tokio::test]
+    async fn human_ask_notifier_snapshots_preexisting_open_asks() {
+        let r = BusRegistry::new();
+        let first = r.ask_human(2, "20", "already open");
+        let answered = r.ask_human(1, "10", "already answered");
+        assert!(r.answer_ask(1, answered, "done"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let snapshot = r.set_ask_notifier(tx);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, 2);
+        assert_eq!(snapshot[0].1.id, first);
+
+        let later = r.ask_human(3, "30", "opened after install");
+        assert!(matches!(
+            rx.recv().await,
+            Some(HumanAskEvent::Asked { thread: 3, ask }) if ask.id == later
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "snapshot asks must not be emitted again"
+        );
     }
 
     #[tokio::test]

@@ -211,9 +211,15 @@ pub struct ScanBegin {
     pub expire_secs: u64,
 }
 
-/// 成功落库回调:拿到凭证后写库 + 重连。返回 future 以支持 async 落库。
+/// 成功落库回调:第一个参数是本次扫码 generation，后续是凭证；返回 future
+/// 以支持在 generation-aware persistence boundary 内异步落库 + 重连。
 pub type OnSuccess = Arc<
-    dyn Fn(String, String, String) -> futures::future::BoxFuture<'static, anyhow::Result<()>>
+    dyn Fn(
+            u64,
+            String,
+            String,
+            String,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<()>>
         + Send
         + Sync,
 >;
@@ -234,9 +240,13 @@ impl Default for Session {
 
 /// 后台轮询的扫码注册服务(挂为 Tauri managed state)。同一时刻只跑一代:
 /// 再次 begin 或 cancel 自增代际号,旧轮询 task 检查到代际变化即退出。
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RegistrationService {
     session: Arc<Mutex<Session>>,
+    /// Serializes the final scan callback with cancel, a newer begin, and a
+    /// manual Feishu credential save. Whichever operation acquires this gate
+    /// first completes before the next one decides whether the scan is stale.
+    apply_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl RegistrationService {
@@ -248,10 +258,47 @@ impl RegistrationService {
             .clone()
     }
 
-    pub fn cancel(&self) {
+    pub async fn cancel(&self) {
+        let _gate = self.apply_gate.lock().await;
         let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
         s.generation = s.generation.wrapping_add(1);
         s.status = ScanStatus::Idle;
+    }
+
+    /// Apply a scan result only if its generation is still current at the
+    /// serialized persistence boundary. The callback future must perform the
+    /// whole credential update atomically before returning.
+    pub async fn apply_if_live<Fut>(
+        &self,
+        generation: u64,
+        apply: Fut,
+    ) -> anyhow::Result<bool>
+    where
+        Fut: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        let _gate = self.apply_gate.lock().await;
+        if !is_live(&self.session, generation) {
+            return Ok(false);
+        }
+        apply.await?;
+        Ok(true)
+    }
+
+    /// Retire every open scan before running a manual Feishu settings write.
+    /// Sharing the apply gate makes the ordering deterministic: an old callback
+    /// either finishes first (then this newer save wins) or observes itself as
+    /// stale and performs no write.
+    pub async fn supersede_with<Fut, T>(&self, apply: Fut) -> anyhow::Result<T>
+    where
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        let _gate = self.apply_gate.lock().await;
+        {
+            let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            s.generation = s.generation.wrapping_add(1);
+            s.status = ScanStatus::Idle;
+        }
+        apply.await
     }
 
     /// 发起 device-flow:begin → 二维码 → 标 Pending → spawn 后台轮询。
@@ -264,6 +311,7 @@ impl RegistrationService {
         // 能让本次作废(下方 is_live 检查),不会留下「迟到的旧 begin 启动一条看不见的轮询、
         // 反把可见 QR 的轮询挤掉」的竞态(P2)。
         let generation = {
+            let _gate = self.apply_gate.lock().await;
             let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
             s.generation = s.generation.wrapping_add(1);
             s.status = ScanStatus::Pending;
@@ -378,7 +426,7 @@ async fn poll_loop(
                 client_secret,
                 open_id,
             } => {
-                match on_success(client_id, client_secret, open_id).await {
+                match on_success(generation, client_id, client_secret, open_id).await {
                     Ok(()) => set_status(&session, generation, ScanStatus::Success),
                     Err(e) => {
                         eprintln!("[weft][im] scan apply credentials: {e}");
@@ -585,14 +633,16 @@ mod tests {
         }
     }
 
-    type SuccessLog = Arc<Mutex<Vec<(String, String, String)>>>;
+    type SuccessLog = Arc<Mutex<Vec<(u64, String, String, String)>>>;
     fn record_success() -> (OnSuccess, SuccessLog) {
         let log: SuccessLog = Arc::new(Mutex::new(Vec::new()));
         let l = log.clone();
-        let cb: OnSuccess = Arc::new(move |id: String, sec: String, open: String| {
+        let cb: OnSuccess = Arc::new(move |generation, id: String, sec: String, open: String| {
             let l = l.clone();
             Box::pin(async move {
-                l.lock().unwrap_or_else(|e| e.into_inner()).push((id, sec, open));
+                l.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((generation, id, sec, open));
                 Ok(())
             }) as futures::future::BoxFuture<'static, anyhow::Result<()>>
         });
@@ -637,7 +687,12 @@ mod tests {
         );
         assert_eq!(
             log.lock().unwrap_or_else(|e| e.into_inner()).as_slice(),
-            &[("cli_x".to_string(), "sec".to_string(), "ou_1".to_string())]
+            &[(
+                1,
+                "cli_x".to_string(),
+                "sec".to_string(),
+                "ou_1".to_string(),
+            )]
         );
     }
 
@@ -734,6 +789,69 @@ mod tests {
             log.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "superseded session must NOT run on_success / apply credentials"
         );
+    }
+
+    #[tokio::test]
+    async fn newer_manual_apply_wins_when_scan_callback_already_started() {
+        let svc = RegistrationService::default();
+        {
+            let mut session = svc.session.lock().unwrap_or_else(|e| e.into_inner());
+            session.generation = 1;
+            session.status = ScanStatus::Pending;
+        }
+        let value = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let scan_svc = svc.clone();
+        let scan_value = value.clone();
+        let scan = tokio::spawn(async move {
+            scan_svc
+                .apply_if_live(1, async move {
+                    *scan_value.lock().await = "scan".into();
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    Ok(())
+                })
+                .await
+                .unwrap()
+        });
+        started_rx.await.unwrap();
+
+        let manual_svc = svc.clone();
+        let manual_value = value.clone();
+        let manual = tokio::spawn(async move {
+            manual_svc
+                .supersede_with(async move {
+                    *manual_value.lock().await = "manual".into();
+                    Ok(())
+                })
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        release_tx.send(()).unwrap();
+
+        assert!(scan.await.unwrap());
+        manual.await.unwrap();
+        assert_eq!(&*value.lock().await, "manual");
+        assert_eq!(
+            svc.session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .generation,
+            2
+        );
+
+        let stale_ran = svc
+            .apply_if_live(1, async {
+                *value.lock().await = "stale scan".into();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(!stale_ran);
+        assert_eq!(&*value.lock().await, "manual");
     }
 
     #[tokio::test]

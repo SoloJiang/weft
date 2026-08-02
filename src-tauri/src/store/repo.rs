@@ -1217,6 +1217,32 @@ pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Persist a related settings bundle in one transaction. Credential tuples
+/// must never become visible half-written (for example a new app id paired
+/// with an old secret) when scan and manual-save flows overlap.
+pub async fn set_settings_atomic(db: &Db, settings: &[(&str, &str)]) -> Result<()> {
+    if settings.is_empty() {
+        return Ok(());
+    }
+    let txn = db.0.begin().await?;
+    for (key, value) in settings {
+        let model = app_setting::ActiveModel {
+            key: Set((*key).to_string()),
+            value: Set((*value).to_string()),
+        };
+        app_setting::Entity::insert(model)
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::column(app_setting::Column::Key)
+                    .update_column(app_setting::Column::Value)
+                    .to_owned(),
+            )
+            .exec(&txn)
+            .await?;
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
 /// Remove an app_setting row. No-op when the key is absent. Used to clear a
 /// stored value entirely so `get_setting` reads `None` again — distinct from
 /// `set_setting(key, "")`, which would still read as `Some("")`.
