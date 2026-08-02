@@ -45,7 +45,7 @@ const PR_SWEEP_DEFAULT_SECS: u64 = 60;
 /// is left in place when this fires — not retracted (that would falsely
 /// claim "resolved") — an honest "here's the last thing we knew, we've
 /// stopped checking" rather than a silent infinite retry loop.
-const MAX_CONSECUTIVE_PROBE_FAILURES: i32 = 10;
+pub(crate) const MAX_CONSECUTIVE_PROBE_FAILURES: i32 = 10;
 
 /// Which bus method should post a notice this module computed — mirrors the
 /// two NOTICE variants of `bus::AskKind` (this module never posts a
@@ -199,7 +199,10 @@ async fn apply_probe_result(
                 pr.id,
                 snapshot,
                 &readiness,
-                axis_error,
+                match axis_error {
+                    Some(reason) => repo::StreakUpdate::Extend(reason),
+                    None => repo::StreakUpdate::Clear,
+                },
             )
             .await
             {
@@ -216,11 +219,24 @@ async fn apply_probe_result(
                 None // merged/closed — the readiness question is moot now
             } else if let Some(reason) = axis_error {
                 // A PARTIAL read escalates on the same threshold a failed
-                // probe does. Without this the row's notice would stay
-                // self-clearing forever, saying only "indeterminate", while
-                // the underlying request failed every sweep with nothing
-                // ever telling the human to go look.
-                Some(partial_read_notice_text(kind, pr.number, &reason, fail_count))
+                // probe does — through the SAME `error_notice_text`, not a
+                // parallel copy of it. Without the escalation the row's
+                // notice would stay self-clearing forever, saying only
+                // "indeterminate", while the underlying request failed every
+                // sweep with nothing telling the human to go look.
+                //
+                // Reusing that function rather than composing new sentences
+                // is deliberate (Codex review round 3 P1): every user-facing
+                // string here is one Rust authors, which AGENTS.md reserves
+                // for the locale catalogs, so this feature adds none. It also
+                // means the self-clearing/action-required split is decided in
+                // exactly one place for both kinds of failure.
+                Some(error_notice_text(
+                    kind,
+                    pr.number,
+                    &super::HostError::Other { message: reason.to_string() },
+                    fail_count,
+                ))
             } else {
                 kind.and_then(|k| judge::notice_text(k, pr.number, &readiness))
                     .map(|text| (NoticeKind::SelfClearing, text))
@@ -256,33 +272,6 @@ async fn apply_probe_result(
 /// retrying; off-by-one-late repeats the ordinary text (and the WRONG,
 /// self-clearing kind) on the exact sweep where tracking silently stops for
 /// good (P1-A: the bug this function exists to prevent from recurring).
-/// The notice for a partial read, escalating on the SAME threshold as a
-/// failed probe (see [`error_notice_text`], whose shape this mirrors) — so a
-/// permanently unreadable axis eventually stops being a self-clearing "still
-/// checking" note and becomes an action-required one.
-fn partial_read_notice_text(
-    kind: Option<HostKind>,
-    pr_number: i32,
-    reason: &str,
-    fail_count: Option<i32>,
-) -> (NoticeKind, String) {
-    let gave_up_now = fail_count.is_some_and(|c| c >= MAX_CONSECUTIVE_PROBE_FAILURES);
-    let abbrev = kind.map_or("PR/MR", |k| k.native_abbrev());
-    if gave_up_now {
-        return (
-            NoticeKind::ActionRequired,
-            format!(
-                "🔌 {abbrev} #{pr_number} 的 review 线程一直读不到({reason}),已经停止重试。\
-                 在解决之前,Weft 不会判定它可以合并。"
-            ),
-        );
-    }
-    (
-        NoticeKind::SelfClearing,
-        format!("🔌 暂时读不到 {abbrev} #{pr_number} 的 review 线程({reason}),仍在重试。"),
-    )
-}
-
 fn error_notice_text(
     kind: Option<HostKind>,
     pr_number: i32,
@@ -495,22 +484,24 @@ mod tests {
     /// action-required. Without the second half, a permanently unreadable
     /// axis leaves the human with a "still checking" note forever while the
     /// underlying request fails every single sweep.
+    ///
+    /// Goes through `error_notice_text` — the SAME function a failed probe
+    /// uses — because a partial read must not introduce a parallel set of
+    /// user-facing sentences (Codex review round 3 P1: every string Rust
+    /// authors here is one AGENTS.md reserves for the locale catalogs).
     #[test]
     fn a_partial_read_notice_escalates_to_action_required_at_the_give_up_threshold() {
-        let (kind, text) = partial_read_notice_text(
+        let as_error = super::super::HostError::Other { message: "no access".to_string() };
+        let (kind, text) = error_notice_text(
             Some(HostKind::GitHub),
             9,
-            "no access",
+            &as_error,
             Some(MAX_CONSECUTIVE_PROBE_FAILURES - 1),
         );
         assert_eq!(kind, NoticeKind::SelfClearing, "still retrying: {text}");
 
-        let (kind, escalated) = partial_read_notice_text(
-            Some(HostKind::GitHub),
-            9,
-            "no access",
-            Some(MAX_CONSECUTIVE_PROBE_FAILURES),
-        );
+        let (kind, escalated) =
+            error_notice_text(Some(HostKind::GitHub), 9, &as_error, Some(MAX_CONSECUTIVE_PROBE_FAILURES));
         assert_eq!(kind, NoticeKind::ActionRequired, "gave up: {escalated}");
         assert_ne!(
             text, escalated,

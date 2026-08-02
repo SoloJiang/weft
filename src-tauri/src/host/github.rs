@@ -174,8 +174,16 @@ fn fetch_review_threads(target: &PrTarget) -> ThreadStatus {
         Err(e) => return ThreadStatus::Unknown { reason: format!("could not run gh: {e}") },
     };
     if !out.status.success() {
+        // A signal-killed `gh` writes no stderr at all, and an empty reason is
+        // not merely unhelpful: `last_error == ""` is that column's sentinel
+        // for "no error", so a blank one would leave a row whose failure
+        // streak is climbing while its error column reads clean (Codex review
+        // round 3 P2). `store::repo::apply_pull_request_snapshot` refuses a
+        // blank reason as a backstop; this makes the message actually useful.
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return ThreadStatus::Unknown { reason: stderr.trim().to_string() };
+        return ThreadStatus::Unknown {
+            reason: threads_failure_reason(&stderr, &out.status.to_string()),
+        };
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     match parse_review_threads_json(&stdout) {
@@ -364,6 +372,25 @@ struct RawThreadsPage {
     data: Option<RawThreadsData>,
     #[serde(default)]
     errors: Vec<serde_json::Value>,
+}
+
+/// The diagnostic for a non-zero `gh api graphql` exit. Pure, so the
+/// empty-stderr branch is a unit test rather than a code path that only
+/// appears when someone signals the process.
+///
+/// `gh` killed by a signal writes no stderr at all, and an empty reason is
+/// not merely unhelpful: `last_error == ""` is that column's sentinel for "no
+/// error", so a blank one produces a row whose failure streak is climbing
+/// while its error column reads clean (Codex review round 3 P2).
+/// `store::repo::apply_pull_request_snapshot` refuses a blank reason as a
+/// structural backstop; this is what makes the message actually useful, by
+/// falling back to the exit status the caller does still have.
+fn threads_failure_reason(stderr: &str, status: &str) -> String {
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return format!("gh api graphql failed without writing any diagnostic ({status})");
+    }
+    stderr.to_string()
 }
 
 /// Reduce a `gh api graphql --paginate` response to one [`ThreadStatus`].
@@ -753,6 +780,24 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// A failure that wrote no stderr must still say something — a blank
+    /// reason is indistinguishable from "no error" in the column it lands in.
+    #[test]
+    fn a_thread_query_failure_without_stderr_still_carries_a_diagnostic() {
+        for blank in ["", "   ", "\n\t"] {
+            let reason = threads_failure_reason(blank, "signal: 9 (SIGKILL)");
+            assert!(!reason.trim().is_empty(), "stderr={blank:?} produced a blank reason");
+            assert!(
+                reason.contains("signal: 9"),
+                "must fall back to the exit status the caller still has: {reason}"
+            );
+        }
+        // Real stderr is passed through, trimmed, and does NOT get the
+        // fallback bolted on.
+        let reason = threads_failure_reason("  HTTP 403: Resource not accessible\n", "exit status: 1");
+        assert_eq!(reason, "HTTP 403: Resource not accessible");
     }
 
     // --- reviewThreads: the pagination + parsing trap ---------------------

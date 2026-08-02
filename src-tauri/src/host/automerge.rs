@@ -401,16 +401,21 @@ async fn evaluate_row(
         &snapshot.conflict,
         &upstream,
     );
-    // Same partial-vs-complete bookkeeping the monitor applies: reporting
-    // "complete" here would zero the streak the monitor is accumulating for a
-    // persistently unreadable axis, so the give-up threshold would never be
-    // reached whenever auto-merge happens to be enabled.
+    // This loop persists the axes but is NOT entitled to move the failure
+    // streak in either direction (`StreakUpdate::Leave`). `host::monitor` owns
+    // that bookkeeping because it is the only loop that runs on every row and
+    // the only one that posts the escalation notice — Codex review round 3 P2
+    // showed both ways this goes wrong from here: clearing the streak would
+    // erase what the monitor is accumulating, and incrementing it could carry
+    // a row from 9 to 10, past `list_open_pull_requests`'s threshold, so the
+    // monitor would never see that row again and never post the
+    // action-required notice.
     if let Err(e) = repo::apply_pull_request_snapshot(
         db,
         pr.id,
         &snapshot,
         &fresh_readiness,
-        snapshot.unreadable_axis_error(),
+        repo::StreakUpdate::Leave,
     )
     .await
     {
@@ -587,7 +592,7 @@ async fn maybe_merge_one(
             let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
             let r = judge::merge_readiness(&s.ci, &s.review, &s.threads, &s.conflict, &upstream);
             if let Err(e) =
-                repo::apply_pull_request_snapshot(db, pr.id, s, &r, s.unreadable_axis_error()).await
+                repo::apply_pull_request_snapshot(db, pr.id, s, &r, repo::StreakUpdate::Leave).await
             {
                 eprintln!(
                     "[weft][automerge] pr #{}: could not save confirmation snapshot: {e}",
@@ -1201,7 +1206,7 @@ mod tests {
             threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         };
-        repo::apply_pull_request_snapshot(db, pr.id, &stored, &MergeReadiness::Ready, None)
+        repo::apply_pull_request_snapshot(db, pr.id, &stored, &MergeReadiness::Ready, repo::StreakUpdate::Clear)
             .await
             .unwrap();
         repo::set_setting(db, K_AUTO_MERGE_ENABLED, "1").await.unwrap();
@@ -1267,22 +1272,53 @@ mod tests {
     /// auto-merge happens to be enabled. Both writers derive it from the same
     /// `PrSnapshot::unreadable_axis_error`, and this is what pins that.
     #[tokio::test]
-    async fn a_partial_fresh_read_extends_the_failure_streak_rather_than_clearing_it() {
+    async fn a_partial_fresh_read_leaves_the_monitors_failure_streak_untouched() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let pr = seam_fixture(&db).await;
         let backoff = MergeBackoffState::default();
-        assert_eq!(pr.probe_fail_count, 0, "the fixture starts from a clean streak");
+        assert_eq!(pr.probe_fail_count, 0, "the row this loop LOADED had a clean streak");
 
+        // The reported race, made deterministic: between this loop loading
+        // the row and writing its snapshot, the monitor observed nine
+        // consecutive failures. `apply_pull_request_snapshot` re-reads the
+        // CURRENT row, so an incrementing write here would take it to 10 —
+        // past `list_open_pull_requests`'s threshold — and because only the
+        // monitor posts the action-required notice AND its next query
+        // excludes rows at the threshold, the row would leave monitoring
+        // wearing its stale "still retrying" note, permanently.
+        let threshold = crate::host::monitor::MAX_CONSECUTIVE_PROBE_FAILURES;
+        for _ in 0..(threshold - 1) {
+            repo::mark_pull_request_probe_error(&db, pr.id, "monitor saw this fail").await.unwrap();
+        }
+        assert!(
+            !repo::list_open_pull_requests(&db, threshold).await.unwrap().is_empty(),
+            "still inside the sweep at one below the threshold"
+        );
+
+        // `pr` is deliberately the STALE copy, exactly as the real loop holds
+        // it — its `probe_fail_count` of 0 is what gets it past the
+        // pre-filter in the first place.
         let verdict =
             evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_threads_unknown).await;
         assert_eq!(verdict, RowVerdict::Skip, "an unreadable axis can never authorize a merge");
 
         let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
         assert_eq!(
-            reloaded.probe_fail_count, 1,
-            "the partial read must EXTEND the streak, not reset it"
+            reloaded.probe_fail_count,
+            threshold - 1,
+            "this loop must not move the streak in EITHER direction — not clear it (which would \
+             erase what the monitor is accumulating) and not extend it (which would push the row \
+             out of the sweep with no escalation notice ever posted)"
         );
-        assert_eq!(reloaded.last_error, "no access", "and keep the diagnostic visible");
+        assert_eq!(
+            reloaded.last_error, "monitor saw this fail",
+            "and must not overwrite the monitor's diagnostic"
+        );
+        assert!(
+            !repo::list_open_pull_requests(&db, threshold).await.unwrap().is_empty(),
+            "the row must still be swept, so the monitor can reach the threshold itself and \
+             actually post the action-required notice"
+        );
         // The readable axes still landed — that is why a partial read is
         // persisted at all rather than thrown away.
         assert_eq!(reloaded.head_sha, "fresh_sha_threads_unknown");
