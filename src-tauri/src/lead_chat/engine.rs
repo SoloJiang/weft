@@ -202,6 +202,18 @@ pub enum Push {
 /// 进行中 turn 最多排队多少条人类消息（满后 send 拒绝入队）。
 pub const MAX_QUEUED: usize = 5;
 
+const HIDDEN_DELIVERY_TAG_PREFIX: &str = "__weft_hidden_delivery:";
+
+fn hidden_delivery_tag(delivery_id: i32) -> String {
+    format!("{HIDDEN_DELIVERY_TAG_PREFIX}{delivery_id}")
+}
+
+fn hidden_delivery_id_from_tag(tag: Option<&str>) -> Option<i32> {
+    tag.and_then(|value| value.strip_prefix(HIDDEN_DELIVERY_TAG_PREFIX))
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|value| *value > 0)
+}
+
 /// One outbound human message: text plus optional image attachments
 /// (media_type, base64). Queued whole while a turn is running.
 #[derive(Clone, Default)]
@@ -449,6 +461,13 @@ fn hidden_delivery(tool: &str, busy: bool, has_stdin: bool, stopped: bool) -> Hi
 }
 
 fn mark_hidden_turn_started(inner: &mut EngineInner) -> i32 {
+    mark_hidden_turn_started_with_delivery(inner, None)
+}
+
+fn mark_hidden_turn_started_with_delivery(
+    inner: &mut EngineInner,
+    hidden_delivery_id: Option<i32>,
+) -> i32 {
     let _ = inner.turn.try_begin_send();
     inner.turn_id += 1;
     inner.clock.begin_turn();
@@ -459,7 +478,11 @@ fn mark_hidden_turn_started(inner: &mut EngineInner) -> i32 {
     // last. Left stale, it would misattribute this turn's outcome to that old
     // row: the rewind anchor (`set_lead_message_anchor` on TurnEnd) and the
     // "consumed" receipt (`note_turn_activity`) both key off `turn_user_row`.
-    inner.turn_user_row = None;
+    // A negative marker occupies the existing pointer without ever being
+    // mistaken for a lead_message id. It lets the activity receipt follow a
+    // hidden delivery through the same queue/dequeue bookkeeping as visible
+    // turns while preserving the rewind anchor's `None` semantics.
+    inner.turn_user_row = hidden_delivery_id.map(|id| -id);
     inner.turn_id
 }
 
@@ -476,6 +499,7 @@ fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> Option<Vec
     let drained: Vec<i32> = inner.turn.queue.iter().filter_map(|o| o.queue_id).collect();
     inner.turn.queue.clear();
     inner.current_origin_tag = None;
+    inner.turn_user_row = None;
     inner.child = None;
     // Dropping `child` kills it (kill_on_drop), so its session_gate slot must go
     // with it — see `child_permit`'s doc for the leak this closes.
@@ -633,6 +657,29 @@ fn note_turn_activity(app: &AppHandle, db: &Db, eng: &EngineRef, inner: &mut Eng
     let Some(message_id) = inner.turn_user_row else {
         return;
     };
+    if message_id < 0 {
+        let delivery_id = -message_id;
+        let db = db.clone();
+        let eng = eng.clone();
+        tauri::async_runtime::spawn(async move {
+            match repo::consume_lead_hidden_delivery(&db, delivery_id).await {
+                Ok(Some(_)) | Ok(None) => {
+                    let mut i = eng.lock().await;
+                    if i.turn_user_row == Some(-delivery_id) {
+                        i.turn_user_row = None;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[weft] consume hidden delivery failed: {e}");
+                    let mut i = eng.lock().await;
+                    if i.turn_user_row == Some(-delivery_id) {
+                        i.clock.rearm_consumed_gate();
+                    }
+                }
+            }
+        });
+        return;
+    }
     let app = app.clone();
     let db = db.clone();
     let eng = eng.clone();
@@ -717,8 +764,13 @@ fn hidden_turn_admissible(inner: &EngineInner) -> bool {
     !inner.stopped && !inner.tearing_down
 }
 
-async fn begin_hidden_turn(app: &AppHandle, db: &Db, inner: &mut EngineInner) -> i32 {
-    let turn_id = mark_hidden_turn_started(inner);
+async fn begin_hidden_turn(
+    app: &AppHandle,
+    db: &Db,
+    inner: &mut EngineInner,
+    hidden_delivery_id: Option<i32>,
+) -> i32 {
+    let turn_id = mark_hidden_turn_started_with_delivery(inner, hidden_delivery_id);
     crate::power::on_turn_began(app);
     // Hidden delivery is a turn-start too, so persist `running`; otherwise a
     // crash mid-action can leave stale `idle` state and skip boot revive.
@@ -1387,6 +1439,7 @@ async fn cleanup_disconnected_turn(
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
     inner.current_origin_tag = None;
+    inner.turn_user_row = None;
     inner.stopped = true;
     // This reset carries STOP semantics (stopped=true, queued rows finalized), so
     // in-flight sends racing Phase 1→3 must die with it: bump the epoch, exactly
@@ -2233,6 +2286,7 @@ async fn ensure_running_locked(
     inner.generation += 1;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
+    inner.turn_user_row = None;
     inner.current = None;
     inner.interrupting = false;
     Ok(Some((stdout, inner.generation, program)))
@@ -2619,8 +2673,13 @@ fn promote_queued_reservation(inner: &mut EngineInner, origin_tag: Option<String
 /// EXTRA dialect-specific resets (e.g. claude's `last_assistant_uuid`, codex
 /// app-server's `turn_saw_text`) alongside this call.
 fn advance_dequeued_turn(inner: &mut EngineInner, next: &Option<Outgoing>) {
-    inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
-    inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
+    inner.turn_user_row = next
+        .as_ref()
+        .and_then(|n| n.queue_id.or_else(|| hidden_delivery_id_from_tag(n.origin_tag.as_deref()).map(|id| -id)));
+    inner.current_origin_tag = next
+        .as_ref()
+        .and_then(|n| n.origin_tag.clone())
+        .filter(|tag| hidden_delivery_id_from_tag(Some(tag)).is_none());
 }
 
 /// Send a human message: optimistic-persist + either write through or queue.
@@ -4045,10 +4104,9 @@ async fn acp_emit_turn_end(
             }
         }
         let next = inner.turn.on_turn_end();
-        inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
+        advance_dequeued_turn(&mut inner, &next);
         inner.last_assistant_uuid = None;
         inner.turn_saw_text = false;
-        inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
         let next_turn_id = if next.is_some() {
             inner.turn_id += 1;
             Some(inner.turn_id)
@@ -4980,7 +5038,9 @@ async fn codex_consumer(
                 // write nothing — the previous completed turn's anchor stands.
                 if status == "complete" {
                     if let (Some(row), Some(anchor)) = (inner.turn_user_row, finished_turn) {
-                        let _ = repo::set_lead_message_anchor(&db, row, &anchor).await;
+                        if row > 0 {
+                            let _ = repo::set_lead_message_anchor(&db, row, &anchor).await;
+                        }
                     }
                 }
                 // An interrupted/failed turn can leave a tool row whose
@@ -5847,7 +5907,16 @@ pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> any
 /// racing user send can't slip a turn in ahead of the read — even when the
 /// resident process has to be spawned first.
 pub async fn nudge_bus_read(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
-    send_hidden_inner(app, db, eng, BUS_WAKE_PROMPT.to_string(), true, true, None)
+    send_hidden_inner(
+        app,
+        db,
+        eng,
+        BUS_WAKE_PROMPT.to_string(),
+        true,
+        true,
+        None,
+        None,
+    )
         .await
         .map(|_| ())
 }
@@ -5862,9 +5931,43 @@ pub async fn send_hidden_existing(
     eng: &EngineRef,
     text: String,
 ) -> anyhow::Result<()> {
-    send_hidden_inner(app, db, eng, text, false, false, None)
+    send_hidden_inner(app, db, eng, text, false, false, None, None)
         .await
         .map(|_| ())
+}
+
+/// Deliver one durable hidden row. The id is carried through queue/dequeue
+/// state so hydration and retry cannot enqueue the same source twice while a
+/// turn is still active.
+pub async fn send_hidden_delivery_existing(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    text: String,
+    delivery_id: i32,
+    revive_stopped: bool,
+) -> anyhow::Result<bool> {
+    let Some(row) = crate::store::repo::get_lead_hidden_delivery(db, delivery_id).await? else {
+        return Ok(false);
+    };
+    if row.state == crate::store::repo::LEAD_HIDDEN_DELIVERY_CONSUMED {
+        return Ok(true);
+    }
+    if revive_stopped {
+        eng.lock().await.stopped = false;
+        ensure_running(app, db, eng).await?;
+    }
+    send_hidden_inner(
+        app,
+        db,
+        eng,
+        text,
+        false,
+        false,
+        None,
+        Some(delivery_id),
+    )
+    .await
 }
 
 /// Deliver a plan approval only if the same card is still actionable at the
@@ -5889,6 +5992,7 @@ pub async fn send_plan_approval_existing(
         false,
         true,
         Some((thread_id, message_id, allow_proposed_scope)),
+        None,
     )
     .await
 }
@@ -5907,6 +6011,7 @@ async fn send_hidden_inner(
     bus_read: bool,
     ensure: bool,
     plan_guard: Option<(i32, i32, bool)>,
+    hidden_delivery_id: Option<i32>,
 ) -> anyhow::Result<bool> {
     let _engine_admission = engine_admission_guard(app, db, eng).await?;
     if let Err(err) = crate::process_quota::admit_new_work(app) {
@@ -5916,6 +6021,15 @@ async fn send_hidden_inner(
         return Err(err);
     }
     let mut inner = eng.lock().await;
+    if let Some(delivery_id) = hidden_delivery_id {
+        let queued = inner.turn.queue.iter().any(|out| {
+            hidden_delivery_id_from_tag(out.origin_tag.as_deref()) == Some(delivery_id)
+        });
+        let current = inner.turn_user_row == Some(-delivery_id);
+        if queued || current {
+            return Ok(true);
+        }
+    }
     // Same reservation the visible path honours via `send_reservation_valid`,
     // which hidden delivery does not go through. A guarded plan approval may
     // revive a stopped lead, but only AFTER the exact card has passed the final
@@ -5970,7 +6084,7 @@ async fn send_hidden_inner(
         text,
         images: vec![],
         tracked: false,
-        origin_tag: None,
+        origin_tag: hidden_delivery_id.map(hidden_delivery_tag),
         queue_id: None,
         has_attachments: false,
     };
@@ -5999,7 +6113,7 @@ async fn send_hidden_inner(
             Ok(true)
         }
         HiddenDelivery::WriteResident => {
-            let turn_id = begin_hidden_turn(app, db, &mut inner).await;
+            let turn_id = begin_hidden_turn(app, db, &mut inner, hidden_delivery_id).await;
             if let Err(e) = write_user(&mut inner, &out).await {
                 drop(inner);
                 rollback_failed_turn(app, db, eng, turn_id, "error").await;
@@ -6013,7 +6127,7 @@ async fn send_hidden_inner(
             // on the same thread. ACP tools similarly stay on the ACP runtime.
             let codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
             let acp = is_acp_tool(&inner.tool);
-            let turn_id = begin_hidden_turn(app, db, &mut inner).await;
+            let turn_id = begin_hidden_turn(app, db, &mut inner, hidden_delivery_id).await;
             // Captured under the lock: a stop-then-restart before the spawn task
             // runs clears `stopped` but bumps the epoch — a canceled hidden turn
             // (bus read / tool-result nudge) must not launch on the restarted
@@ -6284,6 +6398,7 @@ fn reset_ignored_cancel_turn(inner: &mut EngineInner, turn_id: i32) -> Option<Ca
     let turn_saw_text = inner.turn_saw_text;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
+    inner.turn_user_row = None;
     inner.turn_saw_text = false;
     inner.interrupting = false;
     inner.current_origin_tag = None;
@@ -6443,6 +6558,7 @@ pub async fn stop_quiet(eng: &EngineRef) -> StopQuietOutcome {
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
+    inner.turn_user_row = None;
     // A hard stop ends the turn: clear the per-turn text marker, or the NEXT
     // turn inherits a stale true and a pre-output failure there would wrongly
     // suppress its error_before_output row.
@@ -7749,7 +7865,9 @@ fn spawn_reader(
                         if let (Some(row), Some(anchor)) =
                             (inner.turn_user_row, inner.last_assistant_uuid.clone())
                         {
-                            let _ = repo::set_lead_message_anchor(&db, row, &anchor).await;
+                            if row > 0 {
+                                let _ = repo::set_lead_message_anchor(&db, row, &anchor).await;
+                            }
                         }
                     }
                     // Finalize any tool rows still awaiting a result — an
@@ -8090,6 +8208,7 @@ fn spawn_reader(
             inner.stdin = None;
             inner.turn = TurnState::default();
             inner.clock = TurnClock::default();
+            inner.turn_user_row = None;
             // The turn is unconditionally reset to idle here; persist that so a
             // resident-process death (incl. interrupt→kill) doesn't leave the row
             // stuck "running" and falsely revive an engine on the next boot.
@@ -9760,7 +9879,8 @@ mod tests {
         let mut inner = test_inner("claude");
         inner.current_origin_tag = Some("im-reply-target".into());
 
-        let turn_id = mark_hidden_turn_started(&mut inner);
+        let turn_id = mark_hidden_turn_started_with_delivery(&mut inner, Some(9));
+        assert_eq!(inner.turn_user_row, Some(-9));
 
         assert!(inner.turn.busy);
         assert_eq!(turn_id, 1);
@@ -9781,7 +9901,8 @@ mod tests {
             queue_id: None,
             has_attachments: false,
         });
-        let turn_id = mark_hidden_turn_started(&mut inner);
+        let turn_id = mark_hidden_turn_started_with_delivery(&mut inner, Some(9));
+        assert_eq!(inner.turn_user_row, Some(-9));
 
         assert!(reset_failed_hidden_turn(&mut inner, turn_id).is_some());
 
@@ -9794,6 +9915,7 @@ mod tests {
         assert!(inner.current_origin_tag.is_none());
         assert!(inner.current.is_none());
         assert!(!inner.interrupting);
+        assert_eq!(inner.turn_user_row, None);
     }
 
     #[test]

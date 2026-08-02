@@ -1,7 +1,8 @@
 use crate::store::entities::{
     app_setting, backup_config, code_checkpoint, direction, human_card_terminal_outbox,
-    human_request, im_route, lead_message, plan, pull_request, repo_action_execution, repo_profile,
-    repo_ref, session, skill_enable, skill_source, test_plan, thread, workspace, worktree,
+    human_request, im_route, lead_hidden_delivery, lead_message, plan, pull_request,
+    repo_action_execution, repo_profile, repo_ref, session, skill_enable, skill_source, test_plan,
+    thread, workspace, worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -63,6 +64,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0049HumanRequestImRoutes),
             Box::new(M0050HumanCardTerminalOutbox),
             Box::new(M0051RepoActionExecution),
+            Box::new(M0052LeadHiddenDelivery),
         ]
     }
 }
@@ -2320,6 +2322,59 @@ impl MigrationTrait for M0051RepoActionExecution {
             .await
     }
 }
+
+/// Durable hidden lead input. Source rows deliberately remain unreferenced so
+/// a stopped/crashed engine can replay a plan decision or repo feedback after
+/// the originating card/repository has been cleaned up.
+pub struct M0052LeadHiddenDelivery;
+impl MigrationName for M0052LeadHiddenDelivery {
+    fn name(&self) -> &str {
+        "m0052_lead_hidden_delivery"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0052LeadHiddenDelivery {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut statement = schema.create_table_from_entity(lead_hidden_delivery::Entity);
+        statement.if_not_exists();
+        manager.create_table(statement).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_lead_hidden_delivery_dedupe")
+                    .table(Alias::new("lead_hidden_delivery"))
+                    .col(Alias::new("dedupe_key"))
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_lead_hidden_delivery_pending")
+                    .table(Alias::new("lead_hidden_delivery"))
+                    .col(Alias::new("thread_id"))
+                    .col(Alias::new("state"))
+                    .col(Alias::new("id"))
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("lead_hidden_delivery"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
 #[async_trait::async_trait]
 impl MigrationTrait for M0045PullRequest {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -2361,6 +2416,7 @@ mod tests {
         gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest,
         M0046DirectionUpstream, M0047HumanRequest, M0048HumanRequestSourceMessage,
         M0049HumanRequestImRoutes, M0050HumanCardTerminalOutbox, M0051RepoActionExecution,
+        M0052LeadHiddenDelivery,
     };
 
     #[test]
@@ -2990,6 +3046,74 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert!(indexes.contains("idx_repo_action_execution_message"));
         assert!(indexes.contains("idx_repo_action_execution_token"));
+    }
+
+    #[tokio::test]
+    async fn m0052_hidden_delivery_is_rerunnable_and_deduped() {
+        use crate::store::repo;
+        use crate::store::Db;
+        use sea_orm::{ConnectionTrait, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let manager = SchemaManager::new(&db.0);
+        M0052LeadHiddenDelivery.up(&manager).await.unwrap();
+        M0052LeadHiddenDelivery.up(&manager).await.unwrap();
+        let workspace = repo::create_workspace(&db, "m0052").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let first = repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "plan_decision",
+            7,
+            "plan_decision:7",
+            r#"{"tool":"plan_decision","message_id":7}"#,
+        )
+        .await
+        .unwrap();
+        let second = repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "plan_decision",
+            7,
+            "plan_decision:7",
+            r#"{"tool":"plan_decision","message_id":7}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            repo::list_pending_lead_hidden_deliveries(&db, Some(thread.id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "test_cases_updated",
+            8,
+            "test_cases_updated:8",
+            r#"{"tool":"test_cases_updated"}"#,
+        )
+        .await
+        .is_err());
+        let columns = db
+            .0
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "PRAGMA table_info(lead_hidden_delivery)".to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(columns.contains("dedupe_key"));
+        assert!(columns.contains("state"));
     }
 
     /// M0037: code_checkpoint exists after migration and round-trips a row.

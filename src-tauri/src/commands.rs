@@ -1399,6 +1399,18 @@ where
     if !deliver(current.thread_id, payload).await? {
         return Ok(false);
     }
+    if let Some(hidden) = repo::get_lead_hidden_delivery_by_dedupe(
+        db,
+        &format!("repo_action:{}", current.id),
+    )
+    .await
+    .map_err(e)?
+    {
+        // `post_lead_tool_result_inner` has durably accepted the payload, but
+        // this is not a delivery receipt. The engine's first activity consumes
+        // the hidden row and advances feedback_state in one transaction.
+        return Ok(hidden.state == repo::LEAD_HIDDEN_DELIVERY_CONSUMED);
+    }
     repo::mark_repo_action_feedback_delivered(db, current.id, &current.execution_token)
         .await
         .map_err(e)?;
@@ -4897,6 +4909,20 @@ mod tests {
         .await
         .unwrap();
         let execution_id = completed.execution_id.unwrap();
+        let journal = repo::get_repo_action_execution_by_id(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let hidden = repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "repo_action",
+            execution_id,
+            &format!("repo_action:{execution_id}"),
+            &journal.feedback_payload,
+        )
+        .await
+        .unwrap();
         let feedback_locks = lock_repo_action_cleanups(
             &db,
             repo::pending_repo_action_feedback_for_repo(&db, completed.repo.id)
@@ -4913,28 +4939,41 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(retained.feedback_state, repo::REPO_ACTION_FEEDBACK_PENDING);
+        assert_eq!(
+            repo::get_lead_hidden_delivery(&db, hidden.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            repo::LEAD_HIDDEN_DELIVERY_PENDING
+        );
         assert!(repo::get_repo(&db, completed.repo.id)
             .await
             .unwrap()
             .is_none());
         drop(feedback_locks);
 
-        let deliveries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let delivered = deliveries.clone();
-        assert!(drain_repo_action_feedback_with(
-            &db,
-            execution_id,
-            move |delivered_thread, payload| async move {
-                assert_eq!(delivered_thread, thread.id);
-                assert_eq!(payload["execution_id"], execution_id);
-                delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(true)
-            },
-        )
-        .await
-        .unwrap());
-        assert_eq!(deliveries.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A repo delete cannot discard a pending feedback journal or its
+        // hidden outbox row. The engine's first activity is the receipt: both
+        // durable states advance in one transaction, and a missing repo then
+        // permits the completed execution to be cleaned up atomically.
+        assert!(repo::consume_lead_hidden_delivery(&db, hidden.id)
+            .await
+            .unwrap()
+            .is_some());
         assert!(repo::get_repo_action_execution_by_id(&db, execution_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            repo::get_lead_hidden_delivery(&db, hidden.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            repo::LEAD_HIDDEN_DELIVERY_CONSUMED
+        );
+        assert!(repo::consume_lead_hidden_delivery(&db, hidden.id)
             .await
             .unwrap()
             .is_none());

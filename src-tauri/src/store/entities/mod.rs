@@ -5,6 +5,7 @@ pub mod direction;
 pub mod human_card_terminal_outbox;
 pub mod human_request;
 pub mod im_route;
+pub mod lead_hidden_delivery;
 pub mod lead_message;
 pub mod plan;
 pub mod pull_request;

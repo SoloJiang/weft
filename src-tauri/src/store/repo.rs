@@ -2,7 +2,8 @@
 
 use super::entities::{
     app_setting, code_checkpoint, direction, human_card_terminal_outbox, human_request, im_route,
-    lead_message, plan, pull_request, repo_action_execution, repo_profile, repo_ref, session,
+    lead_hidden_delivery, lead_message, plan, pull_request, repo_action_execution, repo_profile,
+    repo_ref, session,
     skill_enable, skill_source, test_plan, thread, workspace, worktree,
 };
 use super::Db;
@@ -163,6 +164,19 @@ pub async fn list_human_card_terminal_outbox(
         .await?)
 }
 
+pub async fn list_human_card_terminal_outbox_for_channel_account(
+    db: &Db,
+    channel: &str,
+    account: &str,
+) -> Result<Vec<human_card_terminal_outbox::Model>> {
+    Ok(human_card_terminal_outbox::Entity::find()
+        .filter(human_card_terminal_outbox::Column::Channel.eq(channel))
+        .filter(human_card_terminal_outbox::Column::Account.eq(account))
+        .order_by_asc(human_card_terminal_outbox::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
 pub async fn list_pending_human_card_terminal_outbox(
     db: &Db,
     channel: &str,
@@ -212,6 +226,245 @@ pub async fn mark_human_card_terminal_outbox_delivered(
         .exec(&db.0)
         .await?;
     Ok(updated.rows_affected == 1)
+}
+
+pub const LEAD_HIDDEN_DELIVERY_PENDING: &str = "pending";
+pub const LEAD_HIDDEN_DELIVERY_CONSUMED: &str = "consumed";
+
+/// Insert-or-load one durable hidden lead delivery. Only source kinds with a
+/// stable source row identity are accepted; ordinary feedback stays ephemeral.
+/// The dedupe key is the application-level idempotency boundary: retries and
+/// concurrent clicks must reuse the original row and payload rather than
+/// enqueue a second turn.
+pub async fn enqueue_lead_hidden_delivery(
+    db: &Db,
+    thread_id: i32,
+    source_kind: &str,
+    source_id: i32,
+    dedupe_key: &str,
+    payload: &str,
+) -> Result<lead_hidden_delivery::Model> {
+    enqueue_lead_hidden_delivery_on(
+        &db.0,
+        thread_id,
+        source_kind,
+        source_id,
+        dedupe_key,
+        payload,
+    )
+    .await
+}
+
+async fn enqueue_lead_hidden_delivery_on<C: ConnectionTrait>(
+    connection: &C,
+    thread_id: i32,
+    source_kind: &str,
+    source_id: i32,
+    dedupe_key: &str,
+    payload: &str,
+) -> Result<lead_hidden_delivery::Model> {
+    if thread_id <= 0
+        || source_id <= 0
+        || !matches!(source_kind, "plan_decision" | "repo_action")
+        || dedupe_key.trim().is_empty()
+        || payload.trim().is_empty()
+    {
+        anyhow::bail!("invalid hidden lead delivery identity");
+    }
+    let timestamp = now();
+    lead_hidden_delivery::Entity::insert(lead_hidden_delivery::ActiveModel {
+        id: NotSet,
+        thread_id: Set(thread_id),
+        source_kind: Set(source_kind.to_string()),
+        source_id: Set(source_id),
+        dedupe_key: Set(dedupe_key.to_string()),
+        payload: Set(payload.to_string()),
+        state: Set(LEAD_HIDDEN_DELIVERY_PENDING.to_string()),
+        created_at: Set(timestamp.clone()),
+        updated_at: Set(timestamp),
+    })
+    .on_conflict(
+        OnConflict::column(lead_hidden_delivery::Column::DedupeKey)
+            .do_nothing()
+            .to_owned(),
+    )
+    .exec_without_returning(connection)
+    .await?;
+    let row = lead_hidden_delivery::Entity::find()
+        .filter(lead_hidden_delivery::Column::DedupeKey.eq(dedupe_key))
+        .one(connection)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("hidden lead delivery disappeared after enqueue"))?;
+    if row.thread_id != thread_id
+        || row.source_kind != source_kind
+        || row.source_id != source_id
+        || row.payload != payload
+    {
+        anyhow::bail!("hidden lead delivery identity changed");
+    }
+    Ok(row)
+}
+
+pub async fn get_lead_hidden_delivery(
+    db: &Db,
+    delivery_id: i32,
+) -> Result<Option<lead_hidden_delivery::Model>> {
+    Ok(lead_hidden_delivery::Entity::find_by_id(delivery_id)
+        .one(&db.0)
+        .await?)
+}
+
+pub async fn get_lead_hidden_delivery_by_dedupe(
+    db: &Db,
+    dedupe_key: &str,
+) -> Result<Option<lead_hidden_delivery::Model>> {
+    Ok(lead_hidden_delivery::Entity::find()
+        .filter(lead_hidden_delivery::Column::DedupeKey.eq(dedupe_key))
+        .one(&db.0)
+        .await?)
+}
+
+pub async fn list_pending_lead_hidden_deliveries(
+    db: &Db,
+    thread_id: Option<i32>,
+) -> Result<Vec<lead_hidden_delivery::Model>> {
+    let query = lead_hidden_delivery::Entity::find()
+        .filter(lead_hidden_delivery::Column::State.eq(LEAD_HIDDEN_DELIVERY_PENDING))
+        .order_by_asc(lead_hidden_delivery::Column::Id);
+    let query = match thread_id {
+        Some(thread_id) => query.filter(lead_hidden_delivery::Column::ThreadId.eq(thread_id)),
+        None => query,
+    };
+    Ok(query.all(&db.0).await?)
+}
+
+/// A thread/workspace rewind or deletion must suppress hidden inputs in the
+/// same transaction as the timeline mutation. No stale engine may replay a
+/// decision after its owning conversation has been removed.
+pub async fn delete_lead_hidden_deliveries_for_thread_on<C: ConnectionTrait>(
+    connection: &C,
+    thread_id: i32,
+) -> Result<u64> {
+    Ok(lead_hidden_delivery::Entity::delete_many()
+        .filter(lead_hidden_delivery::Column::ThreadId.eq(thread_id))
+        .exec(connection)
+        .await?
+        .rows_affected)
+}
+
+pub async fn delete_lead_hidden_deliveries_for_thread(
+    db: &Db,
+    thread_id: i32,
+) -> Result<u64> {
+    delete_lead_hidden_deliveries_for_thread_on(&db.0, thread_id).await
+}
+
+/// Mark a hidden delivery consumed only after the engine reports activity.
+/// Repo-action feedback is advanced in this SAME transaction, so a crash can
+/// leave both durable rows pending but can never publish a delivered receipt
+/// before agent consumption.
+pub async fn consume_lead_hidden_delivery(
+    db: &Db,
+    delivery_id: i32,
+) -> Result<Option<lead_hidden_delivery::Model>> {
+    let txn = db.0.begin().await?;
+    let Some(row) = lead_hidden_delivery::Entity::find_by_id(delivery_id)
+        .one(&txn)
+        .await?
+    else {
+        txn.rollback().await?;
+        return Ok(None);
+    };
+    if row.state == LEAD_HIDDEN_DELIVERY_CONSUMED {
+        if row.source_kind == "repo_action" {
+            if let Some(execution) = repo_action_execution::Entity::find_by_id(row.source_id)
+                .one(&txn)
+                .await?
+            {
+                if execution.feedback_state == REPO_ACTION_FEEDBACK_PENDING {
+                    txn.rollback().await?;
+                    anyhow::bail!(
+                        "consumed hidden lead delivery has pending repo action feedback"
+                    );
+                }
+            }
+        }
+        txn.rollback().await?;
+        return Ok(None);
+    }
+    let updated = lead_hidden_delivery::Entity::update_many()
+        .col_expr(
+            lead_hidden_delivery::Column::State,
+            Expr::value(LEAD_HIDDEN_DELIVERY_CONSUMED),
+        )
+        .col_expr(
+            lead_hidden_delivery::Column::UpdatedAt,
+            Expr::value(now()),
+        )
+        .filter(lead_hidden_delivery::Column::Id.eq(delivery_id))
+        .filter(lead_hidden_delivery::Column::State.eq(LEAD_HIDDEN_DELIVERY_PENDING))
+        .exec(&txn)
+        .await?;
+    if updated.rows_affected != 1 {
+        txn.rollback().await?;
+        anyhow::bail!("hidden lead delivery consumption CAS lost");
+    }
+    if row.source_kind == "repo_action" {
+        let Some(execution) = repo_action_execution::Entity::find_by_id(row.source_id)
+            .one(&txn)
+            .await?
+        else {
+            txn.rollback().await?;
+            anyhow::bail!("repo action feedback journal disappeared before receipt");
+        };
+        if execution.status != REPO_ACTION_COMPLETED {
+            txn.rollback().await?;
+            anyhow::bail!("repo action feedback is not completed");
+        }
+        if execution.feedback_state == REPO_ACTION_FEEDBACK_PENDING {
+            let feedback = repo_action_execution::Entity::update_many()
+                .col_expr(
+                    repo_action_execution::Column::FeedbackState,
+                    Expr::value(REPO_ACTION_FEEDBACK_DELIVERED),
+                )
+                .col_expr(repo_action_execution::Column::UpdatedAt, Expr::value(now()))
+                .filter(repo_action_execution::Column::Id.eq(row.source_id))
+                .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_COMPLETED))
+                .filter(
+                    repo_action_execution::Column::FeedbackState.eq(REPO_ACTION_FEEDBACK_PENDING),
+                )
+                .exec(&txn)
+                .await?;
+            if feedback.rows_affected != 1 {
+                txn.rollback().await?;
+                anyhow::bail!("repo action feedback receipt CAS lost");
+            }
+        } else if execution.feedback_state != REPO_ACTION_FEEDBACK_DELIVERED {
+            txn.rollback().await?;
+            anyhow::bail!("repo action feedback state is not pending");
+        }
+        if repo_ref::Entity::find_by_id(execution.repo_id)
+            .one(&txn)
+            .await?
+            .is_none()
+        {
+            repo_action_execution::Entity::delete_many()
+                .filter(repo_action_execution::Column::Id.eq(execution.id))
+                .filter(
+                    repo_action_execution::Column::ExecutionToken
+                        .eq(&execution.execution_token),
+                )
+                .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_COMPLETED))
+                .filter(
+                    repo_action_execution::Column::FeedbackState
+                        .eq(REPO_ACTION_FEEDBACK_DELIVERED),
+                )
+                .exec(&txn)
+                .await?;
+        }
+    }
+    txn.commit().await?;
+    Ok(Some(row))
 }
 
 fn same_human_request_im_route(left: &HumanRequestImRoute, right: &HumanRequestImRoute) -> bool {
@@ -3542,6 +3795,24 @@ pub async fn delete_repo_cascade_with_human_cancellations(
         .filter(pr_scope)
         .exec(&txn)
         .await?;
+    let deleted_repo_action_ids = repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::RepoId.eq(repo_id))
+        .filter(repo_action_execution::Column::FeedbackState.ne(REPO_ACTION_FEEDBACK_PENDING))
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|execution| execution.id)
+        .collect::<Vec<_>>();
+    if !deleted_repo_action_ids.is_empty() {
+        lead_hidden_delivery::Entity::delete_many()
+            .filter(lead_hidden_delivery::Column::SourceKind.eq("repo_action"))
+            .filter(
+                lead_hidden_delivery::Column::SourceId
+                    .is_in(deleted_repo_action_ids),
+            )
+            .exec(&txn)
+            .await?;
+    }
     repo_action_execution::Entity::delete_many()
         .filter(repo_action_execution::Column::RepoId.eq(repo_id))
         .filter(repo_action_execution::Column::FeedbackState.ne(REPO_ACTION_FEEDBACK_PENDING))
@@ -3791,6 +4062,20 @@ async fn delete_workspace_cascade_with_action_cleanups(
             .filter(test_plan::Column::ThreadId.is_in(removed_threads.clone()))
             .exec(&txn)
             .await?;
+        lead_hidden_delivery::Entity::delete_many()
+            .filter(lead_hidden_delivery::Column::ThreadId.is_in(removed_threads.clone()))
+            .exec(&txn)
+            .await?;
+    }
+    let affected_hidden_threads = directions
+        .iter()
+        .map(|direction| direction.thread_id)
+        .collect::<std::collections::HashSet<_>>();
+    if !affected_hidden_threads.is_empty() {
+        lead_hidden_delivery::Entity::delete_many()
+            .filter(lead_hidden_delivery::Column::ThreadId.is_in(affected_hidden_threads))
+            .exec(&txn)
+            .await?;
     }
     let mut pr_scope = Condition::any();
     if !removed_threads.is_empty() {
@@ -3979,6 +4264,10 @@ async fn delete_thread_cascade_with_action_cleanups(
         .await?;
     test_plan::Entity::delete_many()
         .filter(test_plan::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
+    lead_hidden_delivery::Entity::delete_many()
+        .filter(lead_hidden_delivery::Column::ThreadId.eq(thread_id))
         .exec(&txn)
         .await?;
     human_request::Entity::delete_many()
@@ -4654,6 +4943,18 @@ pub async fn rewind_persist_with_repo_actions(
     use sea_orm::TransactionTrait;
     let txn = db.0.begin().await?;
     let deleted_ids = truncate_lead_messages(&txn, thread_id, session_id, from_message_id).await?;
+    let rewind_action_ids = if deleted_ids.is_empty() {
+        Vec::new()
+    } else {
+        repo_action_execution::Entity::find()
+            .filter(repo_action_execution::Column::ThreadId.eq(thread_id))
+            .filter(repo_action_execution::Column::MessageId.is_in(deleted_ids.iter().copied()))
+            .all(&txn)
+            .await?
+            .into_iter()
+            .map(|execution| execution.id)
+            .collect::<Vec<_>>()
+    };
     reconcile_rewound_repo_actions_on(
         &txn,
         thread_id,
@@ -4662,6 +4963,31 @@ pub async fn rewind_persist_with_repo_actions(
         action_rewind_plans,
     )
     .await?;
+    if !deleted_ids.is_empty() {
+        lead_hidden_delivery::Entity::delete_many()
+            .filter(lead_hidden_delivery::Column::ThreadId.eq(thread_id))
+            .filter(
+                Condition::any()
+                    .add(
+                        lead_hidden_delivery::Column::SourceKind
+                            .eq("plan_decision")
+                            .and(
+                                lead_hidden_delivery::Column::SourceId
+                                    .is_in(deleted_ids.iter().copied()),
+                            ),
+                    )
+                    .add(
+                        lead_hidden_delivery::Column::SourceKind
+                            .eq("repo_action")
+                            .and(
+                                lead_hidden_delivery::Column::SourceId
+                                    .is_in(rewind_action_ids),
+                            ),
+                    ),
+            )
+            .exec(&txn)
+            .await?;
+    }
     if let Some(w) = worktree_id {
         truncate_code_checkpoints(&txn, w, &deleted_ids).await?;
     }
@@ -4994,6 +5320,125 @@ pub async fn resolve_action_card(
     let mut a: lead_message::ActiveModel = m.into();
     a.content = Set(v.to_string());
     Ok(Some(a.update(&db.0).await?))
+}
+
+/// Persist a plan approval and resolve its exact actionable card atomically.
+/// The hidden delivery row is the handoff boundary: once this transaction
+/// commits, the card may leave Needs even if the lead process is stopped or
+/// crashes before the agent consumes the decision.
+pub async fn enqueue_plan_decision_and_resolve(
+    db: &Db,
+    thread_id: i32,
+    message_id: i32,
+    allow_proposed_scope: bool,
+) -> Result<Option<(lead_message::Model, lead_hidden_delivery::Model)>> {
+    let txn = db.0.begin().await?;
+    if let Some(existing) = lead_hidden_delivery::Entity::find()
+        .filter(lead_hidden_delivery::Column::DedupeKey.eq(format!("plan_decision:{message_id}")))
+        .one(&txn)
+        .await?
+    {
+        let existing_scope = serde_json::from_str::<serde_json::Value>(&existing.payload)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("allow_proposed_scope")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false);
+        if existing_scope != allow_proposed_scope {
+            txn.rollback().await?;
+            return Ok(None);
+        }
+        let card = lead_message::Entity::find_by_id(message_id).one(&txn).await?;
+        txn.commit().await?;
+        return Ok(card.map(|card| (card, existing)));
+    }
+    let Some(card) = latest_actionable_attention_card_on(&txn, thread_id).await? else {
+        txn.rollback().await?;
+        return Ok(None);
+    };
+    if card.id != message_id
+        || card.kind != "plan_card"
+        || card.role != "assistant"
+        || card.session_id.is_some()
+        || action_card_is_resolved(&card.content)
+    {
+        txn.rollback().await?;
+        return Ok(None);
+    }
+    let has_proposed_scope = plan::Entity::find()
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .one(&txn)
+        .await?
+        .is_some_and(|row| row.status == "proposed" && !row.proposal.trim().is_empty());
+    if has_proposed_scope != allow_proposed_scope {
+        txn.rollback().await?;
+        return Ok(None);
+    }
+    let title = serde_json::from_str::<serde_json::Value>(&card.content)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let payload = serde_json::json!({
+        "tool": "plan_decision",
+        "status": "approved",
+        "title": title,
+        "message_id": message_id,
+        "allow_proposed_scope": allow_proposed_scope,
+    })
+    .to_string();
+    let delivery = enqueue_lead_hidden_delivery_on(
+        &txn,
+        thread_id,
+        "plan_decision",
+        message_id,
+        &format!("plan_decision:{message_id}"),
+        &payload,
+    )
+    .await?;
+
+    let resolved_label = if title.trim().is_empty() {
+        "Plan"
+    } else {
+        title.as_str()
+    };
+    let mut content: serde_json::Value = serde_json::from_str(&card.content)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = content.as_object_mut() {
+        object.insert(
+            "resolved".into(),
+            serde_json::Value::String(resolved_label.to_string()),
+        );
+    }
+    let updated = lead_message::Entity::update_many()
+        .col_expr(
+            lead_message::Column::Content,
+            Expr::value(content.to_string()),
+        )
+        .filter(lead_message::Column::Id.eq(message_id))
+        .filter(lead_message::Column::Kind.eq("plan_card"))
+        .filter(lead_message::Column::Role.eq("assistant"))
+        .filter(lead_message::Column::SessionId.is_null())
+        .filter(lead_message::Column::Status.eq("complete"))
+        .filter(lead_message::Column::Content.eq(card.content.clone()))
+        .exec(&txn)
+        .await?;
+    if updated.rows_affected != 1 {
+        txn.rollback().await?;
+        return Ok(None);
+    }
+    let resolved = lead_message::Entity::find_by_id(message_id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("plan card disappeared while approving"))?;
+    txn.commit().await?;
+    Ok(Some((resolved, delivery)))
 }
 
 pub const REPO_ACTION_PENDING: &str = "pending";
@@ -14304,5 +14749,164 @@ mod tests {
             "probe failure must not blank the last known snapshot"
         );
         assert_eq!(reloaded.last_error, "network blip");
+    }
+
+    #[tokio::test]
+    async fn plan_decision_enqueue_resolve_is_idempotent_and_consumable() {
+        let db = mem().await;
+        let workspace = create_workspace(&db, "hidden-plan").await.unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let card = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "plan_card",
+            r#"{"title":"Ship it","requirements":[],"approach":"","split":[],"risks":[]}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let first = enqueue_plan_decision_and_resolve(&db, thread.id, card.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(action_card_is_resolved(&first.0.content));
+        assert_eq!(first.1.source_kind, "plan_decision");
+        assert_eq!(first.1.source_id, card.id);
+
+        let replay = enqueue_plan_decision_and_resolve(&db, thread.id, card.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.1.id, first.1.id);
+        assert_eq!(
+            list_pending_lead_hidden_deliveries(&db, Some(thread.id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let consumed = consume_lead_hidden_delivery(&db, first.1.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed.id, first.1.id);
+        assert!(
+            list_pending_lead_hidden_deliveries(&db, Some(thread.id))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn secondary_repo_delete_preserves_unrelated_hidden_plan_delivery() {
+        let db = mem().await;
+        let workspace = create_workspace(&db, "hidden-repo").await.unwrap();
+        let keep = add_repo_ref(&db, workspace.id, "keep", "/tmp/hidden-keep", "main", "", true)
+            .await
+            .unwrap();
+        let remove =
+            add_repo_ref(&db, workspace.id, "remove", "/tmp/hidden-remove", "main", "", true)
+                .await
+                .unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        create_direction(
+            &db,
+            thread.id,
+            "remove lane",
+            "codex",
+            remove.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let delivery = enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "plan_decision",
+            123,
+            "plan_decision:123",
+            r#"{"tool":"plan_decision","message_id":123}"#,
+        )
+        .await
+        .unwrap();
+        delete_repo_cascade_with_human_cancellations(&db, remove.id)
+            .await
+            .unwrap();
+        assert!(get_repo(&db, keep.id).await.unwrap().is_some());
+        assert!(get_lead_hidden_delivery(&db, delivery.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn later_rewind_preserves_hidden_delivery_for_retained_plan_card() {
+        let db = mem().await;
+        let workspace = create_workspace(&db, "hidden-rewind").await.unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let retained = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "plan_card",
+            r#"{"title":"Retained"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let cut = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            2,
+            "assistant",
+            "plan_card",
+            r#"{"title":"Abandoned"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let retained_delivery = enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "plan_decision",
+            retained.id,
+            &format!("plan_decision:{}", retained.id),
+            &format!(r#"{{"tool":"plan_decision","message_id":{}}}"#, retained.id),
+        )
+        .await
+        .unwrap();
+        let abandoned_delivery = enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "plan_decision",
+            cut.id,
+            &format!("plan_decision:{}", cut.id),
+            &format!(r#"{{"tool":"plan_decision","message_id":{}}}"#, cut.id),
+        )
+        .await
+        .unwrap();
+        rewind_persist(&db, thread.id, None, cut.id, None, None)
+            .await
+            .unwrap();
+        assert!(get_lead_hidden_delivery(&db, retained_delivery.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_lead_hidden_delivery(&db, abandoned_delivery.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

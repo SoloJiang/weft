@@ -646,6 +646,13 @@ struct HumanCardTerminalPatch {
     fallback: Option<serde_json::Value>,
 }
 
+fn human_route_key(route: &crate::store::repo::HumanRequestImRoute) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}\u{0}{}",
+        route.channel, route.account, route.owner, route.message_id
+    )
+}
+
 fn human_card_terminal_patch_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -690,6 +697,15 @@ async fn hydrate_human_card_routes(
     cards: &tokio::sync::Mutex<CardIndex>,
     active_scope: Option<&HumanCardProviderScope>,
 ) -> Vec<HumanCardTerminalPatch> {
+    let scopes = active_scope.into_iter().cloned().collect::<Vec<_>>();
+    hydrate_human_card_routes_for_scopes(db, cards, &scopes).await
+}
+
+async fn hydrate_human_card_routes_for_scopes(
+    db: &crate::store::Db,
+    cards: &tokio::sync::Mutex<CardIndex>,
+    active_scopes: &[HumanCardProviderScope],
+) -> Vec<HumanCardTerminalPatch> {
     let requests = match crate::store::repo::list_human_request_im_routes(db).await {
         Ok(requests) => requests,
         Err(error) => {
@@ -697,8 +713,10 @@ async fn hydrate_human_card_routes(
             return Vec::new();
         }
     };
-    let terminal_outbox = if let Some(scope) = active_scope {
-        match crate::store::repo::list_human_card_terminal_outbox(
+    let mut terminal_outbox = Vec::new();
+    let mut seen_outbox_ids = std::collections::HashSet::new();
+    for scope in active_scopes {
+        let rows = match crate::store::repo::list_human_card_terminal_outbox(
             db,
             &scope.channel,
             &scope.account,
@@ -711,32 +729,40 @@ async fn hydrate_human_card_routes(
                 eprintln!("[weft][im] hydrate human terminal outbox: {error}");
                 Vec::new()
             }
+        };
+        for row in rows {
+            if seen_outbox_ids.insert(row.id) {
+                terminal_outbox.push(row);
+            }
         }
-    } else {
-        Vec::new()
-    };
+    }
     let outbox_messages = terminal_outbox
         .iter()
         .filter(|row| !row.delivered)
-        .map(|row| row.message_id.clone())
+        .map(|row| {
+            human_route_key(&crate::store::repo::HumanRequestImRoute {
+                channel: row.channel.clone(),
+                account: row.account.clone(),
+                owner: row.owner.clone(),
+                message_id: row.message_id.clone(),
+                terminal_revision: row.terminal_revision,
+            })
+        })
         .collect::<std::collections::HashSet<_>>();
     let mut terminal_patches = Vec::new();
     let mut seen_terminal_messages = std::collections::HashSet::new();
     {
         let mut index = cards.lock().await;
-        if let Some(scope) = active_scope {
-            let delivery_scope = scope.delivery_scope();
-            for outbox in &terminal_outbox {
-                let Ok(ask_id) = u64::try_from(outbox.request_id) else {
-                    continue;
-                };
-                index.record_human(
-                    outbox.thread_id,
-                    ask_id,
-                    &outbox.message_id,
-                    &delivery_scope,
-                );
-            }
+        for outbox in &terminal_outbox {
+            let Ok(ask_id) = u64::try_from(outbox.request_id) else {
+                continue;
+            };
+            index.record_human(
+                outbox.thread_id,
+                ask_id,
+                &outbox.message_id,
+                &human_delivery_scope(&outbox.channel, &outbox.account, &outbox.owner),
+            );
         }
         for request in requests {
             let Ok(ask_id) = u64::try_from(request.id) else {
@@ -754,11 +780,11 @@ async fn hydrate_human_card_routes(
                 let scope = human_delivery_scope(&route.channel, &route.account, &route.owner);
                 index.record_human(request.thread_id, ask_id, &route.message_id, &scope);
                 if terminal_card.is_some()
-                    && active_scope.is_some_and(|scope| scope.matches(&route))
-                    && !outbox_messages.contains(&route.message_id)
+                    && active_scopes.iter().any(|scope| scope.matches(&route))
+                    && !outbox_messages.contains(&human_route_key(&route))
                 {
                     if route.terminal_revision < request.revision
-                        && seen_terminal_messages.insert(route.message_id.clone())
+                        && seen_terminal_messages.insert(human_route_key(&route))
                     {
                         terminal_patches.push(HumanCardTerminalPatch {
                             request_id: Some(request.id),
@@ -770,18 +796,40 @@ async fn hydrate_human_card_routes(
             }
         }
     }
-    if let Some(scope) = active_scope {
-        for outbox in terminal_outbox.into_iter().filter(|row| !row.delivered) {
-            if seen_terminal_messages.insert(outbox.message_id.clone()) {
-                terminal_patches.push(HumanCardTerminalPatch {
-                    request_id: None,
-                    route: scope.route(outbox.message_id),
-                    fallback: None,
-                });
-            }
+    for outbox in terminal_outbox.into_iter().filter(|row| !row.delivered) {
+        let route = crate::store::repo::HumanRequestImRoute {
+            channel: outbox.channel,
+            account: outbox.account,
+            owner: outbox.owner,
+            message_id: outbox.message_id,
+            terminal_revision: outbox.terminal_revision,
+        };
+        if seen_terminal_messages.insert(human_route_key(&route)) {
+            terminal_patches.push(HumanCardTerminalPatch {
+                request_id: None,
+                route,
+                fallback: None,
+            });
         }
     }
     terminal_patches
+}
+
+async fn send_human_terminal_for_route(
+    ch: &dyn Channel,
+    route: &crate::store::repo::HumanRequestImRoute,
+    status: &str,
+    answer: &str,
+    lang: &str,
+) -> anyhow::Result<()> {
+    match status {
+        crate::store::repo::HUMAN_REQUEST_ANSWERED
+        | crate::store::repo::HUMAN_REQUEST_RESOLVED => {
+            ch.resolve_human_question_card_for_route(route, answer, lang)
+                .await
+        }
+        _ => ch.cancel_human_question_card_for_route(route, lang).await,
+    }
 }
 
 async fn apply_human_card_terminal_patch(
@@ -814,10 +862,18 @@ async fn apply_human_card_terminal_patch(
             if outbox.delivered {
                 return;
             }
-            let Some(card) = human_terminal_outbox_card(&outbox) else {
+            if human_terminal_outbox_card(&outbox).is_none() {
                 return;
-            };
-            if let Err(error) = ch.patch_card(&patch.route.message_id, card).await {
+            }
+            if let Err(error) = send_human_terminal_for_route(
+                ch,
+                &patch.route,
+                &outbox.terminal_status,
+                &outbox.answer,
+                IM_LANG,
+            )
+            .await
+            {
                 eprintln!(
                     "[weft][im] reconcile terminal human card {}: {error}",
                     patch.route.message_id
@@ -883,9 +939,9 @@ async fn apply_human_card_terminal_patch(
                 return;
             }
         };
-        let Some(card) = human_terminal_card(&request) else {
+        if human_terminal_card(&request).is_none() {
             return;
-        };
+        }
         let needs_patch = serde_json::from_str::<Vec<crate::store::repo::HumanRequestImRoute>>(
             &request.im_routes,
         )
@@ -902,7 +958,15 @@ async fn apply_human_card_terminal_patch(
             // The provider send may have won immediately before terminal DB
             // transition while local route persistence lost the race. The
             // in-memory route still lets us settle it under the ordering lock.
-            if let Err(error) = ch.patch_card(&patch.route.message_id, card).await {
+            if let Err(error) = send_human_terminal_for_route(
+                ch,
+                &patch.route,
+                &request.status,
+                &request.answer,
+                IM_LANG,
+            )
+            .await
+            {
                 eprintln!(
                     "[weft][im] patch unrecorded terminal human card {}: {error}",
                     patch.route.message_id
@@ -910,7 +974,15 @@ async fn apply_human_card_terminal_patch(
             }
             return;
         }
-        if let Err(error) = ch.patch_card(&patch.route.message_id, card).await {
+        if let Err(error) = send_human_terminal_for_route(
+            ch,
+            &patch.route,
+            &request.status,
+            &request.answer,
+            IM_LANG,
+        )
+        .await
+        {
             eprintln!(
                 "[weft][im] reconcile terminal human card {}: {error}",
                 patch.route.message_id
@@ -1021,6 +1093,25 @@ pub trait Channel: Send + Sync {
     ) -> anyhow::Result<()> {
         self.patch_card(message_id, outbound::human_cancelled_card(lang))
             .await
+    }
+    /// Terminal delivery addressed by the durable route owner. Providers with
+    /// editable cards use the message id; command-based providers override this
+    /// to send directly to the persisted recipient instead of an in-memory map.
+    async fn resolve_human_question_card_for_route(
+        &self,
+        route: &crate::store::repo::HumanRequestImRoute,
+        answer: &str,
+        lang: &str,
+    ) -> anyhow::Result<()> {
+        self.resolve_human_question_card(&route.message_id, answer, lang)
+            .await
+    }
+    async fn cancel_human_question_card_for_route(
+        &self,
+        route: &crate::store::repo::HumanRequestImRoute,
+        lang: &str,
+    ) -> anyhow::Result<()> {
+        self.cancel_human_question_card(&route.message_id, lang).await
     }
     /// 发纯文本到用户（p2p）。
     async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()>;
@@ -1926,17 +2017,43 @@ pub fn spawn(app: tauri::AppHandle) {
         // terminal transitions before it are visible in the DB read, and later
         // ones queue on `hum_rx`. The scope follows the active provider so a
         // provider switch never reconciles another provider's cards.
-        let active_human_scope = if provider == ImProvider::Feishu {
-            settings.allow_open_ids.first().map(|owner| HumanCardProviderScope {
-                channel: provider.as_str().to_string(),
-                account: settings.app_id.clone(),
-                owner: owner.clone(),
-            })
+        let active_human_scopes = if provider == ImProvider::Feishu {
+            settings
+                .allow_open_ids
+                .first()
+                .map(|owner| HumanCardProviderScope {
+                    channel: provider.as_str().to_string(),
+                    account: settings.app_id.clone(),
+                    owner: owner.clone(),
+                })
+                .into_iter()
+                .collect::<Vec<_>>()
         } else {
-            None
+            let mut owners = settings.allow_open_ids.iter().cloned().collect::<std::collections::HashSet<_>>();
+            if let Ok(rows) = crate::store::repo::list_human_card_terminal_outbox_for_channel_account(
+                &db,
+                provider.as_str(),
+                &settings.app_id,
+            )
+            .await
+            {
+                owners.extend(
+                    rows.into_iter()
+                        .map(|row| row.owner)
+                        .filter(|owner| settings.allow_open_ids.iter().any(|allowed| allowed == owner)),
+                );
+            }
+            owners
+                .into_iter()
+                .map(|owner| HumanCardProviderScope {
+                    channel: provider.as_str().to_string(),
+                    account: settings.app_id.clone(),
+                    owner,
+                })
+                .collect::<Vec<_>>()
         };
         let terminal_patches =
-            hydrate_human_card_routes(&db, cards.as_ref(), active_human_scope.as_ref()).await;
+            hydrate_human_card_routes_for_scopes(&db, cards.as_ref(), &active_human_scopes).await;
         if !bridge.live(generation) {
             return;
         }
@@ -2441,43 +2558,138 @@ async fn patch_human_terminal_event(
     ask_id: u64,
     fallback: serde_json::Value,
     provider: &HumanCardProviderScope,
+    authorized_owners: &[String],
 ) {
     let request_id = i32::try_from(ask_id).ok();
     let active_delivery_scope = provider.delivery_scope();
-    let mut message_ids = routes
-        .into_iter()
-        .filter(|route| route.delivery_scope == active_delivery_scope)
-        .map(|route| route.message_id)
-        .collect::<std::collections::BTreeSet<_>>();
-    if let Some(request_id) = request_id {
-        match crate::store::repo::list_pending_human_card_terminal_outbox(
-            db,
-            &provider.channel,
-            &provider.account,
-            &provider.owner,
-        )
-        .await
-        {
-            Ok(outbox) => {
-                message_ids.extend(
-                    outbox
-                        .into_iter()
-                        .filter(|row| row.request_id == request_id)
-                        .map(|row| row.message_id),
+    let mut message_routes = std::collections::BTreeMap::new();
+    for route in routes {
+        if provider.channel == ImProvider::DingTalk.as_str() {
+            let mut parts = route.delivery_scope.splitn(3, ':');
+            let channel = parts.next().unwrap_or_default();
+            let account = parts.next().unwrap_or_default();
+            let owner = parts.next().unwrap_or_default();
+            if channel == provider.channel
+                && account == provider.account
+                && authorized_owners.iter().any(|allowed| allowed == owner)
+            {
+                message_routes.insert(
+                    human_route_key(&crate::store::repo::HumanRequestImRoute {
+                        channel: channel.to_string(),
+                        account: account.to_string(),
+                        owner: owner.to_string(),
+                        message_id: route.message_id.clone(),
+                        terminal_revision: 0,
+                    }),
+                    crate::store::repo::HumanRequestImRoute {
+                        channel: channel.to_string(),
+                        account: account.to_string(),
+                        owner: owner.to_string(),
+                        message_id: route.message_id,
+                        terminal_revision: 0,
+                    },
                 );
+            }
+        } else if route.delivery_scope == active_delivery_scope {
+            let route = provider.route(route.message_id);
+            message_routes.insert(human_route_key(&route), route);
+        }
+    }
+    let mut terminal_outbox_failures = std::collections::HashSet::new();
+    let mut durable_route_ids = std::collections::HashSet::new();
+    if let Some(request_id) = request_id {
+        let outbox = if provider.channel == ImProvider::DingTalk.as_str() {
+            crate::store::repo::list_human_card_terminal_outbox_for_channel_account(
+                db,
+                &provider.channel,
+                &provider.account,
+            )
+            .await
+        } else {
+            crate::store::repo::list_pending_human_card_terminal_outbox(
+                db,
+                &provider.channel,
+                &provider.account,
+                &provider.owner,
+            )
+            .await
+        };
+        match outbox {
+            Ok(outbox) => {
+                for row in outbox.into_iter().filter(|row| {
+                    row.request_id == request_id
+                        && !row.delivered
+                        && (provider.channel != ImProvider::DingTalk.as_str()
+                            || authorized_owners.iter().any(|owner| owner == &row.owner))
+                }) {
+                    let route = crate::store::repo::HumanRequestImRoute {
+                        channel: row.channel,
+                        account: row.account,
+                        owner: row.owner,
+                        message_id: row.message_id,
+                        terminal_revision: row.terminal_revision,
+                    };
+                    durable_route_ids.insert(human_route_key(&route));
+                    message_routes.insert(human_route_key(&route), route);
+                }
             }
             Err(error) => {
                 eprintln!("[weft][im] load terminal event outbox: {error}");
             }
         }
     }
-    for message_id in message_ids {
+    if let Some(request_id) = request_id {
+        match crate::store::repo::get_human_request(db, request_id).await {
+            Ok(Some(request))
+                if matches!(
+                    request.status.as_str(),
+                    crate::store::repo::HUMAN_REQUEST_ANSWERED
+                        | crate::store::repo::HUMAN_REQUEST_RESOLVED
+                        | crate::store::repo::HUMAN_REQUEST_CANCELLED
+                        | "superseded"
+                ) =>
+            {
+                for route in message_routes.values() {
+                    if let Err(error) = crate::store::repo::queue_human_card_terminal_outbox(
+                        db,
+                        request.id,
+                        request.thread_id,
+                        route,
+                        &request.status,
+                        &request.answer,
+                        request.revision,
+                    )
+                    .await
+                    {
+                        eprintln!(
+                            "[weft][im] queue terminal event outbox {}: {error}",
+                            route.message_id
+                        );
+                        terminal_outbox_failures.insert(human_route_key(route));
+                    } else {
+                        durable_route_ids.insert(human_route_key(route));
+                    }
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => eprintln!("[weft][im] load terminal event request: {error}"),
+        }
+    }
+    for (route_key, route) in message_routes {
+        if provider.channel == ImProvider::DingTalk.as_str()
+            && (terminal_outbox_failures.contains(&route_key)
+                || !durable_route_ids.contains(&route_key))
+        {
+            // DingTalk terminal sends must have a durable owner route first;
+            // leave the event pending for the next bridge/startup retry.
+            continue;
+        }
         apply_human_card_terminal_patch(
             db,
             ch,
             HumanCardTerminalPatch {
                 request_id,
-                route: provider.route(message_id),
+                route,
                 fallback: Some(fallback.clone()),
             },
         )
@@ -2501,7 +2713,7 @@ async fn consume_human_event(
             return;
         }
     };
-    let Some(owner) = settings.allow_open_ids.into_iter().next() else {
+    let Some(owner) = settings.allow_open_ids.first().cloned() else {
         return;
     };
     let provider = HumanCardProviderScope {
@@ -2638,31 +2850,16 @@ async fn consume_human_event(
                             _ => outbound::human_cancelled_card(lang),
                         };
                         drop(index);
-                        if provider.channel == ImProvider::DingTalk.as_str() {
-                            let terminal_result = match status.as_str() {
-                                crate::store::repo::HUMAN_REQUEST_ANSWERED
-                                | crate::store::repo::HUMAN_REQUEST_RESOLVED => {
-                                    ch.resolve_human_question_card(&mid, &answer, lang).await
-                                }
-                                _ => ch.cancel_human_question_card(&mid, lang).await,
-                            };
-                            if let Err(error) = terminal_result {
-                                eprintln!(
-                                    "[weft][im] patch post-send DingTalk human card: {error}"
-                                );
-                            }
-                        } else {
-                            apply_human_card_terminal_patch(
-                                db,
-                                ch,
-                                HumanCardTerminalPatch {
-                                    request_id: Some(request_id),
-                                    route,
-                                    fallback: Some(fallback),
-                                },
-                            )
-                            .await;
-                        }
+                        apply_human_card_terminal_patch(
+                            db,
+                            ch,
+                            HumanCardTerminalPatch {
+                                request_id: Some(request_id),
+                                route,
+                                fallback: Some(fallback),
+                            },
+                        )
+                        .await;
                     }
                 }
                 Err(e) => eprintln!("[weft][im] send human card: {e}"),
@@ -2675,55 +2872,29 @@ async fn consume_human_event(
             ..
         } => {
             let routes = cards.lock().await.settle_human(thread, ask_id);
-            if provider.channel == ImProvider::DingTalk.as_str() {
-                for route in routes
-                    .into_iter()
-                    .filter(|route| route.delivery_scope == delivery_scope)
-                {
-                    if let Err(error) = ch
-                        .resolve_human_question_card(&route.message_id, &text, lang)
-                        .await
-                    {
-                        eprintln!("[weft][im] patch human resolved card: {error}");
-                    }
-                }
-            } else {
-                patch_human_terminal_event(
-                    db,
-                    ch,
-                    routes,
-                    ask_id,
-                    outbound::human_resolved_card(&text, lang),
-                    &provider,
-                )
-                .await;
-            }
+            patch_human_terminal_event(
+                db,
+                ch,
+                routes,
+                ask_id,
+                outbound::human_resolved_card(&text, lang),
+                &provider,
+                &settings.allow_open_ids,
+            )
+            .await;
         }
         crate::bus::state::HumanAskEvent::Cancelled { thread, ask_id } => {
             let routes = cards.lock().await.settle_human(thread, ask_id);
-            if provider.channel == ImProvider::DingTalk.as_str() {
-                for route in routes
-                    .into_iter()
-                    .filter(|route| route.delivery_scope == delivery_scope)
-                {
-                    if let Err(error) = ch
-                        .cancel_human_question_card(&route.message_id, lang)
-                        .await
-                    {
-                        eprintln!("[weft][im] patch human cancelled card: {error}");
-                    }
-                }
-            } else {
-                patch_human_terminal_event(
-                    db,
-                    ch,
-                    routes,
-                    ask_id,
-                    outbound::human_cancelled_card(lang),
-                    &provider,
-                )
-                .await;
-            }
+            patch_human_terminal_event(
+                db,
+                ch,
+                routes,
+                ask_id,
+                outbound::human_cancelled_card(lang),
+                &provider,
+                &settings.allow_open_ids,
+            )
+            .await;
         }
     }
 }
@@ -4084,6 +4255,98 @@ mod tests {
                 .im_routes,
             "[]"
         );
+    }
+
+    #[tokio::test]
+    async fn answered_human_event_queues_terminal_outbox_before_provider_send() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_APP_ID, "cli_test")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "ou_owner")
+            .await
+            .unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "API decision",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+        let provider = test_human_provider_scope();
+        let route = provider.route("om_answered_outbox".to_string());
+        crate::store::repo::record_human_request_im_route(&db, request.id, &route)
+            .await
+            .unwrap();
+        let cards = tokio::sync::Mutex::new(CardIndex::default());
+        cards.lock().await.record_human(
+            thread.id,
+            u64::try_from(request.id).unwrap(),
+            &route.message_id,
+            &provider.delivery_scope(),
+        );
+        let answered = crate::store::repo::answer_human_request(
+            &db,
+            workspace.id,
+            request.id,
+            request.revision,
+            "REST",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let channel = ReplayChannel::default();
+        consume_human_event(
+            crate::bus::state::HumanAskEvent::Answered {
+                thread: thread.id,
+                ask_id: u64::try_from(request.id).unwrap(),
+                from: "lead".to_string(),
+                question: request.question,
+                text: answered.answer.clone(),
+            },
+            &db,
+            &channel,
+            &cards,
+            IM_LANG,
+        )
+        .await;
+
+        assert_eq!(
+            channel
+                .patched_cards
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            [(
+                route.message_id.clone(),
+                outbound::human_resolved_card("REST", IM_LANG),
+            )]
+        );
+        let outbox = crate::store::repo::get_human_card_terminal_outbox_for_route(&db, &route)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outbox.delivered);
+        assert_eq!(outbox.terminal_status, crate::store::repo::HUMAN_REQUEST_ANSWERED);
+        assert_eq!(outbox.terminal_revision, answered.revision);
     }
 
     #[tokio::test]
