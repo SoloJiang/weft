@@ -7489,10 +7489,14 @@ fn rewind_ordinal(tool: &str, texts: &[String], target: &str) -> usize {
     super::rewind::ordinal_of(texts, target)
 }
 
-/// Acquire the same per-thread lifecycle gate as destructive cascades, then
-/// reload the complete durable identity behind a reserved rewind. Deletion
-/// installs its marker before waiting for this gate, so a delete that won
-/// first is observed here before any timeline read, native fork, or restore.
+/// Acquire a rewind's surface admission gate before the same per-thread
+/// lifecycle gate used by destructive cascades, then reload the complete
+/// durable identity behind the reserved rewind. Normal activity is ordered
+/// surface -> global read, while deletion is global write -> lifecycle and
+/// never takes a surface gate; taking surface first here avoids a three-lock
+/// cycle when all three paths overlap. Deletion installs its marker before
+/// waiting for the lifecycle gate, so a delete that won first is observed here
+/// before any timeline read, native fork, or restore.
 async fn acquire_rewind_lifecycle(
     bus: &crate::bus::BusRegistry,
     state: &LeadChatState,
@@ -7501,7 +7505,17 @@ async fn acquire_rewind_lifecycle(
     thread_id: i32,
     session_id: Option<i32>,
     direction_scope: &str,
-) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
+) -> anyhow::Result<(
+    tokio::sync::OwnedMutexGuard<()>,
+    tokio::sync::OwnedMutexGuard<()>,
+)> {
+    let admission_key = session_id
+        .map(i64::from)
+        .unwrap_or_else(|| super::commands::lead_key(thread_id));
+    // Lock order is surface -> lifecycle. Keep the owned surface guard through
+    // validation and the complete rewind so `rewind_reserved` can use admitted
+    // stop/reset helpers without reacquiring the same gate.
+    let surface = admission_gate_for_key(admission_key).lock_owned().await;
     let lifecycle = bus.thread_lifecycle_gate(thread_id).lock_owned().await;
     validate_registered_engine_identity(
         Some(state),
@@ -7512,14 +7526,15 @@ async fn acquire_rewind_lifecycle(
         direction_scope,
     )
     .await?;
-    Ok(lifecycle)
+    Ok((surface, lifecycle))
 }
 
-/// Run an already-reserved rewind under its thread lifecycle gate. Keep this
-/// separate from engine admission: delete takes admission-write before this
-/// gate, so reacquiring admission after lifecycle would invert the established
-/// order. The gate stays held through the complete operation and until the
-/// engine reservation is cleared, including code-only early returns.
+/// Run an already-reserved rewind under its surface and thread lifecycle
+/// gates. Keep this separate from the global engine admission lock: delete
+/// takes admission-write before lifecycle and never takes surface, so a rewind
+/// must acquire surface before lifecycle and never reacquire either gate in
+/// `rewind_reserved`. Both gates stay held through the complete operation and
+/// until the engine reservation is cleared, including code-only early returns.
 async fn run_rewind_reserved_under_lifecycle<T, F, Fut>(
     bus: &crate::bus::BusRegistry,
     state: &LeadChatState,
@@ -7534,26 +7549,20 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    let lifecycle = match acquire_rewind_lifecycle(
-        bus,
-        state,
-        db,
-        eng,
-        thread_id,
-        session_id,
-        direction_scope,
-    )
-    .await
-    {
-        Ok(lifecycle) => lifecycle,
-        Err(error) => {
-            eng.lock().await.rewinding = false;
-            return Err(error);
-        }
-    };
+    let (surface, lifecycle) =
+        match acquire_rewind_lifecycle(bus, state, db, eng, thread_id, session_id, direction_scope)
+            .await
+        {
+            Ok(lifecycle) => lifecycle,
+            Err(error) => {
+                eng.lock().await.rewinding = false;
+                return Err(error);
+            }
+        };
     let result = operation().await;
     eng.lock().await.rewinding = false;
     drop(lifecycle);
+    drop(surface);
     result
 }
 
@@ -7901,7 +7910,9 @@ async fn rewind_reserved(
     // history. A failure HERE, after a restore already happened, is still
     // compensated by rolling the worktree back to its pre-restore state.
     let persist = async {
-        stop_quiet(eng).await;
+        // `rewind` already owns the surface admission gate. Reacquiring the
+        // public wrapper here would self-deadlock; use the admitted reset core.
+        stop_quiet_admitted(eng).await;
         let (deleted_ids, cancelled_request_ids) = repo::rewind_persist_with_repo_actions(
             db,
             snap.thread_id,
@@ -9846,6 +9857,137 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// The production three-way lock order is surface -> lifecycle for rewind,
+    /// surface -> global-read for sends, and global-write -> lifecycle for
+    /// deletion (deletion never acquires a surface gate). Hold a real rewind
+    /// admission through its operation, then interleave send/delete: delete
+    /// may publish its write fence but waits on lifecycle, while send waits on
+    /// surface. Releasing rewind must let all three finish without a cycle or
+    /// leaked guard.
+    #[tokio::test]
+    async fn rewind_surface_lifecycle_global_barrier_has_no_three_lock_cycle() {
+        let fixture = rewind_deletion_fixture().await;
+        let key = fixture.session_id as i64;
+        fixture.engine.lock().await.rewinding = true;
+
+        let (rewind_admitted_tx, rewind_admitted_rx) = tokio::sync::oneshot::channel();
+        let (rewind_release_tx, rewind_release_rx) = tokio::sync::oneshot::channel();
+        let rewind_bus = fixture.bus.clone();
+        let rewind_state = fixture.state.clone();
+        let rewind_db = fixture.db.clone();
+        let rewind_engine = fixture.engine.clone();
+        let rewind_direction = fixture.direction_scope.clone();
+        let thread_id = fixture.thread_id;
+        let session_id = fixture.session_id;
+        let rewind_task = tokio::spawn(async move {
+            run_rewind_reserved_under_lifecycle(
+                &rewind_bus,
+                rewind_state.as_ref(),
+                &rewind_db,
+                &rewind_engine,
+                thread_id,
+                Some(session_id),
+                &rewind_direction,
+                move || async move {
+                    let _ = rewind_admitted_tx.send(());
+                    rewind_release_rx
+                        .await
+                        .map_err(|_| anyhow::anyhow!("test rewind release dropped"))?;
+                    Ok::<(), anyhow::Error>(())
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), rewind_admitted_rx)
+            .await
+            .expect("rewind should acquire surface then lifecycle")
+            .expect("rewind admission signal should remain connected");
+
+        let (send_done_tx, mut send_done_rx) = tokio::sync::oneshot::channel();
+        let send_state = fixture.state.clone();
+        let send_task = tokio::spawn(async move {
+            let _surface = admission_gate_for_key(key).lock_owned().await;
+            let _read = send_state.engine_admission_read().await;
+            let _ = send_done_tx.send(());
+        });
+
+        let (delete_write_tx, mut delete_write_rx) = tokio::sync::oneshot::channel();
+        let (delete_lifecycle_tx, mut delete_lifecycle_rx) = tokio::sync::oneshot::channel();
+        let delete_state = fixture.state.clone();
+        let delete_bus = fixture.bus.clone();
+        let delete_db = fixture.db.clone();
+        let delete_task = tokio::spawn(async move {
+            repo::mark_thread_deleting(&delete_db, thread_id)
+                .await
+                .unwrap();
+            let _write = delete_state.engine_admission_write().await;
+            let _ = delete_write_tx.send(());
+            let _lifecycle = delete_bus
+                .thread_lifecycle_gate(thread_id)
+                .lock_owned()
+                .await;
+            let _ = delete_lifecycle_tx.send(());
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut delete_write_rx)
+            .await
+            .expect("delete should acquire global write before lifecycle")
+            .expect("delete write signal should remain connected");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut delete_lifecycle_rx)
+                .await
+                .is_err(),
+            "delete must wait on rewind's lifecycle gate"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut send_done_rx)
+                .await
+                .is_err(),
+            "send must wait on rewind's surface gate"
+        );
+
+        rewind_release_tx.send(()).unwrap();
+        rewind_task.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), delete_lifecycle_rx)
+            .await
+            .expect("delete should acquire lifecycle after rewind")
+            .expect("delete lifecycle signal should remain connected");
+        tokio::time::timeout(std::time::Duration::from_secs(1), send_done_rx)
+            .await
+            .expect("send should acquire surface and global read after delete")
+            .expect("send completion signal should remain connected");
+        delete_task.await.unwrap();
+        send_task.await.unwrap();
+
+        assert!(!fixture.engine.lock().await.rewinding);
+        let _surface = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            admission_gate_for_key(key).lock_owned(),
+        )
+        .await
+        .expect("rewind surface gate must be released");
+        let _read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.state.engine_admission_read(),
+        )
+        .await
+        .expect("send read guard must be released");
+        drop(_read);
+        let _write = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.state.engine_admission_write(),
+        )
+        .await
+        .expect("delete write guard must be released");
+        drop(_write);
+        let _lifecycle = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.bus.thread_lifecycle_gate(thread_id).lock_owned(),
+        )
+        .await
+        .expect("rewind/delete lifecycle gate must be released");
     }
 
     // ---- issue #99: sub-agent branch attribution (branch_of / text_row_content) ----
