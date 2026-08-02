@@ -99,6 +99,34 @@ pub fn action_key(parts: &[&str]) -> String {
     serde_json::to_string(parts).unwrap_or_default()
 }
 
+/// Whether an `action_key` (see [`action_key`]'s own doc) names a GUI/
+/// computer-use action, from the serialized key alone — issue #160 round-12
+/// P1 #B, generalizing [`AskRegistry::cancel_gui_asks`] beyond the ONE
+/// tool-name shape (`tool == "computer"`) `weft_computer`'s own MCP path
+/// happens to use.
+///
+/// `action_key` is always a JSON array (`serde_json::to_string(parts)`), so
+/// the FIRST element's own quoted text is a stable, structural anchor to
+/// check against — never a substring search over the whole serialized key,
+/// which a later element (an arbitrary window title, a typed digest) could
+/// coincidentally contain. Two routes build a GUI key today:
+///  - `bus::computer_srv`'s `weft_computer` MCP path always leads with
+///    `"gui"` — `["gui", action, window_query, ...]` (see that module's own
+///    `action_key(&["gui", ...])` call sites) — so the serialized key always
+///    STARTS WITH `["gui",`.
+///  - An ACP-native `computer`/`browser` request's key is `["Acp",
+///    "gui:<action>", grant_id]` (`intent_key_from_params`'s own `Gui`
+///    carve-out folds the action into `intent_key` as `gui:<action>` before
+///    `lead_chat::engine`'s ACP `Permission` arm builds the actual key) — so
+///    the serialized key always STARTS WITH `["Acp","gui:`. Round-12 P1 #A
+///    now rejects every ACP-native GUI intent outright before any card (and
+///    so any `action_key`) is ever built for it, but this check stays
+///    general on purpose — see `cancel_gui_asks`'s own doc — so a future
+///    route is covered by construction, not by enumeration.
+fn action_key_is_gui(action_key: &str) -> bool {
+    action_key.starts_with("[\"gui\",") || action_key.starts_with("[\"Acp\",\"gui:")
+}
+
 /// A permission ask's danger tier for the human's one-glance triage in an
 /// authorization storm (issue #101: MCP cards showed only a bare tool name,
 /// giving no way to eyeball which of a pile of asks deserves a closer look).
@@ -2103,13 +2131,14 @@ impl AskRegistry {
         }
     }
 
-    /// Cancel every open `weft_computer` ask (issue #160 round-12 P1 #1):
+    /// Cancel every open GUI/computer-use ask (issue #160 round-12 P1 #B,
+    /// generalizing round-12 P1 #1's own `cancel_computer_asks`):
     /// emergency-stop's own kill switch (`computer::emergency_stop`) only
     /// ever tears down the control lease and disables the setting — it does
     /// NOT touch any GUI approval card already sitting in Needs-you. Without
-    /// this, a human hitting Stop while a `computer` action's card is still
-    /// open could keep answering that STALE card with `Always`/`Full` right
-    /// after — `answer()` records the standing grant BEFORE the caller's own
+    /// this, a human hitting Stop while a GUI action's card is still open
+    /// could keep answering that STALE card with `Always`/`Full` right after
+    /// — `answer()` records the standing grant BEFORE the caller's own
     /// post-await kill-switch recheck ever runs (see `bus::computer_srv::
     /// approve`'s own doc on that recheck), so the grant lands regardless,
     /// and silently auto-approves every future matching action once the
@@ -2117,24 +2146,39 @@ impl AskRegistry {
     /// (`commands::computer_emergency_stop`, which holds an `AskRegistry`
     /// handle directly, and the OS-level global Escape callback in
     /// `computer::mod.rs`, which reaches one via the app handle) call this
-    /// immediately after `computer::emergency_stop` returns — see their own
-    /// call sites for why the cancellation happens there rather than inside
-    /// `computer::emergency_stop` itself (that function has no `AskRegistry`
-    /// to reach, and its existing callers' signatures stay unchanged).
+    /// — see their own call sites for why the cancellation happens there
+    /// rather than inside `computer::trip_stop_latch`/`computer::
+    /// persist_stop` themselves (neither has an `AskRegistry` to reach, and
+    /// their existing callers' signatures stay unchanged).
     ///
     /// Cancelling (not denying) mirrors `cancel_for`'s own semantics: the
     /// waiter's receiver errors, which `bus::computer_srv::approve` already
     /// treats as a fail-closed deny — so a stop-in-flight card reads to the
     /// calling agent exactly like a timed-out one, never a silent no-op.
-    /// Scoped to `tool == "computer"` alone — an ordinary shell/file ask from
-    /// a ChatGPT/Claude/Codex session has nothing to do with the GUI kill
-    /// switch and must keep waiting for its own human answer.
-    pub fn cancel_computer_asks(&self) {
+    ///
+    /// Renamed from the round-12 P1 #1 `cancel_computer_asks` and
+    /// generalized from a bare `tool == "computer"` filter to
+    /// [`action_key_is_gui`] (round-12 review): the old filter only ever
+    /// matched a GUI ask built through `weft_computer`'s own MCP path (which
+    /// always sets `tool = "computer"`) and silently missed a GUI ask an
+    /// ACP-native `computer`/`browser` request would build under the
+    /// ENGINE's own tool name instead (`"claude"`/`"codex"`/…) — see
+    /// `lead_chat::engine`'s ACP `Permission` arm, which round-12 P1 #A now
+    /// rejects those outright before any such card is ever built, but this
+    /// filter stays action-key-based (not tool-name-based) so ANY future
+    /// GUI-ask route is still reachable by an emergency stop by
+    /// construction, not because every route happens to be enumerated here.
+    /// An ordinary shell/file ask from a ChatGPT/Claude/Codex session keys on
+    /// a completely different `action_key` shape (`["Bash", ...]`,
+    /// `["Edit", ...]`, `["mcp", ...]`, `["Acp", "read"|"write:...", ...]`,
+    /// …) and has nothing to do with the GUI kill switch — it keeps waiting
+    /// for its own human answer.
+    pub fn cancel_gui_asks(&self) {
         let ids: Vec<u64> = {
             let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.open
                 .iter()
-                .filter(|a| a.tool == "computer")
+                .filter(|a| action_key_is_gui(&a.action_key))
                 .map(|a| a.id)
                 .collect()
         };
@@ -2511,6 +2555,33 @@ mod tests {
     #[test]
     fn action_key_is_stable_and_deterministic_for_the_same_parts() {
         assert_eq!(action_key(&["cmd", "X", "foo"]), action_key(&["cmd", "X", "foo"]));
+    }
+
+    // ---- action_key_is_gui (issue #160 round-12 P1 #B) -------------------------
+
+    #[test]
+    fn action_key_is_gui_recognizes_the_weft_computer_mcp_shape() {
+        assert!(action_key_is_gui(&action_key(&["gui", "screenshot", "notes", "d"])));
+        assert!(action_key_is_gui(&action_key(&["gui", "type", "", "d"])));
+    }
+
+    #[test]
+    fn action_key_is_gui_recognizes_the_acp_native_shape() {
+        assert!(action_key_is_gui(&action_key(&["Acp", "gui:left_click", "g1"])));
+        assert!(action_key_is_gui(&action_key(&["Acp", "gui:type", "g2"])));
+    }
+
+    #[test]
+    fn action_key_is_gui_never_matches_an_ordinary_action_key() {
+        assert!(!action_key_is_gui(&action_key(&["Bash", "echo hi"])));
+        assert!(!action_key_is_gui(&action_key(&["Edit", "src/main.rs"])));
+        assert!(!action_key_is_gui(&action_key(&["mcp", "some_tool", "{}"])));
+        // A non-GUI ACP intent (`Acp` family, but not the `gui:` intent_key
+        // shape) must not be mistaken for a GUI one either.
+        assert!(!action_key_is_gui(&action_key(&["Acp", "read", "g3"])));
+        // A window title/typed digest that happens to CONTAIN "gui" elsewhere
+        // in the key must not false-positive — only the anchored prefix counts.
+        assert!(!action_key_is_gui(&action_key(&["mcp", "guinness_tracker", "{}"])));
     }
 
     // ---- classify_risk (issue #101: one-glance danger tier) --------------------
@@ -4269,12 +4340,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_computer_asks_cancels_only_computer_tool_asks_and_blocks_a_stale_always_answer() {
-        // issue #160 round-12 P1 #1: emergency-stop must cancel any open
-        // `weft_computer` card BEFORE a human can answer it Always/Full and
-        // silently mint a standing grant that outlives the stop — this is
-        // the registry-level half of that fix (the two emergency-stop entry
+    async fn cancel_gui_asks_cancels_only_gui_asks_and_blocks_a_stale_always_answer() {
+        // issue #160 round-12 P1 #1/#B: emergency-stop must cancel any open
+        // GUI card BEFORE a human can answer it Always/Full and silently mint
+        // a standing grant that outlives the stop — this is the
+        // registry-level half of that fix (the two emergency-stop entry
         // points that call it live in `commands.rs`/`computer::mod.rs`).
+        // Generalized (round-12 P1 #B) from a bare `tool == "computer"`
+        // filter to `action_key_is_gui`: covers BOTH the `weft_computer` MCP
+        // shape (`["gui", ...]`, `tool == "computer"`) and the ACP-native
+        // shape (`["Acp","gui:...", ...]`, `tool` = the ENGINE's own name) —
+        // the round-12 P1 #A fix rejects the latter outright before a card
+        // is ever built, but this test still proves the cancel filter itself
+        // would catch it if one somehow existed.
         let r = AskRegistry::new();
         let (computer_id, computer_rx) = r.request(
             1,
@@ -4285,17 +4363,31 @@ mod tests {
             RiskLevel::Write,
             "[\"gui\",\"type\",\"\",\"d\"]",
         );
+        let (acp_gui_id, acp_gui_rx) = r.request(
+            1,
+            "10",
+            "claude",
+            "computer: left_click",
+            "{}",
+            RiskLevel::Write,
+            "[\"Acp\",\"gui:left_click\",\"g1\"]",
+        );
         let (other_id, other_rx) =
             r.request(1, "10", "claude", "Run: a", "a", RiskLevel::Unknown, "Run: a");
 
-        r.cancel_computer_asks();
+        r.cancel_gui_asks();
 
         let open_ids: std::collections::HashSet<u64> = r.open().iter().map(|a| a.id).collect();
-        assert!(!open_ids.contains(&computer_id), "the computer card must be cancelled");
-        assert!(open_ids.contains(&other_id), "a non-computer ask must survive untouched");
+        assert!(!open_ids.contains(&computer_id), "the weft_computer MCP card must be cancelled");
+        assert!(!open_ids.contains(&acp_gui_id), "an ACP-native GUI card must also be cancelled");
+        assert!(open_ids.contains(&other_id), "a non-GUI ask must survive untouched");
         assert!(
             computer_rx.await.is_err(),
             "the cancelled computer ask's waiter must error, never resolve Allow"
+        );
+        assert!(
+            acp_gui_rx.await.is_err(),
+            "the cancelled ACP-native GUI ask's waiter must error, never resolve Allow"
         );
         drop(other_rx);
 

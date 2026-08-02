@@ -4429,110 +4429,61 @@ fn acp_permission_risk(
     }
 }
 
-/// Which `AskRegistry` entry point decides an ACP permission's standing-grant
-/// auto-verdict (issue #160 round-7 P1). `is_gui` (an omp native `computer`/
-/// `browser` request — see `acp_permission_risk`'s own `PermissionIntent::Gui`
-/// arm) always goes through `auto_decision_exact`: `dangerous` mode, a Full
-/// grant, and an EXACT Always `action_key` match still auto-allow, but the
-/// coarse read-only session/issue batch grant (issue #103) is skipped
-/// entirely — mirrors the SAME protection `bus::computer_srv::approve` already
-/// gives the MCP `weft_computer` path (see that function's own doc for why a
-/// `screenshot`/`list_windows`-shaped ReadOnly tier can't be treated like an
-/// ordinary read-only tool call: it is ReadOnly regardless of WHICH window it
-/// targets, so a blanket "release all read-only" grant would otherwise let it
-/// silently capture pixels from any window on the human's desktop with no
-/// computer-specific card). Every other intent is untouched — `auto_decision`
-/// with its existing semantics, read-only batch grant included.
+/// issue #160 round-12 P1 #A: whether an ACP permission `intent` is OMP's
+/// own native `computer`/`browser` tool (see `acp::permission::
+/// PermissionIntent::Gui`'s own doc) — the ONE question `acp_consumer`'s
+/// `SessionEvent::Permission` arm now asks before it does ANYTHING else with
+/// the request.
 ///
-/// Pulled out as its own small, synchronous function (rather than inlined at
-/// its one call site in `acp_consumer`) so this decision is unit-testable
-/// without the surrounding async ACP event loop, which needs a live
-/// `acp::runtime::ClientHandle` and isn't itself practical to drive from a
-/// plain `#[test]`.
-fn gui_or_ordinary_auto_decision(
-    asks: &crate::ask::AskRegistry,
-    thread_id: i32,
-    dir: &str,
-    risk: crate::ask::RiskLevel,
-    action_key: &str,
-    is_gui: bool,
-) -> Option<crate::ask::Decision> {
-    if is_gui {
-        asks.auto_decision_exact(thread_id, dir, action_key)
-    } else {
-        asks.auto_decision(thread_id, dir, risk, action_key)
-    }
-}
-
-/// issue #160 round-10 P1 #E: whether an ACP GUI intent (omp's native
-/// `computer`/`browser` tools — see `acp_permission_risk`'s own
-/// `PermissionIntent::Gui` arm) must be rejected because computer use's OWN
-/// kill-switch/setting says so. Before this fix, a native GUI request's
-/// permission decision went ONLY through [`gui_or_ordinary_auto_decision`] —
-/// never through `computer::enabled`, and never through weft executor's own
-/// control lease/latch (`bus::computer_srv`'s domain entirely). A human
-/// hitting Stop (tripping the emergency-stop latch) or simply flipping
-/// computer use off in Settings had NO effect on this path at all: with a
-/// Full or exact-Always grant already on file, the Settings banner and the
-/// kill-switch UI both said "disabled" while a native GUI request kept
-/// sailing through Allow regardless — screenshots/input kept flowing.
+/// Superseding rounds 7/9/10 entirely (`gui_or_ordinary_auto_decision`,
+/// `gui_kill_switch_denies`, `permission_reply_must_reject`,
+/// `computer_enabled_for_acp` — all deleted by this round, none had any
+/// other caller): those rounds still let a native GUI request run through
+/// the SAME auto-grant/human-card machinery an ordinary permission gets,
+/// gated only by `computer::enabled`. That design is what produced every
+/// one of this round's own findings, because OMP's native `computer`/
+/// `browser` tool executes the OS action ITSELF — Weft never sees the call
+/// happen, so it cannot fit its control lease, global Escape, completion
+/// guard, or coordinate model around an action some OTHER process already
+/// ran; there is no completion guard Weft could wrap around a process it
+/// doesn't own. So a GUI intent is no longer a permission DECISION at
+/// all — it is rejected outright, unconditionally, before anything else
+/// runs:
+///  - no card is ever shown, so a native `type` action's literal keystrokes
+///    never reach an IM card's `detail` (Codex 4904, "原生 type 进 IM");
+///  - no Always/Full grant is ever written, so the plaintext-carrying
+///    `grant_id` this arm folds into `action_key` a few lines below never
+///    reaches the durable grants store for a GUI intent (review 4858,
+///    "原生授权键含明文");
+///  - the reply always lands before any DB/lease await, needs no lease, and
+///    answers to Stop the same way the pre-existing `reject_now` teardown
+///    check above already does (Codex 4992, "原生不经租约").
 ///
-/// Pure, synchronous, and unit-testable in isolation — see
-/// [`computer_enabled_for_acp`] for the thin, `AppHandle`-taking wrapper this
-/// composes with at the one real call site (not itself unit-testable, per
-/// this module's own `post_stall_notice`-style split: this crate's concrete
-/// `AppHandle` has no path through `tauri::test::mock_app`, which only
-/// yields a `MockRuntime` one).
+/// Depth-in-depth note: `ask::AskRegistry::cancel_gui_asks` (round-12 P1 #B)
+/// still generalizes emergency-stop cancellation to any GUI-marked
+/// `action_key`, so a future path that somehow DID register a GUI-shaped
+/// card would still be reachable by Stop — but THIS check's job is to make
+/// sure that future path never exists for OMP's native tool in the first
+/// place.
 ///
-/// A NON-gui intent is completely unaffected: `is_gui == false` always
-/// returns `false` regardless of `computer_use_enabled`, since
-/// `computer::enabled` has nothing to do with (say) a file write or a shell
-/// command permission decision.
-fn gui_kill_switch_denies(is_gui: bool, computer_use_enabled: bool) -> bool {
-    is_gui && !computer_use_enabled
-}
-
-/// The single "must this ACP permission reply be forced to RejectOnce"
-/// verdict [`acp_consumer`]'s `SessionEvent::Permission` arm converges on,
-/// on the ONE path every branch (auto-grant, human-Allow, human-Deny,
-/// cancelled/timed-out) leaves through — issue #160 round-10 P1 #8 (Codex
-/// 4675). Two independently-sufficient reasons to reject, mirroring this
-/// function's sibling [`gui_kill_switch_denies`]'s own "either gate wins"
-/// shape:
-///  - `teardown` (stopped / interrupting / a reset-epoch mismatch) — the
-///    pre-existing "never allow after this engine tore down" invariant,
-///    unchanged by this round.
-///  - `gui_kill_switch_denies(is_gui, enabled_now)` — computer use's OWN
-///    kill switch, RESAMPLED right here rather than trusting whichever
-///    value was on hand before a (possibly hours-long) human-review await
-///    — round-9's own sample only ran ONCE, before that wait started; a
-///    human hitting Stop WHILE the card sat open never reached it. A
-///    non-GUI intent is completely unaffected either way, exactly like
-///    `gui_kill_switch_denies` itself.
+/// No wire-level "use `weft_computer` instead" hint travels with the
+/// rejection: ACP's `session/request_permission` reply is a bare
+/// `{outcome:{outcome:"selected", optionId}}` (see `acp::permission::
+/// selected_outcome`) with no field for one, and `acp::permission`/
+/// `acp::runtime` are outside this round's file scope — the reply reuses
+/// the EXACT SAME channel the pre-existing `reject_now` teardown check
+/// above already replies through. The guidance belongs here, in this
+/// module's own doc trail, and in whatever an agent's own UI shows for a
+/// rejected native tool call: use the injected `weft_computer` MCP tool
+/// instead — it has a permission card, the control lease, and the
+/// emergency stop.
 ///
 /// Pure and synchronous so this exact decision is unit-testable without the
-/// surrounding async ACP event loop — mirrors `gui_kill_switch_denies`'s own
-/// split from its `AppHandle`-taking wrapper ([`computer_enabled_for_acp`]).
-fn permission_reply_must_reject(teardown: bool, is_gui: bool, computer_use_enabled_now: bool) -> bool {
-    teardown || gui_kill_switch_denies(is_gui, computer_use_enabled_now)
-}
-
-/// issue #160 round-10 P1 #E: `computer::enabled` for an ACP permission
-/// decision, from just the `AppHandle` this module already has in scope.
-/// Fail-CLOSED — `false` — when `crate::store::Db` isn't even mounted as
-/// managed state (a `tauri::test::mock_app` in a unit test, or — in
-/// principle — code reached before `lib.rs`'s `setup()` has finished
-/// `.manage()`-ing it): same fail-closed default `computer::enabled` itself
-/// applies to every other "can't prove enabled" case. This is the SAME
-/// setting+latch kill-switch `bus::computer_srv::run_action` already gates
-/// every `weft_computer` MCP call on — reusing it here means a native ACP
-/// GUI request and a `weft_computer` MCP call now answer to the identical
-/// kill switch instead of two independent ones.
-async fn computer_enabled_for_acp(app: &AppHandle) -> bool {
-    match app.try_state::<crate::store::Db>() {
-        Some(db) => crate::computer::enabled(db.inner()).await,
-        None => false,
-    }
+/// surrounding async ACP event loop, which needs a live
+/// `acp::runtime::ClientHandle` and isn't itself practical to drive from a
+/// plain `#[test]`.
+fn is_gui_intent(intent: &crate::acp::permission::PermissionIntent) -> bool {
+    matches!(intent, crate::acp::permission::PermissionIntent::Gui { .. })
 }
 
 /// How much of the reasoning stream the busy-line chip shows.
@@ -4848,6 +4799,19 @@ async fn acp_consumer(
                         .await;
                     continue;
                 }
+                // issue #160 round-12 P1 #A: every ACP GUI intent (OMP's own
+                // native `computer`/`browser` tool) is rejected outright,
+                // unconditionally — no card, no grant lookup, no kill-switch
+                // consultation, no lease — BEFORE anything below builds a
+                // card or persists a grant for it. See `is_gui_intent`'s own
+                // doc for the full rationale and the specific findings this
+                // converges (Codex 4992/4904, review 4858).
+                if is_gui_intent(&intent) {
+                    client
+                        .reply_permission(&request_id, &options, crate::acp::Want::RejectOnce)
+                        .await;
+                    continue;
+                }
                 // Precise Always key (issue #89): ACP family + session intent +
                 // the canonical action identity, so two different actions never
                 // share a grant. NOT `detail`: that is the stringified
@@ -4855,6 +4819,7 @@ async fn acp_consumer(
                 // whose only difference lives in `toolCall.locations` — the
                 // very field the risk classifier reads first. `grant_id`
                 // folds every named location in; see `permission::grant_identity`.
+                // `intent` is guaranteed non-GUI past the check above.
                 let action_key = crate::ask::action_key(&["Acp", &intent_key, &grant_id]);
                 // Clone the registry BEFORE any await — State guards are !Send.
                 let asks = app
@@ -4866,35 +4831,8 @@ async fn acp_consumer(
                 // grants (issue #103) key on the tier: deriving it only in the
                 // `None` arm would make every ACP ask miss those grants.
                 let risk = acp_permission_risk(&intent, &detail);
-                // round-7 P1: GUI observation/input (omp's native `computer`/
-                // `browser` tools) must never be silently released by the
-                // coarse read-only session/issue batch grant (issue #103) the
-                // way an ordinary ReadOnly-tier tool call is — that grant was
-                // built for things like "skip the card for `pwd`", not for
-                // "screenshot or enumerate any window on the human's desktop
-                // sight unseen". `is_gui` is the ONE discriminated value this
-                // decides on; every non-GUI intent keeps the exact same
-                // `auto_decision` semantics it always had.
-                let is_gui = matches!(intent, crate::acp::permission::PermissionIntent::Gui { .. });
-                // issue #160 round-10 P1 #E: a GUI intent must answer to
-                // computer use's OWN kill-switch/setting BEFORE anything
-                // else decides — see `gui_kill_switch_denies`'s own doc for
-                // the gap this closes (a native ACP `computer`/`browser`
-                // request used to never consult `computer::enabled` at all,
-                // so a Full/exact-Always grant kept it working straight
-                // through a Stop or a disabled setting). `computer_enabled_
-                // for_acp` (an async DB read) is only ever awaited for a GUI
-                // intent — `true` for the non-GUI case is a don't-care value
-                // `gui_kill_switch_denies` never looks at once `is_gui` is
-                // `false`, just enough to give it a value without an
-                // unconditional async DB read on every non-GUI permission
-                // event too.
-                let computer_use_enabled = if is_gui { computer_enabled_for_acp(&app).await } else { true };
-                let gui_disabled = gui_kill_switch_denies(is_gui, computer_use_enabled);
-                let want = if gui_disabled {
-                    crate::acp::Want::RejectOnce
-                } else if let Some(asks) = asks {
-                    match gui_or_ordinary_auto_decision(&asks, thread_id, &dir, risk, &action_key, is_gui) {
+                let want = if let Some(asks) = asks {
+                    match asks.auto_decision(thread_id, &dir, risk, &action_key) {
                         Some(crate::ask::Decision::Allow) => crate::acp::Want::AllowOnce,
                         Some(crate::ask::Decision::Deny) => crate::acp::Want::RejectOnce,
                         None => {
@@ -4968,25 +4906,20 @@ async fn acp_consumer(
                 // the wire as an allow — queued ahead of `session/cancel`,
                 // starting a tool after the user had stopped the turn.
                 //
-                // issue #160 round-10 P1 #8 (Codex 4675): this is ALSO where
-                // a GUI intent's `computer::enabled` gets its SECOND look —
-                // round-9's own sample (`computer_use_enabled` above) only
-                // ran ONCE, before the human-review `rx.await` in the `None`
-                // arm above even started; that await can sit for up to an
-                // hour. A human hitting Stop WHILE that card sits open never
-                // reached the original sample, so an Allow the human answers
-                // AFTER hitting Stop sailed straight through here before this
-                // fix — the funnel below only ever checked engine teardown,
-                // never computer-use's own kill switch a second time. See
-                // `permission_reply_must_reject`'s own doc for the combined
-                // (teardown OR gui-disabled-NOW) verdict this applies.
+                // issue #160 round-12 P1 #A note: a GUI intent never reaches
+                // this point at all (rejected above, before any await) — the
+                // round-10 P1 #E/#8 "recheck computer::enabled a second time
+                // after the human-review await" machinery this gate used to
+                // also carry is gone with it: `computer::enabled` and Stop's
+                // interaction with a native GUI request are no longer this
+                // gate's problem, because a native GUI request can no longer
+                // reach a human-review await in the first place.
                 let want = {
                     let teardown = {
                         let g = eng.lock().await;
                         g.stopped || g.interrupting || g.reset_epoch != start_epoch
                     };
-                    let enabled_now = if is_gui { computer_enabled_for_acp(&app).await } else { true };
-                    if permission_reply_must_reject(teardown, is_gui, enabled_now) {
+                    if teardown {
                         crate::acp::Want::RejectOnce
                     } else {
                         want
@@ -9631,149 +9564,40 @@ mod tests {
         );
     }
 
-    /// issue #160 round-7 P1: a GUI (omp native `computer`/`browser`) intent
-    /// must never be silently auto-allowed by the coarse read-only session
-    /// grant (issue #103) that an ordinary ReadOnly-tier ACP ask IS released
-    /// by — `screenshot`/`list_windows` classify `ReadOnly` regardless of
-    /// which window they target, so that grant would otherwise let an agent
-    /// capture pixels from any window on the human's desktop with no
-    /// computer-specific card. An EXACT Always `action_key` grant, and a Full
-    /// grant, still auto-allow a GUI intent exactly like any other — only the
-    /// coarse batch fallback is skipped.
+    // —— issue #160 round-12 P1 #A: every ACP GUI intent is rejected
+    // outright, unconditionally, before any card or grant — superseding
+    // rounds 7/9/10's own "GUI intent still goes through auto-decision, just
+    // gated by computer::enabled" design entirely ——
+
+    /// `is_gui_intent` recognizes every GUI action regardless of WHICH action
+    /// it names — `type` included, closing the exact leak (a native `type`
+    /// action's literal keystrokes reaching an IM card) round-12 P1 #A
+    /// converges by never letting ANY GUI intent build a card at all.
     #[test]
-    fn gui_intent_ignores_the_read_only_session_grant_but_ordinary_intents_still_use_it() {
-        use crate::ask::{AskRegistry, RiskLevel};
+    fn is_gui_intent_recognizes_every_gui_action() {
+        use crate::acp::permission::PermissionIntent;
 
-        let asks = AskRegistry::new();
-        asks.grant_read_only_session(1, "10");
-
-        assert!(
-            gui_or_ordinary_auto_decision(&asks, 1, "10", RiskLevel::ReadOnly, "gui-key", true).is_none(),
-            "a GUI intent must still card despite a standing read-only-session grant"
-        );
-        // The exact same session's grant still auto-allows an ORDINARY
-        // ReadOnly-tier ACP ask (e.g. a `read` toolCall) — this fix must not
-        // regress that pre-existing, unrelated behavior.
-        assert_eq!(
-            gui_or_ordinary_auto_decision(&asks, 1, "10", RiskLevel::ReadOnly, "ordinary-key", false),
-            Some(crate::ask::Decision::Allow),
-            "a non-GUI intent must be completely unaffected by this fix"
-        );
+        for action in ["screenshot", "left_click", "type", "scroll", "key", "some_future_action"] {
+            assert!(
+                is_gui_intent(&PermissionIntent::Gui { action: action.into() }),
+                "GUI action {action:?} must be recognized regardless of which action it names"
+            );
+        }
     }
 
-    /// The other half of the same fix: an EXACT Always `action_key` grant (or
-    /// a Full grant) still auto-allows a GUI intent — round-7 P1 narrows away
-    /// only the coarse batch fallback, not the precise per-action grant this
-    /// module's own Always/Full flow relies on.
+    /// Every non-GUI intent variant is unaffected — `is_gui_intent` is a
+    /// precise, exhaustive discriminator, never a loose heuristic that could
+    /// accidentally also catch an ordinary command/file/network/other
+    /// intent.
     #[test]
-    fn gui_intent_still_honors_an_exact_always_grant_and_full_grant() {
-        use crate::ask::{AlwaysGrant, AskRegistry, Decision, FullGrant, GrantSnapshot, RiskLevel};
+    fn is_gui_intent_never_matches_a_non_gui_intent() {
+        use crate::acp::permission::PermissionIntent;
 
-        let asks = AskRegistry::new();
-        asks.seed_grants(GrantSnapshot {
-            full: vec![FullGrant { thread: 2, dir: "20".to_string() }],
-            always: vec![AlwaysGrant {
-                thread: 3,
-                dir: "30".to_string(),
-                action_key: "exact-gui-key".to_string(),
-            }],
-        });
-
-        assert_eq!(
-            gui_or_ordinary_auto_decision(&asks, 2, "20", RiskLevel::ReadOnly, "anything", true),
-            Some(Decision::Allow),
-            "a Full grant still auto-allows a GUI intent"
-        );
-        assert_eq!(
-            gui_or_ordinary_auto_decision(&asks, 3, "30", RiskLevel::Write, "exact-gui-key", true),
-            Some(Decision::Allow),
-            "an EXACT Always action_key match still auto-allows a GUI intent"
-        );
-        assert!(
-            gui_or_ordinary_auto_decision(&asks, 3, "30", RiskLevel::Write, "different-key", true).is_none(),
-            "a non-matching action_key must still card, even with a standing Always grant on file"
-        );
-    }
-
-    // —— issue #160 round-10 P1 #E: ACP GUI intents answer to computer use's
-    // own kill-switch/setting ——
-
-    /// The end-to-end property this fix exists for: a GUI intent with
-    /// computer use DISABLED must be denied regardless of ANY grant — this is
-    /// checked before `gui_or_ordinary_auto_decision` (a Full/exact-Always
-    /// grant) is even consulted, so it can never be bypassed by one.
-    #[test]
-    fn gui_kill_switch_denies_a_gui_intent_when_computer_use_is_disabled() {
-        assert!(
-            gui_kill_switch_denies(true, false),
-            "a GUI intent must be denied while computer use is disabled"
-        );
-    }
-
-    /// The other half: a GUI intent with computer use ENABLED is unaffected —
-    /// this fix narrows nothing else about how a GUI intent is later decided
-    /// (still `gui_or_ordinary_auto_decision`/a human card), it only adds a
-    /// kill-switch check ahead of that.
-    #[test]
-    fn gui_kill_switch_allows_a_gui_intent_when_computer_use_is_enabled() {
-        assert!(
-            !gui_kill_switch_denies(true, true),
-            "a GUI intent must proceed to its ordinary decision when computer use is enabled"
-        );
-    }
-
-    /// A non-GUI intent is COMPLETELY unaffected by this check either way —
-    /// `computer::enabled` has nothing to do with a file write, a shell
-    /// command, or any other non-GUI ACP permission decision.
-    #[test]
-    fn gui_kill_switch_never_denies_a_non_gui_intent() {
-        assert!(!gui_kill_switch_denies(false, false), "a non-GUI intent must never be affected");
-        assert!(!gui_kill_switch_denies(false, true), "a non-GUI intent must never be affected");
-    }
-
-    // —— issue #160 round-10 P1 #8: recheck the GUI kill-switch AFTER the
-    // human-review await, not just once before it ——
-
-    /// The end-to-end property this fix exists for: a GUI intent whose card
-    /// was answered Allow, but where computer use is now (at REPLY time, not
-    /// at the ORIGINAL pre-await sample) disabled, must still be forced to
-    /// reject — even with no teardown at all.
-    #[test]
-    fn permission_reply_must_reject_denies_a_gui_intent_disabled_after_the_await() {
-        assert!(
-            permission_reply_must_reject(false, true, false),
-            "a GUI intent whose kill switch flipped off after the human-review await must reject, \
-             even with the engine otherwise perfectly healthy"
-        );
-    }
-
-    /// The happy path this fix must not regress: a GUI intent, still enabled,
-    /// no teardown — proceeds as Allow (the funnel returns `false`, i.e.
-    /// "don't force a reject").
-    #[test]
-    fn permission_reply_must_reject_allows_a_healthy_gui_intent() {
-        assert!(!permission_reply_must_reject(false, true, true));
-    }
-
-    /// Teardown alone is still sufficient to reject, exactly as before this
-    /// round — independent of whether computer use is enabled, and
-    /// independent of `is_gui` (a non-GUI intent must reject on teardown
-    /// too, unlike the GUI-only kill switch half).
-    #[test]
-    fn permission_reply_must_reject_on_teardown_regardless_of_gui_or_enabled() {
-        assert!(permission_reply_must_reject(true, true, true), "teardown alone must still reject");
-        assert!(
-            permission_reply_must_reject(true, false, true),
-            "teardown must reject a non-GUI intent too"
-        );
-    }
-
-    /// A non-GUI intent is never affected by `computer_use_enabled_now`,
-    /// mirroring `gui_kill_switch_denies`'s own non-GUI guarantee.
-    #[test]
-    fn permission_reply_must_reject_never_affects_a_non_gui_intent_via_computer_use() {
-        assert!(!permission_reply_must_reject(false, false, false));
-        assert!(!permission_reply_must_reject(false, false, true));
+        assert!(!is_gui_intent(&PermissionIntent::Command("rm -rf /".into())));
+        assert!(!is_gui_intent(&PermissionIntent::Read { paths: Vec::new() }));
+        assert!(!is_gui_intent(&PermissionIntent::Write { paths: Vec::new() }));
+        assert!(!is_gui_intent(&PermissionIntent::Network));
+        assert!(!is_gui_intent(&PermissionIntent::Other { kind: "think".into() }));
     }
 
     /// An image-only message is addressable in ACP and not in claude, and the

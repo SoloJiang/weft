@@ -780,7 +780,14 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // seed the record directly rather than driving a real `screenshot` call
     // through the gate first just to satisfy this precondition (unrelated to
     // what this section actually tests).
-    computer::record_shot_dims(gate_thread, &gate_dir_s, 1, width, height, "Notes", "Untitled");
+    computer::record_shot_dims(
+        gate_thread,
+        &gate_dir_s,
+        1,
+        width,
+        height,
+        &WindowInfo { id: 1, app: "Notes".into(), title: "Untitled".into(), x: 0, y: 0, width, height },
+    );
     let clicks_before = mock.actions.lock().unwrap().len();
 
     let call = spawn_computer_call(&base, gate_thread, gate_dir_s.clone(), "left_click", "notes");
@@ -907,7 +914,14 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // issue #160 round-11 P1 #D: 12b's `left_click` below reaches the real
     // backend (Full-granted) — seed this session's "notes" (id 1) shot dims
     // directly, same reasoning as section 10 above.
-    computer::record_shot_dims(focus_thread, &focus_dir_s, 1, width, height, "Notes", "Untitled");
+    computer::record_shot_dims(
+        focus_thread,
+        &focus_dir_s,
+        1,
+        width,
+        height,
+        &WindowInfo { id: 1, app: "Notes".into(), title: "Untitled".into(), x: 0, y: 0, width, height },
+    );
     // `clear_control` first: thread=1 (section 11) still holds the single
     // process-wide control lease; the sleep clears the throttle window.
     computer::clear_control();
@@ -992,7 +1006,14 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // dims once, up front, same reasoning as sections 10/12 above (13b/13c's
     // `type` calls don't need this — only coordinate-taking actions do — but
     // 13a/13c's own `left_click`s do).
-    computer::record_shot_dims(refocus_thread, &refocus_dir_s, 1, width, height, "Notes", "Untitled");
+    computer::record_shot_dims(
+        refocus_thread,
+        &refocus_dir_s,
+        1,
+        width,
+        height,
+        &WindowInfo { id: 1, app: "Notes".into(), title: "Untitled".into(), x: 0, y: 0, width, height },
+    );
     computer::clear_control();
     tokio::time::sleep(Duration::from_millis(600)).await;
 

@@ -837,7 +837,7 @@ export const en = {
     computerUseGroup: "Computer use",
     computerUseTitle: "Allow computer use",
     computerUseHint:
-      "Lets an agent see and control other application windows on this computer: enumerate windows, screenshot a named window, and — with your approval — click, scroll, drag, type text, and send keyboard shortcuts into it. Off by default. Screenshots exclude Weft's own window and known terminal-emulator windows (a best-effort list, not an exhaustive one). Each call asks in Needs you first, but an Always or Full grant you give there auto-approves matching later calls. Toggling takes effect for sessions started afterwards.",
+      "Lets an agent see and control other application windows on this computer: enumerate windows, screenshot a named window, and — with your approval — click, scroll, drag, type text, and send keyboard shortcuts into it. Off by default. Screenshots exclude Weft's own window and known terminal-emulator windows (a best-effort list, not an exhaustive one). Each call asks in Needs you first, but an Always or Full grant you give there auto-approves matching later calls. Turning this on or off takes effect immediately, even for sessions already running — the very next tool call is checked against the current setting, with no restart needed.",
     computerControlActive:
       "An agent is controlling the desktop (task {{dir}} in thread {{thread}}). Press Esc or click Stop to cut it off.",
     computerControlStop: "Stop",

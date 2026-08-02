@@ -366,6 +366,61 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
     }
 }
 
+/// Write `bytes` to `path` as an ATOMICALLY-created, owner-only file (issue
+/// #160 round-12 P1 #D, Codex round-11 finding): a bare `std::fs::write`
+/// under the common `022` umask creates the file `0644` FIRST, and only
+/// narrows it to `0600` a moment later via a SEPARATE `set_permissions`
+/// call — any other local account that can reach the path in that gap (the
+/// exact shared/traversable-machine threat model [`inject_computer_claude`]'s
+/// own doc already targets) can read a bearer token straight off disk before
+/// the chmod ever lands. Both token-bearing config writes in this module
+/// ([`inject_computer_claude`]'s Claude `.mcp.json`, and
+/// [`inject_computer_opencode`]'s merged `opencode.json`) go through this
+/// instead of write-then-chmod.
+///
+/// `#[cfg(unix)]`: opens with `create_new` (O_EXCL) + `O_NOFOLLOW` + mode
+/// `0o600` in ONE syscall — never observably `0644`, not even for an
+/// instant — mirroring `computer::screenshot_window`'s own owner-only write
+/// and `lead_chat::engine`'s `write_attachment_no_follow`, the two other
+/// places this codebase already needed the identical "never readable at any
+/// wider mode, ever" guarantee.
+///
+/// Re-injection (the SAME path written again — a resumed/rerun session, or
+/// `merge_opencode_config` re-merging on a later spawn) is the ordinary
+/// case, not an edge case: an existing file at `path` is removed FIRST
+/// (best-effort; `remove_file` unlinks the directory entry itself, it never
+/// follows a symlink there), then `create_new` runs fresh — so a stale
+/// leftover from a previous session never blocks this one with
+/// `AlreadyExists`, and a symlink planted at this predictable path in the
+/// gap between the `remove_file` and the `create_new` is refused by
+/// `O_NOFOLLOW`/`create_new` itself rather than followed.
+///
+/// Non-unix keeps the pre-existing plain `write` (no owner-only concept
+/// there this crate can portably act on) — matches every other
+/// `#[cfg(unix)]` split in this codebase. Returns whether the write actually
+/// landed, so callers keep their existing best-effort
+/// `Injection { args: vec![] }` fallback on failure.
+fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> bool {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::remove_file(path);
+        let mut opt = std::fs::OpenOptions::new();
+        opt.write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let Ok(file) = opt.open(path) else { return false };
+        let mut w = std::io::BufWriter::new(file);
+        if w.write_all(bytes).is_err() {
+            return false;
+        }
+        w.flush().is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes).is_ok()
+    }
+}
+
 /// Claude's computer-use MCP config, issue #160 round-12 P1 #6 (Codex
 /// round-11 finding): `inject_mcp`'s generic claude branch writes
 /// `.weft-<stem>.mcp.json` INSIDE the worktree (`cwd`), relying on
@@ -382,16 +437,19 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
 /// any other account that can reach the path at all.
 ///
 /// This writes the config to a Weft-managed, OUT-OF-REPO location instead —
-/// under `paths::weft_home()`, never inside `cwd` — narrowed to `0600` on
-/// unix so only this user's own account can read the bearer even on a
-/// shared machine, and named per `(thread, dir)` so concurrent sessions each
-/// get their own file. There is no repo path here for the token to ever
-/// land in a commit, so — unlike the claude branch of `inject_mcp` — this
-/// never calls `git::git_exclude` at all (nothing to exclude: canonical
-/// repos must never see Weft's own bookkeeping, and now there is none to
-/// see). Best-effort: an unwritable `weft_home`/config dir falls back to no
-/// injection (`Injection { args: vec![] }`) rather than erroring the whole
-/// session, matching `inject_mcp`'s own best-effort contract.
+/// under `paths::weft_home()`, never inside `cwd` — created ATOMICALLY
+/// owner-only on unix (issue #160 round-12 P1 #D — see
+/// [`write_owner_only_atomic`]'s own doc for why write-then-chmod left a
+/// readable window this closes) so only this user's own account can read
+/// the bearer even on a shared machine, and named per `(thread, dir)` so
+/// concurrent sessions each get their own file. There is no repo path here
+/// for the token to ever land in a commit, so — unlike the claude branch of
+/// `inject_mcp` — this never calls `git::git_exclude` at all (nothing to
+/// exclude: canonical repos must never see Weft's own bookkeeping, and now
+/// there is none to see). Best-effort: an unwritable `weft_home`/config dir,
+/// or a failed atomic write, falls back to no injection (`Injection { args:
+/// vec![] }`) rather than erroring the whole session, matching
+/// `inject_mcp`'s own best-effort contract.
 fn inject_computer_claude(thread: i32, dir: &str, url: &str) -> Injection {
     let Ok(home) = crate::paths::weft_home() else {
         return Injection { args: vec![] };
@@ -407,13 +465,9 @@ fn inject_computer_claude(thread: i32, dir: &str, url: &str) -> Injection {
     let json = serde_json::json!({
         "mcpServers": { "weft_computer": { "type": "http", "url": url } }
     });
-    if std::fs::write(&file, serde_json::to_vec_pretty(&json).unwrap_or_default()).is_err() {
+    let bytes = serde_json::to_vec_pretty(&json).unwrap_or_default();
+    if !write_owner_only_atomic(&file, &bytes) {
         return Injection { args: vec![] };
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
     }
     Injection {
         args: vec!["--mcp-config".into(), file.to_string_lossy().to_string()],
@@ -473,10 +527,16 @@ fn opencode_json_is_tracked(cwd: &Path) -> bool {
 ///    server keeps `merge_opencode_config`'s pre-existing accepted
 ///    limitation (it still merges into a tracked file — harmless, since none
 ///    of them carry a secret).
-/// 2. `#[cfg(unix)]` narrows the file to `0600` right after writing — the
+/// 2. The merged file is written ATOMICALLY owner-only on unix (issue #160
+///    round-12 P1 #D — see [`write_owner_only_atomic`]'s own doc) — the
 ///    bearer token must not be left world/group-readable on a shared or
 ///    traversable checkout, mirroring the SAME protection
-///    [`inject_computer_claude`] applies to Claude's own config.
+///    [`inject_computer_claude`] applies to Claude's own config. Before
+///    round-12, this narrowed the file to `0600` via a SEPARATE
+///    `set_permissions` call right after `merge_opencode_config`'s own
+///    plain `std::fs::write` landed — a default-umask-readable window
+///    between the two, same shape as [`inject_computer_claude`]'s own
+///    pre-round-12 gap.
 ///
 /// KNOWN, ACCEPTED residual (documented here, and in the round's own report):
 /// same-uid processes can still read this file/env regardless (existing §9
@@ -486,13 +546,7 @@ fn inject_computer_opencode(cwd: &Path, url: &str) {
     if opencode_json_is_tracked(cwd) {
         return;
     }
-    merge_opencode_config(cwd, "weft_computer", url);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let path = cwd.join("opencode.json");
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    merge_opencode_config(cwd, "weft_computer", url, true);
 }
 
 /// Build the global-MCP injection for the Concierge engine (M3-2). Not
@@ -530,7 +584,12 @@ fn inject_mcp(server: &str, stem: &str, url: &str, tool: &str, cwd: &Path) -> In
             args: vec!["-c".into(), format!("mcp_servers.{server}.url={url}")],
         },
         "opencode" => {
-            merge_opencode_config(cwd, server, url);
+            // `secret: false` — none of `weft_bus`/`weft_planner`/
+            // `weft_curator`/`weft_global` carry a bearer token, so the
+            // plain (non-atomic, non-owner-only) write is unchanged from
+            // before round-12 P1 #D. Only `inject_computer_opencode`'s
+            // `weft_computer` merge passes `true`.
+            merge_opencode_config(cwd, server, url, false);
             Injection { args: vec![] }
         }
         _ => Injection { args: vec![] },
@@ -539,7 +598,18 @@ fn inject_mcp(server: &str, stem: &str, url: &str, tool: &str, cwd: &Path) -> In
 
 /// Deep-merge `mcp.<server> = {type:remote, url, enabled:true}` into the cwd's
 /// opencode.json, preserving any existing config the sub-repo shipped.
-fn merge_opencode_config(cwd: &Path, server: &str, url: &str) {
+///
+/// `secret` (issue #160 round-12 P1 #D): when `true` ([`inject_computer_opencode`]'s
+/// ONE caller — `url` embeds a per-session bearer token), the merged file is
+/// written via [`write_owner_only_atomic`] instead of a plain `std::fs::write`
+/// — see that function's own doc for the write-then-chmod window this
+/// closes. `false` (every other caller, via `inject_mcp`'s generic
+/// `"opencode"` branch) keeps the pre-existing plain write: none of
+/// `weft_bus`/`weft_planner`/`weft_curator`/`weft_global` carry a secret, so
+/// there is nothing here for owner-only atomicity to protect, and forcing it
+/// anyway would needlessly tighten a config file the sub-repo may expect to
+/// read/write with its own tooling.
+fn merge_opencode_config(cwd: &Path, server: &str, url: &str, secret: bool) {
     let path = cwd.join("opencode.json");
     let mut root: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
@@ -564,7 +634,12 @@ fn merge_opencode_config(cwd: &Path, server: &str, url: &str) {
             serde_json::json!({ "type": "remote", "url": url, "enabled": true }),
         );
     }
-    let _ = std::fs::write(&path, serde_json::to_vec_pretty(&root).unwrap_or_default());
+    let bytes = serde_json::to_vec_pretty(&root).unwrap_or_default();
+    if secret {
+        let _ = write_owner_only_atomic(&path, &bytes);
+    } else {
+        let _ = std::fs::write(&path, &bytes);
+    }
     // Best-effort: only hides opencode.json from git when the sub-repo does NOT
     // track it. If the repo ships a tracked opencode.json, the merge still shows
     // as a modification — an accepted limitation of the worktree-local merge.
@@ -655,6 +730,56 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "the bearer-token-bearing config must be 0600, got {mode:o}");
+        }
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// issue #160 round-12 P1 #D: re-injection (the SAME `(thread, dir)`
+    /// writing this SAME path again — a resumed/rerun session) must land
+    /// via [`write_owner_only_atomic`]'s remove-then-`create_new` path, not
+    /// silently fall back to a wider-mode write because the file already
+    /// exists. Runs the injection TWICE for the identical `(thread, dir)`
+    /// and asserts the SECOND write is still exactly `0600` and the content
+    /// reflects the newer URL — never a stale leftover from the first write,
+    /// and never briefly `0644` in between.
+    #[test]
+    fn computer_claude_config_reinjection_stays_owner_only_and_atomic() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let weft_home =
+            std::env::temp_dir().join(format!("weft-inj-comp-reinject-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let dir = std::env::temp_dir().join(format!("weft-inj-comp-reinject-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let first = inject_computer("http://127.0.0.1:9", 5, "50", "claude", &dir, None);
+        let cfg_path = std::path::PathBuf::from(&first.args[1]);
+        assert!(cfg_path.exists(), "the first injection must write the config");
+
+        // A second injection for the SAME (thread, dir) — standing in for a
+        // resumed/rerun session hitting the SAME predictable path.
+        let second = inject_computer("http://127.0.0.1:9", 5, "50", "claude", &dir, Some(7));
+        assert_eq!(
+            std::path::PathBuf::from(&second.args[1]),
+            cfg_path,
+            "re-injection for the same (thread, dir) must reuse the same predictable path"
+        );
+        let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(cfg.contains("wt=7"), "the SECOND write's content must win: {cfg}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "re-injection must remain exactly 0600, never a wider mode surviving from a stale \
+                 create, got {mode:o}"
+            );
         }
 
         std::env::remove_var("WEFT_HOME");
@@ -1139,6 +1264,44 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "the bearer-token-bearing opencode.json must be 0600, got {mode:o}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// issue #160 round-12 P1 #D: re-merging the SAME `opencode.json` again
+    /// (a second spawn/resume for the same worktree) must go through
+    /// `write_owner_only_atomic`'s remove-then-`create_new` path and land at
+    /// exactly `0600` again — never fall back to a wider mode because the
+    /// file already exists — and the merge itself must still preserve
+    /// whatever the FIRST merge already wrote (the deep-merge semantics
+    /// `merge_opencode_config` reads-then-rewrites are unaffected by which
+    /// write path lands the bytes).
+    #[test]
+    fn computer_opencode_reinjection_stays_owner_only_and_preserves_the_merge() {
+        let dir = std::env::temp_dir().join(format!("weft-inj-comp-oc-reinject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("opencode.json");
+
+        let _ = inject_computer("http://127.0.0.1:9", 2, "20", "opencode", &dir, None);
+        assert!(cfg_path.exists(), "the first merge must write the config");
+
+        // A second merge, standing in for a resumed/rerun session's own
+        // spawn-time injection landing on the SAME worktree.
+        let _ = inject_computer("http://127.0.0.1:9", 2, "20", "opencode", &dir, Some(9));
+        let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(cfg.contains("wt=9"), "the SECOND merge's URL must win: {cfg}");
+        assert!(cfg.contains("weft_computer"), "{cfg}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "re-merging must remain exactly 0600, never a wider mode surviving from a stale \
+                 create, got {mode:o}"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

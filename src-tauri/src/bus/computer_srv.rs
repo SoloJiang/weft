@@ -552,14 +552,15 @@ async fn run_action(
             // THIS call". Also records `window_id_out` for the audit line,
             // even on the failure path (matches every input arm's own
             // ordering — see that helper's doc).
-            // `w` is used for the verification above AND (round-12 P1 #2)
-            // to record this capture's own window IDENTITY alongside its
-            // dimensions below — every other line here still keys off
-            // `shot.window_id` instead (the id `screenshot_window` ITSELF
-            // resolved and captured against), matching this arm's own
-            // pre-existing "no second resolution to drift" discipline (see
-            // the `store_screenshot_preview` call below).
-            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
+            // First check: fail fast (and still record `window_id_out` for
+            // the audit line — `resolve_and_verify_target`'s own doc) before
+            // ever awaiting `screenshot_out_dir`/the capture semaphore below
+            // for a call that was always going to be rejected anyway. Its
+            // OWN `WindowInfo` is intentionally unused past this point —
+            // issue #160 round-12 P1 #I re-resolves and re-verifies a SECOND
+            // time, right before the capture, and THAT result is what gets
+            // used for the actual capture/record below.
+            let _ = resolve_and_verify_target(window_query, &approved, window_id_out)?;
             let out_dir = screenshot_out_dir(db, thread, dir, wt).await?;
             // issue #160 round-12 P1 #5: acquire the process-wide capture
             // semaphore BEFORE the synchronous capture below — see
@@ -571,9 +572,37 @@ async fn run_action(
             // this call does; dropped when this arm's block ends (including
             // on an early `?` return from the capture itself).
             let _capture_permit = screenshot_semaphore().acquire().await.map_err(|e| e.to_string())?;
+            // issue #160 round-12 P1 #I: re-resolve + re-verify identity
+            // AGAIN, here, after EVERY await this arm takes since the first
+            // check above (`screenshot_out_dir`, then the capture semaphore
+            // itself) — with BOTH `SCREENSHOT_CONCURRENCY` permits already
+            // held by concurrent captures, the `acquire().await` just above
+            // can queue for arbitrarily long. `screenshot_window` below only
+            // re-resolves `window_query` for ITS OWN capture; it does not
+            // compare against `approved` at all. Without this second check,
+            // the ORIGINAL window could close during that queueing gap and a
+            // same-query REPLACEMENT window take its place, and
+            // `screenshot_window`'s internal re-resolve would then silently
+            // capture the REPLACEMENT's pixels under an approval that was
+            // only ever shown for the original — this is exactly the
+            // round-11 P1 #C gap, reopened by round-12 P1 #5's OWN semaphore
+            // queue. No further `.await` happens between this check and the
+            // capture call below, so — like every input arm's own second
+            // `resolve_and_verify_target` right before injection (round-8
+            // P1 #4/round-10 P1 #B) — this restores the "just verified"
+            // guarantee the comment below relies on. `w` (this SECOND
+            // resolve's result) is what gets used for the actual capture and
+            // for recording this capture's own window IDENTITY+GEOMETRY
+            // (round-12 P1 #2, round-12 P1 #C) below — every other line here
+            // still keys off `shot.window_id` instead (the id
+            // `screenshot_window` ITSELF resolved and captured against),
+            // matching this arm's own pre-existing "no second resolution to
+            // drift" discipline (see the `store_screenshot_preview` call
+            // below).
+            let w = resolve_and_verify_target(window_query, &approved, window_id_out)?;
             let b = backend::backend();
             // `screenshot_window` re-resolves `window_query` internally —
-            // the SAME query just verified above, against the SAME
+            // the SAME query just re-verified above, against the SAME
             // unchanging backend state, with no await/OS call in between —
             // so it captures the IDENTICAL window `w` just verified. This
             // mirrors the accepted "resolve twice" pattern the click-family
@@ -641,7 +670,7 @@ async fn run_action(
             // successful capture, regardless of which engine is asking —
             // matches `store_screenshot_preview`'s own "refresh every
             // successful screenshot" rule right above.
-            computer::record_shot_dims(thread, dir, shot.window_id, shot.width, shot.height, &w.app, &w.title);
+            computer::record_shot_dims(thread, dir, shot.window_id, shot.width, shot.height, &w);
             // The MCP `image` content block is engine-gated — see
             // `engine_accepts_mcp_image`'s doc table.
             if engine_accepts_mcp_image(db, thread, dir).await {
@@ -1845,10 +1874,12 @@ fn window_arg(args: &Value) -> String {
 /// allowed to touch the backend at all:
 /// 1. is a permission card already blocking this (thread, dir) —
 ///    [`ComputerError::SuspendedPendingAsk`] — see [`check_suspended`];
-/// 2. does someone else hold the control lease — [`ComputerError::Busy`] —
-///    see [`acquire_and_throttle`];
-/// 3. are we going faster than the global input throttle allows —
-///    [`ComputerError::RateLimited`] — also [`acquire_and_throttle`].
+/// 2. are we going faster than the global input throttle allows —
+///    [`ComputerError::RateLimited`] — see [`acquire_and_throttle`];
+/// 3. does someone else hold the control lease — [`ComputerError::Busy`] —
+///    also [`acquire_and_throttle`], checked AFTER the throttle (issue #160
+///    round-12 P2 #G — see that function's own doc for why the order
+///    flipped from the reverse it used to be).
 ///
 /// issue #160 round-2 P2 §4 split this single gate in two and moved the
 /// MUTATING half ([`acquire_and_throttle`] — it actually takes the 30s
@@ -1893,9 +1924,26 @@ fn check_suspended(asks: &AskRegistry, thread: i32, dir: &str) -> Result<(), Str
 /// passed, immediately before the backend call itself: a call that was
 /// always going to be rejected for a bad argument never reaches this, so it
 /// never occupies the control lease or a throttle slot.
+///
+/// issue #160 round-12 P2 #G: throttle is now checked BEFORE the control
+/// lease is (re)acquired — the reverse of this function's own pre-round-12
+/// order. Before this, a same-session input call faster than
+/// `computer::THROTTLE_MS` apart still ran `acquire_control` FIRST, which
+/// unconditionally RENEWS the 30s sliding-window lease (a live same-holder
+/// re-acquire renews `expires_at_ms`, per that function's own doc) — only
+/// THEN did `throttle_input` reject it. A caller spamming calls faster than
+/// the throttle window — each one individually rejected — kept renewing its
+/// own lease on every single rejected attempt, so the control lease (and the
+/// "an agent is controlling the desktop" banner/OS-level Escape shortcut it
+/// keeps registered) could be held open INDEFINITELY by a loop of calls that
+/// never actually got to inject anything. `computer::throttle_input` has no
+/// side effect on its OWN `Err` path (it only records `now` on success — see
+/// that function's own doc), so checking it FIRST costs nothing when it
+/// passes, and means a rejected, rate-limited call no longer touches
+/// `acquire_control`/the lease at all.
 fn acquire_and_throttle(thread: i32, dir: &str) -> Result<(), String> {
-    computer::acquire_control(thread, dir).map_err(|e| e.to_string())?;
     computer::throttle_input().map_err(|e| e.to_string())?;
+    computer::acquire_control(thread, dir).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2148,7 +2196,6 @@ fn audit_line(entry: &AuditEntry<'_>) -> Result<String, serde_json::Error> {
 /// [`open_audit_file_for_append`]) never affects the actual tool result, it
 /// just means this one call goes unlogged.
 async fn append_audit(db: &Db, thread: i32, dir: &str, wt: Option<i32>, entry: &AuditEntry<'_>) {
-    use tokio::io::AsyncWriteExt;
     let Some(path) = audit_log_path(db, thread, dir, wt).await else {
         return;
     };
@@ -2156,15 +2203,61 @@ async fn append_audit(db: &Db, thread: i32, dir: &str, wt: Option<i32>, entry: &
     if tokio::fs::create_dir_all(parent).await.is_err() {
         return;
     }
+    let Ok(line) = audit_line(entry) else { return };
+    write_audit_line_locked(&path, &line).await;
+}
+
+/// issue #160 round-12 P1 #E: process-wide async lock serializing every
+/// "check size → (maybe) rotate → open → append" sequence
+/// [`write_audit_line_locked`] performs — the concurrent-writer race this
+/// closes: two `tools/call`s finishing at nearly the same moment each
+/// independently read the file's size (via [`rotate_audit_if_needed`]) as
+/// still under [`MAX_AUDIT_BYTES`] — true at the instant EACH checked, since
+/// neither call's check-then-act was synchronized against the other — so
+/// BOTH skip rotation and both append; worse, both could decide TO rotate,
+/// racing each other's `rename` and losing whichever line landed between
+/// the loser's stale size-check and its own now-superseded open. The
+/// aggregate can land arbitrarily far past the cap, or a rotation can
+/// clobber/lose lines, before any single caller's own check would have
+/// caught it.
+///
+/// A single GLOBAL lock (not keyed per-path) is deliberate: audit logging is
+/// best-effort and each write is small (one JSON line), so there is no
+/// throughput concern serializing every session's own audit append behind
+/// one mutex — and a single lock can never deadlock across two DIFFERENT
+/// sessions' paths the way a per-path lock keyed by a fallible hash/pool
+/// could. `tokio::sync::Mutex` (not `std::sync::Mutex`): held ACROSS the
+/// `.await`s inside [`write_audit_line_locked`] (the file open/write), which
+/// a `std::sync::Mutex` guard cannot survive across an `.await` point at
+/// all — `tokio::sync::Mutex::lock` never poisons (unlike `std::sync::
+/// Mutex`, there is no fallible `.unwrap_or_else(|e| e.into_inner())` needed
+/// here).
+fn audit_write_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// The actual critical section [`append_audit`] serializes on (issue #160
+/// round-12 P1 #E) — split out from `append_audit` so a test can drive
+/// genuine concurrent calls against a raw path directly, without needing a
+/// `Db`/workspace resolution just to reach the race this closes. Holds
+/// [`audit_write_lock`] across the WHOLE size-check → rotate → open →
+/// append sequence, so two concurrent callers can never interleave their
+/// own rotate decisions or race an open against a rotation still in
+/// flight — see that lock's own doc for the exact corruption this
+/// prevents. Best-effort like every other step here: never blocks or fails
+/// the actual tool call; a lock/rotate/open/write failure here just means
+/// this one line goes unlogged.
+async fn write_audit_line_locked(path: &std::path::Path, line: &str) {
+    use tokio::io::AsyncWriteExt;
+    let _guard = audit_write_lock().lock().await;
     // issue #160 round-10 P1 #F: rotate BEFORE opening for append — see
     // `rotate_audit_if_needed`'s own doc for the unbounded-growth hazard
     // this closes (a Full/exact-Always-granted agent looping
     // `cursor_position`/`list_windows` with no throttle of its own would
-    // otherwise append forever). Best-effort like every other step here:
-    // never blocks or fails the actual append.
-    rotate_audit_if_needed(&path);
-    let Ok(line) = audit_line(entry) else { return };
-    let Ok(mut file) = open_audit_file_for_append(&path).await else {
+    // otherwise append forever).
+    rotate_audit_if_needed(path);
+    let Ok(mut file) = open_audit_file_for_append(path).await else {
         return;
     };
     let _ = file.write_all(line.as_bytes()).await;
@@ -3128,7 +3221,22 @@ mod tests {
         // record directly (standing in for "this session already
         // screenshotted this window") since the CURRENT size is what this
         // test's own window origin/size started at, at 1:1 scale.
-        computer::record_shot_dims(thread, dir, 906_301, 800, 600, "Baz", "Baz");
+        computer::record_shot_dims(
+            thread,
+            dir,
+            906_301,
+            800,
+            600,
+            &computer::WindowInfo {
+                id: 906_301,
+                app: "Baz".into(),
+                title: "Baz".into(),
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
 
         // Prime the global input throttle well ahead of time so the real
         // click below isn't itself rejected as rate-limited.
@@ -3280,6 +3388,11 @@ mod tests {
     /// still passes; only the GEOMETRY changed. The click must land using the
     /// window's geometry AS OF AFTER activation, never the stale
     /// pre-activation origin.
+    ///
+    /// issue #160 round-12 P1 #C note: this origin change is also exactly
+    /// why `computer::shot_dims_for` does NOT gate on geometry — see that
+    /// function's own doc, which names this test by function name as one of
+    /// the two reasons.
     #[tokio::test]
     async fn left_click_uses_the_windows_geometry_as_of_after_activation_not_before() {
         let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -3311,7 +3424,22 @@ mod tests {
         // screenshot dims (its size never changes in this scenario, only its
         // origin does — see the hook below) so the click's coordinate mapping
         // doesn't fail closed for want of a screenshot on file.
-        computer::record_shot_dims(thread, dir, 910_401, 800, 600, "Moving", "moving window");
+        computer::record_shot_dims(
+            thread,
+            dir,
+            910_401,
+            800,
+            600,
+            &computer::WindowInfo {
+                id: 910_401,
+                app: "Moving".into(),
+                title: "moving window".into(),
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
 
         let _ = computer::throttle_input();
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
@@ -3571,7 +3699,22 @@ mod tests {
         // issue #160 round-11 P1 #D: seed this window's recorded screenshot
         // dims (unchanged for this scenario) so the click's coordinate
         // mapping doesn't fail closed for want of a screenshot on file.
-        computer::record_shot_dims(thread, dir, 907_501, 800, 600, "Steady", "steady window");
+        computer::record_shot_dims(
+            thread,
+            dir,
+            907_501,
+            800,
+            600,
+            &computer::WindowInfo {
+                id: 907_501,
+                app: "Steady".into(),
+                title: "steady window".into(),
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
 
         let _ = computer::throttle_input();
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
@@ -4404,7 +4547,28 @@ mod tests {
         });
         // The screenshot this agent is reading coordinates off of was saved
         // at 1280x800 — BEFORE the window resized down to 1000x600 above.
-        computer::record_shot_dims(thread, dir, 912_101, 1280, 800, "Resizable", "resizable window");
+        // issue #160 round-12 P1 #C: geometry is now ALSO recorded here
+        // (the window's own pre-resize rect), but `shot_dims_for` does not
+        // gate on it — see that function's own doc for why this exact
+        // resize-tolerance property (`left_click_maps_the_screenshot_
+        // coordinate_proportionally_after_a_resize`, THIS test) is one of
+        // the two reasons it doesn't.
+        computer::record_shot_dims(
+            thread,
+            dir,
+            912_101,
+            1280,
+            800,
+            &computer::WindowInfo {
+                id: 912_101,
+                app: "Resizable".into(),
+                title: "resizable window".into(),
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 800,
+            },
+        );
 
         // Clear the global input throttle window so this call isn't itself
         // rejected as rate-limited.
@@ -4481,6 +4645,157 @@ mod tests {
         queued
             .await
             .expect("the queued capture must complete once a permit frees up");
+    }
+
+    /// issue #160 round-12 P1 #I: the identity re-verification round-12 P1 #5's
+    /// OWN capture semaphore reopened. With every `SCREENSHOT_CONCURRENCY`
+    /// permit already held (so this call's own `screenshot_semaphore().
+    /// acquire().await` must queue for a while), the ORIGINAL window can
+    /// close and a same-query REPLACEMENT take its place WHILE the call sits
+    /// queued — `approve` and the arm's own FIRST `resolve_and_verify_target`
+    /// (both run before the permit is ever touched) only ever saw the
+    /// ORIGINAL window. A Full grant (not a fresh card) isolates this from
+    /// round-11 P1 #C's own pre-approval gap: authorization already landed
+    /// before the call is even queued, so the ONLY window this test
+    /// exercises is the post-approval, pre-capture one the semaphore reopens.
+    /// Without the round-12 P1 #I re-check, `screenshot_window`'s own
+    /// internal re-resolve would silently capture the REPLACEMENT the
+    /// instant a permit frees up.
+    #[tokio::test]
+    async fn screenshot_re_verifies_after_the_capture_semaphore_queue_before_capturing() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 913_301,
+            app: "Queued".into(),
+            title: "queued window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        let asks = AskRegistry::new();
+        let thread = 913_301;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+
+        // Drain every capture permit so this call's own acquire must queue.
+        let mut held = Vec::new();
+        for _ in 0..SCREENSHOT_CONCURRENCY {
+            held.push(screenshot_semaphore().acquire().await.expect("semaphore is never closed"));
+        }
+
+        let db_bg = db.clone();
+        let asks_bg = asks.clone();
+        let handle = tokio::spawn(async move {
+            let mut window_id_out = None;
+            let mut image_out = None;
+            run_action(
+                &db_bg, &asks_bg, thread, dir, None, "computer", "screenshot",
+                &json!({"window": "queued"}), &mut window_id_out, &mut image_out,
+            )
+            .await
+        });
+
+        // Give the spawned call time to clear approval + its own first
+        // verify and queue on the drained semaphore.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(!handle.is_finished(), "the call must still be queued on the drained capture semaphore");
+
+        // The window is REPLACED while queued: the SAME query still
+        // matches, but a DIFFERENT id/app — standing in for the original
+        // closing and an unrelated one taking its place during the wait.
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 913_302,
+            app: "Different App".into(),
+            title: "queued window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        // Free exactly one permit so the queued call proceeds.
+        held.pop();
+
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(
+            err.contains("changed since this action was approved"),
+            "must fail closed with the re-approve message, never silently capture the replacement: {err}"
+        );
+        assert!(
+            computer::shot_dims_for(
+                thread,
+                dir,
+                &computer::WindowInfo {
+                    id: 913_302,
+                    app: "Different App".into(),
+                    title: "queued window".into(),
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 600,
+                }
+            )
+            .is_none(),
+            "a fail-closed capture must never record shot dims for the replacement window either"
+        );
+
+        drop(held);
+    }
+
+    // —— issue #160 round-12 P2 #G: throttle checked BEFORE the control lease
+    // is (re)acquired ——
+
+    /// The end-to-end property this fix exists for: a same-session input
+    /// call faster than the global throttle window must be rejected WITHOUT
+    /// renewing (extending) the control lease's own expiry. Before this
+    /// round, `acquire_and_throttle` renewed the lease FIRST and only THEN
+    /// checked the throttle — a loop of calls faster than the throttle
+    /// window, each individually rejected, still pushed `expires_at_ms`
+    /// forward on every single attempt, keeping the control lease (and the
+    /// "an agent is controlling the desktop" banner/OS-level Escape shortcut
+    /// it keeps registered) alive indefinitely even though no input actually
+    /// ever got through.
+    #[test]
+    fn acquire_and_throttle_rejects_a_rate_limited_repeat_without_renewing_the_control_lease() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_control();
+        // Consume + reset the throttle window far enough in the past that
+        // the FIRST call below is not itself rejected as rate-limited.
+        let _ = computer::throttle_input();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        // First call: nobody holds the lease and the throttle window has
+        // already elapsed — both checks pass, taking a fresh lease.
+        acquire_and_throttle(931_001, "90").expect("the first call must succeed");
+        let after_first = computer::control_state().expect("the lease must be held after the first call");
+
+        // A SECOND call for the SAME (thread, dir), immediately after — well
+        // inside the throttle window — must be rejected...
+        let err = acquire_and_throttle(931_001, "90")
+            .expect_err("a call inside the throttle window must be rejected");
+        assert!(err.to_lowercase().contains("rate-limited"), "{err}");
+
+        // ...and the lease's own expiry must be UNCHANGED by that rejected
+        // call — proving `acquire_control` was never reached for it.
+        let after_second = computer::control_state()
+            .expect("the lease must still be held — unaffected by the rejected call");
+        assert_eq!(
+            after_first.expires_at_ms, after_second.expires_at_ms,
+            "a rate-limited call must not renew (extend) the control lease's expiry"
+        );
+
+        computer::clear_control();
     }
 
     // —— issue #160 round-2 P2 §2: args_digest / Always-grant action_key ——
@@ -4816,6 +5131,61 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "new-line\n",
             "the new file at the original path must start fresh, not append to the rotated-away content"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// issue #160 round-12 P1 #E: the concurrent-writer race `audit_write_lock`
+    /// closes, exercised through genuine concurrency (a multi-threaded
+    /// runtime, so the check/rotate/open/write sequence really can interleave
+    /// across OS threads without the lock) rather than sequential calls.
+    /// Pre-seeds a REAL over-limit file (`MAX_AUDIT_BYTES` + a margin) so the
+    /// FIRST writer to actually acquire the lock must rotate it — then fires
+    /// many concurrent appends. Without the lock, two callers could each read
+    /// the pre-rotation size, both decide to rotate, and race each other's
+    /// `rename`/open — losing lines or clobbering the `.1` rotation. With it,
+    /// exactly one rotation happens, every line lands, and the live file
+    /// never grows anywhere near the cap again for this many short lines.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_appends_serialize_through_rotation_without_losing_or_corrupting_lines() {
+        let base = std::env::temp_dir().join(format!("weft-audit-concurrent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("computer-audit.jsonl");
+        std::fs::write(&path, vec![b'x'; (MAX_AUDIT_BYTES + 1024) as usize]).unwrap();
+
+        const N: usize = 25;
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let p = path.clone();
+            handles.push(tokio::spawn(async move {
+                write_audit_line_locked(&p, &format!("line-{i}\n")).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let rotated = base.join("computer-audit.jsonl.1");
+        assert!(rotated.exists(), "the pre-seeded over-limit original must have been rotated exactly once");
+        assert!(
+            std::fs::metadata(&rotated).unwrap().len() >= MAX_AUDIT_BYTES,
+            "the rotated-away file must be the ORIGINAL over-limit content, never a torn/mixed one"
+        );
+
+        let live = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            live.lines().count(),
+            N,
+            "every concurrent append must land — none lost to an interleaved rotate/open race: {live:?}"
+        );
+        assert!(
+            (live.len() as u64) < MAX_AUDIT_BYTES / 100,
+            "the post-rotation file must stay small — no SECOND rotation was needed for {N} short \
+             lines, proving no writer raced ahead of the lock to see a stale over-limit size: \
+             {} bytes",
+            live.len()
         );
 
         let _ = std::fs::remove_dir_all(&base);

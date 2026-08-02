@@ -642,11 +642,36 @@ pub fn map_screenshot_coord(
 /// just its dimensions — see [`shot_dims_for`]'s own doc for why a bare
 /// `window_id` key is not enough on its own to answer "is this still the
 /// window that screenshot was taken of".
-fn recent_shot_dims(
-) -> &'static Mutex<std::collections::HashMap<(i32, String, u32), (u32, u32, String, String, u64)>> {
-    static DIMS: OnceLock<Mutex<std::collections::HashMap<(i32, String, u32), (u32, u32, String, String, u64)>>> =
-        OnceLock::new();
+///
+/// issue #160 round-12 P1 #C: the stored value now ALSO carries the window's
+/// own `(x, y, width, height)` geometry AT CAPTURE TIME (see
+/// [`ShotDimsEntry`]) — the strongest per-instance identity signal this
+/// module has access to on top of `app`+`title`, given `xcap` (the backend
+/// this feature is built on) exposes no stable per-window instance token
+/// across separate calls (see [`shot_dims_for`]'s own doc for the honest
+/// residual this leaves, and why it is recorded but deliberately NOT folded
+/// into that function's own pass/fail gate).
+fn recent_shot_dims() -> &'static Mutex<std::collections::HashMap<(i32, String, u32), ShotDimsEntry>> {
+    static DIMS: OnceLock<Mutex<std::collections::HashMap<(i32, String, u32), ShotDimsEntry>>> = OnceLock::new();
     DIMS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// One [`recent_shot_dims`] entry: the saved screenshot's own pixel
+/// dimensions, the window's identity (`app`/`title`) at capture time (issue
+/// #160 round-12 P1 #2), its full `(x, y, width, height)` GEOMETRY at that
+/// same instant (round-12 P1 #C — see [`record_shot_dims`]'s own doc), and
+/// the insertion timestamp [`evict_oldest_shot_dims_if_full`] evicts by.
+#[derive(Debug, Clone)]
+struct ShotDimsEntry {
+    shot_width: u32,
+    shot_height: u32,
+    app: String,
+    title: String,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    ts: u64,
 }
 
 /// This registry's capacity — mirrors [`MAX_PREVIEWS`]'s own reasoning (an
@@ -663,22 +688,26 @@ const MAX_SHOT_DIMS: usize = 128;
 /// already at capacity — same shape as [`evict_oldest_if_full`] above, kept
 /// as its own function (rather than reusing that one) since the key/value
 /// shapes differ (a `window_id`-widened key, no preview payload).
-fn evict_oldest_shot_dims_if_full(
-    map: &mut std::collections::HashMap<(i32, String, u32), (u32, u32, String, String, u64)>,
-) {
+fn evict_oldest_shot_dims_if_full(map: &mut std::collections::HashMap<(i32, String, u32), ShotDimsEntry>) {
     if map.len() < MAX_SHOT_DIMS {
         return;
     }
-    if let Some(oldest_key) = map.iter().min_by_key(|(_, (_, _, _, _, ts))| *ts).map(|(k, _)| k.clone()) {
+    if let Some(oldest_key) = map.iter().min_by_key(|(_, entry)| entry.ts).map(|(k, _)| k.clone()) {
         map.remove(&oldest_key);
     }
 }
 
-/// Record `(width, height, app, title)` — a SAVED screenshot's own dimensions
-/// AND the window identity it was captured against — for `(thread, dir,
-/// window_id)`, refreshing whatever was on file for that exact triple (issue
-/// #160 round-11 P1 #D; `app`/`title` added round-12 P1 #2 — see
-/// [`shot_dims_for`]'s own doc). Called ONLY from `bus::computer_srv`'s
+/// Record a SAVED screenshot's own dimensions AND the window identity +
+/// geometry it was captured against, for `(thread, dir, window_id)`,
+/// refreshing whatever was on file for that exact triple (issue #160
+/// round-11 P1 #D; `app`/`title` added round-12 P1 #2, geometry added
+/// round-12 P1 #C — see [`shot_dims_for`]'s own doc for both). `w` is the
+/// window `screenshot_window` actually captured against, resolved as close
+/// to the capture as this call site can manage (see `bus::computer_srv`'s
+/// screenshot arm, round-12 P1 #I) — its `app`/`title`/`x`/`y`/`width`/
+/// `height` are what get stored; `shot_width`/`shot_height` are the SAVED
+/// IMAGE's own (possibly display-scaled) pixel dimensions, a SEPARATE number
+/// from `w`'s own on-screen geometry. Called ONLY from `bus::computer_srv`'s
 /// screenshot arm, right after a capture actually succeeds — see
 /// [`recent_shot_dims`]'s own doc for the full contract. `#[doc(hidden)]
 /// pub`: `bus::computer_srv` is a sibling module (not a child of this one)
@@ -690,13 +719,26 @@ fn evict_oldest_shot_dims_if_full(
 /// test-visible item is `#[doc(hidden)] pub` rather than
 /// `pub(crate)`/`#[cfg(test)]`.
 #[doc(hidden)]
-pub fn record_shot_dims(thread: i32, dir: &str, window_id: u32, width: u32, height: u32, app: &str, title: &str) {
+pub fn record_shot_dims(thread: i32, dir: &str, window_id: u32, shot_width: u32, shot_height: u32, w: &WindowInfo) {
     let mut g = recent_shot_dims().lock().unwrap_or_else(|e| e.into_inner());
     let key = (thread, dir.to_string(), window_id);
     if !g.contains_key(&key) {
         evict_oldest_shot_dims_if_full(&mut g);
     }
-    g.insert(key, (width, height, app.to_string(), title.to_string(), now_ms()));
+    g.insert(
+        key,
+        ShotDimsEntry {
+            shot_width,
+            shot_height,
+            app: w.app.clone(),
+            title: w.title.clone(),
+            x: w.x,
+            y: w.y,
+            width: w.width,
+            height: w.height,
+            ts: now_ms(),
+        },
+    );
 }
 
 /// The most recently recorded screenshot dimensions for `w` under `(thread,
@@ -721,12 +763,67 @@ pub fn record_shot_dims(thread: i32, dir: &str, window_id: u32, width: u32, heig
 /// same way, so this is a strict narrowing of what counts as a hit, never a
 /// behavior change for the common case (see [`map_screenshot_coord`]'s own
 /// doc).
+///
+/// issue #160 round-12 P1 #C — geometry is recorded (see
+/// [`ShotDimsEntry`]/[`record_shot_dims`]) but DELIBERATELY NOT compared
+/// here, even though an id+app+title match with DIFFERENT geometry is
+/// exactly the "same id, coincidentally same app/title, actually a
+/// different window" case this round set out to narrow. Gating on it would
+/// regress TWO already-shipped, deliberately tested properties this same
+/// module relies on, both driven through this exact function:
+///  - round-10 P1 #B (`bus::computer_srv::
+///    left_click_uses_the_windows_geometry_as_of_after_activation_not_before`):
+///    activation legitimately moves a window (a window manager
+///    un-minimizing/refocusing it) — the ORIGIN changes — and the click
+///    must still land correctly against its NEW position.
+///  - round-11 P1 #D (`bus::computer_srv::
+///    left_click_maps_the_screenshot_coordinate_proportionally_after_a_resize`,
+///    "the end-to-end property this whole round exists for"): the window is
+///    legitimately RESIZED between an earlier screenshot and this click —
+///    the SIZE changes — and the click must still map proportionally
+///    against the new rectangle.
+/// Between them, EVERY field of `(x, y, width, height)` is exercised as a
+/// legitimate, required-to-tolerate change by one test or the other — there
+/// is no subset of geometry this function could gate on without breaking
+/// one of the two. Closing the remaining gap for real needs a stable
+/// per-window instance identity `xcap` does not expose across separate
+/// calls (see this module's own top-of-file doc and issue #160 §9) — a
+/// protocol-level "screenshot token" the agent round-trips, or an OS-level
+/// window handle, either of which is a larger change than this function's
+/// signature. This residual — an id the OS reuses for a genuinely different
+/// window, with a coincidentally identical app+title AND a query that
+/// resolves to it — is unchanged from round-12 P1 #2's own accepted
+/// residual; recording geometry here keeps it available for a future,
+/// protocol-aware fix (or for audit/forensic use) without regressing either
+/// tested tolerance today.
 #[doc(hidden)]
 pub fn shot_dims_for(thread: i32, dir: &str, w: &WindowInfo) -> Option<(u32, u32)> {
     let g = recent_shot_dims().lock().unwrap_or_else(|e| e.into_inner());
-    let (width, height, app, title, _) = g.get(&(thread, dir.to_string(), w.id))?;
-    if *app == w.app && *title == w.title {
-        Some((*width, *height))
+    let entry = g.get(&(thread, dir.to_string(), w.id))?;
+    if entry.app == w.app && entry.title == w.title {
+        Some((entry.shot_width, entry.shot_height))
+    } else {
+        None
+    }
+}
+
+/// The window geometry [`record_shot_dims`] saved for `(thread, dir, w.id)`
+/// at capture time, if any AND if `app`+`title` still match — the SAME
+/// identity gate [`shot_dims_for`] itself applies, exposed as its own
+/// accessor (issue #160 round-12 P1 #C) so a caller that wants to REASON
+/// about geometry drift (audit/forensics, or a future stricter check once a
+/// real per-window instance token exists — see [`shot_dims_for`]'s own doc
+/// for why that check does not live in this round's hot path) can do so
+/// without duplicating the lookup. Not consumed by any production caller
+/// yet — see [`shot_dims_for`]'s own doc for the two shipped, tested
+/// tolerances (round-10 P1 #B, round-11 P1 #D) that keep this deliberately
+/// unwired from the coordinate-mapping path today.
+#[doc(hidden)]
+pub fn shot_geometry_for(thread: i32, dir: &str, w: &WindowInfo) -> Option<(i32, i32, u32, u32)> {
+    let g = recent_shot_dims().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = g.get(&(thread, dir.to_string(), w.id))?;
+    if entry.app == w.app && entry.title == w.title {
+        Some((entry.x, entry.y, entry.width, entry.height))
     } else {
         None
     }
@@ -1362,7 +1459,50 @@ pub fn clear_control() {
 /// call's own (possibly late-arriving) success can never stomp a NEWER,
 /// still-failing `emergency_stop`'s `true` — only the MOST RECENT call, by
 /// generation, is allowed to record the flag's final value.
+///
+/// issue #160 round-12 P1 #B/#F: split into [`trip_stop_latch`] (synchronous,
+/// no lock held across an `.await`, no DB touched at all — flips `stopped`,
+/// bumps the generation, clears the control lease) and [`persist_stop`] (the
+/// awaited DB write, now serialized on the SAME [`enable_serialize_mutex`] a
+/// `commands::set_computer_use_enabled_inner` enable request uses). Two
+/// production callers need that split, not just this combined wrapper:
+///  - `commands::computer_emergency_stop` and this module's own
+///    `register_global_escape` callback both need `AskRegistry::
+///    cancel_gui_asks` to run strictly BEFORE the awaited DB write below —
+///    see that method's own doc for the stale-card-then-Always race left
+///    open when cancellation only ran AFTER this whole function returned
+///    (round-12 P1 #B). Both now call `trip_stop_latch` (latch flips
+///    immediately, no await), then `cancel_gui_asks` (also immediate), then
+///    `persist_stop` (the awaited write) — never this combined function.
+///  - `persist_stop` joining `enable_serialize_mutex` (round-12 P2 #F) is
+///    what makes the LAST call's own write win the DB row regardless of
+///    which call's write happens to finish I/O first — see
+///    `enable_serialize_mutex`'s own doc for the compensating-write race
+///    this closes on the Stop side (before this round, Stop's write ran
+///    OUTSIDE that lock entirely, so a slower Stop write could still land
+///    AFTER a newer, explicit enable's write and silently revert it).
+///
+/// This function itself stays the single, unsplit entry point for every
+/// OTHER caller (tests driving the kill switch end to end; any future
+/// caller that has no `AskRegistry` to cancel against) — it is simply
+/// `trip_stop_latch` immediately followed by an awaited `persist_stop`, with
+/// no behavior change from before this round for a caller that never
+/// observed the gap between the two.
 pub async fn emergency_stop(db: &crate::store::Db) -> Result<(), String> {
+    let my_gen = trip_stop_latch();
+    persist_stop(db, my_gen).await
+}
+
+/// The synchronous half of [`emergency_stop`] (issue #160 round-12 P1 #B/#F)
+/// — flips the in-memory `stopped` latch, bumps the stop-generation, and
+/// clears the control lease, all WITHOUT touching the DB or crossing an
+/// `.await` point. Returns the NEW generation, to be threaded into
+/// [`persist_stop`] afterward (mirrors [`StopState::generation`]'s own
+/// read-before-write contract — this IS that read). Callers that need the
+/// cut-in (and any GUI ask cancellation) to happen strictly before the
+/// slower, awaited DB write call this directly instead of [`emergency_stop`]
+/// — see that function's own doc for the two production call sites and why.
+pub fn trip_stop_latch() -> u64 {
     let my_gen = {
         let mut guard = stop_state().lock().unwrap_or_else(|e| e.into_inner());
         guard.stopped = true;
@@ -1370,13 +1510,33 @@ pub async fn emergency_stop(db: &crate::store::Db) -> Result<(), String> {
         guard.generation
     };
     clear_control();
+    my_gen
+}
+
+/// The awaited half of [`emergency_stop`] (issue #160 round-12 P1 #B/#F):
+/// best-effort persists `computer_use_enabled = false` for `my_gen` (the
+/// generation [`trip_stop_latch`] just minted) and records
+/// [`STOP_PERSIST_FAILED`] under the SAME generation guard `emergency_stop`
+/// always used. Round-12 P2 #F: now serialized on [`enable_serialize_mutex`]
+/// — the SAME lock `commands::set_computer_use_enabled_inner` holds across
+/// its own read-generation/write/reconcile sequence — so Stop's own
+/// persisted write and an overlapping explicit enable's persisted write can
+/// never land out of CALL order. The in-memory latch is already tripped (by
+/// [`trip_stop_latch`], before this ever acquires the lock), so `enabled()`
+/// fails closed for the ENTIRE time this sits queued behind an in-flight
+/// enable — queuing the PERSISTED write behind that lock never reopens the
+/// fail-open window round-6/round-8's own fixes closed, it only decides
+/// which value the DISK ends up with once both writes land.
+pub async fn persist_stop(db: &crate::store::Db, my_gen: u64) -> Result<(), String> {
+    let _serialize = enable_serialize_mutex().lock().await;
     let result = crate::store::repo::set_setting(db, K_COMPUTER_USE_ENABLED, "false")
         .await
         .map_err(|e| e.to_string());
     // round-8 P2 #3: only record THIS call's outcome if no NEWER
-    // `emergency_stop` has since bumped the generation again — otherwise that
-    // newer call owns writing the flag for its own outcome, and a slow
-    // success here must never clear a newer failure it knows nothing about.
+    // `emergency_stop`/`trip_stop_latch` has since bumped the generation
+    // again — otherwise that newer call owns writing the flag for its own
+    // outcome, and a slow success here must never clear a newer failure it
+    // knows nothing about.
     {
         let guard = stop_state().lock().unwrap_or_else(|e| e.into_inner());
         if guard.generation == my_gen {
@@ -1384,6 +1544,30 @@ pub async fn emergency_stop(db: &crate::store::Db) -> Result<(), String> {
         }
     }
     result
+}
+
+/// issue #160 round-10 P2 #D / round-12 P2 #F: serializes every
+/// `commands::set_computer_use_enabled_inner` call AND every [`persist_stop`]
+/// call — see `set_computer_use_enabled_inner`'s own doc for the enable-vs-
+/// enable compensating-write race this originally existed for, and
+/// [`persist_stop`]'s own doc for why Stop's persisted write joined this same
+/// queue (round-12 P2 #F): without it, Stop's write ran OUTSIDE this lock
+/// entirely, so an enable request already past its own read-generation step
+/// could still have its `"true"` write land AFTER a slower Stop's `"false"`
+/// write, silently reverting an explicit, more recent Stop. Held across
+/// EVERY caller's own full read/write/reconcile (or write/record) sequence,
+/// so whichever call is issued LAST is also guaranteed to WRITE last —
+/// `tokio::sync::Mutex`, not `std::sync::Mutex`, because both callers hold it
+/// across their own `.await`s.
+///
+/// Deliberately does NOT gate [`trip_stop_latch`]/the in-memory latch flip
+/// itself — only the two functions' own DB writes join this queue. A human's
+/// Stop must always cut in on the LATCH immediately; queuing that behind an
+/// in-flight enable would delay the one thing this whole feature's safety
+/// property depends on. Only the PERSISTED write is serialized here.
+pub fn enable_serialize_mutex() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 // —— OS-level global Escape (issue #160 review R1 #5) ——
@@ -1469,19 +1653,29 @@ fn register_global_escape() -> Result<(), String> {
         tauri::async_runtime::spawn(async move {
             use tauri::Manager as _;
             let db = app.state::<crate::store::Db>().inner().clone();
-            // Error ignored (but not un-observable — see `STOP_PERSIST_FAILED`):
-            // `emergency_stop` sets the in-memory latch BEFORE its own
-            // fallible DB write, so the kill switch has already taken effect
-            // even on an `Err` here — see that function's doc comment.
-            let _ = emergency_stop(&db).await;
-            // issue #160 round-12 P1 #1: this is the OS-level global Escape's
-            // own entry point into the same cancellation `commands::
-            // computer_emergency_stop` performs — see `AskRegistry::
-            // cancel_computer_asks`'s own doc for the stale-card-then-Always
-            // race this closes. Reached via the app handle (this callback has
-            // no `State` extraction the way a `#[tauri::command]` does).
+            // issue #160 round-12 P1 #B: `trip_stop_latch` (immediate, no
+            // await) THEN `cancel_gui_asks` (also immediate) THEN
+            // `persist_stop` (the awaited DB write) — never the combined
+            // `emergency_stop` wrapper. Before this split, cancellation ran
+            // AFTER the awaited DB write returned; an Always/Full answer
+            // landing on a still-open GUI card DURING that write recorded a
+            // standing grant `answer()` never re-checked the kill switch for
+            // — see `AskRegistry::cancel_gui_asks`'s own doc for the full
+            // race this closes. The latch is already tripped by the time
+            // `cancel_gui_asks` runs, so `computer::enabled` fails closed for
+            // the ENTIRE persist below regardless of how long it takes.
+            let my_gen = trip_stop_latch();
+            // Reached via the app handle (this callback has no `State`
+            // extraction the way a `#[tauri::command]` does) — this is the
+            // OS-level global Escape's own entry point into the same
+            // cancellation `commands::computer_emergency_stop` performs.
             let asks = app.state::<crate::ask::AskRegistry>().inner().clone();
-            asks.cancel_computer_asks();
+            asks.cancel_gui_asks();
+            // Error ignored (but not un-observable — see `STOP_PERSIST_FAILED`):
+            // the in-memory latch (and the GUI-ask cancellation above) already
+            // took effect before this fallible DB write even starts — see
+            // `persist_stop`'s own doc comment.
+            let _ = persist_stop(&db, my_gen).await;
         });
     });
     if let Err(err) = &result {
@@ -2459,17 +2653,21 @@ mod tests {
         ));
     }
 
-    /// Minimal `WindowInfo` for `shot_dims_for` identity tests — only
-    /// `id`/`app`/`title` matter to that lookup; the geometry fields are
-    /// irrelevant filler.
+    /// A `WindowInfo` for `shot_dims_for`/`record_shot_dims` identity tests.
+    /// `id`/`app`/`title` decide `shot_dims_for`'s own hit/miss gate;
+    /// geometry (`x`/`y`/`width`/`height`) is recorded alongside them (issue
+    /// #160 round-12 P1 #C) and readable via `shot_geometry_for`, but is
+    /// NOT part of `shot_dims_for`'s own gate — see that function's own doc
+    /// for why. Defaults to `(0, 0, 0, 0)`; tests that care about geometry
+    /// pass their own explicit values instead of this helper.
     fn shot_win(id: u32, app: &str, title: &str) -> WindowInfo {
         WindowInfo { id, app: app.into(), title: title.into(), x: 0, y: 0, width: 0, height: 0 }
     }
 
     #[test]
     fn shot_dims_round_trips_what_was_recorded_and_is_isolated_per_window_id() {
-        record_shot_dims(920_001, "lead", 7, 1280, 800, "Notes", "Untitled");
-        record_shot_dims(920_001, "lead", 8, 640, 480, "Other", "Untitled");
+        record_shot_dims(920_001, "lead", 7, 1280, 800, &shot_win(7, "Notes", "Untitled"));
+        record_shot_dims(920_001, "lead", 8, 640, 480, &shot_win(8, "Other", "Untitled"));
         assert_eq!(shot_dims_for(920_001, "lead", &shot_win(7, "Notes", "Untitled")), Some((1280, 800)));
         assert_eq!(shot_dims_for(920_001, "lead", &shot_win(8, "Other", "Untitled")), Some((640, 480)));
         // A DIFFERENT (thread, dir, window_id) triple that was never recorded
@@ -2489,8 +2687,8 @@ mod tests {
 
     #[test]
     fn shot_dims_refreshing_the_same_window_overwrites_rather_than_duplicates() {
-        record_shot_dims(920_003, "lead", 1, 1280, 800, "Steady", "steady window");
-        record_shot_dims(920_003, "lead", 1, 640, 480, "Steady", "steady window");
+        record_shot_dims(920_003, "lead", 1, 1280, 800, &shot_win(1, "Steady", "steady window"));
+        record_shot_dims(920_003, "lead", 1, 640, 480, &shot_win(1, "Steady", "steady window"));
         assert_eq!(
             shot_dims_for(920_003, "lead", &shot_win(1, "Steady", "steady window")),
             Some((640, 480)),
@@ -2504,7 +2702,7 @@ mod tests {
     /// the OLD window's saved geometry.
     #[test]
     fn shot_dims_for_fails_closed_when_the_window_id_was_reused_by_a_different_window() {
-        record_shot_dims(920_004, "lead", 5, 1280, 800, "Original App", "Original Title");
+        record_shot_dims(920_004, "lead", 5, 1280, 800, &shot_win(5, "Original App", "Original Title"));
         // Same (thread, dir, id) — a DIFFERENT app+title, standing in for the
         // OS reusing a closed window's id for an unrelated new window.
         let replaced = shot_win(5, "Different App", "Different Title");
@@ -2517,6 +2715,104 @@ mod tests {
         assert_eq!(
             shot_dims_for(920_004, "lead", &shot_win(5, "Original App", "Original Title")),
             Some((1280, 800))
+        );
+    }
+
+    // —— issue #160 round-12 P1 #C: capture-time geometry is recorded and
+    // readable, deliberately NOT folded into `shot_dims_for`'s own gate ——
+
+    /// The data-layer half of round-12 P1 #C: `record_shot_dims` now ALSO
+    /// captures `w`'s own `(x, y, width, height)` at capture time, and
+    /// `shot_geometry_for` returns EXACTLY that — round-tripped, not derived
+    /// or approximated.
+    #[test]
+    fn shot_geometry_for_round_trips_the_windows_capture_time_geometry() {
+        let w = WindowInfo {
+            id: 11,
+            app: "Geo".into(),
+            title: "geo window".into(),
+            x: 50,
+            y: 60,
+            width: 800,
+            height: 600,
+        };
+        record_shot_dims(921_001, "lead", 11, 1280, 800, &w);
+        assert_eq!(shot_geometry_for(921_001, "lead", &w), Some((50, 60, 800, 600)));
+    }
+
+    /// `shot_geometry_for` shares `shot_dims_for`'s own app/title identity
+    /// gate — an id reused by a different window reads as no geometry on
+    /// file either, the same fail-closed answer `shot_dims_for` gives.
+    #[test]
+    fn shot_geometry_for_fails_closed_when_the_window_id_was_reused_by_a_different_window() {
+        let original = WindowInfo {
+            id: 12,
+            app: "Original".into(),
+            title: "original window".into(),
+            x: 10,
+            y: 20,
+            width: 800,
+            height: 600,
+        };
+        record_shot_dims(921_002, "lead", 12, 1280, 800, &original);
+        let replaced = shot_win(12, "Different", "different window");
+        assert_eq!(shot_geometry_for(921_002, "lead", &replaced), None);
+        assert_eq!(
+            shot_geometry_for(921_002, "lead", &original),
+            Some((10, 20, 800, 600)),
+            "the original identity's recorded geometry is unaffected by the check above"
+        );
+    }
+
+    /// The exact residual `shot_dims_for`'s own doc calls out BY DESIGN: an
+    /// id+app+title match with DIFFERENT geometry (the narrow slice round-12
+    /// P1 #C set out to close) still returns `Some` — deliberately, because
+    /// this exact shape is ALSO what a legitimate resize (round-11 P1 #D) or
+    /// activation-driven reposition (round-10 P1 #B) produces, and neither
+    /// of those may regress. `shot_geometry_for`, called alongside, proves
+    /// the drift is at least OBSERVABLE (not silently lost) even though
+    /// `shot_dims_for` does not act on it — seeded to make this
+    /// intentional, not an oversight.
+    #[test]
+    fn shot_dims_for_still_hits_on_an_id_app_title_match_with_different_geometry_by_design() {
+        let at_capture = WindowInfo {
+            id: 13,
+            app: "Same".into(),
+            title: "same window".into(),
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+        };
+        record_shot_dims(921_003, "lead", 13, 1280, 800, &at_capture);
+
+        // A DIFFERENT geometry under the SAME id+app+title — standing in
+        // for either a legitimate move/resize OR a coincidentally identical
+        // id/app/title replacement; `shot_dims_for` cannot tell these apart
+        // without a real per-window instance token (see its own doc), so it
+        // still returns the recorded dims here.
+        let moved = WindowInfo {
+            id: 13,
+            app: "Same".into(),
+            title: "same window".into(),
+            x: 400,
+            y: 300,
+            width: 1000,
+            height: 600,
+        };
+        assert_eq!(
+            shot_dims_for(921_003, "lead", &moved),
+            Some((1280, 800)),
+            "id+app+title still match — shot_dims_for must not regress round-10/round-11's \
+             resize/move tolerance"
+        );
+        // But the geometry drift itself is NOT hidden — a caller that wants
+        // to reason about it (audit, or a future stricter check) can see it
+        // changed.
+        assert_eq!(
+            shot_geometry_for(921_003, "lead", &moved),
+            Some((0, 0, 1280, 800)),
+            "the RECORDED (capture-time) geometry, not the queried window's current one"
         );
     }
 

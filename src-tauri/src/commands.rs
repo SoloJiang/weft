@@ -1585,35 +1585,6 @@ pub async fn get_computer_use_enabled(db: State<'_, Db>) -> R<bool> {
     Ok(crate::computer::enabled(&db).await)
 }
 
-/// issue #160 round-10 P2 #D: serializes every `set_computer_use_enabled_inner`
-/// call — see that function's own doc for the NEW compensating-write race two
-/// OVERLAPPING enable requests can hit on top of round-8 P1 #1's own fix
-/// (enable A loses to a Stop and starts its own compensating write of
-/// `"false"` at the same moment a LATER enable B writes `"true"` and clears
-/// the latch; A's slower compensating write then lands LAST, silently
-/// reverting B's explicit re-enable even though both commands reported
-/// success). Mirrors `computer::input_flight_guard`'s own
-/// `OnceLock<tokio::sync::Mutex<()>>` shape (a `tokio::sync::Mutex`, unlike
-/// `std::sync::Mutex`, can be held across an `.await` — required here, since
-/// the whole point is holding it across `set_computer_use_enabled_inner`'s
-/// own DB write and reconcile call). Serializing enable-vs-enable this way
-/// makes A run to COMPLETION (including its own compensating write) before B
-/// ever starts, so B's read of `stop_generation`/its own write/its own
-/// reconcile all see the world strictly AFTER A finished — B's `"true"`
-/// always lands last, never clobbered.
-///
-/// Deliberately NOT used by `computer::emergency_stop`/
-/// `computer_emergency_stop` (the kill switch/Stop button): a human's Stop
-/// must always be free to cut in immediately — queuing it behind an
-/// in-flight enable request would delay the ONE thing this whole feature's
-/// safety property depends on. Only enable-vs-enable is serialized here;
-/// Stop still races in and wins exactly as round-6/round-8's own fixes
-/// already guarantee.
-fn enable_serialize_mutex() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
 /// issue #160 round-6 review P1 #1: an `enabled == true` request reads the
 /// current stop-generation via `computer::stop_generation` BEFORE its own
 /// `set_setting` write starts — see `computer::clear_emergency_stop`'s own
@@ -1630,9 +1601,22 @@ pub async fn set_computer_use_enabled_inner(db: &Db, enabled: bool) -> R<()> {
     // issue #160 round-10 P2 #D: held for this ENTIRE function — read gen,
     // write the setting, reconcile — so a second overlapping enable request
     // can never interleave with this one's own (possibly compensating)
-    // write. See `enable_serialize_mutex`'s own doc for the race this closes
-    // and why `emergency_stop` is deliberately excluded from it.
-    let _serialize = enable_serialize_mutex().lock().await;
+    // write. See `computer::enable_serialize_mutex`'s own doc for the
+    // enable-vs-enable race this originally closed.
+    //
+    // issue #160 round-12 P2 #F: this is now the SAME lock
+    // `computer::persist_stop` also holds across ITS OWN write — before this
+    // round, Stop's persisted write ran completely outside this queue, so a
+    // slower Stop write could still land AFTER a newer, explicit enable's
+    // write and silently revert it (this function's own `"true"` clobbered
+    // back to `"false"`, with no trace beyond the setting itself). Sharing
+    // the lock makes write-to-disk ORDER follow CALL order for both
+    // enable-vs-enable AND enable-vs-Stop: whichever call is issued last also
+    // writes last. The in-memory latch a Stop trips
+    // (`computer::trip_stop_latch`) is NOT gated by this lock — only the
+    // PERSISTED write is — so a human's Stop still cuts in immediately,
+    // exactly as before.
+    let _serialize = crate::computer::enable_serialize_mutex().lock().await;
     let gen = enabled.then(crate::computer::stop_generation);
     repo::set_setting(
         db,
@@ -1705,30 +1689,42 @@ pub async fn get_computer_control_state() -> R<Option<crate::computer::ControlHo
 /// subsequent computer tool call fails closed. Recovery is manual: a human
 /// has to go back into Settings and turn computer use on again.
 ///
-/// issue #160 review R1 #1: the in-memory latch `computer::emergency_stop`
-/// flips is set BEFORE it attempts to persist the setting, so this stays
-/// fail-closed even when the DB write below fails — but that write error is
-/// still surfaced to the frontend (not swallowed) so a human sees the
-/// half-persisted state instead of believing the kill switch fully landed.
+/// issue #160 review R1 #1: the in-memory latch `computer::trip_stop_latch`
+/// flips is set BEFORE anything attempts to persist the setting, so this
+/// stays fail-closed even when the DB write below fails — but that write
+/// error is still surfaced to the frontend (not swallowed) so a human sees
+/// the half-persisted state instead of believing the kill switch fully
+/// landed.
 ///
-/// issue #160 round-12 P1 #1: also cancels every open `weft_computer` ask
-/// (`AskRegistry::cancel_computer_asks`) right after the stop itself lands —
-/// see that method's own doc for the stale-card race this closes (a human
-/// answering an already-open GUI card `Always`/`Full` right after Stop would
-/// otherwise still record a standing grant, since `answer()` records it
-/// before the calling endpoint's own post-await kill-switch recheck ever
-/// runs). `computer::emergency_stop(db)` itself has no `AskRegistry` to
-/// reach and keeps its existing signature (it has other, non-command
-/// callers — the OS-level global Escape shortcut in `computer::mod.rs` —
-/// that would otherwise all need to grow one too) — the cancellation is
-/// deliberately done here, at each entry point that already holds (or can
-/// reach) one, not inside `emergency_stop` itself. See `computer::mod.rs`'s
-/// own Escape callback for this command's sibling entry point.
+/// issue #160 round-12 P1 #1 / round-12 P1 #B: also cancels every open GUI
+/// ask (`AskRegistry::cancel_gui_asks`) — see that method's own doc for the
+/// stale-card race this closes (a human answering an already-open GUI card
+/// `Always`/`Full` right after Stop would otherwise still record a standing
+/// grant, since `answer()` records it before the calling endpoint's own
+/// post-await kill-switch recheck ever runs).
+///
+/// issue #160 round-12 P1 #B: reordered from the combined
+/// `computer::emergency_stop(db).await` this used to call — cancellation now
+/// runs BEFORE the awaited persisted write, not after. Before this, an
+/// Always/Full answer landing on a still-open GUI card WHILE the DB write
+/// was in flight could record a standing grant before this line ever ran.
+/// `computer::trip_stop_latch()` (synchronous, no await, no lock) flips the
+/// in-memory latch immediately; `cancel_gui_asks()` (also synchronous) runs
+/// right after it, before anything here ever awaits; ONLY THEN does
+/// `computer::persist_stop` await the DB write (now ALSO serialized on
+/// `computer::enable_serialize_mutex` — round-12 P2 #F, see that function's
+/// own doc). `computer::emergency_stop(db)` itself is unchanged (still
+/// `trip_stop_latch` + `persist_stop` combined) and keeps its existing
+/// signature for its other, non-command caller (`tests`, and anything else
+/// with no `AskRegistry` to reach) — see that function's own doc for why
+/// this command uses the split pair directly instead. See
+/// `computer::mod.rs`'s own Escape callback for this command's sibling entry
+/// point, which does the identical trip → cancel → persist sequence.
 #[tauri::command]
 pub async fn computer_emergency_stop(db: State<'_, Db>, asks: State<'_, crate::ask::AskRegistry>) -> R<()> {
-    let result = crate::computer::emergency_stop(&db).await;
-    asks.cancel_computer_asks();
-    result
+    let my_gen = crate::computer::trip_stop_latch();
+    asks.cancel_gui_asks();
+    crate::computer::persist_stop(&db, my_gen).await
 }
 
 /// issue #160 round-6 review P2 #6: whether the MOST RECENT emergency stop
@@ -4259,7 +4255,7 @@ mod tests {
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
         let db = Db::connect("sqlite::memory:").await.unwrap();
 
-        let held = enable_serialize_mutex().lock().await;
+        let held = crate::computer::enable_serialize_mutex().lock().await;
 
         let db_bg = db.clone();
         let handle = tokio::spawn(async move { set_computer_use_enabled_inner(&db_bg, true).await });
@@ -4277,6 +4273,110 @@ mod tests {
             Some("true"),
             "once released, the call must proceed and persist normally"
         );
+
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+    }
+
+    // —— issue #160 round-12 P2 #F: Stop's own persisted write joins the SAME
+    // enable-vs-enable serialization lock ——
+
+    /// The structural half: `computer::persist_stop`'s own write must
+    /// serialize on the SAME lock `set_computer_use_enabled_inner` does —
+    /// holding it ourselves must block a concurrent `persist_stop` call
+    /// exactly like it already blocks a concurrent enable. The in-memory
+    /// latch, by contrast, must NOT wait for this lock at all —
+    /// `computer::trip_stop_latch` flips it synchronously, before
+    /// `persist_stop` is even called, so `computer::enabled` already reads
+    /// `false` while the persisted write sits queued.
+    #[tokio::test]
+    async fn persist_stop_serializes_on_the_same_enable_lock_but_the_latch_does_not_wait_for_it() {
+        let _guard = crate::computer::process_state_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+
+        let held = crate::computer::enable_serialize_mutex().lock().await;
+
+        let my_gen = crate::computer::trip_stop_latch();
+        assert!(
+            !crate::computer::enabled(&db).await,
+            "the in-memory latch must take effect the instant trip_stop_latch returns — it must \
+             not wait for the persisted-write lock at all"
+        );
+
+        let db_bg = db.clone();
+        let handle = tokio::spawn(async move { crate::computer::persist_stop(&db_bg, my_gen).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "persist_stop's own persisted write must block while the enable lock is held"
+        );
+
+        drop(held);
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            repo::get_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED).await.unwrap().as_deref(),
+            Some("false"),
+            "once released, the persisted write must proceed and land normally"
+        );
+
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+    }
+
+    /// The end-to-end property this round exists for: Stop's own persisted
+    /// write, and a LATER explicit re-enable, must land on disk in CALL
+    /// order — never completion order. Before round-12 P2 #F, Stop's write
+    /// ran completely outside the enable-vs-enable lock, so a slow Stop
+    /// write could still land AFTER a faster, later, LOCKED enable write and
+    /// silently revert it. Reproduced here by holding the shared lock
+    /// ourselves so BOTH calls queue behind it in the exact order they each
+    /// first reach it (stop first, the re-enable second) — proving the
+    /// FINAL disk state reflects the LAST call, not whichever write happens
+    /// to finish its own I/O first.
+    #[tokio::test]
+    async fn stop_persist_and_a_later_enable_land_in_call_order_not_completion_order() {
+        let _guard = crate::computer::process_state_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        set_computer_use_enabled_inner(&db, true).await.unwrap();
+
+        let held = crate::computer::enable_serialize_mutex().lock().await;
+
+        // Stop, first: the latch trips immediately (no lock needed at all),
+        // then queues on the shared lock for its own persisted write.
+        let my_gen = crate::computer::trip_stop_latch();
+        assert!(!crate::computer::enabled(&db).await);
+        let db_stop = db.clone();
+        let stop_handle = tokio::spawn(async move { crate::computer::persist_stop(&db_stop, my_gen).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!stop_handle.is_finished(), "stop's own persisted write must queue behind the held lock");
+
+        // A LATER, explicit re-enable — queues behind stop's own
+        // still-pending write, since we are still holding the lock and
+        // stop's task already reached the queue first.
+        let db_enable = db.clone();
+        let enable_handle = tokio::spawn(async move { set_computer_use_enabled_inner(&db_enable, true).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!enable_handle.is_finished(), "the later enable must also queue behind the held lock");
+
+        // Release: whichever call queued FIRST (stop) writes first, THEN
+        // the later enable writes — never the reverse.
+        drop(held);
+        stop_handle.await.unwrap().unwrap();
+        enable_handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            repo::get_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED).await.unwrap().as_deref(),
+            Some("true"),
+            "the LATER call (the explicit re-enable) must be what the disk finally reflects — never \
+             overwritten by stop's own earlier-queued write landing after it"
+        );
+        assert!(crate::computer::enabled(&db).await, "the re-enable must actually take effect");
 
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
     }
