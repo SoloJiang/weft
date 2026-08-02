@@ -541,6 +541,8 @@ export interface DingTalkCopy {
   threadRequired: string;
   freeTextUnavailable: string;
   unboundThread: string;
+  conciergeDmPrefix: string;
+  conciergeGroupPrefix: string;
   leadPrefix: string;
   resyncOne: string;
   resyncMany: string;

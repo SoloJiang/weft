@@ -55,6 +55,8 @@ function ImMessageCopySync() {
       threadRequired: t("imMessages.threadRequired"),
       freeTextUnavailable: t("imMessages.freeTextUnavailable"),
       unboundThread: t("imMessages.unboundThread"),
+      conciergeDmPrefix: t("imMessages.conciergeDmPrefix"),
+      conciergeGroupPrefix: t("imMessages.conciergeGroupPrefix"),
       leadPrefix: t("imMessages.leadPrefix"),
       resyncOne: t("imMessages.resyncOne"),
       resyncMany: t("imMessages.resyncMany"),

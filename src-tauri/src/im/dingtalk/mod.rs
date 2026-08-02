@@ -32,9 +32,31 @@ struct ReplyContext {
     session_webhook: String,
     expires_at_ms: i64,
     chat_type: String,
+    /// Parent group `openConversationId`, valid for proactive group sends.
     chat_id: String,
+    /// Topic-circle identity. DingTalk's documented proactive group API does
+    /// not accept this value in place of `openConversationId`.
+    thread_id: Option<String>,
     sender_user_id: String,
     remembered_at: Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReplyFallbackTarget<'a> {
+    Private(&'a str),
+    Group(&'a str),
+}
+
+fn reply_fallback_target(context: &ReplyContext) -> anyhow::Result<ReplyFallbackTarget<'_>> {
+    if context.chat_type != "group" {
+        return Ok(ReplyFallbackTarget::Private(&context.sender_user_id));
+    }
+    if context.thread_id.is_some() {
+        anyhow::bail!(
+            "dingtalk proactive thread reply is unavailable after session webhook expiry"
+        );
+    }
+    Ok(ReplyFallbackTarget::Group(&context.chat_id))
 }
 
 struct Inner {
@@ -130,10 +152,8 @@ impl DingTalkChannel {
                 session_webhook: message.session_webhook.clone(),
                 expires_at_ms: message.session_webhook_expired_time,
                 chat_type: message.normalized_chat_type().to_string(),
-                // If this callback came from a topic-circle thread, delayed
-                // fallback must still land inside that thread rather than
-                // escape to the parent group.
-                chat_id: message.delivery_conversation_id().to_string(),
+                chat_id: message.group_conversation_id().to_string(),
+                thread_id: message.thread_id().map(str::to_string),
                 sender_user_id,
                 remembered_at: now,
             },
@@ -291,11 +311,9 @@ impl DingTalkChannel {
         context: &ReplyContext,
         text: &str,
     ) -> anyhow::Result<String> {
-        if context.chat_type == "group" {
-            self.send_group_message(&context.chat_id, text).await
-        } else {
-            self.send_private_message(&context.sender_user_id, text)
-                .await
+        match reply_fallback_target(context)? {
+            ReplyFallbackTarget::Private(user_id) => self.send_private_message(user_id, text).await,
+            ReplyFallbackTarget::Group(chat_id) => self.send_group_message(chat_id, text).await,
         }
     }
 
@@ -603,6 +621,8 @@ mod tests {
             thread_required: "thread-required".into(),
             free_text_unavailable: "unavailable".into(),
             unbound_thread: "unbound".into(),
+            concierge_dm_prefix: "DingTalk DM".into(),
+            concierge_group_prefix: "DingTalk group".into(),
             lead_prefix: "lead".into(),
             resync_one: "one".into(),
             resync_many: "many {n}".into(),
@@ -666,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn remembered_thread_reply_falls_back_to_open_conv_thread_id() {
+    fn remembered_thread_reply_never_treats_thread_id_as_group_id() {
         let channel = DingTalkChannel::new("ding_app", "secret", copy()).unwrap();
         let message = ws::RobotMessage {
             conversation_id: "cid_parent".into(),
@@ -691,12 +711,10 @@ mod tests {
             .reply_contexts
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(
-            contexts
-                .get("msg_1")
-                .map(|context| context.chat_id.as_str()),
-            Some("convThreadEncrypted")
-        );
+        let context = contexts.get("msg_1").unwrap();
+        assert_eq!(context.chat_id, "cid_parent");
+        assert_eq!(context.thread_id.as_deref(), Some("convThreadEncrypted"));
+        assert!(reply_fallback_target(context).is_err());
     }
 
     #[test]

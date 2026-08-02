@@ -742,6 +742,8 @@ export const en = {
       "Free chat (this IM conversation's concierge) needs the desktop app context; this path cannot handle it, so reply to cards for asks.",
     unboundThread:
       "This DingTalk thread is not bound to a Weft issue. Send /bind <issue-id> in the current thread.",
+    conciergeDmPrefix: "DingTalk DM",
+    conciergeGroupPrefix: "DingTalk group",
     leadPrefix: "Lead: ",
     resyncOne: "Weft bridge online — 1 ask waiting:",
     resyncMany: "Weft bridge online — {n} asks waiting:",
@@ -938,7 +940,7 @@ export const en = {
     imRoutesGroup: "IM conversation bindings",
     imRoutesLabel: "Bound issues",
     imRoutesHint: "Each issue maps 1:1 to a Feishu topic. Send /bind <issue-id> in a topic to bind it; topic messages drive the lead, and lead replies post back there.",
-    imRoutesHintDingtalk: "DingTalk topic circles use a real openConvThreadId. Create or open a thread, then mention the bot with /bind <issue-id>; later thread messages that mention the bot drive the lead, and replies return there.",
+    imRoutesHintDingtalk: "DingTalk topic circles use a real openConvThreadId. Create or open a thread, then mention the bot with /bind <issue-id>; replies to inbound thread messages return through their temporary session webhook. Proactive output without an inbound message is not misaddressed to the parent group.",
     imRoutesEmpty: "No bindings yet.",
     imRoutesLoading: "Loading…",
     imRoutesUnbind: "Unbind",

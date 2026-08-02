@@ -132,8 +132,10 @@ For issue rooms, send `/topic <issue-id>` in a Feishu group to create a topic,
 or `/bind <issue-id>` inside an existing Feishu topic. DingTalk topic circles
 expose a stable `openConvThreadId`: create or open a DingTalk thread, then send
 `/bind <issue-id>` while mentioning the bot inside it. Later thread messages that
-mention the bot route into the issue lead, and replies return to that same thread.
-Weft never substitutes the parent group conversation ID for a missing thread ID.
+mention the bot route into the issue lead, and replies use that inbound message's
+temporary session webhook to return to the same thread. DingTalk's proactive group
+API accepts a parent `openConversationId`, not `openConvThreadId`, so Weft never
+substitutes the parent group ID or misaddresses the thread ID as a group ID.
 
 The bridge currently covers:
 

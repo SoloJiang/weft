@@ -713,6 +713,8 @@ export const zh = {
     freeTextUnavailable:
       "自由对话（当前 IM 会话助理）需要桌面 app 运行上下文；当前路径无法处理，请回复卡片消息作答权限与提问。",
     unboundThread: "这个钉钉 thread 还没有绑定 Weft issue。请在当前 thread 发送 /bind <issue-id>。",
+    conciergeDmPrefix: "钉钉私聊",
+    conciergeGroupPrefix: "钉钉群聊",
     leadPrefix: "Lead：",
     resyncOne: "Weft 桥已上线，当前 1 项待你处理：",
     resyncMany: "Weft 桥已上线，当前 {n} 项待你处理：",
@@ -904,7 +906,7 @@ export const zh = {
     imRoutesGroup: "IM 会话绑定",
     imRoutesLabel: "已绑定的 issue",
     imRoutesHint: "每个 issue 1:1 映射到一条飞书话题。在话题里发送 /bind <issue-id> 绑定；话题消息会进 lead，lead 的回复会贴回话题。",
-    imRoutesHintDingtalk: "钉钉话题圈使用真实 openConvThreadId。先创建或打开 thread，再在其中 @机器人发送 /bind <issue-id>；之后 thread 内 @机器人的消息进入 lead，回复返回同一 thread。",
+    imRoutesHintDingtalk: "钉钉话题圈使用真实 openConvThreadId。先创建或打开 thread，再在其中 @机器人发送 /bind <issue-id>；入站 thread 消息的回复通过临时 session webhook 返回原 thread。没有入站消息上下文时，不会把主动输出错发到父群。",
     imRoutesEmpty: "暂无绑定。",
     imRoutesLoading: "加载中…",
     imRoutesUnbind: "解绑",

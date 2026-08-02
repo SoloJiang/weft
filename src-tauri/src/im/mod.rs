@@ -257,23 +257,15 @@ fn lead_outbound_target<'a>(
                 })
             }
         }
-        // A DingTalk topic-circle thread has its own openConvThreadId. Prefer
-        // the fresh inbound sessionWebhook while it exists; desktop-driven or
-        // delayed output goes directly to that thread id. Legacy `chat:*`
-        // routes still degrade to their underlying group conversation id.
-        "dingtalk" => {
-            if let Some(message_id) = reply_to {
-                Some(LeadOutboundTarget::Reply {
-                    message_id,
-                    issue_style: true,
-                })
-            } else {
-                Some(LeadOutboundTarget::Chat {
-                    chat_id: chat_ref(&route.im_thread_ref).unwrap_or(route.im_thread_ref.as_str()),
-                    issue_style: true,
-                })
-            }
-        }
+        // A DingTalk topic-circle reply is valid only through the inbound
+        // message's live sessionWebhook. The documented proactive group API
+        // accepts the parent openConversationId, not openConvThreadId, so a
+        // desktop-driven/no-origin output must not misaddress the thread id as
+        // a group id or escape into the parent group.
+        "dingtalk" => reply_to.map(|message_id| LeadOutboundTarget::Reply {
+            message_id,
+            issue_style: true,
+        }),
         "dingtalk_concierge" => {
             if let Some(message_id) = reply_to {
                 Some(LeadOutboundTarget::Reply {
@@ -742,6 +734,7 @@ pub async fn execute_for_provider(
                         lang,
                         ctx,
                         provider,
+                        dingtalk_copy,
                     )
                     .await
                     {
@@ -906,6 +899,7 @@ pub async fn execute_for_provider(
                     lang,
                     ctx,
                     provider,
+                    dingtalk_copy,
                 )
                 .await
                 {
@@ -1131,6 +1125,18 @@ impl ImBridge {
     }
 }
 
+/// Await one broadcast item, then re-check the bridge generation before the
+/// caller can use its captured provider/channel. Checking only before `recv`
+/// leaves a race where a provider switch happens while the old task sleeps.
+async fn recv_for_live_generation<T: Clone>(
+    bridge: &ImBridge,
+    generation: u64,
+    rx: &mut tokio::sync::broadcast::Receiver<T>,
+) -> Result<Option<T>, tokio::sync::broadcast::error::RecvError> {
+    let item = rx.recv().await?;
+    Ok(bridge.live(generation).then_some(item))
+}
+
 /// 启动（或重启）桥：读设置→不 ready 则置 disabled；ready 则装通知器、起出站
 /// 消费与 ws 入站两个任务。设置变更后再次调用即可（代际号淘汰旧任务）。
 /// 通知器在「不 ready 提前返回」前不安装——避免 disabled 时仍堆积事件。
@@ -1240,20 +1246,37 @@ pub fn spawn(app: tauri::AppHandle) {
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel();
         let (hum_tx, mut hum_rx) = tokio::sync::mpsc::unbounded_channel();
         // set_notifier 返回挂接瞬间已 open 的快照：桥重启时补发卡片（无 miss/dup）。
-        let snapshot = app.state::<crate::ask::AskRegistry>().set_notifier(ask_tx);
-        app.state::<crate::bus::BusRegistry>()
+        let permission_snapshot = app.state::<crate::ask::AskRegistry>().set_notifier(ask_tx);
+        // Human asks use the same snapshot+edge contract. This is critical for
+        // DingTalk startup: the first spawn can wait for frontend-localized
+        // copy, while agents revived in that window may already have asked a
+        // question. The copy-triggered respawn replays those still-open asks.
+        let human_snapshot = app
+            .state::<crate::bus::BusRegistry>()
             .set_ask_notifier(hum_tx);
         {
             let (app2, db2, ch, cards2) = (app.clone(), db.clone(), channel.clone(), cards.clone());
             tauri::async_runtime::spawn(async move {
                 let bridge = app2.state::<ImBridge>();
                 // 先补发快照里的已开 Ask（挂接前就 open 的，不会再有 Opened 事件）。
-                for ask in snapshot {
+                for ask in permission_snapshot {
                     if !bridge.live(generation) {
                         return;
                     }
                     consume_ask_event(
                         crate::ask::AskEvent::Opened(ask),
+                        &db2,
+                        ch.as_ref(),
+                        &cards2,
+                    )
+                    .await;
+                }
+                for (thread, ask) in human_snapshot {
+                    if !bridge.live(generation) {
+                        return;
+                    }
+                    consume_human_event(
+                        crate::bus::state::HumanAskEvent::Asked { thread, ask },
                         &db2,
                         ch.as_ref(),
                         &cards2,
@@ -1375,10 +1398,11 @@ pub fn spawn(app: tauri::AppHandle) {
                     if !bridge.live(generation) {
                         return;
                     }
-                    match rx.recv().await {
-                        Ok(out) => {
+                    match recv_for_live_generation(&bridge, generation, &mut rx).await {
+                        Ok(Some(out)) => {
                             consume_lead_out(out, &db2, ch.as_ref(), provider, &acks2, true).await;
                         }
+                        Ok(None) => return,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             // engine 产文本太快 / 桥太慢——容量 64 已远超单轮 finalize
                             // 量级，跑到这里多半是死锁前兆，只丢日志不退出。
@@ -1405,8 +1429,9 @@ pub fn spawn(app: tauri::AppHandle) {
                     if !bridge.live(generation) {
                         return;
                     }
-                    let d = match rx.recv().await {
-                        Ok(d) => d,
+                    let d = match recv_for_live_generation(&bridge, generation, &mut rx).await {
+                        Ok(Some(d)) => d,
+                        Ok(None) => return,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             eprintln!("[weft][im] lead-delta lagged: {n} dropped");
                             continue;
@@ -1425,6 +1450,9 @@ pub fn spawn(app: tauri::AppHandle) {
                         }
                     }
                     for frame in coalesce_delta_frames(d, pending) {
+                        if !bridge.live(generation) {
+                            return;
+                        }
                         consume_lead_delta_frame(
                             frame,
                             &db2,
@@ -2007,7 +2035,8 @@ pub async fn consume_lead_out(
     }
     // Issue-thread replies prefer the originating message, then the latest
     // pending inbound ack. Feishu additionally keeps a replyable topic seed;
-    // DingTalk can fall back directly to its openConvThreadId route.
+    // DingTalk requires a live inbound sessionWebhook and has no proactive
+    // openConvThreadId delivery fallback.
     let reply_to = match route.channel.as_str() {
         "feishu" => match out.origin_tag.clone() {
             Some(t) => Some(t),
@@ -2068,6 +2097,7 @@ async fn ensure_im_concierge_thread(
     chat_id: &str,
     im_thread_ref: &str,
     provider: ImProvider,
+    dingtalk_copy: Option<&outbound::DingTalkCopy>,
 ) -> anyhow::Result<i32> {
     let channel = provider.concierge_channel();
     let existing = crate::store::repo::im_route_of_thread_ref(db, channel, chat_id, im_thread_ref)
@@ -2084,14 +2114,19 @@ async fn ensure_im_concierge_thread(
     }
 
     let ws_id = ensure_concierge_workspace(db).await?;
-    let provider_name = match provider {
-        ImProvider::Feishu => "飞书",
-        ImProvider::DingTalk => "钉钉",
-    };
-    let title = if im_thread_ref.starts_with("dm:") {
-        format!("{provider_name}私聊 · {sender_open_id}")
-    } else {
-        format!("{provider_name}群聊 · {chat_id}")
+    let is_dm = im_thread_ref.starts_with("dm:");
+    let title = match provider {
+        ImProvider::Feishu if is_dm => format!("飞书私聊 · {sender_open_id}"),
+        ImProvider::Feishu => format!("飞书群聊 · {chat_id}"),
+        ImProvider::DingTalk => {
+            let copy = dingtalk_copy
+                .ok_or_else(|| anyhow::anyhow!("DingTalk localized copy is unavailable"))?;
+            if is_dm {
+                format!("{} · {sender_open_id}", copy.concierge_dm_prefix)
+            } else {
+                format!("{} · {chat_id}", copy.concierge_group_prefix)
+            }
+        }
     };
     let legacy_tool = crate::tools::default_tool(db).await;
     let route = crate::engine_routing::resolve_for_db(
@@ -2125,9 +2160,17 @@ async fn consume_free_text(
     lang: &str,
     ctx: Option<&ExecuteCtx>,
     provider: ImProvider,
+    dingtalk_copy: Option<&outbound::DingTalkCopy>,
 ) -> anyhow::Result<()> {
-    let thread_id =
-        ensure_im_concierge_thread(db, sender_open_id, chat_id, im_thread_ref, provider).await?;
+    let thread_id = ensure_im_concierge_thread(
+        db,
+        sender_open_id,
+        chat_id,
+        im_thread_ref,
+        provider,
+        dingtalk_copy,
+    )
+    .await?;
     // The route's im_thread_ref stays the STABLE conversation ref (dm:/chat:) set
     // by ensure_im_concierge_thread. The per-message reply target rides the turn as
     // origin_tag — two rapid free-text messages each thread under their OWN message
@@ -2536,6 +2579,7 @@ mod tests {
             "oc_dm",
             "dm:ou_owner",
             ImProvider::Feishu,
+            None,
         )
         .await
         .unwrap();
@@ -2546,6 +2590,33 @@ mod tests {
             .unwrap();
         assert_eq!(thread.kind, "concierge");
         assert_eq!(thread.lead_tool, expected);
+    }
+
+    #[tokio::test]
+    async fn dingtalk_concierge_thread_title_uses_synchronized_copy() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let copy = outbound::DingTalkCopy {
+            concierge_dm_prefix: "DingTalk DM".into(),
+            concierge_group_prefix: "DingTalk group".into(),
+            ..Default::default()
+        };
+
+        let thread_id = ensure_im_concierge_thread(
+            &db,
+            "staff_owner",
+            "cid_dm",
+            "dm:staff_owner",
+            ImProvider::DingTalk,
+            Some(&copy),
+        )
+        .await
+        .unwrap();
+
+        let thread = crate::store::repo::get_thread(&db, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(thread.title, "DingTalk DM · staff_owner");
     }
 
     #[derive(Default)]
@@ -3075,7 +3146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dingtalk_issue_output_falls_back_to_open_conv_thread_id() {
+    async fn dingtalk_issue_output_without_session_is_not_sent_as_group_message() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = crate::store::repo::create_workspace(&db, "ws")
             .await
@@ -3114,10 +3185,9 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            ch.chat_texts.lock().unwrap().as_slice(),
-            [("convThreadEncrypted".into(), "Lead：我查到了。".into())]
-        );
+        assert!(ch.stream_replies.lock().unwrap().is_empty());
+        assert!(ch.replies.lock().unwrap().is_empty());
+        assert!(ch.chat_texts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3358,6 +3428,7 @@ mod tests {
             "oc_dm",
             "dm:ou_owner",
             ImProvider::Feishu,
+            None,
         )
         .await
         .unwrap();
@@ -3465,6 +3536,23 @@ mod tests {
         assert!(frames[0].done);
         assert_eq!(frames[1].message_id, 20);
         assert_eq!(frames[1].accumulated, "x");
+    }
+
+    #[tokio::test]
+    async fn broadcast_wake_drops_item_after_generation_switch() {
+        let bridge = ImBridge::default();
+        let (generation, _, _) = bridge.bump();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+
+        let waiting = recv_for_live_generation(&bridge, generation, &mut rx);
+        let switch_provider = async {
+            tokio::task::yield_now().await;
+            let _ = bridge.bump();
+            assert_eq!(tx.send(7_u8).unwrap(), 1);
+        };
+        let (received, ()) = tokio::join!(waiting, switch_provider);
+
+        assert_eq!(received.unwrap(), None);
     }
 
     #[test]

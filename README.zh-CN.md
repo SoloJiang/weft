@@ -113,8 +113,9 @@ Stream 模式接收消息，并使用显式的 `/allow`、`/deny`、`/always`、
 `/bind <issue-id>` 绑定。之后，这个 reply thread 里的消息会回到对应 issue 的
 Lead 会话。钉钉话题圈会提供稳定的 `openConvThreadId`：先创建或打开一个钉钉 thread，
 再在 thread 内 @机器人发送 `/bind <issue-id>`。之后该 thread 内 @机器人的消息进入
-对应 Lead，回复也返回同一 thread；Weft 不会用父群的 conversation ID 冒充缺失的
-thread ID。
+对应 Lead，回复通过这条入站消息的临时 session webhook 返回同一 thread。钉钉主动群
+消息 API 只接受父群的 `openConversationId`，不接受 `openConvThreadId`；因此 Weft 不会
+把父群 ID 冒充 thread，也不会把 thread ID 错当成群 ID。
 
 当前桥接覆盖：
 
