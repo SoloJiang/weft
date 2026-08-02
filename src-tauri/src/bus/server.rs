@@ -911,21 +911,18 @@ async fn call_tool(
                     return text_result(format!("error: could not read durable inbox: {error}"));
                 }
             };
-            // Durable answers are the recovery source of truth. Put every
-            // still-unacknowledged answer ahead of process-local messages so
-            // a message that arrived after an earlier read cannot overtake an
-            // answer whose delivery was already observed but not acknowledged.
+            // Durable answers are the recovery source of truth. Prepend only
+            // answers missing from the process-local inbox, so a message that
+            // arrived after an earlier read cannot overtake a missing replay.
             // When the same request is present in both sources, keep the
-            // process-local copy and omit its duplicate (idempotent replay).
+            // process-local copy at its original FIFO position and suppress
+            // only the durable duplicate (idempotent replay).
+            let local_request_ids: HashSet<u64> = local_msgs
+                .iter()
+                .filter_map(|message| message.request_id)
+                .collect();
             let mut pending_ids = HashSet::new();
-            let mut local_indexes_by_request = HashMap::new();
-            for (index, message) in local_msgs.iter().enumerate() {
-                if let Some(request_id) = message.request_id {
-                    local_indexes_by_request.entry(request_id).or_insert(index);
-                }
-            }
             let mut msgs = Vec::with_capacity(local_msgs.len() + pending.len());
-            let mut consumed_local_indexes = HashSet::new();
             for request in pending {
                 let Ok(request_id) = u64::try_from(request.id) else {
                     reg.restore_inbox(thread, me, local_msgs);
@@ -934,10 +931,7 @@ async fn call_tool(
                 if !pending_ids.insert(request_id) {
                     continue;
                 }
-                if let Some(&index) = local_indexes_by_request.get(&request_id) {
-                    msgs.push(local_msgs[index].clone());
-                    consumed_local_indexes.insert(index);
-                } else {
+                if !local_request_ids.contains(&request_id) {
                     msgs.push(crate::bus::Msg {
                         from: crate::bus::HUMAN.to_string(),
                         to: me.to_string(),
@@ -948,16 +942,7 @@ async fn call_tool(
                     });
                 }
             }
-            for (index, message) in local_msgs.into_iter().enumerate() {
-                if consumed_local_indexes.contains(&index)
-                    || message
-                        .request_id
-                        .is_some_and(|request_id| pending_ids.contains(&request_id))
-                {
-                    continue;
-                }
-                msgs.push(message);
-            }
+            msgs.extend(local_msgs);
             text_result(serde_json::to_string(&msgs).unwrap_or_else(|_| "[]".into()))
         }
         "bus_ack" => {
@@ -2680,6 +2665,194 @@ mod tests {
             Some(session.id),
             "bus_ack",
             json!({ "request_ids": [request.id] }),
+        )
+        .await;
+        assert!(duplicate.contains("acknowledged 0"));
+    }
+
+    #[tokio::test]
+    async fn durable_answer_replay_keeps_existing_local_fifo_before_first_time_answer() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let repo_ref = crate::store::repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread =
+            crate::store::repo::create_thread(&db, workspace.id, "Issue", "feature", "codex")
+                .await
+                .unwrap();
+        let direction = crate::store::repo::create_direction(
+            &db,
+            thread.id,
+            "Task",
+            "codex",
+            repo_ref.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = crate::store::repo::create_session(
+            &db,
+            direction.id,
+            repo_ref.id,
+            "codex",
+            "/tmp/durable-answer-local-fifo",
+        )
+        .await
+        .unwrap();
+        let scope = direction.id.to_string();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            &scope,
+            direction.id,
+            1,
+            0,
+            0,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+
+        // Start with an open request so startup restoration does not place A
+        // in the process-local inbox. B arrives first through the production
+        // HTTP bus route, then the durable answer is committed and delivered
+        // locally for the first time.
+        let bus = crate::bus::BusRegistry::new();
+        let (base, _handle) = serve(bus.clone(), db.clone(), crate::ask::AskRegistry::new())
+            .await
+            .unwrap();
+        let posted = bus_tool_text(
+            &base,
+            thread.id,
+            crate::bus::LEAD,
+            "bus_post",
+            json!({ "to": &scope, "text": "peer before answer" }),
+        )
+        .await;
+        assert!(posted.contains("posted to"), "got: {posted}");
+
+        let updated = crate::store::repo::answer_human_request(
+            &db,
+            workspace.id,
+            request.id,
+            request.revision,
+            "REST",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(bus.deliver_durable_answer(
+            thread.id,
+            u64::try_from(updated.id).unwrap(),
+            &scope,
+            &updated.question,
+            &updated.answer,
+        ));
+
+        let second_request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            &scope,
+            direction.id,
+            2,
+            0,
+            0,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+        crate::store::repo::answer_human_request(
+            &db,
+            workspace.id,
+            second_request.id,
+            second_request.revision,
+            "GraphQL",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let posted_after_answer = bus_tool_text(
+            &base,
+            thread.id,
+            crate::bus::LEAD,
+            "bus_post",
+            json!({ "to": &scope, "text": "peer after answer" }),
+        )
+        .await;
+        assert!(posted_after_answer.contains("posted to"), "got: {posted_after_answer}");
+
+        let inbox: Value = serde_json::from_str(
+            &bus_tool_text_for_session(
+                &base,
+                thread.id,
+                &scope,
+                Some(session.id),
+                "bus_inbox",
+                json!({}),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(inbox.as_array().unwrap().len(), 4);
+        assert_eq!(inbox[0]["request_id"], second_request.id);
+        assert_eq!(inbox[0]["text"], "GraphQL");
+        assert!(inbox[1]["request_id"].is_null());
+        assert_eq!(inbox[1]["text"], "peer before answer");
+        assert_eq!(inbox[2]["request_id"], request.id);
+        assert_eq!(inbox[2]["text"], "REST");
+        assert!(inbox[3]["request_id"].is_null());
+        assert_eq!(inbox[3]["text"], "peer after answer");
+
+        let replay: Value = serde_json::from_str(
+            &bus_tool_text_for_session(
+                &base,
+                thread.id,
+                &scope,
+                Some(session.id),
+                "bus_inbox",
+                json!({}),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(replay.as_array().unwrap().len(), 2);
+        assert_eq!(replay[0]["request_id"], request.id);
+        assert_eq!(replay[0]["text"], "REST");
+        assert_eq!(replay[1]["request_id"], second_request.id);
+        assert_eq!(replay[1]["text"], "GraphQL");
+
+        let ack = bus_tool_text_for_session(
+            &base,
+            thread.id,
+            &scope,
+            Some(session.id),
+            "bus_ack",
+            json!({ "request_ids": [request.id, second_request.id] }),
+        )
+        .await;
+        assert!(ack.contains("acknowledged 2"));
+        let duplicate = bus_tool_text_for_session(
+            &base,
+            thread.id,
+            &scope,
+            Some(session.id),
+            "bus_ack",
+            json!({ "request_ids": [request.id, second_request.id] }),
         )
         .await;
         assert!(duplicate.contains("acknowledged 0"));
