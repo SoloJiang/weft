@@ -1,43 +1,31 @@
 import type {
-  NeedItem,
-  PermissionAsk,
+  AttentionItem,
+  AttentionSnapshot,
   ProcessQuotaStatus,
-  SessionStatus,
   ThreadOverview,
-  TurnState,
-  WriteTrigger,
 } from "./types";
 
-/** Notification preference helpers (localStorage-backed). Kept separate from
- *  the React hook so the store can import without a cycle through notifications. */
-
-export type NotifyCategory = "needs" | "review" | "stalled" | "quota";
+/** Notification preferences remain independent from the React hook. */
+export type NotifyCategory = "needs" | "review" | "quota";
 
 export const NOTIFY_CATEGORIES: readonly NotifyCategory[] = [
   "needs",
   "review",
-  "stalled",
   "quota",
 ] as const;
 
 export type NotifyCategoryFlags = Record<NotifyCategory, boolean>;
-
-/** Overview row enriched by the all-workspace notification poll. */
 export type NotificationOverview = ThreadOverview & { workspace_id?: number };
 
 export const DEFAULT_NOTIFY_CATEGORIES: NotifyCategoryFlags = {
   needs: true,
   review: true,
-  stalled: true,
   quota: true,
 };
 
-/** Quiet hours window in local wall-clock minutes. End may wrap past midnight. */
 export interface QuietHours {
   enabled: boolean;
-  /** Inclusive start, minutes since local midnight (0–1439). */
   startMin: number;
-  /** Exclusive end, minutes since local midnight (0–1439). */
   endMin: number;
 }
 
@@ -53,8 +41,6 @@ function clampMinute(n: number): number {
   return m < 0 ? m + 24 * 60 : m;
 }
 
-/** Parse category flags stored as JSON; unknown / partial shapes fall back to
- *  defaults so a future category lands ON without a migration. */
 export function parseNotifyCategories(raw: string | null): NotifyCategoryFlags {
   const out: NotifyCategoryFlags = { ...DEFAULT_NOTIFY_CATEGORIES };
   if (!raw) return out;
@@ -77,19 +63,15 @@ export function parseQuietHours(raw: string | null): QuietHours {
   if (!raw) return { ...DEFAULT_QUIET_HOURS };
   try {
     const parsed = JSON.parse(raw) as Partial<QuietHours>;
-    const startMin =
-      typeof parsed.startMin === "number" && Number.isFinite(parsed.startMin)
-        ? clampMinute(parsed.startMin)
-        : DEFAULT_QUIET_HOURS.startMin;
-    const endMin =
-      typeof parsed.endMin === "number" && Number.isFinite(parsed.endMin)
-        ? clampMinute(parsed.endMin)
-        : DEFAULT_QUIET_HOURS.endMin;
-    return {
-      enabled: parsed.enabled === true,
-      startMin,
-      endMin,
-    };
+    let startMin = DEFAULT_QUIET_HOURS.startMin;
+    if (typeof parsed.startMin === "number" && Number.isFinite(parsed.startMin)) {
+      startMin = clampMinute(parsed.startMin);
+    }
+    let endMin = DEFAULT_QUIET_HOURS.endMin;
+    if (typeof parsed.endMin === "number" && Number.isFinite(parsed.endMin)) {
+      endMin = clampMinute(parsed.endMin);
+    }
+    return { enabled: parsed.enabled === true, startMin, endMin };
   } catch {
     return { ...DEFAULT_QUIET_HOURS };
   }
@@ -103,7 +85,6 @@ export function serializeQuietHours(qh: QuietHours): string {
   });
 }
 
-/** `HH:MM` for Settings inputs; always two-digit. */
 export function formatQuietTime(min: number): string {
   const m = clampMinute(min);
   const hh = String(Math.floor(m / 60)).padStart(2, "0");
@@ -111,27 +92,18 @@ export function formatQuietTime(min: number): string {
   return `${hh}:${mm}`;
 }
 
-/** Parse an `<input type="time">` value; invalid → null. */
 export function parseQuietTime(value: string): number | null {
-  const m = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
-  if (!m) return null;
-  const hh = Number(m[1]);
-  const mm = Number(m[2]);
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+  if (!match) return null;
+  const hh = Number(match[1]);
+  const mm = Number(match[2]);
   if (!Number.isInteger(hh) || !Number.isInteger(mm)) return null;
   if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
   return hh * 60 + mm;
 }
 
-/**
- * Quiet-hours membership. When start === end the window is empty (never quiet).
- * When start < end it is a same-day range; otherwise it wraps past midnight.
- */
-export function isInQuietHours(
-  qh: QuietHours,
-  now: Date = new Date(),
-): boolean {
-  if (!qh.enabled) return false;
-  if (qh.startMin === qh.endMin) return false;
+export function isInQuietHours(qh: QuietHours, now: Date = new Date()): boolean {
+  if (!qh.enabled || qh.startMin === qh.endMin) return false;
   const cur = now.getHours() * 60 + now.getMinutes();
   if (qh.startMin < qh.endMin) {
     return cur >= qh.startMin && cur < qh.endMin;
@@ -139,230 +111,162 @@ export function isInQuietHours(
   return cur >= qh.startMin || cur < qh.endMin;
 }
 
-
-/** Minimal session shape for stalled detection — avoids importing store. */
-export interface NotifySessionRef {
-  info: { session_id: number };
-  status: SessionStatus;
-  directionId: number;
-  repoId: number;
-  threadId: number;
-  /** True when the frontend observed this session from a local/event-driven start. */
-  eventDriven?: boolean;
-  /** Owning workspace when known (adopted live sessions may predate a visit). */
-  workspaceId?: number;
-}
-
-/** Deep-link fields carried through the OS notification `user_info`. */
 export interface NotifyRoute {
   kind: NotifyCategory;
   threadId?: number;
   directionId?: number;
-  /** Prefer opening this exact worker session when set. */
   repoId?: number;
   sessionId?: number;
-  askId?: number;
   workspaceId?: number;
-  /** Prefer the Needs-you surface (write triggers, action-required notices). */
+  attentionId?: string;
   openNeeds?: boolean;
-  /** Prefer the Repo Map curator surface instead of board lead chat. */
   openCurator?: boolean;
 }
 
-/** One snapshot entry: human sample line + optional deep-link route. */
 export interface NotifyEntry {
   sample: string;
   route: NotifyRoute;
 }
 
-/** Notify-relevant state reduced to stable identity keys → entry. */
 export interface NotifySnapshot {
   needs: Map<string, NotifyEntry>;
   review: Map<string, NotifyEntry>;
-  stalled: Map<string, NotifyEntry>;
   quota: Map<string, NotifyEntry>;
 }
 
 export function emptyNotifySnapshot(): NotifySnapshot {
-  return {
-    needs: new Map(),
-    review: new Map(),
-    stalled: new Map(),
-    quota: new Map(),
-  };
+  return { needs: new Map(), review: new Map(), quota: new Map() };
 }
 
-export function snapshotOf(
-  needs: NeedItem[],
-  asks: PermissionAsk[],
-  triggers: WriteTrigger[],
-  overview: NotificationOverview[],
-  sessions: Record<number, NotifySessionRef>,
-  leadTurn: Record<number, { state: TurnState; queue: unknown[] }>,
-  processQuota: ProcessQuotaStatus | null,
-  threadsById: Record<
-    number,
-    { title: string; workspaceId?: number; kind?: string } | undefined
-  > = {},
-  workspaceId: number | null = null,
-): NotifySnapshot {
-  const n = new Map<string, NotifyEntry>();
-  for (const it of needs) {
-    // Self-clearing notices stay silent; questions and action-required notices ping.
-    if (it.kind === "notice") continue;
-    const openNeeds = it.kind === "notice_action_required";
-    const ws =
-      threadsById[it.thread_id]?.workspaceId ?? workspaceId ?? undefined;
-    n.set(`need:${it.ask_id}`, {
-      sample: `${it.thread_title} · ${it.direction_name}`,
-      route: {
-        kind: "needs",
-        threadId: it.thread_id,
-        directionId: it.direction_id,
-        askId: it.ask_id,
-        workspaceId: ws,
-        openNeeds,
-      },
-    });
-  }
-  for (const a of asks) {
-    const directionId = Number(a.dir);
-    // Global permission asks must not inherit the currently selected workspace.
-    // Prefer thread cache, then backend-provided ownership; omit when unknown.
-    const ws =
-      threadsById[a.thread]?.workspaceId ?? a.workspace_id ?? undefined;
-    n.set(`ask:${a.id}`, {
-      sample: `${a.thread_title} · ${a.dir_name}`,
-      route: {
-        kind: "needs",
-        threadId: a.thread,
+function attentionContext(item: AttentionItem): {
+  sample: string;
+  threadId?: number;
+  directionId?: number;
+  workspaceId?: number;
+} {
+  switch (item.kind) {
+    case "permission": {
+      const directionId = Number(item.ask.dir);
+      return {
+        sample: [item.ask.thread_title, item.ask.dir_name].filter(Boolean).join(" · "),
+        threadId: item.ask.thread,
         directionId: Number.isFinite(directionId) ? directionId : undefined,
-        askId: a.id,
-        workspaceId: ws == null ? undefined : ws,
-        openNeeds: true,
-      },
-    });
+        workspaceId: item.ask.workspace_id ?? undefined,
+      };
+    }
+    case "question":
+      return {
+        sample: [item.thread_title, item.direction_name].filter(Boolean).join(" · "),
+        threadId: item.thread_id,
+        directionId: item.direction_id > 0 ? item.direction_id : undefined,
+      };
+    case "plan_approval":
+    case "repo_action":
+      return {
+        sample: [item.thread_title, item.title].filter(Boolean).join(" · "),
+        threadId: item.thread_id,
+      };
+    case "scope_approval":
+      return { sample: item.thread_title, threadId: item.thread_id };
+    case "pr_tracking_retry":
+      return {
+        sample: [item.thread_title, item.direction_name].filter(Boolean).join(" · "),
+        threadId: item.thread_id,
+        directionId: item.direction_id,
+      };
   }
-  for (const w of triggers) {
-    const ws = threadsById[w.thread_id]?.workspaceId ?? workspaceId ?? undefined;
-    n.set(`wt:${w.thread_id}:${w.index}`, {
-      sample: `${w.thread_title} · ${w.name}`,
-      route: {
-        kind: "needs",
-        threadId: w.thread_id,
-        workspaceId: ws,
-        openNeeds: true,
-      },
-    });
+}
+
+function snapshotFromAttentionEntries(
+  entries: Array<{ workspaceId: number | null; items: AttentionItem[] }>,
+  overview: NotificationOverview[],
+  processQuota: ProcessQuotaStatus | null,
+): NotifySnapshot {
+  const fallbackWorkspaceId = entries.length === 1 ? entries[0].workspaceId : null;
+  const needs = new Map<string, NotifyEntry>();
+  for (const entry of entries) {
+    for (const item of entry.items) {
+      const context = attentionContext(item);
+      needs.set(item.id, {
+        sample: context.sample,
+        route: {
+          kind: "needs",
+          threadId: context.threadId,
+          directionId: context.directionId,
+          workspaceId: context.workspaceId ?? entry.workspaceId ?? undefined,
+          attentionId: item.id,
+          openNeeds: true,
+        },
+      });
+    }
   }
 
-  const r = new Map<string, NotifyEntry>();
-  for (const o of overview) {
-    o.statuses.forEach((s, i) => {
-      if (s !== "review") return;
-      const directionId = o.direction_ids[i];
-      const ws =
-        o.workspace_id ??
-        threadsById[o.thread_id]?.workspaceId ??
-        workspaceId ??
-        undefined;
-      r.set(`rev:${directionId}`, {
-        sample: o.title,
+  const review = new Map<string, NotifyEntry>();
+  for (const row of overview) {
+    row.statuses.forEach((status, index) => {
+      if (status !== "review") return;
+      const directionId = row.direction_ids[index];
+      review.set(`rev:${directionId}`, {
+        sample: row.title,
         route: {
           kind: "review",
-          threadId: o.thread_id,
+          threadId: row.thread_id,
           directionId,
-          workspaceId: ws,
+          workspaceId: row.workspace_id ?? fallbackWorkspaceId ?? undefined,
         },
       });
-    });
-  }
-
-  const stalled = new Map<string, NotifyEntry>();
-  for (const s of Object.values(sessions)) {
-    if (s.status !== "stalled") continue;
-    const meta = threadsById[s.threadId];
-    // Global live sessions may predate a visit to their workspace; prefer the
-    // session's own workspace, then thread metadata. Never fall back to the
-    // currently selected workspace for global stalled workers.
-    const ws = s.workspaceId ?? meta?.workspaceId;
-    if (ws == null) continue;
-    const title = meta?.title ?? `#${s.threadId}`;
-    stalled.set(`stall:worker:${s.info.session_id}`, {
-      sample: `${title} · #${s.directionId}`,
-      route: {
-        kind: "stalled",
-        threadId: s.threadId,
-        directionId: s.directionId,
-        repoId: s.repoId,
-        sessionId: s.info.session_id,
-        workspaceId: ws,
-      },
-    });
-  }
-  for (const [tidStr, turn] of Object.entries(leadTurn)) {
-    if (turn.state !== "stalled") continue;
-    const tid = Number(tidStr);
-    const meta = threadsById[tid];
-    // Hidden curator leads belong in the Repo Map panel, not board lead chat.
-    if (meta?.kind === "curator") {
-      const ws = meta.workspaceId;
-      if (ws == null) continue;
-      stalled.set(`stall:curator:${tid}`, {
-        sample: meta.title ?? `#${tid}`,
-        route: {
-          kind: "stalled",
-          threadId: tid,
-          workspaceId: ws,
-          openCurator: true,
-        },
-      });
-      continue;
-    }
-    const ws = meta?.workspaceId;
-    if (ws == null) continue;
-    const title = meta?.title ?? `#${tid}`;
-    stalled.set(`stall:lead:${tid}`, {
-      sample: title,
-      route: {
-        kind: "stalled",
-        threadId: tid,
-        workspaceId: ws,
-      },
     });
   }
 
   const quota = new Map<string, NotifyEntry>();
   if (processQuota?.status === "degraded") {
-    // Identity is the transition sequence so a later re-degrade re-notifies.
     const key = `quota:degraded:${processQuota.transitionSeq}`;
-    const limit = processQuota.processLimit ?? 0;
-    const sample =
-      limit > 0
-        ? `${processQuota.processCount} / ${limit}`
-        : `${processQuota.processCount}`;
-    quota.set(key, {
-      sample,
-      route: {
-        kind: "quota",
-        // Quota / Resources is global — do not pin a workspace that may be stale by click time.
-      },
-    });
+    const sample = processQuota.processLimit
+      ? `${processQuota.processCount} / ${processQuota.processLimit}`
+      : `${processQuota.processCount}`;
+    quota.set(key, { sample, route: { kind: "quota" } });
   }
 
-  return { needs: n, review: r, stalled, quota };
+  return { needs, review, quota };
+}
+
+/** Build notification state from every canonical workspace snapshot. */
+export function snapshotOfAttentionSnapshots(
+  snapshots: AttentionSnapshot[],
+  overview: NotificationOverview[],
+  processQuota: ProcessQuotaStatus | null,
+): NotifySnapshot {
+  return snapshotFromAttentionEntries(
+    snapshots.map((snapshot) => ({
+      workspaceId: snapshot.workspace_id,
+      items: snapshot.items,
+    })),
+    overview,
+    processQuota,
+  );
+}
+
+/** Backwards-compatible single-workspace helper used by focused unit tests. */
+export function snapshotOf(
+  attentionItems: AttentionItem[],
+  overview: NotificationOverview[],
+  processQuota: ProcessQuotaStatus | null,
+  workspaceId: number | null = null,
+): NotifySnapshot {
+  return snapshotFromAttentionEntries(
+    [{ workspaceId, items: attentionItems }],
+    overview,
+    processQuota,
+  );
 }
 
 export interface NotifyEvent {
   kind: NotifyCategory;
   count: number;
-  /** Context of the first new item, used as the body when count === 1. */
   sample: string;
-  /** Deep-link of the first new item (best-effort; multi-item pings open the first). */
   route: NotifyRoute;
 }
 
-/** New keys in `next` that weren't in `prev` — the things worth a ping. */
 export function diffForNotifications(
   prev: NotifySnapshot,
   next: NotifySnapshot,
@@ -371,64 +275,31 @@ export function diffForNotifications(
   const out: NotifyEvent[] = [];
   for (const kind of NOTIFY_CATEGORIES) {
     if (!enabled[kind]) continue;
-    const fresh = [...next[kind]].filter(([k]) => !prev[kind].has(k));
-    if (fresh.length > 0) {
-      const first = fresh[0][1];
-      out.push({
-        kind,
-        count: fresh.length,
-        sample: first.sample,
-        route: first.route,
-      });
-    }
+    const fresh = [...next[kind]].filter(([key]) => !prev[kind].has(key));
+    const first = fresh[0]?.[1];
+    if (!first) continue;
+    out.push({ kind, count: fresh.length, sample: first.sample, route: first.route });
   }
   return out;
 }
 
-/** Title / body i18n keys for each category. Plural forms use i18next `_one/_other`. */
-export function notifyCopyKeys(kind: NotifyCategory): {
-  title: string;
-  body: string;
-} {
+export function notifyCopyKeys(kind: NotifyCategory): { title: string; body: string } {
   switch (kind) {
     case "needs":
       return { title: "notify.needsTitle", body: "notify.needsBody" };
     case "review":
       return { title: "notify.reviewTitle", body: "notify.reviewBody" };
-    case "stalled":
-      return { title: "notify.stalledTitle", body: "notify.stalledBody" };
     case "quota":
       return { title: "notify.quotaTitle", body: "notify.quotaBody" };
-    default: {
-      const _exhaustive: never = kind;
-      return _exhaustive;
-    }
   }
 }
 
-/** Pending Needs-you badge count (actionable only). Exported for Dock badge. */
-export function badgeCountFrom(
-  needs: NeedItem[],
-  asks: PermissionAsk[],
-  writeTriggers: WriteTrigger[],
-): number {
-  return (
-    needs.filter((n) => n.kind === "question" || n.kind === "notice_action_required")
-      .length +
-    asks.length +
-    writeTriggers.length
-  );
+export function badgeCountFrom(items: AttentionItem[]): number {
+  return items.length;
 }
 
-/**
- * Focus / visibility gate. Prefer Tauri window focus when available; fall back
- * to document focus so a visible-but-unfocused window still receives pings.
- */
 export function isAppInForeground(
-  opts: {
-    windowFocused?: boolean | null;
-    documentFocused?: boolean;
-  } = {},
+  opts: { windowFocused?: boolean | null; documentFocused?: boolean } = {},
 ): boolean {
   if (opts.windowFocused === true) return true;
   if (opts.windowFocused === false) return false;
@@ -437,8 +308,6 @@ export function isAppInForeground(
   return false;
 }
 
-
-/** Pure navigation intent for a notification click. UI layer applies it. */
 export type NotifyOpenIntent =
   | { type: "workspace"; workspaceId: number }
   | {
@@ -459,52 +328,32 @@ export function planNotifyOpen(payload: {
   repoId?: number | null;
   sessionId?: number | null;
   workspaceId?: number | null;
+  attentionId?: string | null;
   openNeeds?: boolean | null;
   openCurator?: boolean | null;
 }): NotifyOpenIntent[] {
+  if (payload.kind === "quota") return [{ type: "resources" }];
   const out: NotifyOpenIntent[] = [];
-  // Quota is process-global (Resources). Never switch workspaces for it, even if
-  // an older payload still carries a workspaceId.
-  if (payload.kind === "quota") {
-    out.push({ type: "resources" });
-    return out;
-  }
   if (payload.workspaceId != null) {
     out.push({ type: "workspace", workspaceId: payload.workspaceId });
   }
-  // Hidden curator stalls open the Repo Map curator panel, not board lead chat.
   if (payload.openCurator) {
     out.push({ type: "curator" });
     return out;
   }
-  // Write triggers / action-required notices: open the Needs-you surface so the
-  // human can act on the control the notification advertised.
-  if (payload.openNeeds) {
+  if (payload.kind === "needs" || payload.openNeeds || payload.attentionId) {
     out.push({ type: "needs" });
     return out;
   }
   if (payload.threadId != null) {
-    const direction =
-      payload.directionId != null ? String(payload.directionId) : "lead";
-    if (payload.repoId != null || payload.sessionId != null) {
-      out.push({
-        type: "direction",
-        threadId: payload.threadId,
-        direction,
-        repoId: payload.repoId ?? undefined,
-        sessionId: payload.sessionId ?? undefined,
-      });
-    } else {
-      out.push({
-        type: "direction",
-        threadId: payload.threadId,
-        direction,
-      });
-    }
-    return out;
-  }
-  if (payload.kind === "needs") {
-    out.push({ type: "needs" });
+    const direction = payload.directionId == null ? "lead" : String(payload.directionId);
+    out.push({
+      type: "direction",
+      threadId: payload.threadId,
+      direction,
+      repoId: payload.repoId ?? undefined,
+      sessionId: payload.sessionId ?? undefined,
+    });
   }
   return out;
 }

@@ -57,6 +57,8 @@ pub struct NotifyOpenPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_id: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_needs: Option<bool>,
@@ -83,6 +85,8 @@ pub struct NotifySendRequest {
     #[serde(default)]
     pub ask_id: Option<i32>,
     #[serde(default)]
+    pub attention_id: Option<String>,
+    #[serde(default)]
     pub workspace_id: Option<i32>,
     #[serde(default)]
     pub open_needs: Option<bool>,
@@ -106,6 +110,7 @@ fn payload_from_user_info(info: &HashMap<String, String>) -> NotifyOpenPayload {
         repo_id: info.get("repoId").and_then(|s| s.parse().ok()),
         session_id: info.get("sessionId").and_then(|s| s.parse().ok()),
         ask_id: info.get("askId").and_then(|s| s.parse().ok()),
+        attention_id: info.get("attentionId").cloned(),
         workspace_id: info.get("workspaceId").and_then(|s| s.parse().ok()),
         open_needs: info.get("openNeeds").and_then(|s| parse_bool(s)),
         open_curator: info.get("openCurator").and_then(|s| parse_bool(s)),
@@ -131,6 +136,9 @@ fn user_info_from_req(req: &NotifySendRequest) -> HashMap<String, String> {
     }
     if let Some(v) = req.ask_id {
         info.insert("askId".to_string(), v.to_string());
+    }
+    if let Some(v) = &req.attention_id {
+        info.insert("attentionId".to_string(), v.clone());
     }
     if let Some(v) = req.workspace_id {
         info.insert("workspaceId".to_string(), v.to_string());
@@ -361,6 +369,7 @@ mod tests {
             repo_id: Some(3),
             session_id: Some(44),
             ask_id: Some(99),
+            attention_id: Some("question:99".into()),
             workspace_id: Some(3),
             open_needs: Some(true),
             open_curator: Some(true),
@@ -373,6 +382,7 @@ mod tests {
         assert_eq!(payload.repo_id, Some(3));
         assert_eq!(payload.session_id, Some(44));
         assert_eq!(payload.ask_id, Some(99));
+        assert_eq!(payload.attention_id.as_deref(), Some("question:99"));
         assert_eq!(payload.workspace_id, Some(3));
         assert_eq!(payload.open_needs, Some(true));
         assert_eq!(payload.open_curator, Some(true));
@@ -389,6 +399,7 @@ mod tests {
             repo_id: None,
             session_id: None,
             ask_id: None,
+            attention_id: None,
             workspace_id: None,
             open_needs: None,
             open_curator: None,
@@ -405,6 +416,7 @@ mod tests {
             repo_id: None,
             session_id: None,
             ask_id: None,
+            attention_id: None,
             workspace_id: None,
             open_needs: None,
             open_curator: None,
@@ -427,6 +439,7 @@ mod tests {
             repo_id: None,
             session_id: None,
             ask_id: None,
+            attention_id: None,
             workspace_id: Some(3),
             open_needs: None,
             open_curator: None,

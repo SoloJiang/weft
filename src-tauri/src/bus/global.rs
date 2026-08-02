@@ -176,12 +176,12 @@ pub async fn call_global(
             if let Err(e) = require_active_im_context(db, args).await {
                 return text_result(format!("error: {e}"));
             }
-            if bus.answer_ask(tid, ask_id, text) {
-                text_result(format!("answered ask #{ask_id} on issue {tid}"))
-            } else {
-                text_result(format!(
+            match answer_durable_question(db, bus, tid, ask_id, text).await {
+                Ok(true) => text_result(format!("answered ask #{ask_id} on issue {tid}")),
+                Ok(false) => text_result(format!(
                     "ask #{ask_id} on issue {tid} was already answered or no longer exists"
-                ))
+                )),
+                Err(error) => text_result(format!("error: {error}")),
             }
         }
         "message_lead" => {
@@ -392,6 +392,33 @@ async fn pending_needs_you(db: &Db, asks: &AskRegistry) -> anyhow::Result<Value>
         })
         .collect();
     Ok(Value::Array(arr))
+}
+
+/// Resolve a durable free-text question from the global/Concierge tool with
+/// the same OCC + persisted-answer path used by desktop and IM. The bus event
+/// closes cards/trail; its request-tagged inbox message remains replayable
+/// until the asking agent explicitly acknowledges it through `bus_ack`.
+async fn answer_durable_question(
+    db: &Db,
+    bus: &BusRegistry,
+    thread_id: i32,
+    ask_id: u64,
+    text: &str,
+) -> anyhow::Result<bool> {
+    let Ok(request_id) = i32::try_from(ask_id) else {
+        return Ok(false);
+    };
+    Ok(crate::attention::answer_durable_human_request(
+        db,
+        bus,
+        request_id,
+        Some(thread_id),
+        None,
+        None,
+        text,
+    )
+    .await?
+    .is_some())
 }
 
 /// Push a message into the lead engine of `thread_id` from outside (Concierge).

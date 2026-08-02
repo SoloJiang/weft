@@ -413,7 +413,7 @@ mod tests {
     fn cards() -> CardIndex {
         let mut c = CardIndex::default();
         c.record_perm(42, "om_perm", "Run: npm test");
-        c.record_human(3, 9, "om_q");
+        c.record_human(3, 9, "om_q", "test:a:owner");
         c
     }
 

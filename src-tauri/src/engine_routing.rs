@@ -1445,11 +1445,43 @@ mod tests {
         let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
             .await
             .unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/engine-route-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "task",
+            "codex",
+            repo_ref.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = repo::create_session(
+            &db,
+            direction.id,
+            repo_ref.id,
+            "codex",
+            "/tmp/engine-route-session",
+        )
+        .await
+        .unwrap();
         let old_route = serde_json::json!({
             "tool": "codex",
             "source": "automatic",
             "operation": "planner_confirm",
-            "direction_id": 7,
+            "direction_id": direction.id,
         })
         .to_string();
         repo::insert_lead_message(
@@ -1465,13 +1497,13 @@ mod tests {
         .await
         .unwrap();
 
-        mirror_direction_route(&db, thread.id, 7, 19).await;
+        mirror_direction_route(&db, thread.id, direction.id, session.id).await;
 
         let new_route = serde_json::json!({
             "tool": "claude",
             "source": "automatic",
             "operation": "planner_confirm",
-            "direction_id": 7,
+            "direction_id": direction.id,
         })
         .to_string();
         repo::insert_lead_message(
@@ -1487,8 +1519,8 @@ mod tests {
         .await
         .unwrap();
 
-        mirror_direction_route(&db, thread.id, 7, 19).await;
-        mirror_direction_route(&db, thread.id, 7, 19).await;
+        mirror_direction_route(&db, thread.id, direction.id, session.id).await;
+        mirror_direction_route(&db, thread.id, direction.id, session.id).await;
         // Returning to a prior route still needs a fresh mirror: the newest
         // worker marker is Claude at this point even though Codex appeared
         // earlier in its timeline.
@@ -1504,14 +1536,14 @@ mod tests {
         )
         .await
         .unwrap();
-        mirror_direction_route(&db, thread.id, 7, 19).await;
+        mirror_direction_route(&db, thread.id, direction.id, session.id).await;
 
         let mirrors: Vec<_> = repo::list_lead_messages(&db, thread.id)
             .await
             .unwrap()
             .into_iter()
             .filter(|message| {
-                message.session_id == Some(19) && message.kind == "engine_route"
+                message.session_id == Some(session.id) && message.kind == "engine_route"
             })
             .collect();
         assert_eq!(mirrors.len(), 3);

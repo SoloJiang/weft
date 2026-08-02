@@ -38,9 +38,7 @@ export function AppTopBar() {
     threads,
     overview,
     directionsByThread,
-    needs,
-    asks,
-    writeTriggers,
+    attentionItems,
     proposal,
     reviewingProposal,
     setReviewingProposal,
@@ -89,9 +87,7 @@ export function AppTopBar() {
     viewing == null &&
     !showNeeds &&
     homeTab === "repos";
-  // Header count for the open Needs-you page — excludes self-clearing stall
-  // notices so it can't outnumber the rows actually awaiting a reply (issue #105).
-  const needsCount = pendingNeedsCount(needs, asks, writeTriggers);
+  const needsCount = pendingNeedsCount(attentionItems);
   const proposalPending =
     proposal?.status === "proposed" && proposal.directions.length > 0 && !reviewingProposal;
   const issueTabs = [

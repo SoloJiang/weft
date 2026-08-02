@@ -71,7 +71,31 @@ async fn ask(
     tool_name: &str,
     tool_input: serde_json::Value,
 ) -> String {
-    let url = format!("{base}/ask/{thread}/{dir}?tool={engine}");
+    ask_for_session(
+        base,
+        thread,
+        dir,
+        None,
+        engine,
+        tool_name,
+        tool_input,
+    )
+    .await
+}
+
+async fn ask_for_session(
+    base: &str,
+    thread: i32,
+    dir: &str,
+    session_id: Option<i32>,
+    engine: &str,
+    tool_name: &str,
+    tool_input: serde_json::Value,
+) -> String {
+    let mut url = format!("{base}/ask/{thread}/{dir}?tool={engine}");
+    if let Some(session_id) = session_id {
+        url.push_str(&format!("&session_id={session_id}"));
+    }
     reqwest::Client::new()
         .post(url)
         .json(&serde_json::json!({ "tool_name": tool_name, "tool_input": tool_input }))
@@ -109,6 +133,34 @@ async fn ask_unattended(
     }
 }
 
+async fn ask_unattended_for_session(
+    base: &str,
+    thread: i32,
+    dir: &str,
+    session_id: i32,
+    engine: &str,
+    tool_name: &str,
+    tool_input: serde_json::Value,
+) -> String {
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        ask_for_session(
+            base,
+            thread,
+            dir,
+            Some(session_id),
+            engine,
+            tool_name,
+            tool_input,
+        ),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(_) => panic!("{engine}/{tool_name} must decide without a human, but it blocked"),
+    }
+}
+
 /// Wait for the bridge to surface a card, so a GATED case can be answered
 /// instead of hanging for `ASK_WAIT` (an hour). Fails the test if none appears —
 /// which is exactly how an over-permissive allowlist would present.
@@ -122,12 +174,13 @@ async fn wait_for_card(asks: &AskRegistry, what: &str) -> u64 {
     panic!("{what} must surface a Needs-you card, but none appeared");
 }
 
-/// A workspace + repo + thread + direction + worktree, wired the way a real
-/// dispatch wires them. Returns (base_url, asks, thread_id, direction_id).
+/// A workspace + repo + thread + direction + session + worktree, wired the way
+/// a real dispatch wires them. Returns (base_url, asks, thread_id, direction_id,
+/// session_id).
 async fn worker_session(
     repo_path: &Path,
     worktree_path: &Path,
-) -> (String, AskRegistry, i32, i32, tokio::task::JoinHandle<()>) {
+) -> (String, AskRegistry, i32, i32, i32, tokio::task::JoinHandle<()>) {
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let ws = repo::create_workspace(&db, "w").await.unwrap();
     let r = repo::add_repo_ref(
@@ -147,6 +200,15 @@ async fn worker_session(
     let d = repo::create_direction(&db, t.id, "task", "claude", r.id, "why", "impl-only", "main")
         .await
         .unwrap();
+    let session = repo::create_session(
+        &db,
+        d.id,
+        r.id,
+        "claude",
+        &worktree_path.to_string_lossy(),
+    )
+    .await
+    .unwrap();
     repo::record_worktree(
         &db,
         r.id,
@@ -163,7 +225,7 @@ async fn worker_session(
     let (base, h) = server::serve(BusRegistry::new(), db, asks.clone())
         .await
         .unwrap();
-    (base, asks, t.id, d.id, h)
+    (base, asks, t.id, d.id, session.id, h)
 }
 
 /// The storm this change exists to end: a worker reading its own worktree.
@@ -172,12 +234,14 @@ async fn read_inside_the_worktree_is_auto_approved() {
     let tree = TempTree::new("inside");
     let wt = tree.dir("wt");
     let target = file_in(&wt, "src/main.rs");
-    let (base, _asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+    let (base, _asks, thread, dir, session_id, _h) =
+        worker_session(&tree.dir("repo"), &wt).await;
 
-    let out = ask_unattended(
+    let out = ask_unattended_for_session(
         &base,
         thread,
         &dir.to_string(),
+        session_id,
         "claude",
         "Read",
         serde_json::json!({ "file_path": target }),
@@ -189,10 +253,11 @@ async fn read_inside_the_worktree_is_auto_approved() {
     );
     // NotebookRead too — the other literal-path reader.
     let nb = file_in(&wt, "analysis.ipynb");
-    let out = ask_unattended(
+    let out = ask_unattended_for_session(
         &base,
         thread,
         &dir.to_string(),
+        session_id,
         "claude",
         "NotebookRead",
         serde_json::json!({ "notebook_path": nb }),
@@ -217,7 +282,8 @@ async fn pattern_language_builtins_are_never_auto_approved() {
     let tree = TempTree::new("patterns");
     let wt = tree.dir("wt");
     file_in(&wt, "src/main.rs");
-    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+    let (base, asks, thread, dir, session_id, _h) =
+        worker_session(&tree.dir("repo"), &wt).await;
 
     for (tool, input) in [
         // Entirely inside the worktree — still gated.
@@ -229,8 +295,18 @@ async fn pattern_language_builtins_are_never_auto_approved() {
     ] {
         let base2 = base.clone();
         let dir_s = dir.to_string();
-        let call =
-            tokio::spawn(async move { ask(&base2, thread, &dir_s, "claude", tool, input).await });
+        let call = tokio::spawn(async move {
+            ask_for_session(
+                &base2,
+                thread,
+                &dir_s,
+                Some(session_id),
+                "claude",
+                tool,
+                input,
+            )
+            .await
+        });
         let id = wait_for_card(&asks, &format!("{tool} (a pattern-taking builtin)")).await;
         assert!(asks.answer(id, Answer::Deny));
         assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
@@ -252,16 +328,18 @@ async fn content_search_still_surfaces_the_card() {
     let tree = TempTree::new("contentsearch");
     let wt = tree.dir("wt");
     file_in(&wt, "credentials.json");
-    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+    let (base, asks, thread, dir, session_id, _h) =
+        worker_session(&tree.dir("repo"), &wt).await;
 
     let base2 = base.clone();
     let dir_s = dir.to_string();
     let wt_s = wt.to_string_lossy().to_string();
     let call = tokio::spawn(async move {
-        ask(
+        ask_for_session(
             &base2,
             thread,
             &dir_s,
+            Some(session_id),
             "claude",
             "Grep",
             serde_json::json!({ "pattern": ".+", "path": wt_s }),
@@ -287,15 +365,17 @@ async fn read_outside_the_worktree_still_surfaces_the_card() {
     // would be caught by the risk veto instead and this test would pass with
     // containment removed entirely — verified by mutation, not assumed.
     let outside = tree.file("elsewhere/notes.rs");
-    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+    let (base, asks, thread, dir, session_id, _h) =
+        worker_session(&tree.dir("repo"), &wt).await;
 
     let base2 = base.clone();
     let dir_s = dir.to_string();
     let call = tokio::spawn(async move {
-        ask(
+        ask_for_session(
             &base2,
             thread,
             &dir_s,
+            Some(session_id),
             "claude",
             "Read",
             serde_json::json!({ "file_path": outside }),
@@ -319,15 +399,17 @@ async fn credential_file_inside_the_worktree_still_surfaces_the_card() {
     let tree = TempTree::new("dotenv");
     let wt = tree.dir("wt");
     let dotenv = file_in(&wt, ".env");
-    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+    let (base, asks, thread, dir, session_id, _h) =
+        worker_session(&tree.dir("repo"), &wt).await;
 
     let base2 = base.clone();
     let dir_s = dir.to_string();
     let call = tokio::spawn(async move {
-        ask(
+        ask_for_session(
             &base2,
             thread,
             &dir_s,
+            Some(session_id),
             "claude",
             "Read",
             serde_json::json!({ "file_path": dotenv }),
@@ -357,16 +439,18 @@ async fn credential_reached_through_a_symlink_alias_surfaces_the_card() {
     std::fs::write(&secret, b"TOKEN=1").unwrap();
     let alias = wt.join("config.txt");
     std::os::unix::fs::symlink(&secret, &alias).unwrap();
-    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+    let (base, asks, thread, dir, session_id, _h) =
+        worker_session(&tree.dir("repo"), &wt).await;
 
     let base2 = base.clone();
     let dir_s = dir.to_string();
     let alias_s = alias.to_string_lossy().to_string();
     let call = tokio::spawn(async move {
-        ask(
+        ask_for_session(
             &base2,
             thread,
             &dir_s,
+            Some(session_id),
             "claude",
             "Read",
             serde_json::json!({ "file_path": alias_s }),
@@ -386,15 +470,17 @@ async fn write_inside_the_worktree_still_surfaces_the_card() {
     let tree = TempTree::new("write");
     let wt = tree.dir("wt");
     let target = file_in(&wt, "src/main.rs");
-    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+    let (base, asks, thread, dir, session_id, _h) =
+        worker_session(&tree.dir("repo"), &wt).await;
 
     let base2 = base.clone();
     let dir_s = dir.to_string();
     let call = tokio::spawn(async move {
-        ask(
+        ask_for_session(
             &base2,
             thread,
             &dir_s,
+            Some(session_id),
             "claude",
             "Write",
             serde_json::json!({ "file_path": target, "content": "x" }),
@@ -407,12 +493,16 @@ async fn write_inside_the_worktree_still_surfaces_the_card() {
     assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
 }
 
-/// A `NoTarget` builtin has nothing to contain, so it is decided on the name
-/// alone — no session lookup at all. Asserted against an id pair that resolves
-/// to NOTHING, which is what makes "no lookup" observable.
+/// A `NoTarget` builtin has no path/worktree lookup, but the lead identity still
+/// has to be durable. Use a real lead thread, then separately prove a forged
+/// session query is denied before the name-only verdict.
 #[tokio::test]
 async fn no_target_builtins_need_no_session_lookup() {
     let db = Db::connect("sqlite::memory:").await.unwrap();
+    let workspace = repo::create_workspace(&db, "no-target").await.unwrap();
+    let thread = repo::create_thread(&db, workspace.id, "issue", "issue", "claude")
+        .await
+        .unwrap();
     let asks = AskRegistry::new();
     let (base, _h) = server::serve(BusRegistry::new(), db, asks.clone())
         .await
@@ -431,12 +521,26 @@ async fn no_target_builtins_need_no_session_lookup() {
             serde_json::json!({"plan":[{"step":"x","status":"pending"}]}),
         ),
     ] {
-        let out = ask_unattended(&base, 999, "424242", engine, tool, input).await;
+        let out = ask_unattended(&base, thread.id, "lead", engine, tool, input).await;
         assert!(
             out.contains("\"permissionDecision\":\"allow\""),
-            "{engine}/{tool} must be auto-approved on its name alone, got {out}"
+            "{engine}/{tool} must be auto-approved without path lookup, got {out}"
         );
     }
+    let forged = ask_for_session(
+        &base,
+        thread.id,
+        "lead",
+        Some(424242),
+        "claude",
+        "TodoWrite",
+        serde_json::json!({"todos": []}),
+    )
+    .await;
+    assert!(
+        forged.contains("\"permissionDecision\":\"deny\""),
+        "a forged lead session identity must be denied, got {forged}"
+    );
 }
 
 /// A lead reads across its workspace's repos (its own cwd is an almost-empty
@@ -486,31 +590,27 @@ async fn lead_reads_its_workspace_repo_without_asking() {
 }
 
 /// Fail-closed on identity: a direction id that isn't THIS thread's is a stale
-/// or forged route, so it resolves to no directories and nothing is contained —
-/// even for a path that would be fine for the direction's real thread.
+/// or forged route, so the request is denied before any Needs-you card — even
+/// for a path that would be fine for the direction's real thread.
 #[tokio::test]
-async fn direction_from_another_thread_fails_closed() {
+async fn direction_from_another_thread_is_denied_before_card() {
     let tree = TempTree::new("crossthread");
     let wt = tree.dir("wt");
     let target = file_in(&wt, "src/main.rs");
-    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+    let (base, asks, thread, dir, session_id, _h) =
+        worker_session(&tree.dir("repo"), &wt).await;
 
-    let base2 = base.clone();
-    let dir_s = dir.to_string();
     let other_thread = thread + 4242;
-    let call = tokio::spawn(async move {
-        ask(
-            &base2,
-            other_thread,
-            &dir_s,
-            "claude",
-            "Read",
-            serde_json::json!({ "file_path": target }),
-        )
-        .await
-    });
-
-    let id = wait_for_card(&asks, "a direction routed under the wrong thread").await;
-    assert!(asks.answer(id, Answer::Deny));
-    assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
+    let out = ask_for_session(
+        &base,
+        other_thread,
+        &dir.to_string(),
+        Some(session_id),
+        "claude",
+        "Read",
+        serde_json::json!({ "file_path": target }),
+    )
+    .await;
+    assert!(out.contains("\"permissionDecision\":\"deny\""));
+    assert!(asks.open().is_empty());
 }

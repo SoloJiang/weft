@@ -1,40 +1,31 @@
-import { AlertTriangle, GitBranch, HelpCircle, Layers, ShieldQuestion } from "lucide-react";
+import {
+  AlertTriangle,
+  ClipboardCheck,
+  GitBranch,
+  HelpCircle,
+  Layers,
+  ShieldQuestion,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
+import type { ReactNode } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import type { PermissionAsk, WriteTrigger, NeedItem } from "../lib/types";
+import type { AttentionItem } from "../lib/types";
 import { cn } from "../lib/cn";
-import { isActionableNeed, pendingNeedsCount, useStore } from "../state/store";
+import { pendingNeedsCount, useStore } from "../state/store";
 import { needsBarMotion } from "../lib/motion";
 
-type DockItem =
-  | { kind: "write"; item: WriteTrigger }
-  | { kind: "permission"; item: PermissionAsk }
-  | { kind: "need"; item: NeedItem };
-
-/**
- * Workspace-wide "Needs you" strip: a quiet indicator + router only. It shows
- * the pending count and a one-line summary of the top item, and routes to the
- * queue on click — it never renders answer buttons. Answering happens in-context
- * (the session's PermissionBar) or in the queue, so an ask is never actionable
- * in two places at once.
- */
+/** A quiet router into the canonical action queue. */
 export function NeedsDock() {
-  const { needs, asks, writeTriggers, openNeeds } = useStore();
+  const { attentionItems, openNeeds } = useStore();
   const { t } = useTranslation();
   const reduce = useReducedMotion();
-  // Self-clearing stall notices don't count; persistent action-required notices
-  // do count because their retry control needs explicit attention.
-  const total = pendingNeedsCount(needs, asks, writeTriggers);
-  const top = topDockItem(writeTriggers, asks, needs.filter(isActionableNeed));
+  const total = pendingNeedsCount(attentionItems);
+  const top = attentionItems[0] ?? null;
 
   return (
     <AnimatePresence initial={false}>
       {total > 0 && (
-        <motion.div
-          key="needs-dock"
-          {...needsBarMotion(!!reduce)}
-          className="shrink-0 overflow-hidden"
-        >
+        <motion.div key="needs-dock" {...needsBarMotion(!!reduce)} className="shrink-0 overflow-hidden">
           <button
             type="button"
             onClick={openNeeds}
@@ -44,7 +35,7 @@ export function NeedsDock() {
               {total}
             </span>
             <span className="font-semibold text-waiting">{t("needs.title")}</span>
-            {top && <DockSummary top={top} />}
+            {top && <DockSummary item={top} />}
             <span className="ml-auto text-[11.5px] text-ink-faint transition-colors group-hover:text-ink">
               {t("needs.openQueue")}
             </span>
@@ -55,71 +46,49 @@ export function NeedsDock() {
   );
 }
 
-function topDockItem(
-  writeTriggers: WriteTrigger[],
-  asks: PermissionAsk[],
-  needs: NeedItem[],
-): DockItem | null {
-  if (writeTriggers[0] != null) return { kind: "write", item: writeTriggers[0] };
-  if (asks[0] != null) return { kind: "permission", item: asks[0] };
-  if (needs[0] != null) return { kind: "need", item: needs[0] };
-  return null;
+function DockSummary({ item }: { item: AttentionItem }) {
+  const { t } = useTranslation();
+  switch (item.kind) {
+    case "permission":
+      return (
+        <Summary icon={<ShieldQuestion size={13} className="text-approval" />} label={`${item.ask.tool} ${t("needs.wantsPermission")}`} context={[item.ask.thread_title, item.ask.dir_name]} />
+      );
+    case "question":
+      return <Summary icon={<HelpCircle size={13} className="text-waiting" />} label={t("needs.question")} context={[item.thread_title, item.direction_name]} />;
+    case "plan_approval":
+      return <Summary icon={<ClipboardCheck size={13} className="text-approval" />} label={t("needs.planApproval")} context={[item.thread_title, item.title]} />;
+    case "scope_approval":
+      return <Summary icon={<Layers size={13} className="text-approval" />} label={t("needs.scopeApproval")} context={[item.thread_title]} />;
+    case "repo_action":
+      return <Summary icon={<GitBranch size={13} className="text-approval" />} label={t("needs.repoAction")} context={[item.thread_title, item.title]} />;
+    case "pr_tracking_retry":
+      return <Summary icon={<AlertTriangle size={13} className="text-danger" />} label={t("needs.prTrackingRetry")} context={[item.thread_title, item.direction_name]} />;
+  }
 }
 
-function DockSummary({ top }: { top: DockItem }) {
-  const { t } = useTranslation();
-  if (top.kind === "write") {
-    const item = top.item;
-    return (
-      <span className="flex min-w-0 items-center gap-1.5 text-ink-muted">
-        <GitBranch size={13} className="shrink-0 text-approval" />
-        <span className="truncate">{item.thread_title}</span>
-        <span className="text-ink-faint">·</span>
-        <span className="truncate font-mono text-ink">{item.repo_name}</span>
-      </span>
-    );
-  }
-
-  if (top.kind === "permission") {
-    const item = top.item;
-    return (
-      <span className="flex min-w-0 items-center gap-1.5 text-ink-muted">
-        <ShieldQuestion size={13} className="shrink-0 text-approval" />
-        <span className="text-ink">{item.tool}</span>
-        <span>{t("needs.wantsPermission")}</span>
-        <ContextText text={[item.thread_title, item.dir_name].filter(Boolean).join(" · ")} />
-      </span>
-    );
-  }
-
-  const item = top.item;
-  if (item.kind === "notice_action_required") {
-    return (
-      <span className="flex min-w-0 items-center gap-1.5 text-ink-muted">
-        <AlertTriangle size={13} className="shrink-0 text-danger" />
-        <span>{t("needs.actionRequired")}</span>
-        <ContextText text={[item.thread_title, item.direction_name].filter(Boolean).join(" · ")} />
-      </span>
-    );
-  }
+function Summary({
+  icon,
+  label,
+  context,
+}: {
+  icon: ReactNode;
+  label: string;
+  context: Array<string | undefined>;
+}) {
+  const text = context.filter(Boolean).join(" · ");
   return (
     <span className="flex min-w-0 items-center gap-1.5 text-ink-muted">
-      <HelpCircle size={13} className="shrink-0 text-waiting" />
-      <span>{t("needs.question")}</span>
-      <ContextText text={[item.thread_title, item.direction_name].filter(Boolean).join(" · ")} />
+      <span className="shrink-0">{icon}</span>
+      <span className="shrink-0 text-ink">{label}</span>
+      {text && (
+        <>
+          <span className="text-ink-faint">·</span>
+          <span className={cn("flex min-w-0 items-center gap-1 truncate")}>
+            <Layers size={11} className="shrink-0 text-ink-faint" />
+            <span className="truncate">{text}</span>
+          </span>
+        </>
+      )}
     </span>
-  );
-}
-
-function ContextText({ text }: { text: string }) {
-  if (!text) return null;
-  return (
-    <>
-      <span className="text-ink-faint">·</span>
-      <span className={cn("flex min-w-0 items-center gap-1 truncate")}>
-        <Layers size={11} className="shrink-0 text-ink-faint" />
-        <span className="truncate">{text}</span>
-      </span>
-    </>
   );
 }

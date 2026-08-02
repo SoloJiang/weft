@@ -7,7 +7,7 @@ pub mod feishu;
 pub mod inbound;
 pub mod outbound;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub const K_PROVIDER: &str = "im.provider";
 pub const K_APP_ID: &str = "im.feishu.app_id";
@@ -512,18 +512,34 @@ pub enum ReplyTarget {
     Human { thread: i32, ask_id: u64 },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HumanCardRoute {
+    message_id: String,
+    delivery_scope: String,
+}
+
+fn human_delivery_scope(channel: &str, account: &str, owner: &str) -> String {
+    format!("{channel}:{account}:{owner}")
+}
+
+fn human_card_idempotency_key(request_id: u64, delivery_scope: &str) -> String {
+    // Stable FNV-1a keeps the provider UUID compact while separating credential
+    // accounts and owners. It is an idempotency key, not a security boundary.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in delivery_scope.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("weft-hq-{request_id}-{hash:016x}")
+}
+
 /// 内存卡片索引：出站卡片 message_id ↔ 应答目标（spec §6 内存态）。
 #[derive(Default)]
 pub struct CardIndex {
     /// ask_id → (message_id, summary)。summary 随卡存档：`AskEvent::Resolved`
     /// 只带 id+answer，patch 终态卡（outbound::resolved_card）要 summary 从这取。
     perm_msg: HashMap<u64, (String, String)>,
-    human_msg: HashMap<(i32, u64), String>,
-    /// Human asks already delivered in this bridge generation. Answerable asks
-    /// also have a `human_msg`; display-only notices deliberately do not, but
-    /// still need this identity set so a first-owner replay cannot duplicate a
-    /// queued `Asked` event.
-    delivered_human: HashSet<(i32, u64)>,
+    human_msg: HashMap<(i32, u64), Vec<HumanCardRoute>>,
     by_message: HashMap<String, ReplyTarget>,
 }
 
@@ -538,27 +554,42 @@ impl CardIndex {
         self.by_message
             .insert(message_id.to_string(), ReplyTarget::Perm { ask_id });
     }
-    pub fn record_human(&mut self, thread: i32, ask_id: u64, message_id: &str) {
-        self.delivered_human.insert((thread, ask_id));
-        if let Some(old) = self
-            .human_msg
-            .insert((thread, ask_id), message_id.to_string())
+    pub fn record_human(
+        &mut self,
+        thread: i32,
+        ask_id: u64,
+        message_id: &str,
+        delivery_scope: &str,
+    ) {
+        let messages = self.human_msg.entry((thread, ask_id)).or_default();
+        if !messages
+            .iter()
+            .any(|existing| existing.message_id == message_id)
         {
-            self.by_message.remove(&old);
+            messages.push(HumanCardRoute {
+                message_id: message_id.to_string(),
+                delivery_scope: delivery_scope.to_string(),
+            });
         }
         self.by_message.insert(
             message_id.to_string(),
             ReplyTarget::Human { thread, ask_id },
         );
     }
-    pub fn record_human_notice(&mut self, thread: i32, ask_id: u64) {
-        self.delivered_human.insert((thread, ask_id));
+    pub fn has_human_in_scope(&self, thread: i32, ask_id: u64, delivery_scope: &str) -> bool {
+        self.human_msg
+            .get(&(thread, ask_id))
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message.delivery_scope == delivery_scope)
+            })
     }
     pub fn has_perm(&self, ask_id: u64) -> bool {
         self.perm_msg.contains_key(&ask_id)
     }
     pub fn has_human(&self, thread: i32, ask_id: u64) -> bool {
-        self.delivered_human.contains(&(thread, ask_id))
+        self.human_msg.contains_key(&(thread, ask_id))
     }
     pub fn target_of(&self, message_id: &str) -> Option<ReplyTarget> {
         self.by_message.get(message_id).copied()
@@ -569,12 +600,418 @@ impl CardIndex {
         self.by_message.remove(&m);
         Some((m, s))
     }
-    pub fn take_human(&mut self, thread: i32, ask_id: u64) -> Option<String> {
-        self.delivered_human.remove(&(thread, ask_id));
-        let m = self.human_msg.remove(&(thread, ask_id))?;
-        self.by_message.remove(&m);
-        Some(m)
+    /// Take every live card for terminal patching, while deliberately keeping
+    /// reverse reply routes. A late reply to an old/resolved card must reach the
+    /// stale-answer guard, not fall through as unrelated Concierge free text.
+    fn settle_human(&mut self, thread: i32, ask_id: u64) -> Vec<HumanCardRoute> {
+        self.human_msg
+            .remove(&(thread, ask_id))
+            .unwrap_or_default()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HumanCardProviderScope {
+    channel: String,
+    account: String,
+    owner: String,
+}
+
+impl HumanCardProviderScope {
+    fn delivery_scope(&self) -> String {
+        human_delivery_scope(&self.channel, &self.account, &self.owner)
+    }
+
+    fn matches(&self, route: &crate::store::repo::HumanRequestImRoute) -> bool {
+        self.channel == route.channel
+            && self.account == route.account
+            && self.owner == route.owner
+    }
+
+    fn route(&self, message_id: String) -> crate::store::repo::HumanRequestImRoute {
+        crate::store::repo::HumanRequestImRoute {
+            channel: self.channel.clone(),
+            account: self.account.clone(),
+            owner: self.owner.clone(),
+            message_id,
+            terminal_revision: 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HumanCardTerminalPatch {
+    request_id: Option<i32>,
+    route: crate::store::repo::HumanRequestImRoute,
+    fallback: Option<serde_json::Value>,
+}
+
+fn human_route_key(route: &crate::store::repo::HumanRequestImRoute) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}\u{0}{}",
+        route.channel, route.account, route.owner, route.message_id
+    )
+}
+
+fn human_card_terminal_patch_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn human_terminal_card(
+    request: &crate::store::entities::human_request::Model,
+) -> Option<serde_json::Value> {
+    match request.status.as_str() {
+        crate::store::repo::HUMAN_REQUEST_ANSWERED
+        | crate::store::repo::HUMAN_REQUEST_RESOLVED => {
+            Some(outbound::human_resolved_card(&request.answer, IM_LANG))
+        }
+        crate::store::repo::HUMAN_REQUEST_CANCELLED | "superseded" => {
+            Some(outbound::human_cancelled_card(IM_LANG))
+        }
+        _ => None,
+    }
+}
+
+fn human_terminal_outbox_card(
+    outbox: &crate::store::entities::human_card_terminal_outbox::Model,
+) -> Option<serde_json::Value> {
+    match outbox.terminal_status.as_str() {
+        crate::store::repo::HUMAN_REQUEST_ANSWERED
+        | crate::store::repo::HUMAN_REQUEST_RESOLVED => {
+            Some(outbound::human_resolved_card(&outbox.answer, IM_LANG))
+        }
+        crate::store::repo::HUMAN_REQUEST_CANCELLED | "superseded" => {
+            Some(outbound::human_cancelled_card(IM_LANG))
+        }
+        _ => None,
+    }
+}
+
+/// Restore every persisted reply route before websocket inbound starts, and
+/// return only terminal provider patches that still lack a durable per-route
+/// receipt for the request's current revision. Reverse mappings stay installed
+/// so late replies hit the stale-answer guard instead of Concierge free text.
+async fn hydrate_human_card_routes(
+    db: &crate::store::Db,
+    cards: &tokio::sync::Mutex<CardIndex>,
+    active_scope: Option<&HumanCardProviderScope>,
+) -> Vec<HumanCardTerminalPatch> {
+    let scopes = active_scope.into_iter().cloned().collect::<Vec<_>>();
+    hydrate_human_card_routes_for_scopes(db, cards, &scopes).await
+}
+
+async fn hydrate_human_card_routes_for_scopes(
+    db: &crate::store::Db,
+    cards: &tokio::sync::Mutex<CardIndex>,
+    active_scopes: &[HumanCardProviderScope],
+) -> Vec<HumanCardTerminalPatch> {
+    let requests = match crate::store::repo::list_human_request_im_routes(db).await {
+        Ok(requests) => requests,
+        Err(error) => {
+            eprintln!("[weft][im] hydrate human card routes: {error}");
+            return Vec::new();
+        }
+    };
+    let mut terminal_outbox = Vec::new();
+    let mut seen_outbox_ids = std::collections::HashSet::new();
+    for scope in active_scopes {
+        let rows = match crate::store::repo::list_human_card_terminal_outbox(
+            db,
+            &scope.channel,
+            &scope.account,
+            &scope.owner,
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!("[weft][im] hydrate human terminal outbox: {error}");
+                Vec::new()
+            }
+        };
+        for row in rows {
+            if seen_outbox_ids.insert(row.id) {
+                terminal_outbox.push(row);
+            }
+        }
+    }
+    let outbox_messages = terminal_outbox
+        .iter()
+        .filter(|row| !row.delivered)
+        .map(|row| {
+            human_route_key(&crate::store::repo::HumanRequestImRoute {
+                channel: row.channel.clone(),
+                account: row.account.clone(),
+                owner: row.owner.clone(),
+                message_id: row.message_id.clone(),
+                terminal_revision: row.terminal_revision,
+            })
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut terminal_patches = Vec::new();
+    let mut seen_terminal_messages = std::collections::HashSet::new();
+    {
+        let mut index = cards.lock().await;
+        for outbox in &terminal_outbox {
+            let Ok(ask_id) = u64::try_from(outbox.request_id) else {
+                continue;
+            };
+            index.record_human(
+                outbox.thread_id,
+                ask_id,
+                &outbox.message_id,
+                &human_delivery_scope(&outbox.channel, &outbox.account, &outbox.owner),
+            );
+        }
+        for request in requests {
+            let Ok(ask_id) = u64::try_from(request.id) else {
+                continue;
+            };
+            let terminal_card = human_terminal_card(&request);
+            let routes = serde_json::from_str::<Vec<crate::store::repo::HumanRequestImRoute>>(
+                &request.im_routes,
+            )
+            .unwrap_or_default();
+            for route in routes {
+                if route.message_id.trim().is_empty() {
+                    continue;
+                }
+                let scope = human_delivery_scope(&route.channel, &route.account, &route.owner);
+                index.record_human(request.thread_id, ask_id, &route.message_id, &scope);
+                if terminal_card.is_some()
+                    && active_scopes.iter().any(|scope| scope.matches(&route))
+                    && !outbox_messages.contains(&human_route_key(&route))
+                {
+                    if route.terminal_revision < request.revision
+                        && seen_terminal_messages.insert(human_route_key(&route))
+                    {
+                        terminal_patches.push(HumanCardTerminalPatch {
+                            request_id: Some(request.id),
+                            route,
+                            fallback: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    for outbox in terminal_outbox.into_iter().filter(|row| !row.delivered) {
+        let route = crate::store::repo::HumanRequestImRoute {
+            channel: outbox.channel,
+            account: outbox.account,
+            owner: outbox.owner,
+            message_id: outbox.message_id,
+            terminal_revision: outbox.terminal_revision,
+        };
+        if seen_terminal_messages.insert(human_route_key(&route)) {
+            terminal_patches.push(HumanCardTerminalPatch {
+                request_id: None,
+                route,
+                fallback: None,
+            });
+        }
+    }
+    terminal_patches
+}
+
+async fn send_human_terminal_for_route(
+    ch: &dyn Channel,
+    route: &crate::store::repo::HumanRequestImRoute,
+    status: &str,
+    answer: &str,
+    lang: &str,
+) -> anyhow::Result<()> {
+    match status {
+        crate::store::repo::HUMAN_REQUEST_ANSWERED
+        | crate::store::repo::HUMAN_REQUEST_RESOLVED => {
+            ch.resolve_human_question_card_for_route(route, answer, lang)
+                .await
+        }
+        _ => ch.cancel_human_question_card_for_route(route, lang).await,
+    }
+}
+
+async fn apply_human_card_terminal_patch(
+    db: &crate::store::Db,
+    ch: &dyn Channel,
+    patch: HumanCardTerminalPatch,
+) {
+    // All terminal PATCH calls share one ordering lock. A rewind may advance
+    // answered/rev2 to cancelled/rev3 while provider I/O is in flight; exact-
+    // revision receipt CAS then rejects rev2 and this loop patches rev3 before
+    // releasing the lock. A later event sees the receipt and becomes a no-op.
+    let _patch_guard = human_card_terminal_patch_lock().lock().await;
+    for _ in 0..5 {
+        let outbox = match crate::store::repo::get_human_card_terminal_outbox_for_route(
+            db,
+            &patch.route,
+        )
+        .await
+        {
+            Ok(outbox) => outbox,
+            Err(error) => {
+                eprintln!("[weft][im] reload terminal human card outbox: {error}");
+                return;
+            }
+        };
+        if let Some(outbox) = outbox {
+            // A delivered row is retained as an opaque tombstone. It prevents
+            // a late Answered event whose request was already cascade-deleted
+            // from repainting this route to the older resolved state.
+            if outbox.delivered {
+                return;
+            }
+            if human_terminal_outbox_card(&outbox).is_none() {
+                return;
+            }
+            if let Err(error) = send_human_terminal_for_route(
+                ch,
+                &patch.route,
+                &outbox.terminal_status,
+                &outbox.answer,
+                IM_LANG,
+            )
+            .await
+            {
+                eprintln!(
+                    "[weft][im] reconcile terminal human card {}: {error}",
+                    patch.route.message_id
+                );
+                return;
+            }
+            // Best-effort composition with a request that has not yet been
+            // cascade-deleted. The independent outbox receipt remains the
+            // authority if the request is already gone.
+            let _ = crate::store::repo::mark_human_request_im_route_terminal(
+                db,
+                outbox.request_id,
+                &patch.route.message_id,
+                outbox.terminal_revision,
+            )
+            .await;
+            match crate::store::repo::mark_human_card_terminal_outbox_delivered(
+                db,
+                outbox.id,
+                &outbox.terminal_status,
+                outbox.terminal_revision,
+            )
+            .await
+            {
+                Ok(true) => return,
+                Ok(false) => continue,
+                Err(error) => {
+                    eprintln!(
+                        "[weft][im] persist terminal card outbox receipt {}: {error}",
+                        patch.route.message_id
+                    );
+                    return;
+                }
+            }
+        }
+
+        let Some(request_id) = patch.request_id else {
+            if let Some(card) = patch.fallback.clone() {
+                if let Err(error) = ch.patch_card(&patch.route.message_id, card).await {
+                    eprintln!(
+                        "[weft][im] patch terminal human card {}: {error}",
+                        patch.route.message_id
+                    );
+                }
+            }
+            return;
+        };
+        let request = match crate::store::repo::get_human_request(db, request_id).await {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                if let Some(card) = patch.fallback.clone() {
+                    if let Err(error) = ch.patch_card(&patch.route.message_id, card).await {
+                        eprintln!(
+                            "[weft][im] patch terminal human card {}: {error}",
+                            patch.route.message_id
+                        );
+                    }
+                }
+                return;
+            }
+            Err(error) => {
+                eprintln!("[weft][im] reload terminal human card: {error}");
+                return;
+            }
+        };
+        if human_terminal_card(&request).is_none() {
+            return;
+        }
+        let needs_patch = serde_json::from_str::<Vec<crate::store::repo::HumanRequestImRoute>>(
+            &request.im_routes,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .any(|route| {
+            route.channel == patch.route.channel
+                && route.account == patch.route.account
+                && route.owner == patch.route.owner
+                && route.message_id == patch.route.message_id
+                && route.terminal_revision < request.revision
+        });
+        if !needs_patch {
+            // The provider send may have won immediately before terminal DB
+            // transition while local route persistence lost the race. The
+            // in-memory route still lets us settle it under the ordering lock.
+            if let Err(error) = send_human_terminal_for_route(
+                ch,
+                &patch.route,
+                &request.status,
+                &request.answer,
+                IM_LANG,
+            )
+            .await
+            {
+                eprintln!(
+                    "[weft][im] patch unrecorded terminal human card {}: {error}",
+                    patch.route.message_id
+                );
+            }
+            return;
+        }
+        if let Err(error) = send_human_terminal_for_route(
+            ch,
+            &patch.route,
+            &request.status,
+            &request.answer,
+            IM_LANG,
+        )
+        .await
+        {
+            eprintln!(
+                "[weft][im] reconcile terminal human card {}: {error}",
+                patch.route.message_id
+            );
+            return;
+        }
+        match crate::store::repo::mark_human_request_im_route_terminal(
+            db,
+            request_id,
+            &patch.route.message_id,
+            request.revision,
+        )
+        .await
+        {
+            Ok(true) => return,
+            Ok(false) => continue,
+            Err(error) => {
+                eprintln!(
+                    "[weft][im] persist terminal human card receipt {}: {error}",
+                    patch.route.message_id
+                );
+                return;
+            }
+        }
+    }
+    eprintln!(
+        "[weft][im] terminal human card changed too many times while patching: {}",
+        patch.route.message_id
+    );
 }
 
 /// IM 通道抽象（spec §2.1）：当前提供飞书实现 + 测试替身；第二通道出现时
@@ -583,6 +1020,17 @@ impl CardIndex {
 pub trait Channel: Send + Sync {
     /// 发交互卡片到用户（p2p），返回 message_id。
     async fn send_card(&self, open_id: &str, card: serde_json::Value) -> anyhow::Result<String>;
+    /// Provider-idempotent card send when supported. Durable human questions
+    /// use a stable key so a crash after remote success but before local route
+    /// persistence can safely retry and recover the same message id.
+    async fn send_card_idempotent(
+        &self,
+        open_id: &str,
+        card: serde_json::Value,
+        _idempotency_key: &str,
+    ) -> anyhow::Result<String> {
+        self.send_card(open_id, card).await
+    }
     /// 把已发卡片 patch 成终态。
     async fn patch_card(&self, message_id: &str, card: serde_json::Value) -> anyhow::Result<()>;
     /// Provider-neutral permission prompt. The default keeps the Feishu card
@@ -645,6 +1093,25 @@ pub trait Channel: Send + Sync {
     ) -> anyhow::Result<()> {
         self.patch_card(message_id, outbound::human_cancelled_card(lang))
             .await
+    }
+    /// Terminal delivery addressed by the durable route owner. Providers with
+    /// editable cards use the message id; command-based providers override this
+    /// to send directly to the persisted recipient instead of an in-memory map.
+    async fn resolve_human_question_card_for_route(
+        &self,
+        route: &crate::store::repo::HumanRequestImRoute,
+        answer: &str,
+        lang: &str,
+    ) -> anyhow::Result<()> {
+        self.resolve_human_question_card(&route.message_id, answer, lang)
+            .await
+    }
+    async fn cancel_human_question_card_for_route(
+        &self,
+        route: &crate::store::repo::HumanRequestImRoute,
+        lang: &str,
+    ) -> anyhow::Result<()> {
+        self.cancel_human_question_card(&route.message_id, lang).await
     }
     /// 发纯文本到用户（p2p）。
     async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()>;
@@ -971,7 +1438,21 @@ pub async fn execute_for_provider(
             ask_id,
             text,
         } => {
-            if !bus.answer_ask(thread, ask_id, &text) {
+            let answered = match i32::try_from(ask_id) {
+                Ok(request_id) => crate::attention::answer_durable_human_request(
+                    db,
+                    bus,
+                    request_id,
+                    Some(thread),
+                    None,
+                    None,
+                    &text,
+                )
+                .await?
+                .is_some(),
+                Err(_) => false,
+            };
+            if !answered {
                 let message = match dingtalk_copy {
                     Some(copy) => copy.human_already_answered.as_str(),
                     None => t(
@@ -1532,6 +2013,62 @@ pub fn spawn(app: tauri::AppHandle) {
         };
         let permission_registry = app.state::<crate::ask::AskRegistry>().inner().clone();
         let human_registry = app.state::<crate::bus::BusRegistry>().inner().clone();
+        // Install the notifier boundary before hydrating persisted routes:
+        // terminal transitions before it are visible in the DB read, and later
+        // ones queue on `hum_rx`. The scope follows the active provider so a
+        // provider switch never reconciles another provider's cards.
+        let active_human_scopes = if provider == ImProvider::Feishu {
+            settings
+                .allow_open_ids
+                .first()
+                .map(|owner| HumanCardProviderScope {
+                    channel: provider.as_str().to_string(),
+                    account: settings.app_id.clone(),
+                    owner: owner.clone(),
+                })
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            let mut owners = settings.allow_open_ids.iter().cloned().collect::<std::collections::HashSet<_>>();
+            if let Ok(rows) = crate::store::repo::list_human_card_terminal_outbox_for_channel_account(
+                &db,
+                provider.as_str(),
+                &settings.app_id,
+            )
+            .await
+            {
+                owners.extend(
+                    rows.into_iter()
+                        .map(|row| row.owner)
+                        .filter(|owner| settings.allow_open_ids.iter().any(|allowed| allowed == owner)),
+                );
+            }
+            owners
+                .into_iter()
+                .map(|owner| HumanCardProviderScope {
+                    channel: provider.as_str().to_string(),
+                    account: settings.app_id.clone(),
+                    owner,
+                })
+                .collect::<Vec<_>>()
+        };
+        let terminal_patches =
+            hydrate_human_card_routes_for_scopes(&db, cards.as_ref(), &active_human_scopes).await;
+        if !bridge.live(generation) {
+            return;
+        }
+        if !terminal_patches.is_empty() {
+            let (app_patch, db_patch, ch_patch) =
+                (app.clone(), db.clone(), channel.clone());
+            tauri::async_runtime::spawn(async move {
+                for patch in terminal_patches {
+                    if !app_patch.state::<ImBridge>().live(generation) {
+                        return;
+                    }
+                    apply_human_card_terminal_patch(&db_patch, ch_patch.as_ref(), patch).await;
+                }
+            });
+        }
         {
             let (db2, ch, cards2, copy_state2) = (
                 db.clone(),
@@ -2014,6 +2551,152 @@ async fn consume_ask_event(
     }
 }
 
+async fn patch_human_terminal_event(
+    db: &crate::store::Db,
+    ch: &dyn Channel,
+    routes: Vec<HumanCardRoute>,
+    ask_id: u64,
+    fallback: serde_json::Value,
+    provider: &HumanCardProviderScope,
+    authorized_owners: &[String],
+) {
+    let request_id = i32::try_from(ask_id).ok();
+    let active_delivery_scope = provider.delivery_scope();
+    let mut message_routes = std::collections::BTreeMap::new();
+    for route in routes {
+        if provider.channel == ImProvider::DingTalk.as_str() {
+            let mut parts = route.delivery_scope.splitn(3, ':');
+            let channel = parts.next().unwrap_or_default();
+            let account = parts.next().unwrap_or_default();
+            let owner = parts.next().unwrap_or_default();
+            if channel == provider.channel
+                && account == provider.account
+                && authorized_owners.iter().any(|allowed| allowed == owner)
+            {
+                message_routes.insert(
+                    human_route_key(&crate::store::repo::HumanRequestImRoute {
+                        channel: channel.to_string(),
+                        account: account.to_string(),
+                        owner: owner.to_string(),
+                        message_id: route.message_id.clone(),
+                        terminal_revision: 0,
+                    }),
+                    crate::store::repo::HumanRequestImRoute {
+                        channel: channel.to_string(),
+                        account: account.to_string(),
+                        owner: owner.to_string(),
+                        message_id: route.message_id,
+                        terminal_revision: 0,
+                    },
+                );
+            }
+        } else if route.delivery_scope == active_delivery_scope {
+            let route = provider.route(route.message_id);
+            message_routes.insert(human_route_key(&route), route);
+        }
+    }
+    let mut terminal_outbox_failures = std::collections::HashSet::new();
+    let mut durable_route_ids = std::collections::HashSet::new();
+    if let Some(request_id) = request_id {
+        let outbox = if provider.channel == ImProvider::DingTalk.as_str() {
+            crate::store::repo::list_human_card_terminal_outbox_for_channel_account(
+                db,
+                &provider.channel,
+                &provider.account,
+            )
+            .await
+        } else {
+            crate::store::repo::list_pending_human_card_terminal_outbox(
+                db,
+                &provider.channel,
+                &provider.account,
+                &provider.owner,
+            )
+            .await
+        };
+        match outbox {
+            Ok(outbox) => {
+                for row in outbox.into_iter().filter(|row| {
+                    row.request_id == request_id
+                        && !row.delivered
+                        && (provider.channel != ImProvider::DingTalk.as_str()
+                            || authorized_owners.iter().any(|owner| owner == &row.owner))
+                }) {
+                    let route = crate::store::repo::HumanRequestImRoute {
+                        channel: row.channel,
+                        account: row.account,
+                        owner: row.owner,
+                        message_id: row.message_id,
+                        terminal_revision: row.terminal_revision,
+                    };
+                    durable_route_ids.insert(human_route_key(&route));
+                    message_routes.insert(human_route_key(&route), route);
+                }
+            }
+            Err(error) => {
+                eprintln!("[weft][im] load terminal event outbox: {error}");
+            }
+        }
+    }
+    if let Some(request_id) = request_id {
+        match crate::store::repo::get_human_request(db, request_id).await {
+            Ok(Some(request))
+                if matches!(
+                    request.status.as_str(),
+                    crate::store::repo::HUMAN_REQUEST_ANSWERED
+                        | crate::store::repo::HUMAN_REQUEST_RESOLVED
+                        | crate::store::repo::HUMAN_REQUEST_CANCELLED
+                        | "superseded"
+                ) =>
+            {
+                for route in message_routes.values() {
+                    if let Err(error) = crate::store::repo::queue_human_card_terminal_outbox(
+                        db,
+                        request.id,
+                        request.thread_id,
+                        route,
+                        &request.status,
+                        &request.answer,
+                        request.revision,
+                    )
+                    .await
+                    {
+                        eprintln!(
+                            "[weft][im] queue terminal event outbox {}: {error}",
+                            route.message_id
+                        );
+                        terminal_outbox_failures.insert(human_route_key(route));
+                    } else {
+                        durable_route_ids.insert(human_route_key(route));
+                    }
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => eprintln!("[weft][im] load terminal event request: {error}"),
+        }
+    }
+    for (route_key, route) in message_routes {
+        if provider.channel == ImProvider::DingTalk.as_str()
+            && (terminal_outbox_failures.contains(&route_key)
+                || !durable_route_ids.contains(&route_key))
+        {
+            // DingTalk terminal sends must have a durable owner route first;
+            // leave the event pending for the next bridge/startup retry.
+            continue;
+        }
+        apply_human_card_terminal_patch(
+            db,
+            ch,
+            HumanCardTerminalPatch {
+                request_id,
+                route,
+                fallback: Some(fallback.clone()),
+            },
+        )
+        .await;
+    }
+}
+
 /// ask_human 事件 → 发提问卡（查 DB 富化 thread 标题/提问 direction 名）/
 /// patch 已答终态（带人答文本）。未绑定不出站。
 async fn consume_human_event(
@@ -2023,18 +2706,37 @@ async fn consume_human_event(
     cards: &tokio::sync::Mutex<CardIndex>,
     lang: &str,
 ) {
-    let owner = match ImSettings::load(db).await {
-        Ok(s) => s.allow_open_ids.into_iter().next(),
+    let settings = match ImSettings::load(db).await {
+        Ok(settings) => settings,
         Err(e) => {
             eprintln!("[weft][im] consume_human load owner: {e}");
             return;
         }
     };
-    let Some(owner) = owner else { return };
+    let Some(owner) = settings.allow_open_ids.first().cloned() else {
+        return;
+    };
+    let provider = HumanCardProviderScope {
+        channel: settings.provider.as_str().to_string(),
+        account: settings.app_id.clone(),
+        owner: owner.clone(),
+    };
+    let delivery_scope = provider.delivery_scope();
     match ev {
         crate::bus::state::HumanAskEvent::Asked { thread, ask } => {
-            if cards.lock().await.has_human(thread, ask.id) {
-                return;
+            if ask.durable {
+                let Ok(request_id) = i32::try_from(ask.id) else {
+                    return;
+                };
+                let still_open = matches!(
+                    crate::store::repo::get_human_request(db, request_id).await,
+                    Ok(Some(request))
+                        if request.thread_id == thread
+                            && request.status == crate::store::repo::HUMAN_REQUEST_OPEN
+                );
+                if !still_open {
+                    return;
+                }
             }
             let title = crate::store::repo::get_thread(db, thread)
                 .await
@@ -2051,41 +2753,115 @@ async fn consume_human_event(
                     .unwrap_or_else(|| ask.from.clone()),
                 Err(_) => ask.from.clone(),
             };
-            // A display-only NOTICE (the self-clearing stall hint) can't be
-            // answered and retracts itself, so it must NOT go through IM's
-            // answer-card pipeline (reply-to-answer, then a resolved/cancelled
-            // patch) — that would show a dead reply prompt and a wrong
-            // "cancelled" patch on recovery. But a remote human still needs to
-            // learn a task froze, so send it as plain TEXT. Crucially, do NOT
-            // record it in CardIndex: a later Answered/Cancelled then finds
-            // nothing to patch (take_human → None), which is exactly right for
-            // a notice that never carries an answer.
-            if !ask.kind.is_answerable() {
-                // Background tasks post a stable token rather than prose (they
-                // have no locale); render it here, or a remote human receives
-                // the raw `acp.force_reset_notice`.
-                let body =
-                    crate::bus::notice_text::resolve(&ask.text, lang).unwrap_or(ask.text.as_str());
-                let notice = format!("{title} · {from}\n{body}");
-                match ch.send_text(&owner, &notice).await {
-                    Ok(()) => cards.lock().await.record_human_notice(thread, ask.id),
-                    Err(e) => eprintln!("[weft][im] send stall notice: {e}"),
-                }
+            let mut index = cards.lock().await;
+            if index.has_human_in_scope(thread, ask.id, &delivery_scope) {
                 return;
             }
-            match ch
-                .send_human_question_card(
-                    &owner,
-                    thread,
-                    ask.id,
-                    &title,
-                    &from,
-                    crate::bus::notice_text::resolve(&ask.text, lang).unwrap_or(ask.text.as_str()),
-                    lang,
-                )
-                .await
-            {
-                Ok(mid) => cards.lock().await.record_human(thread, ask.id, &mid),
+            let idempotency_key = human_card_idempotency_key(ask.id, &delivery_scope);
+            let sent = match settings.provider {
+                ImProvider::Feishu => ch
+                    .send_card_idempotent(
+                        &owner,
+                        outbound::human_card(&title, &from, &ask.text, lang),
+                        &idempotency_key,
+                    )
+                    .await,
+                ImProvider::DingTalk => ch
+                    .send_human_question_card(
+                        &owner,
+                        thread,
+                        ask.id,
+                        &title,
+                        &from,
+                        &ask.text,
+                        lang,
+                    )
+                    .await,
+            };
+            match sent {
+                Ok(mid) => {
+                    let route = provider.route(mid.clone());
+                    let mut terminal_after_send = None;
+                    if let Ok(request_id) = i32::try_from(ask.id) {
+                        match crate::store::repo::record_human_request_im_route(
+                            db,
+                            request_id,
+                            &route,
+                        )
+                        .await
+                        {
+                            Ok(_) => {}
+                            Err(error) => {
+                                eprintln!("[weft][im] persist human card route: {error}");
+                            }
+                        }
+                        terminal_after_send = match crate::store::repo::get_human_request(
+                            db,
+                            request_id,
+                        )
+                        .await
+                        {
+                            Ok(Some(request))
+                                if request.status
+                                    != crate::store::repo::HUMAN_REQUEST_OPEN =>
+                            {
+                                Some((
+                                    request.status,
+                                    request.answer,
+                                    request.revision,
+                                ))
+                            }
+                            Ok(Some(_)) => None,
+                            Ok(None) => Some((
+                                crate::store::repo::HUMAN_REQUEST_CANCELLED.to_string(),
+                                String::new(),
+                                i32::MAX,
+                            )),
+                            Err(error) => {
+                                eprintln!(
+                                    "[weft][im] revalidate human card after send: {error}"
+                                );
+                                None
+                            }
+                        };
+                    }
+                    index.record_human(thread, ask.id, &mid, &delivery_scope);
+                    if let (Ok(request_id), Some((status, answer, revision))) =
+                        (i32::try_from(ask.id), terminal_after_send)
+                    {
+                        if let Err(error) = crate::store::repo::queue_human_card_terminal_outbox(
+                            db,
+                            request_id,
+                            thread,
+                            &route,
+                            &status,
+                            &answer,
+                            revision,
+                        )
+                        .await
+                        {
+                            eprintln!("[weft][im] queue post-send terminal card: {error}");
+                        }
+                        let fallback = match status.as_str() {
+                            crate::store::repo::HUMAN_REQUEST_ANSWERED
+                            | crate::store::repo::HUMAN_REQUEST_RESOLVED => {
+                                outbound::human_resolved_card(&answer, lang)
+                            }
+                            _ => outbound::human_cancelled_card(lang),
+                        };
+                        drop(index);
+                        apply_human_card_terminal_patch(
+                            db,
+                            ch,
+                            HumanCardTerminalPatch {
+                                request_id: Some(request_id),
+                                route,
+                                fallback: Some(fallback),
+                            },
+                        )
+                        .await;
+                    }
+                }
                 Err(e) => eprintln!("[weft][im] send human card: {e}"),
             }
         }
@@ -2095,18 +2871,30 @@ async fn consume_human_event(
             text,
             ..
         } => {
-            if let Some(mid) = cards.lock().await.take_human(thread, ask_id) {
-                if let Err(e) = ch.resolve_human_question_card(&mid, &text, lang).await {
-                    eprintln!("[weft][im] patch human resolved card: {e}");
-                }
-            }
+            let routes = cards.lock().await.settle_human(thread, ask_id);
+            patch_human_terminal_event(
+                db,
+                ch,
+                routes,
+                ask_id,
+                outbound::human_resolved_card(&text, lang),
+                &provider,
+                &settings.allow_open_ids,
+            )
+            .await;
         }
         crate::bus::state::HumanAskEvent::Cancelled { thread, ask_id } => {
-            if let Some(mid) = cards.lock().await.take_human(thread, ask_id) {
-                if let Err(e) = ch.cancel_human_question_card(&mid, lang).await {
-                    eprintln!("[weft][im] patch human cancelled card: {e}");
-                }
-            }
+            let routes = cards.lock().await.settle_human(thread, ask_id);
+            patch_human_terminal_event(
+                db,
+                ch,
+                routes,
+                ask_id,
+                outbound::human_cancelled_card(lang),
+                &provider,
+                &settings.allow_open_ids,
+            )
+            .await;
         }
     }
 }
@@ -2644,9 +3432,11 @@ async fn send_resync_summary(app: &tauri::AppHandle, ch: &dyn Channel) {
     }
 }
 
-/// 把 AskRegistry 当前快照拉成 `(thread_id, "标题：summary")` 列表供
+/// 把 permission AskRegistry 当前快照拉成 `(thread_id, "标题：summary")` 列表供
 /// [`outbound::resync_summary`] 渲染。pub(super) 仅为单测可见；正式调用
-/// 入口是 [`send_resync_summary`]。
+/// 入口是 [`send_resync_summary`]。Durable free-text questions deliberately
+/// stay out of this text summary: BusRegistry's atomic notifier snapshot replays
+/// them as answerable cards and records CardIndex routing above.
 pub(crate) async fn build_resync_items(
     db: &crate::store::Db,
     asks: &crate::ask::AskRegistry,
@@ -2673,6 +3463,160 @@ pub(crate) async fn build_resync_items(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn test_human_provider_scope() -> HumanCardProviderScope {
+        HumanCardProviderScope {
+            channel: "feishu".to_string(),
+            account: "cli_test".to_string(),
+            owner: "ou_owner".to_string(),
+        }
+    }
+
+    #[derive(Default)]
+    struct ReplayChannel {
+        sent_cards: std::sync::Mutex<Vec<serde_json::Value>>,
+        patched_cards: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    struct OrderedTerminalPatchChannel {
+        patched_cards: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+        patch_calls: std::sync::atomic::AtomicUsize,
+        first_patch_started: tokio::sync::Semaphore,
+        release_first_patch: tokio::sync::Semaphore,
+    }
+
+    struct BlockingHumanSendChannel {
+        send_started: tokio::sync::Semaphore,
+        release_send: tokio::sync::Semaphore,
+        patched_cards: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl BlockingHumanSendChannel {
+        fn new() -> Self {
+            Self {
+                send_started: tokio::sync::Semaphore::new(0),
+                release_send: tokio::sync::Semaphore::new(0),
+                patched_cards: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl OrderedTerminalPatchChannel {
+        fn new() -> Self {
+            Self {
+                patched_cards: std::sync::Mutex::new(Vec::new()),
+                patch_calls: std::sync::atomic::AtomicUsize::new(0),
+                first_patch_started: tokio::sync::Semaphore::new(0),
+                release_first_patch: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ReplayChannel {
+        async fn send_card(
+            &self,
+            _open_id: &str,
+            card: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            self.sent_cards
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(card);
+            Ok("om_replayed_human".to_string())
+        }
+
+        async fn patch_card(
+            &self,
+            message_id: &str,
+            card: serde_json::Value,
+        ) -> anyhow::Result<()> {
+            self.patched_cards
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((message_id.to_string(), card));
+            Ok(())
+        }
+
+        async fn send_text(&self, _open_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn reply_text(&self, _reply_to: &str, _text: &str) -> anyhow::Result<String> {
+            Ok("om_replayed_reply".to_string())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for OrderedTerminalPatchChannel {
+        async fn send_card(
+            &self,
+            _open_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            Ok("om_ordered_human".to_string())
+        }
+
+        async fn patch_card(
+            &self,
+            message_id: &str,
+            card: serde_json::Value,
+        ) -> anyhow::Result<()> {
+            let call = self
+                .patch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                self.first_patch_started.add_permits(1);
+                self.release_first_patch.acquire().await?.forget();
+            }
+            self.patched_cards
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((message_id.to_string(), card));
+            Ok(())
+        }
+
+        async fn send_text(&self, _open_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn reply_text(&self, _reply_to: &str, _text: &str) -> anyhow::Result<String> {
+            Ok("om_ordered_reply".to_string())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for BlockingHumanSendChannel {
+        async fn send_card(
+            &self,
+            _open_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            self.send_started.add_permits(1);
+            self.release_send.acquire().await?.forget();
+            Ok("om_send_cancel_race".to_string())
+        }
+
+        async fn patch_card(
+            &self,
+            message_id: &str,
+            card: serde_json::Value,
+        ) -> anyhow::Result<()> {
+            self.patched_cards
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((message_id.to_string(), card));
+            Ok(())
+        }
+
+        async fn send_text(&self, _open_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn reply_text(&self, _reply_to: &str, _text: &str) -> anyhow::Result<String> {
+            Ok("om_send_cancel_reply".to_string())
+        }
+    }
 
     #[test]
     fn parse_allow_trims_and_drops_empties() {
@@ -2931,7 +3875,7 @@ mod tests {
     fn card_index_roundtrip() {
         let mut c = CardIndex::default();
         c.record_perm(7, "om_1", "Run: npm test");
-        c.record_human(3, 9, "om_2");
+        c.record_human(3, 9, "om_2", "test:a:owner");
         assert_eq!(c.target_of("om_1"), Some(ReplyTarget::Perm { ask_id: 7 }));
         assert_eq!(
             c.target_of("om_2"),
@@ -2946,20 +3890,53 @@ mod tests {
             Some(("om_1".to_string(), "Run: npm test".to_string()))
         );
         assert_eq!(c.target_of("om_1"), None); // 反向索引同步清
-        assert_eq!(c.take_human(3, 9).as_deref(), Some("om_2"));
+        assert_eq!(
+            c.settle_human(3, 9),
+            vec![HumanCardRoute {
+                message_id: "om_2".to_string(),
+                delivery_scope: "test:a:owner".to_string(),
+            }]
+        );
+        assert_eq!(
+            c.target_of("om_2"),
+            Some(ReplyTarget::Human {
+                thread: 3,
+                ask_id: 9,
+            })
+        );
         assert_eq!(c.take_perm(7), None);
     }
 
     #[test]
-    fn rerecord_clears_old_reverse_index() {
+    fn human_card_delivery_scope_and_idempotency_are_stable_and_distinct() {
+        let mut cards = CardIndex::default();
+        cards.record_human(3, 9, "om_old", "feishu:app-a:ou-old");
+        assert!(cards.has_human_in_scope(3, 9, "feishu:app-a:ou-old"));
+        assert!(!cards.has_human_in_scope(3, 9, "feishu:app-a:ou-new"));
+
+        let key = human_card_idempotency_key(9, "feishu:app-a:ou-old");
+        assert_eq!(key, human_card_idempotency_key(9, "feishu:app-a:ou-old"));
+        assert_ne!(key, human_card_idempotency_key(9, "feishu:app-a:ou-new"));
+        assert_ne!(key, human_card_idempotency_key(10, "feishu:app-a:ou-old"));
+        assert!(key.len() < 50, "provider idempotency key stays compact");
+    }
+
+    #[test]
+    fn durable_human_rerecord_keeps_every_old_reply_route() {
         let mut c = CardIndex::default();
         c.record_perm(7, "om_1", "s1");
         c.record_perm(7, "om_1b", "s2");
         assert_eq!(c.target_of("om_1"), None); // 旧 message_id 不再可路由
         assert_eq!(c.target_of("om_1b"), Some(ReplyTarget::Perm { ask_id: 7 }));
-        c.record_human(3, 9, "om_2");
-        c.record_human(3, 9, "om_2b");
-        assert_eq!(c.target_of("om_2"), None);
+        c.record_human(3, 9, "om_2", "test:a:owner");
+        c.record_human(3, 9, "om_2b", "test:a:owner");
+        assert_eq!(
+            c.target_of("om_2"),
+            Some(ReplyTarget::Human {
+                thread: 3,
+                ask_id: 9,
+            })
+        );
         assert_eq!(
             c.target_of("om_2b"),
             Some(ReplyTarget::Human {
@@ -2971,7 +3948,19 @@ mod tests {
             c.take_perm(7),
             Some(("om_1b".to_string(), "s2".to_string()))
         );
-        assert_eq!(c.take_human(3, 9).as_deref(), Some("om_2b"));
+        assert_eq!(
+            c.settle_human(3, 9),
+            vec![
+                HumanCardRoute {
+                    message_id: "om_2".to_string(),
+                    delivery_scope: "test:a:owner".to_string(),
+                },
+                HumanCardRoute {
+                    message_id: "om_2b".to_string(),
+                    delivery_scope: "test:a:owner".to_string(),
+                },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3041,6 +4030,1077 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_resync_items_leaves_durable_questions_to_answerable_card_replay() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "API decision",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            11,
+            0,
+            0,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+
+        let items = build_resync_items(&db, &asks).await;
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restored_durable_question_replays_as_recorded_answer_card() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_APP_ID, "cli_test")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "ou_owner")
+            .await
+            .unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "API decision",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+        let request_id = u64::try_from(request.id).unwrap();
+        let bus = crate::bus::BusRegistry::new();
+        assert!(bus.restore_human_request(
+            thread.id,
+            "lead",
+            &request.question,
+            request_id,
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let snapshot = bus.set_ask_notifier(tx);
+        let channel = ReplayChannel::default();
+        let cards = tokio::sync::Mutex::new(CardIndex::default());
+
+        for (thread_id, ask) in snapshot {
+            consume_human_event(
+                crate::bus::state::HumanAskEvent::Asked {
+                    thread: thread_id,
+                    ask,
+                },
+                &db,
+                &channel,
+                &cards,
+                IM_LANG,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            channel
+                .sent_cards
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+        assert_eq!(
+            cards.lock().await.target_of("om_replayed_human"),
+            Some(ReplyTarget::Human {
+                thread: thread.id,
+                ask_id: request_id,
+            })
+        );
+        let persisted = crate::store::repo::get_human_request(&db, request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<crate::store::repo::HumanRequestImRoute>>(
+                &persisted.im_routes,
+            )
+            .unwrap(),
+            vec![crate::store::repo::HumanRequestImRoute {
+                channel: "feishu".to_string(),
+                account: "cli_test".to_string(),
+                owner: "ou_owner".to_string(),
+                message_id: "om_replayed_human".to_string(),
+                terminal_revision: 0,
+            }]
+        );
+
+        let restored_cards = tokio::sync::Mutex::new(CardIndex::default());
+        let provider = test_human_provider_scope();
+        assert!(hydrate_human_card_routes(&db, &restored_cards, Some(&provider))
+            .await
+            .is_empty());
+        assert_eq!(
+            restored_cards.lock().await.target_of("om_replayed_human"),
+            Some(ReplyTarget::Human {
+                thread: thread.id,
+                ask_id: request_id,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn answered_open_snapshot_does_not_send_a_ghost_human_card() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_APP_ID, "cli_test")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "ou_owner")
+            .await
+            .unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "API decision",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+        let request_id = u64::try_from(request.id).unwrap();
+        let bus = crate::bus::BusRegistry::new();
+        assert!(bus.restore_human_request(
+            thread.id,
+            "lead",
+            &request.question,
+            request_id,
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut snapshot = bus.set_ask_notifier(tx);
+        let (_, ask) = snapshot.pop().unwrap();
+        crate::store::repo::answer_human_request(
+            &db,
+            workspace.id,
+            request.id,
+            request.revision,
+            "REST",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let channel = ReplayChannel::default();
+        let cards = tokio::sync::Mutex::new(CardIndex::default());
+
+        consume_human_event(
+            crate::bus::state::HumanAskEvent::Asked {
+                thread: thread.id,
+                ask,
+            },
+            &db,
+            &channel,
+            &cards,
+            IM_LANG,
+        )
+        .await;
+
+        assert!(channel
+            .sent_cards
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty());
+        assert!(cards.lock().await.target_of("om_replayed_human").is_none());
+        assert_eq!(
+            crate::store::repo::get_human_request(&db, request.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .im_routes,
+            "[]"
+        );
+    }
+
+    #[tokio::test]
+    async fn answered_human_event_queues_terminal_outbox_before_provider_send() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_APP_ID, "cli_test")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "ou_owner")
+            .await
+            .unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "API decision",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+        let provider = test_human_provider_scope();
+        let route = provider.route("om_answered_outbox".to_string());
+        crate::store::repo::record_human_request_im_route(&db, request.id, &route)
+            .await
+            .unwrap();
+        let cards = tokio::sync::Mutex::new(CardIndex::default());
+        cards.lock().await.record_human(
+            thread.id,
+            u64::try_from(request.id).unwrap(),
+            &route.message_id,
+            &provider.delivery_scope(),
+        );
+        let answered = crate::store::repo::answer_human_request(
+            &db,
+            workspace.id,
+            request.id,
+            request.revision,
+            "REST",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let channel = ReplayChannel::default();
+        consume_human_event(
+            crate::bus::state::HumanAskEvent::Answered {
+                thread: thread.id,
+                ask_id: u64::try_from(request.id).unwrap(),
+                from: "lead".to_string(),
+                question: request.question,
+                text: answered.answer.clone(),
+            },
+            &db,
+            &channel,
+            &cards,
+            IM_LANG,
+        )
+        .await;
+
+        assert_eq!(
+            channel
+                .patched_cards
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            [(
+                route.message_id.clone(),
+                outbound::human_resolved_card("REST", IM_LANG),
+            )]
+        );
+        let outbox = crate::store::repo::get_human_card_terminal_outbox_for_route(&db, &route)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outbox.delivered);
+        assert_eq!(outbox.terminal_status, crate::store::repo::HUMAN_REQUEST_ANSWERED);
+        assert_eq!(outbox.terminal_revision, answered.revision);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_a_terminal_human_card_after_patch_loss() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "API decision",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+        crate::store::repo::record_human_request_im_route(
+            &db,
+            request.id,
+            &crate::store::repo::HumanRequestImRoute {
+                channel: "feishu".to_string(),
+                account: "cli_test".to_string(),
+                owner: "ou_owner".to_string(),
+                message_id: "om_before_crash".to_string(),
+                terminal_revision: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let answered = crate::store::repo::answer_human_request(
+            &db,
+            workspace.id,
+            request.id,
+            request.revision,
+            "REST",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let channel = ReplayChannel::default();
+        let cards = tokio::sync::Mutex::new(CardIndex::default());
+        let provider = test_human_provider_scope();
+
+        let patches = hydrate_human_card_routes(&db, &cards, Some(&provider)).await;
+        assert_eq!(patches.len(), 1);
+        for patch in patches {
+            apply_human_card_terminal_patch(&db, &channel, patch).await;
+        }
+
+        assert_eq!(
+            channel
+                .patched_cards
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            [(
+                "om_before_crash".to_string(),
+                outbound::human_resolved_card("REST", IM_LANG),
+            )]
+        );
+        assert_eq!(
+            cards.lock().await.target_of("om_before_crash"),
+            Some(ReplyTarget::Human {
+                thread: thread.id,
+                ask_id: u64::try_from(request.id).unwrap(),
+            })
+        );
+        let persisted = crate::store::repo::get_human_request(&db, request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let routes = serde_json::from_str::<Vec<crate::store::repo::HumanRequestImRoute>>(
+            &persisted.im_routes,
+        )
+        .unwrap();
+        assert_eq!(routes[0].terminal_revision, answered.revision);
+        assert!(
+            hydrate_human_card_routes(
+                &db,
+                &tokio::sync::Mutex::new(CardIndex::default()),
+                Some(&provider),
+            )
+                .await
+                .is_empty(),
+            "a persisted provider receipt prevents unbounded startup re-patching"
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_terminal_revision_wins_while_an_older_card_patch_is_in_flight() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "API decision",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+        crate::store::repo::record_human_request_im_route(
+            &db,
+            request.id,
+            &crate::store::repo::HumanRequestImRoute {
+                channel: "feishu".to_string(),
+                account: "cli_test".to_string(),
+                owner: "ou_owner".to_string(),
+                message_id: "om_in_flight".to_string(),
+                terminal_revision: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let answered = crate::store::repo::answer_human_request(
+            &db,
+            workspace.id,
+            request.id,
+            request.revision,
+            "REST",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let provider = test_human_provider_scope();
+        let mut patches = hydrate_human_card_routes(
+            &db,
+            &tokio::sync::Mutex::new(CardIndex::default()),
+            Some(&provider),
+        )
+        .await;
+        let patch = patches.pop().unwrap();
+        assert!(patches.is_empty());
+        let channel = std::sync::Arc::new(OrderedTerminalPatchChannel::new());
+        let patch_db = db.clone();
+        let patch_channel = std::sync::Arc::clone(&channel);
+        let patch_task = tokio::spawn(async move {
+            apply_human_card_terminal_patch(&patch_db, patch_channel.as_ref(), patch).await;
+        });
+
+        let started = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            channel.first_patch_started.acquire(),
+        )
+        .await
+        .expect("the first provider patch should start")
+        .expect("the patch-start semaphore stays open");
+        started.forget();
+        assert_eq!(
+            crate::store::repo::cancel_open_human_requests_for_thread(&db, thread.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        channel.release_first_patch.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(10), patch_task)
+            .await
+            .expect("terminal reconciliation should finish")
+            .expect("terminal reconciliation task should not panic");
+
+        let patched = channel
+            .patched_cards
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            patched.as_slice(),
+            [
+                (
+                    "om_in_flight".to_string(),
+                    outbound::human_resolved_card("REST", IM_LANG),
+                ),
+                (
+                    "om_in_flight".to_string(),
+                    outbound::human_cancelled_card(IM_LANG),
+                ),
+            ],
+            "the provider may briefly see rev2, but the same locked worker must finish on rev3"
+        );
+        drop(patched);
+        let cancelled = crate::store::repo::get_human_request(&db, request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, crate::store::repo::HUMAN_REQUEST_CANCELLED);
+        assert!(cancelled.revision > answered.revision);
+        let routes = serde_json::from_str::<Vec<crate::store::repo::HumanRequestImRoute>>(
+            &cancelled.im_routes,
+        )
+        .unwrap();
+        assert_eq!(routes[0].terminal_revision, cancelled.revision);
+    }
+
+    #[tokio::test]
+    async fn cancelled_card_outbox_survives_cascade_and_tombstones_late_resolved_events() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "Delete safely",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "Ship now?",
+        )
+        .await
+        .unwrap();
+        let provider = test_human_provider_scope();
+        let route = provider.route("om_deleted_request".to_string());
+        crate::store::repo::record_human_request_im_route(&db, request.id, &route)
+            .await
+            .unwrap();
+        crate::store::repo::answer_human_request(
+            &db,
+            workspace.id,
+            request.id,
+            request.revision,
+            "Yes",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            crate::store::repo::cancel_open_human_requests_for_thread(&db, thread.id)
+                .await
+                .unwrap(),
+            vec![request.id]
+        );
+        crate::store::repo::delete_thread_cascade(&db, thread.id)
+            .await
+            .unwrap();
+        assert!(crate::store::repo::get_human_request(&db, request.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let channel = ReplayChannel::default();
+        let restored_cards = tokio::sync::Mutex::new(CardIndex::default());
+        let patches = hydrate_human_card_routes(
+            &db,
+            &restored_cards,
+            Some(&provider),
+        )
+        .await;
+        assert_eq!(patches.len(), 1, "the deletion-independent outbox replays after a crash");
+        assert_eq!(
+            restored_cards.lock().await.target_of("om_deleted_request"),
+            Some(ReplyTarget::Human {
+                thread: thread.id,
+                ask_id: u64::try_from(request.id).unwrap(),
+            }),
+            "the provider route is restored before asynchronous PATCH reconciliation"
+        );
+        for patch in patches {
+            apply_human_card_terminal_patch(&db, &channel, patch).await;
+        }
+        apply_human_card_terminal_patch(
+            &db,
+            &channel,
+            HumanCardTerminalPatch {
+                request_id: Some(request.id),
+                route: route.clone(),
+                fallback: Some(outbound::human_resolved_card("Yes", IM_LANG)),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            channel
+                .patched_cards
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            [(
+                "om_deleted_request".to_string(),
+                outbound::human_cancelled_card(IM_LANG),
+            )],
+            "the delivered outbox tombstone suppresses a late pre-delete Answered event"
+        );
+        let outbox = crate::store::repo::get_human_card_terminal_outbox_for_route(&db, &route)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outbox.delivered);
+        assert_eq!(outbox.terminal_status, crate::store::repo::HUMAN_REQUEST_CANCELLED);
+        let restarted_cards = tokio::sync::Mutex::new(CardIndex::default());
+        assert!(
+            hydrate_human_card_routes(&db, &restarted_cards, Some(&provider))
+                .await
+                .is_empty(),
+            "a delivered tombstone is not re-patched at startup"
+        );
+        assert_eq!(
+            restarted_cards.lock().await.target_of("om_deleted_request"),
+            Some(ReplyTarget::Human {
+                thread: thread.id,
+                ask_id: u64::try_from(request.id).unwrap(),
+            }),
+            "a delivered tombstone keeps late replies out of Concierge after restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_card_route_survives_cascade_as_an_inbound_tombstone() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "Delete acknowledged question",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "Was this applied?",
+        )
+        .await
+        .unwrap();
+        let provider = test_human_provider_scope();
+        let patched_route = provider.route("om_resolved_then_deleted".to_string());
+        let pending_route = provider.route("om_resolved_unpatched_then_deleted".to_string());
+        crate::store::repo::record_human_request_im_route(&db, request.id, &patched_route)
+            .await
+            .unwrap();
+        crate::store::repo::record_human_request_im_route(&db, request.id, &pending_route)
+            .await
+            .unwrap();
+        let answered = crate::store::repo::answer_human_request(
+            &db,
+            workspace.id,
+            request.id,
+            request.revision,
+            "Yes",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            crate::store::repo::mark_human_request_im_route_terminal(
+                &db,
+                request.id,
+                &patched_route.message_id,
+                answered.revision,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            crate::store::repo::mark_human_answers_delivered(
+                &db,
+                thread.id,
+                "lead",
+                &[request.id],
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let resolved = crate::store::repo::get_human_request(&db, request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.status, crate::store::repo::HUMAN_REQUEST_RESOLVED);
+
+        assert!(
+            crate::store::repo::cancel_open_human_requests_for_thread(&db, thread.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an acknowledged answer stays resolved while deletion preserves its route"
+        );
+        let patched_outbox =
+            crate::store::repo::get_human_card_terminal_outbox_for_route(&db, &patched_route)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(patched_outbox.delivered, "a provider receipt avoids repainting");
+        assert!(patched_outbox.answer.is_empty(), "opaque tombstones retain no answer");
+        assert_eq!(patched_outbox.thread_id, thread.id);
+        assert_eq!(patched_outbox.request_id, request.id);
+        assert_eq!(
+            patched_outbox.terminal_status,
+            crate::store::repo::HUMAN_REQUEST_RESOLVED
+        );
+        assert_eq!(patched_outbox.terminal_revision, resolved.revision);
+        let pending_outbox =
+            crate::store::repo::get_human_card_terminal_outbox_for_route(&db, &pending_route)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(!pending_outbox.delivered);
+        assert_eq!(pending_outbox.answer, "Yes");
+        crate::store::repo::delete_thread_cascade(&db, thread.id)
+            .await
+            .unwrap();
+
+        let restarted_cards = tokio::sync::Mutex::new(CardIndex::default());
+        let patches = hydrate_human_card_routes(&db, &restarted_cards, Some(&provider)).await;
+        assert_eq!(
+            patches.len(),
+            1,
+            "only the resolved route without a provider receipt is retried"
+        );
+        assert_eq!(patches[0].route.message_id, pending_route.message_id);
+        assert_eq!(
+            restarted_cards
+                .lock()
+                .await
+                .target_of("om_resolved_then_deleted"),
+            Some(ReplyTarget::Human {
+                thread: thread.id,
+                ask_id: u64::try_from(request.id).unwrap(),
+            }),
+            "late replies still hit the stale-answer guard after the request row is gone"
+        );
+        assert_eq!(
+            restarted_cards
+                .lock()
+                .await
+                .target_of("om_resolved_unpatched_then_deleted"),
+            Some(ReplyTarget::Human {
+                thread: thread.id,
+                ask_id: u64::try_from(request.id).unwrap(),
+            })
+        );
+
+        let channel = ReplayChannel::default();
+        for patch in patches {
+            apply_human_card_terminal_patch(&db, &channel, patch).await;
+        }
+        let delivered_outbox =
+            crate::store::repo::get_human_card_terminal_outbox_for_route(&db, &pending_route)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(delivered_outbox.delivered);
+        assert!(
+            delivered_outbox.answer.is_empty(),
+            "the transient answer is scrubbed with the provider receipt"
+        );
+        crate::store::repo::queue_human_card_terminal_outbox(
+            &db,
+            request.id,
+            thread.id,
+            &pending_route,
+            crate::store::repo::HUMAN_REQUEST_RESOLVED,
+            "Yes",
+            resolved.revision,
+        )
+        .await
+        .unwrap();
+        let duplicate_outbox =
+            crate::store::repo::get_human_card_terminal_outbox_for_route(&db, &pending_route)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(duplicate_outbox.delivered);
+        assert!(
+            duplicate_outbox.answer.is_empty(),
+            "a duplicate same-revision event cannot reopen or repopulate a tombstone"
+        );
+        apply_human_card_terminal_patch(
+            &db,
+            &channel,
+            HumanCardTerminalPatch {
+                request_id: Some(request.id),
+                route: patched_route,
+                fallback: Some(outbound::human_resolved_card("Yes", IM_LANG)),
+            },
+        )
+        .await;
+        assert_eq!(
+            channel
+                .patched_cards
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            [(
+                "om_resolved_unpatched_then_deleted".to_string(),
+                outbound::human_resolved_card("Yes", IM_LANG),
+            )],
+            "a late pre-delete event cannot repaint an already tombstoned route"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewound_answered_card_survives_later_cascade_as_cancelled_route_tombstone() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "Rewind then delete",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let source = crate::store::repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            7,
+            "user",
+            "text",
+            "change course",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            source.turn_id,
+            source.id,
+            0,
+            "Keep the old direction?",
+        )
+        .await
+        .unwrap();
+        let provider = test_human_provider_scope();
+        let route = provider.route("om_rewound_then_deleted".to_string());
+        crate::store::repo::record_human_request_im_route(&db, request.id, &route)
+            .await
+            .unwrap();
+        crate::store::repo::answer_human_request(
+            &db,
+            workspace.id,
+            request.id,
+            request.revision,
+            "Keep it",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let (_, cancelled) = crate::store::repo::rewind_persist(
+            &db,
+            thread.id,
+            None,
+            source.id,
+            None,
+            Some("fork-native"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancelled, vec![request.id]);
+        crate::store::repo::delete_thread_cascade(&db, thread.id)
+            .await
+            .unwrap();
+
+        let cards = tokio::sync::Mutex::new(CardIndex::default());
+        let patches = hydrate_human_card_routes(&db, &cards, Some(&provider)).await;
+        assert_eq!(patches.len(), 1);
+        assert_eq!(
+            cards.lock().await.target_of("om_rewound_then_deleted"),
+            Some(ReplyTarget::Human {
+                thread: thread.id,
+                ask_id: u64::try_from(request.id).unwrap(),
+            })
+        );
+        let channel = ReplayChannel::default();
+        for patch in patches {
+            apply_human_card_terminal_patch(&db, &channel, patch).await;
+        }
+        apply_human_card_terminal_patch(
+            &db,
+            &channel,
+            HumanCardTerminalPatch {
+                request_id: Some(request.id),
+                route,
+                fallback: Some(outbound::human_resolved_card("Keep it", IM_LANG)),
+            },
+        )
+        .await;
+        assert_eq!(
+            channel
+                .patched_cards
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            [(
+                "om_rewound_then_deleted".to_string(),
+                outbound::human_cancelled_card(IM_LANG),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn card_send_finishing_after_thread_deletion_is_immediately_cancelled_and_tombstoned() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, K_APP_ID, "cli_test")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "ou_owner")
+            .await
+            .unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "Delete during send",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "Still there?",
+        )
+        .await
+        .unwrap();
+        let channel = std::sync::Arc::new(BlockingHumanSendChannel::new());
+        let cards = std::sync::Arc::new(tokio::sync::Mutex::new(CardIndex::default()));
+        let task_db = db.clone();
+        let task_channel = std::sync::Arc::clone(&channel);
+        let task_cards = std::sync::Arc::clone(&cards);
+        let send_task = tokio::spawn(async move {
+            consume_human_event(
+                crate::bus::state::HumanAskEvent::Asked {
+                    thread: thread.id,
+                    ask: crate::bus::state::Ask {
+                        id: u64::try_from(request.id).unwrap(),
+                        from: "lead".to_string(),
+                        text: "Still there?".to_string(),
+                        ts: 1,
+                        answered: false,
+                        kind: crate::bus::state::AskKind::Question,
+                        durable: true,
+                    },
+                },
+                &task_db,
+                task_channel.as_ref(),
+                task_cards.as_ref(),
+                IM_LANG,
+            )
+            .await;
+        });
+
+        let started = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            channel.send_started.acquire(),
+        )
+        .await
+        .expect("provider send should start")
+        .expect("send-start semaphore stays open");
+        started.forget();
+        assert_eq!(
+            crate::store::repo::cancel_open_human_requests_for_thread(&db, thread.id)
+                .await
+                .unwrap(),
+            vec![request.id]
+        );
+        crate::store::repo::delete_thread_cascade(&db, thread.id)
+            .await
+            .unwrap();
+        channel.release_send.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(10), send_task)
+            .await
+            .expect("post-delete send reconciliation should finish")
+            .expect("post-delete send task should not panic");
+
+        assert_eq!(
+            channel
+                .patched_cards
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            [(
+                "om_send_cancel_race".to_string(),
+                outbound::human_cancelled_card(IM_LANG),
+            )]
+        );
+        let route = test_human_provider_scope().route("om_send_cancel_race".to_string());
+        let outbox = crate::store::repo::get_human_card_terminal_outbox_for_route(&db, &route)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outbox.delivered);
+        assert_eq!(outbox.terminal_status, crate::store::repo::HUMAN_REQUEST_CANCELLED);
+    }
+
+    #[tokio::test]
     async fn im_concierge_thread_uses_effective_default_tool() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         crate::store::repo::set_setting(&db, "default_tool", "codex")
@@ -3098,8 +5158,6 @@ mod tests {
     #[derive(Default)]
     struct CountingChannel {
         cards: std::sync::atomic::AtomicUsize,
-        texts: std::sync::atomic::AtomicUsize,
-        text_bodies: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -3111,9 +5169,7 @@ mod tests {
         async fn patch_card(&self, _m: &str, _c: serde_json::Value) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn send_text(&self, _o: &str, text: &str) -> anyhow::Result<()> {
-            self.texts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.text_bodies.lock().unwrap().push(text.to_string());
+        async fn send_text(&self, _o: &str, _text: &str) -> anyhow::Result<()> {
             Ok(())
         }
         async fn send_chat_text(&self, _c: &str, _t: &str) -> anyhow::Result<String> {
@@ -3230,111 +5286,6 @@ mod tests {
         assert_eq!(channel.cards.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
-    /// An answerable question goes through IM's answer-card pipeline; a
-    /// display-only stall NOTICE reaches the remote human as plain TEXT instead
-    /// (never an answer card, so no dead reply prompt or wrong "cancelled" patch),
-    /// and — verified below — has no patchable message while its identity still
-    /// suppresses duplicate first-owner replay.
-    #[tokio::test]
-    async fn stall_notice_forwarded_as_text_to_im() {
-        use crate::bus::state::{Ask, HumanAskEvent};
-        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
-        let w = crate::store::repo::create_workspace(&db, "ws")
-            .await
-            .unwrap();
-        let th = crate::store::repo::create_thread(&db, w.id, "stalled task", "bugfix", "claude")
-            .await
-            .unwrap();
-        // An owner must be bound, else the handler returns before the notice check
-        // and the test would pass for the wrong reason.
-        crate::store::repo::set_setting(&db, K_ALLOW, "owner_open_id")
-            .await
-            .unwrap();
-        let ch = CountingChannel::default();
-        let cards = tokio::sync::Mutex::new(CardIndex::default());
-        let cards_sent = || ch.cards.load(std::sync::atomic::Ordering::Relaxed);
-        let texts_sent = || ch.texts.load(std::sync::atomic::Ordering::Relaxed);
-        let mk = |id: u64, answerable: bool| Ask {
-            id,
-            from: "10".to_string(),
-            text: "x".to_string(),
-            ts: 0,
-            answered: false,
-            kind: if answerable {
-                crate::bus::state::AskKind::Question
-            } else {
-                crate::bus::state::AskKind::Notice
-            },
-        };
-        // An answerable question IS forwarded as an IM answer card.
-        consume_human_event(
-            HumanAskEvent::Asked {
-                thread: th.id,
-                ask: mk(1, true),
-            },
-            &db,
-            &ch,
-            &cards,
-            IM_LANG,
-        )
-        .await;
-        assert_eq!(cards_sent(), 1, "answerable → one answer card");
-        assert_eq!(texts_sent(), 0, "answerable → not a plain-text notice");
-        // A non-answerable NOTICE still reaches IM — as plain text, not a card.
-        consume_human_event(
-            HumanAskEvent::Asked {
-                thread: th.id,
-                ask: mk(2, false),
-            },
-            &db,
-            &ch,
-            &cards,
-            IM_LANG,
-        )
-        .await;
-        assert_eq!(cards_sent(), 1, "notice must not open an answer card");
-        assert_eq!(texts_sent(), 1, "notice is delivered as plain text");
-        consume_human_event(
-            HumanAskEvent::Asked {
-                thread: th.id,
-                ask: mk(2, false),
-            },
-            &db,
-            &ch,
-            &cards,
-            IM_LANG,
-        )
-        .await;
-        assert_eq!(texts_sent(), 1, "replay must not duplicate a delivered notice");
-        // The identity is tracked for de-duplication, but there is no message to
-        // patch when the display-only notice later cancels itself.
-        assert!(
-            cards.lock().await.take_human(th.id, 2).is_none(),
-            "notice must not have a patchable CardIndex message",
-        );
-
-        let mut force_reset = mk(3, false);
-        force_reset.text = crate::lead_chat::engine::ACP_FORCE_RESET_NOTICE.to_string();
-        consume_human_event(
-            HumanAskEvent::Asked {
-                thread: th.id,
-                ask: force_reset,
-            },
-            &db,
-            &ch,
-            &cards,
-            "en",
-        )
-        .await;
-        let expected = crate::bus::notice_text::resolve(
-            crate::lead_chat::engine::ACP_FORCE_RESET_NOTICE,
-            "en",
-        )
-        .unwrap();
-        let bodies = ch.text_bodies.lock().unwrap();
-        assert!(bodies.last().is_some_and(|body| body.ends_with(expected)));
-    }
-
     #[derive(Default)]
     struct TopicChannel {
         created_topics: std::sync::Mutex<Vec<(String, String)>>,
@@ -3396,6 +5347,93 @@ mod tests {
                 .push((reply_to.to_string(), text.to_string()));
             Ok("om_reply".into())
         }
+    }
+
+    #[tokio::test]
+    async fn im_answer_after_restart_resolves_durable_question_and_reaches_direction() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let repo_ref = crate::store::repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "API decision",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let direction = crate::store::repo::create_direction(
+            &db,
+            thread.id,
+            "Backend",
+            "codex",
+            repo_ref.id,
+            "Choose API",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let request = crate::store::repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            &direction.id.to_string(),
+            direction.id,
+            9,
+            0,
+            0,
+            "REST or GraphQL?",
+        )
+        .await
+        .unwrap();
+
+        // Both registries are intentionally fresh, modeling an app restart.
+        let asks = crate::ask::AskRegistry::new();
+        let bus = crate::bus::BusRegistry::new();
+        let channel = TopicChannel::default();
+        execute(
+            inbound::Route::AnswerHuman {
+                thread: thread.id,
+                ask_id: u64::try_from(request.id).unwrap(),
+                text: "REST".to_string(),
+            },
+            &db,
+            &asks,
+            &bus,
+            &channel,
+            "ou_owner",
+            "en",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = crate::store::repo::get_human_request(&db, request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, crate::store::repo::HUMAN_REQUEST_ANSWERED);
+        assert_eq!(stored.answer, "REST");
+        assert_eq!(stored.revision, request.revision + 1);
+        let inbox = bus.inbox(thread.id, &direction.id.to_string());
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].from, crate::bus::HUMAN);
+        assert_eq!(inbox[0].text, "REST");
     }
 
     #[tokio::test]

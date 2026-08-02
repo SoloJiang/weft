@@ -1,7 +1,8 @@
 use crate::store::entities::{
-    app_setting, backup_config, code_checkpoint, direction, im_route, lead_message, plan,
-    pull_request, repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread,
-    workspace, worktree,
+    app_setting, backup_config, code_checkpoint, direction, human_card_terminal_outbox,
+    human_request, im_route, lead_hidden_delivery, lead_message, plan, pull_request,
+    repo_action_execution, repo_profile, repo_ref, session, skill_enable, skill_source, test_plan,
+    thread, workspace, worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -59,6 +60,12 @@ impl MigratorTrait for Migrator {
             Box::new(M0045PullRequest),
             Box::new(M0046DirectionUpstream),
             Box::new(M0047PullRequestThreadStatus),
+            Box::new(M0048HumanRequest),
+            Box::new(M0049HumanRequestSourceMessage),
+            Box::new(M0050HumanRequestImRoutes),
+            Box::new(M0051HumanCardTerminalOutbox),
+            Box::new(M0052RepoActionExecution),
+            Box::new(M0053LeadHiddenDelivery),
         ]
     }
 }
@@ -1804,15 +1811,9 @@ impl MigrationTrait for M0040LeadMessageConsumedAt {
     }
 }
 
-/// Composite index for the single-row `lead_message` lookups the stall sweep
-/// (`lead_chat::revive`) repeats on every pass. They all shape up as
-/// `thread_id = ? AND kind = ? [AND session_id …]`, but M0007 only ever
-/// indexed `thread_id`, so each one had to walk that thread's ENTIRE message
-/// history — which on a long-lived thread is the whole chat — to return one
-/// row. Three callers ride this: `repo::last_turn_freeze_recovery_secs` (the
-/// turn-freeze grace window, per thread AND per stalled direction) plus the
-/// older `repo::lead_native_id` / `repo::lead_status` meta reads that already
-/// ran twice per thread per sweep.
+/// Composite index for single-row `lead_message` lookups shaped as
+/// `thread_id = ? AND kind = ? [AND session_id …]`. M0007 only indexed
+/// `thread_id`, so each lookup otherwise walks an entire long-lived timeline.
 ///
 /// `(thread_id, kind, session_id, id)` serves all of them: equality on the
 /// leading columns, with `id` last so `ORDER BY id DESC LIMIT 1` reads
@@ -1999,6 +2000,48 @@ impl MigrationTrait for M0044EngineRoutingPin {
     }
 }
 
+pub struct M0045PullRequest;
+impl MigrationName for M0045PullRequest {
+    fn name(&self) -> &str {
+        "m0045_pull_request"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0045PullRequest {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut stmt = schema.create_table_from_entity(pull_request::Entity);
+        stmt.if_not_exists();
+        manager.create_table(stmt).await?;
+        // Belt-and-suspenders alongside `repo::register_pull_request`'s
+        // application-level find-then-upsert: guarantees the natural key
+        // (host_kind, host_owner, host_repo, number) can never duplicate at
+        // the DB level even under a race the app layer doesn't catch.
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_pull_request_natural_key")
+                    .table(Alias::new("pull_request"))
+                    .col(Alias::new("host_kind"))
+                    .col(Alias::new("host_owner"))
+                    .col(Alias::new("host_repo"))
+                    .col(Alias::new("number"))
+                    .unique()
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("pull_request")).to_owned())
+            .await?;
+        Ok(())
+    }
+}
+
 /// Issue #110 T1: the tracked-PR/MR entity — a real DB row (repo, task,
 /// host-normalized state) so "what is this PR/MR waiting on" is a store fact
 /// the background monitor (`crate::host::monitor`) can read and update, not
@@ -2113,33 +2156,247 @@ impl MigrationTrait for M0047PullRequestThreadStatus {
     }
 }
 
-pub struct M0045PullRequest;
-impl MigrationName for M0045PullRequest {
+/// Durable free-text human questions. Permission prompts deliberately stay out
+/// of this table because their tool-call transport cannot survive restart.
+pub struct M0048HumanRequest;
+impl MigrationName for M0048HumanRequest {
     fn name(&self) -> &str {
-        "m0045_pull_request"
+        "m0048_human_request"
     }
 }
+
 #[async_trait::async_trait]
-impl MigrationTrait for M0045PullRequest {
+impl MigrationTrait for M0048HumanRequest {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let schema = Schema::new(manager.get_database_backend());
-        let mut stmt = schema.create_table_from_entity(pull_request::Entity);
-        stmt.if_not_exists();
-        manager.create_table(stmt).await?;
-        // Belt-and-suspenders alongside `repo::register_pull_request`'s
-        // application-level find-then-upsert: guarantees the natural key
-        // (host_kind, host_owner, host_repo, number) can never duplicate at
-        // the DB level even under a race the app layer doesn't catch.
+        let mut statement = schema.create_table_from_entity(human_request::Entity);
+        statement.if_not_exists();
+        manager.create_table(statement).await?;
         manager
             .create_index(
                 Index::create()
                     .if_not_exists()
-                    .name("idx_pull_request_natural_key")
-                    .table(Alias::new("pull_request"))
-                    .col(Alias::new("host_kind"))
-                    .col(Alias::new("host_owner"))
-                    .col(Alias::new("host_repo"))
-                    .col(Alias::new("number"))
+                    .name("idx_human_request_workspace_status")
+                    .table(Alias::new("human_request"))
+                    .col(Alias::new("workspace_id"))
+                    .col(Alias::new("status"))
+                    .col(Alias::new("created_at"))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_human_request_scope_status")
+                    .table(Alias::new("human_request"))
+                    .col(Alias::new("thread_id"))
+                    .col(Alias::new("direction_scope"))
+                    .col(Alias::new("status"))
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("human_request")).to_owned())
+            .await
+    }
+}
+
+/// Add an exact lead_message anchor for rewind-safe durable-question
+/// cancellation. New databases already receive the column from M0048's entity
+/// schema; duplicate-column tolerance keeps reruns and partially upgraded DBs
+/// safe.
+pub struct M0049HumanRequestSourceMessage;
+impl MigrationName for M0049HumanRequestSourceMessage {
+    fn name(&self) -> &str {
+        "m0049_human_request_source_message"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0049HumanRequestSourceMessage {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in ["source_message_id", "source_session_id"] {
+            let result = manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new("human_request"))
+                        .add_column(
+                            ColumnDef::new(Alias::new(column))
+                                .integer()
+                                .not_null()
+                                .default(0),
+                        )
+                        .to_owned(),
+                )
+                .await;
+            match result {
+                Ok(()) => {}
+                Err(error)
+                    if error.to_string().to_lowercase().contains("duplicate column") => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in ["source_session_id", "source_message_id"] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new("human_request"))
+                        .drop_column(Alias::new(column))
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Persist every provider message id used for a durable human-question card,
+/// so replies to pre-restart and replayed cards remain tied to the request.
+pub struct M0050HumanRequestImRoutes;
+impl MigrationName for M0050HumanRequestImRoutes {
+    fn name(&self) -> &str {
+        "m0050_human_request_im_routes"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0050HumanRequestImRoutes {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let result = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("human_request"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("im_routes"))
+                            .text()
+                            .not_null()
+                            .default("[]"),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("human_request"))
+                    .drop_column(Alias::new("im_routes"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Durable provider PATCH work must not disappear with the source question.
+/// There is intentionally no FK: thread/workspace deletion removes the source
+/// content while a pending row retains only the answer needed for its final
+/// provider PATCH; its delivery receipt scrubs that answer and leaves an
+/// opaque route tombstone.
+pub struct M0051HumanCardTerminalOutbox;
+impl MigrationName for M0051HumanCardTerminalOutbox {
+    fn name(&self) -> &str {
+        "m0051_human_card_terminal_outbox"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0051HumanCardTerminalOutbox {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut statement = schema.create_table_from_entity(human_card_terminal_outbox::Entity);
+        statement.if_not_exists();
+        manager.create_table(statement).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_human_card_terminal_route")
+                    .table(Alias::new("human_card_terminal_outbox"))
+                    .col(Alias::new("channel"))
+                    .col(Alias::new("account"))
+                    .col(Alias::new("owner"))
+                    .col(Alias::new("message_id"))
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_human_card_terminal_pending")
+                    .table(Alias::new("human_card_terminal_outbox"))
+                    .col(Alias::new("channel"))
+                    .col(Alias::new("account"))
+                    .col(Alias::new("owner"))
+                    .col(Alias::new("delivered"))
+                    .col(Alias::new("id"))
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("human_card_terminal_outbox"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// A repository action card owns exactly one durable execution. The unique
+/// message index is the cross-process admission gate; the token index makes
+/// filesystem markers unambiguous during recovery.
+pub struct M0052RepoActionExecution;
+impl MigrationName for M0052RepoActionExecution {
+    fn name(&self) -> &str {
+        "m0052_repo_action_execution"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0052RepoActionExecution {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut statement = schema.create_table_from_entity(repo_action_execution::Entity);
+        statement.if_not_exists();
+        manager.create_table(statement).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_repo_action_execution_message")
+                    .table(Alias::new("repo_action_execution"))
+                    .col(Alias::new("message_id"))
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_repo_action_execution_token")
+                    .table(Alias::new("repo_action_execution"))
+                    .col(Alias::new("execution_token"))
                     .unique()
                     .to_owned(),
             )
@@ -2148,17 +2405,74 @@ impl MigrationTrait for M0045PullRequest {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .drop_table(Table::drop().table(Alias::new("pull_request")).to_owned())
-            .await?;
-        Ok(())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("repo_action_execution"))
+                    .to_owned(),
+            )
+            .await
     }
 }
 
+/// Durable hidden lead input. Source rows deliberately remain unreferenced so
+/// a stopped/crashed engine can replay a plan decision or repo feedback after
+/// the originating card/repository has been cleaned up.
+pub struct M0053LeadHiddenDelivery;
+impl MigrationName for M0053LeadHiddenDelivery {
+    fn name(&self) -> &str {
+        "m0053_lead_hidden_delivery"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0053LeadHiddenDelivery {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut statement = schema.create_table_from_entity(lead_hidden_delivery::Entity);
+        statement.if_not_exists();
+        manager.create_table(statement).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_lead_hidden_delivery_dedupe")
+                    .table(Alias::new("lead_hidden_delivery"))
+                    .col(Alias::new("dedupe_key"))
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_lead_hidden_delivery_pending")
+                    .table(Alias::new("lead_hidden_delivery"))
+                    .col(Alias::new("thread_id"))
+                    .col(Alias::new("state"))
+                    .col(Alias::new("id"))
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("lead_hidden_delivery"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::{
         gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest,
-        M0046DirectionUpstream, M0047PullRequestThreadStatus,
+        M0046DirectionUpstream, M0047PullRequestThreadStatus, M0048HumanRequest,
+        M0049HumanRequestSourceMessage, M0050HumanRequestImRoutes,
+        M0051HumanCardTerminalOutbox, M0052RepoActionExecution, M0053LeadHiddenDelivery,
     };
 
     #[test]
@@ -2317,12 +2631,12 @@ mod tests {
         assert_eq!(m.consumed_at, None, "consumed_at must exist and default to NULL");
     }
 
-    /// M0041: the composite index exists AND SQLite actually plans the stall
+    /// M0041: the composite index exists AND SQLite actually plans the
     /// sweep's lookups through it. Asserting the query PLAN, not just
     /// `sqlite_master`, is the point: an index that exists but doesn't match
     /// the query's column order would still leave the sweep doing a full
     /// per-thread scan, and only the plan can tell those apart. Covers both
-    /// shapes — the freeze marker (`kind` + `session_id`) and the older
+    /// shapes — session-scoped card lookups (`kind` + `session_id`) and the
     /// `lead_native_id`/`lead_status` meta reads that use the leading prefix.
     #[tokio::test]
     async fn m0041_thread_kind_index_backs_the_sweep_lookups() {
@@ -2346,10 +2660,10 @@ mod tests {
             }
         };
 
-        // The freeze-marker lookup (repo::last_turn_freeze_recovery_secs),
-        // worker form: all three equality columns plus the ORDER BY.
+        // A session-scoped timeline-kind lookup: all three equality columns
+        // plus the ORDER BY.
         let marker = plan_for(
-            "SELECT * FROM lead_message WHERE thread_id = 1 AND kind = 'turn_freeze_recovered' \
+            "SELECT * FROM lead_message WHERE thread_id = 1 AND kind = 'action_card' \
              AND session_id = 2 ORDER BY id DESC LIMIT 1",
         )
         .await;
@@ -2364,9 +2678,9 @@ mod tests {
             "ORDER BY id DESC should read off the index, got: {marker}"
         );
 
-        // The lead form keys `session_id IS NULL` instead.
+        // The lead-scoped form keys `session_id IS NULL` instead.
         let lead_marker = plan_for(
-            "SELECT * FROM lead_message WHERE thread_id = 1 AND kind = 'turn_freeze_recovered' \
+            "SELECT * FROM lead_message WHERE thread_id = 1 AND kind = 'action_card' \
              AND session_id IS NULL ORDER BY id DESC LIMIT 1",
         )
         .await;
@@ -2595,6 +2909,269 @@ mod tests {
         assert_eq!(value, 1, "a rerun must not clobber an already-recorded upstream edge");
     }
 
+    #[tokio::test]
+    async fn m0048_human_request_table_indexes_and_defaults_survive_rerun() {
+        use crate::store::repo;
+        use crate::store::Db;
+        use sea_orm::{ConnectionTrait, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "Issue", "feature", "codex")
+            .await
+            .unwrap();
+        let request = repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            7,
+            0,
+            0,
+            "Ship it?",
+        )
+        .await
+        .unwrap();
+        assert_eq!(request.status, "open");
+        assert_eq!(request.revision, 1);
+        assert!(request.answer.is_empty());
+
+        // Migrations are expected to be safely repeatable in hand-repaired or
+        // partially-upgraded databases.
+        M0048HumanRequest
+            .up(&SchemaManager::new(&db.0))
+            .await
+            .unwrap();
+        M0049HumanRequestSourceMessage
+            .up(&SchemaManager::new(&db.0))
+            .await
+            .unwrap();
+        M0050HumanRequestImRoutes
+            .up(&SchemaManager::new(&db.0))
+            .await
+            .unwrap();
+
+        let indexes = db
+            .0
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'human_request'"
+                    .to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(indexes.contains("idx_human_request_workspace_status"));
+        assert!(indexes.contains("idx_human_request_scope_status"));
+        let columns = db
+            .0
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "PRAGMA table_info(human_request)".to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(columns.contains("source_message_id"));
+        assert!(columns.contains("source_session_id"));
+        assert!(columns.contains("im_routes"));
+
+        let restored = repo::get_human_request(&db, request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.status, "open");
+        assert_eq!(restored.source_message_id, 0);
+        assert_eq!(restored.source_session_id, 0);
+        assert_eq!(restored.im_routes, "[]");
+    }
+
+    #[tokio::test]
+    async fn m0051_terminal_outbox_is_rerunnable_and_has_no_source_foreign_key() {
+        use crate::store::repo::{self, HumanRequestImRoute, HUMAN_REQUEST_CANCELLED};
+        use crate::store::Db;
+        use sea_orm::{ConnectionTrait, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        M0051HumanCardTerminalOutbox
+            .up(&SchemaManager::new(&db.0))
+            .await
+            .unwrap();
+        let route = HumanRequestImRoute {
+            channel: "feishu".to_string(),
+            account: "cli_test".to_string(),
+            owner: "ou_owner".to_string(),
+            message_id: "om_orphan_safe".to_string(),
+            terminal_revision: 0,
+        };
+        repo::queue_human_card_terminal_outbox(
+            &db,
+            999,
+            42,
+            &route,
+            HUMAN_REQUEST_CANCELLED,
+            "",
+            2,
+        )
+        .await
+        .unwrap();
+
+        let rows = repo::list_pending_human_card_terminal_outbox(
+            &db,
+            &route.channel,
+            &route.account,
+            &route.owner,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_id, 999);
+        assert_eq!(rows[0].thread_id, 42);
+        let indexes = db
+            .0
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND \
+                 tbl_name = 'human_card_terminal_outbox'"
+                    .to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(indexes.contains("idx_human_card_terminal_route"));
+        assert!(indexes.contains("idx_human_card_terminal_pending"));
+    }
+
+    #[tokio::test]
+    async fn m0052_repo_action_execution_is_rerunnable_with_unique_identity_indexes() {
+        use crate::store::Db;
+        use sea_orm::{ConnectionTrait, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let manager = SchemaManager::new(&db.0);
+        M0052RepoActionExecution.up(&manager).await.unwrap();
+        M0052RepoActionExecution.up(&manager).await.unwrap();
+
+        let columns =
+            db.0.query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "PRAGMA table_info(repo_action_execution)".to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        for column in [
+            "workspace_id",
+            "thread_id",
+            "message_id",
+            "action_id",
+            "action_kind",
+            "invocation_fingerprint",
+            "execution_token",
+            "status",
+            "target_path",
+            "staging_path",
+            "repo_id",
+            "repo_name",
+        ] {
+            assert!(columns.contains(column), "missing {column}");
+        }
+        let indexes =
+            db.0.query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND \
+                 tbl_name = 'repo_action_execution'"
+                    .to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(indexes.contains("idx_repo_action_execution_message"));
+        assert!(indexes.contains("idx_repo_action_execution_token"));
+    }
+
+    #[tokio::test]
+    async fn m0053_hidden_delivery_is_rerunnable_and_deduped() {
+        use crate::store::repo;
+        use crate::store::Db;
+        use sea_orm::{ConnectionTrait, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let manager = SchemaManager::new(&db.0);
+        M0053LeadHiddenDelivery.up(&manager).await.unwrap();
+        M0053LeadHiddenDelivery.up(&manager).await.unwrap();
+        let workspace = repo::create_workspace(&db, "m0053").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let first = repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "plan_decision",
+            7,
+            "plan_decision:7",
+            r#"{"tool":"plan_decision","message_id":7}"#,
+        )
+        .await
+        .unwrap();
+        let second = repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "plan_decision",
+            7,
+            "plan_decision:7",
+            r#"{"tool":"plan_decision","message_id":7}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            repo::list_pending_lead_hidden_deliveries(&db, Some(thread.id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "test_cases_updated",
+            8,
+            "test_cases_updated:8",
+            r#"{"tool":"test_cases_updated"}"#,
+        )
+        .await
+        .is_err());
+        let columns = db
+            .0
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "PRAGMA table_info(lead_hidden_delivery)".to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(columns.contains("dedupe_key"));
+        assert!(columns.contains("state"));
+    }
+
     /// M0047 (issue #110): the same upgrade-path coverage M0046 gets, for the
     /// review-thread column — and the assertion that matters most is about
     /// what an EXISTING row gets, not that the column appeared.
@@ -2678,14 +3255,84 @@ mod tests {
     /// M0037: code_checkpoint exists after migration and round-trips a row.
     #[tokio::test]
     async fn m0037_code_checkpoint_table_created() {
-        use crate::store::repo::{code_checkpoint_for, insert_code_checkpoint};
+        use crate::store::repo::{
+            code_checkpoint_for, create_direction, create_session, create_thread,
+            insert_code_checkpoint, insert_lead_message, record_worktree,
+        };
         use crate::store::Db;
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        let c = insert_code_checkpoint(&db, 1, 7, 100, 1, "shadow-sha", "head-sha", "[\"gen\"]", "idx-1")
+        let workspace = crate::store::repo::create_workspace(&db, "m0037").await.unwrap();
+        let repo = crate::store::repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/m0037-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
             .await
             .unwrap();
-        let found = code_checkpoint_for(&db, 1, 100).await.unwrap().unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "task",
+            "codex",
+            repo.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/m0037-session")
+            .await
+            .unwrap();
+        let worktree = record_worktree(
+            &db,
+            repo.id,
+            direction.id,
+            "m0037",
+            "/tmp/m0037-worktree",
+            true,
+            true,
+            "",
+        )
+        .await
+        .unwrap();
+        let message = insert_lead_message(
+            &db,
+            thread.id,
+            Some(session.id),
+            1,
+            "user",
+            "text",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let c = insert_code_checkpoint(
+            &db,
+            worktree.id,
+            session.id,
+            message.id,
+            message.turn_id,
+            "shadow-sha",
+            "head-sha",
+            "[\"gen\"]",
+            "idx-1",
+        )
+            .await
+            .unwrap();
+        let found = code_checkpoint_for(&db, worktree.id, message.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.id, c.id);
         assert_eq!(found.shadow_sha, "shadow-sha");
         assert_eq!(found.head_sha, "head-sha");

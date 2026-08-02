@@ -360,9 +360,15 @@ impl DingTalkChannel {
             .prompt_recipients
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(message_id);
+            .get(message_id)
+            .cloned();
         if let Some(recipient) = recipient {
             self.send_private_message(&recipient, text).await?;
+            self.inner
+                .prompt_recipients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(message_id);
         }
         Ok(())
     }
@@ -459,6 +465,45 @@ impl super::Channel for DingTalkChannel {
             super::outbound::dingtalk_human_cancelled_text(&copy),
         )
         .await
+    }
+
+    async fn resolve_human_question_card_for_route(
+        &self,
+        route: &crate::store::repo::HumanRequestImRoute,
+        answer: &str,
+        _lang: &str,
+    ) -> anyhow::Result<()> {
+        let copy = self.copy();
+        self.send_private_message(
+            &route.owner,
+            &super::outbound::dingtalk_human_resolved_text(answer, &copy),
+        )
+        .await?;
+        self.inner
+            .prompt_recipients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&route.message_id);
+        Ok(())
+    }
+
+    async fn cancel_human_question_card_for_route(
+        &self,
+        route: &crate::store::repo::HumanRequestImRoute,
+        _lang: &str,
+    ) -> anyhow::Result<()> {
+        let copy = self.copy();
+        self.send_private_message(
+            &route.owner,
+            super::outbound::dingtalk_human_cancelled_text(&copy),
+        )
+        .await?;
+        self.inner
+            .prompt_recipients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&route.message_id);
+        Ok(())
     }
 
     fn issue_reply_text(&self, _lang: &str, text: &str) -> String {

@@ -8,7 +8,7 @@ import { Button } from "./ui/Button";
 /**
  * Board marker for an issue whose dispatch approval propagated issue #103's
  * read-only auto-allow to every worker under it (`confirmProposal` /
- * `approveWriteTrigger` on the backend). Sibling to `InheritedAccessChip`, but
+ * scope confirmation on the backend). Sibling to `InheritedAccessChip`, but
  * a DIFFERENT grant with a DIFFERENT lifetime: this one is in-memory only —
  * it never survives a restart (contrast Full/Always) — and it only ever
  * covers a `read_only`-tier ask, never Write/NetworkOrCredential/Unknown. The

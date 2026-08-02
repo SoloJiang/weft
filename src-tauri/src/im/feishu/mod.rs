@@ -75,12 +75,13 @@ impl FeishuChannel {
         receive_id: &str,
         msg_type: &str,
         content: String,
+        uuid: Option<String>,
     ) -> anyhow::Result<String> {
         let body = CreateMessageBody {
             receive_id: receive_id.to_string(),
             msg_type: msg_type.to_string(),
             content,
-            uuid: None,
+            uuid,
         };
         let resp = CreateMessageRequest::new(self.config.clone())
             .receive_id_type(receive_id_type)
@@ -99,6 +100,23 @@ impl super::Channel for FeishuChannel {
             open_id,
             "interactive",
             card.to_string(),
+            None,
+        )
+        .await
+    }
+
+    async fn send_card_idempotent(
+        &self,
+        open_id: &str,
+        card: serde_json::Value,
+        idempotency_key: &str,
+    ) -> anyhow::Result<String> {
+        self.create(
+            ReceiveIdType::OpenId,
+            open_id,
+            "interactive",
+            card.to_string(),
+            Some(idempotency_key.to_string()),
         )
         .await
     }
@@ -116,14 +134,14 @@ impl super::Channel for FeishuChannel {
 
     async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()> {
         let content = serde_json::json!({ "text": text }).to_string();
-        self.create(ReceiveIdType::OpenId, open_id, "text", content)
+        self.create(ReceiveIdType::OpenId, open_id, "text", content, None)
             .await?;
         Ok(())
     }
 
     async fn send_chat_text(&self, chat_id: &str, text: &str) -> anyhow::Result<String> {
         let content = serde_json::json!({ "text": text }).to_string();
-        self.create(ReceiveIdType::ChatId, chat_id, "text", content)
+        self.create(ReceiveIdType::ChatId, chat_id, "text", content, None)
             .await
     }
 

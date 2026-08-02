@@ -74,7 +74,6 @@ export const zh = {
     threadsCount: "{{count}} 个 issue",
     noScope: "尚未划定范围",
     live: "{{count}} 个运行中",
-    stalled: "{{count}} 个停滞",
     failing: "{{count}} 个失败",
     writtenByAnother: "其他 issue 也在写这个仓库",
     emptyTitleHas: "还没有 issue",
@@ -304,8 +303,6 @@ export const zh = {
     needsBody_other: "{{count}} 项新增待办",
     reviewTitle: "可以 review 了",
     reviewBody_other: "{{count}} 个任务进入 review",
-    stalledTitle: "Agent 停滞",
-    stalledBody_other: "{{count}} 个会话长时间无进展",
     quotaTitle: "进程额度已满",
     quotaBody_other: "已暂停新会话和新回合",
   },
@@ -324,15 +321,14 @@ export const zh = {
   },
   needs: {
     acpPermissionRequired: "需要授权",
-    // Authoritative copy. `scripts/gen-notice-copy.mjs` generates the
-    // backend-readable mirror the IM bridge renders from — edit here, run the
-    // script; `noticeCopy.test.ts` fails if the mirror drifts.
-    acpForceResetNotice:
-      "⏹️ 停止后 agent 未响应取消请求，已强制中断并重置为全新会话继续。历史对话仍保留在时间线里，但新会话不带原生上下文；如果后续回复像「忘记」了之前的内容，请重新提示一下关键信息。",
     title: "待你处理",
     subtitle: "只有你能回答的审批与提问",
     wantsPermission: "请求权限",
     question: "需要回答",
+    planApproval: "批准计划",
+    scopeApproval: "批准范围",
+    repoAction: "仓库操作",
+    prTrackingRetry: "PR 跟踪需要重试",
     openQueue: "查看队列",
     more: "更多",
     always: "始终允许",
@@ -347,8 +343,12 @@ export const zh = {
     emptyBody:
       "当 agent 遇到只有你能拍板的决定时，会在这里发问。你回答一次，答复会直接回到它的收件箱，你无需去翻找会话。",
     answerPlaceholder: "回复 {{name}}…",
-    selfClearing: "无需回复 —— 问题解决后会自动消失。",
     openDirection: "打开这个任务",
+    approvePlan: "批准计划",
+    reviewScope: "审核范围",
+    reviewRepoActions: "审核仓库操作",
+    openPullRequest: "打开 Pull Request",
+    pullRequestNumber: "PR #{{number}}",
     wantsToWrite: "想修改",
     approveRun: "批准并运行",
     approveRunTitle: "创建 worktree 并拉起 worker",
@@ -363,12 +363,10 @@ export const zh = {
     riskUnknown: "风险未知",
     riskUnknownTitle: "无法判定风险，批准前请仔细查看参数",
     detailTruncated: "……已截断 {{n}} 个字符",
-    actionRequired: "需要你处理 —— 不会自动消失。",
     retryTracking: "重试",
-    retryTrackingTitle: "重置失败计数，以及暂停中的自动合并重试，让 Weft 重新尝试",
     retryTrackingStarted: "已请求重试，Weft 会尽快重新检查。",
-    retryTrackingNothingToRetry: "没有可重试的项 —— 可能已经自行解决了。",
     retryTrackingFailed: "重试失败，请稍后再试。",
+    answerFailed: "回答发送失败，草稿已保留，请重试。",
   },
   tool: {
     input: "输入",
@@ -769,7 +767,6 @@ export const zh = {
     notifyDeniedUnavailable: "系统已阻止通知。",
     notifyCat_needs: "待你处理",
     notifyCat_review: "可以 review 了",
-    notifyCat_stalled: "会话停滞",
     notifyCat_quota: "进程额度已满",
     notifyQuietHours: "免打扰时段",
     notifyQuietHoursHint: "此时段内不弹系统通知；Dock 角标仍会更新。",
@@ -811,8 +808,6 @@ export const zh = {
     issueBudget: "Issue 预算",
     issueBudgetHint: "用时间边界约束单条 issue 的自动推进。",
     issueBudgetValue: "空闲 {{idle}} 分钟 · 总时长 {{wall}} 分钟",
-    loopDetection: "重复失败检测",
-    loopDetectionHint: "同一失败反复出现时停止自动重试，并把问题交给你处理。",
     reviewGroup: "Review",
     keepAwakeTitle: "运行时防止休眠",
     keepAwakeHint: "有会话运行时阻止系统进入空闲休眠，屏幕仍可正常熄灭。合盖或电池策略仍可能休眠。",
@@ -829,7 +824,7 @@ export const zh = {
     autoMergeGroup: "自动合并",
     autoMergeTitle: "达标后自动合并",
     autoMergeHint:
-      "当被跟踪的 PR/MR 达到本仓库「truly mergeable」的标准（CI 真正跑绿——不是没配置——、GitHub 自己的 review decision 通过、所有 review 讨论线程都已解决、无冲突），且经过一次新鲜、未失联的复查确认这一状态仍然成立，Weft 会自动 squash 合并——不会再逐条询问你。默认关闭：这是一个不可撤销的动作（合并代码），且没有人确认这一次具体的合并。开启后，第一次检查就可能立刻、静默合并所有已经达标的被跟踪 PR/MR，不只是之后才达标的那些。每次尝试无论成功失败，都会在 PR 的时间线留下标记。",
+      "当被跟踪的 PR/MR 达到本仓库「truly mergeable」的标准（CI 真正跑绿——不是没配置——、GitHub 自己的 review decision 通过、所有 review 讨论线程都已解决、无冲突），且经过一次新鲜复查确认这一状态仍然成立，Weft 会自动 squash 合并——不会再逐条询问你。默认关闭：这是一个不可撤销的动作（合并代码），且没有人确认这一次具体的合并。开启后，第一次检查就可能立刻、静默合并所有已经达标的被跟踪 PR/MR，不只是之后才达标的那些。每次尝试无论成功失败，都会在 PR 的时间线留下标记。",
     autoMergeDisclosure:
       "只对 Weft 已经在跟踪（通过 register_pr）、且宿主支持合并的 PR/MR 生效（目前仅 GitHub）。状态过期或探测正在失败的行会被跳过，不会用旧快照去合并。review 线程会被完整翻页读取，只要还有一条未解决就不会合并；如果线程数没能完整读到，一律按「未解决」处理，绝不当成已全部解决。仍然不检查的是某个仓库专属的机器人批准约定（例如某个 review 机器人的 👍）——这因仓库而异，也没有跨宿主的中立信号可读。如果你的仓库依赖它，请开启 GitHub 自己的分支保护（设置必需的 reviewer），这样条件不满足时合并会在服务端被直接拒绝。",
     autoMergeConfirm:
@@ -850,12 +845,6 @@ export const zh = {
     mergeGate: "合并受保护分支",
     deployGate: "生产部署",
     moneyGate: "高成本动作",
-    guardrailsTitle: "失控保护",
-    guardrailsDesc:
-      "强制停止运行过久或长时间无输出的 agent——自动化的安全网。正在等你回应的会话不算空闲。",
-    idleCap: "空闲上限（分钟）",
-    wallCap: "运行上限（分钟）",
-    minutesZeroOff: "0 = 关闭",
     im: "IM",
     imProvider: "IM 桥",
     imProviderFeishu: "飞书 / Lark",
@@ -1039,7 +1028,6 @@ export const zh = {
   },
   status: {
     running: "运行中",
-    stalled: "停滞",
     idle: "空闲",
     exited: "已退出",
   },
@@ -1141,7 +1129,9 @@ export const zh = {
     repoUrlPlaceholder: "https://github.com/...",
     addedToast: "已添加仓库 {{name}}",
     failedToast: "失败：{{message}}",
+    staleCard: "这条仓库操作已失效",
     noWorkspaceToast: "无法准备工作区",
+    completedWithoutRepository: "仓库操作已完成，但没有返回仓库信息。",
   },
   slashLocal: {
     testCases: "推导测试用例",

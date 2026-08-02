@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The sentinel "direction" id for the human operator. Agents address the human
@@ -63,49 +63,18 @@ pub struct Msg {
     pub text: String,
     pub ts: u64,
     pub kind: String, // "message" | "interface" | "ask"
+    /// Durable human_request identity. The asking agent acknowledges these
+    /// messages explicitly with `bus_ack` after incorporating the answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
 }
 
-/// What an `Ask` represents and how the Needs-you card should render it — ONE
-/// discriminant instead of the `answerable: bool` this replaces, now that a
-/// display-only NOTICE (`answerable == false`, in the old shape) itself splits
-/// in two: most notices (the stall hint, the stopped-worker hint, an ordinary
-/// PR/MR readiness or probe-error update) are retracted automatically by a
-/// background process once the condition they describe changes, but the ONE
-/// PR/MR "gave up tracking" notice (`host::judge::give_up_text`) is NOT — the
-/// row backing it drops out of the monitor's sweep entirely (see
-/// `host::monitor`'s `MAX_CONSECUTIVE_PROBE_FAILURES` doc), so nothing will
-/// ever re-check and clear it without an explicit external re-trigger
-/// (`register_pr`). Rendering the same generic "clears itself automatically"
-/// footer under THAT notice directly contradicts its own body text — exactly
-/// the bug this discriminant exists to let the frontend avoid (see
-/// `NeedsRows.tsx`'s `AskRow`). Three states driving the same rendering
-/// decision belong in one enum, not a second bool bolted onto `answerable`
-/// (CLAUDE.md's discriminated-state rule).
+/// Bus asks are concrete, answerable human questions. Informational notices
+/// belong in timeline/status telemetry and never enter this channel.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AskKind {
-    /// A real question awaiting a human answer — the only kind `answer_ask`
-    /// accepts and the only kind the UI renders an answer box for.
     Question,
-    /// A display-only NOTICE a background process retracts on its own once
-    /// the condition it describes changes (the stall hint, the stopped-worker
-    /// hint, an ordinary PR/MR update). Renders the "clears itself
-    /// automatically" footer.
-    Notice,
-    /// A display-only NOTICE that will NOT be retracted by any background
-    /// process — only an explicit external action (named in the notice's own
-    /// text) makes tracking resume, at which point a fresh notice (or none)
-    /// eventually replaces this one. Must NOT render the "clears itself
-    /// automatically" footer, which would contradict this notice's own text.
-    NoticeActionRequired,
-}
-
-impl AskKind {
-    /// Whether `answer_ask` may accept a reply for this kind — true only for
-    /// [`AskKind::Question`]; both notice kinds are display-only.
-    pub fn is_answerable(self) -> bool {
-        matches!(self, AskKind::Question)
-    }
 }
 
 /// A question an agent direction has put to the human, awaiting an answer.
@@ -117,9 +86,13 @@ pub struct Ask {
     pub text: String,
     pub ts: u64,
     pub answered: bool,
-    /// See [`AskKind`]. Determines both `answer_ask`'s eligibility check and
-    /// the Needs-you card's rendering.
+    /// See [`AskKind`]. The single variant makes informational notices
+    /// unrepresentable in this actionable channel.
     pub kind: AskKind,
+    /// True only for an ask backed by human_request. Internal routing uses this
+    /// to attach a durable delivery id without changing the public ask shape.
+    #[serde(skip)]
+    pub durable: bool,
 }
 
 #[derive(Default)]
@@ -129,12 +102,37 @@ struct ThreadBus {
     state: serde_json::Value,           // shared thread_state blob (object)
     members: HashSet<String>,           // dirs that have connected
     asks: Vec<Ask>,                     // questions awaiting a human answer
+    /// Irreversible process-local tombstone installed once thread deletion
+    /// starts. Late answer/post/restore work must not recreate a deleted bus.
+    closed: bool,
+    /// Reversible deletion admission fence. Existing state is retained until
+    /// the DB cascade commits; a failure can reopen it without losing messages.
+    closing: bool,
+}
+
+impl ThreadBus {
+    /// Reads remain visible while a deletion transaction is in flight. The
+    /// reversible `closing` fence only blocks new process-local writes; the
+    /// irreversible `closed` tombstone hides all state after commit.
+    fn read_unavailable(&self) -> bool {
+        self.closed
+    }
+
+    fn write_unavailable(&self) -> bool {
+        self.closed || self.closing
+    }
 }
 
 /// Cloneable handle to all threads' buses.
 #[derive(Default, Clone)]
 pub struct BusRegistry {
     inner: Arc<Mutex<HashMap<i32, ThreadBus>>>,
+    /// Serializes durable human-request lifecycle transitions that cross the
+    /// SQLite/process-local boundary. Answer and delete must share this gate:
+    /// otherwise an answer can commit in SQLite while a concurrent delete has
+    /// fenced delivery, then the delete can fail and reopen a still-live bus
+    /// whose ask disagrees with the durable row.
+    lifecycle_gates: Arc<Mutex<HashMap<i32, Weak<tokio::sync::Mutex<()>>>>>,
     wake: Arc<Mutex<Option<Sender<Wake>>>>,
     next_ask_id: Arc<AtomicU64>,
     ask_notify: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<HumanAskEvent>>>>,
@@ -153,6 +151,22 @@ fn now() -> u64 {
 impl BusRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Per-thread async gate for operations that must linearize a durable DB
+    /// transition with its in-memory bus effect. Callers hold the returned
+    /// mutex only for the affected thread; unrelated issues remain concurrent.
+    pub fn thread_lifecycle_gate(&self, thread: i32) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self
+            .lifecycle_gates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(gate) = gates.get(&thread).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(thread, Arc::downgrade(&gate));
+        gate
     }
 
     /// Install the channel the coordinator listens on (called once at startup).
@@ -186,14 +200,24 @@ impl BusRegistry {
         let mut snapshot = inner
             .iter()
             .flat_map(|(thread, bus)| {
+                if bus.read_unavailable() {
+                    return Vec::new().into_iter();
+                }
                 bus.asks
                     .iter()
                     .filter(|ask| !ask.answered)
                     .cloned()
                     .map(|ask| (*thread, ask))
+                    .collect::<Vec<_>>()
+                    .into_iter()
             })
             .collect::<Vec<_>>();
-        snapshot.sort_by_key(|(thread, ask)| (ask.ts, *thread, ask.id));
+        snapshot.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.ts.cmp(&right.1.ts))
+                .then_with(|| left.1.id.cmp(&right.1.id))
+        });
         snapshot
     }
 
@@ -237,6 +261,9 @@ impl BusRegistry {
     pub fn join(&self, thread: i32, dir: &str) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
+        if bus.write_unavailable() {
+            return;
+        }
         bus.members.insert(dir.to_string());
         if !bus.state.is_object() {
             bus.state = serde_json::json!({});
@@ -245,20 +272,52 @@ impl BusRegistry {
 
     /// Post a message from `from` to a specific `to` direction.
     pub fn post(&self, thread: i32, from: &str, to: &str, text: &str, kind: &str) {
+        let _ = self.post_with_request_id(thread, from, to, text, kind, None, true);
+    }
+
+    fn post_with_request_id(
+        &self,
+        thread: i32,
+        from: &str,
+        to: &str,
+        text: &str,
+        kind: &str,
+        request_id: Option<u64>,
+        wake: bool,
+    ) -> bool {
         let m = Msg {
             from: from.to_string(),
             to: to.to_string(),
             text: text.to_string(),
             ts: now(),
             kind: kind.to_string(),
+            request_id,
         };
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
+            if bus.write_unavailable() {
+                return false;
+            }
             bus.log.push(m.clone());
             bus.inboxes.entry(to.to_string()).or_default().push(m);
         }
-        self.emit_wake(thread, to);
+        if wake {
+            self.emit_wake(thread, to);
+        }
+        true
+    }
+
+    fn post_durable_answer(&self, thread: i32, request_id: u64, to: &str, text: &str) -> bool {
+        self.post_with_request_id(
+            thread,
+            HUMAN,
+            to,
+            text,
+            "message",
+            Some(request_id),
+            true,
+        )
     }
 
     /// Broadcast from `from` to every other member of the thread.
@@ -269,10 +328,14 @@ impl BusRegistry {
             text: text.to_string(),
             ts: now(),
             kind: kind.to_string(),
+            request_id: None,
         };
         let targets: Vec<String> = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
+            if bus.write_unavailable() {
+                return;
+            }
             let mut targets: Vec<String> = bus
                 .members
                 .iter()
@@ -302,12 +365,65 @@ impl BusRegistry {
     pub fn inbox(&self, thread: i32, me: &str) -> Vec<Msg> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
+        // Inbox reads are destructive (they acknowledge process-local
+        // delivery by removing unread messages), so treat them as writes at
+        // the closing fence. A failed deletion must be able to reopen and
+        // deliver the exact retained messages once.
+        if bus.write_unavailable() {
+            return Vec::new();
+        }
         bus.inboxes.remove(me).unwrap_or_default()
+    }
+
+    /// Restore a just-taken inbox when the durable outbox query fails. Messages
+    /// go back in front of anything that arrived while the database read was in
+    /// flight, preserving FIFO order for the retry.
+    pub fn restore_inbox(&self, thread: i32, me: &str, mut messages: Vec<Msg>) {
+        if messages.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let bus = g.entry(thread).or_default();
+        if bus.write_unavailable() {
+            return;
+        }
+        let existing = bus.inboxes.remove(me).unwrap_or_default();
+        messages.extend(existing);
+        bus.inboxes.insert(me.to_string(), messages);
+    }
+
+    /// Emit queued wakes after startup restoration once the coordinator sender
+    /// has been installed. The channel can buffer these before coordinator::run
+    /// starts consuming it during Tauri setup.
+    pub fn wake_pending_inboxes(&self) {
+        let mut targets: Vec<(i32, String)> = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.iter()
+                .flat_map(|(thread, bus)| {
+                    if bus.read_unavailable() {
+                        return Vec::new().into_iter();
+                    }
+                    bus.inboxes
+                        .iter()
+                        .filter(|(_, messages)| !messages.is_empty())
+                        .map(|(direction, _)| (*thread, direction.clone()))
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                })
+                .collect()
+        };
+        targets.sort();
+        for (thread, direction) in targets {
+            self.emit_wake(thread, &direction);
+        }
     }
 
     pub fn state_get(&self, thread: i32) -> serde_json::Value {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
+        if bus.read_unavailable() {
+            return serde_json::json!({});
+        }
         if bus.state.is_object() {
             bus.state.clone()
         } else {
@@ -319,6 +435,9 @@ impl BusRegistry {
     pub fn state_set(&self, thread: i32, patch: serde_json::Value) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
+        if bus.write_unavailable() {
+            return;
+        }
         if !bus.state.is_object() {
             bus.state = serde_json::json!({});
         }
@@ -332,41 +451,48 @@ impl BusRegistry {
     /// The full timeline for a thread (for the UI in v1b).
     pub fn log(&self, thread: i32) -> Vec<Msg> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.entry(thread).or_default().log.clone()
+        let bus = g.entry(thread).or_default();
+        if bus.read_unavailable() {
+            return Vec::new();
+        }
+        bus.log.clone()
     }
 
     /// Record a question from direction `from` to the human; returns its id.
     /// Also lands in the timeline (kind = "ask") and wakes the human sentinel
     /// so the UI knows attention is needed without polling.
     pub fn ask_human(&self, thread: i32, from: &str, text: &str) -> u64 {
-        self.push_ask(thread, from, text, AskKind::Question)
+        self.push_ask(thread, from, text, AskKind::Question, false)
     }
 
-    /// Post a display-only, SELF-CLEARING NOTICE to the human — same
-    /// Needs-you/IM surfacing and wake as `ask_human`, but `answer_ask`
-    /// refuses it (a reply can't inject a stray bus message) and the UI shows
-    /// no answer box. For hints (the stall/stopped-worker notices, an
-    /// ordinary PR/MR update) that a background process retracts once the
-    /// condition it describes changes — there is no answer to give, and
-    /// nothing further for the human to do to make it go away. See
-    /// `notify_human_action_required` for the one notice kind this does NOT
-    /// cover.
-    pub fn notify_human(&self, thread: i32, from: &str, text: &str) -> u64 {
-        self.push_ask(thread, from, text, AskKind::Notice)
+    /// Register a durable question under its database id. Used by the MCP bus
+    /// so desktop and IM observe the same stable identity across restarts.
+    pub fn ask_human_with_id(&self, thread: i32, from: &str, text: &str, id: u64) -> u64 {
+        self.next_ask_id.fetch_max(id, Ordering::Relaxed);
+        self.push_ask_with_id(thread, from, text, AskKind::Question, id, true)
     }
 
-    /// Post a display-only NOTICE like `notify_human`, but one that will NOT
-    /// be retracted by any background process — only an explicit external
-    /// re-trigger (named in `text` itself) makes tracking resume. Currently
-    /// only `host::monitor`'s PR/MR give-up notice (`host::judge::
-    /// give_up_text`) uses this; every other notice in the codebase keeps
-    /// calling `notify_human` and is unaffected.
-    pub fn notify_human_action_required(&self, thread: i32, from: &str, text: &str) -> u64 {
-        self.push_ask(thread, from, text, AskKind::NoticeActionRequired)
-    }
-
-    fn push_ask(&self, thread: i32, from: &str, text: &str, kind: AskKind) -> u64 {
+    fn push_ask(
+        &self,
+        thread: i32,
+        from: &str,
+        text: &str,
+        kind: AskKind,
+        durable: bool,
+    ) -> u64 {
         let id = self.next_ask_id.fetch_add(1, Ordering::Relaxed) + 1;
+        self.push_ask_with_id(thread, from, text, kind, id, durable)
+    }
+
+    fn push_ask_with_id(
+        &self,
+        thread: i32,
+        from: &str,
+        text: &str,
+        kind: AskKind,
+        id: u64,
+        durable: bool,
+    ) -> u64 {
         let ts = now();
         let ask = Ask {
             id,
@@ -375,10 +501,14 @@ impl BusRegistry {
             ts,
             answered: false,
             kind,
+            durable,
         };
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
+            if bus.write_unavailable() {
+                return id;
+            }
             bus.asks.push(ask.clone());
             bus.log.push(Msg {
                 from: from.to_string(),
@@ -386,6 +516,7 @@ impl BusRegistry {
                 text: text.to_string(),
                 ts,
                 kind: "ask".to_string(),
+                request_id: None,
             });
             self.emit_ask_event(HumanAskEvent::Asked { thread, ask });
         }
@@ -393,49 +524,103 @@ impl BusRegistry {
         id
     }
 
+    /// Reconstruct an open durable request without replaying edge-triggered
+    /// Asked events or adding a synthetic bus-log entry at process startup.
+    pub fn restore_human_request(&self, thread: i32, from: &str, text: &str, id: u64) -> bool {
+        self.next_ask_id.fetch_max(id, Ordering::Relaxed);
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let bus = g.entry(thread).or_default();
+        if bus.write_unavailable() {
+            return false;
+        }
+        if bus.asks.iter().any(|ask| ask.id == id) {
+            return false;
+        }
+        bus.asks.push(Ask {
+            id,
+            from: from.to_string(),
+            text: text.to_string(),
+            ts: now(),
+            answered: false,
+            kind: AskKind::Question,
+            durable: true,
+        });
+        true
+    }
+
+    /// Reconstruct one answered-but-unconsumed durable row into its asking
+    /// direction's inbox. Idempotent by request id and intentionally silent;
+    /// wake_pending_inboxes runs after the coordinator sender is installed.
+    pub fn restore_durable_answer(
+        &self,
+        thread: i32,
+        request_id: u64,
+        to: &str,
+        text: &str,
+    ) -> bool {
+        self.next_ask_id.fetch_max(request_id, Ordering::Relaxed);
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let bus = g.entry(thread).or_default();
+        if bus.write_unavailable() {
+            return false;
+        }
+        if bus
+            .inboxes
+            .values()
+            .flatten()
+            .any(|message| message.request_id == Some(request_id))
+        {
+            return false;
+        }
+        let message = Msg {
+            from: HUMAN.to_string(),
+            to: to.to_string(),
+            text: text.to_string(),
+            ts: now(),
+            kind: "message".to_string(),
+            request_id: Some(request_id),
+        };
+        bus.log.push(message.clone());
+        bus.inboxes.entry(to.to_string()).or_default().push(message);
+        true
+    }
+
     /// The unanswered asks in a thread, oldest first.
     pub fn open_asks(&self, thread: i32) -> Vec<Ask> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.entry(thread)
-            .or_default()
-            .asks
+        let bus = g.entry(thread).or_default();
+        if bus.read_unavailable() {
+            return Vec::new();
+        }
+        bus.asks
             .iter()
             .filter(|a| !a.answered)
             .cloned()
             .collect()
     }
 
-    /// Count of open asks the human must actually act on — excludes EITHER
-    /// display-only NOTICE kind (`AskKind::Notice` / `AskKind::
-    /// NoticeActionRequired`, e.g. the self-clearing stall hint), which
-    /// surfaces in Needs-you but has no answer to give. Single source so
-    /// every "needs you" count (the workspace switcher, badges) agrees on
-    /// what's pending: a notice must not inflate a number that promises "N
-    /// things need your action" (issue #105).
-    pub fn open_answerable_ask_count(&self, thread: i32) -> usize {
-        self.open_asks(thread).iter().filter(|a| a.kind.is_answerable()).count()
-    }
-
     /// Answer an open ask: mark it answered and deliver `text` to the asking
     /// direction's inbox (as if from the human). Returns false if not found —
-    /// including a display-only NOTICE (either `AskKind`), which has no
-    /// answer to give, so a stray reply never reaches the asker's inbox.
+    /// including a cancelled or superseded question.
     pub fn answer_ask(&self, thread: i32, ask_id: u64, text: &str) -> bool {
         let target = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
+            if bus.write_unavailable() {
+                return false;
+            }
             let hit = match bus
                 .asks
                 .iter_mut()
-                .find(|a| a.id == ask_id && !a.answered && a.kind.is_answerable())
+                .find(|a| a.id == ask_id && !a.answered)
             {
                 Some(a) => {
                     a.answered = true;
-                    Some((a.from.clone(), a.text.clone()))
+                    Some((a.from.clone(), a.text.clone(), a.durable))
                 }
                 None => None,
             };
-            if let Some((from, question)) = &hit {
+            if let Some((from, question, _)) = &hit {
                 self.emit_ask_event(HumanAskEvent::Answered {
                     thread,
                     ask_id,
@@ -447,12 +632,244 @@ impl BusRegistry {
             hit
         };
         match target {
-            Some((dir, _question)) => {
-                self.post(thread, HUMAN, &dir, text, "message");
+            Some((dir, _question, durable)) => {
+                if durable {
+                    let _ = self.post_durable_answer(thread, ask_id, &dir, text);
+                } else {
+                    self.post(thread, HUMAN, &dir, text, "message");
+                }
                 true
             }
             None => false,
         }
+    }
+
+    /// Deliver an OCC-resolved durable question when the app restarted after
+    /// persistence but before the in-memory bus ask survived. Emit the same
+    /// resolution event as `answer_ask` so transcript trail and IM consumers
+    /// still observe the answer.
+    pub fn deliver_durable_answer(
+        &self,
+        thread: i32,
+        ask_id: u64,
+        from: &str,
+        question: &str,
+        text: &str,
+    ) -> bool {
+        // Post first: the tombstone check and message insert share the inner
+        // mutex, so delete cannot purge between an optimistic check and a late
+        // `entry(thread).or_default()` recreation. Only a delivered answer
+        // emits trail/IM resolution events.
+        if !self.post_durable_answer(thread, ask_id, from, text) {
+            return false;
+        }
+        self.emit_ask_event(HumanAskEvent::Answered {
+            thread,
+            ask_id,
+            from: from.to_string(),
+            question: question.to_string(),
+            text: text.to_string(),
+        });
+        true
+    }
+
+    /// Remove answered messages whose originating turns were abandoned by a
+    /// rewind. Open asks are cancelled separately so their IM cards receive a
+    /// Cancelled event; this handles already-answered rows waiting in inboxes.
+    pub fn discard_durable_answers(&self, thread: i32, request_ids: &[u64]) -> usize {
+        self.discard_durable_answers_matching(thread, request_ids, |_| true)
+    }
+
+    /// Remove acknowledged answer messages only from the authenticated route
+    /// that issued `bus_ack`. A sibling direction can guess a request id, but
+    /// must not be able to drain the asking direction's process-local inbox.
+    pub fn discard_durable_answers_for_scope(
+        &self,
+        thread: i32,
+        to: &str,
+        request_ids: &[u64],
+    ) -> usize {
+        self.discard_durable_answers_matching(thread, request_ids, |message| message.to == to)
+    }
+
+    fn discard_durable_answers_matching(
+        &self,
+        thread: i32,
+        request_ids: &[u64],
+        mut in_scope: impl FnMut(&Msg) -> bool,
+    ) -> usize {
+        if request_ids.is_empty() {
+            return 0;
+        }
+        let ids: HashSet<u64> = request_ids.iter().copied().collect();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let bus = g.entry(thread).or_default();
+        if bus.write_unavailable() {
+            return 0;
+        }
+        let before: usize = bus.inboxes.values().map(Vec::len).sum();
+        for messages in bus.inboxes.values_mut() {
+            messages.retain(|message| {
+                !in_scope(message)
+                    || message
+                        .request_id
+                        .is_none_or(|request_id| !ids.contains(&request_id))
+            });
+        }
+        bus.log.retain(|message| {
+            !in_scope(message)
+                || message
+                    .request_id
+                    .is_none_or(|request_id| !ids.contains(&request_id))
+        });
+        let after: usize = bus.inboxes.values().map(Vec::len).sum();
+        before.saturating_sub(after)
+    }
+
+    /// Install a reversible admission fence before deletion starts while
+    /// retaining the complete bus for rollback. Returns whether a live bus
+    /// existed plus ask ids whose cancellation event must wait for the durable
+    /// DB transition. Late answer/post/restore writes see `closing` and no-op;
+    /// readers continue to observe the retained state until commit.
+    pub fn begin_thread_close(&self, thread: i32) -> (bool, Vec<u64>) {
+        let mut g = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let bus = g.entry(thread).or_default();
+        if bus.closed {
+            return (false, Vec::new());
+        }
+        let existed = !bus.closing
+            && (!bus.inboxes.is_empty()
+                || !bus.log.is_empty()
+                || !bus.members.is_empty()
+                || !bus.asks.is_empty()
+                || bus.state.is_object());
+        bus.closing = true;
+        let cancelled = bus
+            .asks
+            .iter()
+            .filter(|ask| !ask.answered)
+            .map(|ask| ask.id)
+            .collect();
+        (existed, cancelled)
+    }
+
+    /// Apply the durable human-request cancellation to retained process-local
+    /// state. Ordinary bus messages/state stay available if the later cascade
+    /// fails and the close is rolled back; durable answers and asks do not,
+    /// because their DB lifecycle is already cancelled.
+    pub fn apply_thread_human_cancellation(&self, thread: i32) {
+        let mut g = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let bus = g.entry(thread).or_default();
+        if !bus.closing || bus.closed {
+            return;
+        }
+        for ask in &mut bus.asks {
+            ask.answered = true;
+        }
+        for messages in bus.inboxes.values_mut() {
+            messages.retain(|message| message.request_id.is_none());
+        }
+        bus.log.retain(|message| message.request_id.is_none());
+    }
+
+    /// Apply a committed durable cancellation to one surviving thread without
+    /// emitting provider/trail events. The caller batches and de-duplicates
+    /// events after every DB effect is known. This also removes answered-but-
+    /// unacknowledged inbox/log messages for the cancelled request ids.
+    pub fn apply_human_cancellations_by_id(&self, thread: i32, request_ids: &[u64]) -> Vec<u64> {
+        if request_ids.is_empty() {
+            return Vec::new();
+        }
+        let ids = request_ids.iter().copied().collect::<HashSet<_>>();
+        let mut g = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let bus = g.entry(thread).or_default();
+        if bus.closed {
+            return Vec::new();
+        }
+        let mut cancelled = Vec::new();
+        for ask in &mut bus.asks {
+            if ask.answered || !ids.contains(&ask.id) {
+                continue;
+            }
+            ask.answered = true;
+            cancelled.push(ask.id);
+        }
+        for messages in bus.inboxes.values_mut() {
+            messages.retain(|message| {
+                message
+                    .request_id
+                    .is_none_or(|request_id| !ids.contains(&request_id))
+            });
+        }
+        bus.log.retain(|message| {
+            message
+                .request_id
+                .is_none_or(|request_id| !ids.contains(&request_id))
+        });
+        cancelled
+    }
+
+    /// Silently cancel live asks owned by a direction that a committed delete
+    /// removed. Durable and legacy asks share this process-local shape; the
+    /// command layer emits one de-duplicated event batch afterwards.
+    pub fn apply_direction_human_cancellation(&self, thread: i32, from: &str) -> Vec<u64> {
+        let mut g = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let bus = g.entry(thread).or_default();
+        if bus.closed {
+            return Vec::new();
+        }
+        let mut cancelled = Vec::new();
+        for ask in &mut bus.asks {
+            if ask.answered || ask.from != from {
+                continue;
+            }
+            ask.answered = true;
+            cancelled.push(ask.id);
+        }
+        cancelled
+    }
+
+    /// Commit the irreversible tombstone only after the DB cascade succeeds.
+    pub fn commit_thread_close(&self, thread: i32) {
+        let mut g = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        g.insert(
+            thread,
+            ThreadBus {
+                closed: true,
+                ..ThreadBus::default()
+            },
+        );
+    }
+
+    /// Reopen a retained bus when deletion fails. Human request artifacts that
+    /// already transitioned to cancelled stay removed; ordinary state survives.
+    pub fn rollback_thread_close(&self, thread: i32) {
+        let mut g = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let bus = g.entry(thread).or_default();
+        if bus.closing && !bus.closed {
+            bus.closing = false;
+        }
+    }
+
+    /// Publish terminal IM events after the durable cancellation succeeds.
+    /// Keeping this separate from purge preserves crash consistency: an app
+    /// crash before the DB transition leaves an open provider card open too.
+    pub fn notify_cancelled_asks(&self, thread: i32, ask_ids: &[u64]) {
+        for ask_id in ask_ids {
+            self.emit_ask_event(HumanAskEvent::Cancelled {
+                thread,
+                ask_id: *ask_id,
+            });
+        }
+    }
+
+    /// Apply and publish a committed cancellation set. Every durable id emits
+    /// its terminal event, including requests that were already answered or
+    /// acknowledged in memory: their provider cards still need to converge to
+    /// the later durable Cancelled state.
+    pub fn apply_committed_human_cancellations(&self, thread: i32, ask_ids: &[u64]) {
+        self.apply_human_cancellations_by_id(thread, ask_ids);
+        self.notify_cancelled_asks(thread, ask_ids);
     }
 
     fn cancel_open_asks_matching(
@@ -463,15 +880,19 @@ impl BusRegistry {
         let cancelled = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
-            let mut cancelled = Vec::new();
-            for ask in &mut bus.asks {
-                if ask.answered || !should_cancel(ask) {
-                    continue;
+            if bus.write_unavailable() {
+                Vec::new()
+            } else {
+                let mut cancelled = Vec::new();
+                for ask in &mut bus.asks {
+                    if ask.answered || !should_cancel(ask) {
+                        continue;
+                    }
+                    ask.answered = true;
+                    cancelled.push(ask.id);
                 }
-                ask.answered = true;
-                cancelled.push(ask.id);
+                cancelled
             }
-            cancelled
         };
         for ask_id in &cancelled {
             self.emit_ask_event(HumanAskEvent::Cancelled {
@@ -497,10 +918,8 @@ impl BusRegistry {
         self.cancel_open_asks_matching(thread, |ask| ask.from.as_str() == from)
     }
 
-    /// Withdraw a single open human ask by id — for self-clearing notices (e.g.
-    /// the task-stall hint, retracted on recovery/turn-end) that must NOT touch a
-    /// worker's other open asks from the same direction. No message is delivered
-    /// back. Returns whether an open ask with that id was found and cancelled.
+    /// Withdraw one superseded question without touching other questions from
+    /// the same direction.
     pub fn cancel_open_asks_by_id(&self, thread: i32, ask_id: u64) -> bool {
         self.cancel_open_asks_matching(thread, |ask| ask.id == ask_id) > 0
     }
@@ -528,37 +947,50 @@ mod tests {
 
     #[test]
     fn cancel_open_asks_by_id_removes_only_that_ask() {
-        // Precision is the whole point: a stall notice must be retractable WITHOUT
-        // touching the worker's other real open asks from the same direction.
+        // Superseding one question must not touch another from the same scope.
         let r = BusRegistry::new();
-        let stall = r.ask_human(1, "10", "stall hint");
+        let superseded = r.ask_human(1, "10", "old question");
         let question = r.ask_human(1, "10", "real question"); // same dir — must survive
-        assert!(r.cancel_open_asks_by_id(1, stall));
+        assert!(r.cancel_open_asks_by_id(1, superseded));
         let open = r.open_asks(1);
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, question);
         // Unknown / already-cancelled id → no-op false.
-        assert!(!r.cancel_open_asks_by_id(1, stall));
+        assert!(!r.cancel_open_asks_by_id(1, superseded));
         assert!(!r.cancel_open_asks_by_id(1, 9999));
     }
 
-    #[test]
-    fn open_answerable_ask_count_excludes_notices() {
-        // A self-clearing NOTICE (`notify_human`, e.g. the stall hint) still
-        // surfaces via `open_asks` — the queue must render it — but must NOT
-        // inflate the "needs you" count, which promises real pending items
-        // (issue #105: badge showed 4, only 1 was actually awaiting an answer).
+    #[tokio::test]
+    async fn committed_cancellation_discards_answer_and_notifies_even_after_answered() {
         let r = BusRegistry::new();
-        r.notify_human(1, "10", "stall hint");
-        assert_eq!(r.open_asks(1).len(), 1, "the notice still surfaces in the queue");
-        assert_eq!(r.open_answerable_ask_count(1), 0, "but doesn't count as pending");
+        assert!(r.restore_human_request(7, "10", "REST or GraphQL?", 42));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let snapshot = r.set_ask_notifier(tx);
+        assert_eq!(snapshot.len(), 1);
+        assert!(r.answer_ask(7, 42, "REST"));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            HumanAskEvent::Answered { ask_id: 42, .. }
+        ));
+        assert!(r
+            .log(7)
+            .iter()
+            .any(|message| message.request_id == Some(42)));
 
-        let q = r.ask_human(1, "10", "real question");
-        assert_eq!(r.open_asks(1).len(), 2);
-        assert_eq!(r.open_answerable_ask_count(1), 1, "a real question does count");
+        r.apply_committed_human_cancellations(7, &[42]);
 
-        assert!(r.answer_ask(1, q, "ok"));
-        assert_eq!(r.open_answerable_ask_count(1), 0, "answered questions drop out");
+        assert!(!r
+            .log(7)
+            .iter()
+            .any(|message| message.request_id == Some(42)));
+        assert!(r.inbox(7, "10").is_empty());
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            HumanAskEvent::Cancelled {
+                thread: 7,
+                ask_id: 42
+            }
+        ));
     }
 
     #[test]
@@ -658,44 +1090,6 @@ mod tests {
     }
 
     #[test]
-    fn notify_human_is_a_non_answerable_notice() {
-        // A notice surfaces in Needs-you like an ask, but answering it must be a
-        // no-op: no reply reaches the asker's inbox (a stale stall notice answered
-        // in the sweep gap can't inject a stray bus message), and it stays open
-        // until it's explicitly retracted.
-        let r = BusRegistry::new();
-        r.join(1, "10");
-        let id = r.notify_human(1, "10", "⏳ task stalled");
-        let open = r.open_asks(1);
-        assert_eq!(open.len(), 1);
-        assert_eq!(open[0].kind, AskKind::Notice, "an ordinary notify_human posts a self-clearing Notice");
-        assert!(!open[0].kind.is_answerable());
-        // Answering is refused — no delivery, and the notice remains open.
-        assert!(!r.answer_ask(1, id, "hurry up"));
-        assert!(r.inbox(1, "10").is_empty());
-        assert_eq!(r.open_asks(1).len(), 1);
-        // An explicit retract (what the watchdog does on recover/idle) clears it.
-        assert!(r.cancel_open_asks_by_id(1, id));
-        assert!(r.open_asks(1).is_empty());
-    }
-
-    #[test]
-    fn notify_human_action_required_is_a_distinct_non_answerable_kind() {
-        // The give-up PR/MR notice: still a non-answerable NOTICE (surfaces,
-        // refuses a reply, counts against neither open_answerable_ask_count),
-        // but tagged with the OTHER notice kind so the frontend can tell it
-        // apart from a self-clearing one and skip the contradictory footer.
-        let r = BusRegistry::new();
-        let id = r.notify_human_action_required(1, "10", "🛑 gave up tracking");
-        let open = r.open_asks(1);
-        assert_eq!(open.len(), 1);
-        assert_eq!(open[0].kind, AskKind::NoticeActionRequired);
-        assert!(!open[0].kind.is_answerable());
-        assert_eq!(r.open_answerable_ask_count(1), 0, "an action-required notice still isn't a pending question");
-        assert!(!r.answer_ask(1, id, "ignored"), "answering is refused, same as an ordinary notice");
-    }
-
-    #[test]
     fn asks_are_isolated_per_thread() {
         let r = BusRegistry::new();
         r.ask_human(1, "10", "q1");
@@ -743,6 +1137,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notifier_snapshot_replays_restored_durable_ask_as_answerable() {
+        let r = BusRegistry::new();
+        assert!(r.restore_human_request(7, "10", "REST or GraphQL?", 42));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let snapshot = r.set_ask_notifier(tx);
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, 7);
+        assert_eq!(snapshot[0].1.id, 42);
+        assert_eq!(snapshot[0].1.from, "10");
+        assert!(snapshot[0].1.durable);
+        assert!(rx.try_recv().is_err(), "snapshot rows are not duplicated as events");
+        assert!(r.answer_ask(7, 42, "REST"));
+        assert!(matches!(rx.recv().await.unwrap(),
+            HumanAskEvent::Answered { thread: 7, ask_id: 42, .. }));
+        let inbox = r.inbox(7, "10");
+        assert_eq!(inbox[0].request_id, Some(42));
+    }
+
+    #[tokio::test]
+    async fn durable_answer_without_live_ask_still_emits_trail_event_and_delivers() {
+        let r = BusRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_ask_trail_notifier(tx);
+        r.join(7, "10");
+
+        r.deliver_durable_answer(7, 42, "10", "REST or GraphQL?", "REST");
+
+        assert!(matches!(rx.recv().await.unwrap(),
+            HumanAskEvent::Answered { thread: 7, ask_id: 42, from, question, text }
+                if from == "10" && question == "REST or GraphQL?" && text == "REST"));
+        let inbox = r.inbox(7, "10");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].from, HUMAN);
+        assert_eq!(inbox[0].text, "REST");
+    }
+
+    #[test]
+    fn durable_answer_cleanup_is_scoped_to_the_acknowledging_route() {
+        let r = BusRegistry::new();
+        assert!(r.restore_durable_answer(7, 42, "10", "REST"));
+
+        assert_eq!(r.discard_durable_answers_for_scope(7, "20", &[42]), 0);
+        let inbox = r.inbox(7, "10");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].request_id, Some(42));
+    }
+
+    #[test]
+    fn purging_a_deleted_thread_removes_answered_outbox_only_for_that_thread() {
+        let r = BusRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(r.set_ask_notifier(tx).is_empty());
+        assert!(r.restore_durable_answer(7, 42, "10", "REST"));
+        assert!(r.restore_human_request(7, "10", "still open", 44));
+        assert!(r.restore_durable_answer(8, 43, "20", "GraphQL"));
+
+        let (existed, cancelled) = r.begin_thread_close(7);
+        assert!(existed);
+        assert_eq!(cancelled, vec![44]);
+        assert!(
+            r.inbox(7, "10").is_empty(),
+            "closing hides the destructive inbox read without consuming it"
+        );
+        let retained_inbox = {
+            let g = r.inner.lock().unwrap_or_else(|error| error.into_inner());
+            g.get(&7)
+                .and_then(|bus| bus.inboxes.get("10"))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(retained_inbox.len(), 1, "closing retains the inbox message");
+        assert_eq!(retained_inbox[0].request_id, Some(42));
+        r.rollback_thread_close(7);
+        let recovered_inbox = r.inbox(7, "10");
+        assert_eq!(recovered_inbox, retained_inbox);
+        assert!(
+            r.inbox(7, "10").is_empty(),
+            "rollback restores the message once"
+        );
+        r.restore_inbox(7, "10", recovered_inbox);
+        let (existed, cancelled) = r.begin_thread_close(7);
+        assert!(existed);
+        assert_eq!(cancelled, vec![44]);
+        assert_eq!(
+            r.open_asks(7).iter().map(|ask| ask.id).collect::<Vec<_>>(),
+            vec![44]
+        );
+        assert!(
+            !r.log(7).is_empty(),
+            "closing keeps the live log visible before commit"
+        );
+        r.post(7, "10", "lead", "late write", "message");
+        assert!(
+            !r.answer_ask(7, 44, "late answer"),
+            "closing blocks writes before commit"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "purge alone does not outrun DB cancellation"
+        );
+        r.apply_thread_human_cancellation(7);
+        r.notify_cancelled_asks(7, &cancelled);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            HumanAskEvent::Cancelled {
+                thread: 7,
+                ask_id: 44
+            }
+        ));
+        r.commit_thread_close(7);
+        assert!(r.inbox(7, "10").is_empty());
+        assert!(r.log(7).is_empty());
+        assert_eq!(r.inbox(8, "20")[0].request_id, Some(43));
+        assert!(!r.begin_thread_close(999).0);
+        r.rollback_thread_close(999);
+        r.post(999, "10", "lead", "retry after failed deletion", "message");
+        assert_eq!(r.inbox(999, "lead").len(), 1);
+
+        // Late work from an answer command that won DB OCC immediately before
+        // deletion must not recreate the purged bus.
+        assert!(!r.deliver_durable_answer(7, 42, "10", "REST or GraphQL?", "REST"));
+        assert!(!r.restore_durable_answer(7, 42, "10", "REST"));
+        assert!(!r.restore_human_request(7, "10", "late question", 44));
+        r.post(7, "10", "lead", "late", "message");
+        r.join(7, "10");
+        assert!(r.inbox(7, "10").is_empty());
+        assert!(r.log(7).is_empty());
+        assert!(r.open_asks(7).is_empty());
+    }
+
+    #[tokio::test]
     async fn human_ask_notifier_snapshots_preexisting_open_asks() {
         let r = BusRegistry::new();
         let first = r.ask_human(2, "20", "already open");
@@ -770,7 +1297,7 @@ mod tests {
     async fn cancel_open_asks_marks_thread_asks_and_notifies() {
         let r = BusRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let _ = r.set_ask_notifier(tx);
+        assert!(r.set_ask_notifier(tx).is_empty());
         let first = r.ask_human(1, "10", "first?");
         let second = r.ask_human(1, "20", "second?");
         let keep = r.ask_human(2, "30", "keep?");
@@ -801,7 +1328,7 @@ mod tests {
     async fn cancel_open_asks_from_marks_only_that_direction() {
         let r = BusRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let _ = r.set_ask_notifier(tx);
+        assert!(r.set_ask_notifier(tx).is_empty());
         let first = r.ask_human(1, "10", "first?");
         let keep_same_thread = r.ask_human(1, "20", "second?");
         let keep_other_thread = r.ask_human(2, "10", "keep?");

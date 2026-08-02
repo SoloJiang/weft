@@ -16,8 +16,6 @@ export const STORAGE_KEYS = {
   notifyQuietHours: "weft-notify-quiet-hours",
   keepAwake: "weft-keep-awake",
   dangerousMode: "weft-dangerous",
-  idleCapMins: "weft-idle-cap-mins",
-  wallCapMins: "weft-wall-cap-mins",
   // navigation / session
   activeWorkspace: "weft-active-workspace",
   // nudges

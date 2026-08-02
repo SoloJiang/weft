@@ -23,7 +23,7 @@ pub enum UpdateOut {
     Thought {
         text: String,
     },
-    /// Non-terminal tool progress — keep the watchdog fed.
+    /// Non-terminal tool progress for live activity telemetry.
     ToolProgress {
         summary: String,
     },
