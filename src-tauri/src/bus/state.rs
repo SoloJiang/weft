@@ -365,7 +365,11 @@ impl BusRegistry {
     pub fn inbox(&self, thread: i32, me: &str) -> Vec<Msg> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bus = g.entry(thread).or_default();
-        if bus.read_unavailable() {
+        // Inbox reads are destructive (they acknowledge process-local
+        // delivery by removing unread messages), so treat them as writes at
+        // the closing fence. A failed deletion must be able to reopen and
+        // deliver the exact retained messages once.
+        if bus.write_unavailable() {
             return Vec::new();
         }
         bus.inboxes.remove(me).unwrap_or_default()
@@ -1194,6 +1198,10 @@ mod tests {
         let (existed, cancelled) = r.begin_thread_close(7);
         assert!(existed);
         assert_eq!(cancelled, vec![44]);
+        assert!(
+            r.inbox(7, "10").is_empty(),
+            "closing hides the destructive inbox read without consuming it"
+        );
         let retained_inbox = {
             let g = r.inner.lock().unwrap_or_else(|error| error.into_inner());
             g.get(&7)
@@ -1201,13 +1209,36 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
         };
-        assert_eq!(retained_inbox.len(), 1, "closing keeps reads visible before commit");
+        assert_eq!(retained_inbox.len(), 1, "closing retains the inbox message");
         assert_eq!(retained_inbox[0].request_id, Some(42));
-        assert_eq!(r.open_asks(7).iter().map(|ask| ask.id).collect::<Vec<_>>(), vec![44]);
-        assert!(!r.log(7).is_empty(), "closing keeps the live log visible before commit");
+        r.rollback_thread_close(7);
+        let recovered_inbox = r.inbox(7, "10");
+        assert_eq!(recovered_inbox, retained_inbox);
+        assert!(
+            r.inbox(7, "10").is_empty(),
+            "rollback restores the message once"
+        );
+        r.restore_inbox(7, "10", recovered_inbox);
+        let (existed, cancelled) = r.begin_thread_close(7);
+        assert!(existed);
+        assert_eq!(cancelled, vec![44]);
+        assert_eq!(
+            r.open_asks(7).iter().map(|ask| ask.id).collect::<Vec<_>>(),
+            vec![44]
+        );
+        assert!(
+            !r.log(7).is_empty(),
+            "closing keeps the live log visible before commit"
+        );
         r.post(7, "10", "lead", "late write", "message");
-        assert!(!r.answer_ask(7, 44, "late answer"), "closing blocks writes before commit");
-        assert!(rx.try_recv().is_err(), "purge alone does not outrun DB cancellation");
+        assert!(
+            !r.answer_ask(7, 44, "late answer"),
+            "closing blocks writes before commit"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "purge alone does not outrun DB cancellation"
+        );
         r.apply_thread_human_cancellation(7);
         r.notify_cancelled_asks(7, &cancelled);
         assert!(matches!(
