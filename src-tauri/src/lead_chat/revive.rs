@@ -581,6 +581,8 @@ mod tests {
                 .is_empty(),
             "receipt completion must clear the recovered batch"
         );
+        drop(db);
+        let db = Db::connect(&url).await.unwrap();
         assert!(
             collect_pending_lead_targets(&db, &HashSet::new(), &HashSet::new())
                 .await
