@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    issue #160 round-25 P1 (Codex computer/os.rs:210): declare Apple Events
+    usage so macOS TCC can present the Automation consent prompt instead of
+    silently rejecting the automation. Every approved computer-use input action
+    activates its target window via an `osascript` call to System Events (see
+    `computer::os::activate_window_impl`); on a packaged, signed build that
+    Apple Events send requires this usage-description key in the bundle's
+    Info.plist, or the send fails with errAEEventNotPermitted BEFORE the
+    approved click/type ever reaches enigo, even when Accessibility permission
+    was already granted. tauri-bundler MERGES this file into the generated
+    macOS Info.plist (our keys win; it still fills CFBundleIdentifier et al.),
+    so this adds only the automation string without disturbing the rest.
+
+    Real-machine verification of the resulting Automation prompt is tracked in
+    issue #160 §9 (the real-machine checklist) — it cannot run in CI, which
+    builds and tests but never packages a signed macOS bundle.
+  -->
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Weft brings the window an approved computer-use action targets to the front (via System Events) before it clicks or types. This runs only for actions you approve while Computer Use is enabled in Settings.</string>
+</dict>
+</plist>

@@ -1319,6 +1319,18 @@ pub(crate) fn classify_gui_action(action: &str) -> RiskLevel {
     RiskLevel::Unknown
 }
 
+/// Whether `action` is a RECOGNIZED GUI/computer-use action — a member of
+/// either closed word list [`classify_gui_action`] tiers (any tier but
+/// `Unknown`). `acp::permission::is_gui_tool_call` uses this to recognize a
+/// native omp GUI toolCall from its structured `rawInput.action` even when its
+/// display title is not the bare `computer`/`browser` string it happens to
+/// carry today (issue #160 round-25 P1, Codex permission.rs:145) — the action a
+/// tool will actually perform is a stronger identity signal than a mutable,
+/// possibly-localized display title.
+pub(crate) fn is_known_gui_action(action: &str) -> bool {
+    GUI_READ_ONLY_ACTIONS.contains(&action) || GUI_WRITE_ACTIONS.contains(&action)
+}
+
 /// Classify a permission ask's danger tier — the single judgment call every
 /// engine's ask-creation path routes through (see `RiskLevel`). Pure and
 /// deterministic: the same signal always yields the same tier.
@@ -2093,6 +2105,15 @@ impl AskRegistry {
         if g.dangerous {
             return Some(Decision::Allow);
         }
+        Self::exact_grant(&g, thread, dir, action_key)
+    }
+
+    /// The Full-grant / exact-Always-grant core shared by
+    /// [`auto_decision_exact`] and [`auto_decision_gui`], WITHOUT the global
+    /// `dangerous` shortcut each caller layers on (or, for GUI, deliberately
+    /// does not). Kept private and handed the already-held guard so the two
+    /// entry points can never drift on what an exact standing grant is.
+    fn exact_grant(g: &Inner, thread: i32, dir: &str, action_key: &str) -> Option<Decision> {
         let k = (thread, dir.to_string());
         if g.full.contains(&k) {
             return Some(Decision::Allow);
@@ -2101,6 +2122,26 @@ impl AskRegistry {
             return Some(Decision::Allow);
         }
         None
+    }
+
+    /// GUI/computer-use counterpart of [`auto_decision_exact`]: honors a Full
+    /// grant for this `(thread, dir)` or an exact Always grant for this action,
+    /// but NEVER the global `dangerous` shortcut. issue #160 round-25 P1 (Codex
+    /// ask.rs:2095): Dangerous mode's user-facing promise is that agents may act
+    /// freely only "inside their worktrees" (`i18n` `settings.dangerDesc`) — so
+    /// it must NOT silently auto-approve DESKTOP-WIDE GUI control (screenshotting
+    /// unrelated windows, clicking/typing into other apps) the way it does for
+    /// ordinary in-worktree tool calls. Under Dangerous mode a GUI action still
+    /// surfaces its computer card unless a precise Full/Always grant covers it,
+    /// keeping this feature's "nothing is auto-approved; Always/Full are the
+    /// storm-relief valve" posture intact even when Dangerous mode is on.
+    ///
+    /// Used by `bus::computer_srv::approve` in place of [`auto_decision_exact`];
+    /// every OTHER caller (the ordinary [`auto_decision`], the PreToolUse hook
+    /// path in `bus::server::handle`) keeps honoring `dangerous`, unchanged.
+    pub fn auto_decision_gui(&self, thread: i32, dir: &str, action_key: &str) -> Option<Decision> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::exact_grant(&g, thread, dir, action_key)
     }
 
     /// A standing rule's verdict for an incoming ask, checked BEFORE surfacing:
@@ -5586,6 +5627,60 @@ mod tests {
         assert_eq!(r.auto_decision_exact(2, "20", "anything"), Some(Decision::Allow));
         assert_eq!(r.auto_decision_exact(3, "30", "exact"), Some(Decision::Allow));
         assert!(r.auto_decision_exact(3, "30", "different").is_none());
+    }
+
+    /// issue #160 round-25 P1 (Codex ask.rs:2095): the GUI entry point
+    /// `auto_decision_gui` DROPS the global `dangerous` shortcut that
+    /// `auto_decision_exact` keeps — Dangerous mode's promise is worktree-scoped
+    /// so it must never auto-approve desktop-wide GUI control — while STILL
+    /// honoring a Full grant and an exact Always grant. Proves the change is a
+    /// narrowing (Dangerous no longer sweeps GUI in), not "GUI never
+    /// auto-approves".
+    #[test]
+    fn auto_decision_gui_drops_dangerous_but_keeps_full_and_exact_always() {
+        let r = AskRegistry::new();
+        let gui_key = "[\"gui\",\"left_click\",\"notes\",\"digest\"]";
+        assert!(r.auto_decision_gui(1, "10", gui_key).is_none());
+
+        // Dangerous mode still auto-approves ordinary in-worktree tool calls
+        // (via `auto_decision_exact`) but NOT GUI actions (`auto_decision_gui`).
+        r.set_dangerous(true);
+        assert_eq!(
+            r.auto_decision_exact(1, "10", "ordinary-tool"),
+            Some(Decision::Allow),
+            "dangerous still auto-approves ordinary in-worktree tool calls"
+        );
+        assert!(
+            r.auto_decision_gui(1, "10", gui_key).is_none(),
+            "dangerous mode must NOT auto-approve desktop-wide GUI control"
+        );
+        r.set_dangerous(false);
+
+        // A Full grant and an exact Always grant still auto-approve GUI — the
+        // feature's intended storm-relief valve, unchanged.
+        r.seed_grants(GrantSnapshot {
+            full: vec![FullGrant { thread: 2, dir: "20".to_string() }],
+            always: vec![AlwaysGrant {
+                thread: 3,
+                dir: "30".to_string(),
+                action_key: gui_key.to_string(),
+            }],
+        });
+        assert_eq!(
+            r.auto_decision_gui(2, "20", gui_key),
+            Some(Decision::Allow),
+            "a Full grant still covers a GUI action"
+        );
+        assert_eq!(
+            r.auto_decision_gui(3, "30", gui_key),
+            Some(Decision::Allow),
+            "an exact Always grant still covers its GUI action"
+        );
+        assert!(
+            r.auto_decision_gui(3, "30", "[\"gui\",\"type\",\"notes\",\"other\"]")
+                .is_none(),
+            "a DIFFERENT GUI action is not covered by that Always grant"
+        );
     }
 
     /// The whole point of the ISSUE-wide grant vs. the session one: it covers a

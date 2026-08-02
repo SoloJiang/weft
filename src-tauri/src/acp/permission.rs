@@ -131,18 +131,46 @@ pub enum PermissionIntent {
 /// `weft_computer` MCP server (that path is `bus::server::summarize`'s job
 /// — see its doc for the analogous, MCP-side recognition).
 ///
-/// `title` is this file's most reliable available signal for the underlying
-/// tool's identity: ACP's own `kind` is a small, protocol-defined
-/// vocabulary (`read`/`edit`/`delete`/`move`/`search`/`execute`/`fetch`/
-/// `think`/`other`) with no `computer`/`browser` member, and no `toolCall`
-/// this file has ever seen carries a `name` field — only `toolCallId`/
-/// `title`/`kind`/`rawInput`/`content`/`locations` (see `tool_paths`/
-/// `summary_from_params`).
+/// A native GUI toolCall is recognized two ways, EITHER sufficient:
+///
+///  1. its display `title` is the bare `computer`/`browser` string omp's
+///     built-in tool carries today, OR
+///  2. its structured `rawInput.action` names a RECOGNIZED GUI action (the
+///     same closed word list `ask::classify_gui_action` tiers).
+///
+/// issue #160 round-25 P1 (Codex permission.rs:145): title alone is NOT an
+/// authoritative, immutable tool identity — the only evidence that a native
+/// GUI toolCall arrives titled exactly `computer`/`browser` is the
+/// `available_commands_update` SLASH-COMMAND listing in
+/// `tests/fixtures/acp/omp-spike-transcript.json`, which names TOGGLE commands,
+/// not toolCall titles. An action-specific or localized title would otherwise
+/// route a native GUI action down the ordinary-tool path, where a read-only or
+/// dangerous-mode grant could auto-approve an OS operation omp performs itself,
+/// outside weft's control lease / Escape guard / completion checks. Reading the
+/// structured `rawInput.action` — the action the tool will ACTUALLY perform,
+/// the same field [`gui_action`] already trusts — closes that: it is a
+/// stronger identity signal than the title, and the word list is specific
+/// enough that a non-GUI tool coincidentally carrying one of these exact action
+/// verbs is only ever mislabeled MORE closed (its own card becomes a computer
+/// card), never waved through.
+///
+/// ACP's own `kind` is a small, protocol-defined vocabulary
+/// (`read`/`edit`/`delete`/`move`/`search`/`execute`/`fetch`/`think`/`other`)
+/// with no `computer`/`browser` member, and no `toolCall` this file has ever
+/// seen carries a `name` field — only `toolCallId`/`title`/`kind`/`rawInput`/
+/// `content`/`locations` (see `tool_paths`/`summary_from_params`) — so these
+/// two are the strongest signals available.
 fn is_gui_tool_call(tc: &Value) -> bool {
-    matches!(
+    if matches!(
         tc.get("title").and_then(|t| t.as_str()),
         Some("computer") | Some("browser")
-    )
+    ) {
+        return true;
+    }
+    tc.get("rawInput")
+        .and_then(|r| r.get("action"))
+        .and_then(|a| a.as_str())
+        .is_some_and(crate::ask::is_known_gui_action)
 }
 
 /// The GUI/computer-use action name for a `computer`/`browser` toolCall: the
@@ -828,6 +856,48 @@ mod tests {
         assert_eq!(
             intent_from_params(&params),
             PermissionIntent::Read { paths: Vec::new() }
+        );
+    }
+
+    /// issue #160 round-25 P1 (Codex permission.rs:145): a native GUI toolCall
+    /// whose display title is NOT the bare `computer`/`browser` string —
+    /// action-specific, localized, or otherwise renamed — is STILL recognized
+    /// as GUI from its structured `rawInput.action`, so it can never slip down
+    /// the ordinary-tool path where a read-only or dangerous-mode grant might
+    /// auto-approve an OS operation omp performs outside weft's control lease.
+    #[test]
+    fn a_gui_action_is_recognized_from_raw_input_even_with_a_non_standard_title() {
+        let localized = json!({
+            "toolCall": {
+                "title": "Contrôler l'ordinateur",
+                "kind": "other",
+                "rawInput": { "action": "left_click", "window": "Safari" }
+            }
+        });
+        assert_eq!(
+            intent_from_params(&localized),
+            PermissionIntent::Gui {
+                action: "left_click".into()
+            },
+            "a recognized GUI action must classify as Gui regardless of the display title"
+        );
+        // Its Always-grant key is action-scoped exactly like the title-matched path.
+        assert_eq!(intent_key_from_params(&localized), "gui:left_click");
+
+        // An UNRECOGNIZED action under an arbitrary title is NOT swept in — it
+        // still classifies by its ACP `kind`, so the broadening only ever fails
+        // MORE closed, never labels an ordinary tool GUI on a whim.
+        let ordinary = json!({
+            "toolCall": {
+                "title": "do_thing",
+                "kind": "read",
+                "rawInput": { "action": "frobnicate" }
+            }
+        });
+        assert_eq!(
+            intent_from_params(&ordinary),
+            PermissionIntent::Read { paths: Vec::new() },
+            "an unrecognized action must not be misclassified as GUI"
         );
     }
 

@@ -187,7 +187,7 @@ impl WtParam {
 // two small integers/strings) could POST directly into this endpoint,
 // impersonating an arbitrary `(thread, dir)` identity. If that identity
 // happens to already hold a Full/exact-Always grant for some GUI action,
-// `auto_decision_exact` in [`approve`] would silently wave the forged call
+// `auto_decision_gui` in [`approve`] would silently wave the forged call
 // through with no card at all — Weft would screenshot/click/type with its own
 // desktop permissions on a forged caller's behalf.
 //
@@ -996,7 +996,7 @@ async fn run_action(
                 "triple_click" => 3,
                 _ => 1,
             };
-            acquire_and_throttle(thread, dir)?;
+            acquire_and_throttle(thread, dir, wt)?;
             // Held for the FULL duration of the backend call, per the
             // cross-module contract on `computer::input_flight_guard`'s own
             // doc — a second `tools/call` for the SAME (thread, dir) racing
@@ -1004,7 +1004,7 @@ async fn run_action(
             // own click on the human's real desktop (issue #160 review R1
             // P2).
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir).await?;
+            recheck_after_guard(db, asks, thread, dir, wt).await?;
             // issue #160 round-6 review P1 #3: resolve the window AND map
             // the coordinate FRESH here, after the flight guard — not
             // before it, as this used to. A call that queued on the guard
@@ -1031,7 +1031,7 @@ async fn run_action(
             // click risks landing on Weft's own card instead of the target —
             // and an Auto approval offers no guarantee the target still holds
             // the real OS foreground either.
-            activate_and_recheck(db, asks, thread, dir, w.id).await?;
+            activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             // issue #160 round-10 P1 #B: `activate_target` (inside the call
             // above) shells out to a potentially slow, blocking OS call
             // (osascript/wmctrl/`xdotool --sync`) — the window can move,
@@ -1057,7 +1057,7 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
-                recheck_stop_and_lease_before_backend(thread, &dir_owned)?;
+                recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
                 b.click(px, py, button, count).map_err(|e| e.to_string())
             })
             .await??;
@@ -1076,16 +1076,16 @@ async fn run_action(
             let window_query = required_window(args)?;
             let (cx, cy) = parse_coordinate(args, "coordinate")?;
             check_suspended(asks, thread, dir)?;
-            acquire_and_throttle(thread, dir)?;
+            acquire_and_throttle(thread, dir, wt)?;
             // See the click-family arm above for why this guard is held
             // across the backend call itself, and why window resolution/
             // coordinate mapping now happen AFTER it (issue #160 round-6
             // review P1 #3), TWICE — once before activation, once after
             // (issue #160 round-10 P1 #B).
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir).await?;
+            recheck_after_guard(db, asks, thread, dir, wt).await?;
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            activate_and_recheck(db, asks, thread, dir, w.id).await?;
+            activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             // issue #160 round-10 P1 #B: see the click-family arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
@@ -1096,7 +1096,7 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
-                recheck_stop_and_lease_before_backend(thread, &dir_owned)?;
+                recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
                 b.move_cursor(px, py).map_err(|e| e.to_string())
             })
             .await??;
@@ -1110,9 +1110,9 @@ async fn run_action(
             let (sx, sy) = parse_coordinate(args, "start_coordinate")?;
             let (ex, ey) = parse_coordinate(args, "coordinate")?;
             check_suspended(asks, thread, dir)?;
-            acquire_and_throttle(thread, dir)?;
+            acquire_and_throttle(thread, dir, wt)?;
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir).await?;
+            recheck_after_guard(db, asks, thread, dir, wt).await?;
             // issue #160 round-6 review P1 #3: BOTH endpoints are remapped
             // against the SAME freshly-resolved window — a drag has two
             // coordinates, but only one window to go stale. issue #160
@@ -1120,7 +1120,7 @@ async fn run_action(
             // after activation — see the click-family arm above — and BOTH
             // endpoints are mapped against the SECOND (post-activation) `w2`.
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            activate_and_recheck(db, asks, thread, dir, w.id).await?;
+            activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let from = map_input_coord(thread, dir, &w2, sx, sy)?;
             let to = map_input_coord(thread, dir, &w2, ex, ey)?;
@@ -1131,7 +1131,7 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
-                recheck_stop_and_lease_before_backend(thread, &dir_owned)?;
+                recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
                 b.drag(from, to).map_err(|e| e.to_string())
             })
             .await??;
@@ -1145,11 +1145,11 @@ async fn run_action(
             let (cx, cy) = parse_coordinate(args, "coordinate")?;
             let (dx, dy) = parse_scroll(args)?;
             check_suspended(asks, thread, dir)?;
-            acquire_and_throttle(thread, dir)?;
+            acquire_and_throttle(thread, dir, wt)?;
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir).await?;
+            recheck_after_guard(db, asks, thread, dir, wt).await?;
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            activate_and_recheck(db, asks, thread, dir, w.id).await?;
+            activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             // issue #160 round-10 P1 #B: see the click-family arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
@@ -1160,7 +1160,7 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
-                recheck_stop_and_lease_before_backend(thread, &dir_owned)?;
+                recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
                 b.scroll(px, py, dx, dy).map_err(|e| e.to_string())
             })
             .await??;
@@ -1177,9 +1177,9 @@ async fn run_action(
             // is touched — see `check_type_length`'s own doc for why.
             check_type_length(text)?;
             check_suspended(asks, thread, dir)?;
-            acquire_and_throttle(thread, dir)?;
+            acquire_and_throttle(thread, dir, wt)?;
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir).await?;
+            recheck_after_guard(db, asks, thread, dir, wt).await?;
             // issue #160 round-6 review P1 #2+#3: resolve the window (and,
             // right below, check focus-freshness against it) AFTER the
             // flight guard now too — a queued `type` used to resolve the
@@ -1190,7 +1190,7 @@ async fn run_action(
             // `require_recent_focus`'s doc — just now checked against a
             // freshly-resolved id rather than a possibly-stale one.
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            activate_and_recheck(db, asks, thread, dir, w.id).await?;
+            activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             // issue #160 round-10 P1 #B: re-resolve/re-verify AFTER
             // activation, same as every other input arm — and check focus-
             // freshness against THIS fresh id (`w2.id`), not the
@@ -1208,7 +1208,7 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
-                recheck_stop_and_lease_before_backend(thread, &dir_owned)?;
+                recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
                 b.type_text(&text_owned).map_err(|e| e.to_string())
             })
             .await??;
@@ -1239,12 +1239,12 @@ async fn run_action(
             // unchanged; os.rs itself is not touched here).
             let _ = computer::parse_key_combo(combo).map_err(|e| e.to_string())?;
             check_suspended(asks, thread, dir)?;
-            acquire_and_throttle(thread, dir)?;
+            acquire_and_throttle(thread, dir, wt)?;
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir).await?;
+            recheck_after_guard(db, asks, thread, dir, wt).await?;
             // See the matching comment in the "type" arm above.
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            activate_and_recheck(db, asks, thread, dir, w.id).await?;
+            activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             // issue #160 round-10 P1 #B: see the "type" arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             require_recent_focus(thread, dir, &w2)?;
@@ -1256,7 +1256,7 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
-                recheck_stop_and_lease_before_backend(thread, &dir_owned)?;
+                recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
                 b.key(&combo_owned).map_err(|e| e.to_string())
             })
             .await??;
@@ -1576,7 +1576,7 @@ async fn approve(
     let detail_redacted = (action == "type").then(|| redact_audit_args(action, args).to_string());
 
     // issue #160 round-5 review P1 §1: GUI actions — observation AND input
-    // alike — go through `auto_decision_exact`, NOT the ordinary
+    // alike — go through the GUI-only `auto_decision_gui`, NOT the ordinary
     // `auto_decision` every other tool's ask-creation path uses. The
     // difference is deliberate: `auto_decision` also honors issue #103's
     // coarse "release all read-only" batch/issue grant for any
@@ -1588,13 +1588,18 @@ async fn approve(
     // password manager, …) with no computer-specific card and no chance for
     // the human to see WHICH window before the pixels are captured. That is
     // a materially larger disclosure than the coarse grant was ever built to
-    // cover (issue #103's own "skip the card for `git status`" scope). See
-    // `AskRegistry::auto_decision_exact`'s own doc for the full rationale —
-    // it still honors `dangerous` mode, a Full grant, and an EXACT
-    // Always-grant `action_key` match, exactly like `auto_decision` does for
-    // those same three cases; it just never falls through to the read-only
-    // batch/issue grant underneath them.
-    match asks.auto_decision_exact(thread, dir, &action_key) {
+    // cover (issue #103's own "skip the card for `git status`" scope).
+    //
+    // issue #160 round-25 P1 (Codex ask.rs:2095): `auto_decision_gui` also
+    // drops the GLOBAL `dangerous`-mode shortcut that `auto_decision_exact`
+    // keeps — Dangerous mode's user-facing promise is worktree-scoped ("act
+    // freely inside their worktrees", `i18n` `dangerDesc`), so it must not
+    // silently auto-approve desktop-wide GUI control. A GUI action still
+    // auto-approves ONLY under a precise Full grant or an EXACT Always-grant
+    // `action_key` match (this feature's intended storm-relief valve); a Full
+    // grant and exact Always match behave exactly as before, Dangerous mode no
+    // longer sweeps GUI in. See `AskRegistry::auto_decision_gui`'s own doc.
+    match asks.auto_decision_gui(thread, dir, &action_key) {
         // issue #160 round-10 P1 #A: `resolved` was already computed above,
         // BEFORE this grant was even looked up (the key itself depends on
         // it) — reused directly here rather than resolved a second time, so
@@ -2537,7 +2542,7 @@ fn check_suspended(asks: &AskRegistry, thread: i32, dir: &str) -> Result<(), Str
 /// that function's own doc), so checking it FIRST costs nothing when it
 /// passes, and means a rejected, rate-limited call no longer touches
 /// `acquire_control`/the lease at all.
-fn acquire_and_throttle(thread: i32, dir: &str) -> Result<(), String> {
+fn acquire_and_throttle(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), String> {
     // issue #160 round-13 P2 (Codex computer_srv.rs:1955): a call that is about
     // to be rejected as `Busy` (a DIFFERENT, still-live session holds the
     // control lease) must NOT consume a throttle slot on the way out. The
@@ -2560,12 +2565,16 @@ fn acquire_and_throttle(thread: i32, dir: &str) -> Result<(), String> {
     // the new foreign holder and bails before the throttle), so it can never
     // become the repeatable starvation the peek closes.
     if let Some(holder) = computer::control_state() {
-        if !(holder.thread == thread && holder.dir == dir) {
+        // issue #160 round-25 P1 (Codex mod.rs:1552): `wt` is part of the
+        // holder identity, so a SIBLING worker (same `(thread, dir)`, different
+        // worktree) peeks as a foreign holder and bails with `Busy` here
+        // instead of sliding through as the same holder.
+        if !(holder.thread == thread && holder.dir == dir && holder.wt == wt) {
             return Err(ComputerError::Busy { thread: holder.thread, dir: holder.dir }.to_string());
         }
     }
     computer::throttle_input().map_err(|e| e.to_string())?;
-    computer::acquire_control(thread, dir).map_err(|e| e.to_string())?;
+    computer::acquire_control(thread, dir, wt).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2620,7 +2629,7 @@ fn acquire_and_throttle(thread: i32, dir: &str) -> Result<(), String> {
 /// text [`check_suspended`] itself returns — from the calling agent's point
 /// of view, this is indistinguishable from having queued behind that check
 /// in the first place.
-async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str) -> Result<(), String> {
+async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str, wt: Option<i32>) -> Result<(), String> {
     if asks.has_open(thread, dir) {
         return Err(ComputerError::SuspendedPendingAsk.to_string());
     }
@@ -2637,8 +2646,13 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
     if computer_routes_revoked(thread) && !session_is_live(db, thread, dir, None).await {
         return Err(SESSION_GONE_MSG.to_string());
     }
+    // issue #160 round-25 P1 (Codex mod.rs:1552): compare `wt` too, so a
+    // SIBLING worker (same `(thread, dir)`) that legitimately took the lease
+    // after THIS call's own lease expired while it sat queued is recognized as
+    // a different holder here — not mistaken for "I still hold it" and waved
+    // through to inject.
     match computer::control_state() {
-        Some(holder) if holder.thread == thread && holder.dir == dir => Ok(()),
+        Some(holder) if holder.thread == thread && holder.dir == dir && holder.wt == wt => Ok(()),
         Some(holder) => Err(ComputerError::Busy { thread: holder.thread, dir: holder.dir }.to_string()),
         None => Err(
             "the control lease was lost while this call was queued (it may have expired, or been \
@@ -2669,7 +2683,7 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
 /// instant on the same thread as the backend call, closing that residual gap
 /// completely. Callers `?` this at the head of the closure and never fall
 /// through to the backend call on an `Err`.
-fn recheck_stop_and_lease_before_backend(thread: i32, dir: &str) -> Result<(), String> {
+fn recheck_stop_and_lease_before_backend(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), String> {
     if computer::stop_latched() {
         return Err(ComputerError::Disabled.to_string());
     }
@@ -2685,7 +2699,7 @@ fn recheck_stop_and_lease_before_backend(thread: i32, dir: &str) -> Result<(), S
     // directions. Lease-clearing is direction-precise (the lease names exactly
     // one `(thread, dir)`), so it refuses only the torn-down route.
     match computer::control_state() {
-        Some(holder) if holder.thread == thread && holder.dir == dir => Ok(()),
+        Some(holder) if holder.thread == thread && holder.dir == dir && holder.wt == wt => Ok(()),
         Some(holder) => Err(ComputerError::Busy { thread: holder.thread, dir: holder.dir }.to_string()),
         None => Err(
             "the control lease was lost just before injection (it may have expired, or been \
@@ -2726,10 +2740,11 @@ async fn activate_and_recheck(
     asks: &AskRegistry,
     thread: i32,
     dir: &str,
+    wt: Option<i32>,
     window_id: u32,
 ) -> Result<(), String> {
     on_blocking(move || activate_target(window_id)).await??;
-    recheck_after_guard(db, asks, thread, dir).await
+    recheck_after_guard(db, asks, thread, dir, wt).await
 }
 
 /// `arr[0]`/`arr[1]` must each fit `u32` — issue #160 round-3 P2 §3: this
@@ -3580,6 +3595,69 @@ fn refuse_symlinks(base: &std::path::Path, components: &[&str]) -> Result<std::p
     Ok(current)
 }
 
+/// Resolve `<root>/<leaf>` for a computer-use output write (the screenshots
+/// directory or the audit log), refusing if ANY path component from
+/// `weft_home` down — `computer/`, `<thread>/`, `<dir>/`, `wt-<id>/`, AND the
+/// final `<leaf>` — is a symlink. issue #160 round-25 P1 (Codex paths.rs:90).
+///
+/// [`refuse_symlinks`] alone only walks the components appended AFTER its
+/// `base`; both output resolvers passed the already-joined [`session_root`] as
+/// that `base` with just the leaf as a component, so a symlink pre-created at
+/// an ANCESTOR — `computer/` itself, or the per-thread / per-direction /
+/// per-worktree directories [`session_root`] resolves, every one of which
+/// [`crate::paths::computer_output_root`]'s own `create_dir_all` would happily
+/// FOLLOW — escaped the check entirely, while `O_NOFOLLOW` (see
+/// [`append_audit`]) guarded only the final audit filename. A same-uid process
+/// could therefore redirect screenshots and audit appends outside
+/// Weft-managed storage, including into a pre-created attacker-readable file.
+///
+/// Anchoring the walk at `weft_home` — the one directory Weft owns outright, a
+/// symlink THERE being the user's own doing (the same-uid isolation ceiling
+/// this module's top-of-file doc already accepts) — and re-deriving every
+/// intermediate segment from the resolved `root` closes that: a compromised
+/// ancestor is now named and refused BEFORE either output is created or
+/// opened. `root` is always a `session_root` result (built by joining onto
+/// `computer_output_root` = `weft_home/computer`), so the strip below cannot
+/// fail in production; a `root` that somehow does not live under `weft_home`
+/// fails CLOSED rather than silently skipping the ancestor walk.
+fn refuse_symlinked_output(
+    root: &std::path::Path,
+    leaf: &str,
+) -> Result<std::path::PathBuf, String> {
+    let home = crate::paths::weft_home().map_err(|e| format!("weft home unavailable: {e}"))?;
+    let rel = root.strip_prefix(&home).map_err(|_| {
+        format!(
+            "refusing to write computer output outside weft home: {}",
+            root.display()
+        )
+    })?;
+    let mut components: Vec<&str> = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(seg) => match seg.to_str() {
+                Some(s) => components.push(s),
+                None => {
+                    return Err(format!(
+                        "refusing to write through a non-UTF8 path component under {}",
+                        home.display()
+                    ))
+                }
+            },
+            // A session_root is only ever `weft_home` + normal names; anything
+            // else (a stray `..`, a rooted segment) is not a shape we resolve,
+            // so refuse rather than walk it.
+            _ => {
+                return Err(format!(
+                    "refusing to write through a non-normal path component in {}",
+                    root.display()
+                ))
+            }
+        }
+    }
+    components.push(leaf);
+    refuse_symlinks(&home, &components)
+}
+
 /// Resolve the screenshot output directory for `(thread, dir[, wt])`:
 ///  - worker lane: `<session_root>/screenshots` — a dedicated, Weft-managed
 ///    directory (see [`session_root`]'s own doc for the round-10 P1 #1 move
@@ -3604,7 +3682,7 @@ async fn screenshot_out_dir(db: &Db, thread: i32, dir: &str, wt: Option<i32>) ->
     let root = session_root(db, thread, dir, wt)
         .await
         .ok_or_else(|| "no worktree for this session".to_string())?;
-    refuse_symlinks(&root, &["screenshots"])
+    refuse_symlinked_output(&root, "screenshots")
 }
 
 /// Resolve the audit log path for `(thread, dir[, wt])`:
@@ -3627,7 +3705,7 @@ async fn screenshot_out_dir(db: &Db, thread: i32, dir: &str, wt: Option<i32>) ->
 /// goes unlogged, same as any other audit-write failure.
 async fn audit_log_path(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Option<std::path::PathBuf> {
     let root = session_root(db, thread, dir, wt).await?;
-    refuse_symlinks(&root, &["computer-audit.jsonl"]).ok()
+    refuse_symlinked_output(&root, "computer-audit.jsonl").ok()
 }
 
 #[cfg(test)]
@@ -3815,10 +3893,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(600));
 
         // A DIFFERENT session holds the live control lease.
-        computer::acquire_control(999, "foreign").unwrap();
+        computer::acquire_control(999, "foreign", None).unwrap();
 
         // Our call is rejected Busy...
-        let err = acquire_and_throttle(1, "10").unwrap_err();
+        let err = acquire_and_throttle(1, "10", None).unwrap_err();
         assert!(err.contains("controlling the desktop"), "expected a Busy rejection, got: {err}");
 
         // ...and it must have left the throttle untouched: the real holder's
@@ -4179,10 +4257,10 @@ mod tests {
     /// The other half of the property: a session with NO grant at all except
     /// a precise, EXACT `action_key` Always grant for this SAME
     /// `screenshot @ notes` call is still auto-approved without a card —
-    /// `auto_decision_exact` keeps honoring Full/Always exactly like
-    /// `auto_decision` does, it just drops the read-only batch/issue
-    /// fallback. Proves the fix is a narrowing, not a blanket "GUI actions
-    /// never auto-approve".
+    /// `auto_decision_gui` keeps honoring Full/Always exactly like
+    /// `auto_decision` does, it just drops the read-only batch/issue fallback
+    /// (and, round-25, the global `dangerous` shortcut). Proves the fix is a
+    /// narrowing, not a blanket "GUI actions never auto-approve".
     #[tokio::test]
     async fn screenshot_auto_approves_with_an_exact_always_grant_and_no_read_only_batch() {
         // issue #160 round-11 P1 #C: `screenshot` now resolves its window
@@ -5558,30 +5636,61 @@ mod tests {
         // the lease for THIS (thread, dir).
         let base_gen = computer::trip_stop_latch();
         assert!(computer::clear_emergency_stop(base_gen));
-        computer::acquire_control(thread, dir).unwrap();
+        computer::acquire_control(thread, dir, None).unwrap();
         // Latch clear AND this exact (thread, dir) holds the lease — the only
         // combination allowed to reach the injection backend.
-        assert!(recheck_stop_and_lease_before_backend(thread, dir).is_ok());
+        assert!(recheck_stop_and_lease_before_backend(thread, dir, None).is_ok());
 
         // Emergency Stop landing after the last async recheck (during the final
         // resolve, or while the closure sat queued for a blocking thread) trips
         // the latch — deny with the disabled message. `trip_stop_latch` ALSO
         // clears the lease, so the stop check firing first is what this asserts.
         let stop_gen = computer::trip_stop_latch();
-        let err = recheck_stop_and_lease_before_backend(thread, dir).unwrap_err();
+        let err = recheck_stop_and_lease_before_backend(thread, dir, None).unwrap_err();
         assert!(err.to_lowercase().contains("disabled"), "{err}");
         assert!(computer::clear_emergency_stop(stop_gen));
 
         // Latch clear, but the lease is gone (Escape cleared it / it expired in
         // that same window) — deny, and NOT with the disabled message.
         computer::clear_control();
-        let err = recheck_stop_and_lease_before_backend(thread, dir).unwrap_err();
+        let err = recheck_stop_and_lease_before_backend(thread, dir, None).unwrap_err();
         assert!(!err.to_lowercase().contains("disabled"), "{err}");
 
         // A DIFFERENT (thread, dir) now holds the lease — deny (busy).
-        computer::acquire_control(999_999, "someone-else").unwrap();
-        let err = recheck_stop_and_lease_before_backend(thread, dir).unwrap_err();
+        computer::acquire_control(999_999, "someone-else", None).unwrap();
+        let err = recheck_stop_and_lease_before_backend(thread, dir, None).unwrap_err();
         assert!(err.contains("999999") || err.contains("someone-else"), "{err}");
+        computer::clear_control();
+    }
+
+    /// issue #160 round-25 P1 (Codex mod.rs:1552): the final recheck compares
+    /// `wt` too, so a SIBLING worker (SAME `(thread, dir)`, different worktree)
+    /// holding the lease is NOT mistaken for "I still hold it". Worker wt=1's
+    /// recheck must fail while sibling wt=2 holds the lease, even though thread
+    /// and dir match exactly; the actual holder (wt=2) still passes — proving
+    /// this is the wt discrimination, not a blanket refusal.
+    #[test]
+    fn recheck_before_backend_rejects_a_sibling_worker_holding_the_lease() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let thread = 906_401;
+        let dir = "55";
+
+        let base_gen = computer::trip_stop_latch();
+        assert!(computer::clear_emergency_stop(base_gen));
+
+        // Sibling worker wt=2 holds the lease.
+        computer::acquire_control(thread, dir, Some(2)).unwrap();
+
+        // Worker wt=1's final recheck must NOT pass — a busy/lease rejection,
+        // not a stop (the latch is clear).
+        let err = recheck_stop_and_lease_before_backend(thread, dir, Some(1)).unwrap_err();
+        assert!(
+            !err.to_lowercase().contains("disabled"),
+            "must be a busy/lease rejection, not a stop: {err}"
+        );
+
+        // The actual holder (wt=2) still passes.
+        assert!(recheck_stop_and_lease_before_backend(thread, dir, Some(2)).is_ok());
         computer::clear_control();
     }
 
@@ -5779,7 +5888,7 @@ mod tests {
         // Disabled setting denies regardless of the lease.
         repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "false").await.unwrap();
         computer::clear_control();
-        let err = recheck_after_guard(&db, &asks, thread, dir).await.unwrap_err();
+        let err = recheck_after_guard(&db, &asks, thread, dir, None).await.unwrap_err();
         assert!(err.to_lowercase().contains("disabled"), "{err}");
 
         // Enabled, but nobody holds the lease at all (it expired, or was
@@ -5787,21 +5896,21 @@ mod tests {
         // not silently allowed just because the setting itself reads true.
         repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
         computer::clear_control();
-        let err = recheck_after_guard(&db, &asks, thread, dir).await.unwrap_err();
+        let err = recheck_after_guard(&db, &asks, thread, dir, None).await.unwrap_err();
         assert!(!err.to_lowercase().contains("disabled"), "{err}");
 
         // Enabled, but a DIFFERENT (thread, dir) now holds the lease
         // (preempted while this call was queued behind the flight guard) —
         // denied.
-        computer::acquire_control(999_999, "someone-else").unwrap();
-        let err = recheck_after_guard(&db, &asks, thread, dir).await.unwrap_err();
+        computer::acquire_control(999_999, "someone-else", None).unwrap();
+        let err = recheck_after_guard(&db, &asks, thread, dir, None).await.unwrap_err();
         assert!(err.contains("999999") || err.contains("someone-else"), "{err}");
         computer::clear_control();
 
         // Enabled AND this exact (thread, dir) still holds the lease —
         // passes.
-        computer::acquire_control(thread, dir).unwrap();
-        assert!(recheck_after_guard(&db, &asks, thread, dir).await.is_ok());
+        computer::acquire_control(thread, dir, None).unwrap();
+        assert!(recheck_after_guard(&db, &asks, thread, dir, None).await.is_ok());
 
         // issue #160 round-5 review P1 §2: a brand-new, unrelated ask opening
         // for this EXACT (thread, dir) — simulating one that opened WHILE this
@@ -5813,18 +5922,18 @@ mod tests {
         let (other_id, _rx) =
             asks.request(thread, "some-other-dir", "tool", "summary", "detail", crate::ask::RiskLevel::Unknown, "[]");
         assert!(
-            recheck_after_guard(&db, &asks, thread, dir).await.is_ok(),
+            recheck_after_guard(&db, &asks, thread, dir, None).await.is_ok(),
             "a DIFFERENT (thread, dir)'s open ask must not affect this one"
         );
         assert!(asks.answer(other_id, crate::ask::Answer::Deny));
 
         let (id, _rx) = asks.request(thread, dir, "tool", "summary", "detail", crate::ask::RiskLevel::Unknown, "[]");
-        let err = recheck_after_guard(&db, &asks, thread, dir).await.unwrap_err();
+        let err = recheck_after_guard(&db, &asks, thread, dir, None).await.unwrap_err();
         assert!(err.contains("permission card"), "{err}");
 
         // Once answered, the recheck passes again.
         assert!(asks.answer(id, crate::ask::Answer::Deny));
-        assert!(recheck_after_guard(&db, &asks, thread, dir).await.is_ok());
+        assert!(recheck_after_guard(&db, &asks, thread, dir, None).await.is_ok());
 
         computer::clear_control();
     }
@@ -6327,12 +6436,12 @@ mod tests {
 
         // First call: nobody holds the lease and the throttle window has
         // already elapsed — both checks pass, taking a fresh lease.
-        acquire_and_throttle(931_001, "90").expect("the first call must succeed");
+        acquire_and_throttle(931_001, "90", None).expect("the first call must succeed");
         let after_first = computer::control_state().expect("the lease must be held after the first call");
 
         // A SECOND call for the SAME (thread, dir), immediately after — well
         // inside the throttle window — must be rejected...
-        let err = acquire_and_throttle(931_001, "90")
+        let err = acquire_and_throttle(931_001, "90", None)
             .expect_err("a call inside the throttle window must be rejected");
         assert!(err.to_lowercase().contains("rate-limited"), "{err}");
 
@@ -6456,6 +6565,94 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_file(&secret);
+    }
+
+    // —— issue #160 round-25 P1 (Codex paths.rs:90): refuse_symlinked_output
+    // walks EVERY ancestor from weft_home down, not just the appended leaf ——
+
+    /// The ordinary case: an all-real ancestor chain resolves to
+    /// `<weft_home>/computer/<thread>/<dir>/wt-<id>/<leaf>`, unchanged from what
+    /// the old leaf-only `refuse_symlinks` produced.
+    #[test]
+    fn refuse_symlinked_output_accepts_an_ordinary_ancestor_chain() {
+        let _g = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home =
+            std::env::temp_dir().join(format!("weft-symanc-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("WEFT_HOME", &home);
+        let root = home.join("computer").join("5").join("10").join("wt-3");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let out = refuse_symlinked_output(&root, "screenshots").unwrap();
+        assert_eq!(out, root.join("screenshots"));
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A symlink at the `computer/` ancestor — the FIRST segment under
+    /// weft_home, and exactly the one `computer_output_root`'s own
+    /// `create_dir_all` would follow — is refused, where the old leaf-only
+    /// check would have written straight through it.
+    #[cfg(unix)]
+    #[test]
+    fn refuse_symlinked_output_rejects_a_symlinked_computer_ancestor() {
+        let _g = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home =
+            std::env::temp_dir().join(format!("weft-symanc-comp-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("weft-symanc-comp-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::env::set_var("WEFT_HOME", &home);
+        // `computer` itself is a symlink pointing outside weft-managed storage.
+        std::os::unix::fs::symlink(&outside, home.join("computer")).unwrap();
+        let root = home.join("computer").join("5").join("10").join("wt-3");
+
+        let err = refuse_symlinked_output(&root, "screenshots").unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !outside.join("5").join("10").join("wt-3").join("screenshots").exists(),
+            "must never resolve a write through the symlinked computer ancestor"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A symlink at the deepest `wt-<id>/` ancestor (a per-worktree directory
+    /// [`session_root`] resolves) is likewise refused — the ancestor walk
+    /// covers the whole chain, not only its ends.
+    #[cfg(unix)]
+    #[test]
+    fn refuse_symlinked_output_rejects_a_symlinked_worktree_ancestor() {
+        let _g = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home =
+            std::env::temp_dir().join(format!("weft-symanc-wt-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("weft-symanc-wt-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        let parent = home.join("computer").join("5").join("10");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::env::set_var("WEFT_HOME", &home);
+        std::os::unix::fs::symlink(&outside, parent.join("wt-3")).unwrap();
+        let root = parent.join("wt-3");
+
+        let err = refuse_symlinked_output(&root, "computer-audit.jsonl").unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !outside.join("computer-audit.jsonl").exists(),
+            "must never resolve an audit write through the symlinked worktree ancestor"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     // —— issue #160 round-4 P2 §3: O_NOFOLLOW closes the leaf open TOCTOU ——

@@ -1367,6 +1367,18 @@ pub fn encode_jpeg_data_uri(
 struct ControlHolderState {
     thread: i32,
     dir: String,
+    /// The exact worktree this holder's session materialized into (issue #160
+    /// round-25 P1, Codex mod.rs:1552) — `None` for the lead lane (no
+    /// worktree). Two SIBLING worker sessions of one multi-repo direction share
+    /// a single `(thread, dir)` and differ ONLY by `wt`; without it in the
+    /// holder identity the second sibling read as the SAME holder and RENEWED
+    /// the first's lease instead of getting `Busy`, letting the two agents
+    /// interleave click/focus/type against the same physical desktop under one
+    /// lease. Folded into every identity check ([`acquire_control`],
+    /// [`release_control`], and `bus::computer_srv`'s post-queue rechecks) so a
+    /// sibling is a DIFFERENT holder — the same `(thread, dir, wt)` triple the
+    /// per-session bearer already binds (round-13/14).
+    wt: Option<i32>,
     expires_at_ms: u64,
     /// Whether THIS hold's OS-level global Escape shortcut registration has
     /// actually finished and passed [`escape_guard_permits_control`] (issue
@@ -1392,6 +1404,13 @@ struct ControlHolderState {
 pub struct ControlHolder {
     pub thread: i32,
     pub dir: String,
+    /// The exact worktree the holder's session materialized into (issue #160
+    /// round-25 P1) — `None` for the lead lane. Carried so the Settings banner
+    /// and the post-queue lease rechecks in `bus::computer_srv` identify the
+    /// holder by the SAME `(thread, dir, wt)` triple [`acquire_control`] keys
+    /// on, and a sibling worker (same `(thread, dir)`, different `wt`) is never
+    /// mistaken for the current holder.
+    pub wt: Option<i32>,
     pub expires_at_ms: u64,
 }
 
@@ -1539,14 +1558,19 @@ fn now_ms() -> u64 {
 /// the same registration window still gets `Busy` (never steals the slot),
 /// and a registration that hangs forever still self-heals via the normal 30s
 /// lease expiry rather than wedging the desktop.
-pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
+pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), ComputerError> {
     let now = now_ms();
     let sync_needed;
     {
         let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(holder) => {
-                let is_same_holder = holder.thread == thread && holder.dir == dir;
+                // issue #160 round-25 P1 (Codex mod.rs:1552): `wt` is part of
+                // the holder identity, so a SIBLING worker session (same
+                // `(thread, dir)`, different worktree) is a DIFFERENT holder and
+                // gets `Busy` below rather than silently renewing this lease.
+                let is_same_holder =
+                    holder.thread == thread && holder.dir == dir && holder.wt == wt;
                 let is_live = holder_is_live(holder.expires_at_ms, now);
                 if is_live && !is_same_holder {
                     return Err(ComputerError::Busy {
@@ -1591,6 +1615,7 @@ pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
             *guard = Some(ControlHolderState {
                 thread,
                 dir: dir.to_string(),
+                wt,
                 expires_at_ms: now + CONTROL_LEASE_MS,
                 escape_ready: false,
             });
@@ -1627,7 +1652,7 @@ pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
             // Only clears OUR OWN just-stored hold — if some other caller
             // already raced in and overwrote it, this leaves that one alone.
             let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-            if matches!(guard.as_ref(), Some(h) if h.thread == thread && h.dir == dir) {
+            if matches!(guard.as_ref(), Some(h) if h.thread == thread && h.dir == dir && h.wt == wt) {
                 *guard = None;
             }
             return Err(ComputerError::EscapeUnavailable);
@@ -1647,7 +1672,7 @@ pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
         // once this call resumes).
         let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_mut() {
-            Some(h) if h.thread == thread && h.dir == dir => {
+            Some(h) if h.thread == thread && h.dir == dir && h.wt == wt => {
                 h.escape_ready = true;
             }
             _ => {
@@ -1673,9 +1698,9 @@ pub fn acquire_control(thread: i32, dir: &str) -> Result<(), ComputerError> {
 /// anywhere today (see [`acquire_control`]'s doc comment on why expiry alone
 /// is sufficient); this exists for a caller that knows it's done and wants
 /// the next session unblocked sooner than the full 30s lease.
-pub fn release_control(thread: i32, dir: &str) {
+pub fn release_control(thread: i32, dir: &str, wt: Option<i32>) {
     let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-    if matches!(guard.as_ref(), Some(h) if h.thread == thread && h.dir == dir) {
+    if matches!(guard.as_ref(), Some(h) if h.thread == thread && h.dir == dir && h.wt == wt) {
         *guard = None;
     }
 }
@@ -1695,6 +1720,7 @@ fn control_state_detect_and_clear_if_expired() -> (Option<ControlHolder>, bool) 
             Some(ControlHolder {
                 thread: h.thread,
                 dir: h.dir.clone(),
+                wt: h.wt,
                 expires_at_ms: h.expires_at_ms,
             }),
             false,
@@ -3351,29 +3377,29 @@ mod tests {
         clear_control();
         assert!(control_state().is_none());
 
-        acquire_control(1, "10").unwrap();
+        acquire_control(1, "10", None).unwrap();
         let held = control_state().unwrap();
         assert_eq!((held.thread, held.dir.as_str()), (1, "10"));
 
         // A different (thread, dir) is blocked while the lease is live.
-        let err = acquire_control(2, "20").unwrap_err();
+        let err = acquire_control(2, "20", None).unwrap_err();
         assert!(matches!(err, ComputerError::Busy { thread: 1, dir } if dir == "10"));
 
         // The SAME holder re-acquiring (renewing) still succeeds.
-        acquire_control(1, "10").unwrap();
+        acquire_control(1, "10", None).unwrap();
 
         // Releasing a lease you do NOT hold is a no-op.
-        release_control(2, "20");
+        release_control(2, "20", None);
         assert!(control_state().is_some());
 
         // The real holder releasing frees it up immediately.
-        release_control(1, "10");
+        release_control(1, "10", None);
         assert!(control_state().is_none());
 
         // A manually-expired lease reads as absent (and is cleaned up) —
         // simulated by acquiring, then reaching into the internal state to
         // force `expires_at_ms` into the past instead of sleeping 30s.
-        acquire_control(1, "10").unwrap();
+        acquire_control(1, "10", None).unwrap();
         {
             let mut guard = control_mutex().lock().unwrap();
             if let Some(h) = guard.as_mut() {
@@ -3382,12 +3408,56 @@ mod tests {
         }
         assert!(control_state().is_none(), "expired lease must read as absent");
         // ... and once expired, someone else CAN acquire it.
-        acquire_control(2, "20").unwrap();
+        acquire_control(2, "20", None).unwrap();
 
         // clear_control wipes it unconditionally, even mid-lease.
         assert!(control_state().is_some());
         clear_control();
         assert!(control_state().is_none());
+    }
+
+    /// issue #160 round-25 P1 (Codex mod.rs:1552): two SIBLING worker sessions
+    /// of one multi-repo direction share a single `(thread, dir)` and differ
+    /// ONLY by `wt`. The second sibling must be a DIFFERENT holder — it gets
+    /// `Busy` while the first holds the lease, never a silent renewal that
+    /// would let the two agents interleave input under one lease. A same-`wt`
+    /// re-acquire still renews, and `release_control` frees only the exact
+    /// `(thread, dir, wt)`.
+    #[test]
+    fn sibling_workers_differing_only_by_wt_are_distinct_lease_holders() {
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_control();
+
+        // Worker A (worktree 1) takes the lease.
+        acquire_control(7, "42", Some(1)).unwrap();
+        let held = control_state().unwrap();
+        assert_eq!((held.thread, held.dir.as_str(), held.wt), (7, "42", Some(1)));
+
+        // Sibling worker B (SAME thread+dir, worktree 2) is a DIFFERENT holder
+        // and is blocked — not treated as a same-holder renewal.
+        let err = acquire_control(7, "42", Some(2)).unwrap_err();
+        assert!(
+            matches!(err, ComputerError::Busy { thread: 7, ref dir } if dir == "42"),
+            "a sibling worker (different wt) must get Busy, got {err:?}"
+        );
+
+        // Worker A renewing its OWN lease (same wt) still succeeds.
+        acquire_control(7, "42", Some(1)).unwrap();
+
+        // Releasing under the WRONG wt is a no-op — B cannot free A's lease.
+        release_control(7, "42", Some(2));
+        assert!(
+            control_state().is_some(),
+            "a sibling's release must not free the holder's lease"
+        );
+
+        // A releasing its own exact (thread, dir, wt) frees it, and B can then
+        // take it.
+        release_control(7, "42", Some(1));
+        assert!(control_state().is_none());
+        acquire_control(7, "42", Some(2)).unwrap();
+        assert_eq!(control_state().unwrap().wt, Some(2));
+        clear_control();
     }
 
     // —— issue #160 round-4 P2 §4: the Escape-shortcut unregister race ——
@@ -3419,7 +3489,7 @@ mod tests {
         SHORTCUT_REGISTER_ATTEMPTS.store(0, Ordering::SeqCst);
         SHORTCUT_UNREGISTER_ATTEMPTS.store(0, Ordering::SeqCst);
 
-        acquire_control(950_001, "a").unwrap();
+        acquire_control(950_001, "a", None).unwrap();
         assert_eq!(SHORTCUT_REGISTER_ATTEMPTS.load(Ordering::SeqCst), 1, "the first hold must register");
 
         // Force the lease to look expired, exactly like
@@ -3445,7 +3515,7 @@ mod tests {
         // *** THE RACE ***: a DIFFERENT (thread, dir) acquires the now-vacant
         // lease and runs its OWN full register cycle BEFORE the first
         // caller's belated sync (below) ever runs.
-        acquire_control(950_002, "b").unwrap();
+        acquire_control(950_002, "b", None).unwrap();
         assert_eq!(SHORTCUT_REGISTER_ATTEMPTS.load(Ordering::SeqCst), 2, "the new holder must register too");
 
         // Phase 2, NOW (late): the ORIGINAL caller's belated sync finally
@@ -3479,7 +3549,7 @@ mod tests {
         crate::store::repo::set_setting(&db, K_COMPUTER_USE_ENABLED, "true")
             .await
             .unwrap();
-        acquire_control(9, "90").unwrap();
+        acquire_control(9, "90", None).unwrap();
 
         let result = emergency_stop(&db).await;
 
@@ -3767,7 +3837,7 @@ mod tests {
     async fn control_lease_and_escape_registration_stay_live_while_an_input_is_in_flight() {
         let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         clear_control();
-        acquire_control(1, "10").unwrap();
+        acquire_control(1, "10", None).unwrap();
 
         // Force the lease's own timer into the past — standing in for a
         // synchronous injection that ran past CONTROL_LEASE_MS, exactly like
@@ -3869,7 +3939,7 @@ mod tests {
         // `acquire_control`-touching test incidentally succeeding.
         let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         clear_control();
-        assert!(acquire_control(920_001, "esc-no-handle").is_ok());
+        assert!(acquire_control(920_001, "esc-no-handle", None).is_ok());
         clear_control();
     }
 
@@ -3886,7 +3956,7 @@ mod tests {
     fn acquire_control_fresh_hold_marks_escape_ready_when_no_subsystem_exists() {
         let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         clear_control();
-        assert!(acquire_control(920_101, "esc-ready-fresh").is_ok());
+        assert!(acquire_control(920_101, "esc-ready-fresh", None).is_ok());
         {
             let guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
             let holder = guard.as_ref().expect("fresh acquire must have stored a holder");
@@ -3915,6 +3985,7 @@ mod tests {
             *guard = Some(ControlHolderState {
                 thread: 920_201,
                 dir: "esc-pending".to_string(),
+                wt: None,
                 expires_at_ms: now + CONTROL_LEASE_MS,
                 escape_ready: false,
             });
@@ -3922,7 +3993,7 @@ mod tests {
 
         // (a) The SAME holder racing back in while registration is still
         // pending must be refused, not silently renewed.
-        let err = acquire_control(920_201, "esc-pending").unwrap_err();
+        let err = acquire_control(920_201, "esc-pending", None).unwrap_err();
         assert!(
             matches!(err, ComputerError::EscapeRegistrationPending),
             "a same-holder re-acquire against a pending lease must be refused, got {err:?}"
@@ -3931,7 +4002,7 @@ mod tests {
         // (b) A DIFFERENT holder still reads this pending lease as live and
         // gets the ordinary Busy error — it must not be able to steal the
         // slot just because registration hasn't confirmed yet.
-        let err = acquire_control(920_202, "esc-other").unwrap_err();
+        let err = acquire_control(920_202, "esc-other", None).unwrap_err();
         assert!(
             matches!(err, ComputerError::Busy { thread: 920_201, ref dir } if dir == "esc-pending"),
             "a different holder must still see Busy against a pending lease, got {err:?}"
@@ -3955,7 +4026,7 @@ mod tests {
             }
         }
         assert!(
-            acquire_control(920_201, "esc-pending").is_ok(),
+            acquire_control(920_201, "esc-pending", None).is_ok(),
             "a same-holder renewal must succeed once escape_ready is true"
         );
 

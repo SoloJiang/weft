@@ -9,7 +9,11 @@ import { Button } from "./ui/Button";
 
 const POLL_MS = 3000;
 
-type ControlState = { thread: number; dir: string; expires_at_ms: number };
+// `wt` (issue #160 round-25 P1): the exact worktree the holder session
+// materialized into, or null for the lead lane — part of the lease holder
+// identity so sibling workers of one direction are distinct holders. The
+// banner keys its display on (thread, dir) and does not surface wt today.
+type ControlState = { thread: number; dir: string; wt: number | null; expires_at_ms: number };
 
 // One discriminated status the banner renders from, instead of re-deriving
 // "is it visible / is it the error variant" booleans at each call site (see

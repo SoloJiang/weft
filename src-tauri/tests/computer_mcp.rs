@@ -588,7 +588,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // this session's input action is rejected without ever reaching the
     // backend (mock action count stays at 2, from scenario 1's activate+click).
     computer::clear_control();
-    computer::acquire_control(999, "other").unwrap();
+    computer::acquire_control(999, "other", None).unwrap();
     let out = rpc(
         &base,
         thread,

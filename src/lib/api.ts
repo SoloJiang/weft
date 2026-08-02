@@ -340,7 +340,7 @@ export const api = {
   // issue #160 M2: who (if anyone) currently holds the computer-use control
   // mutex, for the global control banner + kill switch.
   getComputerControlState: () =>
-    invoke<{ thread: number; dir: string; expires_at_ms: number } | null>(
+    invoke<{ thread: number; dir: string; wt: number | null; expires_at_ms: number } | null>(
       "get_computer_control_state",
     ),
   computerEmergencyStop: () => invoke<void>("computer_emergency_stop"),
