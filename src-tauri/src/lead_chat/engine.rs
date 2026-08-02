@@ -53,10 +53,11 @@ const STREAM_THROTTLE_MS: u128 = 150;
 /// trips on a wedged/dead child to keep the session from becoming unstoppable.
 const WRITE_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Bound the DB half of a hidden receipt while it owns the per-surface
-/// admission gate. A canceled/hung SQLite future must not strand the gate (or
-/// a shared receipt token after engine replacement) indefinitely.
-const HIDDEN_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Warning threshold for a hidden receipt that is still waiting for its DB
+/// transaction. This is diagnostic only: the transaction future is never
+/// canceled, and the in-flight token remains an admission fence until commit or
+/// rollback is known.
+const HIDDEN_RECEIPT_WARNING: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 一条待发排队消息的前端视图。`images`/`files` 仅给个数（栈里显示角标用）。
 #[derive(Clone, serde::Serialize)]
@@ -672,48 +673,25 @@ fn note_turn_activity(app: &AppHandle, db: &Db, eng: &EngineRef, inner: &mut Eng
         // TurnEnd/EOF handler may retarget `turn_user_row` before that task is
         // polled; the in-flight id is the durable reservation that keeps a
         // concurrent visible admission from enqueueing the same pending row.
-        let Some(receipt_guard) = register_hidden_receipt(&mut *inner, delivery_id) else {
+        if !register_hidden_receipt(&mut *inner, delivery_id) {
             return;
-        };
+        }
         let admission_key = inner
             .session_id
             .map(i64::from)
             .unwrap_or_else(|| super::commands::lead_key(inner.thread_id));
         let db = db.clone();
         let eng = eng.clone();
-        tauri::async_runtime::spawn(async move {
-            let _receipt_guard = receipt_guard;
-            // Durable consumption is another linearization point for the
-            // hidden/visible admission pair. Serialize it with the same
-            // per-surface gate before touching the DB: if admission wins, the
-            // row is already represented by that hidden turn; if consumption
-            // wins, the visible recheck observes `consumed` and skips it.
-            let _serial = admission_gate_for_key(admission_key).lock_owned().await;
-            match tokio::time::timeout(
-                HIDDEN_RECEIPT_TIMEOUT,
-                repo::consume_lead_hidden_delivery(&db, delivery_id),
-            )
-            .await
-            {
-                Ok(Ok(Some(_))) | Ok(Ok(None)) => {
-                    let mut i = eng.lock().await;
-                    finish_hidden_receipt(&mut i, delivery_id, true);
-                }
-                Ok(Err(e)) => {
-                    eprintln!("[weft] consume hidden delivery failed: {e}");
-                    let mut i = eng.lock().await;
-                    finish_hidden_receipt(&mut i, delivery_id, false);
-                }
-                Err(_) => {
-                    eprintln!(
-                        "[weft] consume hidden delivery timed out after {:?}",
-                        HIDDEN_RECEIPT_TIMEOUT
-                    );
-                    let mut i = eng.lock().await;
-                    finish_hidden_receipt(&mut i, delivery_id, false);
-                }
-            }
-        });
+        let registry = inner.hidden_receipt_inflight.clone();
+        tauri::async_runtime::spawn(run_hidden_receipt_worker(
+            eng,
+            admission_key,
+            delivery_id,
+            registry,
+            async move { repo::consume_lead_hidden_delivery(&db, delivery_id).await },
+            HIDDEN_RECEIPT_WARNING,
+            None,
+        ));
         return;
     }
     let app = app.clone();
@@ -800,6 +778,18 @@ fn hidden_turn_admissible(inner: &EngineInner) -> bool {
     !inner.stopped && !inner.tearing_down
 }
 
+/// Whether a hidden admission should ensure a resident that is already active.
+/// Durable hydration needs this even when its caller did not request a revive;
+/// stopped background rows remain deferred, while an explicit path may clear
+/// `stopped` before calling this policy.
+fn should_ensure_active_resident(
+    inner: &EngineInner,
+    ensure: bool,
+    hidden_delivery_id: Option<i32>,
+) -> bool {
+    !inner.stopped && (ensure || hidden_delivery_id.is_some())
+}
+
 fn hidden_delivery_is_duplicate(inner: &EngineInner, delivery_id: i32) -> bool {
     inner.hidden_receipt_inflight.contains(&delivery_id)
         || inner.turn_user_row == Some(-delivery_id)
@@ -813,32 +803,62 @@ fn hidden_delivery_is_duplicate(inner: &EngineInner, delivery_id: i32) -> bool {
 /// already owns it), so TurnEnd/EOF cannot clear the only marker between the
 /// activity observation and task creation. Returns false when an older receipt
 /// for the same delivery is already in flight; one DB consume is sufficient.
-struct HiddenReceiptGuard {
+fn register_hidden_receipt(inner: &mut EngineInner, delivery_id: i32) -> bool {
+    inner.hidden_receipt_inflight.insert(delivery_id)
+}
+
+type HiddenReceiptResult =
+    anyhow::Result<Option<crate::store::entities::lead_hidden_delivery::Model>>;
+
+/// Run one hidden receipt's DB transaction to completion without holding the
+/// admission gate. The caller detaches this worker, so an admission/engine task
+/// cannot abort the transaction future at the warning threshold. The shared
+/// in-flight token remains visible to every engine replacement until this worker
+/// observes a committed success or a definite rollback/error, then the short
+/// gate+engine cleanup linearizes the result.
+async fn run_hidden_receipt_worker<F>(
+    eng: EngineRef,
+    admission_key: i64,
+    delivery_id: i32,
     registry: Arc<DashSet<i32>>,
-    delivery_id: i32,
-}
+    consume: F,
+    warning_after: std::time::Duration,
+    warning_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) where
+    F: std::future::Future<Output = HiddenReceiptResult> + Send + 'static,
+{
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let warning_done = completed.clone();
+    let warning_registry = registry.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(warning_after).await;
+        if !warning_done.load(std::sync::atomic::Ordering::Acquire)
+            && warning_registry.contains(&delivery_id)
+        {
+            eprintln!(
+                "[weft] hidden receipt {delivery_id} still awaiting DB outcome after {:?}",
+                warning_after
+            );
+            if let Some(tx) = warning_tx {
+                let _ = tx.send(());
+            }
+        }
+    });
 
-impl Drop for HiddenReceiptGuard {
-    fn drop(&mut self) {
-        // A receipt task can be canceled while waiting on the admission gate or
-        // during app shutdown. Synchronous DashSet cleanup in Drop prevents a
-        // canceled old engine from leaving a shared token that blocks its
-        // replacement forever.
-        self.registry.remove(&self.delivery_id);
+    // Do not wrap this future in `timeout`: dropping a SeaORM transaction future
+    // does not tell us whether SQLite committed or rolled back. We wait for its
+    // definitive result before releasing the shared admission token.
+    let outcome = consume.await;
+    completed.store(true, std::sync::atomic::Ordering::Release);
+    let _serial = admission_gate_for_key(admission_key).lock_owned().await;
+    let mut inner = eng.lock().await;
+    match outcome {
+        Ok(Some(_)) | Ok(None) => finish_hidden_receipt(&mut inner, delivery_id, true),
+        Err(error) => {
+            eprintln!("[weft] consume hidden delivery failed: {error}");
+            finish_hidden_receipt(&mut inner, delivery_id, false);
+        }
     }
-}
-
-fn register_hidden_receipt(
-    inner: &mut EngineInner,
-    delivery_id: i32,
-) -> Option<HiddenReceiptGuard> {
-    if !inner.hidden_receipt_inflight.insert(delivery_id) {
-        return None;
-    }
-    Some(HiddenReceiptGuard {
-        registry: inner.hidden_receipt_inflight.clone(),
-        delivery_id,
-    })
 }
 
 /// Finish a hidden-delivery receipt and release its admission reservation.
@@ -2492,6 +2512,20 @@ async fn ensure_running_locked(
     inner.current = None;
     inner.interrupting = false;
     Ok(Some((stdout, inner.generation, program)))
+}
+
+/// Ensure an idle, non-stopped resident is available for a durable hidden
+/// delivery. This deliberately does not clear `stopped`: only explicit visible
+/// input or a guarded plan approval may do that. Per-turn and ACP engines return
+/// `None` here because their hidden delivery path starts a turn instead.
+async fn ensure_active_resident_locked(
+    app: &AppHandle,
+    inner: &mut EngineInner,
+) -> anyhow::Result<Option<(tokio::process::ChildStdout, u64, String)>> {
+    if inner.stopped {
+        return Ok(None);
+    }
+    ensure_running_locked(app, inner).await
 }
 
 /// Spawn the process if it isn't alive (fresh or `--resume`), wiring the reader.
@@ -4805,6 +4839,16 @@ async fn acp_consumer(
     // window. Cleared at every prompt boundary — see the DrainBarrier arm.
     let mut thought_buf = ThoughtTail::default();
     while let Some(msg) = rx.recv().await {
+        let receipt_activity = match &msg {
+            SessionEvent::Chat(event) => super::proto::is_agent_activity(event),
+            SessionEvent::Thought { text } => !text.trim().is_empty(),
+            SessionEvent::ToolProgress { summary } => !summary.trim().is_empty(),
+            SessionEvent::Permission { .. } => true,
+            SessionEvent::Commands(_)
+            | SessionEvent::Usage { .. }
+            | SessionEvent::Meta { .. }
+            | SessionEvent::DrainBarrier(_) => false,
+        };
         match msg {
             // Barrier: prompt-task waits until prior events are drained.
             SessionEvent::DrainBarrier(tx) => {
@@ -4831,7 +4875,9 @@ async fn acp_consumer(
             }
             SessionEvent::ToolProgress { summary } => {
                 let mut inner = eng.lock().await;
-                note_turn_activity(&app, &db, &eng, &mut inner);
+                if receipt_activity {
+                    note_turn_activity(&app, &db, &eng, &mut inner);
+                }
                 let (thread_id, session_id) = (inner.thread_id, inner.session_id);
                 drop(inner);
                 let _ = app.emit(
@@ -4847,7 +4893,9 @@ async fn acp_consumer(
             SessionEvent::Thought { text } => {
                 {
                     let mut inner = eng.lock().await;
-                    note_turn_activity(&app, &db, &eng, &mut inner);
+                    if receipt_activity {
+                        note_turn_activity(&app, &db, &eng, &mut inner);
+                    }
                 }
                 thought_buf.push(&text);
                 // Live reasoning on the busy line so the turn doesn't look stuck
@@ -4889,7 +4937,9 @@ async fn acp_consumer(
                     );
                 }
                 let mut inner = eng.lock().await;
-                note_turn_activity(&app, &db, &eng, &mut inner);
+                if receipt_activity {
+                    note_turn_activity(&app, &db, &eng, &mut inner);
+                }
                 let thread_id = inner.thread_id;
                 let (sid, turn) = (inner.session_id, inner.turn_id);
                 if inner.current.is_none() {
@@ -4956,7 +5006,9 @@ async fn acp_consumer(
                     );
                 }
                 let mut inner = eng.lock().await;
-                note_turn_activity(&app, &db, &eng, &mut inner);
+                if receipt_activity {
+                    note_turn_activity(&app, &db, &eng, &mut inner);
+                }
                 // Close the open text row so post-tool text starts a new bubble.
                 if inner.current.is_some() {
                     finalize_current_text(&app, &db, &mut inner, "complete").await;
@@ -4965,6 +5017,9 @@ async fn acp_consumer(
             }
             SessionEvent::Chat(ChatEvent::ToolResults { items }) => {
                 let mut inner = eng.lock().await;
+                if receipt_activity {
+                    note_turn_activity(&app, &db, &eng, &mut inner);
+                }
                 merge_tool_results(&app, &db, &mut inner, items).await;
             }
             SessionEvent::Chat(ChatEvent::Commands { commands }) => {
@@ -5047,7 +5102,10 @@ async fn acp_consumer(
                 options,
             } => {
                 let (thread_id, tool, dir, reject_now) = {
-                    let i = eng.lock().await;
+                    let mut i = eng.lock().await;
+                    if receipt_activity {
+                        note_turn_activity(&app, &db, &eng, &mut i);
+                    }
                     (
                         i.thread_id,
                         i.tool.clone(),
@@ -5205,6 +5263,13 @@ async fn codex_consumer(
     let pending_asks: Arc<crossbeam_skiplist::SkipMap<String, u64>> =
         Arc::new(crossbeam_skiplist::SkipMap::new());
     while let Some(msg) = rx.recv().await {
+        let receipt_activity = match &msg {
+            ThreadMsg::Event(event) => super::proto::is_agent_activity(event),
+            ThreadMsg::Approval { .. } => true,
+            ThreadMsg::QuotaExceeded | ThreadMsg::Heartbeat | ThreadMsg::AskResolved { .. } => {
+                false
+            }
+        };
         match msg {
             ThreadMsg::QuotaExceeded => {
                 let tool = {
@@ -5231,7 +5296,9 @@ async fn codex_consumer(
                 agent_thread,
             }) => {
                 let mut inner = eng.lock().await;
-                note_turn_activity(&app, &db, &eng, &mut inner);
+                if receipt_activity {
+                    note_turn_activity(&app, &db, &eng, &mut inner);
+                }
                 let thread_id = inner.thread_id;
                 let (sid, turn) = (inner.session_id, inner.turn_id);
                 // Ensure the target row exists: item-keyed rows in `open_texts`
@@ -5347,7 +5414,9 @@ async fn codex_consumer(
                 agent_thread,
             }) => {
                 let mut inner = eng.lock().await;
-                note_turn_activity(&app, &db, &eng, &mut inner);
+                if receipt_activity {
+                    note_turn_activity(&app, &db, &eng, &mut inner);
+                }
                 let streamed = item.as_ref().and_then(|k| inner.open_texts.remove(k));
                 match streamed {
                     // The item streamed: finalize its row, preferring the
@@ -5440,7 +5509,9 @@ async fn codex_consumer(
                 // unrelated stream's sentence into fragment bubbles. Serial
                 // ordering still holds: an item's completion precedes its tools.
                 let mut inner = eng.lock().await;
-                note_turn_activity(&app, &db, &eng, &mut inner);
+                if receipt_activity {
+                    note_turn_activity(&app, &db, &eng, &mut inner);
+                }
                 if !texts.is_empty() {
                     finalize_current_text(&app, &db, &mut inner, "complete").await;
                 }
@@ -5453,6 +5524,9 @@ async fn codex_consumer(
             }
             ThreadMsg::Event(ChatEvent::ToolResults { items }) => {
                 let mut inner = eng.lock().await;
+                if receipt_activity {
+                    note_turn_activity(&app, &db, &eng, &mut inner);
+                }
                 merge_tool_results(&app, &db, &mut inner, items).await;
             }
             ThreadMsg::Event(ChatEvent::Usage {
@@ -5718,10 +5792,8 @@ async fn codex_consumer(
             }
             ThreadMsg::Event(_) => {}
             ThreadMsg::Heartbeat => {
-                // outputDelta from a long-running command: no row change, but
-                // preserve consumption telemetry.
-                let mut inner = eng.lock().await;
-                note_turn_activity(&app, &db, &eng, &mut inner);
+                // Heartbeats are transport liveness metadata, not evidence that
+                // the agent consumed the current prompt.
             }
             ThreadMsg::Approval { id, method, params } => {
                 // An approval (command / file-change / permissions) — route to Weft's
@@ -5739,7 +5811,9 @@ async fn codex_consumer(
                     // leave the receipt stuck at "delivered" while the user
                     // stares at a Needs-you card that proves otherwise (PR
                     // #117 review, P2).
-                    note_turn_activity(&app, &db, &eng, &mut i);
+                    if receipt_activity {
+                        note_turn_activity(&app, &db, &eng, &mut i);
+                    }
                     (i.thread_id, i.ask_dir.clone())
                 };
                 // Requested permission profile (also echoed back as the grant on allow).
@@ -6541,8 +6615,12 @@ async fn send_hidden_inner(
         && !revivable_stopped_plan
         && !revivable_stopped_delivery
     {
+        let deferred_stopped_delivery = hidden_delivery_id.is_some()
+            && inner.stopped
+            && !revive_stopped
+            && !inner.tearing_down;
         drop(inner);
-        if bus_read {
+        if bus_read || deferred_stopped_delivery {
             return Ok(false);
         }
         return Err(anyhow::anyhow!("engine is tearing down"));
@@ -6573,12 +6651,16 @@ async fn send_hidden_inner(
         // turn reservation, so a rejected stale click has zero run-state effect.
         inner.stopped = false;
     }
-    if ensure {
+    // Durable hydration must start an idle resident that is already active even
+    // when its caller is a background/retry path (`revive_stopped == false`).
+    // A stopped engine is intentionally left untouched; the admissibility guard
+    // above returns `Ok(false)` for that deferred background delivery.
+    if should_ensure_active_resident(&inner, ensure, hidden_delivery_id) {
         // Spawn the resident process under THIS lock, never releasing it before
         // the slot is reserved below. The reader task blocks on this lock and
         // proceeds once we drop it on return.
         if let Some((stdout, generation, quota_command)) =
-            ensure_running_locked(app, &mut inner).await?
+            ensure_active_resident_locked(app, &mut inner).await?
         {
             spawn_reader(
                 app.clone(),
@@ -8066,7 +8148,6 @@ fn spawn_reader(
             if inner.generation != generation {
                 return; // superseded by a respawn/stop
             }
-            note_turn_activity(&app, &db, &eng, &mut inner);
             let thread_id = inner.thread_id;
             // Per-turn dialects carry the native session id on their events.
             if inner.native_id.is_none() {
@@ -8113,6 +8194,9 @@ fn spawn_reader(
                 .unwrap_or(super::proto::ChatEvent::Other);
             if !matches!(event, super::proto::ChatEvent::Other) {
                 saw_event = true;
+            }
+            if super::proto::is_agent_activity(&event) {
+                note_turn_activity(&app, &db, &eng, &mut inner);
             }
             match event {
                 super::proto::ChatEvent::Init {
@@ -8917,6 +9001,39 @@ mod tests {
         assert!(
             hidden_turn_admissible(&inner),
             "and accepts again afterwards"
+        );
+    }
+
+    #[test]
+    fn durable_hidden_ensure_policy_covers_active_and_stopped_matrix() {
+        let mut active = test_inner("claude");
+        active.stopped = false;
+        assert!(
+            should_ensure_active_resident(&active, false, Some(7)),
+            "active cold resident hydration must ensure/start before delivery"
+        );
+        assert!(
+            should_ensure_active_resident(&active, true, None),
+            "explicit nudge/plan paths still ensure an active resident"
+        );
+
+        let mut stopped = test_inner("claude");
+        stopped.stopped = true;
+        assert!(
+            !should_ensure_active_resident(&stopped, false, Some(7)),
+            "background repo hydration must not clear or start a stopped lead"
+        );
+        assert!(
+            !should_ensure_active_resident(&stopped, true, None),
+            "a stopped generic nudge is refused before ensure"
+        );
+
+        // An authorized durable plan clears `stopped` in send_hidden_inner
+        // before this policy runs, so it lands in the same active branch.
+        stopped.stopped = false;
+        assert!(
+            should_ensure_active_resident(&stopped, true, Some(8)),
+            "explicit plan hydration may revive then ensure the resident"
         );
     }
 
@@ -10733,11 +10850,11 @@ mod tests {
         }
     }
 
-    /// A hidden turn can observe activity before its receipt task gets to run:
-    /// the task waits on the same admission gate as visible sends. TurnEnd is
-    /// intentionally not gated and may clear `turn_user_row` in that window,
-    /// but the synchronous in-flight token must still make the pending row a
-    /// duplicate until the consume transaction finishes.
+    /// A hidden turn can observe activity before its receipt worker gets to
+    /// finish: TurnEnd is intentionally not gated and may clear `turn_user_row`
+    /// in that window, but the synchronous in-flight token must still make the
+    /// pending row a duplicate until the detached DB worker reports its result
+    /// and the short cleanup gate runs.
     #[tokio::test]
     async fn inflight_hidden_receipt_survives_turn_end_and_blocks_replay() {
         let (db, eng, delivery_id) = durable_hidden_fixture("codex").await;
@@ -10748,11 +10865,10 @@ mod tests {
             .map(i64::from)
             .expect("fixture assigns an isolated surface key");
         let serial = admission_gate_for_key(key).lock_owned().await;
-        let receipt_guard = {
+        {
             let mut inner = eng.lock().await;
             mark_hidden_turn_started_with_delivery(&mut inner, Some(delivery_id));
-            let receipt_guard = register_hidden_receipt(&mut inner, delivery_id)
-                .expect("receipt registration must claim the delivery");
+            assert!(register_hidden_receipt(&mut inner, delivery_id));
             let next = inner.turn.on_turn_end();
             assert!(next.is_none(), "fixture has no queued follow-up");
             advance_dequeued_turn(&mut inner, &next);
@@ -10761,36 +10877,54 @@ mod tests {
                 hidden_delivery_is_duplicate(&inner, delivery_id),
                 "the in-flight token is the durable admission reservation"
             );
-            receipt_guard
-        };
+        }
 
-        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
         let db_for_receipt = db.clone();
         let eng_for_receipt = eng.clone();
-        let receipt = tokio::spawn(async move {
-            let _receipt_guard = receipt_guard;
-            let _serial = admission_gate_for_key(key).lock_owned().await;
-            let _ = started_tx.send(());
-            let outcome = repo::consume_lead_hidden_delivery(&db_for_receipt, delivery_id).await;
-            let mut inner = eng_for_receipt.lock().await;
-            finish_hidden_receipt(&mut inner, delivery_id, outcome.is_ok());
-            outcome
-        });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(30), &mut started_rx)
-                .await
-                .is_err(),
-            "the receipt task must wait behind visible admission"
-        );
+        let receipt = tokio::spawn(run_hidden_receipt_worker(
+            eng_for_receipt,
+            key,
+            delivery_id,
+            eng.lock().await.hidden_receipt_inflight.clone(),
+            async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                let outcome = repo::consume_lead_hidden_delivery(&db_for_receipt, delivery_id).await;
+                let _ = committed_tx.send(());
+                outcome
+            },
+            std::time::Duration::from_secs(60),
+            None,
+        ));
+        started_rx.await.unwrap();
 
         let inner = eng.lock().await;
         assert!(hidden_delivery_is_duplicate(&inner, delivery_id));
         let pending = pending_hidden_rows_at_admission(&db, &inner).await.unwrap();
-        assert_eq!(pending.len(), 1, "the durable row remains pending until consume");
+        assert_eq!(pending.len(), 1, "the durable row remains pending while DB is blocked");
+        drop(inner);
+
+        // The DB future is independent of the admission gate. Once released it
+        // can commit while the gate is still held, but the shared token remains
+        // until the worker gets the short gate+engine cleanup turn.
+        release_tx.send(()).unwrap();
+        committed_rx.await.unwrap();
+        let inner = eng.lock().await;
+        assert!(hidden_delivery_is_duplicate(&inner, delivery_id));
+        assert!(
+            pending_hidden_rows_at_admission(&db, &inner)
+                .await
+                .unwrap()
+                .is_empty(),
+            "DB consumption may commit before cleanup gate admission"
+        );
         drop(inner);
         drop(serial);
 
-        receipt.await.unwrap().unwrap();
+        receipt.await.unwrap();
         let inner = eng.lock().await;
         assert!(!inner.hidden_receipt_inflight.contains(&delivery_id));
         assert!(!hidden_delivery_is_duplicate(&inner, delivery_id));
@@ -10800,9 +10934,102 @@ mod tests {
             .is_empty());
     }
 
+    /// The warning/watch task must never cancel the DB worker. While a
+    /// controllable consume future is blocked, the short admission gate remains
+    /// usable by visible work, but the shared receipt token still blocks a
+    /// duplicate. Only the definitive DB result permits cleanup and retry.
+    #[tokio::test]
+    async fn hidden_receipt_warning_keeps_token_until_db_outcome() {
+        let (db, eng, delivery_id) = durable_hidden_fixture("codex").await;
+        let key = eng
+            .lock()
+            .await
+            .session_id
+            .map(i64::from)
+            .expect("fixture assigns an isolated surface key");
+        let registry = {
+            let mut inner = eng.lock().await;
+            mark_hidden_turn_started_with_delivery(&mut inner, Some(delivery_id));
+            assert!(register_hidden_receipt(&mut inner, delivery_id));
+            inner.hidden_receipt_inflight.clone()
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (warning_tx, warning_rx) = tokio::sync::oneshot::channel();
+        let db_for_worker = db.clone();
+        let worker = tokio::spawn(run_hidden_receipt_worker(
+            eng.clone(),
+            key,
+            delivery_id,
+            registry,
+            async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                repo::consume_lead_hidden_delivery(&db_for_worker, delivery_id).await
+            },
+            std::time::Duration::from_millis(1),
+            Some(warning_tx),
+        ));
+
+        started_rx.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(100), warning_rx)
+            .await
+            .expect("warning should fire while the DB future is blocked")
+            .expect("warning sender should remain connected");
+
+        // The worker is not holding the gate while it waits on SQLite, and the
+        // token remains an idempotence fence until the outcome is known.
+        with_admission_gate(key, || async {}).await;
+        let inner = eng.lock().await;
+        assert!(hidden_delivery_is_duplicate(&inner, delivery_id));
+        assert_eq!(
+            pending_hidden_rows_at_admission(&db, &inner)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(inner);
+
+        release_tx.send(()).unwrap();
+        worker.await.unwrap();
+        let inner = eng.lock().await;
+        assert!(!inner.hidden_receipt_inflight.contains(&delivery_id));
+        assert!(
+            pending_hidden_rows_at_admission(&db, &inner)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_receipt_error_releases_token_for_retry() {
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(test_inner("codex")));
+        let key = -9_001_341_i64;
+        let registry = {
+            let mut inner = eng.lock().await;
+            assert!(register_hidden_receipt(&mut inner, 19));
+            inner.hidden_receipt_inflight.clone()
+        };
+        run_hidden_receipt_worker(
+            eng.clone(),
+            key,
+            19,
+            registry,
+            async { Err(anyhow::anyhow!("injected rollback")) },
+            std::time::Duration::from_secs(60),
+            None,
+        )
+        .await;
+        let inner = eng.lock().await;
+        assert!(!inner.hidden_receipt_inflight.contains(&19));
+        assert!(!hidden_delivery_is_duplicate(&inner, 19));
+    }
+
     /// Registry replacement shares the per-surface receipt set with the old
-    /// engine while its task is alive, then the task's Drop guard releases the
-    /// token if runtime cancellation happens before the DB future completes.
+    /// engine while its detached worker is alive. The worker releases the token
+    /// only after its DB future reports a committed result or a definite error.
     #[tokio::test]
     async fn hidden_receipt_registry_is_shared_across_engine_replacement() {
         let key = -9_001_340_i64;
@@ -10813,8 +11040,7 @@ mod tests {
         let mut old = test_inner("codex");
         old.hidden_receipt_inflight = registry.clone();
         mark_hidden_turn_started_with_delivery(&mut old, Some(37));
-        let receipt_guard = register_hidden_receipt(&mut old, 37)
-            .expect("old engine must claim the receipt before replacement");
+        assert!(register_hidden_receipt(&mut old, 37));
         drop(old);
 
         let mut replacement = test_inner("codex");
@@ -10823,10 +11049,10 @@ mod tests {
             hidden_delivery_is_duplicate(&replacement, 37),
             "replacement must honor an old task's in-flight token"
         );
-        drop(receipt_guard);
+        finish_hidden_receipt(&mut replacement, 37, false);
         assert!(
             !hidden_delivery_is_duplicate(&replacement, 37),
-            "task cancellation cleanup must release the shared token"
+            "the worker outcome cleanup must release the shared token"
         );
 
         let concurrent_key = key + 10;
@@ -10867,8 +11093,7 @@ mod tests {
     fn failed_hidden_receipt_releases_retry_token() {
         let mut inner = test_inner("claude");
         mark_hidden_turn_started_with_delivery(&mut inner, Some(17));
-        let _receipt_guard = register_hidden_receipt(&mut inner, 17)
-            .expect("receipt registration must claim the delivery");
+        assert!(register_hidden_receipt(&mut inner, 17));
         assert!(inner.clock.mark_consumed_once());
         finish_hidden_receipt(&mut inner, 17, false);
         assert!(!inner.hidden_receipt_inflight.contains(&17));
@@ -10914,8 +11139,7 @@ mod tests {
         for tool in ["claude", "codex", "opencode", "omp"] {
             let mut inner = test_inner(tool);
             mark_hidden_turn_started_with_delivery(&mut inner, Some(31));
-            let _receipt_guard = register_hidden_receipt(&mut inner, 31)
-                .expect("receipt registration must claim the delivery");
+            assert!(register_hidden_receipt(&mut inner, 31));
             let next = inner.turn.on_turn_end();
             advance_dequeued_turn(&mut inner, &next);
             assert_eq!(inner.turn_user_row, None, "{tool}: marker retargeted");

@@ -154,6 +154,29 @@ pub enum ChatEvent {
     Other,
 }
 
+/// Whether a parsed event proves that the agent has started doing work for the
+/// current turn. Transport/control metadata is intentionally excluded: init,
+/// slash-command responses, usage updates, TurnEnd-only lines, and unknown
+/// envelopes can arrive before the prompt is consumed and must not advance the
+/// delivered→consumed receipt.
+pub(crate) fn is_agent_activity(event: &ChatEvent) -> bool {
+    match event {
+        ChatEvent::TextDelta { text, .. } => !text.trim().is_empty(),
+        ChatEvent::TextDone { text, .. } => text
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        ChatEvent::Assistant { texts, tools, .. } => {
+            texts.iter().any(|text| !text.trim().is_empty()) || !tools.is_empty()
+        }
+        ChatEvent::ToolResults { items } => !items.is_empty(),
+        ChatEvent::Init { .. }
+        | ChatEvent::TurnEnd { .. }
+        | ChatEvent::Usage { .. }
+        | ChatEvent::Commands { .. }
+        | ChatEvent::Other => false,
+    }
+}
+
 /// Dialect dispatch: per-tool line parser.
 pub fn parse_line_for(tool: &str, line: &str) -> ChatEvent {
     match tool {
@@ -1218,6 +1241,61 @@ mod tests {
             }
             e => panic!("{e:?}"),
         }
+    }
+
+    #[test]
+    fn receipt_activity_classifier_excludes_control_metadata() {
+        assert!(!is_agent_activity(&parse_line(
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+        )));
+        assert!(!is_agent_activity(&parse_line(
+            r#"{"type":"control_response","response":{"subtype":"success","response":{"commands":[]}}}"#,
+        )));
+        assert!(!is_agent_activity(&parse_line(
+            r#"{"type":"result","subtype":"success","usage":{"input_tokens":1}}"#,
+        )));
+        assert!(!is_agent_activity(&parse_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":" "}}}"#,
+        )));
+        assert!(!is_agent_activity(&parse_line(
+            r#"{"type":"result","subtype":"success"}"#,
+        )));
+        assert!(!is_agent_activity(&ChatEvent::TextDone {
+            item: None,
+            text: Some("  ".into()),
+            agent_thread: None,
+        }));
+        assert!(!is_agent_activity(&ChatEvent::Assistant {
+            texts: vec![],
+            tools: vec![],
+            uuid: None,
+            agent_thread: None,
+        }));
+        assert!(!is_agent_activity(&ChatEvent::ToolResults { items: vec![] }));
+    }
+
+    #[test]
+    fn receipt_activity_classifier_accepts_real_text_and_tool_events() {
+        assert!(is_agent_activity(&parse_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}}"#,
+        )));
+        assert!(is_agent_activity(&parse_line_for(
+            "codex",
+            r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"echo hi"}}"#,
+        )));
+        assert!(is_agent_activity(&parse_line_for(
+            "codex",
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","aggregated_output":"hi","exit_code":0}}"#,
+        )));
+        assert!(is_agent_activity(&parse_line_for(
+            "opencode",
+            r#"{"type":"text","part":{"type":"text","text":"hello"}}"#,
+        )));
+        assert!(is_agent_activity(&ChatEvent::TextDone {
+            item: None,
+            text: Some("final answer".into()),
+            agent_thread: None,
+        }));
     }
 
     #[test]

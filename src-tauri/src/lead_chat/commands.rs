@@ -3491,20 +3491,30 @@ async fn restore_pending_hidden_deliveries_on_engine(
     eng: &EngineRef,
 ) -> anyhow::Result<()> {
     let rows = repo::list_pending_lead_hidden_deliveries(db, Some(thread_id)).await?;
+    let mut first_error: Option<anyhow::Error> = None;
     for row in rows {
-        // Startup/background hydration must never revive a stopped lead. An
-        // explicit visible send performs its own ordered admission instead.
-        match dispatch_hidden_delivery_with_engine(app, db, &row, eng, false).await {
+        // Repo-action rows are background/retry plumbing and must never revive
+        // a stopped lead. A persisted plan_decision row is an explicit approval
+        // handoff, so preserve the existing contract that it may clear stopped
+        // and start the lead when it is hydrated.
+        let revive_stopped = row.source_kind == "plan_decision";
+        match dispatch_hidden_delivery_with_engine(app, db, &row, eng, revive_stopped).await {
             Ok(_) => {}
             Err(error) => {
                 eprintln!(
                     "[weft] hidden delivery {} replay deferred: {error}",
                     row.id
                 );
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!(
+                        "hidden delivery {} hydration failed: {error}",
+                        row.id
+                    ));
+                }
             }
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Persist and dispatch one UI tool result. Only plan decisions carry a
