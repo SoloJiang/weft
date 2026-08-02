@@ -915,6 +915,25 @@ static SHOT_SEQ: AtomicU64 = AtomicU64::new(0);
 ///     default-permissive create is later tightened.
 /// Non-unix keeps the pre-existing `image.save(&path)` (no owner-only concept
 /// there this crate can portably act on).
+///
+/// issue #160 round-14 P2: `create_new` above only guarantees the leaf didn't
+/// exist a moment ago — it says nothing about what happens if the
+/// SUBSEQUENT `write_to`/`flush` (or, on non-unix, `image.save`, which
+/// creates AND writes in one call) then fails. A full disk or a hit quota
+/// can trip well after the file itself was successfully created, and until
+/// this round that left an empty or truncated PNG sitting on disk under a
+/// name [`SHOT_SEQ`] guarantees this process never reuses — so nothing ever
+/// cleaned it up again: not a retry (the next call picks a brand-new name),
+/// and not [`prune_old_screenshots`] (it doesn't even run on this error
+/// path, since this whole write block returns before reaching that call
+/// below). A caller retrying in a loop against a persistently full disk
+/// could accumulate one corrupt file per attempt without bound, at worst
+/// exhausting inodes rather than just bytes. [`cleanup_on_err`] closes this:
+/// wrapped around the write step on both platforms, it best-effort deletes
+/// whatever ended up at `path` the instant that step errors, then lets the
+/// ORIGINAL error propagate untouched — a screenshot call that fails never
+/// again leaves a file behind for a future `prune_old_screenshots` pass (or
+/// a human) to have to notice and reap.
 pub fn screenshot_window(
     backend: &dyn backend::ComputerBackend,
     query: &str,
@@ -955,26 +974,36 @@ pub fn screenshot_window(
         opt.write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
         let file = opt.open(&path).map_err(|e| ComputerError::Io(e.to_string()))?;
         let mut w = std::io::BufWriter::new(file);
-        image
-            .write_to(&mut w, image::ImageFormat::Png)
-            .map_err(|e| ComputerError::Io(e.to_string()))?;
-        // issue #160 round-10 P2 #G: `write_to` only writes through the
-        // `BufWriter` — it does NOT itself guarantee the final buffered
-        // bytes reach the underlying file, and `BufWriter::drop` (which would
-        // otherwise run implicitly at the end of this block) SILENTLY
-        // SWALLOWS a flush error rather than propagating it. On a full disk
-        // or a hit quota (especially likely here: the whole PNG can still be
-        // sitting in the buffer for a small screenshot), that dropped error
-        // would let this function return `Ok` — reporting a successful save
-        // — for a file that is actually empty or truncated. An explicit,
-        // propagated `flush` closes that: a flush failure now surfaces as
-        // this function's own `Err` instead of a silently-corrupt `Ok`.
-        use std::io::Write as _;
-        w.flush().map_err(|e| ComputerError::Io(e.to_string()))?;
+        // round-14 P2: from this point on, `path` definitely exists on disk
+        // (just created by `create_new` above) — `cleanup_on_err` wraps the
+        // write+flush so any failure below best-effort deletes that
+        // now-incomplete file before this function's `?` returns the
+        // ORIGINAL error. See this function's own doc comment above for why.
+        cleanup_on_err(&path, || {
+            image
+                .write_to(&mut w, image::ImageFormat::Png)
+                .map_err(|e| ComputerError::Io(e.to_string()))?;
+            // issue #160 round-10 P2 #G: `write_to` only writes through the
+            // `BufWriter` — it does NOT itself guarantee the final buffered
+            // bytes reach the underlying file, and `BufWriter::drop` (which would
+            // otherwise run implicitly at the end of this block) SILENTLY
+            // SWALLOWS a flush error rather than propagating it. On a full disk
+            // or a hit quota (especially likely here: the whole PNG can still be
+            // sitting in the buffer for a small screenshot), that dropped error
+            // would let this function return `Ok` — reporting a successful save
+            // — for a file that is actually empty or truncated. An explicit,
+            // propagated `flush` closes that: a flush failure now surfaces as
+            // this function's own `Err` instead of a silently-corrupt `Ok`.
+            use std::io::Write as _;
+            w.flush().map_err(|e| ComputerError::Io(e.to_string()))
+        })?;
     }
     #[cfg(not(unix))]
     {
-        image.save(&path).map_err(|e| ComputerError::Io(e.to_string()))?;
+        // round-14 P2: `save` both creates and writes in one call, so a
+        // failure here may still have left an empty/truncated file behind —
+        // same `cleanup_on_err` guarantee as the unix branch above.
+        cleanup_on_err(&path, || image.save(&path).map_err(|e| ComputerError::Io(e.to_string())))?;
     }
     // round-7 P1: keep the just-saved pixels in memory instead of ever having
     // a caller re-open `path` to get them back — see `Screenshot::pixels`'s
@@ -984,8 +1013,10 @@ pub fn screenshot_window(
     let pixels = CapturedImage { rgba: image.into_raw(), width, height };
 
     // round-7 P1: best-effort retention cap — never fails a screenshot that
-    // already saved successfully just because pruning stumbled.
-    prune_old_screenshots(out_dir, MAX_RETAINED_SCREENSHOTS);
+    // already saved successfully just because pruning stumbled. round-13 P2:
+    // pass `&path` as `just_written` so THIS call's own file is exempt from
+    // pruning no matter how it sorts — see `prune_old_screenshots`'s own doc.
+    prune_old_screenshots(out_dir, MAX_RETAINED_SCREENSHOTS, Some(&path));
 
     Ok(Screenshot {
         path,
@@ -994,6 +1025,25 @@ pub fn screenshot_window(
         scale,
         window_id: matched.id,
         pixels,
+    })
+}
+
+/// Best-effort corrupt-file cleanup wrapper for [`screenshot_window`]'s
+/// on-disk PNG write (issue #160 round-14 P2). `write` performs the actual
+/// platform write (unix: `write_to` + `flush` into an already-`create_new`'d
+/// file handle; non-unix: `image.save`, which creates and writes in one
+/// call) and may fail AFTER it has already put bytes — or an empty file — on
+/// disk at `path`. On `Err`, this deletes whatever ended up at `path` and
+/// then returns the ORIGINAL error completely untouched: `remove_file`'s own
+/// outcome is deliberately discarded (`let _ =`), including the case where
+/// `write` failed before ever creating anything and there's nothing there to
+/// remove — a cleanup failure (or no-op) must never mask or replace the real
+/// I/O error the caller needs to see. On `Ok`, this never touches the
+/// filesystem at all.
+fn cleanup_on_err<T>(path: &Path, write: impl FnOnce() -> Result<T, ComputerError>) -> Result<T, ComputerError> {
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(path);
+        e
     })
 }
 
@@ -1017,15 +1067,43 @@ const MAX_RETAINED_SCREENSHOTS: usize = 20;
 /// so a symlink sitting in `out_dir` is neither followed nor deleted nor
 /// counted against `keep` — `remove_file` on a symlink removes the directory
 /// entry, never the link's target, but this skips symlinks entirely rather
-/// than relying on that alone. The file [`screenshot_window`] itself JUST
-/// saved is by construction the newest entry here (it was just written), so
-/// it is never among the ones pruned — a caller holding this call's own
-/// `Screenshot::path` always still has a file at that path afterward.
-fn prune_old_screenshots(out_dir: &Path, keep: usize) {
+/// than relying on that alone.
+///
+/// `just_written` is [`screenshot_window`]'s own freshly-saved `path`, if
+/// this call is happening right after a save (it is, at this function's one
+/// call site) — `None` from a test that just wants the plain retention-cap
+/// behavior. When `Some`, that EXACT path is never removed by this call, no
+/// matter where it lands in the sort below — a caller holding this call's
+/// own `Screenshot::path` is guaranteed a file still exists there afterward.
+///
+/// issue #160 round-13 P2: sorting used to be mtime-descending ONLY. On a
+/// filesystem with coarse mtime resolution (some FAT-family/network
+/// filesystems round to whole seconds or worse), or simply several
+/// screenshots landing in the same tick, multiple entries can compare
+/// EQUAL by mtime — and since `read_dir`'s own iteration order is
+/// unspecified, a `sort_by` that never breaks that tie could put the
+/// just-saved file anywhere among the equal-mtime group, including past
+/// `keep` and into the deleted tail. The two fixes below close that:
+///  1. a deterministic tiebreak — mtime descending, THEN the filename's own
+///     trailing `<seq>` component (parsed by [`own_screenshot_seq`])
+///     descending. `SHOT_SEQ` is a monotonic per-process counter, so within
+///     one mtime tie, higher `seq` really is newer. This only disambiguates
+///     WITHIN an mtime tie: mtimes across separate process runs essentially
+///     never collide (each run starts `SHOT_SEQ` back at 0), so mtime
+///     ordering still dominates across runs the way it always has — `seq`
+///     is purely a same-tick tiebreak, never a substitute for it.
+///  2. `just_written`, above — an explicit, absolute guarantee independent
+///     of sort order entirely, for the one file this exact call is
+///     responsible for having just created.
+/// Both belong together: (1) makes the common case (many files, one real
+/// mtime tie) sort correctly without needing the escape hatch at all; (2)
+/// is the hard backstop for the pathological case (2) can't fully rule out
+/// on its own — e.g. `keep` itself being 0.
+fn prune_old_screenshots(out_dir: &Path, keep: usize, just_written: Option<&Path>) {
     let Ok(rd) = std::fs::read_dir(out_dir) else {
         return;
     };
-    let mut shots: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let mut shots: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
     for entry in rd.flatten() {
         let path = entry.path();
         if !is_own_screenshot_filename(&path) {
@@ -1040,15 +1118,39 @@ fn prune_old_screenshots(out_dir: &Path, keep: usize) {
         let Ok(mtime) = meta.modified() else {
             continue;
         };
-        shots.push((mtime, path));
+        let seq = own_screenshot_seq(&path);
+        shots.push((mtime, seq, path));
     }
     if shots.len() <= keep {
         return;
     }
-    shots.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
-    for (_, path) in shots.into_iter().skip(keep) {
+    // newest first: mtime descending, then round-13 P2's seq tiebreak.
+    shots.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    for (_, _, path) in shots.into_iter().skip(keep) {
+        if just_written.is_some_and(|p| p == path) {
+            // round-13 P2: this is the file THIS call's own caller just
+            // wrote — never delete it, even though it sorted past `keep`.
+            continue;
+        }
         let _ = std::fs::remove_file(&path);
     }
+}
+
+/// Parse the trailing `<seq>` component out of a filename already confirmed
+/// by [`is_own_screenshot_filename`] to be this module's own
+/// `<unix_ms>-<window_id>-<seq>.png` naming — [`prune_old_screenshots`]'s
+/// round-13 P2 mtime-tie tiebreak; see that function's own doc. Never
+/// panics: a parse failure (shouldn't happen, since the caller only reaches
+/// this after `is_own_screenshot_filename` already confirmed all three
+/// components are non-empty and all-digit) falls back to `0` — worst case,
+/// a malformed name that slipped past that check loses the tiebreak rather
+/// than crashing pruning entirely.
+fn own_screenshot_seq(path: &Path) -> u64 {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|stem| stem.split('-').nth(2))
+        .and_then(|seq| seq.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// Whether `path`'s file name matches this module's OWN screenshot naming —
@@ -2365,6 +2467,61 @@ mod tests {
         assert_eq!(shot.pixels.height, expected.height());
     }
 
+    // —— cleanup_on_err (issue #160 round-14 P2) ——
+
+    #[test]
+    fn cleanup_on_err_removes_a_file_left_behind_by_a_failed_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Stand in for the file `create_new` already made on disk before the
+        // injected write below fails partway through — exactly the shape of
+        // the unix `screenshot_window` write path this guards.
+        let path = tmp.path().join("123-9-0.png");
+        std::fs::write(&path, b"partial, corrupt PNG bytes").unwrap();
+        assert!(path.exists(), "test setup: the file must exist before cleanup runs");
+
+        let result: Result<(), ComputerError> =
+            cleanup_on_err(&path, || Err(ComputerError::Io("disk full".to_string())));
+
+        assert!(result.is_err(), "the original error must still propagate");
+        assert!(
+            matches!(result, Err(ComputerError::Io(msg)) if msg == "disk full"),
+            "the ORIGINAL error must pass through untouched, not be replaced by a cleanup outcome"
+        );
+        assert!(!path.exists(), "a file left behind by a failed write must be cleaned up");
+    }
+
+    #[test]
+    fn cleanup_on_err_is_a_noop_when_the_write_never_created_anything() {
+        // A write that fails before ever touching the filesystem (e.g. the
+        // unix `create_new` open itself failing) leaves nothing at `path` —
+        // cleanup's own `remove_file` failing in that case must never mask
+        // the original error.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist-9-0.png");
+        assert!(!path.exists());
+
+        let result: Result<(), ComputerError> =
+            cleanup_on_err(&path, || Err(ComputerError::Io("open failed".to_string())));
+
+        assert!(
+            matches!(result, Err(ComputerError::Io(msg)) if msg == "open failed"),
+            "the original error must still surface even though there was nothing to clean up"
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cleanup_on_err_leaves_a_successful_write_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("123-9-0.png");
+        std::fs::write(&path, b"a complete, valid PNG").unwrap();
+
+        let result: Result<(), ComputerError> = cleanup_on_err(&path, || Ok(()));
+
+        assert!(result.is_ok());
+        assert!(path.exists(), "cleanup must never touch a file after a successful write");
+    }
+
     // —— prune_old_screenshots (issue #160 round-7 P1) ——
 
     #[cfg(unix)]
@@ -2390,7 +2547,7 @@ mod tests {
             paths.push(p);
         }
 
-        prune_old_screenshots(dir, keep);
+        prune_old_screenshots(dir, keep, None);
 
         let remaining: std::collections::HashSet<PathBuf> = std::fs::read_dir(dir)
             .unwrap()
@@ -2433,7 +2590,7 @@ mod tests {
         // keep=0: pruning must consider every LEGIT candidate it finds — the
         // strongest possible test that non-own files/symlinks are skipped by
         // construction, not merely left alone because they were under the cap.
-        prune_old_screenshots(dir, 0);
+        prune_old_screenshots(dir, 0, None);
 
         assert!(!own.exists(), "the lone own-named real file should be pruned at keep=0");
         assert!(unrelated.exists(), "a non-own file must never be pruned");
@@ -2445,6 +2602,74 @@ mod tests {
         assert!(link_target.exists(), "the symlink's target must never be deleted either");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prune_old_screenshots_breaks_mtime_ties_by_seq_descending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let keep = 2usize;
+
+        // Four own-named files, all given the EXACT same mtime — standing in
+        // for a coarse-mtime filesystem, or several screenshots landing in
+        // the same tick, where mtime alone can't order them (issue #160
+        // round-13 P2). `seq` (the filename's third component) is the only
+        // thing that still tells them apart, and higher `seq` is newer.
+        let mut paths = Vec::new();
+        for seq in 0..4u64 {
+            let p = dir.join(format!("1700000000000-9-{seq}.png"));
+            std::fs::write(&p, b"fake").unwrap();
+            set_mtime(&p, 1_000_000); // identical for all four
+            paths.push(p);
+        }
+
+        prune_old_screenshots(dir, keep, None);
+
+        let remaining: std::collections::HashSet<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(remaining.len(), keep, "expected exactly {keep} files left: {remaining:?}");
+        assert!(remaining.contains(&paths[3]), "highest-seq file in an mtime tie must survive");
+        assert!(remaining.contains(&paths[2]), "second-highest-seq file in an mtime tie must survive");
+        assert!(!remaining.contains(&paths[0]), "lowest-seq file in an mtime tie must be pruned");
+        assert!(!remaining.contains(&paths[1]), "second-lowest-seq file in an mtime tie must be pruned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_old_screenshots_never_deletes_the_just_written_file_even_if_it_sorts_oldest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let keep = 2usize;
+
+        // `a` is the file THIS call's caller "just wrote" — but it's given
+        // the OLDEST mtime, exactly the case that would otherwise get it
+        // sorted into the pruned tail by mtime order alone.
+        let a = dir.join("1700000000000-9-0.png");
+        std::fs::write(&a, b"fake").unwrap();
+        set_mtime(&a, 1_000_000);
+
+        let b = dir.join("1700000000001-9-1.png");
+        std::fs::write(&b, b"fake").unwrap();
+        set_mtime(&b, 1_000_001);
+
+        let c = dir.join("1700000000002-9-2.png");
+        std::fs::write(&c, b"fake").unwrap();
+        set_mtime(&c, 1_000_002);
+
+        let d = dir.join("1700000000003-9-3.png");
+        std::fs::write(&d, b"fake").unwrap();
+        set_mtime(&d, 1_000_003);
+
+        prune_old_screenshots(dir, keep, Some(&a));
+
+        assert!(a.exists(), "the just-written file must survive even though it sorts oldest by mtime");
+        assert!(d.exists(), "the newest file must survive under the normal keep cap");
+        assert!(c.exists(), "the second-newest file must survive under the normal keep cap");
+        assert!(!b.exists(), "a non-exempt file beyond the keep cap must still be pruned");
+    }
+
     #[test]
     fn is_own_screenshot_filename_matches_only_the_exact_naming_scheme() {
         assert!(is_own_screenshot_filename(Path::new("1700000000000-9-3.png")));
@@ -2453,6 +2678,17 @@ mod tests {
         assert!(!is_own_screenshot_filename(Path::new("1-2.png")), "must be exactly three parts");
         assert!(!is_own_screenshot_filename(Path::new("1-2-3.jpg")), "must be a .png extension");
         assert!(!is_own_screenshot_filename(Path::new("1--3.png")), "an empty middle part must not match");
+    }
+
+    #[test]
+    fn own_screenshot_seq_parses_the_trailing_component_and_never_panics() {
+        assert_eq!(own_screenshot_seq(Path::new("1700000000000-9-42.png")), 42);
+        assert_eq!(own_screenshot_seq(Path::new("1700000000000-9-0.png")), 0);
+        // Malformed shapes fall back to 0 rather than panicking — this
+        // function is only ever called on names `is_own_screenshot_filename`
+        // already accepted, but must stay panic-free regardless.
+        assert_eq!(own_screenshot_seq(Path::new("abc.png")), 0);
+        assert_eq!(own_screenshot_seq(Path::new("1-2.png")), 0);
     }
 
     // —— encode_jpeg_data_uri (issue #160 M3-B) ——

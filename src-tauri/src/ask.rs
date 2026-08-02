@@ -1895,6 +1895,32 @@ impl AskRegistry {
     ) -> (u64, oneshot::Receiver<Decision>) {
         let (tx, rx) = oneshot::channel();
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let id = Self::push_open_ask_locked(
+            &mut g, tx, thread, dir, tool, summary, detail, detail_redacted, risk, action_key, preview,
+        );
+        (id, rx)
+    }
+
+    /// The shared "mint an id, register the waiter, push the open Ask, emit
+    /// `Opened`" step both [`Self::request_with_preview`] and
+    /// [`Self::request_with_preview_unless_open`] perform WHILE ALREADY HOLDING
+    /// `self.inner`'s lock — split out so the two entry points can never drift
+    /// on how an Ask is constructed/registered (they differ ONLY in whether a
+    /// prior open Ask suspends the insert; everything else is identical).
+    #[allow(clippy::too_many_arguments)]
+    fn push_open_ask_locked(
+        g: &mut Inner,
+        tx: oneshot::Sender<Decision>,
+        thread: i32,
+        dir: &str,
+        tool: &str,
+        summary: &str,
+        detail: &str,
+        detail_redacted: Option<&str>,
+        risk: RiskLevel,
+        action_key: &str,
+        preview: Option<String>,
+    ) -> u64 {
         g.next_id += 1;
         let id = g.next_id;
         g.waiters.insert(id, tx);
@@ -1916,7 +1942,53 @@ impl AskRegistry {
         };
         g.open.push(ask.clone());
         g.emit(AskEvent::Opened(ask));
-        (id, rx)
+        id
+    }
+
+    /// issue #160 round-14 P1 (Codex computer_srv.rs:515): like
+    /// [`Self::request_with_preview`], but the "is another ask already open for
+    /// this (thread, dir)" check and the insert of THIS ask happen under ONE
+    /// lock acquisition. Returns `None` — inserting NOTHING — when any ask is
+    /// already open for (thread, dir); otherwise inserts and returns
+    /// `Some((id, rx))`.
+    ///
+    /// Closes a check-then-act race the computer-use input gate's separate
+    /// `has_open` pre-check (`bus::computer_srv::check_suspended`) left open:
+    /// that check and `request_with_preview` were two DISTINCT lock
+    /// acquisitions, so two Write (input) calls for the SAME session running
+    /// concurrently on different Tokio workers could both observe
+    /// `has_open == false` before either registered its card, and each then
+    /// opened its own overlapping card. Answering one `Always`/`Full` recorded
+    /// a standing grant while the other's own in-arm suspension recheck
+    /// rejected it (or, with a plain `Allow`, one of two explicitly approved
+    /// actions was silently discarded). Doing the check and the insert
+    /// atomically here means the SECOND concurrent Write sees the first's
+    /// just-inserted card and is suspended, never opening a second one. Only
+    /// the input path uses this (see `bus::computer_srv::approve`); observe
+    /// actions, which are never suspended, keep the plain
+    /// [`Self::request_with_preview`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_with_preview_unless_open(
+        &self,
+        thread: i32,
+        dir: &str,
+        tool: &str,
+        summary: &str,
+        detail: &str,
+        detail_redacted: Option<&str>,
+        risk: RiskLevel,
+        action_key: &str,
+        preview: Option<String>,
+    ) -> Option<(u64, oneshot::Receiver<Decision>)> {
+        let (tx, rx) = oneshot::channel();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.open.iter().any(|a| a.thread == thread && a.dir == dir) {
+            return None;
+        }
+        let id = Self::push_open_ask_locked(
+            &mut g, tx, thread, dir, tool, summary, detail, detail_redacted, risk, action_key, preview,
+        );
+        Some((id, rx))
     }
 
     /// Toggle Dangerous mode (global): every incoming ask auto-allows. Turning it
@@ -4513,6 +4585,39 @@ mod tests {
         assert!(r.has_open(1, "10"));
         assert!(r.answer(id, Answer::Allow));
         assert!(!r.has_open(1, "10"));
+    }
+
+    /// issue #160 round-14 P1 (Codex computer_srv.rs:515): the atomic
+    /// check-and-insert. It inserts only when NO ask is already open for this
+    /// (thread, dir); a second concurrent call for the same session sees the
+    /// first's card and gets `None` (inserting nothing), while a different
+    /// (thread, dir) is unaffected.
+    #[test]
+    fn request_with_preview_unless_open_is_atomic_check_and_insert() {
+        let r = AskRegistry::new();
+
+        // First call: nothing open yet → inserts and returns Some.
+        let first = r.request_with_preview_unless_open(
+            1, "10", "computer", "s", "d", None, RiskLevel::Write, "k1", None,
+        );
+        assert!(first.is_some(), "the first call must insert and return Some");
+        assert!(r.has_open(1, "10"));
+        assert_eq!(r.open().len(), 1);
+
+        // Second call for the SAME (thread, dir): a card is already open →
+        // returns None and inserts NOTHING (no overlapping second card).
+        let second = r.request_with_preview_unless_open(
+            1, "10", "computer", "s", "d", None, RiskLevel::Write, "k2", None,
+        );
+        assert!(second.is_none(), "a second call for the same session must be suspended");
+        assert_eq!(r.open().len(), 1, "no overlapping second card may be created");
+
+        // A DIFFERENT (thread, dir) is unaffected — it opens its own card.
+        let other = r.request_with_preview_unless_open(
+            2, "20", "computer", "s", "d", None, RiskLevel::Write, "k3", None,
+        );
+        assert!(other.is_some(), "a different session is not suspended by the first's card");
+        assert_eq!(r.open().len(), 2);
     }
 
     // ---- authorization persistence ------------------------------------------

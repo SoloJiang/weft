@@ -23,7 +23,10 @@ use weft::store::{repo, Db};
 /// through [`rpc`] gets it for free; the handful of call sites that build
 /// their own URL (the `?wt=` scenarios below) attach it explicitly.
 fn key_query(thread: i32, dir: &str) -> String {
-    format!("key={}", computer_srv::computer_session_token(thread, dir))
+    // No `?wt=` in the URL → the bearer is bound to the absent-worktree case
+    // (issue #160 round-13/14 P1). The handful of `?wt=` scenarios below mint
+    // their own key for the exact `Some(wt)` their URL carries.
+    format!("key={}", computer_srv::computer_session_token(thread, dir, None))
 }
 
 async fn rpc(base: &str, thread: i32, dir: &str, body: serde_json::Value) -> String {
@@ -211,7 +214,7 @@ async fn endpoint_auth_rejects_a_key_minted_for_a_different_thread_dir() {
     let (base, _h) = server::serve(reg, db, asks).await.unwrap();
 
     // A key that is VALID for (thread=1, dir="10")...
-    let foreign_key = computer_srv::computer_session_token(1, "10");
+    let foreign_key = computer_srv::computer_session_token(1, "10", None);
     // ...used to call a DIFFERENT (thread=2, dir="20").
     let url = format!("{base}/computer/2/20/mcp?key={foreign_key}");
     let resp = reqwest::Client::builder()
@@ -1365,9 +1368,12 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // 14a. An explicit `?wt=` naming worktree B lands its audit line in B's
     // OWN weft-managed namespace, NOT A's — and never touches wt_14b_path
     // (the actual worktree CHECKOUT) at all: output no longer lives there.
+    // issue #160 round-13/14 P1: the bearer is bound to the EXACT `wt` the URL
+    // carries, so a `?wt=B` URL must present the key minted for `Some(B)`.
     let url = format!(
-        "{base}/computer/{}/{}/mcp?wt={}&{}",
-        thread_14.id, dir_14_s, wt_14b.id, key_query(thread_14.id, &dir_14_s)
+        "{base}/computer/{}/{}/mcp?wt={}&key={}",
+        thread_14.id, dir_14_s, wt_14b.id,
+        computer_srv::computer_session_token(thread_14.id, &dir_14_s, Some(wt_14b.id))
     );
     let out = rpc_url(
         &url,
@@ -1418,9 +1424,16 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     .await
     .unwrap();
     let lines_before_14c = std::fs::read_to_string(&audit_14a).unwrap().lines().count();
+    // Mint the key for THIS foreign `wt` so the request clears the bearer check
+    // (issue #160 round-13/14 P1) and actually reaches `session_root` — the
+    // point of 14c is that even a token-matching foreign-DIRECTION worktree is
+    // rejected there (round-8 P2 #7), independently of the token layer. The
+    // sibling-worktree hijack the token binding itself blocks is covered
+    // separately by `computer_token_binds_to_the_worktree_not_just_thread_dir`.
     let url = format!(
-        "{base}/computer/{}/{}/mcp?wt={}&{}",
-        thread_14.id, dir_14_s, foreign_14.id, key_query(thread_14.id, &dir_14_s)
+        "{base}/computer/{}/{}/mcp?wt={}&key={}",
+        thread_14.id, dir_14_s, foreign_14.id,
+        computer_srv::computer_session_token(thread_14.id, &dir_14_s, Some(foreign_14.id))
     );
     let out = rpc_url(
         &url,
@@ -1441,7 +1454,9 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
 
     // 14d. issue #160 round-10 P2 #2: an EXPLICIT but non-numeric `wt` must
     // ALSO fail the WHOLE call closed — never silently fall back to "first
-    // worktree" the way an ABSENT `wt` does.
+    // worktree" the way an ABSENT `wt` does. issue #160 round-13/14 P1: it now
+    // fails even earlier, at the bearer check — a malformed `wt` can match no
+    // minted token, so `handle_computer` rejects it with a 401 before dispatch.
     let lines_before_14d = std::fs::read_to_string(&audit_14a).unwrap().lines().count();
     let url = format!(
         "{base}/computer/{}/{}/mcp?wt=abc&{}",

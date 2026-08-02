@@ -1597,7 +1597,27 @@ pub async fn get_computer_use_enabled(db: State<'_, Db>) -> R<bool> {
 /// Kept as a free function taking `&Db` (rather than `State<'_, Db>`) so a
 /// test can drive it without a Tauri runtime — same pattern as
 /// `ensure_default_workspace_inner`.
-pub async fn set_computer_use_enabled_inner(db: &Db, enabled: bool) -> R<()> {
+pub async fn set_computer_use_enabled_inner(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    enabled: bool,
+) -> R<()> {
+    // issue #160 round-13 P1 (Codex commands.rs:1676): on the OFF transition,
+    // cancel every open GUI ask FIRST — mirroring `computer_emergency_stop`'s
+    // own trip→cancel→persist ordering. Without this, a computer permission
+    // card left open at the moment a human disables Computer Use through
+    // Settings could still be answered `Always`/`Full`, and `AskRegistry::
+    // answer` records that standing grant BEFORE the waiting action rechecks
+    // the now-disabled setting and rejects itself — so re-enabling later would
+    // silently activate a permission minted AFTER access was turned off.
+    // `cancel_gui_asks` resolves those cards as denied, so no grant can be
+    // recorded on the way down. Synchronous and independent of the DB write,
+    // so it runs before the first `.await` below (the serialize lock) — no
+    // racing answer can slip in between cancel and persist. The enable path
+    // (`enabled == true`) never cancels anything.
+    if !enabled {
+        asks.cancel_gui_asks();
+    }
     // issue #160 round-10 P2 #D: held for this ENTIRE function — read gen,
     // write the setting, reconcile — so a second overlapping enable request
     // can never interleave with this one's own (possibly compensating)
@@ -1672,8 +1692,12 @@ async fn reconcile_enable_after_write(db: &Db, gen: u64) -> R<()> {
 }
 
 #[tauri::command]
-pub async fn set_computer_use_enabled(db: State<'_, Db>, enabled: bool) -> R<()> {
-    set_computer_use_enabled_inner(&db, enabled).await
+pub async fn set_computer_use_enabled(
+    db: State<'_, Db>,
+    asks: State<'_, crate::ask::AskRegistry>,
+    enabled: bool,
+) -> R<()> {
+    set_computer_use_enabled_inner(&db, &asks, enabled).await
 }
 
 /// issue #160 M2: the current computer-use control holder, if any — the
@@ -4124,7 +4148,7 @@ mod tests {
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
         let db = Db::connect("sqlite::memory:").await.unwrap();
 
-        set_computer_use_enabled_inner(&db, true).await.unwrap();
+        set_computer_use_enabled_inner(&db, &crate::ask::AskRegistry::new(), true).await.unwrap();
 
         assert_eq!(
             repo::get_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED).await.unwrap().as_deref(),
@@ -4229,7 +4253,7 @@ mod tests {
         // B: a later, explicit re-enable through the REAL public entry point
         // — must see the CURRENT (post-A) generation, persist "true", and
         // clear the latch, with nothing from A left to override it.
-        set_computer_use_enabled_inner(&db, true).await.unwrap();
+        set_computer_use_enabled_inner(&db, &crate::ask::AskRegistry::new(), true).await.unwrap();
 
         assert_eq!(
             repo::get_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED).await.unwrap().as_deref(),
@@ -4258,7 +4282,7 @@ mod tests {
         let held = crate::computer::enable_serialize_mutex().lock().await;
 
         let db_bg = db.clone();
-        let handle = tokio::spawn(async move { set_computer_use_enabled_inner(&db_bg, true).await });
+        let handle = tokio::spawn(async move { set_computer_use_enabled_inner(&db_bg, &crate::ask::AskRegistry::new(), true).await });
 
         // Give the spawned call a chance to run — if it did NOT serialize on
         // this lock it would race ahead and finish; confirm it hasn't.
@@ -4343,7 +4367,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        set_computer_use_enabled_inner(&db, true).await.unwrap();
+        set_computer_use_enabled_inner(&db, &crate::ask::AskRegistry::new(), true).await.unwrap();
 
         let held = crate::computer::enable_serialize_mutex().lock().await;
 
@@ -4360,7 +4384,7 @@ mod tests {
         // still-pending write, since we are still holding the lock and
         // stop's task already reached the queue first.
         let db_enable = db.clone();
-        let enable_handle = tokio::spawn(async move { set_computer_use_enabled_inner(&db_enable, true).await });
+        let enable_handle = tokio::spawn(async move { set_computer_use_enabled_inner(&db_enable, &crate::ask::AskRegistry::new(), true).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!enable_handle.is_finished(), "the later enable must also queue behind the held lock");
 
@@ -4377,6 +4401,46 @@ mod tests {
              overwritten by stop's own earlier-queued write landing after it"
         );
         assert!(crate::computer::enabled(&db).await, "the re-enable must actually take effect");
+
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+    }
+
+    /// issue #160 round-13 P1 (Codex commands.rs:1676): turning Computer Use
+    /// OFF from Settings cancels every open GUI ask (so a still-open card can't
+    /// be answered `Always`/`Full` into a standing grant AFTER access was
+    /// disabled), and cancels ONLY those — a concurrent non-GUI card is left
+    /// alone. Turning it ON never cancels anything.
+    #[tokio::test]
+    async fn disabling_computer_use_cancels_open_gui_asks_but_enabling_does_not() {
+        let _guard = crate::computer::process_state_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let asks = crate::ask::AskRegistry::new();
+
+        // One GUI (computer-use) card and one ordinary non-GUI card, both open
+        // for the same (thread, dir).
+        let gui_key = crate::ask::action_key(&["gui", "left_click", "notes"]);
+        let bash_key = crate::ask::action_key(&["bash", "ls"]);
+        let (_gid, _grx) =
+            asks.request(1, "10", "computer", "click", "detail", crate::ask::RiskLevel::Write, &gui_key);
+        let (_bid, _brx) =
+            asks.request(1, "10", "bash", "run", "ls", crate::ask::RiskLevel::Write, &bash_key);
+        assert_eq!(asks.open().len(), 2, "precondition: both cards open");
+
+        // Enabling must not cancel anything.
+        set_computer_use_enabled_inner(&db, &asks, true).await.unwrap();
+        assert_eq!(asks.open().len(), 2, "enabling must not cancel any open ask");
+
+        // Disabling cancels ONLY the GUI card; the bash card survives.
+        set_computer_use_enabled_inner(&db, &asks, false).await.unwrap();
+        let open = asks.open();
+        assert_eq!(open.len(), 1, "the GUI card must be cancelled on the OFF transition");
+        assert_eq!(
+            open[0].tool, "bash",
+            "only the GUI card is cancelled — an unrelated non-GUI card is left alone"
+        );
 
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
     }

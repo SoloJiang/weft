@@ -209,9 +209,29 @@ type HmacSha256 = Hmac<Sha256>;
 /// (including this fixed 32-byte CSPRNG buffer), so this is a can't-happen
 /// path in practice; matched explicitly (never `.expect()`/`.unwrap()`) per
 /// CLAUDE.md's ban on panicking in a production path.
-fn computer_token_mac(thread: i32, dir: &str) -> Result<HmacSha256, hmac::digest::InvalidLength> {
+fn computer_token_mac(
+    thread: i32,
+    dir: &str,
+    wt: Option<i32>,
+) -> Result<HmacSha256, hmac::digest::InvalidLength> {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(computer_endpoint_secret())?;
-    mac.update(format!("{thread}/{dir}").as_bytes());
+    // issue #160 round-13/14 P1 (Codex computer_srv.rs:214 + inject.rs:483): the
+    // MAC binds the EXACT worktree this URL carries, not just `(thread, dir)`.
+    // Sibling worker sessions of one multi-repo direction share a single
+    // `(thread, dir)` but differ only by `wt`; binding just `(thread, dir)`
+    // gave every one of them the SAME bearer, so any of them could swap its
+    // URL's `?wt=` to a sibling's id and route screenshots/audit into that
+    // sibling's namespace under its own otherwise-valid token and shared
+    // grants. Folding `wt` into the MAC means a swapped `?wt=` no longer matches
+    // the token the worker was actually issued. The `none` marker for the
+    // absent/lead case (no worktree at all) is a DISTINCT representation that
+    // can never collide with any explicit `wt<id>` — the separate lead/absent
+    // encoding Codex's finding calls for.
+    let wt_repr = match wt {
+        Some(id) => format!("wt{id}"),
+        None => "none".to_string(),
+    };
+    mac.update(format!("{thread}/{dir}/{wt_repr}").as_bytes());
     Ok(mac)
 }
 
@@ -237,8 +257,8 @@ fn computer_token_mac(thread: i32, dir: &str) -> Result<HmacSha256, hmac::digest
 /// fail-closed even in this can't-happen case, rather than silently minting
 /// (or accepting) an empty/predictable token.
 #[doc(hidden)]
-pub fn computer_session_token(thread: i32, dir: &str) -> String {
-    match computer_token_mac(thread, dir) {
+pub fn computer_session_token(thread: i32, dir: &str, wt: Option<i32>) -> String {
+    match computer_token_mac(thread, dir, wt) {
         Ok(mac) => hex::encode(mac.finalize().into_bytes()),
         Err(_) => "hmac-init-failed-not-valid-hex".to_string(),
     }
@@ -254,11 +274,11 @@ pub fn computer_session_token(thread: i32, dir: &str) -> String {
 /// got right. A `supplied` that isn't even valid hex fails immediately
 /// (`hex::decode` error) — there is no valid token shape it could be
 /// mistaken for.
-fn verify_computer_token(thread: i32, dir: &str, supplied: &str) -> bool {
+fn verify_computer_token(thread: i32, dir: &str, wt: Option<i32>, supplied: &str) -> bool {
     let Ok(supplied_bytes) = hex::decode(supplied) else {
         return false;
     };
-    match computer_token_mac(thread, dir) {
+    match computer_token_mac(thread, dir, wt) {
         Ok(mac) => mac.verify_slice(&supplied_bytes).is_ok(),
         Err(_) => false,
     }
@@ -290,7 +310,19 @@ pub async fn handle_computer(
     // 401 — no JSON-RPC envelope, no hint about method/id/tool shape, nothing
     // that would help a guessing caller narrow down the real token.
     let supplied_key = q.get("key").map(String::as_str).unwrap_or("");
-    if !verify_computer_token(thread, &dir, supplied_key) {
+    // issue #160 round-13/14 P1 (Codex computer_srv.rs:214 + inject.rs:483): the
+    // per-session bearer is bound to the EXACT worktree this URL carries, not
+    // just `(thread, dir)` — see [`computer_token_mac`]'s own doc for the
+    // sibling-worktree hijack this closes. Resolve `?wt=` FIRST: a malformed one
+    // can correspond to no minted token, so it fails auth CLOSED here (a bare
+    // 401, indistinguishable from any other bad key — it never reveals that the
+    // path or a worktree exists), while a well-formed absent/explicit `wt` is
+    // exactly what the token is then verified against.
+    let wt = match WtParam::parse(&q).resolve() {
+        Ok(w) => w,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    if !verify_computer_token(thread, &dir, wt, supplied_key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     // Notifications (no id) get a bare 202, same as the other bus handlers.
@@ -299,7 +331,6 @@ pub async fn handle_computer(
         None => return StatusCode::ACCEPTED.into_response(),
     };
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    let wt = WtParam::parse(&q);
 
     let result: Value = match method {
         "initialize" => json!({
@@ -317,10 +348,7 @@ pub async fn handle_computer(
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match wt.resolve() {
-                Ok(wt) => call_computer(&db, &asks, thread, &dir, wt, name, &args).await,
-                Err(msg) => text_result(msg),
-            }
+            call_computer(&db, &asks, thread, &dir, wt, name, &args).await
         }
         _ => json!({}),
     };
@@ -348,6 +376,21 @@ const VALID_ACTIONS: &[&str] = &[
     "cursor_position",
     "wait",
 ];
+
+/// The ONE rendering of the "unknown action" rejection, shared by BOTH
+/// [`pure_validate`] (which now rejects an unrecognized action FIRST, before
+/// the approval gate — issue #160 round-13 P1) and [`run_action`]'s own
+/// fail-closed `_` arm. issue #160 round-13 follow-up: these two used to
+/// format the message independently — `pure_validate` emitted a bare
+/// `unknown action: <a>` while `run_action` listed the valid ones — so once
+/// `pure_validate` began winning the race, the caller (and the
+/// `computer_mcp` integration test that asserts the valid list is named)
+/// stopped seeing the action list at all. Routing both through this single
+/// function keeps them from ever drifting again — same
+/// closed-list-as-single-source discipline `VALID_ACTIONS` itself follows.
+fn unknown_action_error(action: &str) -> String {
+    format!("unknown action '{action}'; valid actions: {}", VALID_ACTIONS.join(", "))
+}
 
 fn computer_tool_specs() -> Value {
     json!([
@@ -581,6 +624,25 @@ async fn run_action(
             // this call does; dropped when this arm's block ends (including
             // on an early `?` return from the capture itself).
             let _capture_permit = screenshot_semaphore().acquire().await.map_err(|e| e.to_string())?;
+            // issue #160 round-14 P1 (Codex computer_srv.rs:583): recheck the
+            // kill switch AFTER the two awaits this arm took since the last
+            // `enabled` check up top — `screenshot_out_dir`, then the capture
+            // semaphore's own `acquire().await`, which can queue arbitrarily
+            // long when both `SCREENSHOT_CONCURRENCY` permits are already held.
+            // Without this, a human hitting Stop / disabling Computer Use while
+            // this call sat queued on the semaphore would still capture once a
+            // permit freed (the only post-await checks left were the window-
+            // identity re-verifies, which never look at `enabled`) — a
+            // Full/Always-granted caller could leave many captures queued to
+            // fire AFTER Stop. Placed BEFORE the second `resolve_and_verify_
+            // target` below (not right before `screenshot_window`) on purpose:
+            // this is the arm's LAST `.await`, so the resolve→capture→record
+            // sequence after it stays await-free and keeps its "just verified"
+            // identity guarantee (round-12 P1 #I) — a window that changed during
+            // THIS await is still caught fail-closed by that re-resolve.
+            if !computer::enabled(db).await {
+                return Err(ComputerError::Disabled.to_string());
+            }
             // issue #160 round-12 P1 #I: re-resolve + re-verify identity
             // AGAIN, here, after EVERY await this arm takes since the first
             // check above (`screenshot_out_dir`, then the capture semaphore
@@ -669,7 +731,13 @@ async fn run_action(
             if let Ok(preview) =
                 computer::encode_jpeg_data_uri(&shot.pixels, PREVIEW_LONG_EDGE, PREVIEW_QUALITY)
             {
-                store_screenshot_preview(thread, dir, preview, shot.window_id);
+                // issue #160 round-14 P1 (Codex computer_srv.rs:1466): store the
+                // FULL window identity (id + app + title) this capture came
+                // from, not the numeric id alone — `w` is the already-resolved,
+                // just-verified target (its `id` equals `shot.window_id` by that
+                // verification), so this reuses it rather than re-resolving. See
+                // [`PreviewWindowIdentity`] for the id-reuse hazard this closes.
+                store_screenshot_preview(thread, dir, preview, PreviewWindowIdentity::from_window(&w));
             }
             // issue #160 round-11 P1 #D: record THIS capture's own saved
             // dimensions for (thread, dir, shot.window_id) — every
@@ -932,11 +1000,11 @@ async fn run_action(
         }
         // Fail-closed, not fail-open: an unrecognized/missing action is
         // rejected with the valid list, never silently treated as one of
-        // the known ones.
-        _ => Err(format!(
-            "unknown action '{action}'; valid actions: {}",
-            VALID_ACTIONS.join(", ")
-        )),
+        // the known ones. In practice [`pure_validate`] already rejected an
+        // unknown action before dispatch ever reached here (issue #160
+        // round-13 P1) — this arm stays as defense-in-depth, sharing the
+        // SAME [`unknown_action_error`] rendering so the two can't diverge.
+        _ => Err(unknown_action_error(action)),
     }
 }
 
@@ -1196,9 +1264,29 @@ async fn approve(
     }
 
     let preview = preview_for_action(thread, dir, risk, &window_query);
-    let (id, rx) = asks.request_with_preview(
-        thread, dir, "computer", &summary, &detail, detail_redacted.as_deref(), risk, &action_key, preview,
-    );
+    // issue #160 round-14 P1 (Codex computer_srv.rs:515): for an input (Write)
+    // action, open the card ATOMICALLY with the "no other ask is already open
+    // for this (thread, dir)" check — `check_suspended` above and this insert
+    // were two SEPARATE lock acquisitions, so two concurrent Write calls for
+    // the same session could both pass that pre-check and each open a card. The
+    // atomic variant returns `None` (opening nothing) if another card raced in
+    // first, which we surface as the SAME `SuspendedPendingAsk` the pre-check
+    // and every input arm's own recheck already return. Observe actions
+    // (`RiskLevel::ReadOnly` — `screenshot`/`list_windows`/`cursor_position`)
+    // are never suspended (see `check_suspended`'s Write-only gate) and keep
+    // the plain, always-inserts path.
+    let (id, rx) = if risk == crate::ask::RiskLevel::Write {
+        match asks.request_with_preview_unless_open(
+            thread, dir, "computer", &summary, &detail, detail_redacted.as_deref(), risk, &action_key, preview,
+        ) {
+            Some(pair) => pair,
+            None => return Err(ComputerError::SuspendedPendingAsk.to_string()),
+        }
+    } else {
+        asks.request_with_preview(
+            thread, dir, "computer", &summary, &detail, detail_redacted.as_deref(), risk, &action_key, preview,
+        )
+    };
 
     match tokio::time::timeout(crate::bus::server::ASK_WAIT, rx).await {
         // issue #160 round-10 P1 #A: same `resolved` value, reused here too —
@@ -1461,9 +1549,13 @@ fn preview_for_action(
     if risk != crate::ask::RiskLevel::Write {
         return None;
     }
-    let target = resolve_target_window_id(window_query)?;
-    let (data_uri, preview_window_id) = last_screenshot_preview(thread, dir)?;
-    (preview_window_id == target).then_some(data_uri)
+    // issue #160 round-14 P1 (Codex computer_srv.rs:1466): match on the FULL
+    // window identity (id + app + title), not the numeric id alone — see
+    // [`PreviewWindowIdentity`]'s own doc for the id-reuse hazard an id-only
+    // comparison left open.
+    let target = resolve_target_window_identity(window_query)?;
+    let (data_uri, stored) = last_screenshot_preview(thread, dir)?;
+    (stored == target).then_some(data_uri)
 }
 
 /// Best-effort window resolution for [`preview_for_action`]'s id match ONLY
@@ -1472,12 +1564,14 @@ fn preview_for_action(
 /// "should we attach a preview" decision, not the real validation
 /// ([`required_window`] / the per-action dispatch) that actually rejects a
 /// malformed call.
-fn resolve_target_window_id(window_query: &str) -> Option<u32> {
+fn resolve_target_window_identity(window_query: &str) -> Option<PreviewWindowIdentity> {
     if window_query.trim().is_empty() {
         return None;
     }
     let b = backend::backend();
-    computer::resolve_window(b.as_ref(), window_query).ok().map(|w| w.id)
+    computer::resolve_window(b.as_ref(), window_query)
+        .ok()
+        .map(|w| PreviewWindowIdentity::from_window(&w))
 }
 
 /// A window-scoped action's `window` argument, validated BEFORE it ever
@@ -1813,8 +1907,31 @@ async fn engine_accepts_mcp_image(db: &Db, thread: i32, dir: &str) -> bool {
 /// evicted. [`MAX_PREVIEWS`] caps it; the value's third element is the
 /// insertion timestamp [`store_screenshot_preview`] needs to find (and evict)
 /// the single oldest entry once the map is full — see [`evict_oldest_if_full`].
-fn screenshot_previews() -> &'static Mutex<HashMap<(i32, String), (String, u32, u64)>> {
-    static PREVIEWS: OnceLock<Mutex<HashMap<(i32, String), (String, u32, u64)>>> = OnceLock::new();
+/// The FULL identity of the window a stored preview was captured from (issue
+/// #160 round-14 P1, Codex computer_srv.rs:1466) — `id` ALONE is not enough:
+/// an OS window id is reusable, so if the last-screenshotted window closes and
+/// its numeric id is handed to a DIFFERENT window (different app/title), an
+/// id-only match would attach the OLD window's pixels to an approval card for
+/// the REPLACEMENT, letting a human approve an input action against a preview
+/// of a window `approve` never resolved. Comparing `app`+`title` alongside
+/// `id` fails that match closed instead — the SAME id-reuse defense
+/// `computer::shot_dims_for` already applies to recorded screenshot geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreviewWindowIdentity {
+    id: u32,
+    app: String,
+    title: String,
+}
+
+impl PreviewWindowIdentity {
+    fn from_window(w: &computer::WindowInfo) -> Self {
+        Self { id: w.id, app: w.app.clone(), title: w.title.clone() }
+    }
+}
+
+fn screenshot_previews() -> &'static Mutex<HashMap<(i32, String), (String, PreviewWindowIdentity, u64)>> {
+    static PREVIEWS: OnceLock<Mutex<HashMap<(i32, String), (String, PreviewWindowIdentity, u64)>>> =
+        OnceLock::new();
     PREVIEWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1836,7 +1953,7 @@ const MAX_PREVIEWS: usize = 32;
 /// about to be written already exists (an UPDATE never grows the map, so it
 /// never needs to evict anything to make room for itself) — see this
 /// function's one caller for that guard.
-fn evict_oldest_if_full(map: &mut HashMap<(i32, String), (String, u32, u64)>) {
+fn evict_oldest_if_full(map: &mut HashMap<(i32, String), (String, PreviewWindowIdentity, u64)>) {
     if map.len() < MAX_PREVIEWS {
         return;
     }
@@ -1849,7 +1966,7 @@ fn evict_oldest_if_full(map: &mut HashMap<(i32, String), (String, u32, u64)>) {
     }
 }
 
-fn store_screenshot_preview(thread: i32, dir: &str, preview: String, window_id: u32) {
+fn store_screenshot_preview(thread: i32, dir: &str, preview: String, identity: PreviewWindowIdentity) {
     let mut g = screenshot_previews().lock().unwrap_or_else(|e| e.into_inner());
     let key = (thread, dir.to_string());
     // Only evict to make room for a genuinely NEW key — refreshing an
@@ -1859,7 +1976,7 @@ fn store_screenshot_preview(thread: i32, dir: &str, preview: String, window_id: 
     if !g.contains_key(&key) {
         evict_oldest_if_full(&mut g);
     }
-    g.insert(key, (preview, window_id, now_ms()));
+    g.insert(key, (preview, identity, now_ms()));
 }
 
 /// The most recent screenshot preview (and the window id it came from) for
@@ -1867,10 +1984,10 @@ fn store_screenshot_preview(thread: i32, dir: &str, preview: String, window_id: 
 /// from [`preview_for_action`] within this same module now (the round-2 P1
 /// server-side gate owns preview attachment; `bus::server::handle_ask` no
 /// longer does — see this module's own top doc comment).
-fn last_screenshot_preview(thread: i32, dir: &str) -> Option<(String, u32)> {
+fn last_screenshot_preview(thread: i32, dir: &str) -> Option<(String, PreviewWindowIdentity)> {
     let g = screenshot_previews().lock().unwrap_or_else(|e| e.into_inner());
     g.get(&(thread, dir.to_string()))
-        .map(|(preview, window_id, _ts)| (preview.clone(), *window_id))
+        .map(|(preview, identity, _ts)| (preview.clone(), identity.clone()))
 }
 
 fn window_arg(args: &Value) -> String {
@@ -1951,6 +2068,32 @@ fn check_suspended(asks: &AskRegistry, thread: i32, dir: &str) -> Result<(), Str
 /// passes, and means a rejected, rate-limited call no longer touches
 /// `acquire_control`/the lease at all.
 fn acquire_and_throttle(thread: i32, dir: &str) -> Result<(), String> {
+    // issue #160 round-13 P2 (Codex computer_srv.rs:1955): a call that is about
+    // to be rejected as `Busy` (a DIFFERENT, still-live session holds the
+    // control lease) must NOT consume a throttle slot on the way out. The
+    // throttle is process-wide and single-slotted; `throttle_input` records
+    // `now` on success, so a foreign session polling roughly every
+    // `THROTTLE_MS` would pass the throttle, bump that global timestamp, and
+    // only THEN hit `Busy` from `acquire_control` — repeatedly, starving the
+    // ACTUAL holder's own paced calls into `RateLimited` even though they are
+    // ≥ `THROTTLE_MS` apart. Peek the holder first: only a free lease or one
+    // this SAME `(thread, dir)` already holds proceeds to the throttle. This
+    // keeps round-12 P2 #G intact — a same-holder call that is itself rate-
+    // limited still rejects at `throttle_input` WITHOUT renewing its lease,
+    // because `acquire_control` only runs after the throttle passes.
+    //
+    // Residual (accepted, not a starvation vector): the peek and the
+    // acquire below are two separate lock acquisitions, so if the lease is free
+    // at the peek but a foreign holder wins the race to acquire it in the gap,
+    // this one call consumes a throttle slot and then still gets `Busy`. That
+    // can happen at most ONCE per lease-free window (the very next call peeks
+    // the new foreign holder and bails before the throttle), so it can never
+    // become the repeatable starvation the peek closes.
+    if let Some(holder) = computer::control_state() {
+        if !(holder.thread == thread && holder.dir == dir) {
+            return Err(ComputerError::Busy { thread: holder.thread, dir: holder.dir }.to_string());
+        }
+    }
     computer::throttle_input().map_err(|e| e.to_string())?;
     computer::acquire_control(thread, dir).map_err(|e| e.to_string())?;
     Ok(())
@@ -2141,11 +2284,28 @@ fn check_type_length(text: &str) -> Result<(), String> {
 /// `(dx, dy)` delta `backend::ComputerBackend::scroll` understands.
 fn parse_scroll(args: &Value) -> Result<(i32, i32), String> {
     let direction = args.get("scroll_direction").and_then(|v| v.as_str()).unwrap_or("");
-    let amount = args
-        .get("scroll_amount")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(3)
-        .clamp(0, 30) as i32;
+    // issue #160 round-14 P2 (Codex computer_srv.rs:2147): distinguish an
+    // ABSENT `scroll_amount` (→ the documented default of 3) from one that is
+    // PRESENT but not representable as an `i64` (a JSON string like `"30"`, or a
+    // number outside `i64`'s range). The old `.and_then(as_i64).unwrap_or(3)`
+    // collapsed both into 3, so a malformed value passed `pure_validate`, the
+    // approval card rendered the raw requested value, and the backend then
+    // scrolled a DIFFERENT distance after the human allowed it. A present-but-
+    // invalid value is now rejected outright, before approval.
+    let amount = match args.get("scroll_amount") {
+        None | Some(Value::Null) => 3,
+        Some(v) => match v.as_i64() {
+            Some(n) => n,
+            None => {
+                return Err(
+                    "'scroll_amount' must be an integer (a plain JSON number); omit it to use the \
+                     default of 3"
+                        .to_string(),
+                )
+            }
+        },
+    };
+    let amount = amount.clamp(0, 30) as i32;
     match direction {
         "up" => Ok((0, -amount)),
         "down" => Ok((0, amount)),
@@ -2182,7 +2342,7 @@ fn parse_duration_ms(args: &Value) -> Result<u64, String> {
 /// either.
 fn pure_validate(action: &str, args: &Value) -> Result<(), String> {
     if !VALID_ACTIONS.iter().any(|a| *a == action) {
-        return Err(format!("unknown action: {action}"));
+        return Err(unknown_action_error(action));
     }
     match action {
         "left_click" | "right_click" | "double_click" | "triple_click" | "mouse_move" => {
@@ -2678,6 +2838,37 @@ mod tests {
         assert!(WtParam::Invalid.resolve().is_err());
     }
 
+    /// issue #160 round-13/14 P1 (Codex computer_srv.rs:214 + inject.rs:483):
+    /// the bearer binds the EXACT worktree, not just `(thread, dir)`. A token
+    /// minted for one `wt` must NOT verify for a sibling `wt` (the hijack), for
+    /// the absent case, or for a different `(thread, dir)`; the absent token is
+    /// symmetric — it must not verify for any explicit `wt`.
+    #[test]
+    fn computer_token_binds_to_the_worktree_not_just_thread_dir() {
+        let t7 = computer_session_token(1, "10", Some(7));
+        assert!(verify_computer_token(1, "10", Some(7), &t7), "the exact wt must verify");
+        assert!(
+            !verify_computer_token(1, "10", Some(8), &t7),
+            "a SIBLING worktree id must not verify a token minted for a different one"
+        );
+        assert!(
+            !verify_computer_token(1, "10", None, &t7),
+            "the absent-worktree case must not verify a token minted for an explicit wt"
+        );
+        assert!(!verify_computer_token(2, "10", Some(7), &t7), "still bound to thread");
+        assert!(!verify_computer_token(1, "20", Some(7), &t7), "still bound to dir");
+
+        let t_none = computer_session_token(1, "10", None);
+        assert!(verify_computer_token(1, "10", None, &t_none), "the absent case must verify itself");
+        assert!(
+            !verify_computer_token(1, "10", Some(7), &t_none),
+            "an explicit wt must not verify a token minted for the absent case"
+        );
+        // The `none` marker for the absent case can never collide with any
+        // explicit id's `wt<id>` representation.
+        assert_ne!(t7, t_none);
+    }
+
     #[test]
     fn audit_line_is_one_json_object_per_line() {
         let args = json!({"action": "left_click", "coordinate": [1, 2]});
@@ -2735,6 +2926,66 @@ mod tests {
         );
         assert!(parse_scroll(&json!({"scroll_direction": "sideways"})).is_err());
         assert!(parse_scroll(&json!({})).is_err());
+    }
+
+    /// issue #160 round-14 P2 (Codex computer_srv.rs:2147): an ABSENT
+    /// `scroll_amount` defaults to 3, but a PRESENT-but-invalid one (a JSON
+    /// string, or a number outside `i64`) is REJECTED — never silently
+    /// substituted with 3, which would let the approval card and the actual
+    /// scroll distance disagree.
+    #[test]
+    fn parse_scroll_rejects_a_present_but_invalid_amount_but_defaults_when_absent() {
+        // Absent → default 3 (unchanged).
+        assert_eq!(parse_scroll(&json!({"scroll_direction": "down"})).unwrap(), (0, 3));
+        assert_eq!(
+            parse_scroll(&json!({"scroll_direction": "down", "scroll_amount": null})).unwrap(),
+            (0, 3),
+            "an explicit null is treated as absent → default"
+        );
+        // Present but not an i64 → rejected, not silently defaulted.
+        assert!(
+            parse_scroll(&json!({"scroll_direction": "down", "scroll_amount": "30"})).is_err(),
+            "a string scroll_amount must be rejected, not defaulted to 3"
+        );
+        assert!(
+            parse_scroll(&json!({"scroll_direction": "down", "scroll_amount": 9_999_999_999_999_999_999u64}))
+                .is_err(),
+            "a number above i64::MAX must be rejected, not defaulted to 3"
+        );
+        // A valid integer still parses (and clamps) as before.
+        assert_eq!(parse_scroll(&json!({"scroll_direction": "down", "scroll_amount": 5})).unwrap(), (0, 5));
+    }
+
+    /// issue #160 round-13 P2 (Codex computer_srv.rs:1955): a call rejected as
+    /// `Busy` by a DIFFERENT live holder must NOT consume a throttle slot on
+    /// the way out — otherwise a foreign session polling every `THROTTLE_MS`
+    /// keeps bumping the global throttle and starves the real holder.
+    #[test]
+    fn acquire_and_throttle_leaves_the_throttle_untouched_on_a_foreign_busy() {
+        let _guard = computer::process_state_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        computer::clear_control();
+        // Let any throttle timestamp a previous test left behind age out past
+        // the window, so the assertion below is about THIS call alone.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        // A DIFFERENT session holds the live control lease.
+        computer::acquire_control(999, "foreign").unwrap();
+
+        // Our call is rejected Busy...
+        let err = acquire_and_throttle(1, "10").unwrap_err();
+        assert!(err.contains("controlling the desktop"), "expected a Busy rejection, got: {err}");
+
+        // ...and it must have left the throttle untouched: the real holder's
+        // very next input can still pace immediately (a consumed slot would
+        // make this `Err(RateLimited)`).
+        assert!(
+            computer::throttle_input().is_ok(),
+            "a foreign-holder Busy must not consume a throttle slot"
+        );
+
+        computer::clear_control();
     }
 
     #[test]
@@ -5804,11 +6055,19 @@ mod tests {
 
     // —— issue #160 round-2 P2 §7: bounded preview registry ——
 
+    /// A throwaway [`PreviewWindowIdentity`] for tests that only exercise the
+    /// registry's capacity/timestamp behavior, where the window identity itself
+    /// is irrelevant (issue #160 round-14 P1 changed the stored value to carry
+    /// the full identity).
+    fn pid(id: u32) -> PreviewWindowIdentity {
+        PreviewWindowIdentity { id, app: String::new(), title: String::new() }
+    }
+
     #[test]
     fn evict_oldest_if_full_removes_only_the_single_oldest_entry_at_capacity() {
-        let mut map: HashMap<(i32, String), (String, u32, u64)> = HashMap::new();
+        let mut map: HashMap<(i32, String), (String, PreviewWindowIdentity, u64)> = HashMap::new();
         for i in 0..MAX_PREVIEWS as i32 {
-            map.insert((i, "d".to_string()), (format!("p{i}"), i as u32, i as u64));
+            map.insert((i, "d".to_string()), (format!("p{i}"), pid(i as u32), i as u64));
         }
         assert_eq!(map.len(), MAX_PREVIEWS);
 
@@ -5816,7 +6075,7 @@ mod tests {
         evict_oldest_if_full(&mut map);
         map.insert(
             (MAX_PREVIEWS as i32, "d".to_string()),
-            (format!("p{MAX_PREVIEWS}"), MAX_PREVIEWS as u32, MAX_PREVIEWS as u64),
+            (format!("p{MAX_PREVIEWS}"), pid(MAX_PREVIEWS as u32), MAX_PREVIEWS as u64),
         );
 
         assert_eq!(map.len(), MAX_PREVIEWS, "capacity must stay bounded");
@@ -5834,8 +6093,8 @@ mod tests {
 
     #[test]
     fn evict_oldest_if_full_is_a_no_op_below_capacity() {
-        let mut map: HashMap<(i32, String), (String, u32, u64)> = HashMap::new();
-        map.insert((1, "d".to_string()), ("p".to_string(), 1, 100));
+        let mut map: HashMap<(i32, String), (String, PreviewWindowIdentity, u64)> = HashMap::new();
+        map.insert((1, "d".to_string()), ("p".to_string(), pid(1), 100));
         evict_oldest_if_full(&mut map);
         assert_eq!(map.len(), 1, "must not evict anything below capacity");
     }
@@ -5846,9 +6105,9 @@ mod tests {
         // FIRST one again (same key) — this must never trigger an eviction,
         // since it doesn't grow the map.
         for i in 0..MAX_PREVIEWS as i32 {
-            store_screenshot_preview(910_000 + i, "lead", format!("p{i}"), i as u32);
+            store_screenshot_preview(910_000 + i, "lead", format!("p{i}"), pid(i as u32));
         }
-        store_screenshot_preview(910_000, "lead", "refreshed".to_string(), 999);
+        store_screenshot_preview(910_000, "lead", "refreshed".to_string(), pid(999));
 
         let g = screenshot_previews().lock().unwrap();
         assert!(
@@ -5860,6 +6119,32 @@ mod tests {
             g.get(&(910_000, "lead".to_string())).map(|(p, ..)| p.clone()),
             Some("refreshed".to_string()),
             "the refreshed value must actually be stored"
+        );
+    }
+
+    /// issue #160 round-14 P1 (Codex computer_srv.rs:1466): the preview registry
+    /// stores and matches the FULL window identity (id + app + title), so a
+    /// reused numeric id belonging to a DIFFERENT window (different app/title)
+    /// no longer matches a stale preview — the id-reuse hazard an id-only
+    /// comparison left open.
+    #[test]
+    fn screenshot_preview_stores_and_matches_the_full_window_identity() {
+        let captured = PreviewWindowIdentity { id: 5, app: "Notes".into(), title: "todo".into() };
+        let id_reused = PreviewWindowIdentity { id: 5, app: "Mail".into(), title: "inbox".into() };
+        assert_ne!(
+            captured, id_reused,
+            "the SAME numeric id with a different app/title must NOT compare equal"
+        );
+
+        // Unique (thread, dir) key — no process-wide lock needed (see
+        // `process_state_test_lock`'s doc on keyed vs unkeyed state).
+        store_screenshot_preview(920_001, "lead", "PREVIEW".to_string(), captured.clone());
+        let (data, stored) = last_screenshot_preview(920_001, "lead").unwrap();
+        assert_eq!(data, "PREVIEW", "the preview data URI round-trips");
+        assert_eq!(stored, captured, "the FULL identity round-trips, not just the id");
+        assert_ne!(
+            stored, id_reused,
+            "a later window that merely reused the numeric id won't match the stored preview"
         );
     }
 }

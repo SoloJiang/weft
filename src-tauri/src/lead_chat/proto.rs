@@ -65,7 +65,7 @@ pub struct ToolCall {
     /// yet — kept only so `ToolCall` and `ToolResultItem` share the same shape
     /// and a future inline-result dialect, like opencode's already-completed
     /// `tool_use`, has somewhere to put them). Always run through
-    /// [`cap_images`] before landing here. Empty for every dialect today.
+    /// [`cap_and_dedup_images`] before landing here. Empty for every dialect today.
     pub images: Vec<String>,
 }
 
@@ -88,8 +88,8 @@ pub struct ToolResultItem {
     /// Screenshot/image `data:<mime>;base64,<data>` URIs carried on this result
     /// (e.g. a claude `tool_result` image content block, or an ACP
     /// `tool_call_update`'s image block). Always already run through
-    /// [`cap_images`] by the parser that built this — never re-capped by the
-    /// engine. Empty for dialects that don't carry inline result images.
+    /// [`cap_and_dedup_images`] by the parser that built this — never re-capped
+    /// by the engine. Empty for dialects that don't carry inline result images.
     pub images: Vec<String>,
 }
 
@@ -567,29 +567,116 @@ pub(crate) fn cap_output(s: String) -> String {
 /// Image gate for a tool result's `images` (screenshots etc.), shared by every
 /// dialect that can carry them (claude's `tool_result` content blocks, ACP's
 /// `tool_call_update`) — the ONE place size/count limits live, so they can't
-/// drift between call sites. Drops a data URI over 2_000_000 chars (~1.5MB of
-/// raw binary before base64 inflation) outright, then keeps at most the first
-/// 4 survivors in order — a tool result with a handful of inline screenshots is
-/// legitimate, dozens is not something the timeline/DB/push payload should ever
-/// carry. `images` deliberately does NOT run through [`cap_output`]'s 16k
-/// text truncation — that limit is sized for text, not base64 image payloads,
-/// and a truncated data URI is not a smaller image, it's a corrupt one.
-/// Returns `(kept, dropped_count)`; the caller appends a one-line note to its
-/// output text when `dropped_count > 0` (see [`note_omitted_images`]).
-pub(crate) fn cap_images(images: Vec<String>) -> (Vec<String>, usize) {
+/// drift between call sites. `images` deliberately does NOT run through
+/// [`cap_output`]'s 16k text truncation — that limit is sized for text, not
+/// base64 image payloads, and a truncated data URI is not a smaller image,
+/// it's a corrupt one. Returns `(kept, dropped_count)`; the caller appends a
+/// one-line note to its output text when `dropped_count > 0` (see
+/// [`note_omitted_images`]).
+///
+/// issue #160 round-13 P2 (Codex Rea): this used to be two separate
+/// functions — claude's own `cap_images(Vec<String>)`, whose caller
+/// (`tool_result_images`) had to `format!` EVERY image block in a tool result
+/// into an owned `data:` URI and collect them ALL before a single one was
+/// ever dropped, and ACP's streaming capper, added in round-10 P2 #6
+/// specifically to close that exact hole on the ACP side only. A
+/// malicious/broken MCP tool result carrying hundreds of near-2MB image
+/// blocks could still allocate hundreds of MB via the claude path before
+/// this round — same bug shape as round-10, just a different dialect. Both
+/// dialects now call this ONE streaming implementation instead of keeping
+/// two near-identical copies: claude passes [`claude_image_block_fields`],
+/// ACP (`acp::map`) passes its own `image_block_fields` — `resolve` borrows a
+/// block's `(mime, data)` WITHOUT allocating, so only the ≤4 survivors this
+/// returns are ever formatted into an owned `String`.
+///
+/// Caps BOTH count (`MAX_COUNT` = 4) and per-image size (`MAX_CHARS` =
+/// 2_000_000 chars, ~1.5MB of raw binary before base64 inflation) WHILE
+/// scanning. Dedup happens against the borrowed `(mime, data)` pair, so the
+/// `HashSet` used for it only ever holds references, never a clone of its
+/// own; an exact duplicate of an already-kept image silently collapses and
+/// is never counted as dropped (it isn't lost, it's redundant). The moment
+/// `MAX_COUNT` survivors are already kept, `format!` is never reached again —
+/// nothing beyond the 4th survivor is ever allocated, regardless of how many
+/// (or how large) more blocks the source holds.
+///
+/// issue #160 round-13 P2 (Codex Red): once the count cap was already full,
+/// this used to count `blocks.len()` — literally every remaining block,
+/// INCLUDING plain text/other non-image blocks and repeats of an
+/// already-kept image — as "an omitted image". A result with 4 images
+/// followed by ordinary text content then misreported dropped images that
+/// were never there. The remainder is now walked via `resolve` ONLY (never
+/// `format!`, so this adds no allocation) and only DISTINCT image candidates
+/// increment `dropped`: a block `resolve` doesn't recognize as an image
+/// (e.g. text) is skipped entirely, and a block that duplicates one already
+/// seen (kept, dropped-as-oversized, or already counted earlier in the
+/// remainder) is skipped too — the exact same "a duplicate silently
+/// collapses, never counted" rule the loop above already applies to the
+/// first `MAX_COUNT` survivors. This trades away the round-10 "never even
+/// `.next()` the remainder" property for the COUNTING phase — unavoidable,
+/// since text can't be told from an image without looking at it — while
+/// keeping the property that actually matters: nothing past the 4th
+/// survivor is ever formatted/allocated.
+pub(crate) fn cap_and_dedup_images<'a, I, F>(mut blocks: I, resolve: F) -> (Vec<String>, usize)
+where
+    I: Iterator<Item = &'a Value>,
+    F: Fn(&'a Value) -> Option<(&'a str, &'a str)>,
+{
     const MAX_CHARS: usize = 2_000_000;
     const MAX_COUNT: usize = 4;
-    let mut kept = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
     let mut dropped = 0usize;
-    for img in images {
-        // Data URIs are base64 (pure ASCII), so byte length == char count here.
-        if img.len() > MAX_CHARS || kept.len() >= MAX_COUNT {
+    while kept.len() < MAX_COUNT {
+        let Some(block) = blocks.next() else { break };
+        let Some((mime, data)) = resolve(block) else { continue };
+        if !seen.insert((mime, data)) {
+            // An exact duplicate of an already-kept image — silently
+            // collapses, never counted as "omitted" (it isn't — it's
+            // redundant, not lost).
+            continue;
+        }
+        // Data URIs are base64 (pure ASCII), so byte length == char count —
+        // computed WITHOUT formatting the string first.
+        let approx_len = "data:".len() + mime.len() + ";base64,".len() + data.len();
+        if approx_len > MAX_CHARS {
             dropped += 1;
             continue;
         }
-        kept.push(img);
+        kept.push(format!("data:{mime};base64,{data}"));
+    }
+    // Anything left once the count cap is already full: only distinct image
+    // candidates count as "omitted" — text/other blocks were never images to
+    // begin with, and a block repeating one already in `seen` is exactly as
+    // redundant here as it is above, so neither inflates `dropped` (issue
+    // #160 round-13 P2, Codex Red).
+    for block in blocks {
+        if let Some(fields) = resolve(block) {
+            if seen.insert(fields) {
+                dropped += 1;
+            }
+        }
     }
     (kept, dropped)
+}
+
+/// Borrowed `(mime, data)` fields for a claude `{"type":"image","source":
+/// {"type":"base64","media_type"|"mimeType":…,"data":…}}` tool_result content
+/// block — the claude-dialect counterpart to ACP's own `image_block_fields`
+/// (`acp::map`), resolving WITHOUT allocating so [`cap_and_dedup_images`] can
+/// dedup/size-check every block before ever formatting the eventual owned
+/// data URI string (issue #160 round-13 P2). Accepts both `media_type`
+/// (claude's own key) and `mimeType` (seen on some MCP tool passthroughs).
+fn claude_image_block_fields(block: &Value) -> Option<(&str, &str)> {
+    if block["type"] != "image" {
+        return None;
+    }
+    let source = &block["source"];
+    if source["type"] != "base64" {
+        return None;
+    }
+    let mime = source["media_type"].as_str().or_else(|| source["mimeType"].as_str())?;
+    let data = source["data"].as_str()?;
+    Some((mime, data))
 }
 
 /// Append the "(N image(s) omitted: too large)" note [`cap_images`]'s callers
@@ -763,7 +850,15 @@ pub fn parse_line(line: &str) -> ChatEvent {
                 .unwrap_or(&[])
             {
                 if b["type"] == "tool_result" {
-                    let (images, dropped) = cap_images(tool_result_images(&b["content"]));
+                    // issue #160 round-13 P2 (Codex Rea): claude now shares the
+                    // SAME streaming capper the ACP dialect uses instead of
+                    // first formatting every image block in the result into an
+                    // owned data URI via the old `tool_result_images` — see
+                    // `cap_and_dedup_images`'s own doc.
+                    let (images, dropped) = match b["content"].as_array() {
+                        Some(arr) => cap_and_dedup_images(arr.iter(), claude_image_block_fields),
+                        None => (Vec::new(), 0),
+                    };
                     items.push(ToolResultItem {
                         id: b["tool_use_id"].as_str().unwrap_or_default().to_string(),
                         output: note_omitted_images(tool_result_text(&b["content"]), dropped),
@@ -844,36 +939,6 @@ fn compact_input(input: &Value) -> String {
         other => other.to_string(),
     });
     s.chars().take(120).collect()
-}
-
-/// Image content blocks in a claude `tool_result`'s `content` array (a tool
-/// screenshot etc.) → `data:<mime>;base64,<data>` URIs, in order. `content` is
-/// either a plain string (never image blocks — nothing to find) or an array of
-/// blocks; this picks out the `{"type":"image","source":{"type":"base64",…}}`
-/// ones, `tool_result_text` picks out the text ones from the very same array.
-/// Accepts both `media_type` (claude's own key) and `mimeType` (seen on some
-/// MCP tool passthroughs) for the mime field. Callers run the result through
-/// [`cap_images`] — this just extracts, it doesn't gate.
-fn tool_result_images(content: &Value) -> Vec<String> {
-    let Some(arr) = content.as_array() else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|b| {
-            if b["type"] != "image" {
-                return None;
-            }
-            let source = &b["source"];
-            if source["type"] != "base64" {
-                return None;
-            }
-            let mime = source["media_type"]
-                .as_str()
-                .or_else(|| source["mimeType"].as_str())?;
-            let data = source["data"].as_str()?;
-            Some(format!("data:{mime};base64,{data}"))
-        })
-        .collect()
 }
 
 /// Flatten a claude `tool_result` block's `content` to text. It is either a
@@ -1100,12 +1165,13 @@ mod tests {
     }
 
     /// Over-limit images (too large individually, or too many) are dropped by
-    /// `cap_images` and the drop is announced with a trailing note in `output`
-    /// — the row must never silently lose an image without saying so.
+    /// `cap_and_dedup_images` and the drop is announced with a trailing note
+    /// in `output` — the row must never silently lose an image without
+    /// saying so.
     #[test]
     fn claude_tool_result_drops_oversized_and_excess_images_with_a_note() {
-        // One oversized image (over cap_images's 2_000_000-char gate) dropped,
-        // alongside ordinary text output.
+        // One oversized image (over cap_and_dedup_images's 2_000_000-char
+        // gate) dropped, alongside ordinary text output.
         let huge_b64 = "A".repeat(2_000_001);
         let l = format!(
             r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t","content":[{{"type":"text","text":"result text"}},{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{huge_b64}"}}}}]}}]}}}}"#
@@ -1139,26 +1205,88 @@ mod tests {
         }
     }
 
-    /// `cap_images` in isolation: the size gate and the count gate are
-    /// independent, order-preserving, and their drops both count toward the
-    /// returned total.
+    /// A claude `{"type":"image","source":{"type":"base64",…}}` tool_result
+    /// content block with the given base64 payload — shared builder for the
+    /// [`cap_and_dedup_images`] tests below.
+    fn claude_img_block(data: &str) -> Value {
+        serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":data}})
+    }
+
+    /// issue #160 round-13 P2 (Codex Rea): `cap_and_dedup_images` is now the
+    /// ONE streaming capper shared by both dialects — the claude-specific
+    /// half of this coverage exercises it directly via
+    /// [`claude_image_block_fields`], the same resolve fn `parse_line` uses.
+    ///
+    /// (a) 6 legitimate, distinct, small images: only the first 4 survive —
+    /// nothing from the excess 2 is ever formatted into `kept` regardless of
+    /// how many more valid images followed.
     #[test]
-    fn cap_images_drops_oversized_then_caps_at_four() {
-        let ok = |n: usize| "x".repeat(n);
-        // Exactly at the boundary survives; one over it is dropped.
-        let (kept, dropped) = cap_images(vec![ok(2_000_000), ok(2_000_001)]);
-        assert_eq!(kept, vec![ok(2_000_000)]);
+    fn cap_and_dedup_images_caps_at_four_survivors_and_counts_the_rest() {
+        let blocks: Vec<Value> = (0..6).map(|i| claude_img_block(&format!("img{i}"))).collect();
+        let (kept, dropped) = cap_and_dedup_images(blocks.iter(), claude_image_block_fields);
+        assert_eq!(
+            kept,
+            vec![
+                "data:image/png;base64,img0",
+                "data:image/png;base64,img1",
+                "data:image/png;base64,img2",
+                "data:image/png;base64,img3",
+            ]
+        );
+        assert_eq!(dropped, 2);
+    }
+
+    /// (b) A single image over the 2_000_000-char `MAX_CHARS` gate is dropped
+    /// outright — never kept, always counted.
+    #[test]
+    fn cap_and_dedup_images_drops_a_single_oversized_block() {
+        let huge = "x".repeat(2_000_001);
+        let blocks = vec![claude_img_block(&huge)];
+        let (kept, dropped) = cap_and_dedup_images(blocks.iter(), claude_image_block_fields);
+        assert!(kept.is_empty());
         assert_eq!(dropped, 1);
-        // 5 small images: first 4 kept in order, the 5th dropped.
-        let five: Vec<String> = (0..5).map(|i| format!("img{i}")).collect();
-        let (kept, dropped) = cap_images(five);
-        assert_eq!(kept, vec!["img0", "img1", "img2", "img3"]);
-        assert_eq!(dropped, 1);
-        // Nothing dropped → the count is 0 and the note is a no-op.
-        let (kept, dropped) = cap_images(vec!["a".into(), "b".into()]);
-        assert_eq!(kept, vec!["a", "b"]);
+    }
+
+    /// (c) Two blocks with the EXACT same data URI collapse to one kept
+    /// image — the duplicate is redundant, not lost, so it must not inflate
+    /// `dropped`.
+    #[test]
+    fn cap_and_dedup_images_collapses_exact_duplicates_without_counting_them_dropped() {
+        let blocks = vec![claude_img_block("AAAA"), claude_img_block("AAAA")];
+        let (kept, dropped) = cap_and_dedup_images(blocks.iter(), claude_image_block_fields);
+        assert_eq!(kept, vec!["data:image/png;base64,AAAA"]);
         assert_eq!(dropped, 0);
-        assert_eq!(note_omitted_images("out".into(), 0), "out");
+    }
+
+    /// (d) issue #160 round-13 P2 (Codex Red): once the 4-image cap is
+    /// already full, trailing TEXT blocks are not images and must not
+    /// inflate `dropped` — this is the exact bug the round-13 fix closes
+    /// (the old code counted `blocks.len()`, which conflated every leftover
+    /// block, images or not, with an omitted image).
+    #[test]
+    fn cap_and_dedup_images_does_not_count_trailing_text_blocks_as_dropped_images() {
+        let mut blocks: Vec<Value> = (0..4).map(|i| claude_img_block(&format!("img{i}"))).collect();
+        blocks.push(serde_json::json!({"type": "text", "text": "trailing note"}));
+        blocks.push(serde_json::json!({"type": "text", "text": "another note"}));
+        let (kept, dropped) = cap_and_dedup_images(blocks.iter(), claude_image_block_fields);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(
+            dropped, 0,
+            "trailing text blocks are not images and must not inflate the omitted-image count"
+        );
+    }
+
+    /// The counterpart to (d): a genuine EXCESS image sitting among the
+    /// trailing text blocks must still be counted — round-13 fixes the false
+    /// positive above without introducing a false negative here.
+    #[test]
+    fn cap_and_dedup_images_still_counts_a_genuine_excess_image_among_trailing_text() {
+        let mut blocks: Vec<Value> = (0..4).map(|i| claude_img_block(&format!("img{i}"))).collect();
+        blocks.push(serde_json::json!({"type": "text", "text": "note"}));
+        blocks.push(claude_img_block("img4-excess"));
+        let (kept, dropped) = cap_and_dedup_images(blocks.iter(), claude_image_block_fields);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(dropped, 1);
     }
 
     #[test]

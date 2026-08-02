@@ -44,7 +44,8 @@ fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
 ///
 /// `&key=<token>` (issue #160 round-11 P1 #A): EVERY `weft_computer` URL now
 /// also carries this session-scoped bearer — `bus::computer_srv::
-/// computer_session_token(thread, dir)`, an HMAC of the path's own identity
+/// computer_session_token(thread, dir, wt)`, an HMAC of the path's own
+/// identity AND the exact worktree it carries (issue #160 round-13/14 P1),
 /// under a process-lifetime secret that never leaves memory (see that
 /// function's own doc for the full rationale). This is the ONLY bus MCP URL
 /// that gets one: `mcp_url`/`planner_url`/`curator_url`/`global_url` above are
@@ -55,7 +56,11 @@ fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
 /// `&` when `?wt=` is already present, `?` otherwise — still exactly ONE
 /// query string, never two separately-prefixed ones.
 fn computer_url(base: &str, thread: i32, dir: &str, wt: Option<i32>) -> String {
-    let key = crate::bus::computer_srv::computer_session_token(thread, dir);
+    // issue #160 round-13/14 P1: the bearer is minted for the EXACT `wt` this
+    // URL embeds (see `computer_srv::computer_token_mac`), so a worker that
+    // later swaps its own `?wt=` to a sibling's id presents a token that no
+    // longer matches and is rejected server-side.
+    let key = crate::bus::computer_srv::computer_session_token(thread, dir, wt);
     match wt {
         Some(id) => format!("{base}/computer/{thread}/{dir}/mcp?wt={id}&key={key}"),
         None => format!("{base}/computer/{thread}/{dir}/mcp?key={key}"),
@@ -354,7 +359,7 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
     }
     let url = computer_url(base, thread, dir, wt);
     match tool {
-        "claude" => inject_computer_claude(thread, dir, &url),
+        "claude" => inject_computer_claude(thread, dir, wt, &url),
         "codex" => Injection {
             args: vec!["-c".into(), format!("mcp_servers.weft_computer.url={url}")],
         },
@@ -469,7 +474,7 @@ fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> bool {
 /// or a failed atomic write, falls back to no injection (`Injection { args:
 /// vec![] }`) rather than erroring the whole session, matching
 /// `inject_mcp`'s own best-effort contract.
-fn inject_computer_claude(thread: i32, dir: &str, url: &str) -> Injection {
+fn inject_computer_claude(thread: i32, dir: &str, wt: Option<i32>, url: &str) -> Injection {
     let Ok(home) = crate::paths::weft_home() else {
         return Injection { args: vec![] };
     };
@@ -477,8 +482,21 @@ fn inject_computer_claude(thread: i32, dir: &str, url: &str) -> Injection {
     if std::fs::create_dir_all(&mcp_dir).is_err() {
         return Injection { args: vec![] };
     }
+    // issue #160 round-14 P1 (Codex inject.rs:483): the config filename includes
+    // the worktree `wt`, with a DISTINCT representation for the absent/lead
+    // case. Two Claude workers of one multi-repo direction share a single
+    // `(thread, dir)` but differ by `wt`; naming the file by `(thread, dir)`
+    // alone made the SECOND worker's injection atomically overwrite the first's
+    // — and since spawning doesn't guarantee the first child has already parsed
+    // `--mcp-config`, that worker could start with its sibling's URL (and thus
+    // its `wt`), routing screenshots/audit into the wrong worktree namespace.
+    // A per-`wt` filename gives each worker its own stable config file.
+    let wt_suffix = match wt {
+        Some(id) => format!("-wt{id}"),
+        None => String::new(),
+    };
     let file = mcp_dir.join(format!(
-        "{thread}-{}.mcp.json",
+        "{thread}-{}{wt_suffix}.mcp.json",
         sanitize_filename_component(dir)
     ));
     let json = serde_json::json!({
@@ -741,7 +759,7 @@ mod tests {
         // EXACT per-session bearer `computer_session_token` would mint for
         // this same (thread, dir).
         assert!(
-            cfg.contains(&format!("key={}", crate::bus::computer_srv::computer_session_token(1, "10"))),
+            cfg.contains(&format!("key={}", crate::bus::computer_srv::computer_session_token(1, "10", None))),
             "{cfg}"
         );
         #[cfg(unix)]
@@ -757,13 +775,18 @@ mod tests {
     }
 
     /// issue #160 round-12 P1 #D + round-13 P1: re-injection (the SAME
-    /// `(thread, dir)` writing this SAME path again — a resumed/rerun session)
-    /// must land via [`write_owner_only_atomic`]'s temp-then-`rename` path, not
-    /// silently fall back to a wider-mode write because the file already
-    /// exists. Runs the injection TWICE for the identical `(thread, dir)` and
-    /// asserts the SECOND write is still exactly `0600`, the content reflects
-    /// the newer URL, and — round-13 P1 — no `.weft-tmp` sibling is left behind
-    /// (the atomic rename consumes it on success).
+    /// `(thread, dir, wt)` writing this SAME path again — a resumed/rerun
+    /// session) must land via [`write_owner_only_atomic`]'s temp-then-`rename`
+    /// path, not silently fall back to a wider-mode write because the file
+    /// already exists. Runs the injection TWICE for the identical
+    /// `(thread, dir, wt)` and asserts the SECOND write is still exactly
+    /// `0600`, the content reflects the newer URL, and — round-13 P1 — no
+    /// `.weft-tmp` sibling is left behind (the atomic rename consumes it on
+    /// success). issue #160 round-14 P1 (Codex inject.rs:483): the config
+    /// filename now includes `wt`, so a re-injection with a DIFFERENT `wt` is a
+    /// DIFFERENT file by design — this test therefore holds `wt` fixed and
+    /// varies the base URL to prove the same-path rewrite; the distinct-`wt`
+    /// case is asserted separately at the end.
     #[test]
     fn computer_claude_config_reinjection_stays_owner_only_and_atomic() {
         let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -775,20 +798,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-reinject-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
-        let first = inject_computer("http://127.0.0.1:9", 5, "50", "claude", &dir, None);
+        let first = inject_computer("http://127.0.0.1:9", 5, "50", "claude", &dir, Some(7));
         let cfg_path = std::path::PathBuf::from(&first.args[1]);
         assert!(cfg_path.exists(), "the first injection must write the config");
 
-        // A second injection for the SAME (thread, dir) — standing in for a
-        // resumed/rerun session hitting the SAME predictable path.
-        let second = inject_computer("http://127.0.0.1:9", 5, "50", "claude", &dir, Some(7));
+        // A second injection for the SAME (thread, dir, wt) but a DIFFERENT
+        // base URL — standing in for a resumed/rerun session hitting the SAME
+        // predictable path; the newer content must win.
+        let second = inject_computer("http://127.0.0.1:8", 5, "50", "claude", &dir, Some(7));
         assert_eq!(
             std::path::PathBuf::from(&second.args[1]),
             cfg_path,
-            "re-injection for the same (thread, dir) must reuse the same predictable path"
+            "re-injection for the same (thread, dir, wt) must reuse the same predictable path"
         );
         let cfg = std::fs::read_to_string(&cfg_path).unwrap();
-        assert!(cfg.contains("wt=7"), "the SECOND write's content must win: {cfg}");
+        assert!(cfg.contains("127.0.0.1:8"), "the SECOND write's content must win: {cfg}");
 
         #[cfg(unix)]
         {
@@ -810,6 +834,23 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains("weft-tmp"))
             .collect();
         assert!(leftover.is_empty(), "no temp file may be left behind: {leftover:?}");
+
+        // issue #160 round-14 P1 (Codex inject.rs:483): a DIFFERENT wt for the
+        // SAME (thread, dir) is a DIFFERENT config file — two workers of one
+        // multi-repo direction must never clobber each other's config — and the
+        // absent-wt case is distinct from any explicit wt too.
+        let other_wt = inject_computer("http://127.0.0.1:9", 5, "50", "claude", &dir, Some(8));
+        assert_ne!(
+            std::path::PathBuf::from(&other_wt.args[1]),
+            cfg_path,
+            "a different wt must produce a different config path"
+        );
+        let absent_wt = inject_computer("http://127.0.0.1:9", 5, "50", "claude", &dir, None);
+        assert_ne!(
+            std::path::PathBuf::from(&absent_wt.args[1]),
+            cfg_path,
+            "the absent-wt config path must differ from an explicit wt's"
+        );
 
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&dir);
@@ -861,7 +902,7 @@ mod tests {
                 "-c".to_string(),
                 format!(
                     "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp?key={}",
-                    crate::bus::computer_srv::computer_session_token(1, "10")
+                    crate::bus::computer_srv::computer_session_token(1, "10", None)
                 ),
             ]
         );
@@ -880,7 +921,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
         std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
 
-        let key = crate::bus::computer_srv::computer_session_token(1, "10");
+        let key = crate::bus::computer_srv::computer_session_token(1, "10", Some(42));
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-wt-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", &dir, Some(42));
@@ -908,7 +949,7 @@ mod tests {
     // —— issue #160 round-11 P1 #A: computer_url mints a per-session `&key=` ——
 
     /// `computer_url` itself, directly: the token it appends is EXACTLY
-    /// `computer_session_token(thread, dir)` for that same path's own
+    /// `computer_session_token(thread, dir, wt)` for that same path's own
     /// identity — never a different/derived value — and it's attached
     /// correctly whether or not `?wt=` is already present (`&key=` vs
     /// `?key=`, never two separately-prefixed query strings).
@@ -919,7 +960,7 @@ mod tests {
             no_wt,
             format!(
                 "http://127.0.0.1:9/computer/3/30/mcp?key={}",
-                crate::bus::computer_srv::computer_session_token(3, "30")
+                crate::bus::computer_srv::computer_session_token(3, "30", None)
             )
         );
 
@@ -928,7 +969,7 @@ mod tests {
             with_wt,
             format!(
                 "http://127.0.0.1:9/computer/3/30/mcp?wt=9&key={}",
-                crate::bus::computer_srv::computer_session_token(3, "30")
+                crate::bus::computer_srv::computer_session_token(3, "30", Some(9))
             )
         );
 
@@ -944,7 +985,7 @@ mod tests {
 
     #[test]
     fn acp_mcp_servers_include_computer_toggles_weft_computer() {
-        let key = crate::bus::computer_srv::computer_session_token(1, "10");
+        let key = crate::bus::computer_srv::computer_session_token(1, "10", None);
         let with_computer = acp_mcp_servers(
             "http://127.0.0.1:9",
             1,
@@ -977,7 +1018,7 @@ mod tests {
     /// `weft_computer` URL's `?wt=` query param for an ACP worker.
     #[test]
     fn acp_mcp_servers_computer_wt_pins_the_worktree_query_param() {
-        let key = crate::bus::computer_srv::computer_session_token(1, "10");
+        let key = crate::bus::computer_srv::computer_session_token(1, "10", Some(7));
         let with_wt = acp_mcp_servers(
             "http://127.0.0.1:9",
             1,
@@ -1321,7 +1362,7 @@ mod tests {
         let cfg = std::fs::read_to_string(&cfg_path).unwrap();
         assert!(cfg.contains("weft_computer") && cfg.contains("/computer/1/10/mcp"), "{cfg}");
         assert!(
-            cfg.contains(&format!("key={}", crate::bus::computer_srv::computer_session_token(1, "10"))),
+            cfg.contains(&format!("key={}", crate::bus::computer_srv::computer_session_token(1, "10", None))),
             "{cfg}"
         );
         #[cfg(unix)]
@@ -1406,7 +1447,7 @@ mod tests {
         sh(&root, &["git", "add", "-A"]);
         sh(&root, &["git", "commit", "-q", "-m", "init"]);
 
-        let token = crate::bus::computer_srv::computer_session_token(1, "10");
+        let token = crate::bus::computer_srv::computer_session_token(1, "10", None);
         let inj = inject_computer("http://127.0.0.1:9", 1, "10", "opencode", &root, None);
         assert!(inj.args.is_empty());
         let cfg = std::fs::read_to_string(root.join("opencode.json")).unwrap();

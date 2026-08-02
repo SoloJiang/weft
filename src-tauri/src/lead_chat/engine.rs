@@ -1066,20 +1066,23 @@ fn merge_tool_result_content(content: &mut serde_json::Value, item: &super::prot
 /// issue #160 round-10 P1 #9 (Codex 1062): how many of a session's most
 /// recent tool-result rows may keep their inline screenshot data URIs in
 /// `content.images` at once. Screenshot data URIs run from a few hundred KB
-/// to a couple MB each (see `lead_chat::proto::cap_images`'s own
+/// to a couple MB each (see `lead_chat::proto::cap_and_dedup_images`'s own
 /// `MAX_CHARS`); an unthrottled screenshot loop — Full/Always-granted
 /// computer use, no per-call card left to slow it down — can otherwise
 /// persist hundreds of these into SQLite with NO bound at all: this
-/// module's own per-CALL cap (`cap_images`, `bus::computer_srv`'s
-/// `cap_and_dedup_images`, both ≤4 images per single result) does nothing to
-/// stop that ACROSS calls, and `history` load then hands the whole
-/// accumulated payload to the frontend on every reload. Kept SMALL: an
-/// older screenshot is still reachable by its file path, which lives in the
-/// SAME row's `output` text (issue #160 M3-B's own "text path is never
-/// dropped" rule) — this cap only prunes the redundant INLINE base64 copy
-/// once it's no longer among the most recent few, never the on-disk file or
-/// the row's own text, and never the CURRENT call's own inline image (see
-/// `merge_tool_results`'s own doc).
+/// module's own per-CALL cap (`cap_and_dedup_images`, ≤4 images per single
+/// result) does nothing to stop that ACROSS calls, and `history` load then
+/// hands the whole accumulated payload to the frontend on every reload. Kept
+/// SMALL: an older screenshot is still reachable by its file path, which
+/// lives in the SAME row's `output` text (issue #160 M3-B's own "text path
+/// is never dropped" rule) — this cap only prunes the redundant INLINE
+/// base64 copy once it's no longer among the most recent few, never the
+/// on-disk file or the row's own text, and never the CURRENT call's own
+/// inline image (see `merge_tool_results`'s own doc). issue #160 round-13
+/// P2 (Codex Rec): this cap is enforced per-SESSION (see
+/// `enforce_durable_inline_image_cap_db`'s own doc) — a thread's several
+/// lead/worker timelines each get their own `MAX_INLINE_IMAGE_ROWS` budget,
+/// not one shared across all of them.
 const MAX_INLINE_IMAGE_ROWS: usize = 4;
 
 /// Push a newly-completed, image-bearing tool row onto `rows` (oldest first)
@@ -1139,17 +1142,34 @@ fn track_inline_image_row(
 /// unreachable from any test. Returns every `(row_id, content, status)` this
 /// call actually stripped and durably rewrote, so the wrapper can push each
 /// as a `Push::ToolResult` after this returns.
-async fn enforce_durable_inline_image_cap_db(db: &Db, thread_id: i32) -> Vec<(i32, String, String)> {
+///
+/// issue #160 round-13 P2 (Codex Rec): `session_id` scopes the candidate rows
+/// to ONE session's own timeline — `None` for the lead, `Some(id)` for a
+/// chat-mode worker — mirroring how every other per-timeline read in this
+/// module (e.g. `rewind`'s own `filter(|m| m.session_id == snap.session_id)`)
+/// treats `lead_message.session_id` as the timeline key, NOT `thread_id`
+/// alone. A thread can host several lead/worker sessions at once, each with
+/// its OWN chat history; before this fix, `list_lead_messages(db, thread_id)`
+/// pulled every session's tool rows into ONE shared retention queue, so a
+/// screenshot-heavy worker in repo A could strip the most-recent inline
+/// images off a DIFFERENT worker's (repo B's) timeline, leaving B under the
+/// `MAX_INLINE_IMAGE_ROWS` cap it's entitled to on its own.
+async fn enforce_durable_inline_image_cap_db(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Vec<(i32, String, String)> {
     let Ok(messages) = repo::list_lead_messages(db, thread_id).await else {
         return Vec::new();
     };
     // Oldest-first (matches `list_lead_messages`'s own order) ids of every
-    // persisted tool row that STILL carries an inline image. A plain
-    // substring pre-check narrows the set before the real JSON parse below
-    // (this thread's non-tool/non-image rows never pay for one).
+    // persisted tool row that STILL carries an inline image, scoped to THIS
+    // session alone (`session_id` above) — a plain substring pre-check
+    // narrows the set before the real JSON parse below (this thread's
+    // non-tool/non-image rows never pay for one).
     let image_bearing: Vec<&lead_message::Model> = messages
         .iter()
-        .filter(|m| m.kind == "tool" && m.content.contains("\"images\""))
+        .filter(|m| m.kind == "tool" && m.content.contains("\"images\"") && m.session_id == session_id)
         .collect();
     let keep_from = image_bearing.len().saturating_sub(MAX_INLINE_IMAGE_ROWS);
     let mut stripped = Vec::new();
@@ -1178,9 +1198,18 @@ async fn enforce_durable_inline_image_cap_db(db: &Db, thread_id: i32) -> Vec<(i3
 /// The live wrapper: runs [`enforce_durable_inline_image_cap_db`] and pushes
 /// a `Push::ToolResult` for each row it actually stripped, so an open
 /// frontend timeline reflects the durable trim immediately rather than only
-/// on the next reload.
-async fn enforce_durable_inline_image_cap(app: &AppHandle, db: &Db, thread_id: i32) {
-    for (message_id, content, status) in enforce_durable_inline_image_cap_db(db, thread_id).await {
+/// on the next reload. `session_id` is threaded straight through to scope the
+/// cap to the calling session's own timeline (issue #160 round-13 P2, Codex
+/// Rec — see [`enforce_durable_inline_image_cap_db`]'s own doc for why).
+async fn enforce_durable_inline_image_cap(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) {
+    for (message_id, content, status) in
+        enforce_durable_inline_image_cap_db(db, thread_id, session_id).await
+    {
         let _ = app.emit(EVENT, Push::ToolResult { thread_id, message_id, content, status });
     }
 }
@@ -1252,8 +1281,12 @@ async fn merge_tool_results(
             // issue #160 round-12 P2 #3: the DB-write-path cap runs on every
             // new inline image regardless of the in-memory pass above — see
             // `enforce_durable_inline_image_cap`'s own doc for why this one,
-            // not the in-memory queue, is the authoritative bound.
-            enforce_durable_inline_image_cap(app, db, thread_id).await;
+            // not the in-memory queue, is the authoritative bound. issue #160
+            // round-13 P2 (Codex Rec): `inner.session_id` scopes it to THIS
+            // session's own timeline so a different session sharing the same
+            // thread can't have ITS most-recent inline images stripped by an
+            // unrelated session's screenshot volume.
+            enforce_durable_inline_image_cap(app, db, thread_id, inner.session_id).await;
         }
     }
 }
@@ -9976,7 +10009,9 @@ mod tests {
     /// state carried between iterations here at all, standing in for a
     /// fresh engine (empty queue) running after every single write — i.e. a
     /// "restart" between every screenshot. The persisted count must still
-    /// never exceed `MAX_INLINE_IMAGE_ROWS`.
+    /// never exceed `MAX_INLINE_IMAGE_ROWS`. All rows here are the lead's own
+    /// (`session_id: None`) — see the round-13 P2 test below for the
+    /// multi-session scoping this now enforces.
     #[tokio::test]
     async fn enforce_durable_inline_image_cap_db_bounds_persisted_inline_images_across_a_simulated_restart() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
@@ -10010,7 +10045,7 @@ mod tests {
             // No in-memory queue passed in at all — each call here is as
             // independent as if a brand-new engine (empty `inline_image_rows`)
             // ran after every single write, i.e. a "restart" in between each.
-            enforce_durable_inline_image_cap_db(&db, t.id).await;
+            enforce_durable_inline_image_cap_db(&db, t.id, None).await;
         }
 
         let messages = repo::list_lead_messages(&db, t.id).await.unwrap();
@@ -10037,6 +10072,105 @@ mod tests {
             first.content.contains("shot-0.png"),
             "the path reference must survive the strip: {}",
             first.content
+        );
+    }
+
+    /// issue #160 round-13 P2 (Codex Rec): a thread hosting TWO sessions —
+    /// the lead (`session_id: None`) and a chat-mode worker (`session_id:
+    /// Some(7)`) — each writing more than `MAX_INLINE_IMAGE_ROWS` inline
+    /// screenshots, must keep each session's OWN cap independently. Before
+    /// this fix, `enforce_durable_inline_image_cap_db` pooled every
+    /// session's tool rows into ONE shared retention queue keyed only by
+    /// `thread_id`, so calling it while enforcing the lead's cap could strip
+    /// images off the untouched worker's timeline (and vice versa). Here,
+    /// only the worker's cap is ever invoked — the lead's rows must come out
+    /// with every inline image still intact.
+    #[tokio::test]
+    async fn enforce_durable_inline_image_cap_db_scopes_the_cap_to_one_session() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+
+        let worker_session_id = Some(7);
+        let n = MAX_INLINE_IMAGE_ROWS + 2;
+
+        // The lead writes its own screenshots first — session_id: None.
+        for i in 0..n {
+            let content = serde_json::json!({
+                "name": "computer",
+                "summary": "screenshot",
+                "input": {},
+                "output": format!("/tmp/lead-shot-{i}.png"),
+                "is_error": false,
+                "images": [format!("data:image/png;base64,lead-img{i}")],
+            });
+            repo::insert_lead_message(
+                &db,
+                t.id,
+                None,
+                1,
+                "assistant",
+                "tool",
+                &content.to_string(),
+                "complete",
+            )
+            .await
+            .unwrap();
+        }
+
+        // The worker (session_id: Some(7)) then writes its own screenshots,
+        // enforcing ONLY its own cap after each one — the lead's cap is never
+        // invoked here at all.
+        for i in 0..n {
+            let content = serde_json::json!({
+                "name": "computer",
+                "summary": "screenshot",
+                "input": {},
+                "output": format!("/tmp/worker-shot-{i}.png"),
+                "is_error": false,
+                "images": [format!("data:image/png;base64,worker-img{i}")],
+            });
+            repo::insert_lead_message(
+                &db,
+                t.id,
+                worker_session_id,
+                1,
+                "assistant",
+                "tool",
+                &content.to_string(),
+                "complete",
+            )
+            .await
+            .unwrap();
+            enforce_durable_inline_image_cap_db(&db, t.id, worker_session_id).await;
+        }
+
+        let messages = repo::list_lead_messages(&db, t.id).await.unwrap();
+        assert_eq!(messages.len(), 2 * n, "no row is ever deleted, only its images key stripped");
+
+        let lead_rows: Vec<&lead_message::Model> =
+            messages.iter().filter(|m| m.session_id.is_none()).collect();
+        let worker_rows: Vec<&lead_message::Model> = messages
+            .iter()
+            .filter(|m| m.session_id == worker_session_id)
+            .collect();
+        assert_eq!(lead_rows.len(), n);
+        assert_eq!(worker_rows.len(), n);
+
+        let lead_with_images = lead_rows.iter().filter(|m| m.content.contains("\"images\"")).count();
+        assert_eq!(
+            lead_with_images, n,
+            "the lead's timeline was never touched by the worker's cap enforcement — \
+             every one of its inline images must survive intact"
+        );
+
+        let worker_with_images =
+            worker_rows.iter().filter(|m| m.content.contains("\"images\"")).count();
+        assert_eq!(
+            worker_with_images, MAX_INLINE_IMAGE_ROWS,
+            "the worker's OWN cap still applies to its own rows"
         );
     }
 

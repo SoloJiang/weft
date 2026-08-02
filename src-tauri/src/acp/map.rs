@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-use crate::lead_chat::proto::{ChatEvent, SlashCmd, ToolCall, ToolResultItem};
+use crate::lead_chat::proto::{cap_and_dedup_images, ChatEvent, SlashCmd, ToolCall, ToolResultItem};
 
 /// Outcome of mapping one `update` object (the inner `params.update`).
 #[derive(Debug)]
@@ -168,14 +168,16 @@ fn tool_call_update(update: &Value) -> UpdateOut {
         return UpdateOut::Ignore;
     }
     // issue #160 round-10 P2 #6 (Codex 281): the count/size cap is applied
-    // WHILE `extract_tool_images` scans the source array now, not afterward
-    // via the shared claude-dialect `cap_images` gate — see that function's
-    // own doc for why the OLD "format everything, dedup everything, cap
-    // afterward" order let an oversized/excessive ACP result allocate
-    // hundreds of MB before a single image was ever dropped. Any it drops are
-    // announced in `output`, the SAME place the equivalent claude-side note
-    // (still driven by `cap_images` on ITS OWN dialect) lands — `note_omitted_
-    // images`'s wording doesn't care which gate produced the count.
+    // WHILE `extract_tool_images` scans the source array now, not afterward.
+    // issue #160 round-13 P2 (Codex Rea): that streaming cap
+    // (`cap_and_dedup_images`, now `lead_chat::proto`) is the SAME function
+    // the claude dialect calls too — see its own doc for why the OLD "format
+    // everything, dedup everything, cap afterward" order let an
+    // oversized/excessive result (either dialect) allocate hundreds of MB
+    // before a single image was ever dropped. Any it drops are announced in
+    // `output`, the SAME place the equivalent claude-side note lands —
+    // `note_omitted_images`'s wording doesn't care which dialect produced
+    // the count.
     let (images, dropped) = extract_tool_images(update);
     let output = crate::lead_chat::proto::note_omitted_images(
         crate::lead_chat::proto::cap_output(extract_tool_output(update)),
@@ -236,11 +238,12 @@ fn extract_tool_output(update: &Value) -> String {
 /// nested `.content` wrapper, mirroring how `extract_tool_output` tries both
 /// `item.text` and `item.content.text`) so an image sitting in either shape
 /// is found. `{"type":"image","data":d,"mimeType":m}` → `data:<m>;base64,<d>`.
-/// Returns `(kept, dropped)` — `dropped` counts every block this omitted for
-/// being oversized, an exact duplicate of an already-kept one, or in excess
-/// of the count cap (see [`cap_and_dedup_images`]'s own doc); the caller
-/// (`tool_call_update`) turns that into the SAME "(N image(s) omitted)" note
-/// the claude dialect's `cap_images` produces.
+/// Returns `(kept, dropped)` — `dropped` counts every DISTINCT image
+/// candidate this omitted for being oversized or in excess of the count cap
+/// (see [`cap_and_dedup_images`]'s own doc); the caller (`tool_call_update`)
+/// turns that into the SAME "(N image(s) omitted)" note the claude dialect
+/// produces — both dialects share this ONE capper as of issue #160 round-13
+/// P2 (Codex Rea).
 ///
 /// This closes a real gap: before this function existed, an omp screenshot
 /// tool's image block was silently dropped — `extract_tool_output` only ever
@@ -264,8 +267,11 @@ fn extract_tool_output(update: &Value) -> String {
 /// malicious/broken ACP result with hundreds of near-2MB image blocks would
 /// allocate/copy hundreds of MB before a single one was ever dropped. The cap
 /// now applies WHILE scanning, via [`cap_and_dedup_images`] — see its own doc
-/// for how it bounds both the count of survivors AND the work spent getting
-/// there.
+/// (moved to `lead_chat::proto` in issue #160 round-13 P2 so the claude
+/// dialect can share this exact implementation instead of keeping its own
+/// copy; `image_block_fields` below is still ACP's own resolve fn, passed
+/// into the shared capper same as before) for how it bounds both the count
+/// of survivors AND the work spent getting there.
 fn extract_tool_images(update: &Value) -> (Vec<String>, usize) {
     if let Some(arr) = update.pointer("/rawOutput/content").and_then(|c| c.as_array()) {
         let (kept, dropped) = cap_and_dedup_images(arr.iter(), image_block_fields);
@@ -281,59 +287,6 @@ fn extract_tool_images(update: &Value) -> (Vec<String>, usize) {
         }),
         None => (Vec::new(), 0),
     }
-}
-
-/// issue #160 round-10 P2 #6 (Codex 281): scan `blocks`, capping BOTH count
-/// (`MAX_COUNT`) and per-image size (`MAX_CHARS`) WHILE scanning — the SAME
-/// two limits `lead_chat::proto::cap_images` enforces for the claude dialect,
-/// just applied at the SOURCE instead of after the fact. `resolve` turns a
-/// raw block into its borrowed `(mime, data)` fields WITHOUT allocating (see
-/// [`image_block_fields`]) — dedup happens against THAT borrowed pair, so the
-/// `HashSet` used for it only ever holds references, never a clone of its
-/// own; only a block that is non-image-shaped, a size-cap victim, or an exact
-/// duplicate is cheap to reject. The moment `MAX_COUNT` survivors are already
-/// kept, scanning stops ENTIRELY — the next `blocks.next()` is never even
-/// called — so neither the cost of resolving nor of formatting is ever paid
-/// for anything beyond the cap, regardless of how many (or how large) more
-/// blocks the source array holds; `ExactSizeIterator::len` (O(1) for a slice
-/// iterator) accounts for that untouched remainder in `dropped` without
-/// having to visit it. This is the SAME final semantics the old
-/// "format everything, dedup everything, THEN cap" order produced (dedup
-/// among survivors, oversized/excess dropped) — just with memory/CPU bounded
-/// by the CAP instead of by the input's own size.
-fn cap_and_dedup_images<'a, I, F>(mut blocks: I, resolve: F) -> (Vec<String>, usize)
-where
-    I: Iterator<Item = &'a Value> + ExactSizeIterator,
-    F: Fn(&'a Value) -> Option<(&'a str, &'a str)>,
-{
-    const MAX_CHARS: usize = 2_000_000;
-    const MAX_COUNT: usize = 4;
-    let mut kept: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
-    let mut dropped = 0usize;
-    while kept.len() < MAX_COUNT {
-        let Some(block) = blocks.next() else { break };
-        let Some((mime, data)) = resolve(block) else { continue };
-        if !seen.insert((mime, data)) {
-            // An exact duplicate of an already-kept image — matches
-            // `dedup_data_uris`'s old semantics: silently collapses, never
-            // counted as "omitted: too large" (it isn't — it's redundant).
-            continue;
-        }
-        // Data URIs are base64 (pure ASCII), so byte length == char count —
-        // matches `cap_images`'s own size check exactly, computed WITHOUT
-        // formatting the string first.
-        let approx_len = "data:".len() + mime.len() + ";base64,".len() + data.len();
-        if approx_len > MAX_CHARS {
-            dropped += 1;
-            continue;
-        }
-        kept.push(format!("data:{mime};base64,{data}"));
-    }
-    // Anything left once the count cap is already full is omitted too,
-    // WITHOUT ever being visited.
-    dropped += blocks.len();
-    (kept, dropped)
 }
 
 /// Borrowed `(mime, data)` fields for a `{"type":"image",…}` content block —
@@ -584,8 +537,9 @@ mod tests {
         }
 
         // A failed call with more than 4 images: only the first 4 survive and
-        // the rest are announced as omitted in the output text (cap_images,
-        // shared with the claude dialect).
+        // the rest are announced as omitted in the output text
+        // (cap_and_dedup_images, literally shared with the claude dialect
+        // since issue #160 round-13 P2).
         let overflow_images: Vec<Value> = (0..5)
             .map(|i| json!({ "type": "image", "data": format!("img{i}"), "mimeType": "image/png" }))
             .collect();
@@ -697,12 +651,11 @@ mod tests {
         assert_eq!(dropped, 1);
     }
 
-    /// A tiny counting wrapper around a slice iterator — used ONLY to prove
-    /// [`cap_and_dedup_images`] stops touching its source the INSTANT the
-    /// count cap is already full, rather than merely skipping (but still
-    /// visiting) every block beyond it. Holds an external `&Cell<usize>`
-    /// (not an owned counter) so the count survives after the wrapper itself
-    /// is consumed/dropped inside the function under test.
+    /// A tiny counting wrapper around a slice iterator — used to observe
+    /// exactly how many times [`cap_and_dedup_images`] calls `.next()` on its
+    /// source. Holds an external `&Cell<usize>` (not an owned counter) so the
+    /// count survives after the wrapper itself is consumed/dropped inside the
+    /// function under test.
     struct CountingIter<'a> {
         inner: std::slice::Iter<'a, Value>,
         count: &'a std::cell::Cell<usize>,
@@ -714,27 +667,24 @@ mod tests {
             self.inner.next()
         }
     }
-    impl<'a> ExactSizeIterator for CountingIter<'a> {
-        fn len(&self) -> usize {
-            self.inner.len()
-        }
-    }
 
-    /// The property [`extract_tool_images_caps_by_count_even_when_every_
-    /// block_is_small_and_distinct`] alone can't distinguish: does the
-    /// implementation actually STOP scanning once the count cap is full, or
-    /// does it keep visiting (and cheaply rejecting) every remaining block?
-    /// Issue #160 round-10 P2 #6's whole point is bounding the WORK, not just
-    /// the final count — this proves the source is never even `.next()`-ed
-    /// again past the 4th kept image, regardless of how many more blocks
-    /// follow (here, 50 more).
+    /// issue #160 round-10 P2 #6 (Codex 281) proved [`cap_and_dedup_images`]
+    /// never even `.next()`-ed the source once the count cap was full — round-
+    /// 13 P2 (Codex Red) deliberately gives that property up FOR THE COUNTING
+    /// PHASE ONLY: the old `dropped += blocks.len()` counted every leftover
+    /// block, images or not, as an omitted image (see the trailing-text tests
+    /// below), so the remainder must now be visited via `resolve` to tell an
+    /// image candidate from anything else. What still must NEVER happen is
+    /// `format!`-ing (allocating) a data URI for anything beyond the 4th
+    /// survivor — `kept.len()` staying at 4 here, even with 50 more valid,
+    /// distinct images available, is exactly that guarantee.
     #[test]
-    fn cap_and_dedup_images_stops_touching_the_source_once_the_count_cap_is_full() {
+    fn cap_and_dedup_images_visits_the_remainder_to_count_but_never_formats_past_the_cap() {
         let mut blocks: Vec<Value> = (0..4)
             .map(|i| json!({"type":"image","mimeType":"image/png","data": format!("img{i}")}))
             .collect();
-        for _ in 0..50 {
-            blocks.push(json!({"type":"image","mimeType":"image/png","data":"more"}));
+        for i in 0..50 {
+            blocks.push(json!({"type":"image","mimeType":"image/png","data": format!("excess{i}")}));
         }
         let counter = std::cell::Cell::new(0usize);
         let iter = CountingIter {
@@ -742,18 +692,71 @@ mod tests {
             count: &counter,
         };
         let (kept, dropped) = cap_and_dedup_images(iter, image_block_fields);
-        assert_eq!(kept.len(), 4);
+        assert_eq!(
+            kept.len(),
+            4,
+            "format! must never run past the count cap, regardless of how many more valid images follow"
+        );
         assert_eq!(
             counter.get(),
-            4,
-            "must stop calling next() on the source the instant 4 are already kept — the \
-             remaining 50 blocks must never be visited at all"
+            55,
+            "round-13 P2: the remainder IS now visited (via `resolve` only, never `format!`) so \
+             `dropped` can tell a real image from plain text or a duplicate — 4 calls to fill \
+             `kept`, then 50 more `Some` calls for the remainder, plus the final `None` call that \
+             ends the `for` loop"
         );
-        assert_eq!(
-            dropped, 50,
-            "the untouched remainder is still accounted for via ExactSizeIterator::len, \
-             without ever being visited"
-        );
+        assert_eq!(dropped, 50, "all 50 are distinct, non-duplicate images, so every one counts");
+    }
+
+    /// issue #160 round-13 P2 (Codex Red): once the 4-image cap is already
+    /// full, trailing TEXT blocks are not images and must not inflate
+    /// `dropped` — the bug this round fixes: the old code counted
+    /// `blocks.len()`, which conflated every leftover block (image or not)
+    /// with an omitted image.
+    #[test]
+    fn cap_and_dedup_images_does_not_count_trailing_text_blocks_as_dropped_images() {
+        let mut blocks: Vec<Value> = (0..4)
+            .map(|i| json!({"type":"image","mimeType":"image/png","data": format!("img{i}")}))
+            .collect();
+        blocks.push(json!({"type":"text","text":"note one"}));
+        blocks.push(json!({"type":"text","text":"note two"}));
+        let (kept, dropped) = cap_and_dedup_images(blocks.iter(), image_block_fields);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(dropped, 0, "trailing text blocks are not images and must not inflate dropped");
+    }
+
+    /// The counterpart to the text-only case above: a genuine 5th (valid,
+    /// distinct) image sitting right after the 4-image cap already filled,
+    /// followed by a trailing text block, must still be counted as one
+    /// omitted image — round-13 fixes the false positive on text without
+    /// introducing a false negative on a real excess image.
+    #[test]
+    fn cap_and_dedup_images_still_counts_a_genuine_excess_image_before_trailing_text() {
+        let mut blocks: Vec<Value> = (0..5)
+            .map(|i| json!({"type":"image","mimeType":"image/png","data": format!("img{i}")}))
+            .collect();
+        blocks.push(json!({"type":"text","text":"note"}));
+        let (kept, dropped) = cap_and_dedup_images(blocks.iter(), image_block_fields);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(dropped, 1);
+    }
+
+    /// Two IDENTICAL excess images (repeating each other, not merely
+    /// repeating a kept one) collapse to a single `dropped` — mirrors the
+    /// "a duplicate silently collapses, never counted twice" rule the scan
+    /// already applies to the first 4 survivors. Chosen deliberately: Codex's
+    /// note says "remaining distinct image candidates", and collapsing
+    /// duplicates in the remainder is what keeps that word meaningful.
+    #[test]
+    fn cap_and_dedup_images_counts_duplicate_excess_images_once() {
+        let mut blocks: Vec<Value> = (0..4)
+            .map(|i| json!({"type":"image","mimeType":"image/png","data": format!("img{i}")}))
+            .collect();
+        blocks.push(json!({"type":"image","mimeType":"image/png","data":"dup-excess"}));
+        blocks.push(json!({"type":"image","mimeType":"image/png","data":"dup-excess"}));
+        let (kept, dropped) = cap_and_dedup_images(blocks.iter(), image_block_fields);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(dropped, 1, "two identical excess images collapse to a single dropped count");
     }
 
     /// A single oversized block (over `cap_and_dedup_images`'s 2,000,000-char
