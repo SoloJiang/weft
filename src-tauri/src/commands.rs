@@ -1411,18 +1411,11 @@ where
         // the hidden row and advances feedback_state in one transaction.
         return Ok(hidden.state == repo::LEAD_HIDDEN_DELIVERY_CONSUMED);
     }
-    repo::mark_repo_action_feedback_delivered(db, current.id, &current.execution_token)
-        .await
-        .map_err(e)?;
-    repo::delete_delivered_repo_action_feedback_if_repo_missing(
-        db,
-        current.id,
-        &current.execution_token,
-        current.repo_id,
-    )
-    .await
-    .map_err(e)?;
-    Ok(true)
+    // A successful callback is only an attempt to enqueue the durable hidden
+    // row. Without that row there is no engine activity receipt, so the
+    // journal must remain pending for a retry rather than being acknowledged
+    // on the strength of a caller-supplied payload.
+    Ok(false)
 }
 
 async fn drain_repo_action_feedback_once(db: &Db, execution_id: i32) -> R<bool> {
@@ -1430,12 +1423,15 @@ async fn drain_repo_action_feedback_once(db: &Db, execution_id: i32) -> R<bool> 
         return Ok(false);
     };
     let db_for_delivery = db.clone();
-    drain_repo_action_feedback_with(db, execution_id, move |thread_id, payload| {
+    drain_repo_action_feedback_with(db, execution_id, move |_, _| {
         let app = app.clone();
         let db = db_for_delivery.clone();
         async move {
-            crate::lead_chat::commands::post_lead_tool_result_inner(
-                &app, &db, thread_id, payload, "en",
+            crate::lead_chat::commands::post_repo_action_feedback_from_journal(
+                &app,
+                &db,
+                execution_id,
+                "en",
             )
             .await
         }
@@ -4087,6 +4083,7 @@ pub async fn db_change_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn waiting_dingtalk_bridge_retries_after_copy_was_already_initialized() {
@@ -4575,6 +4572,7 @@ mod tests {
         let second_deliveries = deliveries.clone();
         let execution_id = execution.id;
         let expected_thread_id = thread.id;
+        let first_db = db.clone();
         let first_drain = drain_repo_action_feedback_with(
             &db,
             execution_id,
@@ -4582,14 +4580,31 @@ mod tests {
                 assert_eq!(delivered_thread_id, expected_thread_id);
                 assert_eq!(payload["execution_id"], execution_id);
                 first_deliveries.fetch_add(1, Ordering::SeqCst);
+                let hidden = repo::enqueue_repo_action_feedback_from_journal(&first_db, execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(repo::consume_lead_hidden_delivery(&first_db, hidden.id)
+                    .await
+                    .unwrap()
+                    .is_some());
                 Ok(true)
             },
         );
+        let second_db = db.clone();
         let second_drain = drain_repo_action_feedback_with(
             &db,
             execution_id,
             move |_, _| async move {
                 second_deliveries.fetch_add(1, Ordering::SeqCst);
+                let hidden = repo::enqueue_repo_action_feedback_from_journal(&second_db, execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(repo::consume_lead_hidden_delivery(&second_db, hidden.id)
+                    .await
+                    .unwrap()
+                    .is_some());
                 Ok(true)
             },
         );
@@ -4689,20 +4704,38 @@ mod tests {
         let deliveries = std::sync::Arc::new(AtomicUsize::new(0));
         let first_deliveries = deliveries.clone();
         let second_deliveries = deliveries.clone();
+        let first_db = db.clone();
         let first = drain_repo_action_feedback_with(
             &db,
             execution.id,
             move |_, payload| async move {
                 assert_eq!(payload["execution_id"], execution.id);
                 first_deliveries.fetch_add(1, Ordering::SeqCst);
+                let hidden = repo::enqueue_repo_action_feedback_from_journal(&first_db, execution.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(repo::consume_lead_hidden_delivery(&first_db, hidden.id)
+                    .await
+                    .unwrap()
+                    .is_some());
                 Ok(true)
             },
         );
+        let second_db = db.clone();
         let second = drain_repo_action_feedback_with(
             &db,
             execution.id,
             move |_, _| async move {
                 second_deliveries.fetch_add(1, Ordering::SeqCst);
+                let hidden = repo::enqueue_repo_action_feedback_from_journal(&second_db, execution.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(repo::consume_lead_hidden_delivery(&second_db, hidden.id)
+                    .await
+                    .unwrap()
+                    .is_some());
                 Ok(true)
             },
         );
@@ -4847,6 +4880,7 @@ mod tests {
         let expected_thread_id = thread.id;
         let first_deliveries = deliveries.clone();
         let second_deliveries = deliveries.clone();
+        let first_db = db.clone();
         let first_drain = drain_repo_action_feedback_with(
             &db,
             execution_id,
@@ -4855,12 +4889,29 @@ mod tests {
                 assert_eq!(payload["execution_id"], execution_id);
                 first_deliveries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                let hidden = repo::enqueue_repo_action_feedback_from_journal(&first_db, execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(repo::consume_lead_hidden_delivery(&first_db, hidden.id)
+                    .await
+                    .unwrap()
+                    .is_some());
                 Ok(true)
             },
         );
+        let second_db = db.clone();
         let second_drain =
             drain_repo_action_feedback_with(&db, execution_id, move |_, _| async move {
                 second_deliveries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let hidden = repo::enqueue_repo_action_feedback_from_journal(&second_db, execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(repo::consume_lead_hidden_delivery(&second_db, hidden.id)
+                    .await
+                    .unwrap()
+                    .is_some());
                 Ok(true)
             });
         let (first_done, second_done) = tokio::join!(first_drain, second_drain);
@@ -4888,6 +4939,98 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(wrong_args, "action_card_stale");
+    }
+
+    #[tokio::test]
+    async fn repo_action_feedback_drain_requires_hidden_receipt() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let local = init_main_repo(root.path(), "missing-receipt");
+        let (workspace, thread, card) = repo_action_card(&db, "missing-receipt", "add").await;
+        let completed = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "missing-receipt".to_string(),
+            local.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("missing-receipt".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap();
+        let execution_id = completed.execution_id.unwrap();
+        let callback_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let callback_count_for_drain = callback_count.clone();
+        assert!(!drain_repo_action_feedback_with(&db, execution_id, move |_, _| async move {
+            callback_count_for_drain.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        })
+        .await
+        .unwrap());
+        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repo::get_repo_action_execution_by_id(&db, execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .feedback_state,
+            repo::REPO_ACTION_FEEDBACK_PENDING
+        );
+        assert!(repo::get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{execution_id}")
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn journal_feedback_accepts_remote_dedup_path_repoint() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let existing_path = init_main_repo(root.path(), "existing-remote");
+        let requested_path = init_main_repo(root.path(), "requested-remote");
+        let remote = "https://example.com/weft/dedup.git";
+        sh(&existing_path, &["git", "remote", "add", "origin", remote]);
+        sh(&requested_path, &["git", "remote", "add", "origin", remote]);
+        let (workspace, thread, card) = repo_action_card(&db, "remote-dedup", "add").await;
+        let existing = register_repo(
+            &db,
+            workspace.id,
+            "existing-remote",
+            &existing_path.to_string_lossy(),
+        )
+        .await
+        .unwrap();
+        let result = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "requested-remote".to_string(),
+            requested_path.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("remote-dedup".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, RepoActionExecutionOutcome::FreshlyCompleted);
+        assert_eq!(result.repo.id, existing.id);
+        let execution_id = result.execution_id.unwrap();
+        let execution = repo::get_repo_action_execution_by_id(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(execution.target_path, result.repo.local_git_path);
+        let hidden = repo::enqueue_repo_action_feedback_from_journal(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&hidden.payload).unwrap();
+        assert_eq!(payload["local_git_path"], result.repo.local_git_path);
+        assert_eq!(hidden.thread_id, thread.id);
     }
 
     #[tokio::test]

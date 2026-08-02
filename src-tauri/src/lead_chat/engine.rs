@@ -5914,6 +5914,7 @@ pub async fn nudge_bus_read(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow
         BUS_WAKE_PROMPT.to_string(),
         true,
         true,
+        false,
         None,
         None,
     )
@@ -5931,7 +5932,7 @@ pub async fn send_hidden_existing(
     eng: &EngineRef,
     text: String,
 ) -> anyhow::Result<()> {
-    send_hidden_inner(app, db, eng, text, false, false, None, None)
+    send_hidden_inner(app, db, eng, text, false, false, false, None, None)
         .await
         .map(|_| ())
 }
@@ -5953,17 +5954,14 @@ pub async fn send_hidden_delivery_existing(
     if row.state == crate::store::repo::LEAD_HIDDEN_DELIVERY_CONSUMED {
         return Ok(true);
     }
-    if revive_stopped {
-        eng.lock().await.stopped = false;
-        ensure_running(app, db, eng).await?;
-    }
     send_hidden_inner(
         app,
         db,
         eng,
         text,
         false,
-        false,
+        revive_stopped,
+        revive_stopped,
         None,
         Some(delivery_id),
     )
@@ -5991,6 +5989,7 @@ pub async fn send_plan_approval_existing(
         text,
         false,
         true,
+        false,
         Some((thread_id, message_id, allow_proposed_scope)),
         None,
     )
@@ -6010,6 +6009,7 @@ async fn send_hidden_inner(
     text: String,
     bus_read: bool,
     ensure: bool,
+    revive_stopped: bool,
     plan_guard: Option<(i32, i32, bool)>,
     hidden_delivery_id: Option<i32>,
 ) -> anyhow::Result<bool> {
@@ -6021,6 +6021,15 @@ async fn send_hidden_inner(
         return Err(err);
     }
     let mut inner = eng.lock().await;
+    if let Some(delivery_id) = hidden_delivery_id {
+        let Some(row) = crate::store::repo::get_lead_hidden_delivery(db, delivery_id).await?
+        else {
+            return Ok(false);
+        };
+        if row.state == crate::store::repo::LEAD_HIDDEN_DELIVERY_CONSUMED {
+            return Ok(true);
+        }
+    }
     if let Some(delivery_id) = hidden_delivery_id {
         let queued = inner.turn.queue.iter().any(|out| {
             hidden_delivery_id_from_tag(out.origin_tag.as_deref()) == Some(delivery_id)
@@ -6036,12 +6045,23 @@ async fn send_hidden_inner(
     // DB check below. Every other hidden delivery still refuses stopped state.
     let guarded_plan = plan_guard.is_some();
     let revivable_stopped_plan = guarded_plan && inner.stopped && !inner.tearing_down;
-    if !hidden_turn_admissible(&inner) && !revivable_stopped_plan {
+    let revivable_stopped_delivery =
+        revive_stopped && hidden_delivery_id.is_some() && inner.stopped && !inner.tearing_down;
+    if !hidden_turn_admissible(&inner)
+        && !revivable_stopped_plan
+        && !revivable_stopped_delivery
+    {
         drop(inner);
         if bus_read {
             return Ok(false);
         }
         return Err(anyhow::anyhow!("engine is tearing down"));
+    }
+    if revivable_stopped_delivery {
+        // Keep the durable handoff's revive, ensure, duplicate check, and turn
+        // reservation under this one engine admission lock. A visible send
+        // cannot interpose between clearing `stopped` and reserving it.
+        inner.stopped = false;
     }
     if let Some((thread_id, message_id, allow_proposed_scope)) = plan_guard {
         if inner.thread_id != thread_id || !plan_approval_admissible(&inner) {

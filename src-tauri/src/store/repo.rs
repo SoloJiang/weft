@@ -236,7 +236,8 @@ pub const LEAD_HIDDEN_DELIVERY_CONSUMED: &str = "consumed";
 /// The dedupe key is the application-level idempotency boundary: retries and
 /// concurrent clicks must reuse the original row and payload rather than
 /// enqueue a second turn.
-pub async fn enqueue_lead_hidden_delivery(
+#[cfg(test)]
+pub(crate) async fn enqueue_lead_hidden_delivery(
     db: &Db,
     thread_id: i32,
     source_kind: &str,
@@ -303,6 +304,78 @@ async fn enqueue_lead_hidden_delivery_on<C: ConnectionTrait>(
         anyhow::bail!("hidden lead delivery identity changed");
     }
     Ok(row)
+}
+
+fn repo_action_feedback_payload_is_canonical(
+    execution: &repo_action_execution::Model,
+    payload: &serde_json::Value,
+) -> bool {
+    payload.get("tool").and_then(serde_json::Value::as_str) == Some("repo_action")
+        && payload.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+        && payload
+            .get("execution_id")
+            .and_then(serde_json::Value::as_i64)
+            == Some(i64::from(execution.id))
+        && payload
+            .get("workspace_id")
+            .and_then(serde_json::Value::as_i64)
+            == Some(i64::from(execution.workspace_id))
+        && payload
+            .get("repo_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<i64>().ok())
+            == Some(i64::from(execution.repo_id))
+        && payload.get("action_id").and_then(serde_json::Value::as_str)
+            == Some(execution.action_id.as_str())
+        && payload.get("kind").and_then(serde_json::Value::as_str)
+            == Some(execution.action_kind.as_str())
+        && payload.get("name").and_then(serde_json::Value::as_str)
+            == Some(execution.repo_name.as_str())
+        && payload
+            .get("local_git_path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty())
+}
+
+/// Load the authoritative completed repo-action journal and enqueue its exact
+/// canonical feedback payload. No caller-supplied thread or payload is trusted;
+/// the journal row is re-read inside the same transaction as the hidden outbox
+/// insert, so a public command cannot poison `repo_action:{execution_id}`.
+pub(crate) async fn enqueue_repo_action_feedback_from_journal(
+    db: &Db,
+    execution_id: i32,
+) -> Result<Option<lead_hidden_delivery::Model>> {
+    let txn = db.0.begin().await?;
+    let Some(execution) = repo_action_execution::Entity::find_by_id(execution_id)
+        .one(&txn)
+        .await?
+    else {
+        txn.rollback().await?;
+        return Ok(None);
+    };
+    if execution.status != REPO_ACTION_COMPLETED
+        || execution.feedback_state != REPO_ACTION_FEEDBACK_PENDING
+    {
+        txn.rollback().await?;
+        return Ok(None);
+    }
+    let payload: serde_json::Value = serde_json::from_str(&execution.feedback_payload)
+        .map_err(|error| anyhow::anyhow!("invalid repo action feedback payload: {error}"))?;
+    if !repo_action_feedback_payload_is_canonical(&execution, &payload) {
+        txn.rollback().await?;
+        anyhow::bail!("repo action feedback journal payload is not canonical");
+    }
+    let delivery = enqueue_lead_hidden_delivery_on(
+        &txn,
+        execution.thread_id,
+        "repo_action",
+        execution.id,
+        &format!("repo_action:{}", execution.id),
+        &execution.feedback_payload,
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(Some(delivery))
 }
 
 pub async fn get_lead_hidden_delivery(
@@ -3911,6 +3984,47 @@ async fn delete_workspace_cascade_with_action_cleanups(
         .await?;
     stage_repo_action_cleanup_on(&txn, action_cleanups, action_cleanup_plans).await?;
 
+    // Only rows anchored to threads that are actually removed may be deleted
+    // regardless of feedback state. A legacy cross-workspace execution can
+    // point at a surviving external thread; its pending feedback and hidden
+    // outbox must remain until the first engine activity consumes the receipt.
+    // Non-pending external rows are safe to clean up with their exact hidden
+    // source rows once the owning workspace/repo is gone.
+    let mut deleted_repo_action_ids = Vec::new();
+    if !removed_threads.is_empty() {
+        deleted_repo_action_ids.extend(
+            repo_action_execution::Entity::find()
+                .filter(repo_action_execution::Column::ThreadId.is_in(removed_threads.clone()))
+                .filter(repo_action_execution::Column::Status.ne(REPO_ACTION_CLEANUP_PENDING))
+                .all(&txn)
+                .await?
+                .into_iter()
+                .map(|execution| execution.id),
+        );
+    }
+    let mut surviving_workspace_scope = Condition::all()
+        .add(repo_action_execution::Column::WorkspaceId.eq(workspace_id))
+        .add(repo_action_execution::Column::Status.ne(REPO_ACTION_CLEANUP_PENDING))
+        .add(
+            repo_action_execution::Column::FeedbackState
+                .ne(REPO_ACTION_FEEDBACK_PENDING),
+        );
+    if !removed_threads.is_empty() {
+        surviving_workspace_scope = surviving_workspace_scope.add(
+            repo_action_execution::Column::ThreadId.is_not_in(removed_threads.clone()),
+        );
+    }
+    deleted_repo_action_ids.extend(
+        repo_action_execution::Entity::find()
+            .filter(surviving_workspace_scope)
+            .all(&txn)
+            .await?
+            .into_iter()
+            .map(|execution| execution.id),
+    );
+    deleted_repo_action_ids.sort_unstable();
+    deleted_repo_action_ids.dedup();
+
     let mut direction_scope = Condition::any();
     if !removed_threads.is_empty() {
         direction_scope =
@@ -4067,13 +4181,13 @@ async fn delete_workspace_cascade_with_action_cleanups(
             .exec(&txn)
             .await?;
     }
-    let affected_hidden_threads = directions
-        .iter()
-        .map(|direction| direction.thread_id)
-        .collect::<std::collections::HashSet<_>>();
-    if !affected_hidden_threads.is_empty() {
+    if !deleted_repo_action_ids.is_empty() {
         lead_hidden_delivery::Entity::delete_many()
-            .filter(lead_hidden_delivery::Column::ThreadId.is_in(affected_hidden_threads))
+            .filter(lead_hidden_delivery::Column::SourceKind.eq("repo_action"))
+            .filter(
+                lead_hidden_delivery::Column::SourceId
+                    .is_in(deleted_repo_action_ids.clone()),
+            )
             .exec(&txn)
             .await?;
     }
@@ -4104,11 +4218,6 @@ async fn delete_workspace_cascade_with_action_cleanups(
             .await?;
     }
     if !removed_threads.is_empty() {
-        repo_action_execution::Entity::delete_many()
-            .filter(repo_action_execution::Column::ThreadId.is_in(removed_threads.clone()))
-            .filter(repo_action_execution::Column::Status.ne(REPO_ACTION_CLEANUP_PENDING))
-            .exec(&txn)
-            .await?;
         thread::Entity::delete_many()
             .filter(thread::Column::Id.is_in(removed_threads.clone()))
             .exec(&txn)
@@ -4118,11 +4227,12 @@ async fn delete_workspace_cascade_with_action_cleanups(
         .filter(skill_enable::Column::Scope.eq(format!("ws:{workspace_id}")))
         .exec(&txn)
         .await?;
-    repo_action_execution::Entity::delete_many()
-        .filter(repo_action_execution::Column::WorkspaceId.eq(workspace_id))
-        .filter(repo_action_execution::Column::Status.ne(REPO_ACTION_CLEANUP_PENDING))
-        .exec(&txn)
-        .await?;
+    if !deleted_repo_action_ids.is_empty() {
+        repo_action_execution::Entity::delete_many()
+            .filter(repo_action_execution::Column::Id.is_in(deleted_repo_action_ids))
+            .exec(&txn)
+            .await?;
+    }
     app_setting::Entity::delete_many()
         .filter(app_setting::Column::Key.is_in([
             repo_map_doc_key(workspace_id),
@@ -5745,50 +5855,6 @@ pub async fn pending_repo_action_feedback_for_repo(
         .filter(repo_action_execution::Column::FeedbackState.eq(REPO_ACTION_FEEDBACK_PENDING))
         .all(&db.0)
         .await?)
-}
-
-pub async fn mark_repo_action_feedback_delivered(
-    db: &Db,
-    execution_id: i32,
-    execution_token: &str,
-) -> Result<bool> {
-    let updated = repo_action_execution::Entity::update_many()
-        .col_expr(
-            repo_action_execution::Column::FeedbackState,
-            Expr::value(REPO_ACTION_FEEDBACK_DELIVERED),
-        )
-        .col_expr(repo_action_execution::Column::UpdatedAt, Expr::value(now()))
-        .filter(repo_action_execution::Column::Id.eq(execution_id))
-        .filter(repo_action_execution::Column::ExecutionToken.eq(execution_token))
-        .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_COMPLETED))
-        .filter(repo_action_execution::Column::FeedbackState.eq(REPO_ACTION_FEEDBACK_PENDING))
-        .exec(&db.0)
-        .await?;
-    Ok(updated.rows_affected == 1)
-}
-
-pub async fn delete_delivered_repo_action_feedback_if_repo_missing(
-    db: &Db,
-    execution_id: i32,
-    execution_token: &str,
-    repo_id: i32,
-) -> Result<bool> {
-    if repo_ref::Entity::find_by_id(repo_id)
-        .one(&db.0)
-        .await?
-        .is_some()
-    {
-        return Ok(false);
-    }
-    let deleted = repo_action_execution::Entity::delete_many()
-        .filter(repo_action_execution::Column::Id.eq(execution_id))
-        .filter(repo_action_execution::Column::ExecutionToken.eq(execution_token))
-        .filter(repo_action_execution::Column::RepoId.eq(repo_id))
-        .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_COMPLETED))
-        .filter(repo_action_execution::Column::FeedbackState.eq(REPO_ACTION_FEEDBACK_DELIVERED))
-        .exec(&db.0)
-        .await?;
-    Ok(deleted.rows_affected == 1)
 }
 
 pub async fn unfinished_repo_action_executions_for_thread(
@@ -7878,6 +7944,53 @@ mod tests {
 
     async fn mem() -> Db {
         Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    async fn insert_test_repo_action_execution(
+        db: &Db,
+        id: i32,
+        workspace_id: i32,
+        thread_id: i32,
+        message_id: i32,
+        repo: &repo_ref::Model,
+        action_id: &str,
+        feedback_state: &str,
+    ) -> repo_action_execution::Model {
+        let payload = serde_json::json!({
+            "tool": "repo_action",
+            "action_id": action_id,
+            "kind": "add",
+            "status": "ok",
+            "execution_id": id,
+            "workspace_id": workspace_id,
+            "repo_id": repo.id.to_string(),
+            "name": repo.name,
+            "local_git_path": repo.local_git_path,
+        })
+        .to_string();
+        repo_action_execution::ActiveModel {
+            id: Set(id),
+            workspace_id: Set(workspace_id),
+            thread_id: Set(thread_id),
+            message_id: Set(message_id),
+            action_id: Set(action_id.to_string()),
+            action_kind: Set("add".to_string()),
+            invocation_fingerprint: Set(format!("fingerprint-{id}")),
+            execution_token: Set(format!("token-{id}")),
+            status: Set(REPO_ACTION_COMPLETED.to_string()),
+            target_path: Set(repo.local_git_path.clone()),
+            staging_path: Set(String::new()),
+            repo_id: Set(repo.id),
+            repo_name: Set(repo.name.clone()),
+            feedback_state: Set(feedback_state.to_string()),
+            feedback_payload: Set(payload),
+            cleanup_preserve_target: Set(false),
+            created_at: Set(now()),
+            updated_at: Set(now()),
+        }
+        .insert(&db.0)
+        .await
+        .unwrap()
     }
 
     /// A live thread id for message tests: insert_lead_message refuses to write
@@ -10521,6 +10634,247 @@ mod tests {
             .map(|row| row.scope)
             .collect();
         assert_eq!(scopes, vec![format!("ws:{}", keep_ws.id)]);
+    }
+
+    /// Legacy cross-workspace outbox rows on a surviving external thread are
+    /// retained until an engine receipt, while non-pending rows are cleaned by
+    /// exact execution identity.
+    #[tokio::test]
+    async fn delete_workspace_preserves_external_pending_hidden_deliveries() {
+        let db = mem().await;
+        let deleted_ws = create_workspace(&db, "delete hidden workspace").await.unwrap();
+        let external_ws = create_workspace(&db, "external hidden workspace").await.unwrap();
+        let deleted_repo = add_repo_ref(
+            &db,
+            deleted_ws.id,
+            "deleted-repo",
+            "/tmp/deleted-hidden-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let external_repo = add_repo_ref(
+            &db,
+            external_ws.id,
+            "external-repo",
+            "/tmp/external-hidden-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let removed_thread = create_thread(&db, deleted_ws.id, "removed", "feature", "codex")
+            .await
+            .unwrap();
+        let external_thread = create_thread(&db, external_ws.id, "external", "feature", "codex")
+            .await
+            .unwrap();
+        direction::ActiveModel {
+            thread_id: Set(external_thread.id),
+            name: Set("legacy deleted repo direction".to_string()),
+            slug: Set("legacy-deleted-repo-direction".to_string()),
+            tool: Set("codex".to_string()),
+            branch: Set("feature/legacy-deleted-repo".to_string()),
+            status: Set("queued".to_string()),
+            repo_id: Set(deleted_repo.id),
+            reason: Set("legacy cross-workspace".to_string()),
+            engine_pinned: Set(true),
+            mandate: Set("impl-only".to_string()),
+            created_at: Set(now()),
+            ..Default::default()
+        }
+        .insert(&db.0)
+        .await
+        .unwrap();
+
+        let plan_message = insert_lead_message(
+            &db,
+            external_thread.id,
+            None,
+            1,
+            "assistant",
+            "plan_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let plan_hidden = enqueue_lead_hidden_delivery(
+            &db,
+            external_thread.id,
+            "plan_decision",
+            plan_message.id,
+            &format!("plan_decision:{}", plan_message.id),
+            &serde_json::json!({
+                "tool": "plan_decision",
+                "message_id": plan_message.id,
+                "status": "approved"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let external_message = insert_lead_message(
+            &db,
+            external_thread.id,
+            None,
+            2,
+            "assistant",
+            "action_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let external_execution = insert_test_repo_action_execution(
+            &db,
+            9001,
+            external_ws.id,
+            external_thread.id,
+            external_message.id,
+            &external_repo,
+            "external-action",
+            REPO_ACTION_FEEDBACK_PENDING,
+        )
+        .await;
+        let external_hidden =
+            enqueue_repo_action_feedback_from_journal(&db, external_execution.id)
+                .await
+                .unwrap()
+                .unwrap();
+
+        let related_message = insert_lead_message(
+            &db,
+            external_thread.id,
+            None,
+            3,
+            "assistant",
+            "action_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let related_execution = insert_test_repo_action_execution(
+            &db,
+            9002,
+            deleted_ws.id,
+            external_thread.id,
+            related_message.id,
+            &deleted_repo,
+            "related-action",
+            REPO_ACTION_FEEDBACK_PENDING,
+        )
+        .await;
+        let related_hidden =
+            enqueue_repo_action_feedback_from_journal(&db, related_execution.id)
+                .await
+                .unwrap()
+                .unwrap();
+
+        let delivered_message = insert_lead_message(
+            &db,
+            external_thread.id,
+            None,
+            4,
+            "assistant",
+            "action_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let delivered_execution = insert_test_repo_action_execution(
+            &db,
+            9003,
+            deleted_ws.id,
+            external_thread.id,
+            delivered_message.id,
+            &deleted_repo,
+            "delivered-action",
+            REPO_ACTION_FEEDBACK_DELIVERED,
+        )
+        .await;
+        let delivered_hidden = enqueue_lead_hidden_delivery(
+            &db,
+            external_thread.id,
+            "repo_action",
+            delivered_execution.id,
+            &format!("repo_action:{}", delivered_execution.id),
+            &delivered_execution.feedback_payload,
+        )
+        .await
+        .unwrap();
+
+        delete_workspace_cascade_with_human_cancellations(&db, deleted_ws.id)
+            .await
+            .unwrap();
+
+        assert!(get_thread(&db, removed_thread.id).await.unwrap().is_none());
+        assert!(get_thread(&db, external_thread.id).await.unwrap().is_some());
+        assert!(get_repo(&db, deleted_repo.id).await.unwrap().is_none());
+        assert!(get_repo(&db, external_repo.id).await.unwrap().is_some());
+        assert_eq!(
+            get_lead_hidden_delivery(&db, plan_hidden.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            LEAD_HIDDEN_DELIVERY_PENDING
+        );
+        assert_eq!(
+            get_lead_hidden_delivery(&db, external_hidden.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            LEAD_HIDDEN_DELIVERY_PENDING
+        );
+        assert!(get_repo_action_execution_by_id(&db, external_execution.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            get_repo_action_execution_by_id(&db, related_execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .feedback_state,
+            REPO_ACTION_FEEDBACK_PENDING
+        );
+        assert!(get_lead_hidden_delivery(&db, related_hidden.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_repo_action_execution_by_id(&db, delivered_execution.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(get_lead_hidden_delivery(&db, delivered_hidden.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        assert!(consume_lead_hidden_delivery(&db, related_hidden.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_repo_action_execution_by_id(&db, related_execution.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            get_lead_hidden_delivery(&db, related_hidden.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            LEAD_HIDDEN_DELIVERY_CONSUMED
+        );
     }
 
     /// issue #110 T3 review: same fix as `delete_thread_cascade_removes_
@@ -14801,6 +15155,136 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn repo_action_journal_enqueue_rejects_unready_or_tampered_rows() {
+        let db = mem().await;
+        let workspace = create_workspace(&db, "journal-guard").await.unwrap();
+        let repo = add_repo_ref(&db, workspace.id, "repo", "/tmp/journal-guard", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        assert!(enqueue_repo_action_feedback_from_journal(&db, 9999)
+            .await
+            .unwrap()
+            .is_none());
+
+        let pending_message = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "action_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let pending = insert_test_repo_action_execution(
+            &db,
+            9100,
+            workspace.id,
+            thread.id,
+            pending_message.id,
+            &repo,
+            "pending",
+            REPO_ACTION_FEEDBACK_PENDING,
+        )
+        .await;
+        let mut pending_active: repo_action_execution::ActiveModel = pending.into();
+        pending_active.status = Set(REPO_ACTION_PENDING.to_string());
+        pending_active.update(&db.0).await.unwrap();
+        assert!(enqueue_repo_action_feedback_from_journal(&db, 9100)
+            .await
+            .unwrap()
+            .is_none());
+
+        let delivered_message = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            2,
+            "assistant",
+            "action_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let delivered = insert_test_repo_action_execution(
+            &db,
+            9101,
+            workspace.id,
+            thread.id,
+            delivered_message.id,
+            &repo,
+            "delivered",
+            REPO_ACTION_FEEDBACK_DELIVERED,
+        )
+        .await;
+        assert!(enqueue_repo_action_feedback_from_journal(&db, delivered.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let tampered_message = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            3,
+            "assistant",
+            "action_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let tampered = insert_test_repo_action_execution(
+            &db,
+            9102,
+            workspace.id,
+            thread.id,
+            tampered_message.id,
+            &repo,
+            "tampered",
+            REPO_ACTION_FEEDBACK_PENDING,
+        )
+        .await;
+        let mut tampered_payload: serde_json::Value =
+            serde_json::from_str(&tampered.feedback_payload).unwrap();
+        tampered_payload["workspace_id"] = serde_json::json!(workspace.id + 1000);
+        let mut tampered_active: repo_action_execution::ActiveModel = tampered.clone().into();
+        tampered_active.feedback_payload = Set(tampered_payload.to_string());
+        tampered_active.update(&db.0).await.unwrap();
+        assert!(enqueue_repo_action_feedback_from_journal(&db, tampered.id)
+            .await
+            .is_err());
+        assert!(get_lead_hidden_delivery_by_dedupe(&db, "repo_action:9102")
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut repaired_active: repo_action_execution::ActiveModel = tampered.into();
+        repaired_active.feedback_payload = Set(serde_json::json!({
+            "tool": "repo_action",
+            "action_id": "tampered",
+            "kind": "add",
+            "status": "ok",
+            "execution_id": 9102,
+            "workspace_id": workspace.id,
+            "repo_id": repo.id.to_string(),
+            "name": repo.name,
+            "local_git_path": repo.local_git_path,
+        }).to_string());
+        repaired_active.update(&db.0).await.unwrap();
+        assert!(enqueue_repo_action_feedback_from_journal(&db, 9102)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

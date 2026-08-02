@@ -231,11 +231,17 @@ pub async fn lead_engine(
     lang: &str,
 ) -> anyhow::Result<EngineRef> {
     let state = app.state::<LeadChatState>();
-    let _engine_admission = state.engine_admission_read().await;
-    let t = repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-    if let Some(e) = state.get(lead_key(thread_id)) {
+    let existing = {
+        let _engine_admission = state.engine_admission_read().await;
+        state.get(lead_key(thread_id))
+    };
+    if let Some(e) = existing {
+        repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+        restore_pending_hidden_deliveries_on_engine(app, db, thread_id, &e).await?;
         return Ok(e);
     }
+    let engine_admission = state.engine_admission_read().await;
+    let t = repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let t = crate::engine_routing::prepare_initial_lead(db, &t).await?;
     let cwd = ensure_lead_cwd(thread_id)?;
     let base = app.state::<crate::BusBase>().0.clone();
@@ -375,7 +381,12 @@ pub async fn lead_engine(
     engine::apply_persisted_meta(&mut inner, &t.lead_meta);
     let eng: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     let selected = state.get_or_insert(lead_key(thread_id), eng);
-    spawn_pending_hidden_deliveries(db.clone(), Some(thread_id));
+    drop(engine_admission);
+    // Hydrate durable hidden rows before returning the engine to a caller that
+    // may immediately send a visible turn. Fire-and-forget replay allowed a
+    // post-restart visible send to win the engine mutex ahead of an old plan
+    // approval; synchronous admission here preserves the durable row order.
+    restore_pending_hidden_deliveries_on_engine(app, db, thread_id, &selected).await?;
     Ok(selected)
 }
 
@@ -710,6 +721,25 @@ mod tests {
         let bare = serde_json::json!({"status": "ok"});
         let text = super::hidden_feedback_text(&bare).unwrap();
         assert!(text.starts_with("<weft:repo_action>"));
+    }
+
+    #[test]
+    fn public_repo_action_feedback_never_becomes_durable() {
+        let ordinary = serde_json::json!({"tool": "repo_action", "status": "ok"});
+        let journal_shaped = serde_json::json!({
+            "tool": "repo_action",
+            "status": "ok",
+            "execution_id": 42,
+            "workspace_id": 7,
+            "repo_id": "9"
+        });
+        assert!(!super::public_feedback_is_durable(&ordinary));
+        assert!(!super::public_feedback_is_durable(&journal_shaped));
+        assert!(super::public_feedback_is_durable(&serde_json::json!({
+            "tool": "plan_decision",
+            "message_id": 11,
+            "status": "approved"
+        })));
     }
 
     #[test]
@@ -3293,6 +3323,10 @@ fn hidden_feedback_text(payload: &serde_json::Value) -> Result<String, serde_jso
     Ok(format!("<weft:{tag}>{json}</weft:{tag}>"))
 }
 
+fn public_feedback_is_durable(payload: &serde_json::Value) -> bool {
+    payload.get("tool").and_then(serde_json::Value::as_str) == Some("plan_decision")
+}
+
 fn hidden_delivery_identity(
     payload: &serde_json::Value,
 ) -> Result<(String, i32, String), String> {
@@ -3301,24 +3335,15 @@ fn hidden_delivery_identity(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("other")
         .to_string();
-    if !matches!(source_kind.as_str(), "plan_decision" | "repo_action") {
+    if source_kind != "plan_decision" {
         return Err("hidden delivery has no stable source identity".to_string());
     }
-    let source_id = match source_kind.as_str() {
-        "plan_decision" => payload
-            .get("message_id")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .ok_or_else(|| "plan decision missing message_id".to_string())?,
-        "repo_action" => payload
-            .get("execution_id")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .ok_or_else(|| "repo action feedback missing execution_id".to_string())?,
-        _ => 0,
-    };
+    let source_id = payload
+        .get("message_id")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "plan decision missing message_id".to_string())?;
     let dedupe_key = format!("{source_kind}:{source_id}");
     Ok((source_kind, source_id, dedupe_key))
 }
@@ -3332,9 +3357,6 @@ async fn dispatch_hidden_delivery(
     if row.state == repo::LEAD_HIDDEN_DELIVERY_CONSUMED {
         return Ok(true);
     }
-    let payload: serde_json::Value = serde_json::from_str(&row.payload)
-        .map_err(|error| format!("invalid hidden lead delivery payload: {error}"))?;
-    let text = hidden_feedback_text(&payload).map_err(|error| error.to_string())?;
     let revive = row.source_kind == "plan_decision";
     let eng = match app.state::<LeadChatState>().get(lead_key(row.thread_id)) {
         Some(eng) => eng,
@@ -3355,9 +3377,50 @@ async fn dispatch_hidden_delivery(
                 .map_err(|error| error.to_string())?
         }
     };
-    engine::send_hidden_delivery_existing(app, db, &eng, text, row.id, revive)
+    dispatch_hidden_delivery_with_engine(app, db, row, &eng).await
+}
+
+async fn dispatch_hidden_delivery_with_engine(
+    app: &AppHandle,
+    db: &Db,
+    row: &crate::store::entities::lead_hidden_delivery::Model,
+    eng: &EngineRef,
+) -> Result<bool, String> {
+    if row.state == repo::LEAD_HIDDEN_DELIVERY_CONSUMED {
+        return Ok(true);
+    }
+    let payload: serde_json::Value = serde_json::from_str(&row.payload)
+        .map_err(|error| format!("invalid hidden lead delivery payload: {error}"))?;
+    let text = hidden_feedback_text(&payload).map_err(|error| error.to_string())?;
+    let revive = row.source_kind == "plan_decision";
+    engine::send_hidden_delivery_existing(app, db, eng, text, row.id, revive)
         .await
         .map_err(|error| error.to_string())
+}
+
+/// Internal-only repo-action feedback handoff. The public Tauri command treats
+/// repo_action payloads as ephemeral; only this journal-backed path may create
+/// a durable `repo_action:{execution_id}` hidden row.
+pub(crate) async fn post_repo_action_feedback_from_journal(
+    app: &AppHandle,
+    db: &Db,
+    execution_id: i32,
+    lang: &str,
+) -> Result<bool, String> {
+    let Some(delivery) = repo::enqueue_repo_action_feedback_from_journal(db, execution_id)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    match dispatch_hidden_delivery(app, db, &delivery, lang).await {
+        Ok(true) => Ok(true),
+        Ok(false) => Ok(true),
+        Err(error) => {
+            log_hidden_feedback_ignored(delivery.thread_id, &error);
+            Ok(true)
+        }
+    }
 }
 
 async fn dispatch_ephemeral_hidden_feedback(
@@ -3395,31 +3458,40 @@ async fn dispatch_ephemeral_hidden_feedback(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn spawn_pending_hidden_deliveries(db: Db, thread_id: Option<i32>) {
-    tauri::async_runtime::spawn(async move {
-        let Some(app) = crate::APP_HANDLE.get().cloned() else {
-            return;
-        };
-        let rows = match repo::list_pending_lead_hidden_deliveries(&db, thread_id).await {
-            Ok(rows) => rows,
-            Err(error) => {
-                eprintln!("[weft] list pending hidden lead deliveries failed: {error}");
-                return;
+async fn restore_pending_hidden_deliveries_on_engine(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    eng: &EngineRef,
+) -> anyhow::Result<()> {
+    let rows = repo::list_pending_lead_hidden_deliveries(db, Some(thread_id)).await?;
+    for row in rows {
+        match dispatch_hidden_delivery_with_engine(app, db, &row, eng).await {
+            Ok(accepted) if row.source_kind == "plan_decision" && !accepted => {
+                anyhow::bail!("pending plan hidden delivery {} was not admitted", row.id);
             }
-        };
-        for row in rows {
-            if let Err(error) = dispatch_hidden_delivery(&app, &db, &row, "en").await {
-                eprintln!("[weft] hidden lead delivery {} replay failed: {error}", row.id);
+            Ok(_) => {}
+            Err(error) if row.source_kind == "plan_decision" => {
+                return Err(anyhow::anyhow!(
+                    "pending plan hidden delivery {} replay failed: {error}",
+                    row.id
+                ));
+            }
+            Err(error) => {
+                eprintln!(
+                    "[weft] non-critical repo hidden delivery {} replay deferred: {error}",
+                    row.id
+                );
             }
         }
-    });
+    }
+    Ok(())
 }
 
-/// Persist and dispatch one UI tool result. Stable `plan_decision` and
-/// `repo_action` payloads return `Ok(true)` once their durable handoff commits,
-/// even when the engine is stopped or a transient spawn/write fails; startup
-/// replay owns the pending row. Ordinary feedback (for example
-/// `test_cases_updated`) remains an ephemeral best-effort nudge.
+/// Persist and dispatch one UI tool result. Only plan decisions carry a
+/// user-facing durable handoff here; repo-action feedback is accepted durably
+/// only through [`post_repo_action_feedback_from_journal`]. Other feedback
+/// remains an ephemeral best-effort nudge.
 pub(crate) async fn post_lead_tool_result_inner(
     app: &AppHandle,
     db: &Db,
@@ -3427,68 +3499,43 @@ pub(crate) async fn post_lead_tool_result_inner(
     payload: serde_json::Value,
     lang: &str,
 ) -> Result<bool, String> {
-    let source_kind = payload
-        .get("tool")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("other");
-    if !matches!(source_kind, "plan_decision" | "repo_action") {
+    if !public_feedback_is_durable(&payload) {
         return dispatch_ephemeral_hidden_feedback(app, db, thread_id, &payload, lang).await;
     }
-    let (source_kind, source_id, dedupe_key) = match hidden_delivery_identity(&payload) {
+    let (_, source_id, _) = match hidden_delivery_identity(&payload) {
         Ok(identity) => identity,
         Err(error) => {
             log_hidden_feedback_ignored(thread_id, &error);
             return Ok(false);
         }
     };
-    let payload_text = match serde_json::to_string(&payload) {
-        Ok(payload) => payload,
-        Err(error) => {
-            log_hidden_feedback_ignored(thread_id, &error.to_string());
-            return Ok(false);
-        }
+    let Some(message_id) = (source_id > 0).then_some(source_id) else {
+        return Ok(false);
     };
-    let delivery = if source_kind == "plan_decision" {
-        let Some(message_id) = (source_id > 0).then_some(source_id) else {
-            return Ok(false);
-        };
-        let Some((resolved, delivery)) = repo::enqueue_plan_decision_and_resolve(
-            db,
-            thread_id,
-            message_id,
-            payload
-                .get("allow_proposed_scope")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-        )
-        .await
-        .map_err(|error| error.to_string())?
-        else {
-            return Ok(false);
-        };
-        let _ = app.emit(
-            engine::EVENT,
-            engine::Push::ToolResult {
-                thread_id: resolved.thread_id,
-                message_id: resolved.id,
-                content: resolved.content,
-                status: resolved.status,
-            },
-        );
-        let _ = app.emit("needs-you://changed", resolved.thread_id);
-        delivery
-    } else {
-        repo::enqueue_lead_hidden_delivery(
-            db,
-            thread_id,
-            &source_kind,
-            source_id,
-            &dedupe_key,
-            &payload_text,
-        )
-        .await
-        .map_err(|error| error.to_string())?
+    let Some((resolved, delivery)) = repo::enqueue_plan_decision_and_resolve(
+        db,
+        thread_id,
+        message_id,
+        payload
+            .get("allow_proposed_scope")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    )
+    .await
+    .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
     };
+    let _ = app.emit(
+        engine::EVENT,
+        engine::Push::ToolResult {
+            thread_id: resolved.thread_id,
+            message_id: resolved.id,
+            content: resolved.content,
+            status: resolved.status,
+        },
+    );
+    let _ = app.emit("needs-you://changed", resolved.thread_id);
     match dispatch_hidden_delivery(app, db, &delivery, lang).await {
         Ok(true) => Ok(true),
         Ok(false) => {
