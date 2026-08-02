@@ -357,6 +357,40 @@ pub struct PrSnapshot {
     pub conflict: ConflictStatus,
 }
 
+impl PrSnapshot {
+    /// Why this otherwise-successful fetch could not read every axis, or
+    /// `None` when it read them all — the difference between a COMPLETE and a
+    /// PARTIAL probe (see `store::repo::apply_pull_request_snapshot`, which
+    /// only resets the consecutive-failure streak for a complete one).
+    ///
+    /// Lives on the snapshot rather than in either sweep because BOTH the
+    /// monitor and the auto-merge loop persist snapshots, and they must agree.
+    /// If one of them reported "complete" for a partial read, it would zero
+    /// the streak the other is accumulating and the give-up threshold would
+    /// never be reached — the exact bug this distinction exists to fix, just
+    /// reintroduced through the second writer.
+    ///
+    /// ONLY the review-thread axis qualifies, and only its `Unknown` variant.
+    /// That is deliberate: [`ThreadStatus::Unknown`] means a REQUEST failed
+    /// (`gh api graphql` errored, or its output could not be trusted
+    /// complete), whereas the other axes' `Unknown` variants mean the host
+    /// answered and its answer was "not determined yet" —
+    /// [`ConflictStatus::Unknown`] in particular is a common, transient,
+    /// entirely healthy state GitHub reports for seconds after every push.
+    /// Counting those would march a perfectly healthy PR toward the give-up
+    /// threshold. [`ThreadStatus::Unchecked`] is likewise not a failure: it
+    /// means a backend does not implement the axis at all, which no amount of
+    /// retrying changes.
+    pub fn unreadable_axis_error(&self) -> Option<&str> {
+        match &self.threads {
+            ThreadStatus::Unknown { reason } => Some(reason.as_str()),
+            ThreadStatus::Unchecked
+            | ThreadStatus::AllResolved
+            | ThreadStatus::Unresolved { .. } => None,
+        }
+    }
+}
+
 /// Why a fetch failed — always surfaced honestly (`monitor` never treats this
 /// as "nothing changed" or silently substitutes an empty/clean state).
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -401,7 +401,19 @@ async fn evaluate_row(
         &snapshot.conflict,
         &upstream,
     );
-    if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, &snapshot, &fresh_readiness).await {
+    // Same partial-vs-complete bookkeeping the monitor applies: reporting
+    // "complete" here would zero the streak the monitor is accumulating for a
+    // persistently unreadable axis, so the give-up threshold would never be
+    // reached whenever auto-merge happens to be enabled.
+    if let Err(e) = repo::apply_pull_request_snapshot(
+        db,
+        pr.id,
+        &snapshot,
+        &fresh_readiness,
+        snapshot.unreadable_axis_error(),
+    )
+    .await
+    {
         eprintln!(
             "[weft][automerge] pr #{}: could not save pre-merge confirmation snapshot: {e}",
             pr.id
@@ -574,7 +586,9 @@ async fn maybe_merge_one(
         Ok(s) => {
             let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
             let r = judge::merge_readiness(&s.ci, &s.review, &s.threads, &s.conflict, &upstream);
-            if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, s, &r).await {
+            if let Err(e) =
+                repo::apply_pull_request_snapshot(db, pr.id, s, &r, s.unreadable_axis_error()).await
+            {
                 eprintln!(
                     "[weft][automerge] pr #{}: could not save confirmation snapshot: {e}",
                     pr.id
@@ -1057,6 +1071,21 @@ mod tests {
         })))
     }
 
+    /// A fresh read whose thread query failed — the PARTIAL-read shape.
+    fn resolver_fresh_threads_unknown(_: HostKind) -> Result<Box<dyn PrHost>, HostError> {
+        Ok(Box::new(FakeHost(PrSnapshot {
+            head_sha: "fresh_sha_threads_unknown".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: PrLifecycle::Open,
+            ci: CiStatus::Passing,
+            review: ReviewStatus::Approved,
+            threads: ThreadStatus::Unknown { reason: "no access".to_string() },
+            conflict: ConflictStatus::Clean,
+        })))
+    }
+
     fn resolver_fresh_already_merged(_: HostKind) -> Result<Box<dyn PrHost>, HostError> {
         Ok(Box::new(FakeHost(PrSnapshot {
             head_sha: "fresh_sha_already_merged".to_string(),
@@ -1172,7 +1201,9 @@ mod tests {
             threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         };
-        repo::apply_pull_request_snapshot(db, pr.id, &stored, &MergeReadiness::Ready).await.unwrap();
+        repo::apply_pull_request_snapshot(db, pr.id, &stored, &MergeReadiness::Ready, None)
+            .await
+            .unwrap();
         repo::set_setting(db, K_AUTO_MERGE_ENABLED, "1").await.unwrap();
         repo::get_pull_request(db, pr.id).await.unwrap().unwrap()
     }
@@ -1225,6 +1256,36 @@ mod tests {
             gate::parse_threads(&reloaded.thread_status),
             ThreadStatus::Unresolved { count: 2 }
         );
+    }
+
+    /// This loop is the SECOND writer of `probe_fail_count`, and that makes
+    /// it able to silently undo the monitor's give-up bookkeeping: if it
+    /// reported a partial read as an unqualified success, it would zero the
+    /// streak the monitor is accumulating on every one of its own sweeps, so
+    /// a permanently unreadable thread axis would never reach the threshold
+    /// — the Codex round 2 P2 bug, reintroduced through this path whenever
+    /// auto-merge happens to be enabled. Both writers derive it from the same
+    /// `PrSnapshot::unreadable_axis_error`, and this is what pins that.
+    #[tokio::test]
+    async fn a_partial_fresh_read_extends_the_failure_streak_rather_than_clearing_it() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let backoff = MergeBackoffState::default();
+        assert_eq!(pr.probe_fail_count, 0, "the fixture starts from a clean streak");
+
+        let verdict =
+            evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_threads_unknown).await;
+        assert_eq!(verdict, RowVerdict::Skip, "an unreadable axis can never authorize a merge");
+
+        let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.probe_fail_count, 1,
+            "the partial read must EXTEND the streak, not reset it"
+        );
+        assert_eq!(reloaded.last_error, "no access", "and keep the diagnostic visible");
+        // The readable axes still landed — that is why a partial read is
+        // persisted at all rather than thrown away.
+        assert_eq!(reloaded.head_sha, "fresh_sha_threads_unknown");
     }
 
     #[tokio::test]

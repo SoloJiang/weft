@@ -4300,14 +4300,37 @@ pub async fn register_pull_request(
 /// `mark_pull_request_probe_error` for the failure counterpart, which
 /// deliberately leaves these observed fields untouched — a failed probe is a
 /// fact about the ATTEMPT, not new information about the PR/MR's real state.
+/// `axis_error` distinguishes a COMPLETE probe from a PARTIAL one.
+///
+/// `None` — every axis was read; this is an unqualified success and resets
+/// the consecutive-failure streak.
+///
+/// `Some(reason)` — the fetch returned a snapshot, but at least one axis came
+/// back unreadable. Its readable axes are real and still worth persisting
+/// (that is the whole reason a partial read is not simply discarded), but it
+/// must NOT reset the streak: a permanently unreadable axis would otherwise
+/// zero the counter on every sweep, so the give-up threshold could never be
+/// reached, the failing request would be retried forever, and the human would
+/// never be escalated past the self-clearing notice. Codex review round 2 P2
+/// on the review-thread axis, which is exactly this shape — `gh api graphql`
+/// failing for a token without `reviewThreads` access while `gh pr view` keeps
+/// succeeding.
+///
+/// Returns the resulting `probe_fail_count` so the caller can apply the same
+/// give-up escalation `mark_pull_request_probe_error`'s callers already do.
 pub async fn apply_pull_request_snapshot(
     db: &Db,
     id: i32,
     snapshot: &crate::host::PrSnapshot,
     readiness: &crate::host::MergeReadiness,
-) -> Result<()> {
+    axis_error: Option<&str>,
+) -> Result<Option<i32>> {
     let Some(row) = pull_request::Entity::find_by_id(id).one(&db.0).await? else {
-        return Ok(());
+        return Ok(None);
+    };
+    let next_fail_count = match axis_error {
+        None => 0,
+        Some(_) => row.probe_fail_count.saturating_add(1),
     };
     let mut a: pull_request::ActiveModel = row.into();
     a.head_sha = Set(snapshot.head_sha.clone());
@@ -4325,10 +4348,13 @@ pub async fn apply_pull_request_snapshot(
     a.conflict_status = Set(serde_json::to_string(&snapshot.conflict).unwrap_or_default());
     a.merge_readiness = Set(serde_json::to_string(readiness).unwrap_or_default());
     a.last_checked_at = Set(now());
-    a.last_error = Set(String::new());
-    a.probe_fail_count = Set(0); // a success resets the consecutive-failure streak
+    // A partial read keeps its diagnostic visible in `last_error` for exactly
+    // the same reason a failed probe does — "we could not tell" must never
+    // look identical to "we checked and it was fine".
+    a.last_error = Set(axis_error.unwrap_or("").to_string());
+    a.probe_fail_count = Set(next_fail_count);
     a.update(&db.0).await?;
-    Ok(())
+    Ok(Some(next_fail_count))
 }
 
 /// Record a failed probe attempt without touching the last known snapshot,
@@ -8212,7 +8238,7 @@ mod tests {
             threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready, None)
             .await
             .unwrap();
 
@@ -8257,7 +8283,7 @@ mod tests {
             threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready, None)
             .await
             .unwrap();
 
@@ -8321,7 +8347,7 @@ mod tests {
             threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready, None)
             .await
             .unwrap();
 
@@ -8361,7 +8387,7 @@ mod tests {
             threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready, None)
             .await
             .unwrap();
 
@@ -8407,7 +8433,7 @@ mod tests {
             threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready, None)
             .await
             .unwrap();
 
@@ -8458,7 +8484,7 @@ mod tests {
             threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, matching.id, &matching_snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, matching.id, &matching_snapshot, &crate::host::MergeReadiness::Ready, None)
             .await
             .unwrap();
         // The unrelated repo's PR merged into a branch that COINCIDENTALLY shares the real
@@ -8475,7 +8501,7 @@ mod tests {
             threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, unrelated.id, &unrelated_snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, unrelated.id, &unrelated_snapshot, &crate::host::MergeReadiness::Ready, None)
             .await
             .unwrap();
 
@@ -8520,7 +8546,7 @@ mod tests {
             threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready, None)
             .await
             .unwrap();
 
@@ -8815,7 +8841,7 @@ mod tests {
             threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, first.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, first.id, &snapshot, &crate::host::MergeReadiness::Ready, None)
             .await
             .unwrap();
 
@@ -8864,7 +8890,7 @@ mod tests {
             threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, closed.id, &closed_snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, closed.id, &closed_snapshot, &crate::host::MergeReadiness::Ready, None)
             .await
             .unwrap();
         assert!(
@@ -8887,7 +8913,7 @@ mod tests {
             threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, merged.id, &merged_snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, merged.id, &merged_snapshot, &crate::host::MergeReadiness::Ready, None)
             .await
             .unwrap();
 
@@ -9178,9 +9204,96 @@ mod tests {
                 &snapshot.conflict,
                 &host::UpstreamStatus::None,
             );
-        apply_pull_request_snapshot(&db, broken.id, &snapshot, &readiness).await.unwrap();
+        apply_pull_request_snapshot(&db, broken.id, &snapshot, &readiness, None).await.unwrap();
         let listed = list_open_pull_requests(&db, 2).await.unwrap();
         assert_eq!(listed.len(), 2, "a success must reset the failure streak and rejoin the sweep");
+    }
+
+    /// Codex review round 2 P2 (issue #110): a PARTIAL read must not reset
+    /// the failure streak.
+    ///
+    /// The reported shape: `gh api graphql` fails persistently (a token
+    /// without `reviewThreads` access, a GHE install that does not serve the
+    /// query) while `gh pr view` keeps succeeding. `fetch_status` then returns
+    /// `Ok` with `threads: Unknown` every sweep. If that counted as an
+    /// unqualified success it would zero the streak forever: the give-up
+    /// threshold could never be reached, the failing request would be retried
+    /// until the end of time, and the human would never be escalated past a
+    /// self-clearing "indeterminate" note.
+    #[tokio::test]
+    async fn a_partial_read_accumulates_the_failure_streak_instead_of_resetting_it() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let pr = register_pull_request(
+            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 7, "", "",
+        )
+        .await
+        .unwrap();
+
+        let partial = crate::host::PrSnapshot {
+            head_sha: "aaa".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Open,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::Unknown { reason: "no access".to_string() },
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        // The snapshot itself decides it is partial — both sweeps read the
+        // same property, so neither can disagree and zero the other's streak.
+        let axis_error = partial.unreadable_axis_error();
+        assert_eq!(axis_error, Some("no access"));
+
+        for expected in 1..=3 {
+            let count = apply_pull_request_snapshot(
+                &db,
+                pr.id,
+                &partial,
+                &crate::host::MergeReadiness::Indeterminate { reasons: vec!["x".to_string()] },
+                axis_error,
+            )
+            .await
+            .unwrap();
+            assert_eq!(count, Some(expected), "each partial read must extend the streak");
+        }
+
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.probe_fail_count, 3);
+        assert_eq!(
+            reloaded.last_error, "no access",
+            "the diagnostic must stay visible — \"could not tell\" must never look like \"checked, fine\""
+        );
+        // The readable axes are still persisted: refusing to discard them is
+        // the entire reason a partial read is not simply an error.
+        assert_eq!(
+            crate::host::gate::parse_ci(&reloaded.ci_status),
+            crate::host::CiStatus::Passing
+        );
+        assert!(
+            list_open_pull_requests(&db, 3).await.unwrap().is_empty(),
+            "at the threshold the row must fall out of the sweep instead of retrying forever"
+        );
+
+        // And a later COMPLETE read clears it, so a transient failure heals.
+        let complete = crate::host::PrSnapshot {
+            threads: crate::host::ThreadStatus::AllResolved,
+            ..partial.clone()
+        };
+        assert_eq!(complete.unreadable_axis_error(), None);
+        let count = apply_pull_request_snapshot(
+            &db,
+            pr.id,
+            &complete,
+            &crate::host::MergeReadiness::Ready,
+            complete.unreadable_axis_error(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, Some(0), "a complete read resets the streak");
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.last_error, "", "and clears the diagnostic with it");
     }
 
     /// P1-A (issue #110 adversarial review, round 3): a success is not the
@@ -9253,7 +9366,7 @@ mod tests {
                 &snapshot.conflict,
                 &host::UpstreamStatus::None,
             );
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness, None)
             .await
             .unwrap();
 
@@ -9292,7 +9405,7 @@ mod tests {
                 &snapshot.conflict,
                 &host::UpstreamStatus::None,
             );
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness, None)
             .await
             .unwrap();
 

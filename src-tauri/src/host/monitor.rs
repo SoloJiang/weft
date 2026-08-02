@@ -193,13 +193,34 @@ async fn apply_probe_result(
                 &upstream,
             );
             let changed = snapshot_changed(pr, snapshot, &readiness);
-            if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, snapshot, &readiness).await {
-                eprintln!("[weft][host] pr #{}: could not save snapshot: {e}", pr.id);
-            } else if changed {
+            let axis_error = snapshot.unreadable_axis_error();
+            let fail_count = match repo::apply_pull_request_snapshot(
+                db,
+                pr.id,
+                snapshot,
+                &readiness,
+                axis_error,
+            )
+            .await
+            {
+                Ok(count) => count,
+                Err(e) => {
+                    eprintln!("[weft][host] pr #{}: could not save snapshot: {e}", pr.id);
+                    None
+                }
+            };
+            if changed {
                 emit_pr_changed(app, pr);
             }
             if snapshot.lifecycle != super::PrLifecycle::Open {
                 None // merged/closed — the readiness question is moot now
+            } else if let Some(reason) = axis_error {
+                // A PARTIAL read escalates on the same threshold a failed
+                // probe does. Without this the row's notice would stay
+                // self-clearing forever, saying only "indeterminate", while
+                // the underlying request failed every sweep with nothing
+                // ever telling the human to go look.
+                Some(partial_read_notice_text(kind, pr.number, &reason, fail_count))
             } else {
                 kind.and_then(|k| judge::notice_text(k, pr.number, &readiness))
                     .map(|text| (NoticeKind::SelfClearing, text))
@@ -235,6 +256,33 @@ async fn apply_probe_result(
 /// retrying; off-by-one-late repeats the ordinary text (and the WRONG,
 /// self-clearing kind) on the exact sweep where tracking silently stops for
 /// good (P1-A: the bug this function exists to prevent from recurring).
+/// The notice for a partial read, escalating on the SAME threshold as a
+/// failed probe (see [`error_notice_text`], whose shape this mirrors) — so a
+/// permanently unreadable axis eventually stops being a self-clearing "still
+/// checking" note and becomes an action-required one.
+fn partial_read_notice_text(
+    kind: Option<HostKind>,
+    pr_number: i32,
+    reason: &str,
+    fail_count: Option<i32>,
+) -> (NoticeKind, String) {
+    let gave_up_now = fail_count.is_some_and(|c| c >= MAX_CONSECUTIVE_PROBE_FAILURES);
+    let abbrev = kind.map_or("PR/MR", |k| k.native_abbrev());
+    if gave_up_now {
+        return (
+            NoticeKind::ActionRequired,
+            format!(
+                "🔌 {abbrev} #{pr_number} 的 review 线程一直读不到({reason}),已经停止重试。\
+                 在解决之前,Weft 不会判定它可以合并。"
+            ),
+        );
+    }
+    (
+        NoticeKind::SelfClearing,
+        format!("🔌 暂时读不到 {abbrev} #{pr_number} 的 review 线程({reason}),仍在重试。"),
+    )
+}
+
 fn error_notice_text(
     kind: Option<HostKind>,
     pr_number: i32,
@@ -439,6 +487,64 @@ mod tests {
         let (kind, text) = error_notice_text(Some(HostKind::GitHub), 1, &err, None);
         assert_eq!(text, judge::probe_error_text(HostKind::GitHub, 1, &err));
         assert_eq!(kind, NoticeKind::SelfClearing);
+    }
+
+    // --- partial reads escalate (Codex review round 2 P2) -----------------
+
+    /// Below the threshold the notice self-clears; AT it, it becomes
+    /// action-required. Without the second half, a permanently unreadable
+    /// axis leaves the human with a "still checking" note forever while the
+    /// underlying request fails every single sweep.
+    #[test]
+    fn a_partial_read_notice_escalates_to_action_required_at_the_give_up_threshold() {
+        let (kind, text) = partial_read_notice_text(
+            Some(HostKind::GitHub),
+            9,
+            "no access",
+            Some(MAX_CONSECUTIVE_PROBE_FAILURES - 1),
+        );
+        assert_eq!(kind, NoticeKind::SelfClearing, "still retrying: {text}");
+
+        let (kind, escalated) = partial_read_notice_text(
+            Some(HostKind::GitHub),
+            9,
+            "no access",
+            Some(MAX_CONSECUTIVE_PROBE_FAILURES),
+        );
+        assert_eq!(kind, NoticeKind::ActionRequired, "gave up: {escalated}");
+        assert_ne!(
+            text, escalated,
+            "byte-identical text would leave a human unable to tell \"still trying\" from \
+             \"stopped trying\" — the same honesty rule `give_up_text` already carries"
+        );
+        assert!(escalated.contains("no access"), "keeps the diagnostic: {escalated}");
+    }
+
+    /// Only a failed thread READ counts as partial. `ConflictStatus::Unknown`
+    /// is what GitHub reports for seconds after every push — treating it as a
+    /// probe failure would march healthy PRs to the give-up threshold, and
+    /// `Unchecked` means a backend does not implement the axis at all, which
+    /// retrying cannot fix.
+    #[test]
+    fn only_an_unreadable_thread_axis_makes_a_read_partial() {
+        let mut snap = base_snapshot();
+        assert_eq!(snap.unreadable_axis_error(), None);
+
+        snap.conflict = ConflictStatus::Unknown { reason: "not computed yet".to_string() };
+        assert_eq!(
+            snap.unreadable_axis_error(),
+            None,
+            "a transient mergeability window is not a probe failure"
+        );
+
+        snap.threads = crate::host::ThreadStatus::Unchecked;
+        assert_eq!(snap.unreadable_axis_error(), None, "an unimplemented axis is not a failure");
+
+        snap.threads = crate::host::ThreadStatus::Unresolved { count: 2 };
+        assert_eq!(snap.unreadable_axis_error(), None, "a successful count is not a failure");
+
+        snap.threads = crate::host::ThreadStatus::Unknown { reason: "boom".to_string() };
+        assert_eq!(snap.unreadable_axis_error(), Some("boom"));
     }
 
     fn base_row() -> pull_request::Model {
