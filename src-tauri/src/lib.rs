@@ -286,6 +286,7 @@ pub fn run() {
             commands::thread_messages,
             commands::bus_post_human,
             attention::attention_items,
+            attention::attention_snapshots,
             attention::answer_human_request,
             commands::answer_permission,
             commands::list_auth_grants,

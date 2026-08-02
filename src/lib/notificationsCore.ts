@@ -1,5 +1,6 @@
 import type {
   AttentionItem,
+  AttentionSnapshot,
   ProcessQuotaStatus,
   ThreadOverview,
 } from "./types";
@@ -176,27 +177,28 @@ function attentionContext(item: AttentionItem): {
   }
 }
 
-/** Build notification state from the same canonical attention rows as the page. */
-export function snapshotOf(
-  attentionItems: AttentionItem[],
+function snapshotFromAttentionEntries(
+  entries: Array<{ workspaceId: number | null; items: AttentionItem[] }>,
   overview: NotificationOverview[],
   processQuota: ProcessQuotaStatus | null,
-  workspaceId: number | null = null,
 ): NotifySnapshot {
+  const fallbackWorkspaceId = entries.length === 1 ? entries[0].workspaceId : null;
   const needs = new Map<string, NotifyEntry>();
-  for (const item of attentionItems) {
-    const context = attentionContext(item);
-    needs.set(item.id, {
-      sample: context.sample,
-      route: {
-        kind: "needs",
-        threadId: context.threadId,
-        directionId: context.directionId,
-        workspaceId: context.workspaceId ?? workspaceId ?? undefined,
-        attentionId: item.id,
-        openNeeds: true,
-      },
-    });
+  for (const entry of entries) {
+    for (const item of entry.items) {
+      const context = attentionContext(item);
+      needs.set(item.id, {
+        sample: context.sample,
+        route: {
+          kind: "needs",
+          threadId: context.threadId,
+          directionId: context.directionId,
+          workspaceId: context.workspaceId ?? entry.workspaceId ?? undefined,
+          attentionId: item.id,
+          openNeeds: true,
+        },
+      });
+    }
   }
 
   const review = new Map<string, NotifyEntry>();
@@ -210,7 +212,7 @@ export function snapshotOf(
           kind: "review",
           threadId: row.thread_id,
           directionId,
-          workspaceId: row.workspace_id ?? workspaceId ?? undefined,
+          workspaceId: row.workspace_id ?? fallbackWorkspaceId ?? undefined,
         },
       });
     });
@@ -226,6 +228,36 @@ export function snapshotOf(
   }
 
   return { needs, review, quota };
+}
+
+/** Build notification state from every canonical workspace snapshot. */
+export function snapshotOfAttentionSnapshots(
+  snapshots: AttentionSnapshot[],
+  overview: NotificationOverview[],
+  processQuota: ProcessQuotaStatus | null,
+): NotifySnapshot {
+  return snapshotFromAttentionEntries(
+    snapshots.map((snapshot) => ({
+      workspaceId: snapshot.workspace_id,
+      items: snapshot.items,
+    })),
+    overview,
+    processQuota,
+  );
+}
+
+/** Backwards-compatible single-workspace helper used by focused unit tests. */
+export function snapshotOf(
+  attentionItems: AttentionItem[],
+  overview: NotificationOverview[],
+  processQuota: ProcessQuotaStatus | null,
+  workspaceId: number | null = null,
+): NotifySnapshot {
+  return snapshotFromAttentionEntries(
+    [{ workspaceId, items: attentionItems }],
+    overview,
+    processQuota,
+  );
 }
 
 export interface NotifyEvent {

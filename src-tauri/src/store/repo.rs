@@ -3274,6 +3274,73 @@ pub async fn list_lead_messages(db: &Db, thread_id: i32) -> Result<Vec<lead_mess
         .await?)
 }
 
+/// Return the single lead-timeline card that can still be acted on from a
+/// global attention surface. This mirrors ChatTimeline's read-only guards
+/// without loading the complete transcript on every Needs refresh:
+/// only the latest top-level assistant interaction can remain actionable;
+/// same-turn tool/test-case rows are companion artifacts; and a queued or
+/// later user reply retires a plan card.
+pub async fn latest_actionable_attention_card(
+    db: &Db,
+    thread_id: i32,
+) -> Result<Option<lead_message::Model>> {
+    use sea_orm::Order;
+
+    let top_level_assistant = || {
+        lead_message::Entity::find()
+            .filter(lead_message::Column::ThreadId.eq(thread_id))
+            .filter(lead_message::Column::SessionId.is_null())
+            .filter(lead_message::Column::Role.eq("assistant"))
+            .filter(Expr::cust(
+                "(kind NOT IN ('text', 'tool') \
+                 OR CASE WHEN json_valid(content) \
+                         THEN COALESCE(json_extract(content, '$.agentThread'), '') \
+                         ELSE '' END = '')",
+            ))
+            .order_by(Expr::cust("COALESCE(seq, id)"), Order::Desc)
+            .order_by_desc(lead_message::Column::Id)
+    };
+
+    let Some(latest) = top_level_assistant().one(&db.0).await? else {
+        return Ok(None);
+    };
+    let candidate = if matches!(latest.kind.as_str(), "tool" | "test_cases") {
+        let candidate = top_level_assistant()
+            .filter(lead_message::Column::Kind.is_not_in(["tool", "test_cases"]))
+            .one(&db.0)
+            .await?;
+        candidate.filter(|row| row.turn_id == latest.turn_id)
+    } else {
+        Some(latest)
+    };
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    if !matches!(candidate.kind.as_str(), "plan_card" | "action_card") {
+        return Ok(None);
+    }
+    if candidate.kind == "plan_card" {
+        let order = candidate.seq.unwrap_or(i64::from(candidate.id));
+        let pending_user = lead_message::Entity::find()
+            .filter(lead_message::Column::ThreadId.eq(thread_id))
+            .filter(lead_message::Column::SessionId.is_null())
+            .filter(lead_message::Column::Role.eq("user"))
+            .filter(Expr::cust_with_values(
+                "status = 'queued' \
+                 OR COALESCE(seq, id) > ? \
+                 OR (COALESCE(seq, id) = ? AND id > ?)",
+                [order, order, i64::from(candidate.id)],
+            ))
+            .one(&db.0)
+            .await?
+            .is_some();
+        if pending_user {
+            return Ok(None);
+        }
+    }
+    Ok(Some(candidate))
+}
+
 /// The next turn number for a thread's timeline (1-based).
 pub async fn next_turn_id(db: &Db, thread_id: i32) -> Result<i32> {
     Ok(list_lead_messages(db, thread_id)

@@ -285,6 +285,7 @@ export const api = {
 
   attentionItems: (workspaceId: number) =>
     invoke<AttentionSnapshot>("attention_items", { workspaceId }),
+  attentionSnapshots: () => invoke<AttentionSnapshot[]>("attention_snapshots"),
   answerHumanRequest: (
     workspaceId: number,
     requestId: number,

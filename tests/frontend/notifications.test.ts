@@ -17,8 +17,14 @@ import {
   serializeNotifyCategories,
   serializeQuietHours,
   snapshotOf,
+  snapshotOfAttentionSnapshots,
 } from "../../src/lib/notificationsCore.ts";
-import type { AttentionItem, ProcessQuotaStatus, ThreadOverview } from "../../src/lib/types.ts";
+import type {
+  AttentionItem,
+  AttentionSnapshot,
+  ProcessQuotaStatus,
+  ThreadOverview,
+} from "../../src/lib/types.ts";
 
 const question: AttentionItem = {
   kind: "question",
@@ -101,6 +107,28 @@ test("stable attention ids dedupe refreshes and notify only a genuinely new acti
   assert.equal(events[0]?.kind, "needs");
   assert.equal(events[0]?.count, 1);
   assert.equal(events[0]?.route.attentionId, "question:8");
+});
+
+test("inactive workspace actions participate in the global Needs notification diff", () => {
+  const snapshots = (backgroundItems: AttentionItem[]): AttentionSnapshot[] => [
+    { workspace_id: 9, count: 1, items: [question] },
+    { workspace_id: 10, count: backgroundItems.length, items: backgroundItems },
+  ];
+  const prev = snapshotOfAttentionSnapshots(snapshots([]), [], null);
+  const background = {
+    ...question,
+    id: "question:80",
+    request_id: 80,
+    thread_id: 8,
+    thread_title: "Background issue",
+  };
+  const next = snapshotOfAttentionSnapshots(snapshots([background]), [], null);
+
+  const events = diffForNotifications(prev, next);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.route.workspaceId, 10);
+  assert.equal(events[0]?.route.threadId, 8);
+  assert.equal(events[0]?.route.attentionId, "question:80");
 });
 
 test("quota notification is transition-keyed and warnings remain silent", () => {

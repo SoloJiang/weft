@@ -577,12 +577,12 @@ pub async fn execute(
                 .await?;
                 if let Some(updated) = updated {
                     if !bus.answer_ask(thread, ask_id, &updated.answer) {
-                        bus.post(
+                        bus.deliver_durable_answer(
                             thread,
-                            crate::bus::HUMAN,
+                            ask_id,
                             &updated.direction_scope,
+                            &updated.question,
                             &updated.answer,
-                            "message",
                         );
                     }
                     true

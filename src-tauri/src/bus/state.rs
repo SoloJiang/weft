@@ -377,6 +377,28 @@ impl BusRegistry {
         }
     }
 
+    /// Deliver an OCC-resolved durable question when the app restarted after
+    /// persistence but before the in-memory bus ask survived. Emit the same
+    /// resolution event as `answer_ask` so transcript trail and IM consumers
+    /// still observe the answer.
+    pub fn deliver_durable_answer(
+        &self,
+        thread: i32,
+        ask_id: u64,
+        from: &str,
+        question: &str,
+        text: &str,
+    ) {
+        self.emit_ask_event(HumanAskEvent::Answered {
+            thread,
+            ask_id,
+            from: from.to_string(),
+            question: question.to_string(),
+            text: text.to_string(),
+        });
+        self.post(thread, HUMAN, from, text, "message");
+    }
+
     fn cancel_open_asks_matching(
         &self,
         thread: i32,
@@ -602,6 +624,24 @@ mod tests {
         // 未命中/重复作答不发事件
         assert!(!r.answer_ask(1, id, "again"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn durable_answer_without_live_ask_still_emits_trail_event_and_delivers() {
+        let r = BusRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_ask_trail_notifier(tx);
+        r.join(7, "10");
+
+        r.deliver_durable_answer(7, 42, "10", "REST or GraphQL?", "REST");
+
+        assert!(matches!(rx.recv().await.unwrap(),
+            HumanAskEvent::Answered { thread: 7, ask_id: 42, from, question, text }
+                if from == "10" && question == "REST or GraphQL?" && text == "REST"));
+        let inbox = r.inbox(7, "10");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].from, HUMAN);
+        assert_eq!(inbox[0].text, "REST");
     }
 
     #[tokio::test]

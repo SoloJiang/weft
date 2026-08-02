@@ -13,7 +13,7 @@ import {
   NOTIFY_CATEGORIES,
   notifyCopyKeys,
   planNotifyOpen,
-  snapshotOf,
+  snapshotOfAttentionSnapshots,
   type NotifyCategoryFlags,
   type NotifyRoute,
   type NotifySnapshot,
@@ -373,7 +373,7 @@ async function sendOsNotification(
  */
 export function useSystemNotifications() {
   const {
-    attentionItems,
+    attentionSnapshots,
     notificationOverview,
     processQuota,
     notificationHydration,
@@ -744,16 +744,14 @@ export function useSystemNotifications() {
   // so old work is never replayed as a new OS notification.
   useEffect(() => {
     if (workspaceLoading) return;
-    const workspaceMatches =
-      notificationHydration.workspaceId === activeWorkspaceId;
-    const next = snapshotOf(
-      attentionItems,
+    const workspaceMatches = notificationHydration.workspaceId === activeWorkspaceId;
+    const next = snapshotOfAttentionSnapshots(
+      attentionSnapshots,
       notificationOverview,
       processQuota,
-      activeWorkspaceId,
     );
     const sourceReady: NotifyCategoryFlags = {
-      needs: workspaceMatches && notificationHydration.needs,
+      needs: notificationHydration.workspaceNeeds,
       review: workspaceMatches && notificationHydration.overview,
       quota: notificationHydration.quota,
     };
@@ -766,18 +764,20 @@ export function useSystemNotifications() {
     const workspaceChanged = baselineWs.current !== activeWorkspaceId;
     if (prev.current == null || workspaceChanged) {
       const previous = prev.current;
-      const baseline = emptyNotifySnapshot();
-      if (previous) {
-        baseline.review = new Map(previous.review);
-        baseline.quota = new Map(previous.quota);
-      }
-      prev.current = baseline;
+      prev.current = previous ?? emptyNotifySnapshot();
       baselineWs.current = activeWorkspaceId;
-      sourceReadyPrevious.current.needs = false;
-      categoryEnabledPrevious.current.needs = false;
-      if (!previous) {
+      if (previous) {
+        // Needs and quota are global. A workspace switch must not reset their
+        // diff baseline or suppress an action created in another workspace
+        // during the switch. Review hydration is re-armed with the workspace
+        // overview load below.
+        sourceReadyPrevious.current.review = false;
+        categoryEnabledPrevious.current.review = false;
+      } else {
+        sourceReadyPrevious.current.needs = false;
         sourceReadyPrevious.current.review = false;
         sourceReadyPrevious.current.quota = false;
+        categoryEnabledPrevious.current.needs = false;
         categoryEnabledPrevious.current.review = false;
         categoryEnabledPrevious.current.quota = false;
       }
@@ -841,7 +841,7 @@ export function useSystemNotifications() {
       if (sent) void requestAttention();
     })();
   }, [
-    attentionItems,
+    attentionSnapshots,
     notificationOverview,
     processQuota,
     notificationHydration,

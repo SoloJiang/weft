@@ -197,11 +197,15 @@ async fn collect_snapshot(
     asks: &crate::ask::AskRegistry,
     workspace_id: i32,
 ) -> anyhow::Result<AttentionSnapshot> {
-    let threads: Vec<thread::Model> = repo::list_threads(db, workspace_id)
-        .await?
-        .into_iter()
-        .filter(|thread| thread.kind != "curator")
-        .collect();
+    collect_snapshot_from_asks(db, &asks.open(), workspace_id).await
+}
+
+async fn collect_snapshot_from_asks(
+    db: &Db,
+    open_asks: &[Ask],
+    workspace_id: i32,
+) -> anyhow::Result<AttentionSnapshot> {
+    let threads: Vec<thread::Model> = repo::list_threads(db, workspace_id).await?;
     let mut items = Vec::new();
     let mut thread_map = std::collections::HashMap::new();
     let mut direction_map = std::collections::HashMap::new();
@@ -211,11 +215,14 @@ async fn collect_snapshot(
         let directions = repo::list_directions(db, thread.id).await?;
         direction_map.insert(thread.id, directions.clone());
 
-        let messages = repo::list_lead_messages(db, thread.id).await?;
-        let lead_messages: Vec<_> = messages
-            .iter()
-            .filter(|message| message.session_id.is_none())
-            .collect();
+        // Curator permission/questions still belong to the workspace and must
+        // remain answerable. Its hidden planning timeline is not a user issue,
+        // so never project plan/repo cards from it.
+        if thread.kind == "curator" {
+            continue;
+        }
+
+        let actionable_card = repo::latest_actionable_attention_card(db, thread.id).await?;
         let proposed = repo::get_plan(db, thread.id)
             .await?
             .filter(|plan| plan.status == "proposed" && !plan.proposal.trim().is_empty());
@@ -228,10 +235,9 @@ async fn collect_snapshot(
                 thread_id: thread.id,
                 thread_title: thread.title.clone(),
             });
-        } else if let Some(message) = lead_messages
-            .iter()
-            .rev()
-            .find(|message| message.kind == "plan_card" && card_is_open(message))
+        } else if let Some(message) = actionable_card
+            .as_ref()
+            .filter(|message| message.kind == "plan_card" && card_is_open(message))
         {
             items.push(AttentionItem::PlanApproval {
                 id: format!("plan:{}", message.id),
@@ -244,10 +250,9 @@ async fn collect_snapshot(
             });
         }
 
-        if let Some(message) = lead_messages
-            .iter()
-            .rev()
-            .find(|message| message.kind == "action_card" && card_is_open(message))
+        if let Some(message) = actionable_card
+            .as_ref()
+            .filter(|message| message.kind == "action_card" && card_is_open(message))
         {
             let actions = repo_actions(message);
             if !actions.is_empty() {
@@ -265,7 +270,7 @@ async fn collect_snapshot(
         }
     }
 
-    for mut ask in asks.open() {
+    for mut ask in open_asks.iter().cloned() {
         let Some(thread) = thread_map.get(&ask.thread) else {
             continue;
         };
@@ -338,6 +343,26 @@ async fn collect_snapshot(
     })
 }
 
+async fn collect_snapshots(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+) -> anyhow::Result<Vec<AttentionSnapshot>> {
+    let hidden_workspace = repo::get_setting(db, repo::K_CONCIERGE_WORKSPACE)
+        .await?
+        .and_then(|value| value.parse::<i32>().ok());
+    let open_asks = asks.open();
+    let mut workspaces = repo::list_workspaces(db).await?;
+    workspaces.sort_by_key(|workspace| workspace.id);
+    let mut snapshots = Vec::with_capacity(workspaces.len());
+    for workspace in workspaces {
+        if Some(workspace.id) == hidden_workspace {
+            continue;
+        }
+        snapshots.push(collect_snapshot_from_asks(db, &open_asks, workspace.id).await?);
+    }
+    Ok(snapshots)
+}
+
 fn pr_retry_item(
     pr: pull_request::Model,
     thread: &thread::Model,
@@ -373,6 +398,20 @@ pub async fn attention_items(
         .map_err(|error| error.to_string())
 }
 
+/// One canonical global read for the polling frontend. Returning all visible
+/// workspace snapshots together prevents an N+1 IPC loop, avoids rebuilding
+/// the active workspace twice, and gives OS notifications stable identities
+/// and routes for background-workspace actions.
+#[tauri::command]
+pub async fn attention_snapshots(
+    db: State<'_, Db>,
+    asks: State<'_, crate::ask::AskRegistry>,
+) -> R<Vec<AttentionSnapshot>> {
+    collect_snapshots(&db, &asks)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub async fn answer_human_request(
     app: AppHandle,
@@ -397,12 +436,12 @@ pub async fn answer_human_request(
     };
     let ask_id = u64::try_from(request.id).map_err(|_| "invalid_question_id".to_string())?;
     if !bus.answer_ask(request.thread_id, ask_id, &request.answer) {
-        bus.post(
+        bus.deliver_durable_answer(
             request.thread_id,
-            crate::bus::HUMAN,
+            ask_id,
             &request.direction_scope,
+            &request.question,
             &request.answer,
-            "message",
         );
     }
     let _ = app.emit("needs-you://changed", request.thread_id);
@@ -609,6 +648,189 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(after.items.as_slice(), [AttentionItem::ScopeApproval { .. }]));
+    }
+
+    #[tokio::test]
+    async fn historical_cards_never_resurface_as_actionable() {
+        let (db, thread, _direction) = fixture().await;
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "action_card",
+            r#"{"title":"Old","actions":[{"id":"a","label":"Add","kind":"add"}]}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            2,
+            "assistant",
+            "text",
+            r#"{"text":"newer"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let stale = collect_snapshot(&db, &crate::ask::AskRegistry::new(), thread.workspace_id)
+            .await
+            .unwrap();
+        assert!(stale.items.is_empty());
+
+        let latest = repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            3,
+            "assistant",
+            "action_card",
+            r#"{"title":"Latest","actions":[{"id":"b","label":"Clone","kind":"clone"}]}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        repo::resolve_action_card(&db, latest.id, "done").await.unwrap();
+        let settled = collect_snapshot(&db, &crate::ask::AskRegistry::new(), thread.workspace_id)
+            .await
+            .unwrap();
+        assert!(settled.items.is_empty(), "an older unresolved card must not resurface");
+
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            4,
+            "assistant",
+            "plan_card",
+            r#"{"title":"Plan"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            5,
+            "user",
+            "text",
+            r#"{"text":"revise"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let revision = collect_snapshot(&db, &crate::ask::AskRegistry::new(), thread.workspace_id)
+            .await
+            .unwrap();
+        assert!(revision.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn curator_requests_remain_actionable_but_curator_cards_do_not() {
+        let (db, thread, _direction) = fixture().await;
+        let curator = repo::create_thread(
+            &db,
+            thread.workspace_id,
+            "Curator",
+            "curator",
+            "codex",
+        )
+        .await
+        .unwrap();
+        repo::create_human_request(
+            &db,
+            thread.workspace_id,
+            curator.id,
+            "lead",
+            0,
+            1,
+            "Which repository?",
+        )
+        .await
+        .unwrap();
+        repo::insert_lead_message(
+            &db,
+            curator.id,
+            None,
+            1,
+            "assistant",
+            "action_card",
+            r#"{"title":"Hidden","actions":[{"id":"a","label":"Add","kind":"add"}]}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        let (_ask_id, _rx) = asks.request(
+            curator.id,
+            "lead",
+            "codex",
+            "Inspect repository",
+            "git status",
+            crate::ask::RiskLevel::ReadOnly,
+            "git status",
+        );
+
+        let snapshot = collect_snapshot(&db, &asks, thread.workspace_id)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.count, 2);
+        assert!(snapshot.items.iter().any(|item| matches!(item, AttentionItem::Permission { .. })));
+        assert!(snapshot.items.iter().any(|item| matches!(item, AttentionItem::Question { .. })));
+        assert!(!snapshot.items.iter().any(|item| matches!(item, AttentionItem::RepoAction { .. })));
+    }
+
+    #[tokio::test]
+    async fn global_snapshots_include_inactive_workspace_actions_once() {
+        let (db, thread, direction) = fixture().await;
+        let other_workspace = repo::create_workspace(&db, "background").await.unwrap();
+        let other_thread = repo::create_thread(
+            &db,
+            other_workspace.id,
+            "Background issue",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        repo::create_human_request(
+            &db,
+            other_workspace.id,
+            other_thread.id,
+            "lead",
+            0,
+            1,
+            "Ship now?",
+        )
+        .await
+        .unwrap();
+        repo::create_human_request(
+            &db,
+            thread.workspace_id,
+            thread.id,
+            &direction.id.to_string(),
+            direction.id,
+            1,
+            "Use REST?",
+        )
+        .await
+        .unwrap();
+
+        let snapshots = collect_snapshots(&db, &crate::ask::AskRegistry::new())
+            .await
+            .unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots.iter().map(|snapshot| snapshot.count).sum::<usize>(), 2);
+        let background = snapshots
+            .iter()
+            .find(|snapshot| snapshot.workspace_id == other_workspace.id)
+            .unwrap();
+        assert!(matches!(background.items.as_slice(), [AttentionItem::Question { thread_id, .. }] if *thread_id == other_thread.id));
     }
 
     #[tokio::test]

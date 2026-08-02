@@ -39,6 +39,7 @@ import {
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   AttentionItem,
+  AttentionSnapshot,
   BusMsg,
   Direction,
   GrantSnapshot,
@@ -79,7 +80,7 @@ export interface NotificationHydration {
   workspaceId: number | null;
   /** Global permission asks have completed one authoritative pull. */
   asks: boolean;
-  /** Active workspace Needs-you rows have completed one authoritative pull. */
+  /** All visible workspaces' Needs-you rows completed one authoritative pull. */
   workspaceNeeds: boolean;
   /** Both Needs-you sources are ready for opening the combined surface. */
   needs: boolean;
@@ -350,6 +351,8 @@ interface Store {
   needs: QuestionAttentionItem[];
   /** Canonical, deterministic workspace action queue used by every aggregate UI. */
   attentionItems: AttentionItem[];
+  /** Canonical global snapshots used by Dock counts and OS notification diffing. */
+  attentionSnapshots: AttentionSnapshot[];
   /** Pending tool permission requests (the Ask Bridge). */
   asks: PermissionAsk[];
   /** Standing authorization grants (full / always) that persist across restarts,
@@ -703,6 +706,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   } | null>(null);
   const [messages, setMessages] = useState<BusMsg[]>([]);
   const [attentionItems, setAttentionItems] = useState<AttentionItem[]>([]);
+  const [attentionSnapshots, setAttentionSnapshots] = useState<AttentionSnapshot[]>([]);
   const [needs, setNeeds] = useState<QuestionAttentionItem[]>([]);
   const [asks, setAsks] = useState<PermissionAsk[]>([]);
   const [authGrants, setAuthGrants] = useState<GrantSnapshot>({
@@ -1118,7 +1122,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setNotificationHydration((current) => ({
         ...current,
         workspaceId: id,
-        workspaceNeeds: false,
         needs: false,
         overview: false,
       }));
@@ -2682,56 +2685,40 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       console.error(e);
     }
-    if (workspaceId == null) {
-      if (isLatestRequest() && activeWorkspaceIdRef.current == null) {
-        setAttentionItems([]);
-        setNeeds([]);
-        setAsks([]);
-        setNotificationHydration((current) => ({
-          ...current,
-          asks: true,
-          workspaceNeeds: true,
-          needs: true,
-        }));
-      }
-      return;
-    }
     try {
-      const snapshot = await api.attentionItems(workspaceId);
-      if (isLatestRequest() && activeWorkspaceIdRef.current === workspaceId) {
-        setAttentionItems(snapshot.items);
-        setNeeds(snapshot.items.filter((item) => item.kind === "question"));
-        setAsks(
-          snapshot.items
-            .filter((item) => item.kind === "permission")
-            .map((item) => item.ask),
-        );
-        setNotificationHydration((current) => {
-          if (current.workspaceId !== workspaceId) return current;
-          return {
-            ...current,
-            asks: true,
-            workspaceNeeds: true,
-            needs: true,
-          };
-        });
-      }
+      // One global canonical projection per poll. This supplies the active
+      // Needs page, every workspace count, Dock badge and background-workspace
+      // OS notification identities without an N+1 loop or a duplicate active
+      // workspace projection.
+      const snapshots = await api.attentionSnapshots();
+      if (!isLatestRequest()) return;
+      setAttentionSnapshots(snapshots);
+      setNeedsByWorkspace(
+        Object.fromEntries(snapshots.map((snapshot) => [snapshot.workspace_id, snapshot.count])),
+      );
+
+      if (activeWorkspaceIdRef.current !== workspaceId) return;
+      const activeSnapshot =
+        workspaceId == null
+          ? null
+          : snapshots.find((snapshot) => snapshot.workspace_id === workspaceId) ?? null;
+      const items = activeSnapshot?.items ?? [];
+      setAttentionItems(items);
+      setNeeds(items.filter((item) => item.kind === "question"));
+      setAsks(
+        items
+          .filter((item) => item.kind === "permission")
+          .map((item) => item.ask),
+      );
+      setNotificationHydration((current) => ({
+        ...current,
+        workspaceId,
+        asks: true,
+        workspaceNeeds: true,
+        needs: true,
+      }));
     } catch (e) {
       /* bus may not be ready */
-      console.error(e);
-    }
-    // The switcher uses the same canonical projection as the active page.
-    try {
-      const snapshots = await Promise.all(
-        workspacesRef.current.map((workspace) => api.attentionItems(workspace.id)),
-      );
-      if (isLatestRequest()) {
-        setNeedsByWorkspace(
-          Object.fromEntries(snapshots.map((snapshot) => [snapshot.workspace_id, snapshot.count])),
-        );
-      }
-    } catch (e) {
-      /* ignore */
       console.error(e);
     }
   }, []);
@@ -3605,6 +3592,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshProcessQuota,
     notificationHydration,
     attentionItems,
+    attentionSnapshots,
     needs,
     asks,
     authGrants,
