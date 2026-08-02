@@ -62,6 +62,7 @@ fn reply_fallback_target(context: &ReplyContext) -> anyhow::Result<ReplyFallback
 struct Inner {
     client_id: String,
     client_secret: String,
+    token_url: String,
     http: reqwest::Client,
     token: tokio::sync::Mutex<Option<CachedToken>>,
     reply_contexts: Mutex<HashMap<String, ReplyContext>>,
@@ -95,20 +96,31 @@ impl DingTalkChannel {
         client_secret: &str,
         copy: super::DingTalkCopyState,
     ) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| anyhow::anyhow!("dingtalk HTTP client: {e}"))?;
+        Self::from_parts(client_id, client_secret, copy, http, TOKEN_URL)
+    }
+
+    fn from_parts(
+        client_id: &str,
+        client_secret: &str,
+        copy: super::DingTalkCopyState,
+        http: reqwest::Client,
+        token_url: &str,
+    ) -> anyhow::Result<Self> {
         let client_id = client_id.trim();
         let client_secret = client_secret.trim();
         if client_id.is_empty() || client_secret.is_empty() {
             anyhow::bail!("dingtalk client id and client secret are required");
         }
         super::dingtalk_copy_snapshot(&copy).validate()?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|e| anyhow::anyhow!("dingtalk HTTP client: {e}"))?;
         Ok(Self {
             inner: Arc::new(Inner {
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
+                token_url: token_url.to_string(),
                 http,
                 token: tokio::sync::Mutex::new(None),
                 reply_contexts: Mutex::new(HashMap::new()),
@@ -224,7 +236,7 @@ impl DingTalkChannel {
         let response = self
             .inner
             .http
-            .post(TOKEN_URL)
+            .post(self.inner.token_url.as_str())
             .json(&json!({
                 "appKey": self.inner.client_id,
                 "appSecret": self.inner.client_secret,
@@ -307,13 +319,11 @@ impl DingTalkChannel {
         text: &str,
     ) -> anyhow::Result<String> {
         let url = validated_session_webhook(&context.session_webhook)?;
-        let token = self.access_token(false).await?;
         let marker = self.copy().truncated_marker;
         let response = self
             .inner
             .http
             .post(url)
-            .header("x-acs-dingtalk-access-token", token)
             .json(&json!({
                 "msgtype": "text",
                 "text": { "content": clamp_text(text, &marker) },
@@ -598,11 +608,16 @@ fn ensure_session_reply_success(status: reqwest::StatusCode, value: &Value) -> a
 fn validated_session_webhook(raw: &str) -> anyhow::Result<reqwest::Url> {
     let url = reqwest::Url::parse(raw)
         .map_err(|_| anyhow::anyhow!("dingtalk session webhook is invalid"))?;
-    let trusted_host = matches!(
-        url.host_str(),
-        Some("oapi.dingtalk.com") | Some("api.dingtalk.com")
-    );
-    if url.scheme() != "https" || !trusted_host {
+    let trusted = url.scheme() == "https"
+        && matches!(
+            url.host_str(),
+            Some("oapi.dingtalk.com") | Some("api.dingtalk.com")
+        );
+    #[cfg(test)]
+    let trusted = trusted
+        || (url.scheme() == "http"
+            && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost")));
+    if !trusted {
         anyhow::bail!("dingtalk session webhook host is not trusted");
     }
     Ok(url)
@@ -704,6 +719,68 @@ mod tests {
             &json!({"errcode": 0, "errmsg": "ok"}),
         )
         .is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_reply_succeeds_when_oauth_endpoint_is_unavailable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0_u8; 8_192];
+            let count = socket.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8_lossy(&bytes[..count]).to_string();
+            let is_session = request.starts_with("POST /session ");
+            let (status, body) = if is_session {
+                (
+                    "200 OK",
+                    r#"{"errcode":0,"errmsg":"ok","processQueryKey":"session-ok"}"#,
+                )
+            } else {
+                (
+                    "503 Service Unavailable",
+                    r#"{"code":"oauth_unavailable","message":"offline"}"#,
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let channel = DingTalkChannel::from_parts(
+            "invalid-client",
+            "invalid-secret",
+            Arc::new(std::sync::RwLock::new(copy())),
+            http,
+            &format!("http://{address}/oauth"),
+        )
+        .unwrap();
+        let context = ReplyContext {
+            session_webhook: format!("http://{address}/session"),
+            expires_at_ms: 0,
+            chat_type: "private".into(),
+            chat_id: String::new(),
+            thread_id: None,
+            sender_user_id: "staff-1".into(),
+            remembered_at: Instant::now(),
+        };
+
+        let result = channel.post_session_reply("msg-1", &context, "hello").await;
+        let request = server.await.unwrap();
+
+        assert_eq!(result.unwrap(), "session-ok");
+        assert!(request.starts_with("POST /session "));
+        assert!(!request
+            .to_ascii_lowercase()
+            .contains("x-acs-dingtalk-access-token"));
     }
 
     #[test]

@@ -1995,7 +1995,10 @@ pub async fn ensure_issue_topic(
     };
     crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
 
-    if let Some(route) = crate::store::repo::im_route_of_thread(db, thread_id).await? {
+    if let Some(route) = crate::store::repo::im_route_of_thread(db, thread_id)
+        .await?
+        .filter(|route| route.channel == "feishu")
+    {
         if let Some(reply_to) = reply_to {
             if let Err(e) = ch
                 .reply_text(
@@ -2019,6 +2022,10 @@ pub async fn ensure_issue_topic(
         let _ = route;
         return Ok(());
     }
+
+    // A route owned by another provider is inactive for this Feishu handoff.
+    // Create the Feishu topic first, then bind_im_route atomically replaces the
+    // stale target; if topic creation fails, the old route remains untouched.
 
     let lead_intro = format!(
         "Weft issue #{} · {}\n这个飞书话题已连接到该 issue 的 Lead agent。后续在这里发消息，会直接进入对应 Lead。",
@@ -3055,6 +3062,34 @@ mod tests {
                 .any(|(_, body)| body.contains("Lead agent") || body.contains("Lead Agent")),
             "topic creation message should tell users this topic is connected to the issue Lead agent: {created:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_issue_topic_replaces_an_inactive_dingtalk_route() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "dingtalk", "cid_old", "ding-thread-old")
+            .await
+            .unwrap();
+        let ch = TopicChannel::default();
+
+        ensure_issue_topic(&db, &ch, issue.id, "oc_current", Some("om_request"), "zh")
+            .await
+            .unwrap();
+
+        let route = crate::store::repo::im_route_of_thread(&db, issue.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.channel, "feishu");
+        assert_eq!(route.chat_id, "oc_current");
+        assert_eq!(route.im_thread_ref, "omt_created_topic");
+        assert_eq!(ch.created_topics.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

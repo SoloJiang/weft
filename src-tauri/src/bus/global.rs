@@ -163,7 +163,7 @@ pub async fn call_global(
             if text.trim().is_empty() {
                 return text_result("error: text required".into());
             }
-            match message_lead(db, tid, &text, im_lang(args)).await {
+            match message_lead(db, tid, &text, args).await {
                 Ok(()) => text_result(format!("delivered to lead of issue {tid}")),
                 Err(e) => text_result(format!("error: {e}")),
             }
@@ -358,12 +358,47 @@ async fn pending_needs_you(db: &Db, asks: &AskRegistry) -> anyhow::Result<Value>
 /// Push a message into the lead engine of `thread_id` from outside (Concierge).
 /// Pulls the global `AppHandle` from the `OnceLock` set in `setup()` — by the
 /// time an MCP request lands, the Tauri builder is long past that point.
-async fn message_lead(db: &Db, thread_id: i32, text: &str, lang: &str) -> anyhow::Result<()> {
+async fn message_lead_origin(
+    db: &Db,
+    thread_id: i32,
+    args: &Value,
+) -> anyhow::Result<Option<String>> {
+    let provider = im_provider(args);
+    if provider.is_empty() {
+        anyhow::bail!("message_lead requires the current IM provider context");
+    }
+    let reply_to = im_reply_to(args);
+    let route = repo::im_route_of_thread(db, thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("issue {thread_id} has no active IM topic"))?;
+    if route.channel != provider {
+        anyhow::bail!(
+            "issue {thread_id} is bound to {}, not the active {provider} conversation",
+            route.channel
+        );
+    }
+    if route.channel == "dingtalk" {
+        let reply_to = reply_to.ok_or_else(|| {
+            anyhow::anyhow!("dingtalk lead delivery requires the current conversation reply target")
+        })?;
+        return Ok(Some(reply_to.to_string()));
+    }
+    // Feishu issue routes retain their stable topic/seed fallback. The current
+    // Concierge message can be outside that topic and must not become its reply
+    // parent merely because both conversations use the same provider.
+    Ok(None)
+}
+
+async fn message_lead(db: &Db, thread_id: i32, text: &str, args: &Value) -> anyhow::Result<()> {
+    // Resolve the delivery target before starting the engine. DingTalk issue
+    // output cannot fall back to a stable topic message, so a no-origin turn
+    // would run successfully while silently discarding its response.
+    let origin = message_lead_origin(db, thread_id, args).await?;
     let app = crate::APP_HANDLE
         .get()
         .ok_or_else(|| anyhow::anyhow!("app handle not initialized"))?;
-    let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, lang).await?;
-    crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new(), None).await
+    let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, im_lang(args)).await?;
+    crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new(), origin).await
 }
 
 fn im_provider(args: &Value) -> &str {
@@ -394,6 +429,13 @@ fn im_chat_id(args: &Value) -> Option<&str> {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+fn im_reply_to(args: &Value) -> Option<&str> {
+    args.pointer("/im_context/conversation/reply_to")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 async fn create_issue_from_im(
@@ -477,7 +519,7 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
             "chat_id": route.chat_id,
             "open_hint": "已有 issue topic，请进入那里继续讨论"
         });
-    } else if existing_route.is_none() && provider == "feishu" && can_create {
+    } else if provider == "feishu" && can_create {
         if let Some(chat_id) = im_chat_id(args) {
             let v = ensure_issue_topic(db, thread_id, chat_id).await?;
             im = json!({
@@ -497,7 +539,7 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let delivered = if has_topic && !initial_message.is_empty() {
-        message_lead(db, thread_id, initial_message, im_lang(args))
+        message_lead(db, thread_id, initial_message, args)
             .await
             .is_ok()
     } else {
@@ -540,6 +582,7 @@ async fn create_issue(db: &Db, ws: i32, title: &str, kind: &str) -> anyhow::Resu
 
 async fn ensure_issue_topic(db: &Db, thread_id: i32, chat_id: &str) -> anyhow::Result<Value> {
     let before = repo::im_route_of_thread(db, thread_id).await?;
+    let created = before.as_ref().map(|route| route.channel.as_str()) != Some("feishu");
     let settings = crate::im::ImSettings::load(db).await?;
     if !settings.ready() {
         anyhow::bail!("Feishu app credentials are not configured");
@@ -553,7 +596,7 @@ async fn ensure_issue_topic(db: &Db, thread_id: i32, chat_id: &str) -> anyhow::R
         "issue_id": after.thread_id,
         "chat_id": after.chat_id,
         "topic_ref": after.im_thread_ref,
-        "created": before.is_none(),
+        "created": created,
     }))
 }
 
@@ -600,10 +643,10 @@ pub fn global_specs() -> Value {
         },
         {
             "name": "message_lead",
-            "description": "Send a message into an issue's lead engine, as if the human typed it in the desktop. Use when the human wants to nudge a specific issue's lead from IM; pass the current im_context so the lead uses the active locale.",
+            "description": "Send a message into an issue's lead engine, as if the human typed it in the desktop. Use when the human wants to nudge a specific issue's lead from IM; pass the current im_context so the lead preserves the active locale and reply target.",
             "inputSchema": { "type": "object",
                 "properties": { "issue_id": i(), "text": s(), "im_context": { "type": "object" } },
-                "required": ["issue_id", "text"] }
+                "required": ["issue_id", "text", "im_context"] }
         },
         {
             "name": "create_issue_from_im",
@@ -924,6 +967,41 @@ mod tests {
         assert!(parsed["im"]["open_hint"]
             .as_str()
             .is_some_and(|hint| hint.contains(&format!("/bind {}", issue.id))));
+    }
+
+    #[tokio::test]
+    async fn message_lead_origin_uses_the_current_dingtalk_reply_target() {
+        let db = mem_db().await;
+        let ws = repo::create_workspace(&db, "alpha").await.unwrap();
+        let issue = repo::create_thread(&db, ws.id, "Existing", "feature", "claude")
+            .await
+            .unwrap();
+        repo::bind_im_route(
+            &db,
+            issue.id,
+            "dingtalk",
+            "cid_current",
+            "ding-thread-current",
+        )
+        .await
+        .unwrap();
+        let args = json!({
+            "im_context": {
+                "provider": "dingtalk",
+                "conversation": { "reply_to": "msg-current" }
+            }
+        });
+
+        let origin = message_lead_origin(&db, issue.id, &args).await.unwrap();
+        assert_eq!(origin.as_deref(), Some("msg-current"));
+
+        let missing = json!({
+            "im_context": {
+                "provider": "dingtalk",
+                "conversation": { "reply_to": "" }
+            }
+        });
+        assert!(message_lead_origin(&db, issue.id, &missing).await.is_err());
     }
 
     #[tokio::test]
