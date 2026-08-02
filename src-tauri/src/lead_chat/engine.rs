@@ -2780,6 +2780,23 @@ fn advance_dequeued_turn(inner: &mut EngineInner, next: &Option<Outgoing>) {
 /// itself infeasible in the first place.
 static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// issue #160 round-19 P2 (Codex engine.rs:3214): a per-PROCESS random nonce
+/// folded into codex app-server attachment file names. `ATTACH_SEQ` above is
+/// monotonic and unique only WITHIN one process — two concurrent Weft
+/// processes sharing the OS temp dir (an installed app plus `tauri dev`, which
+/// use SEPARATE databases and can therefore mint the SAME `row_id`) both start
+/// that counter at 0 and generate identical `msg<row>-<i>-<seq>` paths. The
+/// app-server branch writes with `create_new` (O_EXCL), so whichever process
+/// loses that collision silently drops the human's image from
+/// `local_image_paths` while its text turn proceeds. A random component that is
+/// stable for THIS process's lifetime (but disjoint from any other process's)
+/// makes the two processes' paths never collide, without disturbing the
+/// PREDICTABLE non-app-server names `rewind::dispatched_text` reconstructs.
+fn attach_process_nonce() -> u64 {
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NONCE.get_or_init(rand::random::<u64>)
+}
+
 /// issue #160 round-8 P1 #2: write a codex app-server image attachment to `p`
 /// guarded against a pre-placed symlink/existing file at that exact path —
 /// mirrors `computer::screenshot_window`'s own no-follow/exclusive/owner-only
@@ -3177,6 +3194,19 @@ pub async fn send(
         use base64::Engine as _;
         let dir = std::env::temp_dir().join("weft-attachments");
         let _ = std::fs::create_dir_all(&dir);
+        // issue #160 round-19 P1 (Codex engine.rs:3189): refuse a SYMLINK
+        // planted at the shared spill dir. `create_dir_all` FOLLOWS a symlink
+        // already sitting at this path, and the `set_permissions` below would
+        // then chmod — and every spill write would traverse — whatever it
+        // points to; the per-file `O_NOFOLLOW` writes only guard the LEAF file
+        // name, never this parent. Verify the dir itself is a real directory
+        // via `symlink_metadata`; if it is not, spill NOTHING (iterate an empty
+        // slice below) rather than write through an attacker-substituted
+        // parent — the human's text turn still goes out, just without inline
+        // images.
+        let dir_is_real = std::fs::symlink_metadata(&dir)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
         // issue #160 round-8 P1 #2: best-effort tighten the shared spill
         // directory to owner-only — defense in depth alongside the per-file
         // hardening below, for the identical "shared tmp dir, permissive
@@ -3185,11 +3215,18 @@ pub async fn send(
         // mount, non-unix) never blocks the spill itself.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            if dir_is_real {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
         }
-        outbound.push_str("\n\nAttached images (read them as needed):\n");
-        for (i, (mt, data)) in images.iter().enumerate() {
+        if dir_is_real {
+            outbound.push_str("\n\nAttached images (read them as needed):\n");
+        }
+        // A symlinked/unsafe spill dir yields an empty iteration — no image is
+        // written through it, and `local_image_paths` stays empty.
+        let spill: &[(String, String)] = if dir_is_real { &images } else { &[] };
+        for (i, (mt, data)) in spill.iter().enumerate() {
             let ext = mt.rsplit('/').next().unwrap_or("png");
             // issue #160 round-8 P1 #2: ONLY the codex app-server branch gets
             // a NONCE-bearing name — that's the ONLY transport that later
@@ -3211,7 +3248,13 @@ pub async fn send(
             // path — the vulnerable step is THIS write, not the later read.
             let p = if is_codex_appserver {
                 let seq = ATTACH_SEQ.fetch_add(1, Ordering::SeqCst);
-                dir.join(format!("msg{row_id}-{i}-{seq}.{ext}"))
+                // issue #160 round-19 P2 (Codex engine.rs:3214): the per-process
+                // nonce disjoins this name from any OTHER Weft process's spill
+                // (which could share `row_id`/`seq` with an independent counter)
+                // — see `attach_process_nonce`'s own doc. Only the app-server
+                // branch: the `else` branch's name stays PREDICTABLE for
+                // `rewind::dispatched_text`'s reconstruction.
+                dir.join(format!("msg{row_id}-{i}-{}-{seq}.{ext}", attach_process_nonce()))
             } else {
                 dir.join(format!("msg{row_id}-{i}.{ext}"))
             };

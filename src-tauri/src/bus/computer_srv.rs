@@ -568,6 +568,16 @@ async fn run_action(
     if !computer::enabled(db).await {
         return Err(ComputerError::Disabled.to_string());
     }
+    // issue #160 round-19 P1 (Codex computer_srv.rs:403): admission gate — a
+    // thread/direction (or pinned worktree) deleted after this session's bearer
+    // was minted must never reach ANY enumeration, capture, or injection. The
+    // token stays valid for the process lifetime and the delete path cannot
+    // abort an in-flight/queued HTTP call, so this is the fail-closed check
+    // that revokes the ROUTE. Runs before schema validation and the approval
+    // gate — nothing about a deleted session should even be validated.
+    if !session_is_live(db, thread, dir, wt).await {
+        return Err(SESSION_GONE_MSG.to_string());
+    }
     if name != "computer" {
         return Err(format!("unknown tool: {name}"));
     }
@@ -2519,6 +2529,17 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
     if !computer::enabled(db).await {
         return Err(ComputerError::Disabled.to_string());
     }
+    // issue #160 round-19 P1 (Codex computer_srv.rs:403): re-confirm the
+    // session is STILL live at this post-queue checkpoint, right before the
+    // injection. A call can sit on `input_flight_guard` for as long as another
+    // session's in-flight action takes; a thread/direction deleted during that
+    // wait must be caught here, not only at `run_action`'s admission gate.
+    // `wt` isn't threaded through this checkpoint, but the delete cascade
+    // removes a direction (and its worktrees) wholesale, so thread+direction
+    // liveness (`None`) is the check that matters for "is this session gone".
+    if !session_is_live(db, thread, dir, None).await {
+        return Err(SESSION_GONE_MSG.to_string());
+    }
     match computer::control_state() {
         Some(holder) if holder.thread == thread && holder.dir == dir => Ok(()),
         Some(holder) => Err(ComputerError::Busy { thread: holder.thread, dir: holder.dir }.to_string()),
@@ -3168,6 +3189,47 @@ pub(crate) fn remove_computer_output_for_thread(thread: i32) {
     if dir.exists() {
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// issue #160 round-19 P1 (Codex computer_srv.rs:403): does `(thread, dir, wt)`
+/// STILL denote a live session? The per-session bearer stays valid for the
+/// whole process lifetime and each Axum request is independent of the engine,
+/// so a thread/direction deleted AFTER the token was minted — `delete_thread_
+/// cascade` purges asks/grants and stops engines, but can neither revoke an
+/// already-minted token nor abort an in-flight HTTP call — must still be
+/// refused before any OS work, or a stale caller could keep driving (or newly
+/// submit calls against) the human's desktop under a deleted identity.
+///
+/// Mirrors [`session_root`]'s OWN DB validation: a worker lane's `dir` must
+/// resolve to a direction of THIS exact thread and, if a worktree is pinned,
+/// that worktree must belong to the direction; the lead lane requires only that
+/// the thread row still exists. Fail-CLOSED — any DB error resolves to `false`
+/// (not live), so a transient store hiccup can never fail OPEN into driving a
+/// desktop whose owning session may already be gone.
+/// The one rendering of the "session deleted" refusal (issue #160 round-19 P1),
+/// shared by the [`run_action`] admission gate and the [`recheck_after_guard`]
+/// post-queue revalidation so the two can never drift.
+const SESSION_GONE_MSG: &str =
+    "this computer-use session no longer exists (its issue or direction was deleted) — refused";
+
+async fn session_is_live(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> bool {
+    if dir == crate::bus::LEAD {
+        return matches!(repo::get_thread(db, thread).await, Ok(Some(_)));
+    }
+    let Ok(direction_id) = dir.parse::<i32>() else {
+        return false;
+    };
+    match repo::get_direction(db, direction_id).await {
+        Ok(Some(d)) if d.thread_id == thread => {}
+        _ => return false,
+    }
+    let Some(wt_id) = wt else {
+        return true;
+    };
+    matches!(
+        repo::list_worktrees(db, Some(direction_id)).await,
+        Ok(wts) if wts.iter().any(|w| w.id == wt_id)
+    )
 }
 
 /// Build `base/components[0]/components[1]/...`, refusing if ANY existing
@@ -5212,6 +5274,46 @@ mod tests {
 
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// issue #160 round-19 P1 (Codex computer_srv.rs:403): a request under a
+    /// deleted thread/direction is refused — `session_is_live` is the admission
+    /// gate that revokes the route once the delete cascade runs.
+    #[tokio::test]
+    async fn session_is_live_tracks_thread_and_direction_deletion() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_ref =
+            repo::add_repo_ref(&db, ws.id, "a", &tmp.path().to_string_lossy(), "main", "", true)
+                .await
+                .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let direction = repo::create_direction(
+            &db, thread.id, "task", "claude", repo_ref.id, "why", "impl-only", "main",
+        )
+        .await
+        .unwrap();
+        let wt = repo::record_worktree(&db, repo_ref.id, direction.id, "b1", "/tmp/weft-wt", true, true, "")
+            .await
+            .unwrap();
+        let dir_s = direction.id.to_string();
+
+        // Live: lead lane, worker lane, and a pinned worktree all resolve.
+        assert!(session_is_live(&db, thread.id, crate::bus::LEAD, None).await);
+        assert!(session_is_live(&db, thread.id, &dir_s, None).await);
+        assert!(session_is_live(&db, thread.id, &dir_s, Some(wt.id)).await);
+        // A worktree that isn't this direction's, and a direction under a
+        // DIFFERENT thread, both fail closed.
+        assert!(!session_is_live(&db, thread.id, &dir_s, Some(wt.id + 999)).await);
+        assert!(!session_is_live(&db, thread.id + 999, &dir_s, None).await);
+        assert!(!session_is_live(&db, thread.id, "not-a-number", None).await);
+
+        // After the delete cascade, every lane is refused.
+        repo::delete_thread_cascade(&db, thread.id).await.unwrap();
+        assert!(!session_is_live(&db, thread.id, crate::bus::LEAD, None).await);
+        assert!(!session_is_live(&db, thread.id, &dir_s, None).await);
+        assert!(!session_is_live(&db, thread.id, &dir_s, Some(wt.id)).await);
     }
 
     // —— issue #160 round-3 P1 §2 (extended round-5 review P1 §2): recheck_after_guard ——

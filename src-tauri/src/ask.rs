@@ -2132,7 +2132,14 @@ impl AskRegistry {
         // dispatch-approval time (`read_only_issue`) auto-allows a ReadOnly-tier
         // ask — never anything else, by construction (the `risk ==` check gates
         // the whole branch, not just a sub-case).
+        // issue #160 round-19 P1 (Codex computer_srv.rs:1543): the coarse
+        // read-only grants NEVER cover a native GUI observe action — only an
+        // exact GUI grant (checked above via `auto_decision_exact`) may. Excluding
+        // GUI action keys here is the forward-looking half of the same fix the
+        // `grant_read_only_*` sweeps got: a GUI card opening AFTER the grant was
+        // set must still fall through to a real decision, never auto-Allow.
         if risk == RiskLevel::ReadOnly
+            && !action_key_is_gui(action_key)
             && (g.read_only_issue.contains(&thread) || g.read_only_session.contains(&k))
         {
             return Some(Decision::Allow);
@@ -2422,7 +2429,19 @@ impl AskRegistry {
         let hit: Vec<Ask> = g
             .open
             .iter()
-            .filter(|a| a.risk == RiskLevel::ReadOnly && a.thread == thread && a.dir == dir)
+            // issue #160 round-19 P1 (Codex computer_srv.rs:1543): a native
+            // GUI observe ask (screenshot / list_windows / cursor_position) is
+            // `RiskLevel::ReadOnly` too, but the coarse "release read-only"
+            // grant must NEVER auto-allow it — `auto_decision_exact`
+            // deliberately withholds GUI authorization from anything but an
+            // exact GUI grant. Exclude GUI-keyed asks from the sweep (and from
+            // the forward-looking rule in `auto_decision`).
+            .filter(|a| {
+                a.risk == RiskLevel::ReadOnly
+                    && a.thread == thread
+                    && a.dir == dir
+                    && !action_key_is_gui(&a.action_key)
+            })
             .cloned()
             .collect();
         g.resolve_read_only(hit)
@@ -2442,7 +2461,12 @@ impl AskRegistry {
         let hit: Vec<Ask> = g
             .open
             .iter()
-            .filter(|a| a.risk == RiskLevel::ReadOnly && a.thread == thread)
+            // issue #160 round-19 P1 (Codex computer_srv.rs:1543): GUI observe
+            // asks are excluded from this coarse read-only sweep too — see the
+            // matching filter in `grant_read_only_session`.
+            .filter(|a| {
+                a.risk == RiskLevel::ReadOnly && a.thread == thread && !action_key_is_gui(&a.action_key)
+            })
             .cloned()
             .collect();
         g.resolve_read_only(hit)
@@ -5630,6 +5654,58 @@ mod tests {
         assert!(!open.contains(&ro_id));
         assert!(open.contains(&write_id));
         assert!(open.contains(&unknown_id));
+    }
+
+    /// issue #160 round-19 P1 (Codex computer_srv.rs:1543): a native GUI observe
+    /// ask is `RiskLevel::ReadOnly`, but the coarse "release read-only" grant
+    /// must NEVER sweep it (nor auto-allow a future one) — only an exact GUI
+    /// grant may. An ordinary read-only ask alongside it is still swept.
+    #[test]
+    fn read_only_grants_never_cover_gui_observe_asks() {
+        let gui_key = "[\"gui\",\"screenshot\",\"notes\",\"digest\"]";
+
+        let r = AskRegistry::new();
+        let (ordinary_id, mut ordinary_rx) =
+            r.request(1, "10", "codex", "ls", "ls", RiskLevel::ReadOnly, "ls");
+        let (gui_id, _gui_rx) = r.request(
+            1,
+            "10",
+            "weft_computer",
+            "computer: screenshot @ notes",
+            "{}",
+            RiskLevel::ReadOnly,
+            gui_key,
+        );
+
+        // Session grant sweeps ONLY the non-GUI read-only ask; the GUI card
+        // stays open, still needing a real answer.
+        let n = r.grant_read_only_session(1, "10");
+        assert_eq!(n, 1, "only the non-GUI read-only ask is swept");
+        assert_eq!(ordinary_rx.try_recv().expect("ordinary ask resolves"), Decision::Allow);
+        let open: std::collections::HashSet<u64> = r.open().iter().map(|a| a.id).collect();
+        assert!(!open.contains(&ordinary_id), "ordinary read-only ask swept");
+        assert!(open.contains(&gui_id), "GUI observe ask must stay open");
+
+        // The forward-looking rule likewise refuses to auto-allow a FUTURE GUI
+        // observe ask, while still covering an ordinary read-only one.
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::ReadOnly, "ls"),
+            Some(Decision::Allow),
+            "ordinary read-only stays auto-allowed by the session grant"
+        );
+        assert!(
+            r.auto_decision(1, "10", RiskLevel::ReadOnly, gui_key).is_none(),
+            "a GUI observe ask must never be auto-allowed by the coarse read-only grant"
+        );
+
+        // The issue-wide grant has the identical GUI carve-out.
+        let r2 = AskRegistry::new();
+        let (_o, _orx) = r2.request(1, "10", "codex", "ls", "ls", RiskLevel::ReadOnly, "ls");
+        let (gui2, _g2) =
+            r2.request(1, "10", "weft_computer", "s", "{}", RiskLevel::ReadOnly, gui_key);
+        let n2 = r2.grant_read_only_issue(1);
+        assert_eq!(n2, 1, "issue grant sweeps only the non-GUI read-only ask");
+        assert!(r2.open().iter().any(|a| a.id == gui2), "GUI ask stays open under issue grant too");
     }
 
     #[test]
