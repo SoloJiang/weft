@@ -116,8 +116,14 @@ export function ComputerControlBanner() {
         api.getComputerStopPersistFailed(),
       ]);
       if (!alive) return;
-      setState(controlResult.status === "fulfilled" ? controlResult.value : null);
-      setServerStopFailed(persistResult.status === "fulfilled" ? persistResult.value : false);
+      // issue #160 round-13 P1: a transient invoke rejection must NEVER hide the
+      // Stop banner / warning — that would remove the human's kill-switch surface
+      // (and the WebView Escape listener) while the backend was never shown to
+      // have cleared. Only a SUCCESSFUL poll updates each piece of state; a
+      // rejected one keeps the last known value, so the banner stays up until a
+      // real poll confirms control and the persistence warning are both gone.
+      if (controlResult.status === "fulfilled") setState(controlResult.value);
+      if (persistResult.status === "fulfilled") setServerStopFailed(persistResult.value);
     };
     void tick();
     const h = setInterval(() => void tick(), POLL_MS);

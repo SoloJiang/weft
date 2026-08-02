@@ -476,6 +476,15 @@ async fn run_action(
     if name != "computer" {
         return Err(format!("unknown tool: {name}"));
     }
+    // issue #160 round-13 P1 (Codex computer_srv.rs:515): run ALL pure,
+    // side-effect-free schema validation for THIS action BEFORE the approval
+    // gate below ever opens a card. A malformed call (e.g. `left_click` with no
+    // `coordinate`) must be rejected outright — never after a human already
+    // answered a card for it, which would mint a standing Always/Full grant for
+    // a request that then fails its own arm's parse and never runs. The arms
+    // below still re-parse (idempotent) and still do the LIVE checks (window
+    // resolution, focus freshness, control lease) that can only run post-approval.
+    pure_validate(action, args)?;
     // The server-side approval gate (issue #160 round-2 P1) — see this
     // module's own doc comment and `approve`'s. Runs for EVERY action,
     // observation or input, before any action-specific argument is even
@@ -2157,6 +2166,57 @@ fn parse_duration_ms(args: &Value) -> Result<u64, String> {
         Some(ms) => Ok(ms.min(5000)),
         None => Err("missing required 'duration_ms'".to_string()),
     }
+}
+
+/// Every pure, side-effect-free schema check for `action`'s arguments,
+/// factored out so [`run_action`] can run them ALL before the approval gate
+/// (`approve`) ever opens a Needs-you card (issue #160 round-13 P1, Codex
+/// computer_srv.rs:515). A malformed call is rejected here, up front — never
+/// after a human answered a card for it, which would mint a standing
+/// Always/Full grant for a request that then fails its own arm's parse and
+/// never executes. This mirrors, EXACTLY, the pure checks each arm in
+/// `run_action`'s `match` already does; the arms keep doing them (idempotent)
+/// and additionally do the LIVE checks — window resolution, focus freshness,
+/// the control lease — that can only run after approval. An unknown `action`
+/// is rejected here too, so it can never reach `approve` and open a card
+/// either.
+fn pure_validate(action: &str, args: &Value) -> Result<(), String> {
+    if !VALID_ACTIONS.iter().any(|a| *a == action) {
+        return Err(format!("unknown action: {action}"));
+    }
+    match action {
+        "left_click" | "right_click" | "double_click" | "triple_click" | "mouse_move" => {
+            required_window(args)?;
+            parse_coordinate(args, "coordinate")?;
+        }
+        "left_click_drag" => {
+            required_window(args)?;
+            parse_coordinate(args, "start_coordinate")?;
+            parse_coordinate(args, "coordinate")?;
+        }
+        "scroll" => {
+            required_window(args)?;
+            parse_coordinate(args, "coordinate")?;
+            parse_scroll(args)?;
+        }
+        "type" => {
+            required_window(args)?;
+            check_type_length(required_text(args)?)?;
+        }
+        "key" => {
+            required_window(args)?;
+            computer::parse_key_combo(required_text(args)?).map_err(|e| e.to_string())?;
+        }
+        "screenshot" => {
+            required_window(args)?;
+        }
+        "wait" => {
+            parse_duration_ms(args)?;
+        }
+        // list_windows / cursor_position take no arguments to validate.
+        _ => {}
+    }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -5574,6 +5634,65 @@ mod tests {
         );
 
         assert!(asks.answer(existing_ask_id, crate::ask::Answer::Deny));
+        computer::clear_control();
+    }
+
+    #[tokio::test]
+    async fn run_action_rejects_a_malformed_action_before_opening_any_card() {
+        // issue #160 round-13 P1 (Codex computer_srv.rs:515): a malformed call
+        // (here `left_click` with no `coordinate`) must be rejected by pure
+        // schema validation BEFORE `approve` — so NO permission card is ever
+        // opened for it, even with no standing grant. If validation regressed
+        // to run only inside the arm (after `approve`), this call would block
+        // on a Needs-you card (no grant, no answer) up to `ASK_WAIT`; the 2s
+        // timeout turns that regression into a clean fast failure, never a
+        // 3600s hang.
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 904_401,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true")
+            .await
+            .unwrap();
+        let asks = AskRegistry::new(); // no grant, no pre-existing open ask
+        let thread = 904_401;
+        let dir = "lead";
+
+        let mut window_id_out = None;
+        let mut image_out = None;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_action(
+                &db, &asks, thread, dir, None, "computer", "left_click",
+                &json!({"window": "notes"}), // no `coordinate`
+                &mut window_id_out, &mut image_out,
+            ),
+        )
+        .await
+        .expect("a malformed call must reject synchronously via pure_validate, never block on a card");
+
+        let err = result.unwrap_err();
+        assert!(err.contains("coordinate"), "expected a coordinate schema error, got: {err}");
+        assert!(
+            asks.open().is_empty(),
+            "a malformed call must open NO approval card: {:?}",
+            asks.open()
+        );
+        assert!(
+            mock.actions.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "the backend must never be touched by a malformed call"
+        );
         computer::clear_control();
     }
 

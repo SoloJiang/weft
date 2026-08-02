@@ -378,22 +378,28 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
 /// [`inject_computer_opencode`]'s merged `opencode.json`) go through this
 /// instead of write-then-chmod.
 ///
-/// `#[cfg(unix)]`: opens with `create_new` (O_EXCL) + `O_NOFOLLOW` + mode
-/// `0o600` in ONE syscall — never observably `0644`, not even for an
-/// instant — mirroring `computer::screenshot_window`'s own owner-only write
-/// and `lead_chat::engine`'s `write_attachment_no_follow`, the two other
-/// places this codebase already needed the identical "never readable at any
-/// wider mode, ever" guarantee.
+/// `#[cfg(unix)]`: writes to a fresh temp SIBLING opened with `create_new`
+/// (O_EXCL) + `O_NOFOLLOW` + mode `0o600` in ONE syscall — never observably
+/// `0644`, not even for an instant — then, only after the FULL contents are
+/// written and flushed, atomically `rename`s that temp over `path`. This
+/// mirrors `computer::screenshot_window`'s own owner-only write and
+/// `lead_chat::engine`'s `write_attachment_no_follow` for the "never readable
+/// at any wider mode, ever" guarantee, and adds crash/failure atomicity on
+/// top.
 ///
-/// Re-injection (the SAME path written again — a resumed/rerun session, or
-/// `merge_opencode_config` re-merging on a later spawn) is the ordinary
-/// case, not an edge case: an existing file at `path` is removed FIRST
-/// (best-effort; `remove_file` unlinks the directory entry itself, it never
-/// follows a symlink there), then `create_new` runs fresh — so a stale
-/// leftover from a previous session never blocks this one with
-/// `AlreadyExists`, and a symlink planted at this predictable path in the
-/// gap between the `remove_file` and the `create_new` is refused by
-/// `O_NOFOLLOW`/`create_new` itself rather than followed.
+/// issue #160 round-13 P1: the previous version unlinked `path` FIRST and then
+/// `create_new`+wrote in place, so a write that failed partway (full disk,
+/// quota, I/O error) left the caller's ORIGINAL config permanently destroyed
+/// — catastrophic for `merge_opencode_config`, which merges the USER's
+/// existing `opencode.json` and writes it back. The temp-then-rename order
+/// fixes that: `path` is only ever replaced by a temp that already holds the
+/// complete bytes, so any failure before the rename leaves the original
+/// untouched, and the rename itself is atomic (a reader sees either the old
+/// complete file or the new complete file, never a truncated one). The temp
+/// name carries the pid so two processes can't collide on it; a stale temp
+/// from a crashed run is removed best-effort first. `rename` replaces the
+/// directory entry at `path` (never writes THROUGH a symlink sitting there),
+/// so the no-follow guarantee holds for the final path too.
 ///
 /// Non-unix keeps the pre-existing plain `write` (no owner-only concept
 /// there this crate can portably act on) — matches every other
@@ -405,15 +411,28 @@ fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> bool {
     {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
-        let _ = std::fs::remove_file(path);
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let tmp = path.with_file_name(format!(".{name}.{}.weft-tmp", std::process::id()));
+        let _ = std::fs::remove_file(&tmp); // best-effort: clear a stale temp from a crashed run
         let mut opt = std::fs::OpenOptions::new();
         opt.write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        let Ok(file) = opt.open(path) else { return false };
+        let Ok(file) = opt.open(&tmp) else { return false };
         let mut w = std::io::BufWriter::new(file);
-        if w.write_all(bytes).is_err() {
+        if w.write_all(bytes).is_err() || w.flush().is_err() {
+            drop(w);
+            let _ = std::fs::remove_file(&tmp);
             return false;
         }
-        w.flush().is_ok()
+        drop(w);
+        // Atomic replace ONLY after the temp holds the complete, flushed bytes:
+        // any earlier failure above left `path` untouched.
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        true
     }
     #[cfg(not(unix))]
     {
@@ -737,14 +756,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// issue #160 round-12 P1 #D: re-injection (the SAME `(thread, dir)`
-    /// writing this SAME path again — a resumed/rerun session) must land
-    /// via [`write_owner_only_atomic`]'s remove-then-`create_new` path, not
+    /// issue #160 round-12 P1 #D + round-13 P1: re-injection (the SAME
+    /// `(thread, dir)` writing this SAME path again — a resumed/rerun session)
+    /// must land via [`write_owner_only_atomic`]'s temp-then-`rename` path, not
     /// silently fall back to a wider-mode write because the file already
-    /// exists. Runs the injection TWICE for the identical `(thread, dir)`
-    /// and asserts the SECOND write is still exactly `0600` and the content
-    /// reflects the newer URL — never a stale leftover from the first write,
-    /// and never briefly `0644` in between.
+    /// exists. Runs the injection TWICE for the identical `(thread, dir)` and
+    /// asserts the SECOND write is still exactly `0600`, the content reflects
+    /// the newer URL, and — round-13 P1 — no `.weft-tmp` sibling is left behind
+    /// (the atomic rename consumes it on success).
     #[test]
     fn computer_claude_config_reinjection_stays_owner_only_and_atomic() {
         let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -782,9 +801,55 @@ mod tests {
             );
         }
 
+        // round-13 P1: the atomic rename consumes the temp on success — no
+        // `.weft-tmp` sibling may linger next to the real config.
+        let mcp_dir = cfg_path.parent().unwrap();
+        let leftover: Vec<_> = std::fs::read_dir(mcp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("weft-tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "no temp file may be left behind: {leftover:?}");
+
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// issue #160 round-13 P1: `write_owner_only_atomic` must replace an
+    /// existing file's contents WHOLESALE (never append/partial) at exactly
+    /// 0600, and leave no temp sibling — the temp-then-rename path. (The
+    /// data-preservation-on-failure guarantee — the original survives a failed
+    /// write — is structural to writing the temp first and only renaming after
+    /// a complete flush; it isn't unit-forceable without injecting a write
+    /// fault, so this pins the observable success-path invariants.)
+    #[cfg(unix)]
+    #[test]
+    fn write_owner_only_atomic_replaces_existing_content_owner_only_no_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("weft-woa-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opencode.json");
+
+        // A pre-existing, wider-mode file with OLD content.
+        std::fs::write(&path, b"OLD-LONGER-CONTENT-that-must-be-fully-replaced").unwrap();
+
+        assert!(write_owner_only_atomic(&path, b"new"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new", "content must be replaced wholesale");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the replaced file must be exactly 0600"
+        );
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("weft-tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "no temp file may be left behind: {leftover:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
