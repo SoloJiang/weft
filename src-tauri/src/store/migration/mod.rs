@@ -59,12 +59,13 @@ impl MigratorTrait for Migrator {
             Box::new(M0044EngineRoutingPin),
             Box::new(M0045PullRequest),
             Box::new(M0046DirectionUpstream),
-            Box::new(M0047HumanRequest),
-            Box::new(M0048HumanRequestSourceMessage),
-            Box::new(M0049HumanRequestImRoutes),
-            Box::new(M0050HumanCardTerminalOutbox),
-            Box::new(M0051RepoActionExecution),
-            Box::new(M0052LeadHiddenDelivery),
+            Box::new(M0047PullRequestThreadStatus),
+            Box::new(M0048HumanRequest),
+            Box::new(M0049HumanRequestSourceMessage),
+            Box::new(M0050HumanRequestImRoutes),
+            Box::new(M0051HumanCardTerminalOutbox),
+            Box::new(M0052RepoActionExecution),
+            Box::new(M0053LeadHiddenDelivery),
         ]
     }
 }
@@ -1999,6 +2000,48 @@ impl MigrationTrait for M0044EngineRoutingPin {
     }
 }
 
+pub struct M0045PullRequest;
+impl MigrationName for M0045PullRequest {
+    fn name(&self) -> &str {
+        "m0045_pull_request"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0045PullRequest {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut stmt = schema.create_table_from_entity(pull_request::Entity);
+        stmt.if_not_exists();
+        manager.create_table(stmt).await?;
+        // Belt-and-suspenders alongside `repo::register_pull_request`'s
+        // application-level find-then-upsert: guarantees the natural key
+        // (host_kind, host_owner, host_repo, number) can never duplicate at
+        // the DB level even under a race the app layer doesn't catch.
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_pull_request_natural_key")
+                    .table(Alias::new("pull_request"))
+                    .col(Alias::new("host_kind"))
+                    .col(Alias::new("host_owner"))
+                    .col(Alias::new("host_repo"))
+                    .col(Alias::new("number"))
+                    .unique()
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("pull_request")).to_owned())
+            .await?;
+        Ok(())
+    }
+}
+
 /// Issue #110 T1: the tracked-PR/MR entity — a real DB row (repo, task,
 /// host-normalized state) so "what is this PR/MR waiting on" is a store fact
 /// the background monitor (`crate::host::monitor`) can read and update, not
@@ -2058,24 +2101,72 @@ impl MigrationTrait for M0046DirectionUpstream {
     }
 }
 
-pub struct M0045PullRequest;
-impl MigrationName for M0045PullRequest {
+/// Issue #110: `pull_request.thread_status` — the review-discussion-thread
+/// axis (`crate::host::ThreadStatus`, JSON-serialized like the CI/review/
+/// conflict columns beside it). Until this column existed, "are there
+/// unresolved review threads" was not merely unchecked but unrepresentable,
+/// so the auto-merge gate could authorize a merge over an open review round.
+///
+/// Existing rows migrate to `""`, and that emptiness is load-bearing rather
+/// than incidental: `host::gate::parse_threads` maps it to
+/// `ThreadStatus::Unknown`, which blocks. An upgraded install therefore
+/// auto-merges NOTHING until `host::monitor`'s next successful sweep has
+/// actually read each row's threads — the opposite of the default a
+/// `NOT NULL DEFAULT 'all_resolved'` would have quietly created, which would
+/// have granted every pre-existing row a clean bill of health it never
+/// earned, at exactly the moment the checking code first shipped.
+pub struct M0047PullRequestThreadStatus;
+impl MigrationName for M0047PullRequestThreadStatus {
     fn name(&self) -> &str {
-        "m0045_pull_request"
+        "m0047_pull_request_thread_status"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0047PullRequestThreadStatus {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let result = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("pull_request"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("thread_status"))
+                            .text()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) if err.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("pull_request"))
+                    .drop_column(Alias::new("thread_status"))
+                    .to_owned(),
+            )
+            .await
     }
 }
 
 /// Durable free-text human questions. Permission prompts deliberately stay out
 /// of this table because their tool-call transport cannot survive restart.
-pub struct M0047HumanRequest;
-impl MigrationName for M0047HumanRequest {
+pub struct M0048HumanRequest;
+impl MigrationName for M0048HumanRequest {
     fn name(&self) -> &str {
-        "m0047_human_request"
+        "m0048_human_request"
     }
 }
 
 #[async_trait::async_trait]
-impl MigrationTrait for M0047HumanRequest {
+impl MigrationTrait for M0048HumanRequest {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let schema = Schema::new(manager.get_database_backend());
         let mut statement = schema.create_table_from_entity(human_request::Entity);
@@ -2115,18 +2206,18 @@ impl MigrationTrait for M0047HumanRequest {
 }
 
 /// Add an exact lead_message anchor for rewind-safe durable-question
-/// cancellation. New databases already receive the column from M0047's entity
+/// cancellation. New databases already receive the column from M0048's entity
 /// schema; duplicate-column tolerance keeps reruns and partially upgraded DBs
 /// safe.
-pub struct M0048HumanRequestSourceMessage;
-impl MigrationName for M0048HumanRequestSourceMessage {
+pub struct M0049HumanRequestSourceMessage;
+impl MigrationName for M0049HumanRequestSourceMessage {
     fn name(&self) -> &str {
-        "m0048_human_request_source_message"
+        "m0049_human_request_source_message"
     }
 }
 
 #[async_trait::async_trait]
-impl MigrationTrait for M0048HumanRequestSourceMessage {
+impl MigrationTrait for M0049HumanRequestSourceMessage {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         for column in ["source_message_id", "source_session_id"] {
             let result = manager
@@ -2169,15 +2260,15 @@ impl MigrationTrait for M0048HumanRequestSourceMessage {
 
 /// Persist every provider message id used for a durable human-question card,
 /// so replies to pre-restart and replayed cards remain tied to the request.
-pub struct M0049HumanRequestImRoutes;
-impl MigrationName for M0049HumanRequestImRoutes {
+pub struct M0050HumanRequestImRoutes;
+impl MigrationName for M0050HumanRequestImRoutes {
     fn name(&self) -> &str {
-        "m0049_human_request_im_routes"
+        "m0050_human_request_im_routes"
     }
 }
 
 #[async_trait::async_trait]
-impl MigrationTrait for M0049HumanRequestImRoutes {
+impl MigrationTrait for M0050HumanRequestImRoutes {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let result = manager
             .alter_table(
@@ -2216,15 +2307,15 @@ impl MigrationTrait for M0049HumanRequestImRoutes {
 /// content while a pending row retains only the answer needed for its final
 /// provider PATCH; its delivery receipt scrubs that answer and leaves an
 /// opaque route tombstone.
-pub struct M0050HumanCardTerminalOutbox;
-impl MigrationName for M0050HumanCardTerminalOutbox {
+pub struct M0051HumanCardTerminalOutbox;
+impl MigrationName for M0051HumanCardTerminalOutbox {
     fn name(&self) -> &str {
-        "m0050_human_card_terminal_outbox"
+        "m0051_human_card_terminal_outbox"
     }
 }
 
 #[async_trait::async_trait]
-impl MigrationTrait for M0050HumanCardTerminalOutbox {
+impl MigrationTrait for M0051HumanCardTerminalOutbox {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let schema = Schema::new(manager.get_database_backend());
         let mut statement = schema.create_table_from_entity(human_card_terminal_outbox::Entity);
@@ -2274,15 +2365,15 @@ impl MigrationTrait for M0050HumanCardTerminalOutbox {
 /// A repository action card owns exactly one durable execution. The unique
 /// message index is the cross-process admission gate; the token index makes
 /// filesystem markers unambiguous during recovery.
-pub struct M0051RepoActionExecution;
-impl MigrationName for M0051RepoActionExecution {
+pub struct M0052RepoActionExecution;
+impl MigrationName for M0052RepoActionExecution {
     fn name(&self) -> &str {
-        "m0051_repo_action_execution"
+        "m0052_repo_action_execution"
     }
 }
 
 #[async_trait::async_trait]
-impl MigrationTrait for M0051RepoActionExecution {
+impl MigrationTrait for M0052RepoActionExecution {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let schema = Schema::new(manager.get_database_backend());
         let mut statement = schema.create_table_from_entity(repo_action_execution::Entity);
@@ -2326,15 +2417,15 @@ impl MigrationTrait for M0051RepoActionExecution {
 /// Durable hidden lead input. Source rows deliberately remain unreferenced so
 /// a stopped/crashed engine can replay a plan decision or repo feedback after
 /// the originating card/repository has been cleaned up.
-pub struct M0052LeadHiddenDelivery;
-impl MigrationName for M0052LeadHiddenDelivery {
+pub struct M0053LeadHiddenDelivery;
+impl MigrationName for M0053LeadHiddenDelivery {
     fn name(&self) -> &str {
-        "m0052_lead_hidden_delivery"
+        "m0053_lead_hidden_delivery"
     }
 }
 
 #[async_trait::async_trait]
-impl MigrationTrait for M0052LeadHiddenDelivery {
+impl MigrationTrait for M0053LeadHiddenDelivery {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let schema = Schema::new(manager.get_database_backend());
         let mut statement = schema.create_table_from_entity(lead_hidden_delivery::Entity);
@@ -2375,48 +2466,13 @@ impl MigrationTrait for M0052LeadHiddenDelivery {
             .await
     }
 }
-#[async_trait::async_trait]
-impl MigrationTrait for M0045PullRequest {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let schema = Schema::new(manager.get_database_backend());
-        let mut stmt = schema.create_table_from_entity(pull_request::Entity);
-        stmt.if_not_exists();
-        manager.create_table(stmt).await?;
-        // Belt-and-suspenders alongside `repo::register_pull_request`'s
-        // application-level find-then-upsert: guarantees the natural key
-        // (host_kind, host_owner, host_repo, number) can never duplicate at
-        // the DB level even under a race the app layer doesn't catch.
-        manager
-            .create_index(
-                Index::create()
-                    .if_not_exists()
-                    .name("idx_pull_request_natural_key")
-                    .table(Alias::new("pull_request"))
-                    .col(Alias::new("host_kind"))
-                    .col(Alias::new("host_owner"))
-                    .col(Alias::new("host_repo"))
-                    .col(Alias::new("number"))
-                    .unique()
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_table(Table::drop().table(Alias::new("pull_request")).to_owned())
-            .await?;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest,
-        M0046DirectionUpstream, M0047HumanRequest, M0048HumanRequestSourceMessage,
-        M0049HumanRequestImRoutes, M0050HumanCardTerminalOutbox, M0051RepoActionExecution,
-        M0052LeadHiddenDelivery,
+        M0046DirectionUpstream, M0047PullRequestThreadStatus, M0048HumanRequest,
+        M0049HumanRequestSourceMessage, M0050HumanRequestImRoutes,
+        M0051HumanCardTerminalOutbox, M0052RepoActionExecution, M0053LeadHiddenDelivery,
     };
 
     #[test]
@@ -2854,7 +2910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m0047_human_request_table_indexes_and_defaults_survive_rerun() {
+    async fn m0048_human_request_table_indexes_and_defaults_survive_rerun() {
         use crate::store::repo;
         use crate::store::Db;
         use sea_orm::{ConnectionTrait, Statement};
@@ -2884,15 +2940,15 @@ mod tests {
 
         // Migrations are expected to be safely repeatable in hand-repaired or
         // partially-upgraded databases.
-        M0047HumanRequest
+        M0048HumanRequest
             .up(&SchemaManager::new(&db.0))
             .await
             .unwrap();
-        M0048HumanRequestSourceMessage
+        M0049HumanRequestSourceMessage
             .up(&SchemaManager::new(&db.0))
             .await
             .unwrap();
-        M0049HumanRequestImRoutes
+        M0050HumanRequestImRoutes
             .up(&SchemaManager::new(&db.0))
             .await
             .unwrap();
@@ -2937,14 +2993,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m0050_terminal_outbox_is_rerunnable_and_has_no_source_foreign_key() {
+    async fn m0051_terminal_outbox_is_rerunnable_and_has_no_source_foreign_key() {
         use crate::store::repo::{self, HumanRequestImRoute, HUMAN_REQUEST_CANCELLED};
         use crate::store::Db;
         use sea_orm::{ConnectionTrait, Statement};
         use sea_orm_migration::{MigrationTrait, SchemaManager};
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        M0050HumanCardTerminalOutbox
+        M0051HumanCardTerminalOutbox
             .up(&SchemaManager::new(&db.0))
             .await
             .unwrap();
@@ -2996,15 +3052,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m0051_repo_action_execution_is_rerunnable_with_unique_identity_indexes() {
+    async fn m0052_repo_action_execution_is_rerunnable_with_unique_identity_indexes() {
         use crate::store::Db;
         use sea_orm::{ConnectionTrait, Statement};
         use sea_orm_migration::{MigrationTrait, SchemaManager};
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let manager = SchemaManager::new(&db.0);
-        M0051RepoActionExecution.up(&manager).await.unwrap();
-        M0051RepoActionExecution.up(&manager).await.unwrap();
+        M0052RepoActionExecution.up(&manager).await.unwrap();
+        M0052RepoActionExecution.up(&manager).await.unwrap();
 
         let columns =
             db.0.query_all(Statement::from_string(
@@ -3049,7 +3105,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m0052_hidden_delivery_is_rerunnable_and_deduped() {
+    async fn m0053_hidden_delivery_is_rerunnable_and_deduped() {
         use crate::store::repo;
         use crate::store::Db;
         use sea_orm::{ConnectionTrait, Statement};
@@ -3057,9 +3113,9 @@ mod tests {
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let manager = SchemaManager::new(&db.0);
-        M0052LeadHiddenDelivery.up(&manager).await.unwrap();
-        M0052LeadHiddenDelivery.up(&manager).await.unwrap();
-        let workspace = repo::create_workspace(&db, "m0052").await.unwrap();
+        M0053LeadHiddenDelivery.up(&manager).await.unwrap();
+        M0053LeadHiddenDelivery.up(&manager).await.unwrap();
+        let workspace = repo::create_workspace(&db, "m0053").await.unwrap();
         let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
             .await
             .unwrap();
@@ -3114,6 +3170,86 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert!(columns.contains("dedupe_key"));
         assert!(columns.contains("state"));
+    }
+
+    /// M0047 (issue #110): the same upgrade-path coverage M0046 gets, for the
+    /// review-thread column — and the assertion that matters most is about
+    /// what an EXISTING row gets, not that the column appeared.
+    ///
+    /// A row written before this migration has never had its review threads
+    /// read. It must come out `""`, which `host::gate::parse_threads` maps to
+    /// `ThreadStatus::Unknown`, which the auto-merge gate refuses. Any other
+    /// default — most temptingly a serialized `all_resolved`, which would
+    /// have made every existing row keep flowing through the gate unchanged —
+    /// would hand a clean bill of health to precisely the rows nobody has
+    /// ever checked, at the exact moment the checking code first ships.
+    #[tokio::test]
+    async fn m0047_thread_status_defaults_existing_rows_to_unknown_not_to_a_clear_value() {
+        use crate::host::{gate, ThreadStatus};
+        use sea_orm::{ConnectionTrait, Database, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        // Pre-M0047 shape: a `pull_request` table with the three sibling
+        // status columns but no `thread_status` at all.
+        db.execute(Statement::from_string(
+            backend,
+            "CREATE TABLE pull_request (id INTEGER PRIMARY KEY, ci_status TEXT NOT NULL DEFAULT '', \
+             review_status TEXT NOT NULL DEFAULT '', conflict_status TEXT NOT NULL DEFAULT '')"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_string(
+            backend,
+            "INSERT INTO pull_request (id, ci_status, review_status, conflict_status) \
+             VALUES (1, '{\"state\":\"passing\"}', '{\"state\":\"approved\"}', '{\"state\":\"clean\"}')"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+
+        M0047PullRequestThreadStatus.up(&SchemaManager::new(&db)).await.unwrap();
+
+        let read = |db: &sea_orm::DatabaseConnection| {
+            let stmt = Statement::from_string(
+                backend,
+                "SELECT thread_status FROM pull_request WHERE id = 1".to_owned(),
+            );
+            let db = db.clone();
+            async move {
+                let row = db.query_one(stmt).await.unwrap().unwrap();
+                row.try_get::<String>("", "thread_status").unwrap()
+            }
+        };
+
+        let stored = read(&db).await;
+        assert_eq!(stored, "", "an existing pre-M0047 row carries no thread reading at all");
+        assert!(
+            matches!(gate::parse_threads(&stored), ThreadStatus::Unknown { .. }),
+            "the migration default must decode to Unknown — a row nobody has checked must not \
+             read as clear, got {:?}",
+            gate::parse_threads(&stored)
+        );
+
+        // A real reading, written the way `apply_pull_request_snapshot` does.
+        let all_resolved = serde_json::to_string(&ThreadStatus::AllResolved).unwrap();
+        db.execute(Statement::from_string(
+            backend,
+            format!("UPDATE pull_request SET thread_status = '{all_resolved}' WHERE id = 1"),
+        ))
+        .await
+        .unwrap();
+
+        // A rerun (the "duplicate column" catch in `up()`) must succeed and
+        // must not reset an already-recorded reading back to the default.
+        M0047PullRequestThreadStatus.up(&SchemaManager::new(&db)).await.unwrap();
+        assert_eq!(
+            gate::parse_threads(&read(&db).await),
+            ThreadStatus::AllResolved,
+            "a rerun must not clobber a reading the monitor already took"
+        );
     }
 
     /// M0037: code_checkpoint exists after migration and round-trips a row.

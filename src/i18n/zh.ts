@@ -823,11 +823,11 @@ export const zh = {
     autoMergeGroup: "自动合并",
     autoMergeTitle: "达标后自动合并",
     autoMergeHint:
-      "当被跟踪的 PR/MR 达到本仓库「truly mergeable」的标准（CI 真正跑绿——不是没配置——、GitHub 自己的 review decision 通过、无冲突），且经过一次新鲜、未失联的复查确认这一状态仍然成立，Weft 会自动 squash 合并——不会再逐条询问你。默认关闭：这是一个不可撤销的动作（合并代码），且没有人确认这一次具体的合并。开启后，第一次检查就可能立刻、静默合并所有已经达标的被跟踪 PR/MR，不只是之后才达标的那些。每次尝试无论成功失败，都会在 PR 的时间线留下标记。",
+      "当被跟踪的 PR/MR 达到本仓库「truly mergeable」的标准（CI 真正跑绿——不是没配置——、GitHub 自己的 review decision 通过、所有 review 讨论线程都已解决、无冲突），且经过一次新鲜复查确认这一状态仍然成立，Weft 会自动 squash 合并——不会再逐条询问你。默认关闭：这是一个不可撤销的动作（合并代码），且没有人确认这一次具体的合并。开启后，第一次检查就可能立刻、静默合并所有已经达标的被跟踪 PR/MR，不只是之后才达标的那些。每次尝试无论成功失败，都会在 PR 的时间线留下标记。",
     autoMergeDisclosure:
-      "只对 Weft 已经在跟踪（通过 register_pr）、且宿主支持合并的 PR/MR 生效（目前仅 GitHub）。状态过期或探测正在失败的行会被跳过，不会用旧快照去合并。这不会独立检查未解决的 review 讨论线程，也不会检查某个仓库专属的机器人批准约定（例如某个 review 机器人的 👍）——只看 GitHub 自己的聚合 review decision。如果你的仓库依赖这些，请开启 GitHub 自己的分支保护（「Require conversation resolution before merging」、必需的 reviewer），这样条件不满足时合并会在服务端被直接拒绝。",
+      "只对 Weft 已经在跟踪（通过 register_pr）、且宿主支持合并的 PR/MR 生效（目前仅 GitHub）。状态过期或探测正在失败的行会被跳过，不会用旧快照去合并。review 线程会被完整翻页读取，只要还有一条未解决就不会合并；如果线程数没能完整读到，一律按「未解决」处理，绝不当成已全部解决。仍然不检查的是某个仓库专属的机器人批准约定（例如某个 review 机器人的 👍）——这因仓库而异，也没有跨宿主的中立信号可读。如果你的仓库依赖它，请开启 GitHub 自己的分支保护（设置必需的 reviewer），这样条件不满足时合并会在服务端被直接拒绝。",
     autoMergeConfirm:
-      "要开启自动合并吗？Weft 会自动 squash 合并每一个已经达到、或之后达到本仓库「truly mergeable」标准的被跟踪 PR/MR——不会再逐条问你，可能一开启就立刻合并好几个。它只看 GitHub 自己的 review decision：不会检查未解决的 review 线程，也不看 review 机器人是否批准。这个动作一旦发生就无法撤销。",
+      "要开启自动合并吗？Weft 会自动 squash 合并每一个已经达到、或之后达到本仓库「truly mergeable」标准的被跟踪 PR/MR——不会再逐条问你，可能一开启就立刻合并好几个。它会检查 CI、GitHub 自己的 review decision、未解决的 review 线程和冲突，但不会判断某个 review 机器人是否已经放行。这个动作一旦发生就无法撤销。",
     engineRoutingGroup: "引擎路由",
     automaticRoutingTitle: "允许 Weft 自动选择引擎",
     automaticRoutingHint:

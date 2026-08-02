@@ -32,8 +32,13 @@ const PR_SWEEP_DEFAULT_SECS: u64 = 60;
 /// default 60s cadence this is ~10 minutes of persistent failure: long
 /// enough to ride out a transient blip (a network hiccup, a momentary `gh`
 /// rate limit), short enough not to hammer the host indefinitely for
-/// something that has clearly stopped being transient. At the threshold the
-/// row becomes a canonical `pr_tracking_retry` attention item.
+/// something that has clearly stopped being transient (a deleted PR, `gh`
+/// auth revoked and never restored). The row's last-posted Needs-you notice
+/// is left in place when this fires — not retracted (that would falsely
+/// claim "resolved") — an honest "here's the last thing we knew, we've
+/// stopped checking" rather than a silent infinite retry loop.
+/// The row also becomes a canonical `pr_tracking_retry` attention item at
+/// this boundary, so the user can explicitly restart tracking.
 pub(crate) const MAX_CONSECUTIVE_PROBE_FAILURES: i32 = 10;
 
 /// Start the runtime PR/MR sweep. Call once at app setup.
@@ -122,12 +127,40 @@ async fn apply_probe_result(
             // early. `direction_id == 0` (a legacy row) resolves to Unknown,
             // which is the honest answer for a PR whose task we cannot find.
             let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
-            let readiness =
-                judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict, &upstream);
+            let readiness = judge::merge_readiness(
+                &snapshot.ci,
+                &snapshot.review,
+                &snapshot.threads,
+                &snapshot.conflict,
+                &upstream,
+            );
             let changed = snapshot_changed(pr, snapshot, &readiness);
-            if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, snapshot, &readiness).await {
-                eprintln!("[weft][host] pr #{}: could not save snapshot: {e}", pr.id);
-            } else if changed {
+            let axis_error = snapshot.unreadable_axis_error();
+            let fail_count = match repo::apply_pull_request_snapshot(
+                db,
+                pr.id,
+                snapshot,
+                &readiness,
+                match axis_error {
+                    Some(reason) => repo::StreakUpdate::Extend(reason),
+                    None => repo::StreakUpdate::Clear,
+                },
+            )
+            .await
+            {
+                Ok(count) => Some(count),
+                Err(e) => {
+                    eprintln!("[weft][host] pr #{}: could not save snapshot: {e}", pr.id);
+                    None
+                }
+            };
+            // Only a PERSISTED change is announced. Restructuring this write
+            // to also return the failure count turned the original `if let
+            // Err … else if changed` into an unconditional emit, which would
+            // announce state the DB never accepted — the same "claiming
+            // something we could not confirm" this whole feature exists to
+            // stop. Found in self-review, not by a reviewer.
+            if fail_count.is_some() && changed {
                 emit_pr_changed(app, pr);
             }
         }
@@ -172,12 +205,14 @@ fn emit_pr_changed(app: &AppHandle, pr: &pull_request::Model) {
 fn snapshot_changed(old: &pull_request::Model, snapshot: &PrSnapshot, readiness: &MergeReadiness) -> bool {
     let new_ci = serde_json::to_string(&snapshot.ci).unwrap_or_default();
     let new_review = serde_json::to_string(&snapshot.review).unwrap_or_default();
+    let new_threads = serde_json::to_string(&snapshot.threads).unwrap_or_default();
     let new_conflict = serde_json::to_string(&snapshot.conflict).unwrap_or_default();
     let new_readiness = serde_json::to_string(readiness).unwrap_or_default();
     old.head_sha != snapshot.head_sha
         || old.lifecycle != snapshot.lifecycle.as_str()
         || old.ci_status != new_ci
         || old.review_status != new_review
+        || old.thread_status != new_threads
         || old.conflict_status != new_conflict
         || old.merge_readiness != new_readiness
 }
@@ -185,7 +220,34 @@ fn snapshot_changed(old: &pull_request::Model, snapshot: &PrSnapshot, readiness:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{CiStatus, ConflictStatus, PrLifecycle, ReviewStatus};
+    use crate::host::{CiStatus, ConflictStatus, PrLifecycle, ReviewStatus, ThreadStatus};
+
+    /// Only a failed thread READ counts as partial. `ConflictStatus::Unknown`
+    /// is what GitHub reports for seconds after every push — treating it as a
+    /// probe failure would march healthy PRs to the give-up threshold, and
+    /// `Unchecked` means a backend does not implement the axis at all, which
+    /// retrying cannot fix.
+    #[test]
+    fn only_an_unreadable_thread_axis_makes_a_read_partial() {
+        let mut snap = base_snapshot();
+        assert_eq!(snap.unreadable_axis_error(), None);
+
+        snap.conflict = ConflictStatus::Unknown { reason: "not computed yet".to_string() };
+        assert_eq!(
+            snap.unreadable_axis_error(),
+            None,
+            "a transient mergeability window is not a probe failure"
+        );
+
+        snap.threads = crate::host::ThreadStatus::Unchecked;
+        assert_eq!(snap.unreadable_axis_error(), None, "an unimplemented axis is not a failure");
+
+        snap.threads = crate::host::ThreadStatus::Unresolved { count: 2 };
+        assert_eq!(snap.unreadable_axis_error(), None, "a successful count is not a failure");
+
+        snap.threads = crate::host::ThreadStatus::Unknown { reason: "boom".to_string() };
+        assert_eq!(snap.unreadable_axis_error(), Some("boom"));
+    }
 
     fn base_row() -> pull_request::Model {
         pull_request::Model {
@@ -205,6 +267,7 @@ mod tests {
             lifecycle: "open".to_string(),
             ci_status: serde_json::to_string(&CiStatus::Passing).unwrap(),
             review_status: serde_json::to_string(&ReviewStatus::Approved).unwrap(),
+            thread_status: serde_json::to_string(&ThreadStatus::AllResolved).unwrap(),
             conflict_status: serde_json::to_string(&ConflictStatus::Clean).unwrap(),
             merge_readiness: serde_json::to_string(&MergeReadiness::Ready).unwrap(),
             last_checked_at: "100".to_string(),
@@ -223,6 +286,7 @@ mod tests {
             lifecycle: PrLifecycle::Open,
             ci: CiStatus::Passing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         }
     }
@@ -270,7 +334,7 @@ mod tests {
         // Same raw axes stored, but readiness recomputed differently (e.g. the
         // judgement function itself changed) must still be caught — this is
         // what keeps `snapshot_changed` honest about DERIVED state, not just
-        // the three raw axis columns.
+        // the raw axis columns.
         let old = base_row();
         let snap = base_snapshot();
         let readiness = MergeReadiness::Blocked { reasons: vec!["something".to_string()] };

@@ -338,6 +338,7 @@ async fn evaluate_row(
     let now = repo::now_unix();
     let stored_lifecycle = gate::parse_lifecycle(&pr.lifecycle);
     let stored_ci = gate::parse_ci(&pr.ci_status);
+    let stored_threads = gate::parse_threads(&pr.thread_status);
     let stored_readiness = gate::parse_readiness(&pr.merge_readiness);
     let age = gate::age_secs(&pr.last_checked_at, &now);
     let pre_decision = gate::decide_auto_merge(
@@ -349,6 +350,7 @@ async fn evaluate_row(
         host_kind,
         stored_lifecycle,
         &stored_ci,
+        &stored_threads,
         &stored_readiness,
         pr.probe_fail_count,
         age,
@@ -410,9 +412,31 @@ async fn evaluate_row(
     // Re-resolved here rather than trusting the swept row: this is the
     // pre-merge confirmation, and an upstream can have moved since the sweep.
     let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
-    let fresh_readiness =
-        judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict, &upstream);
-    if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, &snapshot, &fresh_readiness).await {
+    let fresh_readiness = judge::merge_readiness(
+        &snapshot.ci,
+        &snapshot.review,
+        &snapshot.threads,
+        &snapshot.conflict,
+        &upstream,
+    );
+    // This loop persists the axes but is NOT entitled to move the failure
+    // streak in either direction (`StreakUpdate::Leave`). `host::monitor` owns
+    // that bookkeeping because it is the only loop that runs on every row and
+    // the only one that posts the escalation notice — Codex review round 3 P2
+    // showed both ways this goes wrong from here: clearing the streak would
+    // erase what the monitor is accumulating, and incrementing it could carry
+    // a row from 9 to 10, past `list_open_pull_requests`'s threshold, so the
+    // monitor would never see that row again and never post the
+    // action-required notice.
+    if let Err(e) = repo::apply_pull_request_snapshot(
+        db,
+        pr.id,
+        &snapshot,
+        &fresh_readiness,
+        repo::StreakUpdate::Leave,
+    )
+    .await
+    {
         eprintln!(
             "[weft][automerge] pr #{}: could not save pre-merge confirmation snapshot: {e}",
             pr.id
@@ -430,6 +454,7 @@ async fn evaluate_row(
         host_kind,
         Some(snapshot.lifecycle),
         &snapshot.ci,
+        &snapshot.threads,
         &fresh_readiness,
         0,
         0,
@@ -452,7 +477,7 @@ async fn evaluate_row(
     // PR's OWN head commit moving, never this LOCAL fact. Without this, a re-proposal that
     // adds or replaces this consumer's dependency in the window between the read above and
     // `run_gh_merge` actually executing would merge a consumer whose upstream just changed,
-    // with no backstop at all — CI/review/conflict staleness in that same window is at least
+    // with no backstop at all — CI/review/threads/conflict staleness in that same window is at least
     // partly covered by GitHub's OWN branch-protection enforcement, but this axis is purely a
     // Weft-side invariant that only Weft can protect. This is INTENTIONALLY separate from (and
     // does not touch) `record_upstream_edges`'s two-pass write-ordering mechanism (round 5+6):
@@ -567,6 +592,7 @@ async fn evaluate_and_execute_merge(
         host_kind,
         gate::parse_lifecycle(&current.lifecycle),
         &gate::parse_ci(&current.ci_status),
+        &gate::parse_threads(&current.thread_status),
         &gate::parse_readiness(&current.merge_readiness),
         current.probe_fail_count,
         gate::age_secs(&current.last_checked_at, &now),
@@ -667,8 +693,10 @@ async fn maybe_merge_one(
     let (state, state_error) = match &confirmed {
         Ok(s) => {
             let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
-            let r = judge::merge_readiness(&s.ci, &s.review, &s.conflict, &upstream);
-            if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, s, &r).await {
+            let r = judge::merge_readiness(&s.ci, &s.review, &s.threads, &s.conflict, &upstream);
+            if let Err(e) =
+                repo::apply_pull_request_snapshot(db, pr.id, s, &r, repo::StreakUpdate::Leave).await
+            {
                 eprintln!(
                     "[weft][automerge] pr #{}: could not save confirmation snapshot: {e}",
                     pr.id
@@ -903,7 +931,9 @@ fn is_enabled(raw: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{CiStatus, ConflictStatus, MergeReadiness, PrHost, PrSnapshot, ReviewStatus};
+    use crate::host::{
+        CiStatus, ConflictStatus, MergeReadiness, PrHost, PrSnapshot, ReviewStatus, ThreadStatus,
+    };
     use sea_orm::ConnectionTrait;
 
     type EvaluationProbe = (
@@ -1166,6 +1196,39 @@ mod tests {
             lifecycle: PrLifecycle::Open,
             ci: CiStatus::Failing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
+            conflict: ConflictStatus::Clean,
+        })))
+    }
+
+    /// A fresh read showing a NEW review round opened since the stored
+    /// snapshot: still open, still green, still approved — and now with
+    /// unresolved threads.
+    fn resolver_fresh_threads_unresolved(_: HostKind) -> Result<Box<dyn PrHost>, HostError> {
+        Ok(Box::new(FakeHost(PrSnapshot {
+            head_sha: "fresh_sha_threads_unresolved".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: PrLifecycle::Open,
+            ci: CiStatus::Passing,
+            review: ReviewStatus::Approved,
+            threads: ThreadStatus::Unresolved { count: 2 },
+            conflict: ConflictStatus::Clean,
+        })))
+    }
+
+    /// A fresh read whose thread query failed — the PARTIAL-read shape.
+    fn resolver_fresh_threads_unknown(_: HostKind) -> Result<Box<dyn PrHost>, HostError> {
+        Ok(Box::new(FakeHost(PrSnapshot {
+            head_sha: "fresh_sha_threads_unknown".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: PrLifecycle::Open,
+            ci: CiStatus::Passing,
+            review: ReviewStatus::Approved,
+            threads: ThreadStatus::Unknown { reason: "no access".to_string() },
             conflict: ConflictStatus::Clean,
         })))
     }
@@ -1179,6 +1242,7 @@ mod tests {
             lifecycle: PrLifecycle::Merged,
             ci: CiStatus::Passing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         })))
     }
@@ -1192,6 +1256,7 @@ mod tests {
             lifecycle: PrLifecycle::Open,
             ci: CiStatus::Passing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         })))
     }
@@ -1290,9 +1355,12 @@ mod tests {
             lifecycle: PrLifecycle::Open,
             ci: CiStatus::Passing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         };
-        repo::apply_pull_request_snapshot(db, pr.id, &stored, &MergeReadiness::Ready).await.unwrap();
+        repo::apply_pull_request_snapshot(db, pr.id, &stored, &MergeReadiness::Ready, repo::StreakUpdate::Clear)
+            .await
+            .unwrap();
         repo::set_setting(db, K_AUTO_MERGE_ENABLED, "1").await.unwrap();
         repo::get_pull_request(db, pr.id).await.unwrap().unwrap()
     }
@@ -1316,6 +1384,96 @@ mod tests {
         let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
         assert_eq!(reloaded.head_sha, "fresh_sha_ci_failing");
         assert_eq!(gate::parse_ci(&reloaded.ci_status), CiStatus::Failing);
+    }
+
+    /// The scenario this whole axis exists for, end-to-end through the real
+    /// evaluation path rather than the pure gate alone: a reviewer opens a
+    /// new round between two sweeps. The stored row still reads Ready from
+    /// before, CI is still green, GitHub still says APPROVED — the ONLY thing
+    /// that changed is that threads are open. Without the axis this merged.
+    #[tokio::test]
+    async fn evaluate_row_refuses_when_the_fresh_read_shows_unresolved_review_threads() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let backoff = MergeBackoffState::default();
+
+        let verdict =
+            evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_threads_unresolved).await;
+
+        assert_eq!(
+            verdict,
+            RowVerdict::Skip,
+            "open review threads must stop an otherwise-ready merge"
+        );
+        // And the fresh reading is persisted, proving the refusal came from
+        // the live read rather than from the row never being re-evaluated.
+        let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.head_sha, "fresh_sha_threads_unresolved");
+        assert_eq!(
+            gate::parse_threads(&reloaded.thread_status),
+            ThreadStatus::Unresolved { count: 2 }
+        );
+    }
+
+    /// This loop is the SECOND writer of `probe_fail_count`, and that makes
+    /// it able to silently undo the monitor's give-up bookkeeping: if it
+    /// reported a partial read as an unqualified success, it would zero the
+    /// streak the monitor is accumulating on every one of its own sweeps, so
+    /// a permanently unreadable thread axis would never reach the threshold
+    /// — the Codex round 2 P2 bug, reintroduced through this path whenever
+    /// auto-merge happens to be enabled. Both writers derive it from the same
+    /// `PrSnapshot::unreadable_axis_error`, and this is what pins that.
+    #[tokio::test]
+    async fn a_partial_fresh_read_leaves_the_monitors_failure_streak_untouched() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let backoff = MergeBackoffState::default();
+        assert_eq!(pr.probe_fail_count, 0, "the row this loop LOADED had a clean streak");
+
+        // The reported race, made deterministic: between this loop loading
+        // the row and writing its snapshot, the monitor observed nine
+        // consecutive failures. `apply_pull_request_snapshot` re-reads the
+        // CURRENT row, so an incrementing write here would take it to 10 —
+        // past `list_open_pull_requests`'s threshold — and because only the
+        // monitor posts the action-required notice AND its next query
+        // excludes rows at the threshold, the row would leave monitoring
+        // wearing its stale "still retrying" note, permanently.
+        let threshold = crate::host::monitor::MAX_CONSECUTIVE_PROBE_FAILURES;
+        for _ in 0..(threshold - 1) {
+            repo::mark_pull_request_probe_error(&db, pr.id, "monitor saw this fail").await.unwrap();
+        }
+        assert!(
+            !repo::list_open_pull_requests(&db, threshold).await.unwrap().is_empty(),
+            "still inside the sweep at one below the threshold"
+        );
+
+        // `pr` is deliberately the STALE copy, exactly as the real loop holds
+        // it — its `probe_fail_count` of 0 is what gets it past the
+        // pre-filter in the first place.
+        let verdict =
+            evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_threads_unknown).await;
+        assert_eq!(verdict, RowVerdict::Skip, "an unreadable axis can never authorize a merge");
+
+        let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.probe_fail_count,
+            threshold - 1,
+            "this loop must not move the streak in EITHER direction — not clear it (which would \
+             erase what the monitor is accumulating) and not extend it (which would push the row \
+             out of the sweep with no escalation notice ever posted)"
+        );
+        assert_eq!(
+            reloaded.last_error, "monitor saw this fail",
+            "and must not overwrite the monitor's diagnostic"
+        );
+        assert!(
+            !repo::list_open_pull_requests(&db, threshold).await.unwrap().is_empty(),
+            "the row must still be swept, so the monitor can reach the threshold itself and \
+             actually post the action-required notice"
+        );
+        // The readable axes still landed — that is why a partial read is
+        // persisted at all rather than thrown away.
+        assert_eq!(reloaded.head_sha, "fresh_sha_threads_unknown");
     }
 
     #[tokio::test]

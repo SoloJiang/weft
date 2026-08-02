@@ -859,7 +859,7 @@ async fn register_pr_tool(
     .await
     {
         Ok(pr) => text_result(format!(
-            "tracking {} #{} — weft will monitor its CI/review/conflict state in the background and post to Needs-you if it needs your attention",
+            "tracking {} #{} — weft will monitor its CI, review, unresolved review threads and conflict state in the background and post to Needs-you if it needs your attention",
             parts.host_kind.native_noun(),
             pr.number
         )),
@@ -1578,7 +1578,7 @@ fn tool_specs() -> Value {
         },
         {
             "name": "register_pr",
-            "description": "Tell weft you just opened a pull request for this task, so it tracks CI, review, and conflict state in the background and posts to Needs-you if something needs you — instead of that state only living in this conversation (which doesn't survive a restart). Call this right after `gh pr create` succeeds, with the URL it printed. Re-calling it for the same PR (e.g. after a restart) just refreshes context, it does not duplicate tracking. GitHub only for now — a GitLab merge request URL is recognized but currently REJECTED (not yet supported), so don't rely on this for GitLab repos.",
+            "description": "Tell weft you just opened a pull request for this task, so it tracks CI, review, unresolved review threads, and conflict state in the background and posts to Needs-you if something needs you — instead of that state only living in this conversation (which doesn't survive a restart). Call this right after `gh pr create` succeeds, with the URL it printed. Re-calling it for the same PR (e.g. after a restart) just refreshes context, it does not duplicate tracking. GitHub only for now — a GitLab merge request URL is recognized but currently REJECTED (not yet supported), so don't rely on this for GitLab repos.",
             "inputSchema": { "type": "object",
                 "properties": {
                     "url": { "type": "string", "description": "The PR web URL, e.g. https://github.com/owner/repo/pull/123 — host, owner, repo, and number are all parsed from this." },
