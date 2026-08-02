@@ -639,6 +639,24 @@ pub async fn list_threads(db: &Db, workspace_id: i32) -> Result<Vec<thread::Mode
         .await?)
 }
 
+/// Deduped thread ids that own at least one direction in `repo_id` — issue #160
+/// round-22 P1 (Codex computer_srv.rs:385). `delete_repo` removes those
+/// directions (the threads themselves survive), so its caller revokes these
+/// threads' computer routes; `session_is_live` then refuses the removed
+/// directions while still allowing each thread's surviving ones.
+pub async fn thread_ids_for_repo(db: &Db, repo_id: i32) -> Result<Vec<i32>> {
+    let mut ids: Vec<i32> = direction::Entity::find()
+        .filter(direction::Column::RepoId.eq(repo_id))
+        .all(&db.0)
+        .await?
+        .into_iter()
+        .map(|d| d.thread_id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
 pub async fn list_repos(db: &Db, workspace_id: i32) -> Result<Vec<repo_ref::Model>> {
     Ok(repo_ref::Entity::find()
         .filter(repo_ref::Column::WorkspaceId.eq(workspace_id))

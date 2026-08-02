@@ -1847,6 +1847,21 @@ pub fn trip_stop_latch() -> u64 {
 /// which value the DISK ends up with once both writes land.
 pub async fn persist_stop(db: &crate::store::Db, my_gen: u64) -> Result<(), String> {
     let _serialize = enable_serialize_mutex().lock().await;
+    // issue #160 round-22 P2 (Codex computer/mod.rs:1849): only persist "false"
+    // if THIS Stop is STILL the current truth. `enable_serialize_mutex` orders
+    // lock ATTEMPTS, not the user-visible calls that preceded them — so a later
+    // Settings re-enable that reached the lock FIRST has already written "true"
+    // and cleared the latch, and writing "false" now would silently revert that
+    // newer, explicit enable on disk while the UI reports it succeeded. Re-read
+    // the latch under its own lock: if it is no longer tripped (a re-enable
+    // cleared it) or a NEWER Stop has since bumped the generation (that call
+    // owns writing "false" for its OWN outcome), skip this stale write.
+    {
+        let guard = stop_state().lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.stopped || guard.generation != my_gen {
+            return Ok(());
+        }
+    }
     let result = crate::store::repo::set_setting(db, K_COMPUTER_USE_ENABLED, "false")
         .await
         .map_err(|e| e.to_string());
@@ -1963,6 +1978,19 @@ fn escape_shortcut() -> tauri_plugin_global_shortcut::Shortcut {
 fn register_global_escape() -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
     let Some(app) = APP_HANDLE.get() else { return Ok(()) };
+    // issue #160 round-22 P1 (Codex computer/mod.rs:2081): clear any prior
+    // bare-Escape registration FIRST. A control lease that EXPIRED between the
+    // banner's cleanup polls leaves the OLD shortcut still registered at the OS;
+    // registering the same accelerator again then fails ("already registered"),
+    // so a fresh `acquire_control` rolls back — clearing its new holder WITHOUT
+    // ever unregistering the stale shortcut, which would then stay globally
+    // intercepting Escape with no live lease until restart. A best-effort
+    // unregister here is idempotent (a no-op when nothing is registered) and
+    // makes the re-registration below deterministic. `unregister` is safe to
+    // call here — it never re-enters this module synchronously (the Escape
+    // callback runs on a later spawned task), same as `sync_shortcut_state`'s
+    // own reasoning.
+    let _ = app.global_shortcut().unregister(escape_shortcut());
     let result = app.global_shortcut().on_shortcut(escape_shortcut(), |app, _shortcut, event| {
         if event.state != tauri_plugin_global_shortcut::ShortcutState::Pressed {
             return;

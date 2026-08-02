@@ -130,9 +130,26 @@ async fn delete_workspace_after_fence(
     for repo_id in repo_paths.keys() {
         crate::curator::run_forget(*repo_id);
     }
+    // issue #160 round-22 (Codex computer_srv.rs:385 + commands.rs:1462):
+    // collect this workspace's thread ids BEFORE the cascade removes their rows,
+    // so the bulk delete can revoke each thread's computer routes AND drop its
+    // computer-output subtree — `delete_thread` does both for the single-thread
+    // path, but this bulk path previously did neither, leaving stale valid
+    // bearers accepted and screenshots/audit logs orphaned under
+    // `WEFT_HOME/computer/<thread>`.
+    let doomed_threads: Vec<i32> = repo::list_threads(db, workspace_id)
+        .await
+        .map_err(e)?
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
     let removed = repo::delete_workspace_cascade(db, workspace_id)
         .await
         .map_err(e)?;
+    for thread_id in &doomed_threads {
+        crate::bus::computer_srv::revoke_computer_routes(*thread_id);
+        crate::bus::computer_srv::remove_computer_output_for_thread(*thread_id);
+    }
     extend_removed_repo_paths(db, &mut repo_paths, &removed).await?;
     for (wt_id, repo_id, path, branch, created_branch, created_checkout) in &removed {
         // The worktree's code-checkpoint shadow repo goes with it (its rows
@@ -728,7 +745,16 @@ pub async fn delete_repo(
     // Forget before the cascade so any in-flight curator pass sees the deletion
     // as early as possible and does not publish stale running/done state.
     crate::curator::run_forget(repo_id);
+    // issue #160 round-22 P1 (Codex computer_srv.rs:385): revoke computer routes
+    // for every thread that owns a direction in this repo BEFORE the cascade
+    // removes those directions. The threads themselves survive, so their output
+    // subtree is NOT dropped (unlike the workspace delete); `session_is_live`
+    // refuses the removed directions while allowing each thread's surviving ones.
+    let doomed_threads = repo::thread_ids_for_repo(&db, repo_id).await.map_err(e)?;
     let removed = repo::delete_repo_cascade(&db, repo_id).await.map_err(e)?;
+    for thread_id in &doomed_threads {
+        crate::bus::computer_srv::revoke_computer_routes(*thread_id);
+    }
     // Gate worktree removal on created_checkout (a reused pre-existing path must
     // survive) and branch deletion on created_branch (a pre-existing branch reused
     // by the -b fallback survives repo deletion). cleanup_worktrees cannot be used

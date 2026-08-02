@@ -219,14 +219,18 @@ export function ComputerControlBanner() {
           lastServerStopFailedRef.current = next;
           setServerStopFailed(next);
         }
-        // round-16 P2: a fulfilled poll landing on enabled === true means a human
-        // just re-enabled computer use from Settings, which is the same backend
-        // path that clears the persist-failed flag — so it's recovery confirmation
-        // on its own, independent of whether round-15's transition above ever saw
-        // the intervening `true`. enabled === false clears nothing here: a
-        // disabled state doesn't tell us a prior local failure was handled.
+        // round-16 P2 / issue #160 round-22 P1 (Codex ComputerControlBanner.tsx:230):
+        // a fulfilled enabled === true poll clears the SERVER persist-failure
+        // tracking (a re-enable is the same backend path that clears it), but it
+        // must NOT clear the LOCAL Stop-failure warning. `enabled === true` is
+        // ambiguous: it can mean a human re-enabled from Settings OR that a
+        // `computerEmergencyStop` rejected CLIENT-side (a transient IPC failure)
+        // never reached the backend at all — so computer use was never disabled and
+        // the agent may still hold control. Clearing `localStopFailed` on that value
+        // would drop the kill-switch warning with no real recovery having occurred.
+        // The local warning now clears ONLY on an explicit successful Stop retry (see
+        // the `stop` callback below); `enabled === false` still clears nothing.
         if (enabledResult.status === "fulfilled" && enabledResult.value) {
-          setLocalStopFailed(false);
           lastServerStopFailedRef.current = false;
         }
       } finally {

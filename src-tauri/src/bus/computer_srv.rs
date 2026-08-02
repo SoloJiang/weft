@@ -664,6 +664,18 @@ async fn run_action(
             if !computer::enabled(db).await {
                 return Err(ComputerError::Disabled.to_string());
             }
+            // issue #160 round-22 P1 (Codex computer_srv.rs:664): re-check the
+            // session's liveness after the observe queue too. A thread deleted
+            // while this `list_windows` sat waiting for a permit records a route
+            // revocation but does NOT flip `enabled`, so without this a
+            // standing-granted caller would still enumerate the desktop under a
+            // deleted identity — the input arms' `recheck_after_guard` closes
+            // the same gap for injection, this closes it for enumeration. Gated
+            // on the revocation set: a never-deleted thread pays only the
+            // lock-only lookup, never the `session_is_live` DB check.
+            if computer_routes_revoked(thread) && !session_is_live(db, thread, dir, wt).await {
+                return Err(SESSION_GONE_MSG.to_string());
+            }
             let b = backend::backend();
             // issue #160 round-16 P1 (Codex 605): the enumeration itself
             // moves onto tokio's blocking pool — see `on_blocking`'s own doc

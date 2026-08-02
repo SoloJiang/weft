@@ -3879,28 +3879,34 @@ async fn spawn_acp_turn(
     let mcp = if base.is_empty() {
         vec![]
     } else if sid.is_none() {
-        // Lead-kind engine: choose MCP from thread kind.
-        let kind = repo::get_thread(&db, thread_id_i)
-            .await
-            .ok()
-            .flatten()
-            .map(|th| th.kind)
-            .unwrap_or_default();
-        match kind.as_str() {
-            // Concierge: weft_global only (never bus, never computer).
-            "concierge" => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, "lead", false, false, true, false, false, None,
-            ),
-            // Curator: curator MCP + bus under LEAD identity (never computer).
-            "curator" => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, crate::bus::LEAD, true, false, false, true, false, None,
-            ),
-            // Issue lead: planner + bus + computer (always injected, gated
-            // server-side). No worktree of its own (issue #160 round-2 P2
-            // §5) — always `None`.
-            _ => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, crate::bus::LEAD, true, true, false, false, true, None,
-            ),
+        // Lead-kind engine: choose MCP from thread kind. issue #160 round-22 P1
+        // (Codex engine.rs:3902): a TRANSIENT `get_thread` failure must fail
+        // CLOSED — the old `.ok().flatten()...unwrap_or_default()` collapsed an
+        // error into `""`, which the `_` arm below classifies as an issue lead
+        // and injects `weft_computer` into, even for a concierge/curator lead
+        // that must NEVER receive it (and whose bearer would then work once the
+        // DB recovers, an existing Full grant authorizing input with no card).
+        // On a lookup ERROR inject NO MCP servers at all this open (the turn
+        // still runs; it simply gets no injected server, and definitely not
+        // computer-use); a genuine `Ok(None)` keeps the prior default.
+        match repo::get_thread(&db, thread_id_i).await {
+            Err(_) => vec![],
+            Ok(row) => match row.map(|th| th.kind).unwrap_or_default().as_str() {
+                // Concierge: weft_global only (never bus, never computer).
+                "concierge" => crate::bus::inject::acp_mcp_servers(
+                    &base, thread_id_i, "lead", false, false, true, false, false, None,
+                ),
+                // Curator: curator MCP + bus under LEAD identity (never computer).
+                "curator" => crate::bus::inject::acp_mcp_servers(
+                    &base, thread_id_i, crate::bus::LEAD, true, false, false, true, false, None,
+                ),
+                // Issue lead: planner + bus + computer (always injected, gated
+                // server-side). No worktree of its own (issue #160 round-2 P2
+                // §5) — always `None`.
+                _ => crate::bus::inject::acp_mcp_servers(
+                    &base, thread_id_i, crate::bus::LEAD, true, true, false, false, true, None,
+                ),
+            },
         }
     } else {
         // Worker: bus under direction id + computer (always injected,
