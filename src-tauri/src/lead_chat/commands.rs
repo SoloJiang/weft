@@ -3423,9 +3423,19 @@ pub(crate) async fn post_repo_action_feedback_from_journal(
     // inserted before Phase 1 is absorbed in FIFO order, while a row inserted
     // after Phase 1 is unambiguously a later follow-up.
     let delivery = engine::with_admission_gate(lead_key(execution.thread_id), || async {
-        repo::enqueue_repo_action_feedback_from_journal(db, execution_id)
-            .await
-            .map_err(|error| error.to_string())
+        if let Some(existing) = repo::get_lead_hidden_delivery_by_dedupe(
+            db,
+            &format!("repo_action:{execution_id}"),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        {
+            Ok(Some(existing))
+        } else {
+            repo::enqueue_repo_action_feedback_from_journal(db, execution_id)
+                .await
+                .map_err(|error| error.to_string())
+        }
     })
     .await?;
     let Some(delivery) = delivery else {

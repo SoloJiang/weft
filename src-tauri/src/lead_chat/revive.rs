@@ -312,7 +312,6 @@ async fn nudge_engine_if_idle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{ActiveModelTrait, Set};
 
     async fn fixture(db: &Db) -> (i32, i32, i32) {
         let workspace = repo::create_workspace(db, "ws").await.unwrap();
@@ -462,58 +461,41 @@ mod tests {
         repo::set_lead_status(&db, thread.id, "stopped")
             .await
             .unwrap();
-        let repo_ref = repo::add_repo_ref(
-            &db,
-            workspace.id,
-            "repo",
-            "/tmp/revive-repo",
-            "main",
-            "",
-            true,
-        )
-        .await
-        .unwrap();
-        let execution = crate::store::entities::repo_action_execution::ActiveModel {
-            id: Set(41),
-            workspace_id: Set(workspace.id),
-            thread_id: Set(thread.id),
-            message_id: Set(0),
-            action_id: Set("repo-action-41".to_string()),
-            action_kind: Set("add".to_string()),
-            invocation_fingerprint: Set("restart-fingerprint-41".to_string()),
-            execution_token: Set("restart-token-41".to_string()),
-            status: Set(repo::REPO_ACTION_COMPLETED.to_string()),
-            target_path: Set(repo_ref.local_git_path.clone()),
-            staging_path: Set(String::new()),
-            repo_id: Set(repo_ref.id),
-            repo_name: Set(repo_ref.name.clone()),
-            feedback_state: Set(repo::REPO_ACTION_FEEDBACK_PENDING.to_string()),
-            feedback_payload: Set(
-                r#"{"tool":"repo_action","execution_id":41,"status":"ok"}"#
-                    .to_string(),
-            ),
-            cleanup_preserve_target: Set(false),
-            created_at: Set(String::new()),
-            updated_at: Set(String::new()),
-        }
-        .insert(&db.0)
-        .await
-        .unwrap();
-        let older = repo::enqueue_lead_hidden_delivery(
-            &db,
-            thread.id,
-            "repo_action",
-            execution.id,
-            "repo_action:41",
-            r#"{"tool":"repo_action","execution_id":41,"status":"ok"}"#,
-        )
-        .await
-        .unwrap();
-        let card = repo::insert_lead_message(
+        let action_card = repo::insert_lead_message(
             &db,
             thread.id,
             None,
             1,
+            "assistant",
+            "action_card",
+            r#"{"title":"Create repo","actions":[{"id":"repo-action-41","kind":"new","label":"Run"}]}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let target = root.path().join("repo-target");
+        let execution = crate::commands::test_complete_repo_action_for_restart(
+            &db,
+            workspace.id,
+            thread.id,
+            action_card.id,
+            "repo-action-41",
+            &target,
+        )
+        .await
+        .unwrap();
+        let older = repo::get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{}", execution.id),
+        )
+        .await
+        .unwrap()
+        .expect("completion transaction must insert the repo hidden row");
+        let card = repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            2,
             "assistant",
             "plan_card",
             r#"{"title":"Ship it","requirements":[],"approach":"","split":[],"risks":[]}"#,
@@ -571,6 +553,14 @@ mod tests {
         repo::consume_lead_hidden_delivery(&db, older.id)
             .await
             .unwrap();
+        assert_eq!(
+            repo::get_repo_action_execution_by_id(&db, execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .feedback_state,
+            repo::REPO_ACTION_FEEDBACK_DELIVERED
+        );
         repo::consume_lead_hidden_delivery(&db, newer.id)
             .await
             .unwrap();

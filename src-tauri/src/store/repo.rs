@@ -337,6 +337,37 @@ fn repo_action_feedback_payload_is_canonical(
             .is_some_and(|path| !path.trim().is_empty())
 }
 
+/// Insert the canonical repo-action hidden row on the caller's existing
+/// transaction. Completion uses this as its final write before commit, while
+/// startup/journal repair reuses the same idempotent path when an older row is
+/// missing. A delivered journal is never resurrected here: only the pending
+/// feedback state still represents an unacknowledged agent handoff.
+async fn enqueue_repo_action_feedback_for_completed_on<C: ConnectionTrait>(
+    connection: &C,
+    execution: &repo_action_execution::Model,
+) -> Result<Option<lead_hidden_delivery::Model>> {
+    if execution.status != REPO_ACTION_COMPLETED
+        || execution.feedback_state != REPO_ACTION_FEEDBACK_PENDING
+    {
+        return Ok(None);
+    }
+    let payload: serde_json::Value = serde_json::from_str(&execution.feedback_payload)
+        .map_err(|error| anyhow::anyhow!("invalid repo action feedback payload: {error}"))?;
+    if !repo_action_feedback_payload_is_canonical(execution, &payload) {
+        anyhow::bail!("repo action feedback journal payload is not canonical");
+    }
+    let delivery = enqueue_lead_hidden_delivery_on(
+        connection,
+        execution.thread_id,
+        "repo_action",
+        execution.id,
+        &format!("repo_action:{}", execution.id),
+        &execution.feedback_payload,
+    )
+    .await?;
+    Ok(Some(delivery))
+}
+
 /// Load the authoritative completed repo-action journal and enqueue its exact
 /// canonical feedback payload. No caller-supplied thread or payload is trusted;
 /// the journal row is re-read inside the same transaction as the hidden outbox
@@ -353,27 +384,11 @@ pub(crate) async fn enqueue_repo_action_feedback_from_journal(
         txn.rollback().await?;
         return Ok(None);
     };
-    if execution.status != REPO_ACTION_COMPLETED
-        || execution.feedback_state != REPO_ACTION_FEEDBACK_PENDING
-    {
+    let Some(delivery) = enqueue_repo_action_feedback_for_completed_on(&txn, &execution).await?
+    else {
         txn.rollback().await?;
         return Ok(None);
-    }
-    let payload: serde_json::Value = serde_json::from_str(&execution.feedback_payload)
-        .map_err(|error| anyhow::anyhow!("invalid repo action feedback payload: {error}"))?;
-    if !repo_action_feedback_payload_is_canonical(&execution, &payload) {
-        txn.rollback().await?;
-        anyhow::bail!("repo action feedback journal payload is not canonical");
-    }
-    let delivery = enqueue_lead_hidden_delivery_on(
-        &txn,
-        execution.thread_id,
-        "repo_action",
-        execution.id,
-        &format!("repo_action:{}", execution.id),
-        &execution.feedback_payload,
-    )
-    .await?;
+    };
     txn.commit().await?;
     Ok(Some(delivery))
 }
@@ -6077,6 +6092,14 @@ pub async fn complete_repo_action_execution(
         .await?
         .ok_or_else(|| anyhow::anyhow!("action_card_stale"))?;
     if execution.status == REPO_ACTION_COMPLETED {
+        if execution.feedback_state == REPO_ACTION_FEEDBACK_PENDING {
+            if let Err(error) =
+                enqueue_repo_action_feedback_for_completed_on(&txn, &execution).await
+            {
+                let _ = txn.rollback().await;
+                return Err(error);
+            }
+        }
         txn.commit().await?;
         return Ok(execution);
     }
@@ -6193,6 +6216,10 @@ pub async fn complete_repo_action_execution(
         .one(&txn)
         .await?
         .ok_or_else(|| anyhow::anyhow!("action_card_stale"))?;
+    if let Err(error) = enqueue_repo_action_feedback_for_completed_on(&txn, &completed).await {
+        let _ = txn.rollback().await;
+        return Err(error);
+    }
     txn.commit().await?;
     Ok(completed)
 }
@@ -15692,6 +15719,86 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn repo_action_completion_rolls_back_when_hidden_outbox_insert_fails() {
+        let db = mem().await;
+        let workspace = create_workspace(&db, "atomic-complete").await.unwrap();
+        let repo = add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/atomic-complete",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let card = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "action_card",
+            r#"{"title":"Add repo","actions":[{"id":"atomic","kind":"add","label":"Run"}]}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let execution = insert_test_repo_action_execution(
+            &db,
+            9201,
+            workspace.id,
+            thread.id,
+            card.id,
+            &repo,
+            "atomic",
+            REPO_ACTION_FEEDBACK_NONE,
+        )
+        .await;
+        let mut materialized: repo_action_execution::ActiveModel = execution.clone().into();
+        materialized.status = Set(REPO_ACTION_MATERIALIZED.to_string());
+        materialized.feedback_payload = Set(String::new());
+        let execution = materialized.update(&db.0).await.unwrap();
+
+        db.0
+            .execute_unprepared(
+                "CREATE TRIGGER fail_hidden_delivery_insert BEFORE INSERT ON lead_hidden_delivery \
+                 BEGIN SELECT RAISE(ABORT, 'forced hidden outbox failure'); END;",
+            )
+            .await
+            .unwrap();
+        let error = complete_repo_action_execution(&db, &execution, &repo)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("forced hidden outbox failure"));
+
+        let retained = get_repo_action_execution_by_id(&db, execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.status, REPO_ACTION_MATERIALIZED);
+        assert_eq!(retained.feedback_state, REPO_ACTION_FEEDBACK_NONE);
+        assert!(!action_card_is_resolved(
+            &get_lead_message(&db, card.id).await.unwrap().unwrap().content
+        ));
+        assert!(get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{}", execution.id)
+        )
+        .await
+        .unwrap()
+        .is_none());
+        db.0
+            .execute_unprepared("DROP TRIGGER fail_hidden_delivery_insert")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

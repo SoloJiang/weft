@@ -611,6 +611,55 @@ async fn complete_admitted_repo_action(
     Ok(())
 }
 
+/// Test-only production-path seam for a durable restart regression. It drives
+/// the same claim → materialize → register → complete sequence as the guarded
+/// `new` repository command, including the completion transaction's atomic
+/// hidden-row insert.
+#[cfg(test)]
+pub(crate) async fn test_complete_repo_action_for_restart(
+    db: &Db,
+    workspace_id: i32,
+    thread_id: i32,
+    message_id: i32,
+    action_id: &str,
+    target: &std::path::Path,
+) -> R<entities::repo_action_execution::Model> {
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| "action_card_stale".to_string())?;
+    let target = std::fs::canonicalize(target.parent().unwrap_or(target))
+        .map_err(|error| error.to_string())?
+        .join(file_name);
+    let fingerprint = repo_action_fingerprint(&["new", &target.to_string_lossy(), "checkout"]);
+    let admission = admit_repo_action(
+        db,
+        workspace_id,
+        Some(thread_id),
+        Some(message_id),
+        Some(action_id),
+        Some("new"),
+        "new",
+        &fingerprint,
+        &target,
+        target.parent(),
+    )
+    .await?;
+    let Some(mut admission) = admission else {
+        return Err("action_card_stale".to_string());
+    };
+    let materialized = materialize_repo_action(db, &mut admission, crate::git::init_repo).await?;
+    let repo_ref = register_repo_without_schedule(
+        db,
+        workspace_id,
+        "checkout",
+        &materialized.to_string_lossy(),
+        Some(&admission._os_lock),
+    )
+    .await?;
+    complete_admitted_repo_action(db, &mut admission, &repo_ref).await?;
+    Ok(admission.execution)
+}
+
 const REPO_ACTION_TOKEN_MARKER: &str = "weft-action-token";
 
 fn repo_action_target_has_token(path: &std::path::Path, token: &str) -> bool {
@@ -4945,10 +4994,25 @@ mod tests {
         assert_eq!(execution.status, repo::REPO_ACTION_COMPLETED);
         assert_eq!(execution.repo_id, first.repo.id);
         assert_eq!(execution.feedback_state, repo::REPO_ACTION_FEEDBACK_PENDING);
+        let first_hidden = repo::get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{}", execution.id),
+        )
+        .await
+        .unwrap()
+        .expect("completion must atomically create the hidden outbox row");
         let payload: serde_json::Value = serde_json::from_str(&execution.feedback_payload).unwrap();
         assert_eq!(payload["execution_id"], execution.id);
         assert_eq!(payload["action_id"], "add");
         assert_eq!(payload["status"], "ok");
+        let replay_hidden = repo::get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{}", execution.id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(replay_hidden.id, first_hidden.id);
 
         let deliveries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let execution_id = execution.id;
@@ -5001,6 +5065,35 @@ mod tests {
             repo::REPO_ACTION_FEEDBACK_DELIVERED
         );
 
+        let replay_after_delivery = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "local".to_string(),
+            local.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("add".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay_after_delivery.outcome,
+            RepoActionExecutionOutcome::Replayed
+        );
+        let retained_hidden = repo::get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{}", execution.id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(retained_hidden.id, first_hidden.id);
+        assert_eq!(
+            retained_hidden.state,
+            repo::LEAD_HIDDEN_DELIVERY_CONSUMED
+        );
+
         let wrong_args = add_repo_ref_inner(
             &db,
             workspace.id,
@@ -5040,6 +5133,22 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_repo_action_lock_handoff(&execution.execution_token);
+        let hidden = repo::get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{execution_id}"),
+        )
+        .await
+        .unwrap()
+        .expect("completion must atomically create the hidden outbox row");
+        repo::delete_lead_hidden_deliveries_for_thread(&db, thread.id)
+            .await
+            .unwrap();
+        assert!(
+            repo::get_lead_hidden_delivery(&db, hidden.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let callback_count = std::sync::Arc::new(AtomicUsize::new(0));
         let callback_count_for_drain = callback_count.clone();
         assert!(!drain_repo_action_feedback_with(&db, execution_id, move |_, _| async move {
