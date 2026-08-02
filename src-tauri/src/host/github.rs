@@ -345,6 +345,13 @@ struct RawThreadsPage {
 ///     stopped early (a rate limit, a truncated pipe), so the threads most
 ///     likely to be unresolved are precisely the ones missing. This check is
 ///     what makes the pagination contract verified rather than assumed.
+///
+/// An OUTDATED thread (the code under it changed) still counts when it is
+/// unresolved. That is not leniency traded away: GitHub does not auto-resolve
+/// those, and its own "Require conversation resolution before merging" branch
+/// protection blocks on them too — so counting them keeps this gate aligned
+/// with the server-side rule it is meant to anticipate, rather than quietly
+/// admitting a class of open thread the host itself would refuse.
 fn parse_review_threads_json(raw: &str) -> Result<ThreadStatus, String> {
     let mut unresolved: u32 = 0;
     let mut pages = 0usize;
@@ -672,12 +679,37 @@ mod tests {
     }
 
     /// GraphQL reports partial failures in-band, in a response that is itself
-    /// perfectly well-formed JSON.
+    /// perfectly well-formed JSON — in two shapes. A field-level failure
+    /// carries `data: null`; a query-level one (validation, a bad token)
+    /// omits `data` ENTIRELY. Both must reach the `errors` branch and keep
+    /// the server's own diagnostic, rather than the second one dying as a
+    /// generic decode failure that says nothing useful. Serde's implicit
+    /// treatment of `Option` fields as optional is what makes the second
+    /// shape decode at all, so it is pinned here rather than assumed.
     #[test]
     fn an_in_band_graphql_error_is_unknown_even_though_the_json_parses() {
-        let raw = r#"{"data":null,"errors":[{"message":"Resource not accessible"}]}"#;
-        let err = parse_review_threads_json(raw).unwrap_err();
-        assert!(err.contains("Resource not accessible"), "got: {err}");
+        for raw in [
+            r#"{"data":null,"errors":[{"message":"Resource not accessible"}]}"#,
+            r#"{"errors":[{"message":"Resource not accessible"}]}"#,
+        ] {
+            let err = parse_review_threads_json(raw).unwrap_err();
+            assert!(
+                err.contains("Resource not accessible"),
+                "raw={raw} must surface the server's own message, got: {err}"
+            );
+        }
+    }
+
+    /// An outdated thread is still an open thread. GitHub does not
+    /// auto-resolve them and its own conversation-resolution branch
+    /// protection blocks on them, so neither does this.
+    #[test]
+    fn an_outdated_but_unresolved_thread_still_counts() {
+        let raw = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#;
+        assert_eq!(
+            parse_review_threads_json(raw).unwrap(),
+            ThreadStatus::Unresolved { count: 1 }
+        );
     }
 
     /// A well-formed response for a PR that isn't there must not read as
