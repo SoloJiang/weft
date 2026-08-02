@@ -683,12 +683,14 @@ fn note_turn_activity(app: &AppHandle, db: &Db, eng: &EngineRef, inner: &mut Eng
         let db = db.clone();
         let eng = eng.clone();
         let registry = inner.hidden_receipt_inflight.clone();
+        let db_for_consume = db.clone();
         tauri::async_runtime::spawn(run_hidden_receipt_worker(
+            db,
             eng,
             admission_key,
             delivery_id,
             registry,
-            async move { repo::consume_lead_hidden_delivery(&db, delivery_id).await },
+            async move { repo::consume_lead_hidden_delivery(&db_for_consume, delivery_id).await },
             HIDDEN_RECEIPT_WARNING,
             None,
         ));
@@ -810,6 +812,84 @@ fn register_hidden_receipt(inner: &mut EngineInner, delivery_id: i32) -> bool {
 type HiddenReceiptResult =
     anyhow::Result<Option<crate::store::entities::lead_hidden_delivery::Model>>;
 
+/// A receipt worker's authoritative fallback state after its DB task panics or
+/// is otherwise unable to return a result. Unknown/read-error states remain
+/// unresolved: guessing rollback would reopen a duplicate-delivery window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HiddenReceiptAuthoritativeState {
+    ConsumedOrMissing,
+    Pending,
+    Unknown,
+}
+
+async fn settle_hidden_receipt(
+    eng: &EngineRef,
+    admission_key: i64,
+    delivery_id: i32,
+    consumed: bool,
+) {
+    let _serial = admission_gate_for_key(admission_key).lock_owned().await;
+    let mut inner = eng.lock().await;
+    finish_hidden_receipt(&mut inner, delivery_id, consumed);
+}
+
+/// A panic/JoinError means the consume future did not report whether SQLite
+/// committed. Keep the shared token while repeatedly re-reading the durable row
+/// under the admission gate. Only an authoritative missing/consumed or pending
+/// state releases it; temporary read errors retain the fence and retry with
+/// backoff until the DB becomes readable (or the process is restarted).
+async fn recover_hidden_receipt_after_worker_failure(
+    eng: &EngineRef,
+    db: &Db,
+    admission_key: i64,
+    delivery_id: i32,
+) {
+    let mut backoff = std::time::Duration::from_millis(100);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+    loop {
+        let _serial = admission_gate_for_key(admission_key).lock_owned().await;
+        let state = match repo::get_lead_hidden_delivery(db, delivery_id).await {
+            Ok(None) => HiddenReceiptAuthoritativeState::ConsumedOrMissing,
+            Ok(Some(row)) if row.state == repo::LEAD_HIDDEN_DELIVERY_CONSUMED => {
+                HiddenReceiptAuthoritativeState::ConsumedOrMissing
+            }
+            Ok(Some(row)) if row.state == repo::LEAD_HIDDEN_DELIVERY_PENDING => {
+                HiddenReceiptAuthoritativeState::Pending
+            }
+            Ok(Some(row)) => {
+                eprintln!(
+                    "[weft] hidden receipt {delivery_id} has unknown durable state {:?}; retaining fence",
+                    row.state
+                );
+                HiddenReceiptAuthoritativeState::Unknown
+            }
+            Err(error) => {
+                eprintln!(
+                    "[weft] hidden receipt {delivery_id} authoritative reread failed: {error}; retaining fence"
+                );
+                HiddenReceiptAuthoritativeState::Unknown
+            }
+        };
+        match state {
+            HiddenReceiptAuthoritativeState::ConsumedOrMissing => {
+                let mut inner = eng.lock().await;
+                finish_hidden_receipt(&mut inner, delivery_id, true);
+                return;
+            }
+            HiddenReceiptAuthoritativeState::Pending => {
+                let mut inner = eng.lock().await;
+                finish_hidden_receipt(&mut inner, delivery_id, false);
+                return;
+            }
+            HiddenReceiptAuthoritativeState::Unknown => {
+                drop(_serial);
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff.saturating_mul(2), MAX_BACKOFF);
+            }
+        }
+    }
+}
+
 /// Run one hidden receipt's DB transaction to completion without holding the
 /// admission gate. The caller detaches this worker, so an admission/engine task
 /// cannot abort the transaction future at the warning threshold. The shared
@@ -817,6 +897,7 @@ type HiddenReceiptResult =
 /// observes a committed success or a definite rollback/error, then the short
 /// gate+engine cleanup linearizes the result.
 async fn run_hidden_receipt_worker<F>(
+    db: Db,
     eng: EngineRef,
     admission_key: i64,
     delivery_id: i32,
@@ -831,32 +912,51 @@ async fn run_hidden_receipt_worker<F>(
     let warning_done = completed.clone();
     let warning_registry = registry.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(warning_after).await;
-        if !warning_done.load(std::sync::atomic::Ordering::Acquire)
-            && warning_registry.contains(&delivery_id)
-        {
-            eprintln!(
-                "[weft] hidden receipt {delivery_id} still awaiting DB outcome after {:?}",
-                warning_after
-            );
-            if let Some(tx) = warning_tx {
-                let _ = tx.send(());
+        let mut warning_tx = warning_tx;
+        loop {
+            tokio::time::sleep(warning_after).await;
+            if warning_done.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            if warning_registry.contains(&delivery_id) {
+                eprintln!(
+                    "[weft] hidden receipt {delivery_id} still awaiting DB outcome after {:?}",
+                    warning_after
+                );
+                if let Some(tx) = warning_tx.take() {
+                    let _ = tx.send(());
+                }
             }
         }
     });
 
     // Do not wrap this future in `timeout`: dropping a SeaORM transaction future
-    // does not tell us whether SQLite committed or rolled back. We wait for its
-    // definitive result before releasing the shared admission token.
-    let outcome = consume.await;
-    completed.store(true, std::sync::atomic::Ordering::Release);
-    let _serial = admission_gate_for_key(admission_key).lock_owned().await;
-    let mut inner = eng.lock().await;
-    match outcome {
-        Ok(Some(_)) | Ok(None) => finish_hidden_receipt(&mut inner, delivery_id, true),
-        Err(error) => {
+    // does not tell us whether SQLite committed or rolled back. A separately
+    // spawned DB task lets this supervisor await a JoinError on panic without
+    // losing ownership of the receipt lifecycle.
+    let db_worker = tauri::async_runtime::spawn(consume);
+    match db_worker.await {
+        Ok(Ok(Some(_))) | Ok(Ok(None)) => {
+            completed.store(true, std::sync::atomic::Ordering::Release);
+            settle_hidden_receipt(&eng, admission_key, delivery_id, true).await;
+        }
+        Ok(Err(error)) => {
+            completed.store(true, std::sync::atomic::Ordering::Release);
             eprintln!("[weft] consume hidden delivery failed: {error}");
-            finish_hidden_receipt(&mut inner, delivery_id, false);
+            settle_hidden_receipt(&eng, admission_key, delivery_id, false).await;
+        }
+        Err(join_error) => {
+            eprintln!(
+                "[weft] hidden receipt worker terminated before reporting DB outcome: {join_error}; rereading"
+            );
+            recover_hidden_receipt_after_worker_failure(
+                &eng,
+                &db,
+                admission_key,
+                delivery_id,
+            )
+            .await;
+            completed.store(true, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -2201,8 +2301,9 @@ pub fn apply_persisted_meta(inner: &mut EngineInner, json: &str) {
 /// One serial admission gate per lead thread / worker session. This is kept
 /// outside [`EngineInner`] so constructors, engine replacement, and durable
 /// journal enqueue all converge on the same gate even when no engine is
-/// resident yet. The gate is always acquired before the global engine
-/// admission `RwLock`; callers must not invert that order.
+/// resident yet. The normal order is surface gate -> global engine-admission
+/// read. A destructive path that already owns the global write fence must use
+/// an admitted stop core and never reacquire a surface gate.
 static ENGINE_ADMISSION_GATES:
     std::sync::OnceLock<DashMap<i64, std::sync::Weak<tokio::sync::Mutex<()>>>> =
     std::sync::OnceLock::new();
@@ -2306,7 +2407,9 @@ impl LeadChatState {
     /// Constructors hold a read guard from their durable admission check
     /// through registry insertion/start. Destructive cascades take the write
     /// guard from their key snapshot through post-commit stop, closing the
-    /// suspended-constructor window that a DB marker alone cannot fence.
+    /// suspended-constructor window that a DB marker alone cannot fence. While
+    /// this write guard is held, callers must use admitted stop/teardown cores;
+    /// public wrappers acquire a surface gate and would invert admission order.
     pub async fn engine_admission_read(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
         self.1.clone().read_owned().await
     }
@@ -2724,12 +2827,6 @@ async fn pending_hidden_rows_at_admission(
     Ok(prepared)
 }
 
-struct PendingHiddenSpawn {
-    out: Outgoing,
-    turn_id: i32,
-    reset_epoch: u64,
-}
-
 /// Spawn the first per-turn/connection hidden delivery after its turn slot has
 /// been reserved under the engine mutex. The reservation stays ahead of every
 /// later visible send; callers roll it back on an actual spawn failure.
@@ -2777,28 +2874,69 @@ async fn spawn_hidden_turn_after_admission(
     }
 }
 
-/// Admit every pending durable hidden row before a visible user send. This is
-/// called only after `send` has acquired its engine-admission read guard, and
-/// all row-order/duplicate checks plus hidden reservations happen under one
-/// engine mutex boundary. A stopped lead is revived here only because the
-/// visible send is explicit user authorization; background hydration never
-/// calls this path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableResumeAuthorization {
+    Background,
+    Visible,
+}
+
+fn durable_batch_may_resume(
+    prepared: &[(crate::store::entities::lead_hidden_delivery::Model, String)],
+    authorization: DurableResumeAuthorization,
+) -> bool {
+    authorization == DurableResumeAuthorization::Visible
+        || prepared
+            .iter()
+            .any(|(row, _)| row.source_kind == "plan_decision")
+}
+
+/// Admit every pending durable hidden row in one ordered batch. The caller
+/// either already owns the per-surface admission guard (`Visible`) or this
+/// function acquires it (`Background`). A pending plan decision is itself an
+/// explicit persisted resume authorization, so a stopped batch containing one
+/// may clear `stopped` once before dispatching all rows in ID order.
 ///
-/// Resident tools start/write the first hidden turn while the mutex is held;
-/// per-turn/connection tools reserve the first hidden turn and spawn it before
-/// returning. Later durable rows are queued FIFO, so the visible Phase-1
-/// reservation necessarily lands behind them. No receipt is consumed here —
+/// No row after a failed resident write or per-turn/connection spawn is
+/// reserved: the first spawn is completed before the next row is queued.
 /// `note_turn_activity` remains the sole transition to delivered/consumed.
+pub(crate) async fn admit_pending_durable_batch_existing(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+) -> anyhow::Result<bool> {
+    let _admission = engine_admission_guard(app, db, eng).await?;
+    admit_pending_durable_batch_admitted(
+        app,
+        db,
+        eng,
+        DurableResumeAuthorization::Background,
+    )
+    .await
+}
+
 async fn admit_pending_durable_hidden_for_visible(
     app: &AppHandle,
     db: &Db,
     eng: &EngineRef,
 ) -> anyhow::Result<()> {
-    // Keep the engine mutex from the final pending-row snapshot through every
-    // DB state recheck and hidden reservation. The per-surface admission gate
-    // held by `send` covers the lock gap before/after this helper; retaining
-    // this mutex here closes the older stale-snapshot window where a consume
-    // task could clear the marker after the snapshot and before enqueue.
+    let _ = admit_pending_durable_batch_admitted(
+        app,
+        db,
+        eng,
+        DurableResumeAuthorization::Visible,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Core batch admission. `send` holds the per-surface gate before calling this
+/// function; background/live hydration uses the public wrapper above.
+async fn admit_pending_durable_batch_admitted(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    authorization: DurableResumeAuthorization,
+) -> anyhow::Result<bool> {
     let mut inner = eng.lock().await;
     if inner.tearing_down {
         anyhow::bail!("engine is tearing down");
@@ -2806,26 +2944,28 @@ async fn admit_pending_durable_hidden_for_visible(
     if inner.rewinding {
         anyhow::bail!("会话正在回退，请稍后重试");
     }
-    // Validate/format the snapshot before mutating engine state. A malformed
-    // durable row therefore fails the visible send without partially reviving
-    // the stopped lead or reserving an earlier row.
+    // Validate and format every row before mutating engine state. This makes a
+    // malformed later row fail the whole batch without dispatching an earlier
+    // row or clearing stopped as an accidental side effect.
     let prepared = pending_hidden_rows_at_admission(db, &inner).await?;
     if prepared.is_empty() {
-        return Ok(());
+        return Ok(false);
+    }
+    let may_resume = durable_batch_may_resume(&prepared, authorization);
+    if inner.stopped && !may_resume {
+        return Ok(false);
     }
 
     let thread_id = inner.thread_id;
     let was_stopped = inner.stopped;
-    let mut pending_spawn: Option<PendingHiddenSpawn> = None;
-    // Explicit visible input is the only path allowed to clear this flag for
-    // durable replay. The background restore path passes revive=false.
-    inner.stopped = false;
+    let initial_epoch = inner.reset_epoch;
+    if may_resume {
+        inner.stopped = false;
+    }
+    let mut admitted = false;
 
     for (snapshot, _) in prepared {
-        // The DB row is authoritative at the actual reservation point. In
-        // particular, note_turn_activity may have consumed it while the
-        // engine mutex was held (its marker clear is intentionally a later
-        // re-lock); a consumed/deleted row must never be re-enqueued.
+        // The durable state is authoritative at the actual reservation point.
         let Some(row) = repo::get_lead_hidden_delivery(db, snapshot.id).await? else {
             continue;
         };
@@ -2833,11 +2973,8 @@ async fn admit_pending_durable_hidden_for_visible(
             continue;
         }
         let text = durable_hidden_delivery_text(&row)?;
-
-        // A row may already be represented by the current or queued hidden
-        // turn (for example, a retry racing a previous admission); preserve
-        // that reservation instead of enqueueing a duplicate.
         if hidden_delivery_is_duplicate(&inner, row.id) {
+            admitted = true;
             continue;
         }
 
@@ -2847,14 +2984,17 @@ async fn admit_pending_durable_hidden_for_visible(
             inner.stdin.is_some(),
             inner.stopped,
         );
-        // A stopped resident has no stdin. We have just admitted explicit user
-        // intent, so start the resident before classifying its first hidden row;
-        // the spawn and the hidden turn reservation stay in this mutex boundary.
-        if !inner.turn.busy && !per_turn(&inner.tool) && !is_acp_tool(&inner.tool) {
-            let reader = match ensure_running_locked(app, &mut inner).await {
+        if should_ensure_active_resident(&inner, true, Some(row.id))
+            && !inner.turn.busy
+            && !per_turn(&inner.tool)
+            && !is_acp_tool(&inner.tool)
+        {
+            let reader = match ensure_active_resident_locked(app, &mut inner).await {
                 Ok(reader) => reader,
                 Err(error) => {
-                    inner.stopped = was_stopped;
+                    if was_stopped && inner.reset_epoch == initial_epoch {
+                        inner.stopped = true;
+                    }
                     return Err(error);
                 }
             };
@@ -2886,11 +3026,14 @@ async fn admit_pending_durable_hidden_for_visible(
         };
         match delivery {
             HiddenDelivery::Noop => {
-                inner.stopped = was_stopped;
+                if was_stopped && inner.reset_epoch == initial_epoch {
+                    inner.stopped = true;
+                }
                 anyhow::bail!("durable hidden delivery {} is not admissible", row.id);
             }
             HiddenDelivery::Queue => {
                 queue_hidden_delivery(app, &mut inner, out);
+                admitted = true;
             }
             HiddenDelivery::WriteResident => {
                 let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await;
@@ -2904,41 +3047,37 @@ async fn admit_pending_durable_hidden_for_visible(
                     }
                     return Err(error);
                 }
+                admitted = true;
             }
             HiddenDelivery::SpawnTurn => {
                 let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await;
-                // Only the first hidden row can need a spawn: it owns the busy
-                // slot, and every following row observes Queue.
-                pending_spawn = Some(PendingHiddenSpawn {
+                let reset_epoch = inner.reset_epoch;
+                drop(inner);
+                if let Err(error) = spawn_hidden_turn_after_admission(
+                    app,
+                    db,
+                    eng,
                     out,
-                    turn_id,
-                    reset_epoch: inner.reset_epoch,
-                });
+                    reset_epoch,
+                )
+                .await
+                {
+                    rollback_failed_turn(app, db, eng, turn_id, "error").await;
+                    if was_stopped {
+                        let mut restored = eng.lock().await;
+                        restored.stopped = true;
+                        persist_activity(db, restored.session_id, thread_id, STATUS_STOPPED).await;
+                    }
+                    return Err(error);
+                }
+                admitted = true;
+                inner = eng.lock().await;
             }
         }
     }
 
     drop(inner);
-    if let Some(pending) = pending_spawn {
-        if let Err(error) = spawn_hidden_turn_after_admission(
-            app,
-            db,
-            eng,
-            pending.out,
-            pending.reset_epoch,
-        )
-        .await
-        {
-            rollback_failed_turn(app, db, eng, pending.turn_id, "error").await;
-            if was_stopped {
-                let mut restored = eng.lock().await;
-                restored.stopped = true;
-                persist_activity(db, restored.session_id, thread_id, STATUS_STOPPED).await;
-            }
-            return Err(error);
-        }
-    }
-    Ok(())
+    Ok(admitted)
 }
 
 /// Drop the resident child and its stdin so the next send respawns a clean
@@ -3253,7 +3392,7 @@ pub async fn send(
             orphans,
             acp_asks,
             ..
-        } = stop_quiet(eng).await;
+        } = stop_quiet_admitted(eng).await;
         if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
             for id in acp_asks {
                 asks.inner().cancel(id);
@@ -6910,6 +7049,14 @@ pub fn build_switch_digest(
 /// interruption that did not happen is the same class of lie as the "nothing
 /// changed" claims earlier rounds removed, pointing the other way.
 pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) -> bool {
+    let key = {
+        let inner = eng.lock().await;
+        inner
+            .session_id
+            .map(i64::from)
+            .unwrap_or_else(|| super::commands::lead_key(inner.thread_id))
+    };
+    let _serial = admission_gate_for_key(key).lock_owned().await;
     let StopQuietOutcome {
         thread_id,
         session_id,
@@ -6917,7 +7064,7 @@ pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) -> bool {
         orphans,
         acp_asks,
         was_busy,
-    } = stop_quiet(eng).await;
+    } = stop_quiet_admitted(eng).await;
     // Same reason `stop` does it: a switch replaces this engine outright, so an
     // ACP permission card still on screen belongs to a turn that no longer
     // exists. Answering it — especially with Always/Full — would persist a
@@ -7079,7 +7226,9 @@ fn take_acp_teardown_and_invalidate(inner: &mut EngineInner) -> AcpTeardown {
 /// Kill the live child + reset turn state WITHOUT emitting a "stopped" event —
 /// the UI keeps its last (idle) state. Used by the skill-refresh restart so the
 /// bounce is invisible; `stop` wraps this and then emits "stopped".
-pub async fn stop_quiet(eng: &EngineRef) -> StopQuietOutcome {
+/// Stop/reset implementation for callers that already own the surface
+/// admission gate (notably visible `send`'s skill-refresh bounce).
+async fn stop_quiet_admitted(eng: &EngineRef) -> StopQuietOutcome {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
     let was_busy = inner.turn.busy;
@@ -7173,6 +7322,35 @@ pub async fn stop_quiet(eng: &EngineRef) -> StopQuietOutcome {
     }
 }
 
+/// Hard-reset an engine under the same per-surface admission gate used by
+/// visible sends and durable hidden batches. This prevents a user Stop or
+/// switch/rewind reset from interleaving between the first durable row's spawn
+/// and the later FIFO reservations in the batch.
+pub async fn stop_quiet(eng: &EngineRef) -> StopQuietOutcome {
+    let key = {
+        let inner = eng.lock().await;
+        inner
+            .session_id
+            .map(i64::from)
+            .unwrap_or_else(|| super::commands::lead_key(inner.thread_id))
+    };
+    let _serial = admission_gate_for_key(key).lock_owned().await;
+    stop_quiet_admitted(eng).await
+}
+
+/// Stop an engine while the caller already owns the global engine-admission
+/// write fence (for example a destructive workspace/repo/thread cascade).
+///
+/// The normal public [`stop`] wrapper acquires the per-surface serial gate
+/// first. A caller that already holds the global write lock must not acquire a
+/// surface gate here: normal admission is surface gate -> global read, so
+/// global write -> surface gate would form the classic two-lock cycle. The
+/// destructive caller owns the write fence for the complete cascade and all
+/// admitted activity has drained before this core runs.
+pub(crate) async fn stop_under_engine_admission(app: &AppHandle, eng: &EngineRef) {
+    stop_admitted(app, eng).await;
+}
+
 /// Stop the engine outright (e.g. before a terminal takeover or by the runaway
 /// guard). Persists `STATUS_STOPPED` so a stopped/taken-over session can't be
 /// falsely revived into a COMPETING headless process — neither by the boot
@@ -7180,6 +7358,20 @@ pub async fn stop_quiet(eng: &EngineRef) -> StopQuietOutcome {
 /// (which skips "stopped"). Distinct from "idle" so a cleanly-idle session can
 /// still be driven by a bus post.
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
+    let key = {
+        let inner = eng.lock().await;
+        inner
+            .session_id
+            .map(i64::from)
+            .unwrap_or_else(|| super::commands::lead_key(inner.thread_id))
+    };
+    let _serial = admission_gate_for_key(key).lock_owned().await;
+    stop_admitted(app, eng).await;
+}
+
+/// Stop implementation shared by the public gate-owning wrapper and
+/// destructive callers that already hold the global write fence.
+async fn stop_admitted(app: &AppHandle, eng: &EngineRef) {
     let StopQuietOutcome {
         thread_id,
         session_id,
@@ -7187,7 +7379,7 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
         orphans,
         acp_asks,
         ..
-    } = stop_quiet(eng).await;
+    } = stop_quiet_admitted(eng).await;
     let mut inner = eng.lock().await;
     inner.stopped = true;
     drop(inner);
@@ -10600,6 +10792,95 @@ mod tests {
         )
     }
 
+    async fn durable_hidden_fifo_fixture(tool: &str) -> (Db, EngineRef, Vec<i32>) {
+        static NEXT_TEST_SURFACE_KEY: std::sync::atomic::AtomicI32 =
+            std::sync::atomic::AtomicI32::new(910_000);
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "admission-fifo").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "thread", "issue", tool)
+            .await
+            .unwrap();
+        let older = repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "repo_action",
+            6,
+            "repo_action:6",
+            r#"{"tool":"repo_action","status":"ok","execution_id":6}"#,
+        )
+        .await
+        .unwrap();
+        let newer = repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "plan_decision",
+            7,
+            "plan_decision:7",
+            r#"{"tool":"plan_decision","message_id":7}"#,
+        )
+        .await
+        .unwrap();
+        let mut inner = test_inner(tool);
+        inner.thread_id = thread.id;
+        inner.session_id = Some(
+            NEXT_TEST_SURFACE_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        (
+            db,
+            Arc::new(tokio::sync::Mutex::new(inner)),
+            vec![older.id, newer.id],
+        )
+    }
+
+    #[tokio::test]
+    async fn durable_batch_fifo_keeps_older_repo_before_plan_resume() {
+        let (db, eng, ids) = durable_hidden_fifo_fixture("codex").await;
+        let mut inner = eng.lock().await;
+        inner.stopped = true;
+        let rows = pending_hidden_rows_at_admission(&db, &inner).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|(row, _)| row.source_kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["repo_action", "plan_decision"]
+        );
+        assert_eq!(
+            rows.iter().map(|(row, _)| row.id).collect::<Vec<_>>(),
+            ids
+        );
+        assert!(durable_batch_may_resume(
+            &rows,
+            DurableResumeAuthorization::Background
+        ));
+    }
+
+    #[tokio::test]
+    async fn stopped_repo_only_batch_defers_without_resume_authorization() {
+        let (db, eng, _delivery_id) = durable_hidden_fixture("claude").await;
+        let mut inner = eng.lock().await;
+        inner.stopped = true;
+        // Replace the fixture's plan row with a repo-action-only batch so this
+        // exercises the no-plan background policy directly.
+        repo::delete_lead_hidden_deliveries_for_thread(&db, inner.thread_id)
+            .await
+            .unwrap();
+        repo::enqueue_lead_hidden_delivery(
+            &db,
+            inner.thread_id,
+            "repo_action",
+            8,
+            "repo_action:8",
+            r#"{"tool":"repo_action","status":"ok","execution_id":8}"#,
+        )
+        .await
+        .unwrap();
+        let rows = pending_hidden_rows_at_admission(&db, &inner).await.unwrap();
+        assert!(!durable_batch_may_resume(
+            &rows,
+            DurableResumeAuthorization::Background
+        ));
+    }
+
     /// The final admission snapshot must trust the durable state, not the
     /// in-memory negative marker. `note_turn_activity` consumes first and
     /// clears that marker only after a later engine re-lock, so a visible send
@@ -10777,6 +11058,30 @@ mod tests {
         visible_rx.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn stop_quiet_waits_for_durable_batch_admission_gate() {
+        let key = -9_001_342_i64;
+        let mut inner = test_inner("codex");
+        inner.session_id = Some(key as i32);
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+        let serial = admission_gate_for_key(key).lock_owned().await;
+        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel();
+        let eng_for_stop = eng.clone();
+        let stop_task = tokio::spawn(async move {
+            let outcome = stop_quiet(&eng_for_stop).await;
+            let _ = stopped_tx.send(outcome.was_busy);
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut stopped_rx)
+                .await
+                .is_err(),
+            "stop must not interleave with a durable batch holding the gate"
+        );
+        drop(serial);
+        stop_task.await.unwrap();
+        stopped_rx.await.unwrap();
+    }
+
     /// The static map reuses one gate while any admission guard is live, so a
     /// same-key hidden activity task cannot acquire a second mutex and run in
     /// parallel. Weak values plus pruning then allow abandoned keys to be
@@ -10885,6 +11190,7 @@ mod tests {
         let db_for_receipt = db.clone();
         let eng_for_receipt = eng.clone();
         let receipt = tokio::spawn(run_hidden_receipt_worker(
+            db.clone(),
             eng_for_receipt,
             key,
             delivery_id,
@@ -10958,6 +11264,7 @@ mod tests {
         let (warning_tx, warning_rx) = tokio::sync::oneshot::channel();
         let db_for_worker = db.clone();
         let worker = tokio::spawn(run_hidden_receipt_worker(
+            db.clone(),
             eng.clone(),
             key,
             delivery_id,
@@ -11005,6 +11312,7 @@ mod tests {
 
     #[tokio::test]
     async fn hidden_receipt_error_releases_token_for_retry() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
         let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(test_inner("codex")));
         let key = -9_001_341_i64;
         let registry = {
@@ -11013,6 +11321,7 @@ mod tests {
             inner.hidden_receipt_inflight.clone()
         };
         run_hidden_receipt_worker(
+            db,
             eng.clone(),
             key,
             19,
@@ -11025,6 +11334,91 @@ mod tests {
         let inner = eng.lock().await;
         assert!(!inner.hidden_receipt_inflight.contains(&19));
         assert!(!hidden_delivery_is_duplicate(&inner, 19));
+    }
+
+    #[tokio::test]
+    async fn hidden_receipt_panic_before_commit_releases_pending_row_for_retry() {
+        let (db, eng, delivery_id) = durable_hidden_fixture("codex").await;
+        let key = eng
+            .lock()
+            .await
+            .session_id
+            .map(i64::from)
+            .expect("fixture assigns an isolated surface key");
+        let registry = {
+            let mut inner = eng.lock().await;
+            assert!(register_hidden_receipt(&mut inner, delivery_id));
+            inner.hidden_receipt_inflight.clone()
+        };
+        let worker = tokio::spawn(run_hidden_receipt_worker(
+            db.clone(),
+            eng.clone(),
+            key,
+            delivery_id,
+            registry,
+            async {
+                panic!("injected panic before commit");
+                #[allow(unreachable_code)]
+                Ok(None)
+            },
+            std::time::Duration::from_secs(60),
+            None,
+        ));
+        worker.await.unwrap();
+        let inner = eng.lock().await;
+        assert!(!inner.hidden_receipt_inflight.contains(&delivery_id));
+        assert_eq!(
+            pending_hidden_rows_at_admission(&db, &inner)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "pending row remains authoritative after pre-commit panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_receipt_panic_after_commit_clears_token_without_retry() {
+        let (db, eng, delivery_id) = durable_hidden_fixture("codex").await;
+        let key = eng
+            .lock()
+            .await
+            .session_id
+            .map(i64::from)
+            .expect("fixture assigns an isolated surface key");
+        let registry = {
+            let mut inner = eng.lock().await;
+            assert!(register_hidden_receipt(&mut inner, delivery_id));
+            inner.hidden_receipt_inflight.clone()
+        };
+        let db_for_consume = db.clone();
+        let worker = tokio::spawn(run_hidden_receipt_worker(
+            db.clone(),
+            eng.clone(),
+            key,
+            delivery_id,
+            registry,
+            async move {
+                repo::consume_lead_hidden_delivery(&db_for_consume, delivery_id)
+                    .await
+                    .unwrap();
+                panic!("injected panic after commit");
+                #[allow(unreachable_code)]
+                Ok(None)
+            },
+            std::time::Duration::from_secs(60),
+            None,
+        ));
+        worker.await.unwrap();
+        let inner = eng.lock().await;
+        assert!(!inner.hidden_receipt_inflight.contains(&delivery_id));
+        assert!(
+            pending_hidden_rows_at_admission(&db, &inner)
+                .await
+                .unwrap()
+                .is_empty(),
+            "consumed row is not retried after post-commit panic"
+        );
     }
 
     /// Registry replacement shares the per-surface receipt set with the old

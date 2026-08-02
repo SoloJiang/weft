@@ -329,7 +329,11 @@ async fn stop_engines_by_key(app: &tauri::AppHandle, keys: &std::collections::BT
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
     for key in keys {
         if let Some(eng) = state.remove(*key) {
-            crate::lead_chat::engine::stop(app, &eng).await;
+            // Destructive callers hold the global engine-admission write
+            // fence. Do not call the public stop wrapper here: it acquires
+            // the per-surface gate after the write lock, inverting normal
+            // surface-gate -> global-read admission order.
+            crate::lead_chat::engine::stop_under_engine_admission(app, &eng).await;
         }
     }
 }
@@ -2867,7 +2871,10 @@ async fn delete_thread_after_fence(app: tauri::AppHandle, db: &Db, thread_id: i3
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
     for key in keys {
         if let Some(eng) = state.remove(key) {
-            crate::lead_chat::engine::stop(&app, &eng).await;
+            // The global write fence is still held; use the admitted stop
+            // core so this path never waits for a surface gate while holding
+            // the write lock.
+            crate::lead_chat::engine::stop_under_engine_admission(&app, &eng).await;
         }
     }
     drop(engine_admission);

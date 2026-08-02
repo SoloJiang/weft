@@ -245,7 +245,7 @@ pub async fn lead_engine(
     if let Some(e) = existing {
         repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
         drop(serial);
-        restore_pending_hidden_deliveries_on_engine(app, db, thread_id, &e).await?;
+        restore_pending_hidden_deliveries_on_engine(app, db, &e).await?;
         return Ok(e);
     }
     let engine_admission = state.engine_admission_read().await;
@@ -398,7 +398,7 @@ pub async fn lead_engine(
     // may immediately send a visible turn. Fire-and-forget replay allowed a
     // post-restart visible send to win the engine mutex ahead of an old plan
     // approval; synchronous admission here preserves the durable row order.
-    restore_pending_hidden_deliveries_on_engine(app, db, thread_id, &selected).await?;
+    restore_pending_hidden_deliveries_on_engine(app, db, &selected).await?;
     Ok(selected)
 }
 
@@ -1479,7 +1479,12 @@ pub(crate) async fn chat_open_worker_impl(
     lang: &str,
 ) -> anyhow::Result<SessionInfo> {
     let state = app.state::<LeadChatState>();
-    let _engine_admission = state.engine_admission_read().await;
+    // Normal engine admission is surface gate -> global read. Keep the global
+    // read optional here so a stale-engine teardown can release it before
+    // acquiring the surface gate; otherwise a concurrent global writer can
+    // deadlock this global-read -> surface-gate path against a sender's normal
+    // surface-gate -> global-read order.
+    let mut _engine_admission = Some(state.engine_admission_read().await);
     engine::ensure_worker_parent_chain(db, direction_id, repo_id).await?;
     let wt = repo::worktree_for(db, direction_id, repo_id)
         .await?
@@ -1518,7 +1523,9 @@ pub(crate) async fn chat_open_worker_impl(
     {
         if let Some(stale) = state.get(session.id as i64) {
             if let Some(stale) = state.remove_if_same(session.id as i64, &stale) {
+                _engine_admission = None;
                 let _ = engine::teardown_for_switch(app, &stale).await;
+                _engine_admission = Some(state.engine_admission_read().await);
             }
         }
     }
@@ -3391,22 +3398,7 @@ async fn dispatch_hidden_delivery(
                 .map_err(|error| error.to_string())?
         }
     };
-    let revive = row.source_kind == "plan_decision";
-    dispatch_hidden_delivery_with_engine(app, db, row, &eng, revive).await
-}
-
-async fn dispatch_hidden_delivery_with_engine(
-    app: &AppHandle,
-    db: &Db,
-    row: &crate::store::entities::lead_hidden_delivery::Model,
-    eng: &EngineRef,
-    revive_stopped: bool,
-) -> Result<bool, String> {
-    if row.state == repo::LEAD_HIDDEN_DELIVERY_CONSUMED {
-        return Ok(true);
-    }
-    let text = engine::durable_hidden_delivery_text(row).map_err(|error| error.to_string())?;
-    engine::send_hidden_delivery_existing(app, db, eng, text, row.id, revive_stopped)
+    engine::admit_pending_durable_batch_existing(app, db, &eng)
         .await
         .map_err(|error| error.to_string())
 }
@@ -3487,34 +3479,10 @@ async fn dispatch_ephemeral_hidden_feedback(
 async fn restore_pending_hidden_deliveries_on_engine(
     app: &AppHandle,
     db: &Db,
-    thread_id: i32,
     eng: &EngineRef,
 ) -> anyhow::Result<()> {
-    let rows = repo::list_pending_lead_hidden_deliveries(db, Some(thread_id)).await?;
-    let mut first_error: Option<anyhow::Error> = None;
-    for row in rows {
-        // Repo-action rows are background/retry plumbing and must never revive
-        // a stopped lead. A persisted plan_decision row is an explicit approval
-        // handoff, so preserve the existing contract that it may clear stopped
-        // and start the lead when it is hydrated.
-        let revive_stopped = row.source_kind == "plan_decision";
-        match dispatch_hidden_delivery_with_engine(app, db, &row, eng, revive_stopped).await {
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!(
-                    "[weft] hidden delivery {} replay deferred: {error}",
-                    row.id
-                );
-                if first_error.is_none() {
-                    first_error = Some(anyhow::anyhow!(
-                        "hidden delivery {} hydration failed: {error}",
-                        row.id
-                    ));
-                }
-            }
-        }
-    }
-    first_error.map_or(Ok(()), Err)
+    let _ = engine::admit_pending_durable_batch_existing(app, db, eng).await?;
+    Ok(())
 }
 
 /// Persist and dispatch one UI tool result. Only plan decisions carry a
