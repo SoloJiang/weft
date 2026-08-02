@@ -377,6 +377,14 @@ pub async fn handle_computer(
     if !verify_computer_token(thread, &dir, wt, supplied_key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // issue #160 round-19 P1 (Codex computer_srv.rs:403): a still-valid token is
+    // refused once its owning thread has been deleted — `delete_thread` revokes
+    // the route. Fast path is a lock-only set lookup (live sessions and the
+    // synthetic-identity tests pay nothing); only a revoked thread pays one
+    // `session_is_live` DB check, which also lets a REUSED thread id back in.
+    if computer_routes_revoked(thread) && !session_is_live(&db, thread, &dir, wt).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     // Notifications (no id) get a bare 202, same as the other bus handlers.
     let id = match req.get("id") {
         Some(v) => v.clone(),
@@ -567,16 +575,6 @@ async fn run_action(
     // not just a well-formed request.
     if !computer::enabled(db).await {
         return Err(ComputerError::Disabled.to_string());
-    }
-    // issue #160 round-19 P1 (Codex computer_srv.rs:403): admission gate — a
-    // thread/direction (or pinned worktree) deleted after this session's bearer
-    // was minted must never reach ANY enumeration, capture, or injection. The
-    // token stays valid for the process lifetime and the delete path cannot
-    // abort an in-flight/queued HTTP call, so this is the fail-closed check
-    // that revokes the ROUTE. Runs before schema validation and the approval
-    // gate — nothing about a deleted session should even be validated.
-    if !session_is_live(db, thread, dir, wt).await {
-        return Err(SESSION_GONE_MSG.to_string());
     }
     if name != "computer" {
         return Err(format!("unknown tool: {name}"));
@@ -818,6 +816,19 @@ async fn run_action(
                 // are still two). If `w` closed in the instant since the
                 // verify above, `capture_window(w.id)` fails closed rather
                 // than ever falling back to a lookalike.
+                // issue #160 round-20 P1 (Codex computer_srv.rs:813): recheck
+                // the stop latch on THIS blocking thread, immediately before
+                // the capture. The arm's last `enabled` recheck ran BEFORE this
+                // closure was scheduled; a Stop landing while the closure sat
+                // queued for a blocking thread — or while the final resolve
+                // just above stalled — would otherwise let the capture proceed
+                // AFTER Emergency Stop. `screenshot` holds no control lease
+                // (it is ReadOnly), so only the stop latch is checked here (the
+                // input arms' `recheck_stop_and_lease_before_backend` also
+                // re-checks the lease).
+                if computer::stop_latched() {
+                    return (resolved_id, Err(ComputerError::Disabled.to_string()));
+                }
                 let shot = match computer::screenshot_resolved(b.as_ref(), &w, &out_dir) {
                     Ok(s) => s,
                     Err(e) => return (resolved_id, Err(e.to_string())),
@@ -1518,7 +1529,7 @@ async fn approve(
         None => {}
     }
 
-    let preview = preview_for_action(thread, dir, risk, &window_query);
+    let preview = preview_for_action(thread, dir, risk, resolved.as_ref());
     // issue #160 round-14 P1 (Codex computer_srv.rs:515): for an input (Write)
     // action, open the card ATOMICALLY with the "no other ask is already open
     // for this (thread, dir)" check — `check_suspended` above and this insert
@@ -1869,34 +1880,25 @@ fn preview_for_action(
     thread: i32,
     dir: &str,
     risk: crate::ask::RiskLevel,
-    window_query: &str,
+    resolved: Option<&computer::WindowInfo>,
 ) -> Option<String> {
     if risk != crate::ask::RiskLevel::Write {
         return None;
     }
-    // issue #160 round-14 P1 (Codex computer_srv.rs:1466): match on the FULL
-    // window identity (id + app + title), not the numeric id alone — see
-    // [`VerifiedWindowIdentity`]'s own doc for the id-reuse hazard an id-only
-    // comparison left open.
-    let target = resolve_target_window_identity(window_query)?;
+    // issue #160 round-20 P1 (Codex computer_srv.rs:1889): REUSE the identity
+    // `approve` already resolved once (on the blocking pool — see its
+    // `resolved` binding) instead of enumerating windows a SECOND time inline
+    // on the async runtime. Under several concurrent grant-less input requests
+    // that extra synchronous `xcap` enumeration could occupy every tokio worker
+    // before the first card was even admitted, starving the Stop/Escape tasks;
+    // reusing the already-resolved window removes it (and closes the last
+    // "resolve twice, window swapped in between" gap for the preview). issue
+    // #160 round-14 P1: match on the FULL window identity (id + app + title),
+    // not the numeric id alone — see [`VerifiedWindowIdentity`]'s own doc for
+    // the id-reuse hazard an id-only comparison left open.
+    let target = VerifiedWindowIdentity::from_window(resolved?);
     let (data_uri, stored) = last_screenshot_preview(thread, dir)?;
     (stored == target).then_some(data_uri)
-}
-
-/// Best-effort window resolution for [`preview_for_action`]'s id match ONLY
-/// — `None` for an empty/blank query or anything `resolve_window` itself
-/// can't resolve to exactly one window, never an error: this is purely a
-/// "should we attach a preview" decision, not the real validation
-/// ([`required_window`] / the per-action dispatch) that actually rejects a
-/// malformed call.
-fn resolve_target_window_identity(window_query: &str) -> Option<VerifiedWindowIdentity> {
-    if window_query.trim().is_empty() {
-        return None;
-    }
-    let b = backend::backend();
-    computer::resolve_window(b.as_ref(), window_query)
-        .ok()
-        .map(|w| VerifiedWindowIdentity::from_window(&w))
 }
 
 /// A window-scoped action's `window` argument, validated BEFORE it ever
@@ -1937,20 +1939,36 @@ fn required_window(args: &Value) -> Result<&str, String> {
 /// becomes `{"text_redacted": true, "text_chars": N}` in place of the
 /// literal string; every other key (`action`, `window`, …) is untouched.
 fn redact_audit_args(action: &str, args: &Value) -> Value {
-    if action != "type" {
+    if action != "type" && action != "key" {
         return args.clone();
     }
     let mut redacted = args.clone();
-    if let Some(obj) = redacted.as_object_mut() {
-        // Only redact when `text` is ACTUALLY present as a string — a
-        // malformed call missing it entirely (rejected by `required_text`
-        // before it ever reaches the backend, see the "type" arm of
-        // `run_action`) must not have a synthetic `text` key manufactured
-        // into its audit record that was never in the real request.
-        if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-            let chars = text.chars().count();
-            obj.insert("text".to_string(), json!({ "text_redacted": true, "text_chars": chars }));
-        }
+    let Some(obj) = redacted.as_object_mut() else {
+        return redacted;
+    };
+    // Only redact when `text` is ACTUALLY present as a string — a malformed
+    // call missing it entirely (rejected by `required_text` before it ever
+    // reaches the backend, see the "type"/"key" arms of `run_action`) must not
+    // have a synthetic `text` key manufactured into its audit record that was
+    // never in the real request.
+    let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
+        return redacted;
+    };
+    // `type` always redacts (bulk keystrokes are content). issue #160 round-20
+    // (Codex computer_srv.rs:1475): `key` redacts ONLY a BARE single printable
+    // character — the sensitive char-by-char case `pure_validate`/
+    // `reject_unsafe_key_combo` reject; redacting it HERE too means even the
+    // rejected attempt's audit line never records the raw character. A real
+    // combo (`cmd+s`, `ctrl+c`, `enter`) is NOT content and stays in the audit
+    // for forensics.
+    let redact = action == "type"
+        || matches!(
+            computer::parse_key_combo(text).as_deref(),
+            Ok([computer::KeyToken::Unicode(_)])
+        );
+    if redact {
+        let chars = text.chars().count();
+        obj.insert("text".to_string(), json!({ "text_redacted": true, "text_chars": chars }));
     }
     redacted
 }
@@ -2529,15 +2547,14 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
     if !computer::enabled(db).await {
         return Err(ComputerError::Disabled.to_string());
     }
-    // issue #160 round-19 P1 (Codex computer_srv.rs:403): re-confirm the
-    // session is STILL live at this post-queue checkpoint, right before the
-    // injection. A call can sit on `input_flight_guard` for as long as another
-    // session's in-flight action takes; a thread/direction deleted during that
-    // wait must be caught here, not only at `run_action`'s admission gate.
-    // `wt` isn't threaded through this checkpoint, but the delete cascade
-    // removes a direction (and its worktrees) wholesale, so thread+direction
-    // liveness (`None`) is the check that matters for "is this session gone".
-    if !session_is_live(db, thread, dir, None).await {
+    // issue #160 round-19 P1 (Codex computer_srv.rs:403): revalidate the session
+    // at this post-queue checkpoint, immediately before injection — a thread
+    // deleted WHILE this call sat queued on `input_flight_guard` (behind another
+    // session's in-flight action) must be caught here, not only at the
+    // `handle_computer` entry gate. Gated on the revocation set: a thread that
+    // was never deleted (every synthetic-identity test, and normal operation)
+    // pays only the lock-only lookup, never the `session_is_live` DB check.
+    if computer_routes_revoked(thread) && !session_is_live(db, thread, dir, None).await {
         return Err(SESSION_GONE_MSG.to_string());
     }
     match computer::control_state() {
@@ -2792,7 +2809,8 @@ fn pure_validate(action: &str, args: &Value) -> Result<(), String> {
         }
         "key" => {
             required_window(args)?;
-            computer::parse_key_combo(required_text(args)?).map_err(|e| e.to_string())?;
+            let tokens = computer::parse_key_combo(required_text(args)?).map_err(|e| e.to_string())?;
+            reject_unsafe_key_combo(&tokens)?;
         }
         "screenshot" => {
             required_window(args)?;
@@ -2804,6 +2822,39 @@ fn pure_validate(action: &str, args: &Value) -> Result<(), String> {
         _ => {}
     }
     Ok(())
+}
+
+/// issue #160 round-20 (Codex computer_srv.rs:1189 + :1475): reject two `key`
+/// payloads outright, from [`pure_validate`] — BEFORE the approval card is ever
+/// built (so neither reaches the IM bridge) and before any backend work:
+///
+///  - a BARE printable character (a lone `Unicode` token, no modifier): this is
+///    char-by-char TEXT entry, which `type` — not `key` — exists for. Unlike
+///    `type`, a `key` payload is NOT redacted on the outbound Lark card or in
+///    the durable audit, so routing sensitive text through `key` one character
+///    at a time would disclose each character; forcing it onto `type` (which
+///    redacts) closes that (round-20 P1, Codex ...:1475).
+///  - a BARE `Escape` (no modifier): the process-wide global Escape shortcut is
+///    the kill switch's OS-level layer whenever a control lease is held, so an
+///    injected bare Escape can be swallowed as Emergency Stop instead of
+///    reaching the target window — disabling Computer Use rather than acting on
+///    it (round-20 P2, Codex ...:1189). A MODIFIED chord (e.g. `shift+escape`)
+///    does not match the bare-Escape shortcut and is deliberately left alone.
+fn reject_unsafe_key_combo(tokens: &[computer::KeyToken]) -> Result<(), String> {
+    match tokens {
+        [computer::KeyToken::Unicode(_)] => Err(
+            "send a single printable character with the `type` action, not `key` — `key` is for \
+             named keys and modifier shortcuts (e.g. `enter`, `tab`, `ctrl+c`)"
+                .to_string(),
+        ),
+        [computer::KeyToken::Named(computer::NamedKey::Escape)] => Err(
+            "`escape` can't be injected through the `key` action — a bare Escape collides with \
+             weft's global emergency-stop shortcut and could trip the kill switch instead of \
+             reaching the target window"
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -3207,10 +3258,52 @@ pub(crate) fn remove_computer_output_for_thread(thread: i32) {
 /// (not live), so a transient store hiccup can never fail OPEN into driving a
 /// desktop whose owning session may already be gone.
 /// The one rendering of the "session deleted" refusal (issue #160 round-19 P1),
-/// shared by the [`run_action`] admission gate and the [`recheck_after_guard`]
-/// post-queue revalidation so the two can never drift.
+/// used by the [`recheck_after_guard`] post-queue revalidation.
 const SESSION_GONE_MSG: &str =
     "this computer-use session no longer exists (its issue or direction was deleted) — refused";
+
+/// Process-global set of thread ids whose computer-use routes were REVOKED by a
+/// thread deletion (issue #160 round-19 P1, Codex computer_srv.rs:403).
+/// `commands::delete_thread` records a thread here (via [`revoke_computer_
+/// routes`]) as part of its cascade; the [`handle_computer`] entry gate and the
+/// [`recheck_after_guard`] pre-injection revalidation consult it.
+///
+/// Why a revocation SET rather than a blanket DB-liveness check on every
+/// request: the per-session bearer is a process-lifetime HMAC the delete path
+/// can't rescind, and the Axum request is independent of the engine it stops,
+/// so a token minted before a delete stays cryptographically valid. Recording
+/// the deletion here revokes those tokens WITHOUT a DB round-trip on the
+/// overwhelmingly common live-session request — and without coupling every
+/// request (or the many synthetic-identity tests, which deliberately never set
+/// up matching DB rows) to a DB shape. Only a thread that was actually deleted
+/// is ever in this set, and such a request then pays ONE [`session_is_live`]
+/// check to tell a genuinely-deleted thread (refuse) from a REUSED thread id (a
+/// brand-new thread that happens to reuse the number — allow), so id reuse can
+/// never permanently strand a fresh session.
+fn revoked_computer_threads() -> &'static std::sync::Mutex<std::collections::HashSet<i32>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Revoke every computer-use route for `thread` (issue #160 round-19 P1) — see
+/// [`revoked_computer_threads`]. Called from `commands::delete_thread`.
+pub(crate) fn revoke_computer_routes(thread: i32) {
+    revoked_computer_threads()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(thread);
+}
+
+/// Whether `thread`'s routes were revoked by a delete — a lock-only set lookup,
+/// `false` for every thread that was never deleted (so live sessions and the
+/// synthetic-identity tests never reach the [`session_is_live`] DB check).
+fn computer_routes_revoked(thread: i32) -> bool {
+    revoked_computer_threads()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&thread)
+}
 
 async fn session_is_live(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> bool {
     if dir == crate::bus::LEAD {
@@ -3611,10 +3704,42 @@ mod tests {
     }
 
     #[test]
-    fn redact_audit_args_leaves_every_other_action_untouched() {
-        let args = json!({"action": "key", "window": "notes", "text": "cmd+s"});
+    fn redact_audit_args_leaves_key_combos_and_other_actions_untouched() {
+        // A real `key` COMBO is a shortcut, not content — it stays in the audit
+        // for forensics (issue #160 round-20 only redacts a BARE printable key).
+        let combo = json!({"action": "key", "window": "notes", "text": "cmd+s"});
+        assert_eq!(redact_audit_args("key", &combo), combo, "a key combo is not redacted");
+        // A non-type/non-key action is passed through wholesale.
+        let click = json!({"action": "left_click", "window": "notes", "coordinate": [1, 2]});
+        assert_eq!(redact_audit_args("left_click", &click), click, "other actions untouched");
+    }
+
+    /// issue #160 round-20 (Codex computer_srv.rs:1475): a BARE printable `key`
+    /// payload (the char-by-char text-entry case `pure_validate` rejects) is
+    /// redacted in the durable audit too, so even the rejected attempt records
+    /// no raw character.
+    #[test]
+    fn redact_audit_args_redacts_a_bare_printable_key() {
+        let args = json!({"action": "key", "window": "notes", "text": "h"});
         let redacted = redact_audit_args("key", &args);
-        assert_eq!(redacted, args, "only action==\"type\" redacts — key's text is a combo, not content");
+        assert_eq!(redacted["text"]["text_redacted"], true);
+        assert_eq!(redacted["text"]["text_chars"], 1);
+        assert_eq!(redacted["window"], "notes", "non-text keys pass through");
+    }
+
+    /// issue #160 round-20 (Codex computer_srv.rs:1189 + :1475): the `key`
+    /// action rejects a bare printable character (use `type`) and a bare Escape
+    /// (kill-switch collision), but still accepts named keys and modifier chords.
+    #[test]
+    fn pure_validate_rejects_bare_printable_and_bare_escape_key() {
+        let key = |text: &str| json!({"action": "key", "window": "notes", "text": text});
+        assert!(pure_validate("key", &key("a")).is_err(), "a bare printable char is rejected");
+        assert!(pure_validate("key", &key("Escape")).is_err(), "a bare Escape is rejected");
+        assert!(pure_validate("key", &key("esc")).is_err(), "the `esc` alias is rejected too");
+        // Named keys, modifier chords, and modified-Escape chords still pass.
+        assert!(pure_validate("key", &key("enter")).is_ok());
+        assert!(pure_validate("key", &key("ctrl+c")).is_ok());
+        assert!(pure_validate("key", &key("shift+escape")).is_ok());
     }
 
     #[test]
@@ -5314,6 +5439,19 @@ mod tests {
         assert!(!session_is_live(&db, thread.id, crate::bus::LEAD, None).await);
         assert!(!session_is_live(&db, thread.id, &dir_s, None).await);
         assert!(!session_is_live(&db, thread.id, &dir_s, Some(wt.id)).await);
+    }
+
+    /// issue #160 round-19 P1 (Codex computer_srv.rs:403): the revocation set is
+    /// empty until a delete (so no live session — nor any synthetic-identity
+    /// test — ever pays the `session_is_live` DB check); `revoke_computer_routes`
+    /// flags exactly the deleted thread.
+    #[test]
+    fn revoke_computer_routes_flags_only_the_deleted_thread() {
+        let t = 917_001;
+        assert!(!computer_routes_revoked(t), "a never-deleted thread is not revoked");
+        revoke_computer_routes(t);
+        assert!(computer_routes_revoked(t), "the deleted thread is revoked");
+        assert!(!computer_routes_revoked(t + 1), "revocation is per-thread");
     }
 
     // —— issue #160 round-3 P1 §2 (extended round-5 review P1 §2): recheck_after_guard ——

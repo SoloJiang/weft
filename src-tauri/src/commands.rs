@@ -1447,6 +1447,12 @@ pub async fn delete_thread(
             crate::lead_chat::engine::stop(&app, &eng).await;
         }
     }
+    // issue #160 round-19 P1 (Codex computer_srv.rs:403): revoke this thread's
+    // computer-use routes so a still-valid per-session bearer (a process-lifetime
+    // HMAC the delete can't rescind) can no longer drive the desktop under the
+    // deleted identity — the `handle_computer` entry gate and the pre-injection
+    // revalidation both consult this set.
+    crate::bus::computer_srv::revoke_computer_routes(thread_id);
     // issue #160 round-18 P2 (Codex paths.rs:89): drop this thread's computer-
     // use output subtree (screenshots + rotated audit logs under
     // `weft_home/computer/<thread>/`) as part of the delete cascade —
