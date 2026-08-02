@@ -29,7 +29,8 @@ use super::{
 
 /// Each axis reduced to a 3-way verdict before combining — keeps
 /// `merge_readiness` a single small exhaustive match instead of a spelled-out
-/// 4×4×3 cross-product of the three raw enums.
+/// cross-product of the raw axis enums, which grows multiplicatively with
+/// every axis added (CI × review × threads × conflict × upstream today).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AxisVerdict {
     Unknown,
@@ -294,9 +295,10 @@ mod tests {
         merge_readiness(ci, review, &ThreadStatus::AllResolved, conflict, upstream)
     }
 
-    /// The ordering axis, on a change set whose other three axes are perfect.
-    /// This is the whole point: a consumer PR can be green, approved and
-    /// conflict-free and STILL not be mergeable, because merging it would land
+    /// The ordering axis, on a change set whose every other axis is perfect.
+    /// This is the whole point: a consumer PR can be green, approved,
+    /// thread-clear and conflict-free and STILL not be mergeable, because
+    /// merging it would land
     /// a commit referencing a producer change that is not on any default
     /// branch yet.
     #[test]

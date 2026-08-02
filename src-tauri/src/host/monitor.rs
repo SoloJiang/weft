@@ -526,7 +526,7 @@ mod tests {
         // Same raw axes stored, but readiness recomputed differently (e.g. the
         // judgement function itself changed) must still be caught — this is
         // what keeps `snapshot_changed` honest about DERIVED state, not just
-        // the three raw axis columns.
+        // the raw axis columns.
         let old = base_row();
         let snap = base_snapshot();
         let readiness = MergeReadiness::Blocked { reasons: vec!["something".to_string()] };

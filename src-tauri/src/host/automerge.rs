@@ -442,7 +442,7 @@ async fn evaluate_row(
     // PR's OWN head commit moving, never this LOCAL fact. Without this, a re-proposal that
     // adds or replaces this consumer's dependency in the window between the read above and
     // `run_gh_merge` actually executing would merge a consumer whose upstream just changed,
-    // with no backstop at all — CI/review/conflict staleness in that same window is at least
+    // with no backstop at all — CI/review/threads/conflict staleness in that same window is at least
     // partly covered by GitHub's OWN branch-protection enforcement, but this axis is purely a
     // Weft-side invariant that only Weft can protect. This is INTENTIONALLY separate from (and
     // does not touch) `record_upstream_edges`'s two-pass write-ordering mechanism (round 5+6):
