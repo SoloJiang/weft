@@ -107,6 +107,25 @@ pub async fn delete_workspace(
     result
 }
 
+/// issue #160 round-23 P1 (Codex computer_srv.rs:2608): if the process-wide
+/// computer control lease is held by a route this delete is tearing down, clear
+/// it. Otherwise an input call that already cleared `recheck_after_guard` and is
+/// stalled at its final resolve/injection would find the lease STILL naming its
+/// now-deleted `(thread, dir)` and reach the desktop after the rows are gone —
+/// the final `recheck_stop_and_lease_before_backend` only re-reads the lease, so
+/// clearing it here is what makes that check fail closed. The lease names exactly
+/// one holder, so this refuses only the torn-down route; a surviving sibling
+/// direction that merely happens to hold it re-acquires on its next action
+/// (entry-gated — a deleted route cannot re-acquire).
+fn clear_control_if_doomed(doomed_threads: &[i32]) {
+    let Some(holder) = crate::computer::control_state() else {
+        return;
+    };
+    if doomed_threads.contains(&holder.thread) {
+        crate::computer::clear_control();
+    }
+}
+
 async fn delete_workspace_after_fence(
     app: tauri::AppHandle,
     db: &Db,
@@ -143,11 +162,28 @@ async fn delete_workspace_after_fence(
         .into_iter()
         .map(|t| t.id)
         .collect();
-    let removed = repo::delete_workspace_cascade(db, workspace_id)
-        .await
-        .map_err(e)?;
+    // issue #160 round-23 P1 (Codex commands.rs:756): publish the route
+    // revocations BEFORE the destructive cascade, not after. Otherwise an
+    // in-flight computer call whose thread is deleted mid-cascade slips through
+    // — its thread isn't in the revocation set yet, so both `recheck_after_guard`
+    // and the final `recheck_stop_and_lease_before_backend` skip it — and reaches
+    // the desktop after its rows are gone. Roll the revocations back if the
+    // cascade itself fails, so a still-live session isn't fail-closed forever.
     for thread_id in &doomed_threads {
         crate::bus::computer_srv::revoke_computer_routes(*thread_id);
+    }
+    clear_control_if_doomed(&doomed_threads);
+    let removed = match repo::delete_workspace_cascade(db, workspace_id).await {
+        Ok(removed) => removed,
+        Err(err) => {
+            for thread_id in &doomed_threads {
+                crate::bus::computer_srv::unrevoke_computer_routes(*thread_id);
+            }
+            return Err(e(err));
+        }
+    };
+    // Output cleanup runs only after the rows are actually gone.
+    for thread_id in &doomed_threads {
         crate::bus::computer_srv::remove_computer_output_for_thread(*thread_id);
     }
     extend_removed_repo_paths(db, &mut repo_paths, &removed).await?;
@@ -751,10 +787,24 @@ pub async fn delete_repo(
     // subtree is NOT dropped (unlike the workspace delete); `session_is_live`
     // refuses the removed directions while allowing each thread's surviving ones.
     let doomed_threads = repo::thread_ids_for_repo(&db, repo_id).await.map_err(e)?;
-    let removed = repo::delete_repo_cascade(&db, repo_id).await.map_err(e)?;
+    // issue #160 round-23 P1 (Codex commands.rs:756): revoke BEFORE the cascade,
+    // roll back on failure — see `delete_workspace_after_fence`'s own note. The
+    // threads themselves survive a repo delete, so there is no output subtree to
+    // drop here (only the removed directions' routes need refusing, which
+    // `session_is_live` handles per-direction once the thread is revoked).
     for thread_id in &doomed_threads {
         crate::bus::computer_srv::revoke_computer_routes(*thread_id);
     }
+    clear_control_if_doomed(&doomed_threads);
+    let removed = match repo::delete_repo_cascade(&db, repo_id).await {
+        Ok(removed) => removed,
+        Err(err) => {
+            for thread_id in &doomed_threads {
+                crate::bus::computer_srv::unrevoke_computer_routes(*thread_id);
+            }
+            return Err(e(err));
+        }
+    };
     // Gate worktree removal on created_checkout (a reused pre-existing path must
     // survive) and branch deletion on created_branch (a pre-existing branch reused
     // by the -b fallback survives repo deletion). cleanup_worktrees cannot be used
@@ -1456,9 +1506,24 @@ pub async fn delete_thread(
     // either: set_lead_status fences its meta-row insert on the thread still
     // existing, and per-session status updates no-op on deleted rows.
     let keys = thread_engine_keys(&db, thread_id).await?;
-    let removed = repo::delete_thread_cascade(&db, thread_id)
-        .await
-        .map_err(e)?;
+    // issue #160 round-23 P1 (Codex commands.rs:756): revoke this thread's
+    // computer routes BEFORE the destructive cascade (and the grant flush +
+    // engine shutdown that follow it), not after. An in-flight computer call
+    // whose thread is deleted during any of those steps would otherwise slip
+    // past both `recheck_after_guard` and the final
+    // `recheck_stop_and_lease_before_backend` — the thread isn't in the
+    // revocation set until the revoke runs — and reach the desktop after its
+    // rows are gone. Roll back if the cascade fails so a still-live session
+    // isn't fail-closed forever.
+    crate::bus::computer_srv::revoke_computer_routes(thread_id);
+    clear_control_if_doomed(std::slice::from_ref(&thread_id));
+    let removed = match repo::delete_thread_cascade(&db, thread_id).await {
+        Ok(removed) => removed,
+        Err(err) => {
+            crate::bus::computer_srv::unrevoke_computer_routes(thread_id);
+            return Err(e(err));
+        }
+    };
     // Purge the issue's WHOLE AskRegistry footprint: cancel its still-open asks
     // (else a lingering card, answered Full/Always after the rows are gone, would
     // persist a fresh grant for the deleted id) AND revoke its standing grants, so
@@ -1473,12 +1538,6 @@ pub async fn delete_thread(
             crate::lead_chat::engine::stop(&app, &eng).await;
         }
     }
-    // issue #160 round-19 P1 (Codex computer_srv.rs:403): revoke this thread's
-    // computer-use routes so a still-valid per-session bearer (a process-lifetime
-    // HMAC the delete can't rescind) can no longer drive the desktop under the
-    // deleted identity — the `handle_computer` entry gate and the pre-injection
-    // revalidation both consult this set.
-    crate::bus::computer_srv::revoke_computer_routes(thread_id);
     // issue #160 round-18 P2 (Codex paths.rs:89): drop this thread's computer-
     // use output subtree (screenshots + rotated audit logs under
     // `weft_home/computer/<thread>/`) as part of the delete cascade —

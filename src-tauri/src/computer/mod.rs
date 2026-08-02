@@ -673,9 +673,20 @@ pub fn map_screenshot_coord(
             max_y: shot_h.saturating_sub(1),
         });
     }
-    let px = current_w.x + ((f64::from(cx) / f64::from(shot_w)) * f64::from(current_w.width)).round() as i32;
-    let py = current_w.y + ((f64::from(cy) / f64::from(shot_h)) * f64::from(current_w.height)).round() as i32;
-    Ok((px, py))
+    // issue #160 round-23 P2 (Codex computer/mod.rs:677): clamp each mapped
+    // offset to `width-1`/`height-1`. `cx`/`cy` are bounds-checked only against
+    // the SCREENSHOT's own space (`cx < shot_w`), so a far-edge coordinate on a
+    // window that SHRANK since the capture can round UP to exactly `width` —
+    // e.g. `cx=1279` of `shot_w=1280` mapped onto a current width of `100`
+    // rounds to `100`, landing on `current_w.x + width`, the EXCLUSIVE right
+    // edge that sits one pixel OUTSIDE the approved window (valid offsets are
+    // `0..=width-1`). Clamping keeps the click inside the window while leaving
+    // every interior mapping bit-identical.
+    let off_x = ((f64::from(cx) / f64::from(shot_w)) * f64::from(current_w.width)).round() as i32;
+    let off_y = ((f64::from(cy) / f64::from(shot_h)) * f64::from(current_w.height)).round() as i32;
+    let off_x = off_x.min(current_w.width.saturating_sub(1) as i32);
+    let off_y = off_y.min(current_w.height.saturating_sub(1) as i32);
+    Ok((current_w.x + off_x, current_w.y + off_y))
 }
 
 /// Process-level "most recent screenshot's OWN saved dimensions, per window"
@@ -3131,6 +3142,33 @@ mod tests {
             err,
             ComputerError::OutOfBounds { x: 1280, y: 0, max_x: 1279, max_y: 799 }
         ));
+    }
+
+    #[test]
+    fn map_screenshot_coord_clamps_the_far_edge_inside_a_shrunk_window() {
+        // issue #160 round-23 P2 (Codex computer/mod.rs:677): a window that
+        // SHRANK to 100x100 since a 1280x800 screenshot. The far in-bounds
+        // screenshot corner (1279, 799) proportionally rounds UP to the window's
+        // EXCLUSIVE edge (offset 100 on a 100-wide window) — clamping holds it at
+        // width-1/height-1 so the click lands INSIDE the approved window, never
+        // one pixel past it onto an overlapping foreground app.
+        let current = WindowInfo {
+            id: 1,
+            app: "x".into(),
+            title: "x".into(),
+            x: 500,
+            y: 300,
+            width: 100,
+            height: 100,
+        };
+        let (px, py) = map_screenshot_coord(&current, 1280, 800, 1279, 799).unwrap();
+        assert_eq!(px, 500 + 99, "x clamped to width-1, inside the window");
+        assert_eq!(py, 300 + 99, "y clamped to height-1, inside the window");
+        // Interior mappings are untouched by the clamp: the screenshot midpoint
+        // still maps to the window midpoint.
+        let (mx, my) = map_screenshot_coord(&current, 1280, 800, 640, 400).unwrap();
+        assert_eq!(mx, 500 + 50);
+        assert_eq!(my, 300 + 50);
     }
 
     /// A `WindowInfo` for `shot_dims_for`/`record_shot_dims` identity tests.

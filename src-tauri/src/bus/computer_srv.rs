@@ -680,10 +680,22 @@ async fn run_action(
             // issue #160 round-16 P1 (Codex 605): the enumeration itself
             // moves onto tokio's blocking pool — see `on_blocking`'s own doc
             // for why every OS-touching call here now does.
-            on_blocking(move || computer::visible_windows(b.as_ref()))
-                .await?
-                .map(|windows| serde_json::to_string(&windows).unwrap_or_else(|_| "[]".into()))
-                .map_err(|e| e.to_string())
+            on_blocking(move || {
+                // issue #160 round-23 P2 (Codex computer_srv.rs:684): final
+                // synchronous Stop-latch check on the blocking-pool thread, as
+                // the first statement immediately before the OS enumeration — a
+                // Stop landing while THIS closure sat QUEUED for a blocking
+                // thread must fail closed here, exactly as the screenshot/input
+                // closures already do via `recheck_stop_and_lease_before_backend`.
+                // `list_windows` holds no control lease, so only the stop latch
+                // applies (there is no thread/dir-scoped lease to re-verify).
+                if computer::stop_latched() {
+                    return Err(ComputerError::Disabled.to_string());
+                }
+                computer::visible_windows(b.as_ref()).map_err(|e| e.to_string())
+            })
+            .await?
+            .map(|windows| serde_json::to_string(&windows).unwrap_or_else(|_| "[]".into()))
         }
         "screenshot" => {
             let window_query = required_window(args)?;
@@ -750,6 +762,19 @@ async fn run_action(
             // in flight went unseen, and the capture was scheduled anyway. The
             // recheck must be the arm's genuinely LAST await.
             let want_mcp_image = engine_accepts_mcp_image(db, thread, dir).await;
+            // issue #160 round-23 P1 (Codex computer_srv.rs:766): recheck session
+            // liveness after the capture queue too. The list_windows arm gained
+            // this in round-22, but this screenshot arm still only rechecked
+            // `enabled` below. A thread deleted while this call waited for a
+            // capture permit records a route revocation but does NOT flip
+            // `enabled`, so without this a standing-granted caller would capture
+            // pixels after its session is gone — and `screenshot_window` writing
+            // into the already-resolved `out_dir` would RECREATE the just-cleaned
+            // per-thread output tree. Gated on the revocation set (a never-deleted
+            // thread pays only the lock-only lookup, never the DB check).
+            if computer_routes_revoked(thread) && !session_is_live(db, thread, dir, wt).await {
+                return Err(SESSION_GONE_MSG.to_string());
+            }
             // issue #160 round-14 P1 (Codex computer_srv.rs:583): recheck the
             // kill switch AFTER every await this arm took since the last
             // `enabled` check up top — `screenshot_out_dir`, the capture
@@ -1422,11 +1447,28 @@ async fn approve(
         // inline.
         let b = backend::backend();
         let wq = window_query.to_string();
-        Some(
-            on_blocking(move || computer::resolve_window(b.as_ref(), &wq))
-                .await?
-                .map_err(|e| e.to_string())?,
-        )
+        // issue #160 round-23 P1 (Codex computer_srv.rs:1428): this resolve runs
+        // at AUTHORIZATION time — before `auto_decision_exact` and before any
+        // permission card. `ComputerError::AmbiguousWindow`'s Display lists every
+        // matching app name, window title, and id; returning it here would hand
+        // that desktop metadata to the agent with NO human approval — exactly the
+        // enumeration the `list_windows` card exists to gate, reconstructable via
+        // repeated broad-query probes. Redact the candidate list to a generic
+        // narrow-your-query message. Other resolution errors (e.g. WindowNotFound)
+        // disclose nothing about OTHER windows and pass through unchanged; the
+        // full candidate list still reaches the human on the approval card.
+        let window = match on_blocking(move || computer::resolve_window(b.as_ref(), &wq)).await? {
+            Ok(w) => w,
+            Err(ComputerError::AmbiguousWindow { .. }) => {
+                return Err(
+                    "the window query matched more than one window — narrow it to a unique \
+                     application name or window title"
+                        .to_string(),
+                );
+            }
+            Err(other) => return Err(other.to_string()),
+        };
+        Some(window)
     } else {
         None
     };
@@ -2605,6 +2647,17 @@ fn recheck_stop_and_lease_before_backend(thread: i32, dir: &str) -> Result<(), S
     if computer::stop_latched() {
         return Err(ComputerError::Disabled.to_string());
     }
+    // issue #160 round-23 P1 (Codex computer_srv.rs:2608): the "session deleted
+    // after recheck_after_guard, while the final resolve/injection was queued"
+    // gap is closed at ITS ROOT rather than here — the delete paths now CLEAR
+    // the control lease for any route they tear down (see `commands`'
+    // `clear_control_if_doomed`), so the lease check below already fails closed
+    // for a deleted route. A blanket revocation check HERE would be wrong: this
+    // helper is `dir`-blind at the thread level, and `delete_repo` revokes a
+    // SURVIVING thread (only one of its directions is gone), so a thread-level
+    // refuse would permanently break computer-use for that thread's OTHER
+    // directions. Lease-clearing is direction-precise (the lease names exactly
+    // one `(thread, dir)`), so it refuses only the torn-down route.
     match computer::control_state() {
         Some(holder) if holder.thread == thread && holder.dir == dir => Ok(()),
         Some(holder) => Err(ComputerError::Busy { thread: holder.thread, dir: holder.dir }.to_string()),
@@ -3324,6 +3377,19 @@ pub(crate) fn revoke_computer_routes(thread: i32) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(thread);
+}
+
+/// Undo a [`revoke_computer_routes`] — issue #160 round-23 P1 (Codex
+/// commands.rs:756). The delete paths now publish the revocation BEFORE their
+/// first destructive await; if the cascade then FAILS the owning rows still
+/// exist, so the thread must be un-revoked — otherwise the final
+/// [`recheck_stop_and_lease_before_backend`] guard (which refuses ANY revoked
+/// thread) would fail-close that still-live session's input forever.
+pub(crate) fn unrevoke_computer_routes(thread: i32) {
+    revoked_computer_threads()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&thread);
 }
 
 /// Whether `thread`'s routes were revoked by a delete — a lock-only set lookup,

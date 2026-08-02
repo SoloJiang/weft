@@ -482,7 +482,20 @@ fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> bool {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             return false;
         };
-        let tmp = path.with_file_name(format!(".{name}.{}.weft-tmp", std::process::id()));
+        // issue #160 round-23 P2 (Codex inject.rs:486): a PID-only temp name is
+        // NOT unique WITHIN one process. Two concurrent constructors injecting
+        // the same session's config would derive the identical temp path, and
+        // the best-effort `remove_file` below would let the second writer unlink
+        // the first writer's still-open temp — after which the first writer's
+        // `rename` could publish the second writer's still-buffered file,
+        // yielding a partial config. A monotonic per-write counter makes every
+        // temp name distinct, so each writer only ever touches its OWN temp.
+        let seq = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        };
+        let tmp = path.with_file_name(format!(".{name}.{}.{seq}.weft-tmp", std::process::id()));
         let _ = std::fs::remove_file(&tmp); // best-effort: clear a stale temp from a crashed run
         let mut opt = std::fs::OpenOptions::new();
         opt.write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
@@ -529,7 +542,16 @@ fn set_owner_only_windows(path: &Path, bytes: &[u8]) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    let tmp = path.with_file_name(format!(".{name}.{}.weft-tmp", std::process::id()));
+    // issue #160 round-23 P2 (Codex inject.rs:486): distinct temp name per write
+    // — a PID-only name collides between two concurrent same-process writers for
+    // one destination (see the unix branch's own note for the unlink/rename
+    // race this closes).
+    let seq = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    };
+    let tmp = path.with_file_name(format!(".{name}.{}.{seq}.weft-tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp); // best-effort: clear a stale temp from a crashed run
     let Ok(file) = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) else {
         return false;
