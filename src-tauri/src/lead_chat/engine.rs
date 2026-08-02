@@ -91,9 +91,7 @@ fn plan_approval_turn_idle(turn: &TurnState) -> bool {
 }
 
 fn plan_approval_admissible(inner: &EngineInner) -> bool {
-    !inner.rewinding
-        && !inner.quota_failover_committing
-        && plan_approval_turn_idle(&inner.turn)
+    !inner.rewinding && !inner.quota_failover_committing && plan_approval_turn_idle(&inner.turn)
 }
 
 /// Incremental pushes to the frontend. snake_case-tagged to match the TS side.
@@ -565,7 +563,10 @@ fn finalize_text(
         .ok()
         .map(|v| {
             let empty = |k: &str| {
-                v.get(k).and_then(|x| x.as_array()).map(|a| a.is_empty()).unwrap_or(true)
+                v.get(k)
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.is_empty())
+                    .unwrap_or(true)
             };
             empty("images") && empty("files")
         })
@@ -777,8 +778,7 @@ async fn acp_drain_and_finalize_open_rows(
     }
     let mut inner = eng.lock().await;
     let thread_id = inner.thread_id;
-    let orphans: Vec<(i32, serde_json::Value)> =
-        inner.tool_rows.drain().map(|(_, v)| v).collect();
+    let orphans: Vec<(i32, serde_json::Value)> = inner.tool_rows.drain().map(|(_, v)| v).collect();
     finalize_orphan_tool_rows(app, db, thread_id, orphans, status).await;
     finalize_open_texts(app, db, &mut inner, status).await;
     if inner.current.is_some() {
@@ -932,7 +932,10 @@ fn tool_row_status(has_output: bool, trackable: bool, is_error: bool) -> &'stati
 /// is byte-identical to pre-#99 output — same contract as `text_row_content`.
 /// Pure and DB-free by design: `persist_tool_calls` is the only caller in the
 /// live path, but keeping this separate lets it be unit-tested directly.
-fn tool_row_content(call: &super::proto::ToolCall, agent_thread: Option<&str>) -> serde_json::Value {
+fn tool_row_content(
+    call: &super::proto::ToolCall,
+    agent_thread: Option<&str>,
+) -> serde_json::Value {
     let mut content = serde_json::json!({
         "name": call.name,
         "summary": call.summary,
@@ -1104,13 +1107,8 @@ async fn apply_lead_sentinels(
                 if md.is_empty() {
                     eprintln!("[weft] lead sentinel: test_cases body is empty — dropped");
                 } else {
-                    match repo::lead_upsert_test_plan(
-                        db,
-                        thread_id,
-                        md,
-                        inner.clock.started_millis,
-                    )
-                    .await
+                    match repo::lead_upsert_test_plan(db, thread_id, md, inner.clock.started_millis)
+                        .await
                     {
                         Ok(true) => {
                             let summary = super::test_plan::summarize(md).to_string();
@@ -1199,7 +1197,6 @@ fn has_pending_user_test_update(turn: &TurnState) -> bool {
         .any(|o| o.text.contains("<weft:test_cases_updated>"))
 }
 
-
 /// Persist one card sentinel (`action_card` / `plan_card`) as its own timeline
 /// row and push it to the UI. Rejects anything that isn't a JSON object so the
 /// UI can rely on the card's fields; errors are logged, never fatal.
@@ -1215,7 +1212,14 @@ async fn persist_card_row(
         Ok(v) if v.is_object() => {
             let (sid, turn) = (inner.session_id, inner.turn_id);
             match repo::insert_lead_message(
-                db, thread_id, sid, turn, "assistant", kind, json, "complete",
+                db,
+                thread_id,
+                sid,
+                turn,
+                "assistant",
+                kind,
+                json,
+                "complete",
             )
             .await
             {
@@ -1258,7 +1262,17 @@ async fn finalize_open_texts(app: &AppHandle, db: &Db, inner: &mut EngineInner, 
         .map(|(_, r)| (r.row, r.buf, r.agent_thread))
         .collect();
     for (id, text, agent_thread) in rows {
-        finalize_text_row(app, db, inner, id, text, status, false, agent_thread.as_deref()).await;
+        finalize_text_row(
+            app,
+            db,
+            inner,
+            id,
+            text,
+            status,
+            false,
+            agent_thread.as_deref(),
+        )
+        .await;
     }
 }
 
@@ -1303,8 +1317,8 @@ async fn finalize_text_row(
     } else {
         (text, false)
     };
-    let _ = repo::update_lead_message(db, id, &text_row_content(&clean, agent_thread), status)
-        .await;
+    let _ =
+        repo::update_lead_message(db, id, &text_row_content(&clean, agent_thread), status).await;
     let _ = app.emit(
         EVENT,
         Push::Finalize {
@@ -1399,9 +1413,13 @@ async fn cleanup_disconnected_turn(
     // append a spurious terminal bubble after it.
     let had_orphan_texts = !orphan_texts.is_empty() || turn_saw_text;
     for (id, text, agent_thread) in orphan_texts {
-        let _ =
-            repo::update_lead_message(db, id, &text_row_content(&text, agent_thread.as_deref()), status)
-                .await;
+        let _ = repo::update_lead_message(
+            db,
+            id,
+            &text_row_content(&text, agent_thread.as_deref()),
+            status,
+        )
+        .await;
         emit_finalize(app, thread_id, id, status);
     }
     if let Ok(Some(row)) = persist_disconnected_turn_row(
@@ -1586,6 +1604,10 @@ pub struct EngineInner {
     pub cwd: std::path::PathBuf,
     /// Ask-hook + MCP injection args, appended to every spawn.
     pub extra_args: Vec<String>,
+    /// Per-engine environment injected at spawn. OpenCode uses this for a
+    /// session-scoped inline MCP config; keeping it on the engine prevents two
+    /// sessions sharing one worktree from overwriting each other's bus URL.
+    pub extra_env: Vec<(String, String)>,
     pub system_prompt: String,
     pub native_id: Option<String>,
     /// A mechanical digest of the thread's history, staged by an engine/model
@@ -1886,7 +1908,11 @@ async fn persist_engine_meta(db: &Db, inner: &EngineInner) {
 /// `absorb_probe_meta` later compares the ticket against the newest committed
 /// one, so a slow probe that returns after a fresher one can't roll usage back.
 /// No engine → None: nothing is running, so there is no race to order.
-pub async fn take_probe_ticket(app: &AppHandle, thread_id: i32, session_id: Option<i32>) -> Option<u64> {
+pub async fn take_probe_ticket(
+    app: &AppHandle,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Option<u64> {
     let key = match session_id {
         Some(sid) => sid as i64,
         None => -(thread_id as i64),
@@ -2001,9 +2027,21 @@ pub fn apply_persisted_meta(inner: &mut EngineInner, json: &str) {
 /// callers is the natural one DashMap already enforces: don't keep a per-entry
 /// `Ref`/`RefMut` alive across an `.await` (clone the value out and drop it).
 #[derive(Default)]
-pub struct LeadChatState(pub DashMap<i64, EngineRef>);
+pub struct LeadChatState(pub DashMap<i64, EngineRef>, Arc<tokio::sync::RwLock<()>>);
 
 impl LeadChatState {
+    /// Constructors hold a read guard from their durable admission check
+    /// through registry insertion/start. Destructive cascades take the write
+    /// guard from their key snapshot through post-commit stop, closing the
+    /// suspended-constructor window that a DB marker alone cannot fence.
+    pub async fn engine_admission_read(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.1.clone().read_owned().await
+    }
+
+    pub async fn engine_admission_write(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.1.clone().write_owned().await
+    }
+
     pub fn get(&self, key: i64) -> Option<EngineRef> {
         self.0.get(&key).map(|r| r.value().clone())
     }
@@ -2052,9 +2090,8 @@ impl LeadChatState {
 pub(crate) fn initial_worker_route_gate(
     direction_id: i32,
 ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    static GATES: std::sync::OnceLock<
-        DashMap<i32, std::sync::Arc<tokio::sync::Mutex<()>>>,
-    > = std::sync::OnceLock::new();
+    static GATES: std::sync::OnceLock<DashMap<i32, std::sync::Arc<tokio::sync::Mutex<()>>>> =
+        std::sync::OnceLock::new();
     let gates = GATES.get_or_init(DashMap::new);
     gates
         .entry(direction_id)
@@ -2157,6 +2194,7 @@ async fn ensure_running_locked(
         .args(build_args(inner))
         .current_dir(&inner.cwd)
         .env("PATH", crate::detect::tool_path())
+        .envs(inner.extra_env.iter().cloned())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -2202,23 +2240,131 @@ async fn ensure_running_locked(
 
 /// Spawn the process if it isn't alive (fresh or `--resume`), wiring the reader.
 /// Per-turn dialects have no resident process — sending spawns one per turn.
-pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
-    let mut inner = eng.lock().await;
-    let reader = ensure_running_locked(app, &mut inner).await?;
-    drop(inner);
-    if let Some((stdout, generation, quota_command)) = reader {
-        spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation, quota_command);
+pub(crate) async fn ensure_worker_parent_chain(
+    db: &Db,
+    direction_id: i32,
+    session_repo_id: i32,
+) -> anyhow::Result<crate::store::entities::direction::Model> {
+    let direction = repo::ensure_direction_workspace_accepts_writes(db, direction_id).await?;
+    let thread = repo::ensure_thread_workspace_accepts_writes(db, direction.thread_id).await?;
+    let primary_repo = repo::ensure_repo_workspace_accepts_writes(db, direction.repo_id).await?;
+    let session_repo = repo::ensure_repo_workspace_accepts_writes(db, session_repo_id).await?;
+    if primary_repo.workspace_id != thread.workspace_id {
+        anyhow::bail!(
+            "direction {direction_id} repo {} does not belong to thread {}'s workspace",
+            primary_repo.id,
+            thread.id
+        );
+    }
+    if session_repo.workspace_id != thread.workspace_id {
+        anyhow::bail!(
+            "session repo {} does not belong to thread {}'s workspace",
+            session_repo.id,
+            thread.id
+        );
+    }
+    Ok(direction)
+}
+
+async fn validate_registered_engine_identity(
+    state: Option<&LeadChatState>,
+    db: &Db,
+    eng: &EngineRef,
+    thread_id: i32,
+    session_id: Option<i32>,
+    direction_scope: &str,
+) -> anyhow::Result<()> {
+    if let Some(state) = state {
+        let key = session_id
+            .map(i64::from)
+            .unwrap_or_else(|| super::commands::lead_key(thread_id));
+        let registered = state
+            .get(key)
+            .is_some_and(|registered| Arc::ptr_eq(&registered, eng));
+        if !registered {
+            anyhow::bail!("engine is no longer registered");
+        }
+    }
+    repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let Some(session_id) = session_id else {
+        if direction_scope != crate::bus::LEAD {
+            anyhow::bail!("invalid lead engine identity");
+        }
+        return Ok(());
+    };
+
+    let direction_id = direction_scope
+        .parse::<i32>()
+        .map_err(|_| anyhow::anyhow!("invalid worker direction identity"))?;
+    let session = repo::get_session(db, session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} no longer exists"))?;
+    if session.direction_id != direction_id {
+        anyhow::bail!("session {session_id} no longer belongs to direction {direction_id}");
+    }
+    let direction = ensure_worker_parent_chain(db, direction_id, session.repo_id).await?;
+    if direction.thread_id != thread_id {
+        anyhow::bail!("direction {direction_id} no longer belongs to thread {thread_id}");
     }
     Ok(())
 }
 
-pub async fn ensure_running_for_send(
+async fn engine_admission_guard(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+) -> anyhow::Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>> {
+    let state = app.try_state::<LeadChatState>();
+    let guard = if let Some(state) = state.as_ref() {
+        Some(state.engine_admission_read().await)
+    } else {
+        None
+    };
+    let (thread_id, session_id, direction_scope) = {
+        let inner = eng.lock().await;
+        (inner.thread_id, inner.session_id, inner.ask_dir.clone())
+    };
+    validate_registered_engine_identity(
+        state.as_deref(),
+        db,
+        eng,
+        thread_id,
+        session_id,
+        &direction_scope,
+    )
+    .await?;
+    Ok(guard)
+}
+
+async fn ensure_running_admitted(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
+    let mut inner = eng.lock().await;
+    let reader = ensure_running_locked(app, &mut inner).await?;
+    drop(inner);
+    if let Some((stdout, generation, quota_command)) = reader {
+        spawn_reader(
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            stdout,
+            generation,
+            quota_command,
+        );
+    }
+    Ok(())
+}
+
+pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
+    let _admission = engine_admission_guard(app, db, eng).await?;
+    ensure_running_admitted(app, db, eng).await
+}
+
+async fn ensure_running_for_send_admitted(
     app: &AppHandle,
     db: &Db,
     eng: &EngineRef,
 ) -> anyhow::Result<()> {
     eng.lock().await.stopped = false;
-    ensure_running(app, db, eng).await
+    ensure_running_admitted(app, db, eng).await
 }
 
 /// Drop the resident child and its stdin so the next send respawns a clean
@@ -2271,7 +2417,7 @@ pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
 ///   drains it, and a later send would run ahead of it.
 /// - the session activity Phase 1 optimistically persisted as "running" is
 ///   re-persisted ("stopped"/"idle" per current state): a stop landing between
-///   ensure_running_for_send and Phase 1 has its unlocked "stopped" write
+///   ensure_running_for_send_admitted and Phase 1 has its unlocked "stopped" write
 ///   overtaken by Phase 1's locked "running" write.
 async fn rollback_canceled_send(
     app: &AppHandle,
@@ -2315,7 +2461,11 @@ async fn rollback_canceled_send(
         // let this idle/stopped write land AFTER the new turn's running write —
         // leaving DB/UI idle while a turn runs (breaking live counts and
         // boot-revive decisions).
-        let status = if inner.stopped { STATUS_STOPPED } else { "idle" };
+        let status = if inner.stopped {
+            STATUS_STOPPED
+        } else {
+            "idle"
+        };
         persist_activity(db, inner.session_id, inner.thread_id, status).await;
         emit_turn_state(app, inner.thread_id, inner.session_id, false, Vec::new());
         (inner.thread_id, drained)
@@ -2485,6 +2635,7 @@ pub async fn send(
     files: Vec<String>,
     origin_tag: Option<String>,
 ) -> anyhow::Result<()> {
+    let _engine_admission = engine_admission_guard(app, db, eng).await?;
     crate::process_quota::admit_new_work(app)?;
     // A rewind holds its reservation from the busy check to the final
     // truncate; sends error out for that window rather than racing the
@@ -2584,20 +2735,39 @@ pub async fn send(
             let user_row =
                 repo::insert_lead_message(db, thread_id, sid, turn, "user", "text", &user, "error")
                     .await?;
-            let _ = app.emit(EVENT, Push::Message { thread_id, message: user_row });
+            let _ = app.emit(
+                EVENT,
+                Push::Message {
+                    thread_id,
+                    message: user_row,
+                },
+            );
             let notice =
                 serde_json::json!({ "terminal": "agent_not_found", "tool": tool }).to_string();
             let notice_row = repo::insert_lead_message(
-                db, thread_id, sid, turn, "assistant", "text", &notice, "error",
+                db,
+                thread_id,
+                sid,
+                turn,
+                "assistant",
+                "text",
+                &notice,
+                "error",
             )
             .await?;
-            let _ = app.emit(EVENT, Push::Message { thread_id, message: notice_row });
+            let _ = app.emit(
+                EVENT,
+                Push::Message {
+                    thread_id,
+                    message: notice_row,
+                },
+            );
             // Both rows are durably recorded, so resolve OK: returning Err here would
             // trip the composer's error path and restore the draft → duplicate on retry.
             return Ok(());
         }
     }
-    ensure_running_for_send(app, db, eng).await?;
+    ensure_running_for_send_admitted(app, db, eng).await?;
 
     // Phase 1: acquire the lock only long enough to reserve turn state and
     // snapshot the fields needed for persistence. All slow IO (DB writes,
@@ -2815,7 +2985,7 @@ pub async fn send(
         // to a dead stdin, queueing on a drained turn, or spawning after stop.
         if !send_reservation_valid(&inner, &ctx) {
             drop(inner);
-            // A stop/interrupt can land between ensure_running_for_send and
+            // A stop/interrupt can land between ensure_running_for_send_admitted and
             // Phase 3, leaving Phase 1's reservation on an engine that will
             // never run it. Undo it and restore the invariants (busy, activity,
             // interrupt flag, anything queued behind the canceled turn) — the
@@ -2831,7 +3001,8 @@ pub async fn send(
         if ctx.direct && !spawn_now && !is_connection {
             if let Err(e) = write_user(&mut inner, &out).await {
                 drop(inner);
-                rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, "error").await;
+                rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, "error")
+                    .await;
                 return Err(e);
             }
         } else if !ctx.direct {
@@ -2861,7 +3032,10 @@ pub async fn send(
                 // The active turn ENDED while this send persisted: nothing drains
                 // an idle queue, so deliver NOW by promoting into a fresh direct
                 // turn — the same commit-time decision a direct send makes.
-                promoted = Some(promote_queued_reservation(&mut inner, ctx.origin_tag.clone()));
+                promoted = Some(promote_queued_reservation(
+                    &mut inner,
+                    ctx.origin_tag.clone(),
+                ));
                 // Same pre-turn checkpoint as a direct send, taken between the
                 // promotion and the dispatch (the resident write below; per-turn
                 // / codex spawns in Phase 4).
@@ -2920,8 +3094,14 @@ pub async fn send(
     // snapshot, so neither a plain stop nor a stop-then-restart landing in the
     // Phase-3-to-spawn window can launch a child for a canceled send.
     if spawn_now {
-        if let Err(e) =
-            spawn_turn(app.clone(), db.clone(), eng.clone(), out, Some(ctx.reset_epoch)).await
+        if let Err(e) = spawn_turn(
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            out,
+            Some(ctx.reset_epoch),
+        )
+        .await
         {
             // A guard-canceled spawn (stop/interrupt raced the window) is the
             // user's cancel — finalize "interrupted", not "error".
@@ -3219,8 +3399,14 @@ async fn spawn_codex_turn_or_exec(
     out: Outgoing,
     expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
-    if let Err(e) =
-        spawn_codex_turn(app.clone(), db.clone(), eng.clone(), out.clone(), expected_epoch).await
+    if let Err(e) = spawn_codex_turn(
+        app.clone(),
+        db.clone(),
+        eng.clone(),
+        out.clone(),
+        expected_epoch,
+    )
+    .await
     {
         // Stop pressed while the app-server start was pending and it then errored:
         // don't resurrect the canceled turn on exec — propagate so the caller rolls
@@ -3253,7 +3439,6 @@ fn codex_first_turn_text(system_prompt: &str, message: &str, had_native: bool) -
         message.to_string()
     }
 }
-
 
 pub(crate) fn is_acp_tool(tool: &str) -> bool {
     crate::acp::backend_for(tool).is_some()
@@ -3313,8 +3498,8 @@ async fn spawn_acp_turn(
             i.ask_dir.clone(),
         )
     };
-    let backend = crate::acp::backend_for(&tool)
-        .ok_or_else(|| anyhow::anyhow!("not an ACP tool: {tool}"))?;
+    let backend =
+        crate::acp::backend_for(&tool).ok_or_else(|| anyhow::anyhow!("not an ACP tool: {tool}"))?;
     let program = crate::tool_command::effective(command.as_deref(), &tool);
     let client = crate::acp::runtime::client(backend.id(), &program).await?;
 
@@ -3337,21 +3522,49 @@ async fn spawn_acp_turn(
         match kind.as_str() {
             // Concierge: weft_global only (never bus).
             "concierge" => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, "lead", false, false, true, false,
+                &base,
+                thread_id_i,
+                "lead",
+                None,
+                false,
+                false,
+                true,
+                false,
             ),
             // Curator: curator MCP + bus under LEAD identity.
             "curator" => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, crate::bus::LEAD, true, false, false, true,
+                &base,
+                thread_id_i,
+                crate::bus::LEAD,
+                None,
+                true,
+                false,
+                false,
+                true,
             ),
             // Issue lead: planner + bus.
             _ => crate::bus::inject::acp_mcp_servers(
-                &base, thread_id_i, crate::bus::LEAD, true, true, false, false,
+                &base,
+                thread_id_i,
+                crate::bus::LEAD,
+                None,
+                true,
+                true,
+                false,
+                false,
             ),
         }
     } else {
         // Worker: bus only under direction id.
         crate::bus::inject::acp_mcp_servers(
-            &base, thread_id_i, &ask_dir, true, false, false, false,
+            &base,
+            thread_id_i,
+            &ask_dir,
+            sid,
+            true,
+            false,
+            false,
+            false,
         )
     };
 
@@ -3482,9 +3695,7 @@ async fn spawn_acp_turn(
         let mut g = eng.lock().await;
         // Ordinary composer Stop sets `interrupting` without bumping epoch until
         // the delayed force reset — must not publish acp_client or arm prompt.
-        let won = g.stopped
-            || g.interrupting
-            || expected_epoch.is_some_and(|e| e != g.reset_epoch);
+        let won = g.stopped || g.interrupting || expected_epoch.is_some_and(|e| e != g.reset_epoch);
         if !won {
             g.acp_client = Some(client.clone());
             if g.native_id.as_deref() != Some(session_id.as_str()) {
@@ -3529,10 +3740,7 @@ async fn spawn_acp_turn(
     // between stop_won and here must not start session/prompt after cancel.
     let prompt_epoch = {
         let g = eng.lock().await;
-        if g.stopped
-            || g.interrupting
-            || expected_epoch.is_some_and(|e| e != g.reset_epoch)
-        {
+        if g.stopped || g.interrupting || expected_epoch.is_some_and(|e| e != g.reset_epoch) {
             drop(g);
             let _ = client.cancel(&session_id).await;
             client.unsubscribe(&session_id).await;
@@ -3619,10 +3827,7 @@ async fn spawn_acp_turn(
                 eprintln!("[weft][acp] prompt failed: {err}");
                 let (interrupting, stopped) = {
                     let g = e.lock().await;
-                    (
-                        g.interrupting,
-                        g.stopped || g.reset_epoch != prompt_epoch,
-                    )
+                    (g.interrupting, g.stopped || g.reset_epoch != prompt_epoch)
                 };
                 if stopped {
                     return;
@@ -3688,7 +3893,10 @@ async fn acp_drain_then_end(
 ) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let sent = client
-        .send_session_event(&session_id, crate::acp::runtime::SessionEvent::DrainBarrier(tx))
+        .send_session_event(
+            &session_id,
+            crate::acp::runtime::SessionEvent::DrainBarrier(tx),
+        )
         .await;
     if sent {
         // Bounded wait: if the consumer is gone, don't hang finalize forever.
@@ -3730,8 +3938,13 @@ async fn acp_emit_turn_end(
     let mut pending_error = is_error;
     let mut pending_cancel = cancelled;
     // Optional follow-up prompt after finalize (queue drain) — loop, not recurse.
-    let mut follow_up: Option<(crate::acp::runtime::ClientHandle, String, Outgoing, u64, i32)> =
-        None;
+    let mut follow_up: Option<(
+        crate::acp::runtime::ClientHandle,
+        String,
+        Outgoing,
+        u64,
+        i32,
+    )> = None;
     loop {
         if let Some((client, sid, msg, dequeue_epoch, turn_id)) = follow_up.take() {
             let admissible = {
@@ -3909,9 +4122,11 @@ fn file_risk(
     if paths.is_empty() {
         return pathless;
     }
-    crate::ask::most_severe(paths.iter().map(|path| {
-        crate::ask::classify_risk(crate::ask::RiskSignal::File { tool_name, path })
-    }))
+    crate::ask::most_severe(
+        paths.iter().map(|path| {
+            crate::ask::classify_risk(crate::ask::RiskSignal::File { tool_name, path })
+        }),
+    )
 }
 
 /// Reject an ACP permission request on the wire without a human verdict —
@@ -3958,9 +4173,7 @@ fn acp_permission_risk(
         }
         // A write that named nothing IS still a write: the verb alone
         // establishes mutation, so the verb-derived tier is the honest floor.
-        PermissionIntent::Write { paths } => {
-            file_risk("Edit", paths, crate::ask::RiskLevel::Write)
-        }
+        PermissionIntent::Write { paths } => file_risk("Edit", paths, crate::ask::RiskLevel::Write),
         PermissionIntent::Network => crate::ask::classify_risk(crate::ask::RiskSignal::Network),
         PermissionIntent::Other { kind } => {
             crate::ask::classify_risk(crate::ask::RiskSignal::Other {
@@ -4034,8 +4247,8 @@ async fn acp_consumer(
     // the route rather than whatever won a race afterwards.
     start_epoch: u64,
 ) {
-    use crate::acp::runtime::SessionEvent;
     use super::proto::ChatEvent;
+    use crate::acp::runtime::SessionEvent;
     // Accumulated thought text for the busy-line chip, bounded to the display
     // window. Cleared at every prompt boundary — see the DrainBarrier arm.
     let mut thought_buf = ThoughtTail::default();
@@ -4060,7 +4273,8 @@ async fn acp_consumer(
             _ if {
                 let g = eng.lock().await;
                 g.stopped || g.reset_epoch != start_epoch
-            } => {
+            } =>
+            {
                 // Drop late events after stop/unsubscribe/teardown.
             }
             SessionEvent::ToolProgress { summary } => {
@@ -4100,7 +4314,11 @@ async fn acp_consumer(
                 );
             }
 
-            SessionEvent::Chat(ChatEvent::TextDelta { text, item: _, agent_thread: _ }) => {
+            SessionEvent::Chat(ChatEvent::TextDelta {
+                text,
+                item: _,
+                agent_thread: _,
+            }) => {
                 // Answer tokens started — drop soft/real thinking chip always.
                 thought_buf.clear();
                 {
@@ -4138,10 +4356,18 @@ async fn acp_consumer(
                         continue;
                     };
                     inner.current = Some((m.id, String::new(), std::time::Instant::now()));
-                    let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Message {
+                            thread_id,
+                            message: m,
+                        },
+                    );
                 }
                 let origin_tag = inner.current_origin_tag.clone();
-                let Some(c) = inner.current.as_mut() else { continue };
+                let Some(c) = inner.current.as_mut() else {
+                    continue;
+                };
                 c.1.push_str(&text);
                 let row = c.0;
                 if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
@@ -4328,9 +4554,8 @@ async fn acp_consumer(
                             // into a rejection, it cannot un-grant that.
                             let registered = {
                                 let mut g = eng.lock().await;
-                                let lost = g.stopped
-                                    || g.interrupting
-                                    || g.reset_epoch != start_epoch;
+                                let lost =
+                                    g.stopped || g.interrupting || g.reset_epoch != start_epoch;
                                 if !lost {
                                     g.acp_pending_asks.push(id);
                                 }
@@ -4441,12 +4666,18 @@ async fn codex_consumer(
                 };
                 if let Some(tool) = tool {
                     let previous = crate::engine_quota::current(&tool);
-                    if let Some(snapshot) = structured_codex_exhaustion_snapshot(&tool, previous.as_ref()) {
+                    if let Some(snapshot) =
+                        structured_codex_exhaustion_snapshot(&tool, previous.as_ref())
+                    {
                         crate::engine_quota::report_for_command(snapshot, &quota_command);
                     }
                 }
             }
-            ThreadMsg::Event(ChatEvent::TextDelta { text, item, agent_thread }) => {
+            ThreadMsg::Event(ChatEvent::TextDelta {
+                text,
+                item,
+                agent_thread,
+            }) => {
                 let mut inner = eng.lock().await;
                 note_turn_activity(&app, &db, &eng, &mut inner);
                 let thread_id = inner.thread_id;
@@ -4558,7 +4789,11 @@ async fn codex_consumer(
                     },
                 );
             }
-            ThreadMsg::Event(ChatEvent::TextDone { item, text, agent_thread }) => {
+            ThreadMsg::Event(ChatEvent::TextDone {
+                item,
+                text,
+                agent_thread,
+            }) => {
                 let mut inner = eng.lock().await;
                 note_turn_activity(&app, &db, &eng, &mut inner);
                 let streamed = item.as_ref().and_then(|k| inner.open_texts.remove(k));
@@ -4570,12 +4805,23 @@ async fn codex_consumer(
                     // The row's origin was already decided at its FIRST delta
                     // (OpenTextRow::agent_thread) — this event's OWN agent_thread
                     // is redundant with it (same item, same thread) and unused.
-                    Some(OpenTextRow { row, buf, agent_thread: tag, .. }) => {
+                    Some(OpenTextRow {
+                        row,
+                        buf,
+                        agent_thread: tag,
+                        ..
+                    }) => {
                         let auth = text.filter(|t| !t.is_empty());
                         let replaced = auth.as_deref().is_some_and(|t| t != buf);
                         let body = auth.unwrap_or(buf);
                         finalize_text_row(
-                            &app, &db, &mut inner, row, body, "complete", replaced,
+                            &app,
+                            &db,
+                            &mut inner,
+                            row,
+                            body,
+                            "complete",
+                            replaced,
                             tag.as_deref(),
                         )
                         .await;
@@ -4615,14 +4861,25 @@ async fn codex_consumer(
                         // the body or the live view shows an empty bubble.
                         // (finalize_text_row records turn_saw_text.)
                         finalize_text_row(
-                            &app, &db, &mut inner, m.id, t, "complete", true,
+                            &app,
+                            &db,
+                            &mut inner,
+                            m.id,
+                            t,
+                            "complete",
+                            true,
                             branch.as_deref(),
                         )
                         .await;
                     }
                 }
             }
-            ThreadMsg::Event(ChatEvent::Assistant { texts, tools, agent_thread, .. }) => {
+            ThreadMsg::Event(ChatEvent::Assistant {
+                texts,
+                tools,
+                agent_thread,
+                ..
+            }) => {
                 // Codex streams text via deltas; non-text items are tool calls →
                 // inline `kind:"tool"` rows, filled by their item.completed result.
                 // Text rows are NOT finalized here: each agentMessage closes via
@@ -4960,7 +5217,9 @@ async fn codex_consumer(
                         let _ = client
                             .reply_result(
                                 &id,
-                                crate::codex_app_server::codex_approval_reply(is_perm, allow, requested),
+                                crate::codex_app_server::codex_approval_reply(
+                                    is_perm, allow, requested,
+                                ),
                             )
                             .await;
                     }
@@ -4994,7 +5253,9 @@ async fn codex_consumer(
                             let _ = client
                                 .reply_result(
                                     &id,
-                                    crate::codex_app_server::codex_approval_reply(is_perm, allow, requested),
+                                    crate::codex_app_server::codex_approval_reply(
+                                        is_perm, allow, requested,
+                                    ),
                                 )
                                 .await;
                         });
@@ -5006,7 +5267,9 @@ async fn codex_consumer(
                 // matching Needs-you card so it doesn't linger and send a stale
                 // reply when clicked. The reply task's rx then errors → it declines.
                 if let Some(entry) = pending_asks.remove(&request_id.to_string()) {
-                    app.state::<crate::ask::AskRegistry>().inner().cancel(*entry.value());
+                    app.state::<crate::ask::AskRegistry>()
+                        .inner()
+                        .cancel(*entry.value());
                 }
             }
         }
@@ -5019,7 +5282,6 @@ async fn codex_consumer(
         cleanup_disconnected_turn(&app, &db, &eng, "error").await;
     }
 }
-
 
 /// The (tool, summary, detail, risk, action_key) quintuple for a codex
 /// app-server approval — computed ONCE so the Needs-you card, the IM card,
@@ -5085,7 +5347,13 @@ pub(crate) fn codex_approval_fields(
         // per call site (see #89's round-2 finding on the claude/opencode side).
         let action_key = crate::ask::action_key(&["Bash", &full]);
         let risk = crate::ask::classify_risk(crate::ask::RiskSignal::Command(&full));
-        return ("Bash", format!("Run: {first}"), full.clone(), risk, action_key);
+        return (
+            "Bash",
+            format!("Run: {first}"),
+            full.clone(),
+            risk,
+            action_key,
+        );
     }
     if has_changes {
         // `full_paths` is the UNTRUNCATED changed-path list: the AskRegistry
@@ -5212,6 +5480,7 @@ async fn spawn_turn(
         .args(&args)
         .current_dir(&inner.cwd)
         .env("PATH", crate::detect::tool_path())
+        .envs(inner.extra_env.iter().cloned())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         // stderr → app log: a per-turn CLI that dies prints its reason there.
@@ -5241,12 +5510,23 @@ async fn spawn_turn(
 }
 
 /// 取消一条还在队列中的消息；幂等（消息已交付则静默成功）。
-pub async fn queue_remove(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i32) -> anyhow::Result<()> {
+pub async fn queue_remove(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    message_id: i32,
+) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
     if !inner.turn.remove(message_id) {
         return Ok(());
     }
-    emit_turn_state(app, inner.thread_id, inner.session_id, inner.turn.busy, queue_items(&inner.turn));
+    emit_turn_state(
+        app,
+        inner.thread_id,
+        inner.session_id,
+        inner.turn.busy,
+        queue_items(&inner.turn),
+    );
     // Delete under the lock so a concurrent stop (mark_queued_status also takes
     // the lock) cannot re-finalize a row we just removed from memory.
     repo::delete_message(db, message_id).await?;
@@ -5254,7 +5534,13 @@ pub async fn queue_remove(app: &AppHandle, db: &Db, eng: &EngineRef, message_id:
 }
 
 /// 编辑一条还在队列中的消息文本；text 为空或有附件时返回 Err。
-pub async fn queue_edit(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i32, text: &str) -> anyhow::Result<()> {
+pub async fn queue_edit(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    message_id: i32,
+    text: &str,
+) -> anyhow::Result<()> {
     if text.trim().is_empty() {
         return Err(anyhow::anyhow!("empty"));
     }
@@ -5262,7 +5548,12 @@ pub async fn queue_edit(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i
         let mut inner = eng.lock().await;
         // Reject edits on attachment-bearing rows: they carry image/file chips
         // in their content that the text-only edit path would silently drop.
-        if inner.turn.queue.iter().any(|o| o.queue_id == Some(message_id) && o.has_attachments) {
+        if inner
+            .turn
+            .queue
+            .iter()
+            .any(|o| o.queue_id == Some(message_id) && o.has_attachments)
+        {
             return Err(anyhow::anyhow!("not_editable"));
         }
         if !inner.turn.edit(message_id, text) {
@@ -5298,7 +5589,12 @@ pub async fn queue_edit(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i
 }
 
 /// 重排队列；order 必须是当前队列 id 的排列，否则返回 Err。
-pub async fn queue_reorder(app: &AppHandle, _db: &Db, eng: &EngineRef, order: Vec<i32>) -> anyhow::Result<()> {
+pub async fn queue_reorder(
+    app: &AppHandle,
+    _db: &Db,
+    eng: &EngineRef,
+    order: Vec<i32>,
+) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
     let ok = inner.turn.reorder(&order);
     let (tid, sid) = (inner.thread_id, inner.session_id);
@@ -5378,12 +5674,7 @@ async fn force_acp_finalize_drain(
 }
 
 /// Force-reset a wedged ACP turn after cancel is ignored.
-async fn force_acp_turn_reset(
-    app: &AppHandle,
-    eng: &EngineRef,
-    turn_id: i32,
-    epoch_at_arm: u64,
-) {
+async fn force_acp_turn_reset(app: &AppHandle, eng: &EngineRef, turn_id: i32, epoch_at_arm: u64) {
     let snapshot = {
         let mut inner = eng.lock().await;
         if !inner.turn.busy || inner.turn_id != turn_id || inner.reset_epoch != epoch_at_arm {
@@ -5413,13 +5704,7 @@ async fn force_acp_turn_reset(
         // epoch, is admitted onto a fresh session, and then has its native id
         // cleared and an idle state emitted over it by this older reset.
         inner.tearing_down = true;
-        (
-            inner.thread_id,
-            inner.session_id,
-            client,
-            sid,
-            drain,
-        )
+        (inner.thread_id, inner.session_id, client, sid, drain)
     };
     let (thread_id, session_id, client, sid, drain) = snapshot;
     if let (Some(c), Some(sid)) = (client.as_ref(), sid.as_deref()) {
@@ -5623,6 +5908,7 @@ async fn send_hidden_inner(
     ensure: bool,
     plan_guard: Option<(i32, i32, bool)>,
 ) -> anyhow::Result<bool> {
+    let _engine_admission = engine_admission_guard(app, db, eng).await?;
     if let Err(err) = crate::process_quota::admit_new_work(app) {
         if bus_read {
             return Ok(false);
@@ -5667,7 +5953,9 @@ async fn send_hidden_inner(
         // Spawn the resident process under THIS lock, never releasing it before
         // the slot is reserved below. The reader task blocks on this lock and
         // proceeds once we drop it on return.
-        if let Some((stdout, generation, quota_command)) = ensure_running_locked(app, &mut inner).await? {
+        if let Some((stdout, generation, quota_command)) =
+            ensure_running_locked(app, &mut inner).await?
+        {
             spawn_reader(
                 app.clone(),
                 db.clone(),
@@ -5751,7 +6039,14 @@ async fn send_hidden_inner(
                 )
                 .await
             } else {
-                spawn_turn(app.clone(), db.clone(), eng.clone(), out, Some(hidden_epoch)).await
+                spawn_turn(
+                    app.clone(),
+                    db.clone(),
+                    eng.clone(),
+                    out,
+                    Some(hidden_epoch),
+                )
+                .await
             };
             if let Err(e) = res {
                 rollback_failed_turn(app, db, eng, turn_id, "error").await;
@@ -5837,7 +6132,11 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// actually said them in). Empty history (a thread that never said anything,
 /// or a `messages` slice already filtered to one session) → empty digest, so
 /// callers can treat "" as "nothing to inject" without a separate check.
-pub fn build_switch_digest(old_tool: &str, new_tool: &str, messages: &[lead_message::Model]) -> String {
+pub fn build_switch_digest(
+    old_tool: &str,
+    new_tool: &str,
+    messages: &[lead_message::Model],
+) -> String {
     let lines: Vec<String> = messages
         .iter()
         .filter(|m| m.kind == "text" && (m.role == "user" || m.role == "assistant"))
@@ -5847,8 +6146,15 @@ pub fn build_switch_digest(old_tool: &str, new_tool: &str, messages: &[lead_mess
             if text.is_empty() {
                 return None;
             }
-            let who = if m.role == "user" { "User" } else { "Assistant" };
-            Some(format!("{who}: {}", truncate_chars(text, SWITCH_DIGEST_MAX_CHARS)))
+            let who = if m.role == "user" {
+                "User"
+            } else {
+                "Assistant"
+            };
+            Some(format!(
+                "{who}: {}",
+                truncate_chars(text, SWITCH_DIGEST_MAX_CHARS)
+            ))
         })
         .collect();
     if lines.is_empty() {
@@ -6079,7 +6385,12 @@ pub async fn stop_quiet(eng: &EngineRef) -> StopQuietOutcome {
         .map(|(id, text, _)| (id, text, None))
         .into_iter()
         .collect();
-    texts.extend(inner.open_texts.drain().map(|(_, r)| (r.row, r.buf, r.agent_thread)));
+    texts.extend(
+        inner
+            .open_texts
+            .drain()
+            .map(|(_, r)| (r.row, r.buf, r.agent_thread)),
+    );
     // Drain tool rows still awaiting a result, but DON'T finalize here: the
     // caller makes the stop visible (sets `stopped`) first. Awaiting DB/event
     // work while the engine is reset-but-not-yet-stopped would let a concurrent
@@ -6259,6 +6570,74 @@ fn rewind_ordinal(tool: &str, texts: &[String], target: &str) -> usize {
     super::rewind::ordinal_of(texts, target)
 }
 
+/// Acquire the same per-thread lifecycle gate as destructive cascades, then
+/// reload the complete durable identity behind a reserved rewind. Deletion
+/// installs its marker before waiting for this gate, so a delete that won
+/// first is observed here before any timeline read, native fork, or restore.
+async fn acquire_rewind_lifecycle(
+    bus: &crate::bus::BusRegistry,
+    state: &LeadChatState,
+    db: &Db,
+    eng: &EngineRef,
+    thread_id: i32,
+    session_id: Option<i32>,
+    direction_scope: &str,
+) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
+    let lifecycle = bus.thread_lifecycle_gate(thread_id).lock_owned().await;
+    validate_registered_engine_identity(
+        Some(state),
+        db,
+        eng,
+        thread_id,
+        session_id,
+        direction_scope,
+    )
+    .await?;
+    Ok(lifecycle)
+}
+
+/// Run an already-reserved rewind under its thread lifecycle gate. Keep this
+/// separate from engine admission: delete takes admission-write before this
+/// gate, so reacquiring admission after lifecycle would invert the established
+/// order. The gate stays held through the complete operation and until the
+/// engine reservation is cleared, including code-only early returns.
+async fn run_rewind_reserved_under_lifecycle<T, F, Fut>(
+    bus: &crate::bus::BusRegistry,
+    state: &LeadChatState,
+    db: &Db,
+    eng: &EngineRef,
+    thread_id: i32,
+    session_id: Option<i32>,
+    direction_scope: &str,
+    operation: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let lifecycle = match acquire_rewind_lifecycle(
+        bus,
+        state,
+        db,
+        eng,
+        thread_id,
+        session_id,
+        direction_scope,
+    )
+    .await
+    {
+        Ok(lifecycle) => lifecycle,
+        Err(error) => {
+            eng.lock().await.rewinding = false;
+            return Err(error);
+        }
+    };
+    let result = operation().await;
+    eng.lock().await.rewinding = false;
+    drop(lifecycle);
+    result
+}
+
 /// Rewind a worker session's OR the lead console's conversation to just
 /// BEFORE `message_id`: fork the native session at the cut point (claude
 /// transcript surgery / codex `thread/fork` / opencode `session/fork`), drop
@@ -6280,7 +6659,7 @@ pub async fn rewind(
     message_id: i32,
     mode: RewindMode,
 ) -> anyhow::Result<RewindOutcome> {
-    {
+    let (thread_id, session_id, direction_scope) = {
         let mut inner = eng.lock().await;
         if inner.turn.busy {
             return Err(anyhow::anyhow!("先中断当前 turn"));
@@ -6293,10 +6672,21 @@ pub async fn rewind(
         // loses to this reservation and errors out in `send` — no turn can
         // start mid-rewind for the stop/truncate steps to silently consume.
         inner.rewinding = true;
-    }
-    let result = rewind_reserved(app, db, eng, message_id, mode).await;
-    eng.lock().await.rewinding = false;
-    result
+        (inner.thread_id, inner.session_id, inner.ask_dir.clone())
+    };
+    let bus = app.state::<crate::bus::BusRegistry>();
+    let state = app.state::<LeadChatState>();
+    run_rewind_reserved_under_lifecycle(
+        &bus,
+        &state,
+        db,
+        eng,
+        thread_id,
+        session_id,
+        &direction_scope,
+        || rewind_reserved(app, db, eng, message_id, mode),
+    )
+    .await
 }
 
 /// The body of [`rewind`], run with the engine's rewind reservation held.
@@ -6352,6 +6742,28 @@ async fn rewind_reserved(
         .ok()
         .and_then(|v| v["text"].as_str().map(String::from))
         .unwrap_or_default();
+
+    // A conversation rewind can abandon repository actions whose card rows
+    // are in the deleted suffix. Lock their durable execution tokens before
+    // any native fork or filesystem restore. The lifecycle gate is already
+    // held, and these OS locks are non-blocking, so a concurrently executing
+    // action makes rewind fail cleanly instead of deadlocking with deletion.
+    let planned_deleted_ids = if mode == RewindMode::Code {
+        Vec::new()
+    } else {
+        session_rows[pos..].iter().map(|message| message.id).collect()
+    };
+    let action_executions = repo::repo_action_executions_requiring_lock_for_message_ids(
+        db,
+        snap.thread_id,
+        &planned_deleted_ids,
+    )
+    .await?;
+    let action_cleanups = crate::commands::lock_repo_action_cleanups(db, action_executions)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let action_cleanup_plans = crate::commands::repo_action_cleanup_plans(&action_cleanups);
+    let action_rewind_plans = crate::commands::repo_action_rewind_plans(&action_cleanups);
 
     // The cut anchor lives on the nearest user row BEFORE the target (its
     // turn's end = the native state right before the target was sent). Only
@@ -6444,7 +6856,9 @@ async fn rewind_reserved(
                         (true, None) => {
                             return Err(anyhow::anyhow!("该会话历史缺少回退锚点（旧会话）"));
                         }
-                        (true, Some(turn_id)) => Some(fork_codex_thread(&snap, old, &turn_id).await?),
+                        (true, Some(turn_id)) => {
+                            Some(fork_codex_thread(&snap, old, &turn_id).await?)
+                        }
                     },
                 }
             }
@@ -6460,10 +6874,17 @@ async fn rewind_reserved(
                     if ordinal == 0 {
                         return Err(anyhow::anyhow!("该会话历史缺少回退锚点（旧会话）"));
                     }
-                    let program = crate::tool_command::effective(snap.command.as_deref(), &snap.tool);
+                    let program =
+                        crate::tool_command::effective(snap.command.as_deref(), &snap.tool);
                     Some(
-                        super::rewind::fork_opencode_at(&program, &snap.cwd, old, &match_text, ordinal)
-                            .await?,
+                        super::rewind::fork_opencode_at(
+                            &program,
+                            &snap.cwd,
+                            old,
+                            &match_text,
+                            ordinal,
+                        )
+                        .await?,
                     )
                 }
             },
@@ -6499,7 +6920,11 @@ async fn rewind_reserved(
     // reservation AND the shadow op lock live to the end of the function,
     // covering persistence and any compensation — a second rewind can't
     // restore between our restore and our rollback.
-    let mut compensation: Option<(std::path::PathBuf, std::path::PathBuf, crate::checkpoint::RestoreReceipt)> = None;
+    let mut compensation: Option<(
+        std::path::PathBuf,
+        std::path::PathBuf,
+        crate::checkpoint::RestoreReceipt,
+    )> = None;
     let mut _reservation = None;
     let mut _op_arc = None;
     let mut _op_guard = None;
@@ -6539,9 +6964,9 @@ async fn rewind_reserved(
         // Code-only has no persistence to roll back into it — deleting now is
         // as durable as it gets; a deletion failure is surfaced, not hidden.
         if let Some((p, recorded)) = nested_cleanup {
-            cleanup_unrecorded_nested(p, recorded)
-                .await
-                .map_err(|e| anyhow::anyhow!("代码已回退，但删除检查点之后新建的嵌套仓库失败：{e}"))?;
+            cleanup_unrecorded_nested(p, recorded).await.map_err(|e| {
+                anyhow::anyhow!("代码已回退，但删除检查点之后新建的嵌套仓库失败：{e}")
+            })?;
         }
         return Ok(RewindOutcome {
             rewound_text: String::new(),
@@ -6558,13 +6983,15 @@ async fn rewind_reserved(
     // compensated by rolling the worktree back to its pre-restore state.
     let persist = async {
         stop_quiet(eng).await;
-        let (deleted_ids, cancelled_request_ids) = repo::rewind_persist(
+        let (deleted_ids, cancelled_request_ids) = repo::rewind_persist_with_repo_actions(
             db,
             snap.thread_id,
             snap.session_id,
             message_id,
             wt.as_ref().map(|w| w.id),
             new_native.as_deref(),
+            &action_cleanup_plans,
+            &action_rewind_plans,
         )
         .await?;
         eng.lock().await.native_id = new_native.clone();
@@ -6599,15 +7026,18 @@ async fn rewind_reserved(
             return Err(e);
         }
     };
-    // Conversation + code are durably rewound — only NOW can post-checkpoint
-    // nested repos be deleted (rollback can no longer need them). A deletion
-    // failure is surfaced: a leftover repo contradicts the promised rewind.
-    if let Some((p, recorded)) = nested_cleanup {
-        cleanup_unrecorded_nested(p, recorded)
-            .await
-            .map_err(|e| anyhow::anyhow!("回退已完成，但删除检查点之后新建的嵌套仓库失败：{e}"))?;
-    }
     let deleted = deleted_ids.len() as u64;
+    crate::commands::cleanup_locked_repo_actions(db, &action_cleanups).await;
+    let durable_ids: Vec<u64> = cancelled_request_ids
+        .iter()
+        .filter_map(|request_id| u64::try_from(*request_id).ok())
+        .collect();
+    // The DB transition is committed. Converge every retained process-local
+    // ask/inbox and provider card before any fallible post-commit filesystem
+    // cleanup can return early. Answered/resolved requests still receive the
+    // later Cancelled event because their IM cards must match durable state.
+    app.state::<crate::bus::BusRegistry>()
+        .apply_committed_human_cancellations(snap.thread_id, &durable_ids);
     // The divider row every surface renders between the kept past and the
     // rewound future. Best-effort: the rewind itself already happened.
     insert_rewind_marker(
@@ -6620,17 +7050,6 @@ async fn rewind_reserved(
         deleted,
     )
     .await;
-    // A dangling ask from the abandoned turns would sit unanswered forever.
-    if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
-        let durable_ids: Vec<u64> = cancelled_request_ids
-            .iter()
-            .filter_map(|request_id| u64::try_from(*request_id).ok())
-            .collect();
-        for request_id in &durable_ids {
-            bus.cancel_open_asks_by_id(snap.thread_id, *request_id);
-        }
-        bus.discard_durable_answers(snap.thread_id, &durable_ids);
-    }
     let _ = app.emit(
         EVENT,
         Push::Rewound {
@@ -6639,6 +7058,15 @@ async fn rewind_reserved(
             native_id: new_native.clone(),
         },
     );
+    // Conversation + code are durably rewound — only NOW can post-checkpoint
+    // nested repos be deleted (rollback can no longer need them). A deletion
+    // failure is surfaced, but cannot suppress the committed cancellation and
+    // rewind events above.
+    if let Some((p, recorded)) = nested_cleanup {
+        cleanup_unrecorded_nested(p, recorded)
+            .await
+            .map_err(|e| anyhow::anyhow!("回退已完成，但删除检查点之后新建的嵌套仓库失败：{e}"))?;
+    }
     Ok(RewindOutcome {
         rewound_text,
         deleted,
@@ -6653,7 +7081,10 @@ async fn rewind_reserved(
 /// recreate them and they must survive until rollback is off the table.
 /// Failures are PROPAGATED — a leftover nested repo contradicts the promised
 /// rewind and must be surfaced, not just logged.
-async fn cleanup_unrecorded_nested(path: std::path::PathBuf, recorded: Vec<String>) -> anyhow::Result<usize> {
+async fn cleanup_unrecorded_nested(
+    path: std::path::PathBuf,
+    recorded: Vec<String>,
+) -> anyhow::Result<usize> {
     let removed = tokio::task::spawn_blocking(move || {
         crate::checkpoint::remove_unrecorded_nested_repos(&path, &recorded)
     })
@@ -6734,16 +7165,45 @@ async fn snapshot_turn_checkpoint_impl(
     if crate::checkpoint::has_initialized_submodules(&path) {
         return Ok(());
     }
-    let shadow = crate::checkpoint::shadow_repo_for(wt.id)?;
     // Serialized per worktree: sibling sessions share one shadow index.
     let op_lock = crate::checkpoint::op_lock(wt.id);
     let _op = op_lock.lock().await;
+    // Deletion may have committed while this snapshot waited for the op lock.
+    // Re-resolve every durable owner only after winning the lock and before
+    // shadow_repo_for can create a directory containing source blobs.
+    let session = repo::get_session(db, session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session deleted before checkpoint snapshot"))?;
+    let current_wt = repo::worktree_for(db, session.direction_id, session.repo_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("worktree deleted before checkpoint snapshot"))?;
+    if current_wt.id != wt.id || current_wt.path != wt.path {
+        anyhow::bail!("worktree identity changed before checkpoint snapshot");
+    }
+    let direction =
+        repo::ensure_direction_workspace_accepts_writes(db, session.direction_id).await?;
+    if direction.id != wt.direction_id {
+        anyhow::bail!("checkpoint direction identity changed");
+    }
+    repo::ensure_repo_workspace_accepts_writes(db, session.repo_id).await?;
+    let source = repo::get_lead_message(db, user_row_id)
+        .await?
+        .filter(|message| {
+            message.thread_id == direction.thread_id
+                && message.session_id == Some(session_id)
+                && message.turn_id == turn_id
+        })
+        .ok_or_else(|| anyhow::anyhow!("checkpoint source message was deleted"))?;
+    let _ = source;
+    let path = std::path::PathBuf::from(&current_wt.path);
+    if !path.is_dir() {
+        return Ok(());
+    }
+    let shadow = crate::checkpoint::shadow_repo_for(wt.id)?;
     let snap = tokio::task::spawn_blocking(move || {
         crate::checkpoint::snapshot(&path, &shadow, session_id, turn_id)
     })
     .await??;
-    drop(_op);
-    drop(op_guard);
     repo::insert_code_checkpoint(
         db,
         wt.id,
@@ -6756,6 +7216,8 @@ async fn snapshot_turn_checkpoint_impl(
         &snap.index_tree,
     )
     .await?;
+    drop(_op);
+    drop(op_guard);
     Ok(())
 }
 
@@ -6798,7 +7260,9 @@ async fn resolve_code_target(
     // An initialized submodule would be silently UNDER-restored (nested-repo
     // edits are invisible to the parent's snapshot/restore) — refuse honestly.
     if crate::checkpoint::has_initialized_submodules(std::path::Path::new(&wt.path)) {
-        return Err(anyhow::anyhow!("该 worktree 含 submodule，暂不支持代码回退"));
+        return Err(anyhow::anyhow!(
+            "该 worktree 含 submodule，暂不支持代码回退"
+        ));
     }
     let Some(ckpt) = repo::code_checkpoint_for(db, wt.id, message_id).await? else {
         return Err(anyhow::anyhow!("该消息没有代码检查点（旧会话或快照失败）"));
@@ -6808,7 +7272,9 @@ async fn resolve_code_target(
     // (restore bails on the same condition as a backstop).
     let nested_repos: Vec<String> = serde_json::from_str(&ckpt.nested_repos).unwrap_or_default();
     if !nested_repos.is_empty() {
-        return Err(anyhow::anyhow!("该检查点包含嵌套 git 仓库，暂不支持代码回退"));
+        return Err(anyhow::anyhow!(
+            "该检查点包含嵌套 git 仓库，暂不支持代码回退"
+        ));
     }
     let Some(sid) = session_id else {
         return Err(anyhow::anyhow!("lead 会话没有 worktree，不支持代码回退"));
@@ -6884,19 +7350,18 @@ async fn insert_rewind_marker(
     })
     .to_string();
     match repo::insert_lead_message(
-        db,
-        thread_id,
-        session_id,
-        turn_id,
-        "system",
-        "rewind",
-        &content,
-        "complete",
+        db, thread_id, session_id, turn_id, "system", "rewind", &content, "complete",
     )
     .await
     {
         Ok(m) => {
-            let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+            let _ = app.emit(
+                EVENT,
+                Push::Message {
+                    thread_id,
+                    message: m,
+                },
+            );
         }
         Err(e) => eprintln!("[weft] rewind marker insert failed: {e}"),
     }
@@ -7003,11 +7468,10 @@ fn spawn_reader(
             // main event classification below (claude's `rate_limit_event` can
             // arrive on any line, not just the first) — lands in the
             // account-scoped quota hub directly, never as a chat row.
-            if let Some(snapshot) = crate::adapters::adapter_for(&inner.tool)
-                .and_then(|a| a.quota_signal(&line))
+            if let Some(snapshot) =
+                crate::adapters::adapter_for(&inner.tool).and_then(|a| a.quota_signal(&line))
             {
-                if inner.turn.busy
-                    && snapshot.status == crate::engine_quota::QuotaStatus::Exceeded
+                if inner.turn.busy && snapshot.status == crate::engine_quota::QuotaStatus::Exceeded
                 {
                     inner.turn.quota_exceeded = true;
                 }
@@ -7148,7 +7612,9 @@ fn spawn_reader(
                         },
                     );
                 }
-                super::proto::ChatEvent::Assistant { texts, tools, uuid, .. } => {
+                super::proto::ChatEvent::Assistant {
+                    texts, tools, uuid, ..
+                } => {
                     // claude/exec/opencode never populate agent_thread (no
                     // collab/sub-agent concept in these dialects) — ignored (`..`).
                     // claude assistant events carry the transcript uuid — the
@@ -7384,7 +7850,8 @@ fn spawn_reader(
                             // before the resident write dispatches its message
                             // (both run under this lock).
                             if let Some(qid) = next.queue_id {
-                                snapshot_turn_checkpoint(&app, &db, session_id, next_turn_id, qid).await;
+                                snapshot_turn_checkpoint(&app, &db, session_id, next_turn_id, qid)
+                                    .await;
                             }
                             if let Err(e) = write_user(&mut inner, &next).await {
                                 eprintln!("[weft] queued resident delivery failed: {e}");
@@ -7700,6 +8167,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         session_id: None,
         cwd: "/tmp".into(),
         extra_args: vec![],
+        extra_env: vec![],
         system_prompt: String::new(),
         native_id: None,
         pending_context_digest: None,
@@ -7776,8 +8244,14 @@ mod tests {
         assert!(!queued_dispatch_admissible(&inner, epoch));
 
         inner.tearing_down = false;
-        assert!(!queued_dispatch_admissible(&inner, epoch + 1), "a reset still invalidates");
-        assert!(queued_dispatch_admissible(&inner, epoch), "and recovers otherwise");
+        assert!(
+            !queued_dispatch_admissible(&inner, epoch + 1),
+            "a reset still invalidates"
+        );
+        assert!(
+            queued_dispatch_admissible(&inner, epoch),
+            "and recovers otherwise"
+        );
     }
 
     /// Hidden delivery bypasses `send_reservation_valid` entirely, so the
@@ -7787,17 +8261,26 @@ mod tests {
     #[test]
     fn a_hidden_turn_is_refused_while_a_teardown_is_reserved() {
         let mut inner = test_inner("omp");
-        assert!(hidden_turn_admissible(&inner), "baseline: idle engine accepts");
+        assert!(
+            hidden_turn_admissible(&inner),
+            "baseline: idle engine accepts"
+        );
 
         inner.tearing_down = true;
-        assert!(!hidden_turn_admissible(&inner), "a reserved teardown refuses");
+        assert!(
+            !hidden_turn_admissible(&inner),
+            "a reserved teardown refuses"
+        );
 
         inner.tearing_down = false;
         inner.stopped = true;
         assert!(!hidden_turn_admissible(&inner), "a stopped engine refuses");
 
         inner.stopped = false;
-        assert!(hidden_turn_admissible(&inner), "and accepts again afterwards");
+        assert!(
+            hidden_turn_admissible(&inner),
+            "and accepts again afterwards"
+        );
     }
 
     #[test]
@@ -7806,7 +8289,10 @@ mod tests {
         assert!(plan_approval_admissible(&inner));
 
         inner.turn.busy = true;
-        assert!(!plan_approval_admissible(&inner), "an active turn refuses approval");
+        assert!(
+            !plan_approval_admissible(&inner),
+            "an active turn refuses approval"
+        );
 
         inner.turn.busy = false;
         inner.turn.queue.push_back(Outgoing {
@@ -8040,6 +8526,368 @@ mod tests {
         assert!(!state.worker_is_running(42));
     }
 
+    #[tokio::test]
+    async fn delete_admission_waits_for_suspended_constructor_then_removes_its_engine() {
+        let state = Arc::new(LeadChatState::default());
+        let constructor_guard = state.engine_admission_read().await;
+        let delete_state = state.clone();
+        let mut delete = tokio::spawn(async move {
+            let _delete_guard = delete_state.engine_admission_write().await;
+            delete_state.remove(42).is_some()
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut delete)
+                .await
+                .is_err(),
+            "delete must wait while a constructor can still publish its engine"
+        );
+
+        let engine: EngineRef = Arc::new(tokio::sync::Mutex::new(test_inner("claude")));
+        state.get_or_insert(42, engine);
+        drop(constructor_guard);
+
+        assert!(
+            delete.await.unwrap(),
+            "post-commit stop sees the newly inserted key"
+        );
+        assert!(state.get(42).is_none());
+    }
+
+    struct RewindDeletionFixture {
+        db: Db,
+        bus: crate::bus::BusRegistry,
+        state: Arc<LeadChatState>,
+        engine: EngineRef,
+        thread_id: i32,
+        session_id: i32,
+        direction_scope: String,
+        primary_repo_id: i32,
+        session_repo_id: i32,
+    }
+
+    async fn rewind_deletion_fixture() -> RewindDeletionFixture {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "rewind-delete")
+            .await
+            .unwrap();
+        let primary = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "primary",
+            "/tmp/rewind-delete-primary",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let secondary = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "secondary",
+            "/tmp/rewind-delete-secondary",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(
+            &db,
+            workspace.id,
+            "issue",
+            "feature/rewind-delete",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "codex",
+            primary.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = repo::create_session(
+            &db,
+            direction.id,
+            secondary.id,
+            "codex",
+            "/tmp/rewind-delete-secondary-wt",
+        )
+        .await
+        .unwrap();
+        let mut inner = test_inner("codex");
+        inner.thread_id = thread.id;
+        inner.session_id = Some(session.id);
+        inner.ask_dir = direction.id.to_string();
+        inner.cwd = session.cwd.clone().into();
+        let engine: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+        let state = Arc::new(LeadChatState::default());
+        state.get_or_insert(session.id as i64, engine.clone());
+
+        RewindDeletionFixture {
+            db,
+            bus: crate::bus::BusRegistry::new(),
+            state,
+            engine,
+            thread_id: thread.id,
+            session_id: session.id,
+            direction_scope: direction.id.to_string(),
+            primary_repo_id: primary.id,
+            session_repo_id: secondary.id,
+        }
+    }
+
+    /// A worker on secondary repo B still depends on its direction's primary
+    /// repo A. Every engine entry point shares this admission helper, so A's
+    /// marker must stop reconstruction/ensure, native spawn, and hidden input
+    /// before their respective side-effect sinks; clearing the marker restores
+    /// all three without rebuilding the fixture.
+    #[tokio::test]
+    async fn primary_repo_marker_fences_worker_admission_and_clear_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = rewind_deletion_fixture().await;
+        let ensure_sink = AtomicUsize::new(0);
+        let spawn_sink = AtomicUsize::new(0);
+        let hidden_sink = AtomicUsize::new(0);
+
+        repo::mark_repo_deleting(&fixture.db, fixture.primary_repo_id)
+            .await
+            .unwrap();
+        if ensure_worker_parent_chain(
+            &fixture.db,
+            fixture.direction_scope.parse().unwrap(),
+            fixture.session_repo_id,
+        )
+        .await
+        .is_ok()
+        {
+            ensure_sink.fetch_add(1, Ordering::SeqCst);
+        }
+        for sink in [&spawn_sink, &hidden_sink] {
+            if validate_registered_engine_identity(
+                Some(fixture.state.as_ref()),
+                &fixture.db,
+                &fixture.engine,
+                fixture.thread_id,
+                Some(fixture.session_id),
+                &fixture.direction_scope,
+            )
+            .await
+            .is_ok()
+            {
+                sink.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        assert_eq!(ensure_sink.load(Ordering::SeqCst), 0);
+        assert_eq!(spawn_sink.load(Ordering::SeqCst), 0);
+        assert_eq!(hidden_sink.load(Ordering::SeqCst), 0);
+
+        repo::clear_repo_deleting(&fixture.db, fixture.primary_repo_id)
+            .await
+            .unwrap();
+        if ensure_worker_parent_chain(
+            &fixture.db,
+            fixture.direction_scope.parse().unwrap(),
+            fixture.session_repo_id,
+        )
+        .await
+        .is_ok()
+        {
+            ensure_sink.fetch_add(1, Ordering::SeqCst);
+        }
+        for sink in [&spawn_sink, &hidden_sink] {
+            if validate_registered_engine_identity(
+                Some(fixture.state.as_ref()),
+                &fixture.db,
+                &fixture.engine,
+                fixture.thread_id,
+                Some(fixture.session_id),
+                &fixture.direction_scope,
+            )
+            .await
+            .is_ok()
+            {
+                sink.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        assert_eq!(ensure_sink.load(Ordering::SeqCst), 1);
+        assert_eq!(spawn_sink.load(Ordering::SeqCst), 1);
+        assert_eq!(hidden_sink.load(Ordering::SeqCst), 1);
+    }
+
+    /// A durable deletion fence must reject the stale registered engine before
+    /// the operation future is entered. Cover both repositories in a worker's
+    /// parent chain, then the committed-delete form where the session is gone.
+    #[tokio::test]
+    async fn deletion_marker_or_commit_wins_before_rewind_and_runs_no_side_effects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = rewind_deletion_fixture().await;
+        let fork_runs = Arc::new(AtomicUsize::new(0));
+        let restore_runs = Arc::new(AtomicUsize::new(0));
+
+        for repo_id in [fixture.primary_repo_id, fixture.session_repo_id] {
+            repo::mark_repo_deleting(&fixture.db, repo_id)
+                .await
+                .unwrap();
+            fixture.engine.lock().await.rewinding = true;
+            let fork_counter = fork_runs.clone();
+            let restore_counter = restore_runs.clone();
+            let result = run_rewind_reserved_under_lifecycle(
+                &fixture.bus,
+                fixture.state.as_ref(),
+                &fixture.db,
+                &fixture.engine,
+                fixture.thread_id,
+                Some(fixture.session_id),
+                &fixture.direction_scope,
+                move || async move {
+                    fork_counter.fetch_add(1, Ordering::SeqCst);
+                    restore_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), anyhow::Error>(())
+                },
+            )
+            .await;
+            assert!(result.is_err(), "repo deletion marker must fence rewind");
+            assert!(!fixture.engine.lock().await.rewinding);
+            repo::clear_repo_deleting(&fixture.db, repo_id)
+                .await
+                .unwrap();
+        }
+
+        repo::delete_repo_cascade(&fixture.db, fixture.session_repo_id)
+            .await
+            .unwrap();
+        fixture.engine.lock().await.rewinding = true;
+        let fork_counter = fork_runs.clone();
+        let restore_counter = restore_runs.clone();
+        let result = run_rewind_reserved_under_lifecycle(
+            &fixture.bus,
+            fixture.state.as_ref(),
+            &fixture.db,
+            &fixture.engine,
+            fixture.thread_id,
+            Some(fixture.session_id),
+            &fixture.direction_scope,
+            move || async move {
+                fork_counter.fetch_add(1, Ordering::SeqCst);
+                restore_counter.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), anyhow::Error>(())
+            },
+        )
+        .await;
+        assert!(result.is_err(), "committed deletion must fence stale rewind");
+        assert_eq!(fork_runs.load(Ordering::SeqCst), 0);
+        assert_eq!(restore_runs.load(Ordering::SeqCst), 0);
+        assert!(!fixture.engine.lock().await.rewinding);
+    }
+
+    /// Once rewind has passed admission, deletion may publish its marker but
+    /// must wait at the shared lifecycle gate until the complete rewind body
+    /// and reservation clear have both finished.
+    #[tokio::test]
+    async fn rewind_that_wins_lifecycle_finishes_before_thread_deletion() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let fixture = rewind_deletion_fixture().await;
+        fixture.engine.lock().await.rewinding = true;
+        let fork_runs = Arc::new(AtomicUsize::new(0));
+        let restore_runs = Arc::new(AtomicUsize::new(0));
+        let rewind_complete = Arc::new(AtomicBool::new(false));
+        let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+
+        let rewind_db = fixture.db.clone();
+        let rewind_bus = fixture.bus.clone();
+        let rewind_state = fixture.state.clone();
+        let rewind_engine = fixture.engine.clone();
+        let rewind_direction = fixture.direction_scope.clone();
+        let fork_counter = fork_runs.clone();
+        let restore_counter = restore_runs.clone();
+        let completed = rewind_complete.clone();
+        let thread_id = fixture.thread_id;
+        let session_id = fixture.session_id;
+        let rewind_task = tokio::spawn(async move {
+            run_rewind_reserved_under_lifecycle(
+                &rewind_bus,
+                rewind_state.as_ref(),
+                &rewind_db,
+                &rewind_engine,
+                thread_id,
+                Some(session_id),
+                &rewind_direction,
+                move || async move {
+                    let _ = admitted_tx.send(());
+                    finish_rx
+                        .await
+                        .map_err(|_| anyhow::anyhow!("test rewind release dropped"))?;
+                    fork_counter.fetch_add(1, Ordering::SeqCst);
+                    restore_counter.fetch_add(1, Ordering::SeqCst);
+                    completed.store(true, Ordering::Release);
+                    Ok::<(), anyhow::Error>(())
+                },
+            )
+            .await
+        });
+        admitted_rx.await.unwrap();
+
+        let delete_db = fixture.db.clone();
+        let delete_bus = fixture.bus.clone();
+        let delete_state = fixture.state.clone();
+        let delete_complete = rewind_complete.clone();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let mut delete_task = tokio::spawn(async move {
+            repo::mark_thread_deleting(&delete_db, thread_id)
+                .await
+                .unwrap();
+            let _engine_admission = delete_state.engine_admission_write().await;
+            let _ = waiting_tx.send(());
+            let lifecycle = delete_bus.thread_lifecycle_gate(thread_id);
+            let _lifecycle = lifecycle.lock_owned().await;
+            let saw_completed_rewind = delete_complete.load(Ordering::Acquire);
+            repo::delete_thread_cascade_with_human_cancellations(&delete_db, thread_id)
+                .await
+                .unwrap();
+            delete_state.remove(session_id as i64);
+            saw_completed_rewind
+        });
+        waiting_rx.await.unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut delete_task)
+                .await
+                .is_err(),
+            "deletion must wait while rewind owns the lifecycle gate"
+        );
+        assert!(repo::get_thread(&fixture.db, fixture.thread_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        finish_tx.send(()).unwrap();
+        rewind_task.await.unwrap().unwrap();
+        assert!(!fixture.engine.lock().await.rewinding);
+        assert!(
+            delete_task.await.unwrap(),
+            "deletion may acquire the gate only after rewind completed"
+        );
+        assert_eq!(fork_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(restore_runs.load(Ordering::SeqCst), 1);
+        assert!(repo::get_thread(&fixture.db, fixture.thread_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     // ---- issue #99: sub-agent branch attribution (branch_of / text_row_content) ----
 
     #[test]
@@ -8200,7 +9048,10 @@ mod tests {
 
         // Old snapshots missing optional arrays still deserialize (serde defaults).
         let mut sparse = test_inner("claude");
-        apply_persisted_meta(&mut sparse, r#"{"context_tokens":1,"window":2,"model":null}"#);
+        apply_persisted_meta(
+            &mut sparse,
+            r#"{"context_tokens":1,"window":2,"model":null}"#,
+        );
         assert_eq!(sparse.last_context_tokens, Some(1));
         assert!(sparse.last_tools.is_empty());
     }
@@ -8237,8 +9088,16 @@ mod tests {
             ..Default::default()
         };
         known.merge_probe(&snap, true, true);
-        assert_eq!(known.context_tokens, Some(57_000), "eventful usage must not be overwritten");
-        assert_eq!(known.model.as_deref(), Some("gpt-5.6-sol"), "config updates when freshest");
+        assert_eq!(
+            known.context_tokens,
+            Some(57_000),
+            "eventful usage must not be overwritten"
+        );
+        assert_eq!(
+            known.model.as_deref(),
+            Some("gpt-5.6-sol"),
+            "config updates when freshest"
+        );
         // Freshest + probe-sourced usage (opencode): overwrites.
         let mut live = PersistedMeta {
             context_tokens: Some(57_000),
@@ -8438,7 +9297,10 @@ mod tests {
         assert!(t.try_begin_send()); // idle → busy（占用一个在飞 turn）
         for i in 0..MAX_QUEUED {
             assert!(!t.try_begin_send()); // busy
-            t.queue.push_back(Outgoing { text: format!("m{i}"), ..Default::default() });
+            t.queue.push_back(Outgoing {
+                text: format!("m{i}"),
+                ..Default::default()
+            });
         }
         assert_eq!(t.queue.len(), MAX_QUEUED);
         // Full-queue rejection (send() returning Err("queue_full")) is an async/DB path
@@ -8456,7 +9318,6 @@ mod tests {
         assert_eq!(codex_first_turn_text("", "hello", false), "hello");
     }
 
-
     #[tokio::test]
     async fn clear_native_id_clears_the_lead_meta_row() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
@@ -8464,7 +9325,9 @@ mod tests {
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
             .await
             .unwrap();
-        repo::set_lead_native_id(&db, t.id, "old-native").await.unwrap();
+        repo::set_lead_native_id(&db, t.id, "old-native")
+            .await
+            .unwrap();
         assert_eq!(
             repo::lead_native_id(&db, t.id).await.unwrap().as_deref(),
             Some("old-native")
@@ -8478,7 +9341,11 @@ mod tests {
     }
 
     fn text_msg(role: &str, text: &str) -> lead_message::Model {
-        text_msg_kind(role, "text", &serde_json::json!({ "text": text }).to_string())
+        text_msg_kind(
+            role,
+            "text",
+            &serde_json::json!({ "text": text }).to_string(),
+        )
     }
 
     fn text_msg_kind(role: &str, kind: &str, content: &str) -> lead_message::Model {
@@ -8525,7 +9392,10 @@ mod tests {
         let rows = vec![text_msg("user", "hi")];
         let d = build_switch_digest("claude", "claude", &rows);
         assert!(d.contains("reloaded"), "same tool → reload phrasing: {d}");
-        assert!(!d.contains("→"), "no switch arrow when the tool didn't change: {d}");
+        assert!(
+            !d.contains("→"),
+            "no switch arrow when the tool didn't change: {d}"
+        );
     }
 
     #[test]
@@ -8537,16 +9407,27 @@ mod tests {
         ];
         let d = build_switch_digest("claude", "codex", &rows);
         assert!(d.contains("here is the plan"));
-        assert!(!d.contains("Bash"), "tool-kind rows are not part of the conversational digest");
+        assert!(
+            !d.contains("Bash"),
+            "tool-kind rows are not part of the conversational digest"
+        );
     }
 
     #[test]
     fn switch_digest_caps_turn_count_and_marks_omission() {
-        let rows: Vec<_> = (0..20).map(|i| text_msg("user", &format!("turn {i}"))).collect();
+        let rows: Vec<_> = (0..20)
+            .map(|i| text_msg("user", &format!("turn {i}")))
+            .collect();
         let d = build_switch_digest("claude", "claude", &rows);
         assert!(d.contains("turn 19"), "keeps the most recent turns: {d}");
-        assert!(!d.contains("turn 0\n"), "drops the oldest turns beyond the cap: {d}");
-        assert!(d.contains("earlier turn(s) omitted"), "says something was cut: {d}");
+        assert!(
+            !d.contains("turn 0\n"),
+            "drops the oldest turns beyond the cap: {d}"
+        );
+        assert!(
+            d.contains("earlier turn(s) omitted"),
+            "says something was cut: {d}"
+        );
     }
 
     #[test]
@@ -8554,7 +9435,11 @@ mod tests {
         let long = "x".repeat(2000);
         let rows = vec![text_msg("user", &long)];
         let d = build_switch_digest("claude", "codex", &rows);
-        assert!(d.len() < long.len(), "a single huge message must be truncated: {}", d.len());
+        assert!(
+            d.len() < long.len(),
+            "a single huge message must be truncated: {}",
+            d.len()
+        );
         assert!(d.contains('…'));
     }
 
@@ -8700,7 +9585,10 @@ mod tests {
         let b = codex_change_approval_summary(&serde_json::json!({
             "changes": [{"path":"1"},{"path":"2"},{"path":"3"},{"path":"5"}]
         }));
-        assert_eq!(a.0, b.0, "both display as \"apply file changes: 1, 2, 3 +1\"");
+        assert_eq!(
+            a.0, b.0,
+            "both display as \"apply file changes: 1, 2, 3 +1\""
+        );
         // ...but the full (untruncated) list disambiguates them.
         assert_ne!(a.1, b.1);
     }
@@ -8832,8 +9720,16 @@ mod tests {
     #[test]
     fn queue_items_preserves_order_and_text() {
         let mut t = TurnState::default();
-        t.queue.push_back(Outgoing { text: "a".into(), queue_id: Some(1), ..Default::default() });
-        t.queue.push_back(Outgoing { text: "b".into(), queue_id: Some(2), ..Default::default() });
+        t.queue.push_back(Outgoing {
+            text: "a".into(),
+            queue_id: Some(1),
+            ..Default::default()
+        });
+        t.queue.push_back(Outgoing {
+            text: "b".into(),
+            queue_id: Some(2),
+            ..Default::default()
+        });
         let items = queue_items(&t);
         assert_eq!(items.len(), 2);
         assert_eq!((items[0].id, items[0].text.as_str()), (1, "a"));
@@ -8891,7 +9787,10 @@ mod tests {
 
         assert!(!inner.turn.busy);
         assert!(inner.turn.queue.is_empty());
-        assert!(inner.clock.started_millis > 0, "telemetry remains read-only history");
+        assert!(
+            inner.clock.started_millis > 0,
+            "telemetry remains read-only history"
+        );
         assert!(inner.current_origin_tag.is_none());
         assert!(inner.current.is_none());
         assert!(!inner.interrupting);
@@ -9004,7 +9903,6 @@ mod tests {
         assert!(reset_ignored_cancel_turn(&mut inner, 5).is_none());
     }
 
-
     // ---- session_gate: a cleared `child` must hand its slot back ----
     //
     // `session_gate`'s own tests only cover the semaphore primitives; nothing
@@ -9072,7 +9970,11 @@ mod tests {
 
         invalidate_resident(&mut inner);
 
-        assert_eq!(slots_used(), baseline, "the killed resident's slot comes back");
+        assert_eq!(
+            slots_used(),
+            baseline,
+            "the killed resident's slot comes back"
+        );
         assert!(inner.child_permit.is_none());
     }
 
@@ -9105,7 +10007,11 @@ mod tests {
         owned.turn_id = 5;
         park_a_real_slot(&mut owned, baseline).await;
         assert!(reset_ignored_cancel_turn(&mut owned, 5).is_some());
-        assert_eq!(slots_used(), baseline, "the cancelled turn's slot comes back");
+        assert_eq!(
+            slots_used(),
+            baseline,
+            "the cancelled turn's slot comes back"
+        );
         assert!(owned.child_permit.is_none());
 
         let mut newer = test_inner("codex");
@@ -9211,7 +10117,10 @@ mod tests {
         assert!(!send_reservation_valid(&inner, &direct_ctx));
         assert!(!send_reservation_valid(
             &inner,
-            &SendContext { direct: false, ..direct_ctx.clone() }
+            &SendContext {
+                direct: false,
+                ..direct_ctx.clone()
+            }
         ));
         inner.reset_epoch = 0;
 
@@ -9221,7 +10130,10 @@ mod tests {
         assert!(!send_reservation_valid(&inner, &direct_ctx));
         assert!(send_reservation_valid(
             &inner,
-            &SendContext { direct: false, ..direct_ctx.clone() }
+            &SendContext {
+                direct: false,
+                ..direct_ctx.clone()
+            }
         ));
         inner.interrupting = false;
 
@@ -9269,7 +10181,10 @@ mod tests {
         assert_eq!(inner.turn_id, 8);
         assert!(inner.turn.busy, "promotion reserves the turn (busy)");
         assert_eq!(inner.current_origin_tag.as_deref(), Some("tag"));
-        assert!(inner.clock.started_millis > 0, "promotion records OCC telemetry");
+        assert!(
+            inner.clock.started_millis > 0,
+            "promotion records OCC telemetry"
+        );
     }
 
     fn queued_outgoing(queue_id: i32, origin_tag: &str) -> Outgoing {
@@ -9340,7 +10255,10 @@ mod tests {
         c.on_turn_end(true); // queued message popped → new turn
         assert!(c.started_millis >= first);
         c.on_turn_end(false); // queue drained → idle
-        assert!(c.started_millis >= first, "time remains telemetry only after idle");
+        assert!(
+            c.started_millis >= first,
+            "time remains telemetry only after idle"
+        );
     }
 
     /// [`TurnClock::mark_consumed_once`] fires exactly once per turn — the gate
@@ -9353,7 +10271,10 @@ mod tests {
         // "first observation" — begin_turn is what a real send always calls
         // first, but the gate itself doesn't depend on it.
         assert!(c.mark_consumed_once(), "first observation fires");
-        assert!(!c.mark_consumed_once(), "second observation in the same turn no-ops");
+        assert!(
+            !c.mark_consumed_once(),
+            "second observation in the same turn no-ops"
+        );
         assert!(!c.mark_consumed_once(), "third+ stays a no-op");
         // A new turn resets the gate — begin_turn is called at EVERY turn-start
         // site (direct send, promoted queue, dequeue via on_turn_end(true)).
@@ -9373,7 +10294,10 @@ mod tests {
         c.begin_turn();
         assert!(c.mark_consumed_once());
         c.on_turn_end(true); // dequeue: still busy → begin_turn() again
-        assert!(c.mark_consumed_once(), "the dequeued turn gets its own first mark");
+        assert!(
+            c.mark_consumed_once(),
+            "the dequeued turn gets its own first mark"
+        );
     }
 
     #[test]
@@ -9385,6 +10309,7 @@ mod tests {
             session_id: None,
             cwd: "/tmp".into(),
             extra_args: vec!["--mcp-config".into(), "x".into()],
+            extra_env: vec![],
             system_prompt: "be lead".into(),
             native_id: None,
             pending_context_digest: None,
@@ -9440,7 +10365,11 @@ mod tests {
     fn turnstate_remove_edit_reorder() {
         let mut t = TurnState::default();
         for id in [10, 20, 30] {
-            t.queue.push_back(Outgoing { text: format!("t{id}"), queue_id: Some(id), ..Default::default() });
+            t.queue.push_back(Outgoing {
+                text: format!("t{id}"),
+                queue_id: Some(id),
+                ..Default::default()
+            });
         }
         assert!(t.edit(20, "edited"));
         assert_eq!(t.queue[1].text, "edited");
@@ -9466,9 +10395,22 @@ mod tests {
     fn reorder_preserves_untracked_items() {
         // Visible T1, an internal untracked delivery, then visible T2.
         let mut t = TurnState::default();
-        t.queue.push_back(Outgoing { text: "t1".into(), queue_id: Some(10), ..Default::default() });
-        t.queue.push_back(Outgoing { text: "nudge".into(), tracked: false, queue_id: None, ..Default::default() });
-        t.queue.push_back(Outgoing { text: "t2".into(), queue_id: Some(20), ..Default::default() });
+        t.queue.push_back(Outgoing {
+            text: "t1".into(),
+            queue_id: Some(10),
+            ..Default::default()
+        });
+        t.queue.push_back(Outgoing {
+            text: "nudge".into(),
+            tracked: false,
+            queue_id: None,
+            ..Default::default()
+        });
+        t.queue.push_back(Outgoing {
+            text: "t2".into(),
+            queue_id: Some(20),
+            ..Default::default()
+        });
         // Reorder the two visible items; the untracked nudge must keep its slot.
         assert!(t.reorder(&[20, 10]));
         let ids: Vec<Option<i32>> = t.queue.iter().map(|o| o.queue_id).collect();
@@ -9482,11 +10424,23 @@ mod tests {
         // A, B queued; a bus wake lands (read at index 2); then C queued.
         let mut t = TurnState::default();
         assert!(t.try_begin_send()); // idle → busy
-        t.queue.push_back(Outgoing { text: "a".into(), queue_id: Some(1), ..Default::default() });
-        t.queue.push_back(Outgoing { text: "b".into(), queue_id: Some(2), ..Default::default() });
+        t.queue.push_back(Outgoing {
+            text: "a".into(),
+            queue_id: Some(1),
+            ..Default::default()
+        });
+        t.queue.push_back(Outgoing {
+            text: "b".into(),
+            queue_id: Some(2),
+            ..Default::default()
+        });
         assert!(!t.request_bus_read()); // busy → coalesced at index 2
         assert_eq!(t.bus_read_pos, Some(2));
-        t.queue.push_back(Outgoing { text: "c".into(), queue_id: Some(3), ..Default::default() });
+        t.queue.push_back(Outgoing {
+            text: "c".into(),
+            queue_id: Some(3),
+            ..Default::default()
+        });
         // Deleting A (index 0, before the wake) shifts the wake left so C still
         // delivers AFTER the inbox-read, not ahead of it.
         assert!(t.remove(1));
@@ -9500,21 +10454,47 @@ mod tests {
     fn cap_counts_only_visible_items() {
         let mut t = TurnState::default();
         // 4 visible user sends + 1 hidden plumbing delivery interleaved.
-        t.queue.push_back(Outgoing { queue_id: Some(1), ..Default::default() });
-        t.queue.push_back(Outgoing { queue_id: None, tracked: false, ..Default::default() });
-        t.queue.push_back(Outgoing { queue_id: Some(2), ..Default::default() });
-        t.queue.push_back(Outgoing { queue_id: Some(3), ..Default::default() });
-        t.queue.push_back(Outgoing { queue_id: Some(4), ..Default::default() });
+        t.queue.push_back(Outgoing {
+            queue_id: Some(1),
+            ..Default::default()
+        });
+        t.queue.push_back(Outgoing {
+            queue_id: None,
+            tracked: false,
+            ..Default::default()
+        });
+        t.queue.push_back(Outgoing {
+            queue_id: Some(2),
+            ..Default::default()
+        });
+        t.queue.push_back(Outgoing {
+            queue_id: Some(3),
+            ..Default::default()
+        });
+        t.queue.push_back(Outgoing {
+            queue_id: Some(4),
+            ..Default::default()
+        });
         assert_eq!(t.queue.len(), 5);
-        assert_eq!(visible_queued(&t), 4, "hidden delivery must not eat the cap budget");
+        assert_eq!(
+            visible_queued(&t),
+            4,
+            "hidden delivery must not eat the cap budget"
+        );
     }
 
     #[test]
     fn reorder_refused_while_bus_wake_pending() {
         let mut t = TurnState::default();
         assert!(t.try_begin_send()); // idle → busy
-        t.queue.push_back(Outgoing { queue_id: Some(1), ..Default::default() });
-        t.queue.push_back(Outgoing { queue_id: Some(2), ..Default::default() });
+        t.queue.push_back(Outgoing {
+            queue_id: Some(1),
+            ..Default::default()
+        });
+        t.queue.push_back(Outgoing {
+            queue_id: Some(2),
+            ..Default::default()
+        });
         assert!(!t.request_bus_read()); // wake coalesced at index 2
         assert!(t.bus_read_pos.is_some());
         // A valid permutation is still refused while the wake is pending, so the
@@ -9584,16 +10564,31 @@ mod tests {
             native_anchor: None,
             consumed_at: None,
         };
-        let plain = Outgoing { text: "edited".into(), queue_id: Some(1), ..Default::default() };
+        let plain = Outgoing {
+            text: "edited".into(),
+            queue_id: Some(1),
+            ..Default::default()
+        };
         // Plain text, no attachments → use the (edited) Outgoing text.
         assert_eq!(
-            finalize_text(&row("text", r#"{"text":"orig","images":[],"files":[]}"#), &plain),
+            finalize_text(
+                &row("text", r#"{"text":"orig","images":[],"files":[]}"#),
+                &plain
+            ),
             Some("edited".to_string()),
         );
         // Persisted images but out.images cleared (per-turn spill) → keep cached body.
-        let spilled = Outgoing { text: "/tmp/x.png".into(), images: vec![], queue_id: Some(1), ..Default::default() };
+        let spilled = Outgoing {
+            text: "/tmp/x.png".into(),
+            images: vec![],
+            queue_id: Some(1),
+            ..Default::default()
+        };
         assert_eq!(
-            finalize_text(&row("text", r#"{"text":"","images":["data:..."],"files":[]}"#), &spilled),
+            finalize_text(
+                &row("text", r#"{"text":"","images":["data:..."],"files":[]}"#),
+                &spilled
+            ),
             None,
         );
         // Resident inline image (out.images non-empty) → keep cached body.
@@ -9603,9 +10598,15 @@ mod tests {
             queue_id: Some(1),
             ..Default::default()
         };
-        assert_eq!(finalize_text(&row("text", r#"{"text":"hi"}"#), &resident), None);
+        assert_eq!(
+            finalize_text(&row("text", r#"{"text":"hi"}"#), &resident),
+            None
+        );
         // Command row → keep cached body.
-        assert_eq!(finalize_text(&row("command", r#"{"command":"x","args":""}"#), &plain), None);
+        assert_eq!(
+            finalize_text(&row("command", r#"{"command":"x","args":""}"#), &plain),
+            None
+        );
     }
 
     /// queue_edit must preserve images/files in the persisted row; only text changes.
@@ -9632,18 +10633,26 @@ mod tests {
 
         // Simulate what queue_edit now does: read row, update text only.
         let existing = repo::get_message(&db, row.id).await.unwrap().unwrap();
-        let mut val: serde_json::Value =
-            serde_json::from_str(&existing.content).unwrap();
+        let mut val: serde_json::Value = serde_json::from_str(&existing.content).unwrap();
         val["text"] = serde_json::Value::String("edited text".into());
-        repo::update_message_content(&db, row.id, &val.to_string()).await.unwrap();
+        repo::update_message_content(&db, row.id, &val.to_string())
+            .await
+            .unwrap();
 
         let updated = repo::get_message(&db, row.id).await.unwrap().unwrap();
         let content: serde_json::Value = serde_json::from_str(&updated.content).unwrap();
         assert_eq!(content["text"], "edited text");
         assert!(content["images"].is_array());
-        assert_eq!(content["images"].as_array().unwrap().len(), 1, "images must be preserved");
+        assert_eq!(
+            content["images"].as_array().unwrap().len(),
+            1,
+            "images must be preserved"
+        );
         assert!(content["files"].is_array());
-        assert_eq!(content["files"][0], "/tmp/attach.txt", "files must be preserved");
+        assert_eq!(
+            content["files"][0], "/tmp/attach.txt",
+            "files must be preserved"
+        );
     }
 
     /// FIX 1: an Outgoing with files or images exposes has_attachments=true via queue_items.
@@ -9670,7 +10679,13 @@ mod tests {
         });
         let items = queue_items(&turn);
         assert_eq!(items.len(), 2);
-        assert!(items[0].has_attachments, "attachment item must report has_attachments=true");
-        assert!(!items[1].has_attachments, "plain text item must report has_attachments=false");
+        assert!(
+            items[0].has_attachments,
+            "attachment item must report has_attachments=true"
+        );
+        assert!(
+            !items[1].has_attachments,
+            "plain text item must report has_attachments=false"
+        );
     }
 }

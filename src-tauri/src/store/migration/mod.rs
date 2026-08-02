@@ -1,7 +1,7 @@
 use crate::store::entities::{
     app_setting, backup_config, code_checkpoint, direction, human_card_terminal_outbox,
-    human_request, im_route, lead_message, plan, pull_request, repo_profile, repo_ref, session,
-    skill_enable, skill_source, test_plan, thread, workspace, worktree,
+    human_request, im_route, lead_message, plan, pull_request, repo_action_execution, repo_profile,
+    repo_ref, session, skill_enable, skill_source, test_plan, thread, workspace, worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -62,6 +62,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0048HumanRequestSourceMessage),
             Box::new(M0049HumanRequestImRoutes),
             Box::new(M0050HumanCardTerminalOutbox),
+            Box::new(M0051RepoActionExecution),
         ]
     }
 }
@@ -2267,6 +2268,58 @@ impl MigrationTrait for M0050HumanCardTerminalOutbox {
             .await
     }
 }
+
+/// A repository action card owns exactly one durable execution. The unique
+/// message index is the cross-process admission gate; the token index makes
+/// filesystem markers unambiguous during recovery.
+pub struct M0051RepoActionExecution;
+impl MigrationName for M0051RepoActionExecution {
+    fn name(&self) -> &str {
+        "m0051_repo_action_execution"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0051RepoActionExecution {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut statement = schema.create_table_from_entity(repo_action_execution::Entity);
+        statement.if_not_exists();
+        manager.create_table(statement).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_repo_action_execution_message")
+                    .table(Alias::new("repo_action_execution"))
+                    .col(Alias::new("message_id"))
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_repo_action_execution_token")
+                    .table(Alias::new("repo_action_execution"))
+                    .col(Alias::new("execution_token"))
+                    .unique()
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("repo_action_execution"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
 #[async_trait::async_trait]
 impl MigrationTrait for M0045PullRequest {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -2307,7 +2360,7 @@ mod tests {
     use super::{
         gateway_components_to_backend, M0044EngineRoutingPin, M0045PullRequest,
         M0046DirectionUpstream, M0047HumanRequest, M0048HumanRequestSourceMessage,
-        M0049HumanRequestImRoutes, M0050HumanCardTerminalOutbox,
+        M0049HumanRequestImRoutes, M0050HumanCardTerminalOutbox, M0051RepoActionExecution,
     };
 
     #[test]
@@ -2884,6 +2937,59 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert!(indexes.contains("idx_human_card_terminal_route"));
         assert!(indexes.contains("idx_human_card_terminal_pending"));
+    }
+
+    #[tokio::test]
+    async fn m0051_repo_action_execution_is_rerunnable_with_unique_identity_indexes() {
+        use crate::store::Db;
+        use sea_orm::{ConnectionTrait, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let manager = SchemaManager::new(&db.0);
+        M0051RepoActionExecution.up(&manager).await.unwrap();
+        M0051RepoActionExecution.up(&manager).await.unwrap();
+
+        let columns =
+            db.0.query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "PRAGMA table_info(repo_action_execution)".to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        for column in [
+            "workspace_id",
+            "thread_id",
+            "message_id",
+            "action_id",
+            "action_kind",
+            "invocation_fingerprint",
+            "execution_token",
+            "status",
+            "target_path",
+            "staging_path",
+            "repo_id",
+            "repo_name",
+        ] {
+            assert!(columns.contains(column), "missing {column}");
+        }
+        let indexes =
+            db.0.query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND \
+                 tbl_name = 'repo_action_execution'"
+                    .to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(indexes.contains("idx_repo_action_execution_message"));
+        assert!(indexes.contains("idx_repo_action_execution_token"));
     }
 
     /// M0037: code_checkpoint exists after migration and round-trips a row.

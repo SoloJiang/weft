@@ -946,37 +946,19 @@ pub async fn execute(
             ask_id,
             text,
         } => {
-            let persisted = match i32::try_from(ask_id) {
-                Ok(request_id) => crate::store::repo::get_human_request(db, request_id).await?,
-                Err(_) => None,
-            };
-            let answered = if let Some(request) = persisted.filter(|request| {
-                request.thread_id == thread && request.status == "open"
-            }) {
-                let updated = crate::store::repo::answer_human_request(
+            let answered = match i32::try_from(ask_id) {
+                Ok(request_id) => crate::attention::answer_durable_human_request(
                     db,
-                    request.workspace_id,
-                    request.id,
-                    request.revision,
+                    bus,
+                    request_id,
+                    Some(thread),
+                    None,
+                    None,
                     &text,
                 )
-                .await?;
-                if let Some(updated) = updated {
-                    if !bus.answer_ask(thread, ask_id, &updated.answer) {
-                        bus.deliver_durable_answer(
-                            thread,
-                            ask_id,
-                            &updated.direction_scope,
-                            &updated.question,
-                            &updated.answer,
-                        );
-                    }
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
+                .await?
+                .is_some(),
+                Err(_) => false,
             };
             if !answered {
                 if let Err(e) = channel

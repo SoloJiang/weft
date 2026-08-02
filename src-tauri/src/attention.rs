@@ -6,9 +6,12 @@
 //! from the tracked pull_request state machine.
 
 use serde::Serialize;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::ask::Ask;
+use crate::bus::BusRegistry;
+use crate::store::entities::human_request;
 use crate::store::entities::{lead_message, pull_request, thread};
 use crate::store::{repo, Db};
 
@@ -55,7 +58,7 @@ pub enum AttentionItem {
     ScopeApproval {
         id: String,
         revision: String,
-        created_at: String,
+        created_at: Option<String>,
         thread_id: i32,
         thread_title: String,
     },
@@ -99,14 +102,14 @@ impl AttentionItem {
         }
     }
 
-    fn created_at(&self) -> &str {
+    fn created_at(&self) -> Option<&str> {
         match self {
             Self::Permission { created_at, .. }
             | Self::Question { created_at, .. }
             | Self::PlanApproval { created_at, .. }
-            | Self::ScopeApproval { created_at, .. }
             | Self::RepoAction { created_at, .. }
-            | Self::PrTrackingRetry { created_at, .. } => created_at,
+            | Self::PrTrackingRetry { created_at, .. } => Some(created_at.as_str()),
+            Self::ScopeApproval { created_at, .. } => created_at.as_deref(),
         }
     }
 
@@ -193,9 +196,26 @@ fn sort_items(items: &mut [AttentionItem]) {
     items.sort_by(|left, right| {
         left.rank()
             .cmp(&right.rank())
-            .then_with(|| left.created_at().cmp(right.created_at()))
+            .then_with(|| left.created_at().cmp(&right.created_at()))
             .then_with(|| left.id().cmp(right.id()))
     });
+}
+
+/// The plan row's `created_at` is an opaque OCC revision, not a timestamp.
+/// Proposal timeline rows are the durable wall-clock source for display. Old
+/// plans can predate those rows, so absence stays explicit instead of inventing
+/// an age from the thread or attempting to decode the revision.
+async fn latest_proposal_created_at(db: &Db, thread_id: i32) -> anyhow::Result<Option<String>> {
+    let message = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::SessionId.is_null())
+        .filter(lead_message::Column::Kind.eq("proposal"))
+        .order_by_desc(lead_message::Column::Id)
+        .one(&db.0)
+        .await?;
+    Ok(message
+        .map(|message| message.created_at)
+        .filter(|created_at| !created_at.trim().is_empty()))
 }
 
 async fn collect_snapshot(
@@ -234,10 +254,11 @@ async fn collect_snapshot_from_asks(
             .filter(|plan| plan.status == "proposed" && !plan.proposal.trim().is_empty());
 
         if let Some(plan) = proposed {
+            let created_at = latest_proposal_created_at(db, thread.id).await?;
             items.push(AttentionItem::ScopeApproval {
                 id: format!("scope:{}:{}", thread.id, plan.created_at),
                 revision: plan.created_at.clone(),
-                created_at: plan.created_at,
+                created_at,
                 thread_id: thread.id,
                 thread_title: thread.title.clone(),
             });
@@ -418,6 +439,65 @@ pub async fn attention_snapshots(
         .map_err(|error| error.to_string())
 }
 
+/// Linearize a durable answer with thread/repo/workspace deletion. The first
+/// read only discovers the gate key; every authority and OCC check is repeated
+/// while holding that thread's lifecycle gate before SQLite is mutated.
+pub(crate) async fn answer_durable_human_request(
+    db: &Db,
+    bus: &BusRegistry,
+    request_id: i32,
+    expected_thread_id: Option<i32>,
+    expected_workspace_id: Option<i32>,
+    expected_revision: Option<i32>,
+    text: &str,
+) -> anyhow::Result<Option<human_request::Model>> {
+    let Some(discovered) = repo::get_human_request(db, request_id).await? else {
+        return Ok(None);
+    };
+    if expected_thread_id.is_some_and(|thread_id| discovered.thread_id != thread_id) {
+        return Ok(None);
+    }
+
+    let gate = bus.thread_lifecycle_gate(discovered.thread_id);
+    let _lifecycle = gate.lock().await;
+    let Some(request) = repo::get_human_request(db, request_id).await? else {
+        return Ok(None);
+    };
+    if request.status != repo::HUMAN_REQUEST_OPEN
+        || request.thread_id != discovered.thread_id
+        || expected_thread_id.is_some_and(|thread_id| request.thread_id != thread_id)
+        || expected_workspace_id.is_some_and(|workspace_id| request.workspace_id != workspace_id)
+        || expected_revision.is_some_and(|revision| request.revision != revision)
+    {
+        return Ok(None);
+    }
+
+    let Some(updated) = repo::answer_human_request(
+        db,
+        request.workspace_id,
+        request.id,
+        request.revision,
+        text,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let Ok(ask_id) = u64::try_from(updated.id) else {
+        anyhow::bail!("invalid durable question id");
+    };
+    if !bus.answer_ask(updated.thread_id, ask_id, &updated.answer) {
+        bus.deliver_durable_answer(
+            updated.thread_id,
+            ask_id,
+            &updated.direction_scope,
+            &updated.question,
+            &updated.answer,
+        );
+    }
+    Ok(Some(updated))
+}
+
 #[tauri::command]
 pub async fn answer_human_request(
     app: AppHandle,
@@ -428,11 +508,13 @@ pub async fn answer_human_request(
     revision: i32,
     text: String,
 ) -> R<()> {
-    let Some(request) = repo::answer_human_request(
+    let Some(request) = answer_durable_human_request(
         &db,
-        workspace_id,
+        &bus,
         request_id,
-        revision,
+        None,
+        Some(workspace_id),
+        Some(revision),
         &text,
     )
     .await
@@ -440,16 +522,6 @@ pub async fn answer_human_request(
     else {
         return Err("stale_attention_item".to_string());
     };
-    let ask_id = u64::try_from(request.id).map_err(|_| "invalid_question_id".to_string())?;
-    if !bus.answer_ask(request.thread_id, ask_id, &request.answer) {
-        bus.deliver_durable_answer(
-            request.thread_id,
-            ask_id,
-            &request.direction_scope,
-            &request.question,
-            &request.answer,
-        );
-    }
     let _ = app.emit("needs-you://changed", request.thread_id);
     Ok(())
 }
@@ -498,20 +570,7 @@ async fn retry_pr_tracking_core(
     {
         anyhow::bail!("stale_attention_item");
     }
-    repo::register_pull_request(
-        db,
-        pr.thread_id,
-        pr.direction_id,
-        pr.repo_id,
-        &pr.host_kind,
-        &pr.host_base,
-        &pr.host_owner,
-        &pr.host_repo,
-        pr.number,
-        &pr.url,
-        &pr.title,
-    )
-    .await?;
+    repo::refresh_pull_request_tracking(db, &pr).await?;
     merge_backoff.clear(pr.id);
     Ok(pr.thread_id)
 }
@@ -676,19 +735,47 @@ mod tests {
             .unwrap();
         assert!(matches!(before.items.as_slice(), [AttentionItem::PlanApproval { .. }]));
 
+        let proposal_row = repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "system",
+            "proposal",
+            r#"{"rationale":"x","count":1}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let revision = "1700000000000000000-7";
+
         repo::upsert_plan(
             &db,
             thread.id,
             r#"{"rationale":"x","directions":[{"name":"Task"}]}"#,
             "proposed",
-            "2",
+            revision,
         )
         .await
         .unwrap();
         let after = collect_snapshot(&db, &crate::ask::AskRegistry::new(), thread.workspace_id)
             .await
             .unwrap();
-        assert!(matches!(after.items.as_slice(), [AttentionItem::ScopeApproval { .. }]));
+        let [AttentionItem::ScopeApproval {
+            id,
+            revision: projected_revision,
+            created_at,
+            ..
+        }] = after.items.as_slice()
+        else {
+            panic!("the proposed plan should project as one scope approval");
+        };
+        assert_eq!(id, &format!("scope:{}:{revision}", thread.id));
+        assert_eq!(projected_revision, revision);
+        assert_eq!(created_at.as_deref(), Some(proposal_row.created_at.as_str()));
+        let payload = serde_json::to_value(&after.items[0]).unwrap();
+        assert_eq!(payload["revision"], revision);
+        assert_eq!(payload["created_at"], proposal_row.created_at);
         assert!(!repo::attention_card_is_actionable(
             &db,
             thread.id,
@@ -707,6 +794,36 @@ mod tests {
         )
         .await
         .unwrap());
+    }
+
+    #[tokio::test]
+    async fn scope_without_a_proposal_timeline_keeps_revision_and_omits_display_time() {
+        let (db, thread, _direction) = fixture().await;
+        let legacy_revision = "1700000000";
+        repo::upsert_plan(
+            &db,
+            thread.id,
+            r#"{"rationale":"legacy","directions":[{"name":"Task"}]}"#,
+            "proposed",
+            legacy_revision,
+        )
+        .await
+        .unwrap();
+
+        let snapshot =
+            collect_snapshot(&db, &crate::ask::AskRegistry::new(), thread.workspace_id)
+                .await
+                .unwrap();
+        let [AttentionItem::ScopeApproval {
+            revision,
+            created_at,
+            ..
+        }] = snapshot.items.as_slice()
+        else {
+            panic!("the legacy proposed plan should remain actionable");
+        };
+        assert_eq!(revision, legacy_revision);
+        assert_eq!(created_at, &None);
     }
 
     #[tokio::test]
@@ -956,11 +1073,21 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = repo::create_session(
+            &db,
+            direction.id,
+            direction.repo_id,
+            "codex",
+            "/tmp/attention-pr-source",
+        )
+        .await
+        .unwrap();
         let pr = repo::register_pull_request(
             &db,
             thread.id,
             direction.id,
             direction.repo_id,
+            Some(session.id),
             "github",
             "github.com",
             "acme",
@@ -995,11 +1122,21 @@ mod tests {
     #[tokio::test]
     async fn pr_retry_is_occ_scoped_to_one_failure_episode() {
         let (db, thread, direction) = fixture().await;
+        let session = repo::create_session(
+            &db,
+            direction.id,
+            direction.repo_id,
+            "codex",
+            "/tmp/attention-retry-pr-source",
+        )
+        .await
+        .unwrap();
         let pr = repo::register_pull_request(
             &db,
             thread.id,
             direction.id,
             direction.repo_id,
+            Some(session.id),
             "github",
             "github.com",
             "acme",
@@ -1099,7 +1236,7 @@ mod tests {
             AttentionItem::ScopeApproval {
                 id: "scope:1:4".to_string(),
                 revision: "4".to_string(),
-                created_at: "4".to_string(),
+                created_at: Some("4".to_string()),
                 thread_id: 1,
                 thread_title: "Issue".to_string(),
             },

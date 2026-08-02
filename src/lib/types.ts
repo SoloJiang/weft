@@ -814,9 +814,14 @@ export interface ReadOnlyGrants {
   session: ReadOnlySessionGrant[];
 }
 
-interface AttentionBase {
+interface AttentionIdentity {
   id: string;
+  /** Opaque optimistic-concurrency token. Never parse this as a timestamp. */
   revision: string;
+}
+
+interface AttentionBase extends AttentionIdentity {
+  /** Wall-clock creation time used only for ordering and display. */
   created_at: string;
 }
 
@@ -843,8 +848,10 @@ export type PlanApprovalAttentionItem = AttentionBase & {
   title: string;
 };
 
-export type ScopeApprovalAttentionItem = AttentionBase & {
+export type ScopeApprovalAttentionItem = AttentionIdentity & {
   kind: "scope_approval";
+  /** Missing on legacy plans that have no durable proposal timeline row. */
+  created_at: string | null;
   thread_id: number;
   thread_title: string;
 };

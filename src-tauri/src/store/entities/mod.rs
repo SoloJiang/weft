@@ -8,6 +8,7 @@ pub mod im_route;
 pub mod lead_message;
 pub mod plan;
 pub mod pull_request;
+pub mod repo_action_execution;
 pub mod repo_profile;
 pub mod repo_ref;
 pub mod session;

@@ -240,6 +240,8 @@ pub fn run() {
                 // APP_HANDLE is set above; access the managed Db via Manager.
                 use tauri::Manager as _;
                 let db = app.state::<store::Db>().inner().clone();
+                commands::spawn_pending_repo_action_cleanups(db.clone());
+                commands::spawn_pending_repo_action_feedback(db.clone(), None);
                 tauri::async_runtime::spawn(async move {
                     curator::resume_running_analyses(&db).await;
                 });

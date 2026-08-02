@@ -11,8 +11,8 @@ import { toast } from "../components/Toast";
 import { currentLang } from "../i18n";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
+import type { RepoActionCommandResult } from "../lib/api";
 import { repoNameFromUrl } from "../lib/gitUrl";
-import type { RepoRef } from "../lib/types";
 
 export type RepoActionKind = "add" | "new" | "clone";
 
@@ -36,8 +36,16 @@ export interface RepoActionInvocation {
 }
 
 type RepoActionResult =
-  | { status: "ok"; repo_id: string; name: string; local_git_path: string }
+  | {
+      status: "ok";
+      execution_outcome: "freshly_completed" | "replayed";
+      repo_id: string;
+      name: string;
+      local_git_path: string;
+    }
+  | { status: "in_progress" }
   | { status: "error"; message: string }
+  | { status: "stale"; message: string }
   | { status: "cancelled" };
 
 type Translate = (key: string, opts?: Record<string, unknown>) => string;
@@ -83,22 +91,16 @@ export function useRepoActions() {
     async (inv: RepoActionInvocation) => {
       setBusyFor(inv.actionId, true);
       try {
+        const guarded = inv.ctx.threadId != null && inv.ctx.messageId != null;
         const wsId = await resolveWorkspaceId(inv.ctx);
         if (!wsId) {
-          await maybePost(inv, { status: "error", message: "no workspace" });
+          if (!guarded) {
+            await maybePost(inv, { status: "error", message: "no workspace" });
+          }
           return;
         }
         const result = await dispatch(inv, wsId, t as Translate);
         if (result.status === "ok") {
-          if (inv.ctx.messageId != null) {
-            // Persist the card's settled state so it survives reload (no
-            // re-click double-add). Best-effort: the repo is already registered.
-            try {
-              await api.resolveActionCard(inv.ctx.messageId, result.name);
-            } catch (err) {
-              console.warn("[weft] action-card resolve persist failed", err);
-            }
-          }
           toast(t("repoActions.addedToast", { name: result.name }));
           try {
             await refreshReposAndMap(wsId);
@@ -112,6 +114,22 @@ export function useRepoActions() {
           }
         } else if (result.status === "error") {
           toast(t("repoActions.failedToast", { message: result.message }));
+        } else if (result.status === "stale") {
+          toast(result.message);
+          // A stale card is no longer an authorized lead action. Do not inject
+          // a synthetic repo_action result into the newer conversation turn.
+          return;
+        } else if (result.status === "in_progress") {
+          // Another surface/process owns this exact execution token. It will
+          // refresh Needs and notify the lead; this loser is not a failure and
+          // must not inject a duplicate result.
+          return;
+        }
+        if (guarded) {
+          // Guarded card execution persists one authoritative feedback outbox
+          // in the same backend transaction that resolves the card. Every UI
+          // surface, including the fresh winner, must stay out of that path.
+          return;
         }
         await maybePost(inv, { ...result, workspace_id: wsId });
       } finally {
@@ -129,14 +147,25 @@ async function dispatch(
   workspaceId: number,
   t: Translate,
 ): Promise<RepoActionResult> {
+  let guard:
+    | { threadId: number; messageId: number; actionId: string; actionKind: string }
+    | undefined;
+  if (inv.ctx.threadId != null && inv.ctx.messageId != null) {
+    guard = {
+      threadId: inv.ctx.threadId,
+      messageId: inv.ctx.messageId,
+      actionId: inv.actionId,
+      actionKind: inv.kind,
+    };
+  }
   if (inv.kind === "add") {
     const dir = await openDialog({ directory: true, multiple: false });
     if (!dir || typeof dir !== "string") return { status: "cancelled" };
     try {
-      const r: RepoRef = await api.addRepoRef(workspaceId, basename(dir), dir);
+      const r = await api.addRepoRef(workspaceId, basename(dir), dir, guard);
       return ok(r);
     } catch (e) {
-      return { status: "error", message: String(e) };
+      return repoActionError(e, t);
     }
   }
 
@@ -149,10 +178,10 @@ async function dispatch(
     );
     if (!name) return { status: "cancelled" };
     try {
-      const r: RepoRef = await api.createRepo(workspaceId, name, parent);
+      const r = await api.createRepo(workspaceId, name, parent, guard);
       return ok(r);
     } catch (e) {
-      return { status: "error", message: String(e) };
+      return repoActionError(e, t);
     }
   }
 
@@ -172,16 +201,32 @@ async function dispatch(
   );
   if (!name) return { status: "cancelled" };
   try {
-    const r: RepoRef = await api.cloneRepo(workspaceId, url, parent, name);
+    const r = await api.cloneRepo(workspaceId, url, parent, name, guard);
     return ok(r);
   } catch (e) {
-    return { status: "error", message: String(e) };
+    return repoActionError(e, t);
   }
 }
 
-function ok(r: RepoRef): RepoActionResult {
+function repoActionError(error: unknown, t: Translate): RepoActionResult {
+  const message = String(error);
+  if (message.includes("action_card_stale")) {
+    return { status: "stale", message: t("repoActions.staleCard") };
+  }
+  return { status: "error", message };
+}
+
+function ok(result: RepoActionCommandResult): RepoActionResult {
+  if (result.execution_outcome === "in_progress") {
+    return { status: "in_progress" };
+  }
+  const r = result.repo;
+  if (!r) {
+    return { status: "error", message: "repository action completed without a repository" };
+  }
   return {
     status: "ok",
+    execution_outcome: result.execution_outcome,
     repo_id: String(r.id),
     name: r.name,
     local_git_path: r.local_git_path,

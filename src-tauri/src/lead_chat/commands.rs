@@ -22,7 +22,8 @@ fn ensure_lead_cwd(thread_id: i32) -> anyhow::Result<std::path::PathBuf> {
     std::fs::create_dir_all(&cwd)?;
     // git-init so claude's session store (keyed by cwd) behaves like any other
     // cwd; harmless if it already exists.
-    let _ = std::process::Command::new("git").env("PATH", crate::detect::tool_path())
+    let _ = std::process::Command::new("git")
+        .env("PATH", crate::detect::tool_path())
         .args(["init", "-q"])
         .current_dir(&cwd)
         .status();
@@ -229,8 +230,9 @@ pub async fn lead_engine(
     thread_id: i32,
     lang: &str,
 ) -> anyhow::Result<EngineRef> {
-    let t = repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let state = app.state::<LeadChatState>();
+    let _engine_admission = state.engine_admission_read().await;
+    let t = repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     if let Some(e) = state.get(lead_key(thread_id)) {
         return Ok(e);
     }
@@ -239,7 +241,14 @@ pub async fn lead_engine(
     let base = app.state::<crate::BusBase>().0.clone();
     let is_concierge = t.kind == "concierge";
     let is_curator = t.kind == "curator";
-    let ask = crate::bus::inject::inject_ask_hook(&base, thread_id, "lead", &t.lead_tool, &cwd);
+    let ask = crate::bus::inject::inject_ask_hook(
+        &base,
+        thread_id,
+        crate::bus::LEAD,
+        None,
+        &t.lead_tool,
+        &cwd,
+    );
     crate::skills::inject_for(db, t.workspace_id, &cwd).await;
     let mut extra = ask.args;
     if is_concierge {
@@ -253,7 +262,15 @@ pub async fn lead_engine(
         // directions.
         extra.extend(crate::bus::inject::inject_curator(&base, thread_id, &t.lead_tool, &cwd).args);
         extra.extend(
-            crate::bus::inject::inject(&base, thread_id, crate::bus::LEAD, &t.lead_tool, &cwd).args,
+            crate::bus::inject::inject(
+                &base,
+                thread_id,
+                crate::bus::LEAD,
+                None,
+                &t.lead_tool,
+                &cwd,
+            )
+            .args,
         );
     } else {
         // A per-issue lead gets the planner (read-only scope planning) AND the
@@ -262,7 +279,15 @@ pub async fn lead_engine(
         // lead turn (see coordinator::run).
         extra.extend(crate::bus::inject::inject_planner(&base, thread_id, &t.lead_tool, &cwd).args);
         extra.extend(
-            crate::bus::inject::inject(&base, thread_id, crate::bus::LEAD, &t.lead_tool, &cwd).args,
+            crate::bus::inject::inject(
+                &base,
+                thread_id,
+                crate::bus::LEAD,
+                None,
+                &t.lead_tool,
+                &cwd,
+            )
+            .args,
         );
     }
     push_model_arg(&mut extra, t.lead_model.as_deref());
@@ -271,13 +296,16 @@ pub async fn lead_engine(
     } else if is_curator {
         let repo_state =
             crate::lead_chat::repo_state::render_repo_state(db, Some(t.workspace_id)).await?;
-        format!("{}{}\n\n{}", curator_prompt(), lang_directive(lang), repo_state)
+        format!(
+            "{}{}\n\n{}",
+            curator_prompt(),
+            lang_directive(lang),
+            repo_state
+        )
     } else {
         let repos = repo::list_repos(db, t.workspace_id).await?;
-        let repo_state = crate::lead_chat::repo_state::render_repo_state_from(
-            Some(t.workspace_id),
-            &repos,
-        );
+        let repo_state =
+            crate::lead_chat::repo_state::render_repo_state_from(Some(t.workspace_id), &repos);
         format!(
             "{}{}\n\n{}",
             lead_prompt_for(needs_list_repos_directives(repos.len())),
@@ -300,6 +328,7 @@ pub async fn lead_engine(
         session_id: None,
         cwd,
         extra_args: extra,
+        extra_env: vec![],
         system_prompt,
         native_id: repo::lead_native_id(db, thread_id).await.ok().flatten(),
         pending_context_digest: None,
@@ -387,7 +416,9 @@ pub async fn lead_send(
         None,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    crate::commands::spawn_pending_repo_action_feedback(db.inner().clone(), Some(thread_id));
+    Ok(())
 }
 
 #[tauri::command]
@@ -419,7 +450,9 @@ pub async fn lead_ensure(
         .map_err(|e| e.to_string())?;
     engine::ensure_running(&app, &db, &eng)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    crate::commands::spawn_pending_repo_action_feedback(db.inner().clone(), Some(thread_id));
+    Ok(())
 }
 
 /// Stop the lead engine explicitly. Lifecycle control is separate from session
@@ -514,7 +547,10 @@ mod tests {
         push_model_arg(&mut extra, None);
         assert_eq!(extra, before, "None must not append anything");
         push_model_arg(&mut extra, Some(""));
-        assert_eq!(extra, before, "empty string must not append anything either");
+        assert_eq!(
+            extra, before,
+            "empty string must not append anything either"
+        );
     }
 
     #[test]
@@ -524,7 +560,10 @@ mod tests {
         // non-empty starting vec).
         let mut extra = vec![];
         push_model_arg(&mut extra, Some("gpt-5.5-high"));
-        assert_eq!(extra, vec!["--model".to_string(), "gpt-5.5-high".to_string()]);
+        assert_eq!(
+            extra,
+            vec!["--model".to_string(), "gpt-5.5-high".to_string()]
+        );
     }
 
     #[test]
@@ -532,8 +571,14 @@ mod tests {
         assert_eq!(normalize_model(None), None);
         assert_eq!(normalize_model(Some("".into())), None);
         assert_eq!(normalize_model(Some("   ".into())), None);
-        assert_eq!(normalize_model(Some("  opus  ".into())), Some("opus".to_string()));
-        assert_eq!(normalize_model(Some("gpt-5.5-high".into())), Some("gpt-5.5-high".to_string()));
+        assert_eq!(
+            normalize_model(Some("  opus  ".into())),
+            Some("opus".to_string())
+        );
+        assert_eq!(
+            normalize_model(Some("gpt-5.5-high".into())),
+            Some("gpt-5.5-high".to_string())
+        );
     }
 
     /// End-to-end contract for a single switch: `normalize_model` (the switch
@@ -544,12 +589,19 @@ mod tests {
     #[test]
     fn normalize_model_feeds_push_model_arg_correctly() {
         let mut extra = vec![];
-        push_model_arg(&mut extra, normalize_model(Some("  opus  ".into())).as_deref());
+        push_model_arg(
+            &mut extra,
+            normalize_model(Some("  opus  ".into())).as_deref(),
+        );
         assert_eq!(extra, vec!["--model".to_string(), "opus".to_string()]);
 
         let mut extra2 = vec!["existing".to_string()];
         push_model_arg(&mut extra2, normalize_model(Some("   ".into())).as_deref());
-        assert_eq!(extra2, vec!["existing".to_string()], "blank override clears to no-op");
+        assert_eq!(
+            extra2,
+            vec!["existing".to_string()],
+            "blank override clears to no-op"
+        );
     }
 
     #[test]
@@ -571,7 +623,10 @@ mod tests {
         assert!(lead_alive(false, true)); // no child, app-server client present
         assert!(lead_alive(true, false)); // resident child (exec/claude)
         assert!(!lead_alive(false, false)); // neither → genuinely down
-        assert_eq!(lead_state_label(lead_alive(false, true), false, false), "idle");
+        assert_eq!(
+            lead_state_label(lead_alive(false, true), false, false),
+            "idle"
+        );
     }
 
     #[test]
@@ -588,7 +643,9 @@ mod tests {
         assert!(!prompt.contains("<weft:list_repos/>"));
         assert!(lead_prompt_for(true).contains("<weft:list_repos/>"));
         assert!(!needs_list_repos_directives(0));
-        assert!(needs_list_repos_directives(crate::lead_chat::repo_state::MAX_LISTED + 1));
+        assert!(needs_list_repos_directives(
+            crate::lead_chat::repo_state::MAX_LISTED + 1
+        ));
         assert!(!needs_list_repos_directives(1));
     }
 
@@ -700,7 +757,13 @@ mod tests {
         use crate::lead_chat::engine::QueuedItem;
         let info = super::LeadStateInfo {
             state: "idle".into(),
-            queue: vec![QueuedItem { id: 1, text: "hello".into(), images: 0, files: 0, has_attachments: false }],
+            queue: vec![QueuedItem {
+                id: 1,
+                text: "hello".into(),
+                images: 0,
+                files: 0,
+                has_attachments: false,
+            }],
             native_id: None,
             command: String::new(),
             slash_commands: vec![],
@@ -775,7 +838,10 @@ pub async fn lead_state(
                 .map(|c| c.try_wait().ok().flatten().is_none())
                 .unwrap_or(false);
             // codex app-server leads are childless when idle but alive via the client.
-            let alive = lead_alive(child_alive, i.codex_client.is_some() || i.acp_client.is_some());
+            let alive = lead_alive(
+                child_alive,
+                i.codex_client.is_some() || i.acp_client.is_some(),
+            );
             let command = crate::tool_command::effective(i.command.as_deref(), &i.tool);
             Ok(LeadStateInfo {
                 state: lead_state_label(alive, i.turn.busy, i.stopped).into(),
@@ -1176,10 +1242,20 @@ pub async fn list_live_worker_slots(
     for eng in engines {
         let (session_id, thread_id, busy, queue) = {
             let inner = eng.lock().await;
-            (inner.session_id, inner.thread_id, inner.turn.busy, engine::queue_items(&inner.turn))
+            (
+                inner.session_id,
+                inner.thread_id,
+                inner.turn.busy,
+                engine::queue_items(&inner.turn),
+            )
         };
         if let Some(sid) = session_id {
-            snaps.push(WorkerSnapshot { session_id: sid, thread_id, busy, queue });
+            snaps.push(WorkerSnapshot {
+                session_id: sid,
+                thread_id,
+                busy,
+                queue,
+            });
         }
     }
     Ok(build_worker_slots(&db, snaps).await)
@@ -1192,10 +1268,7 @@ pub async fn list_live_worker_slots(
 /// The frontend calls this on a worker idle turn push and runs verify_direction when
 /// it returns Some; this replaces the racy frontend busy→idle / phase-cache effect.
 #[tauri::command]
-pub async fn auto_verify_check(
-    db: State<'_, Db>,
-    session_id: i32,
-) -> Result<Option<i32>, String> {
+pub async fn auto_verify_check(db: State<'_, Db>, session_id: i32) -> Result<Option<i32>, String> {
     let Some(sess) = repo::get_session(&db, session_id)
         .await
         .map_err(|e| e.to_string())?
@@ -1361,10 +1434,12 @@ pub(crate) async fn chat_open_worker_impl(
     repo_id: i32,
     lang: &str,
 ) -> anyhow::Result<SessionInfo> {
+    let state = app.state::<LeadChatState>();
+    let _engine_admission = state.engine_admission_read().await;
+    engine::ensure_worker_parent_chain(db, direction_id, repo_id).await?;
     let wt = repo::worktree_for(db, direction_id, repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no materialized worktree for that direction+repo"))?;
-    repo::ensure_repo_workspace_accepts_writes(db, repo_id).await?;
     let cwd = std::path::PathBuf::from(&wt.path);
     // A worktree row can outlive its directory (reclaimed via the Done-card
     // delete, or removed out of band). Never spawn a worker in a missing cwd —
@@ -1381,7 +1456,7 @@ pub(crate) async fn chat_open_worker_impl(
     let _initial_route_guard = engine::initial_worker_route_gate(direction_id)
         .lock_owned()
         .await;
-    let mut dir = repo::ensure_direction_workspace_accepts_writes(db, direction_id).await?;
+    let mut dir = engine::ensure_worker_parent_chain(db, direction_id, repo_id).await?;
 
     // An unpinned direction that has not yet established a native conversation
     // is still an initial route, not a running participant. Re-resolve it so a
@@ -1389,7 +1464,6 @@ pub(crate) async fn chat_open_worker_impl(
     // excludes. Once a worker has a native conversation or a live engine, keep
     // its selected identity: automatic routing is not a license to migrate an
     // existing session on open.
-    let state = app.state::<LeadChatState>();
     let prior = repo::latest_session_for(db, direction_id, repo_id).await?;
     let has_live_prior = prior
         .as_ref()
@@ -1445,8 +1519,9 @@ pub(crate) async fn chat_open_worker_impl(
     let resumed = native.is_some();
     let sess = match prior {
         Some(s) if s.native_session_id.is_some() => s,
-        _ => repo::create_session_for_current_direction(db, direction_id, repo_id, &wt.path)
-            .await?,
+        _ => {
+            repo::create_session_for_current_direction(db, direction_id, repo_id, &wt.path).await?
+        }
     };
     let session_tool = sess.tool.clone();
     crate::engine_routing::mirror_direction_route(db, dir.thread_id, direction_id, sess.id).await;
@@ -1456,6 +1531,7 @@ pub(crate) async fn chat_open_worker_impl(
         &base,
         dir.thread_id,
         &direction_id.to_string(),
+        Some(sess.id),
         &session_tool,
         &cwd,
     );
@@ -1463,6 +1539,7 @@ pub(crate) async fn chat_open_worker_impl(
         &base,
         dir.thread_id,
         &direction_id.to_string(),
+        Some(sess.id),
         &session_tool,
         &cwd,
     );
@@ -1471,10 +1548,16 @@ pub(crate) async fn chat_open_worker_impl(
     }
     let mut extra = ask.args;
     extra.extend(inj.args);
+    let mut extra_env = ask.env;
+    extra_env.extend(inj.env);
     push_model_arg(&mut extra, sess.model.as_deref());
 
     let key = sess.id as i64;
-    repo::ensure_thread_workspace_accepts_writes(db, dir.thread_id).await?;
+    let admitted_dir =
+        engine::ensure_worker_parent_chain(db, sess.direction_id, sess.repo_id).await?;
+    if admitted_dir.thread_id != dir.thread_id {
+        anyhow::bail!("worker direction changed threads before engine registration");
+    }
     let eng = match state.get(key) {
         Some(e) => e,
         None => {
@@ -1485,6 +1568,7 @@ pub(crate) async fn chat_open_worker_impl(
                 session_id: Some(sess.id),
                 cwd,
                 extra_args: extra,
+                extra_env,
                 system_prompt: String::new(),
                 native_id: native.clone(),
                 pending_context_digest: None,
@@ -1517,13 +1601,13 @@ pub(crate) async fn chat_open_worker_impl(
                 tool_rows: std::collections::HashMap::new(),
                 stopped: sess.status == "stopped",
                 codex_client: None,
-        acp_client: None,
-        acp_pending_asks: Vec::new(),
+                acp_client: None,
+                acp_pending_asks: Vec::new(),
                 turn_user_row: None,
                 last_assistant_uuid: None,
                 rewinding: false,
                 quota_failover_committing: false,
-        tearing_down: false,
+                tearing_down: false,
                 worktree_id: Some(wt.id),
             };
             // Restore the last persisted meta snapshot so the Session panel is
@@ -1533,6 +1617,7 @@ pub(crate) async fn chat_open_worker_impl(
             state.get_or_insert(key, e)
         }
     };
+    drop(_engine_admission);
     if let Err(err) = engine::ensure_running(app, db, &eng).await {
         if let Some(stale) = state.remove_if_same(key, &eng) {
             let _ = engine::teardown_for_switch(app, &stale).await;
@@ -1585,12 +1670,12 @@ pub(crate) async fn chat_open_worker_impl(
 /// Get-or-rebuild a worker's engine from its session row — so a chat worker
 /// survives app restarts the same way the lead does: sending resumes it.
 async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Result<EngineRef> {
+    let state = app.state::<LeadChatState>();
+    let _engine_admission = state.engine_admission_read().await;
     let sess = repo::get_session(db, session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no such session"))?;
-    let dir = repo::ensure_direction_workspace_accepts_writes(db, sess.direction_id).await?;
-    repo::ensure_repo_workspace_accepts_writes(db, sess.repo_id).await?;
-    let state = app.state::<LeadChatState>();
+    let dir = engine::ensure_worker_parent_chain(db, sess.direction_id, sess.repo_id).await?;
     if let Some(e) = state.get(session_id as i64) {
         return Ok(e);
     }
@@ -1600,6 +1685,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         &base,
         dir.thread_id,
         &sess.direction_id.to_string(),
+        Some(sess.id),
         &sess.tool,
         &cwd,
     );
@@ -1607,6 +1693,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         &base,
         dir.thread_id,
         &sess.direction_id.to_string(),
+        Some(sess.id),
         &sess.tool,
         &cwd,
     );
@@ -1615,6 +1702,8 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     }
     let mut extra = ask.args;
     extra.extend(inj.args);
+    let mut extra_env = ask.env;
+    extra_env.extend(inj.env);
     push_model_arg(&mut extra, sess.model.as_deref());
     let mut inner = engine::EngineInner {
         thread_id: dir.thread_id,
@@ -1623,6 +1712,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         session_id: Some(sess.id),
         cwd,
         extra_args: extra,
+        extra_env,
         system_prompt: String::new(),
         native_id: sess.native_session_id.clone(),
         pending_context_digest: None,
@@ -1674,6 +1764,11 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     // also races a fresh relaunch (slash discovery / direct chat_send), and an
     // engine born empty would persist a blank snapshot at its next checkpoint.
     engine::apply_persisted_meta(&mut inner, &sess.meta);
+    let admitted_dir =
+        engine::ensure_worker_parent_chain(db, sess.direction_id, sess.repo_id).await?;
+    if admitted_dir.thread_id != dir.thread_id {
+        anyhow::bail!("worker direction changed threads before engine registration");
+    }
     let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(session_id as i64, e))
 }
@@ -1722,25 +1817,47 @@ pub async fn chat_stop(app: AppHandle, session_id: i32) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn chat_dequeue(app: AppHandle, db: State<'_, Db>, session_id: i32, message_id: i32) -> Result<(), String> {
+pub async fn chat_dequeue(
+    app: AppHandle,
+    db: State<'_, Db>,
+    session_id: i32,
+    message_id: i32,
+) -> Result<(), String> {
     if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
-        engine::queue_remove(&app, &db, &eng, message_id).await.map_err(|e| e.to_string())?;
+        engine::queue_remove(&app, &db, &eng, message_id)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
 #[tauri::command]
-pub async fn chat_edit_queued(app: AppHandle, db: State<'_, Db>, session_id: i32, message_id: i32, text: String) -> Result<(), String> {
+pub async fn chat_edit_queued(
+    app: AppHandle,
+    db: State<'_, Db>,
+    session_id: i32,
+    message_id: i32,
+    text: String,
+) -> Result<(), String> {
     if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
-        engine::queue_edit(&app, &db, &eng, message_id, &text).await.map_err(|e| e.to_string())?;
+        engine::queue_edit(&app, &db, &eng, message_id, &text)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
 #[tauri::command]
-pub async fn chat_reorder_queue(app: AppHandle, db: State<'_, Db>, session_id: i32, order: Vec<i32>) -> Result<(), String> {
+pub async fn chat_reorder_queue(
+    app: AppHandle,
+    db: State<'_, Db>,
+    session_id: i32,
+    order: Vec<i32>,
+) -> Result<(), String> {
     if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
-        engine::queue_reorder(&app, &db, &eng, order).await.map_err(|e| e.to_string())?;
+        engine::queue_reorder(&app, &db, &eng, order)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -1780,9 +1897,15 @@ pub async fn lead_rewind(
     let eng = lead_engine(&app, &db, thread_id, lang.as_deref().unwrap_or("en"))
         .await
         .map_err(|e| e.to_string())?;
-    engine::rewind(&app, &db, &eng, message_id, engine::RewindMode::Conversation)
-        .await
-        .map_err(|e| e.to_string())
+    engine::rewind(
+        &app,
+        &db,
+        &eng,
+        message_id,
+        engine::RewindMode::Conversation,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// The coding-agent identities weft actually drives. `switch_lead_tool`/
@@ -1864,7 +1987,13 @@ async fn insert_switch_marker(
     .await
     {
         Ok(m) => {
-            let _ = app.emit(engine::EVENT, engine::Push::Message { thread_id, message: m });
+            let _ = app.emit(
+                engine::EVENT,
+                engine::Push::Message {
+                    thread_id,
+                    message: m,
+                },
+            );
         }
         Err(e) => eprintln!("[weft] engine-switch marker insert failed: {e}"),
     }
@@ -2170,7 +2299,9 @@ async fn switch_worker_tool_inner(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("direction {} not found", sess.direction_id))?;
 
-    let messages = repo::list_lead_messages(db, dir.thread_id).await.unwrap_or_default();
+    let messages = repo::list_lead_messages(db, dir.thread_id)
+        .await
+        .unwrap_or_default();
     let own: Vec<_> = messages
         .into_iter()
         .filter(|m| m.session_id == Some(session_id))
@@ -2295,8 +2426,8 @@ const QUOTA_FAILOVER_COOLDOWN_SECS: u64 = 120;
 
 type QuotaFailoverKey = (i32, Option<i32>);
 
-fn quota_failover_cooldowns() -> &'static std::sync::Mutex<std::collections::HashMap<QuotaFailoverKey, std::time::Instant>>
-{
+fn quota_failover_cooldowns(
+) -> &'static std::sync::Mutex<std::collections::HashMap<QuotaFailoverKey, std::time::Instant>> {
     static COOLDOWNS: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<QuotaFailoverKey, std::time::Instant>>,
     > = std::sync::OnceLock::new();
@@ -2429,7 +2560,9 @@ fn quota_failover_dispatch_decision(
 }
 
 fn quota_failover_engine_key(thread_id: i32, session_id: Option<i32>) -> i64 {
-    session_id.map(i64::from).unwrap_or_else(|| lead_key(thread_id))
+    session_id
+        .map(i64::from)
+        .unwrap_or_else(|| lead_key(thread_id))
 }
 
 /// Per-engine switch serialization. A manual switch takes this before reading
@@ -2491,11 +2624,7 @@ async fn quota_failover_commit_is_valid(
         && inner.tool == expected_tool
 }
 
-async fn release_quota_failover_commit(
-    app: &AppHandle,
-    thread_id: i32,
-    session_id: Option<i32>,
-) {
+async fn release_quota_failover_commit(app: &AppHandle, thread_id: i32, session_id: Option<i32>) {
     let state = app.state::<LeadChatState>();
     let Some(eng) = state.get(quota_failover_engine_key(thread_id, session_id)) else {
         return;
@@ -2535,8 +2664,7 @@ pub fn spawn_quota_failover_check(
         return;
     }
     tauri::async_runtime::spawn(async move {
-        maybe_failover_on_quota(&app, &db, thread_id, session_id, &tool, structured_exceeded)
-            .await;
+        maybe_failover_on_quota(&app, &db, thread_id, session_id, &tool, structured_exceeded).await;
     });
 }
 
@@ -2594,12 +2722,7 @@ async fn maybe_failover_on_quota(
                 }
             };
             crate::engine_routing::record_failover_blocked(
-                db,
-                thread_id,
-                session_id,
-                tool,
-                fallback,
-                reason,
+                db, thread_id, session_id, tool, fallback, reason,
             )
             .await;
             return;
@@ -2639,33 +2762,29 @@ async fn maybe_failover_on_quota(
     );
     let reason = Some(QUOTA_FAILOVER_REASON.to_string());
     let result = match session_id {
-        Some(sid) => {
-            switch_worker_tool_inner(
-                app,
-                db,
-                sid,
-                fallback.to_string(),
-                None,
-                reason,
-                Some("exceeded".to_string()),
-            )
-                .await
-                .map(|_| ())
-        }
-        None => {
-            switch_lead_tool_inner(
-                app,
-                db,
-                thread_id,
-                fallback.to_string(),
-                None,
-                None,
-                reason,
-                Some("exceeded".to_string()),
-            )
-                .await
-                .map(|_| ())
-        }
+        Some(sid) => switch_worker_tool_inner(
+            app,
+            db,
+            sid,
+            fallback.to_string(),
+            None,
+            reason,
+            Some("exceeded".to_string()),
+        )
+        .await
+        .map(|_| ()),
+        None => switch_lead_tool_inner(
+            app,
+            db,
+            thread_id,
+            fallback.to_string(),
+            None,
+            None,
+            reason,
+            Some("exceeded".to_string()),
+        )
+        .await
+        .map(|_| ()),
     };
     if let Err(err) = result {
         release_quota_failover_commit(app, thread_id, session_id).await;
@@ -2714,7 +2833,13 @@ async fn insert_quota_failover_failed_marker(
     .await
     {
         Ok(m) => {
-            let _ = app.emit(engine::EVENT, engine::Push::Message { thread_id, message: m });
+            let _ = app.emit(
+                engine::EVENT,
+                engine::Push::Message {
+                    thread_id,
+                    message: m,
+                },
+            );
         }
         Err(e) => eprintln!("[weft] quota-failover-failed marker insert failed: {e}"),
     }
@@ -2832,7 +2957,9 @@ mod quota_failover_tests {
             "unset setting must not silently enable an auto-switch"
         );
 
-        repo::set_setting(&db, K_QUOTA_FAILOVER_ENABLED, "0").await.unwrap();
+        repo::set_setting(&db, K_QUOTA_FAILOVER_ENABLED, "0")
+            .await
+            .unwrap();
         assert_eq!(
             crate::engine_routing::quota_failover_for_db(&db, "claude", false, true, true).await,
             crate::engine_routing::FailoverDecision::Skip(
@@ -2841,7 +2968,9 @@ mod quota_failover_tests {
             "\"0\" must not be read as truthy"
         );
 
-        repo::set_setting(&db, K_QUOTA_FAILOVER_ENABLED, "1").await.unwrap();
+        repo::set_setting(&db, K_QUOTA_FAILOVER_ENABLED, "1")
+            .await
+            .unwrap();
         assert_eq!(
             crate::engine_routing::quota_failover_for_db(&db, "claude", false, true, true).await,
             crate::engine_routing::FailoverDecision::SwitchTo {
@@ -2939,7 +3068,10 @@ mod quota_failover_tests {
         // A different key (e.g. a worker session on the same thread) is
         // independent — same invariant `claim_quota_failover_slot` proves.
         let other: QuotaFailoverKey = (900_020, Some(1));
-        assert_eq!(quota_failover_claim_gate(other), QuotaFailoverClaimGate::Claimed);
+        assert_eq!(
+            quota_failover_claim_gate(other),
+            QuotaFailoverClaimGate::Claimed
+        );
     }
 
     /// Direct proof of gate 6's PURE verdict function
@@ -2952,7 +3084,9 @@ mod quota_failover_tests {
     fn quota_failover_dispatch_decision_respects_a_lost_claim() {
         assert_eq!(
             quota_failover_dispatch_decision("codex", QuotaFailoverClaimGate::Claimed),
-            QuotaFailoverOutcome::Switch { tool: "codex".to_string() },
+            QuotaFailoverOutcome::Switch {
+                tool: "codex".to_string()
+            },
             "a won claim must dispatch to the resolved fallback tool"
         );
         assert_eq!(
@@ -2961,29 +3095,50 @@ mod quota_failover_tests {
             "a lost claim must never dispatch, regardless of which tool gates 1-5 picked"
         );
     }
-
 }
 
 #[tauri::command]
-pub async fn lead_dequeue(app: AppHandle, db: State<'_, Db>, thread_id: i32, message_id: i32) -> Result<(), String> {
+pub async fn lead_dequeue(
+    app: AppHandle,
+    db: State<'_, Db>,
+    thread_id: i32,
+    message_id: i32,
+) -> Result<(), String> {
     if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
-        engine::queue_remove(&app, &db, &eng, message_id).await.map_err(|e| e.to_string())?;
+        engine::queue_remove(&app, &db, &eng, message_id)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
 #[tauri::command]
-pub async fn lead_edit_queued(app: AppHandle, db: State<'_, Db>, thread_id: i32, message_id: i32, text: String) -> Result<(), String> {
+pub async fn lead_edit_queued(
+    app: AppHandle,
+    db: State<'_, Db>,
+    thread_id: i32,
+    message_id: i32,
+    text: String,
+) -> Result<(), String> {
     if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
-        engine::queue_edit(&app, &db, &eng, message_id, &text).await.map_err(|e| e.to_string())?;
+        engine::queue_edit(&app, &db, &eng, message_id, &text)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
 #[tauri::command]
-pub async fn lead_reorder_queue(app: AppHandle, db: State<'_, Db>, thread_id: i32, order: Vec<i32>) -> Result<(), String> {
+pub async fn lead_reorder_queue(
+    app: AppHandle,
+    db: State<'_, Db>,
+    thread_id: i32,
+    order: Vec<i32>,
+) -> Result<(), String> {
     if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
-        engine::queue_reorder(&app, &db, &eng, order).await.map_err(|e| e.to_string())?;
+        engine::queue_reorder(&app, &db, &eng, order)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -3109,8 +3264,14 @@ pub async fn post_lead_tool_result(
     payload: serde_json::Value,
     lang: Option<String>,
 ) -> Result<bool, String> {
-    post_lead_tool_result_inner(&app, &db, thread_id, payload, lang.as_deref().unwrap_or("en"))
-        .await
+    post_lead_tool_result_inner(
+        &app,
+        &db,
+        thread_id,
+        payload,
+        lang.as_deref().unwrap_or("en"),
+    )
+    .await
 }
 
 /// The issue's test-case document for the panel (None = never derived).
@@ -3170,7 +3331,7 @@ fn hidden_feedback_text(payload: &serde_json::Value) -> Result<String, serde_jso
 /// the approval isn't a dead-end that makes the user restart and re-approve.
 /// Other feedback (test_cases_updated / repo_action) stays droppable when
 /// stopped: its DB write is authoritative and the lead reads it back later.
-async fn post_lead_tool_result_inner(
+pub(crate) async fn post_lead_tool_result_inner(
     app: &AppHandle,
     db: &Db,
     thread_id: i32,
@@ -3298,21 +3459,46 @@ mod live_slot_tests {
         let th = repo::create_thread(db, ws.id, "issue", "feature", "codex")
             .await
             .unwrap();
-        let dir = repo::create_direction(db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only", "")
-            .await
-            .unwrap();
+        let dir = repo::create_direction(
+            db,
+            th.id,
+            "alpha",
+            "codex",
+            repo_ref.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
         let sess = repo::create_session(db, dir.id, repo_ref.id, "codex", "/tmp/wt")
             .await
             .unwrap();
-        repo::set_session_native_id(db, sess.id, "nat-1").await.unwrap();
-        repo::record_worktree(db, repo_ref.id, dir.id, "feat/alpha", "/tmp/wt", false, true, "")
+        repo::set_session_native_id(db, sess.id, "nat-1")
             .await
             .unwrap();
+        repo::record_worktree(
+            db,
+            repo_ref.id,
+            dir.id,
+            "feat/alpha",
+            "/tmp/wt",
+            false,
+            true,
+            "",
+        )
+        .await
+        .unwrap();
         (th.id, dir.id, repo_ref.id, sess.id)
     }
 
     fn snap(session_id: i32, thread_id: i32, busy: bool) -> WorkerSnapshot {
-        WorkerSnapshot { session_id, thread_id, busy, queue: vec![] }
+        WorkerSnapshot {
+            session_id,
+            thread_id,
+            busy,
+            queue: vec![],
+        }
     }
 
     /// A busy worker is assembled into a full slot carrying its own thread id and
@@ -3324,12 +3510,29 @@ mod live_slot_tests {
         let (th, dir, repo_id, sess) = fixture(&db).await;
 
         let items = vec![
-            QueuedItem { id: 10, text: "hi".into(), images: 0, files: 0, has_attachments: false },
-            QueuedItem { id: 11, text: "there".into(), images: 1, files: 0, has_attachments: true },
+            QueuedItem {
+                id: 10,
+                text: "hi".into(),
+                images: 0,
+                files: 0,
+                has_attachments: false,
+            },
+            QueuedItem {
+                id: 11,
+                text: "there".into(),
+                images: 1,
+                files: 0,
+                has_attachments: true,
+            },
         ];
         let slots = build_worker_slots(
             &db,
-            vec![WorkerSnapshot { session_id: sess, thread_id: th, busy: true, queue: items }],
+            vec![WorkerSnapshot {
+                session_id: sess,
+                thread_id: th,
+                busy: true,
+                queue: items,
+            }],
         )
         .await;
 
@@ -3380,11 +3583,24 @@ mod live_slot_tests {
     async fn busy_worker_without_worktree_is_skipped() {
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let repo_ref = repo::add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "", true).await.unwrap();
-        let th = repo::create_thread(&db, ws.id, "issue", "feature", "codex").await.unwrap();
-        let dir = repo::create_direction(&db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only", "")
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "", true)
             .await
             .unwrap();
+        let th = repo::create_thread(&db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let dir = repo::create_direction(
+            &db,
+            th.id,
+            "alpha",
+            "codex",
+            repo_ref.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
         let sess = repo::create_session(&db, dir.id, repo_ref.id, "codex", "/tmp/wt")
             .await
             .unwrap();
@@ -3428,14 +3644,27 @@ mod switch_write_tests {
         let th = repo::create_thread(db, ws.id, "issue", "feature", "claude")
             .await
             .unwrap();
-        let dir = repo::create_direction(db, th.id, "alpha", "claude", repo_ref.id, "why", "impl-only", "")
-            .await
-            .unwrap();
+        let dir = repo::create_direction(
+            db,
+            th.id,
+            "alpha",
+            "claude",
+            repo_ref.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
         let sess = repo::create_session(db, dir.id, repo_ref.id, "claude", "/tmp/wt")
             .await
             .unwrap();
-        repo::set_lead_native_id(db, th.id, "lead-nat-1").await.unwrap();
-        repo::set_session_native_id(db, sess.id, "worker-nat-1").await.unwrap();
+        repo::set_lead_native_id(db, th.id, "lead-nat-1")
+            .await
+            .unwrap();
+        repo::set_session_native_id(db, sess.id, "worker-nat-1")
+            .await
+            .unwrap();
         (th.id, dir.id, sess.id)
     }
 
@@ -3505,7 +3734,10 @@ mod switch_write_tests {
         // BOTH halves of the tool write: `direction.tool` is what
         // `chat_open_worker_impl`'s cold-recreate path reads, `session.tool`
         // what the live path reads.
-        assert_eq!(repo::get_direction(&db, dir).await.unwrap().unwrap().tool, "codex");
+        assert_eq!(
+            repo::get_direction(&db, dir).await.unwrap().unwrap().tool,
+            "codex"
+        );
         let s = repo::get_session(&db, sess).await.unwrap().unwrap();
         assert_eq!(s.tool, "codex");
         assert_eq!(s.model.as_deref(), Some("gpt-5.5-high"));

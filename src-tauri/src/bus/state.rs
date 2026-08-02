@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The sentinel "direction" id for the human operator. Agents address the human
@@ -120,6 +120,12 @@ impl ThreadBus {
 #[derive(Default, Clone)]
 pub struct BusRegistry {
     inner: Arc<Mutex<HashMap<i32, ThreadBus>>>,
+    /// Serializes durable human-request lifecycle transitions that cross the
+    /// SQLite/process-local boundary. Answer and delete must share this gate:
+    /// otherwise an answer can commit in SQLite while a concurrent delete has
+    /// fenced delivery, then the delete can fail and reopen a still-live bus
+    /// whose ask disagrees with the durable row.
+    lifecycle_gates: Arc<Mutex<HashMap<i32, Weak<tokio::sync::Mutex<()>>>>>,
     wake: Arc<Mutex<Option<Sender<Wake>>>>,
     next_ask_id: Arc<AtomicU64>,
     ask_notify: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<HumanAskEvent>>>>,
@@ -138,6 +144,22 @@ fn now() -> u64 {
 impl BusRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Per-thread async gate for operations that must linearize a durable DB
+    /// transition with its in-memory bus effect. Callers hold the returned
+    /// mutex only for the affected thread; unrelated issues remain concurrent.
+    pub fn thread_lifecycle_gate(&self, thread: i32) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self
+            .lifecycle_gates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(gate) = gates.get(&thread).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(thread, Arc::downgrade(&gate));
+        gate
     }
 
     /// Install the channel the coordinator listens on (called once at startup).
@@ -730,6 +752,63 @@ impl BusRegistry {
         bus.log.retain(|message| message.request_id.is_none());
     }
 
+    /// Apply a committed durable cancellation to one surviving thread without
+    /// emitting provider/trail events. The caller batches and de-duplicates
+    /// events after every DB effect is known. This also removes answered-but-
+    /// unacknowledged inbox/log messages for the cancelled request ids.
+    pub fn apply_human_cancellations_by_id(&self, thread: i32, request_ids: &[u64]) -> Vec<u64> {
+        if request_ids.is_empty() {
+            return Vec::new();
+        }
+        let ids = request_ids.iter().copied().collect::<HashSet<_>>();
+        let mut g = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let bus = g.entry(thread).or_default();
+        if bus.closed {
+            return Vec::new();
+        }
+        let mut cancelled = Vec::new();
+        for ask in &mut bus.asks {
+            if ask.answered || !ids.contains(&ask.id) {
+                continue;
+            }
+            ask.answered = true;
+            cancelled.push(ask.id);
+        }
+        for messages in bus.inboxes.values_mut() {
+            messages.retain(|message| {
+                message
+                    .request_id
+                    .is_none_or(|request_id| !ids.contains(&request_id))
+            });
+        }
+        bus.log.retain(|message| {
+            message
+                .request_id
+                .is_none_or(|request_id| !ids.contains(&request_id))
+        });
+        cancelled
+    }
+
+    /// Silently cancel live asks owned by a direction that a committed delete
+    /// removed. Durable and legacy asks share this process-local shape; the
+    /// command layer emits one de-duplicated event batch afterwards.
+    pub fn apply_direction_human_cancellation(&self, thread: i32, from: &str) -> Vec<u64> {
+        let mut g = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let bus = g.entry(thread).or_default();
+        if bus.closed {
+            return Vec::new();
+        }
+        let mut cancelled = Vec::new();
+        for ask in &mut bus.asks {
+            if ask.answered || ask.from != from {
+                continue;
+            }
+            ask.answered = true;
+            cancelled.push(ask.id);
+        }
+        cancelled
+    }
+
     /// Commit the irreversible tombstone only after the DB cascade succeeds.
     pub fn commit_thread_close(&self, thread: i32) {
         let mut g = self.inner.lock().unwrap_or_else(|error| error.into_inner());
@@ -762,6 +841,15 @@ impl BusRegistry {
                 ask_id: *ask_id,
             });
         }
+    }
+
+    /// Apply and publish a committed cancellation set. Every durable id emits
+    /// its terminal event, including requests that were already answered or
+    /// acknowledged in memory: their provider cards still need to converge to
+    /// the later durable Cancelled state.
+    pub fn apply_committed_human_cancellations(&self, thread: i32, ask_ids: &[u64]) {
+        self.apply_human_cancellations_by_id(thread, ask_ids);
+        self.notify_cancelled_asks(thread, ask_ids);
     }
 
     fn cancel_open_asks_matching(
@@ -850,6 +938,39 @@ mod tests {
         // Unknown / already-cancelled id → no-op false.
         assert!(!r.cancel_open_asks_by_id(1, superseded));
         assert!(!r.cancel_open_asks_by_id(1, 9999));
+    }
+
+    #[tokio::test]
+    async fn committed_cancellation_discards_answer_and_notifies_even_after_answered() {
+        let r = BusRegistry::new();
+        assert!(r.restore_human_request(7, "10", "REST or GraphQL?", 42));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let snapshot = r.set_ask_notifier(tx);
+        assert_eq!(snapshot.len(), 1);
+        assert!(r.answer_ask(7, 42, "REST"));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            HumanAskEvent::Answered { ask_id: 42, .. }
+        ));
+        assert!(r
+            .log(7)
+            .iter()
+            .any(|message| message.request_id == Some(42)));
+
+        r.apply_committed_human_cancellations(7, &[42]);
+
+        assert!(!r
+            .log(7)
+            .iter()
+            .any(|message| message.request_id == Some(42)));
+        assert!(r.inbox(7, "10").is_empty());
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            HumanAskEvent::Cancelled {
+                thread: 7,
+                ask_id: 42
+            }
+        ));
     }
 
     #[test]

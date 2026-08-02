@@ -1071,6 +1071,7 @@ export const zh = {
     repoUrlPlaceholder: "https://github.com/...",
     addedToast: "已添加仓库 {{name}}",
     failedToast: "失败：{{message}}",
+    staleCard: "这条仓库操作已失效",
     noWorkspaceToast: "无法准备工作区",
   },
   slashLocal: {

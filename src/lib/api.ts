@@ -42,6 +42,11 @@ import type {
   TargetDiff,
 } from "./types";
 
+export interface RepoActionCommandResult {
+  execution_outcome: "freshly_completed" | "replayed" | "in_progress";
+  repo: RepoRef | null;
+}
+
 // Tauri converts camelCase command args to snake_case Rust params.
 
 export const api = {
@@ -57,14 +62,27 @@ export const api = {
 
   listRepos: (workspaceId: number) =>
     invoke<RepoRef[]>("list_repos", { workspaceId }),
-  addRepoRef: (workspaceId: number, name: string, localGitPath: string) =>
-    invoke<RepoRef>("add_repo_ref", { workspaceId, name, localGitPath }),
+  addRepoRef: (
+    workspaceId: number,
+    name: string,
+    localGitPath: string,
+    guard?: { threadId: number; messageId: number; actionId: string; actionKind: string },
+  ) => invoke<RepoActionCommandResult>("add_repo_ref", { workspaceId, name, localGitPath, ...guard }),
   checkGitRepo: (path: string) =>
     invoke<boolean>("check_git_repo", { path }),
-  cloneRepo: (workspaceId: number, url: string, dest: string, name: string) =>
-    invoke<RepoRef>("clone_repo", { workspaceId, url, dest, name }),
-  createRepo: (workspaceId: number, name: string, dest: string) =>
-    invoke<RepoRef>("create_repo", { workspaceId, name, dest }),
+  cloneRepo: (
+    workspaceId: number,
+    url: string,
+    dest: string,
+    name: string,
+    guard?: { threadId: number; messageId: number; actionId: string; actionKind: string },
+  ) => invoke<RepoActionCommandResult>("clone_repo", { workspaceId, url, dest, name, ...guard }),
+  createRepo: (
+    workspaceId: number,
+    name: string,
+    dest: string,
+    guard?: { threadId: number; messageId: number; actionId: string; actionKind: string },
+  ) => invoke<RepoActionCommandResult>("create_repo", { workspaceId, name, dest, ...guard }),
   /** Best-effort hidden delivery to the lead; resolves false when the lead
    *  ignored it (stopped/dead engine) so callers can keep follow-up UI honest. */
   postLeadToolResult: (threadId: number, payload: unknown, lang: string) =>

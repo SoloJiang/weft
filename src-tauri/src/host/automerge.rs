@@ -255,6 +255,11 @@ async fn run_automerge_sweep(app: &AppHandle) {
         return;
     };
     let backoff = backoff.inner().clone();
+    let Some(bus) = app.try_state::<crate::bus::BusRegistry>() else {
+        return;
+    };
+    let bus = bus.inner().clone();
+    let merge_runner: MergeRunner = std::sync::Arc::new(run_gh_merge);
 
     // No probe-failure ceiling here (`i32::MAX`, effectively "don't exclude
     // anything at the query level") — unlike `host::monitor`'s own sweep,
@@ -271,7 +276,16 @@ async fn run_automerge_sweep(app: &AppHandle) {
         }
     };
     for pr in open {
-        maybe_merge_one(app, &db, pr, &backoff, super::resolve_host).await;
+        maybe_merge_one(
+            app,
+            &db,
+            &bus,
+            pr,
+            &backoff,
+            super::resolve_host,
+            &merge_runner,
+        )
+        .await;
     }
 }
 
@@ -287,6 +301,10 @@ async fn run_automerge_sweep(app: &AppHandle) {
 /// read-only boundary (`host/mod.rs`'s module doc) means `monitor.rs` stays
 /// untouched, byte-for-byte, by this file's own follow-up work.
 type HostResolver = fn(HostKind) -> Result<Box<dyn super::PrHost>, HostError>;
+
+type MergeRunner = std::sync::Arc<
+    dyn Fn(&str, &str, &str, i32, &str) -> Result<(), String> + Send + Sync + 'static,
+>;
 
 /// [`evaluate_row`]'s return: whether `maybe_merge_one` should actually
 /// attempt [`run_gh_merge`], and if so, against exactly which `head_sha` —
@@ -502,34 +520,85 @@ async fn evaluate_row(
 /// feature only speaks up when it actually acts (see
 /// `insert_automerge_marker`'s doc). See this module's own doc for the full
 /// numbered flow, and [`evaluate_row`]'s doc for why steps 1-5 live there.
-async fn maybe_merge_one(
-    app: &AppHandle,
+struct MergeExecution {
+    pr: pull_request::Model,
+    head_sha: String,
+    merge_result: Result<(), String>,
+    attempts_exhausted: bool,
+}
+
+/// Evaluate one row, then linearize the final external side effect with every
+/// thread/repo/workspace deletion path. The lifecycle guard is acquired only
+/// after the live host evaluation, then held across exact row/head/parent/
+/// marker revalidation and the complete merge runner call.
+async fn evaluate_and_execute_merge(
     db: &Db,
+    bus: &crate::bus::BusRegistry,
     pr: pull_request::Model,
     backoff: &MergeBackoffState,
     resolver: HostResolver,
-) {
-    let Some(host_kind) = HostKind::parse(&pr.host_kind) else {
-        return; // unrecognized host_kind on the row — nothing sane to do
-    };
-
+    host_kind: HostKind,
+    merge_runner: &MergeRunner,
+) -> Option<MergeExecution> {
     let head_sha = match evaluate_row(db, &pr, host_kind, backoff, resolver).await {
-        RowVerdict::Skip => return,
+        RowVerdict::Skip => return None,
         RowVerdict::Merge { head_sha } => head_sha,
     };
+
+    #[cfg(test)]
+    tests::after_automerge_evaluation_probe(pr.id).await;
+
+    let lifecycle_gate = bus.thread_lifecycle_gate(pr.thread_id);
+    let _lifecycle = lifecycle_gate.lock().await;
+    let current = match repo::reload_pull_request_merge_candidate(db, &pr, &head_sha).await {
+        Ok(Some(current)) => current,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln!(
+                "[weft][automerge] pr #{}: final parent revalidation failed: {error}",
+                pr.id
+            );
+            return None;
+        }
+    };
+    let now = repo::now_unix();
+    let current_decision = gate::decide_auto_merge(
+        auto_merge_enabled(db).await,
+        host_kind,
+        gate::parse_lifecycle(&current.lifecycle),
+        &gate::parse_ci(&current.ci_status),
+        &gate::parse_readiness(&current.merge_readiness),
+        current.probe_fail_count,
+        gate::age_secs(&current.last_checked_at, &now),
+        MAX_READY_AGE_SECS,
+    );
+    if current_decision != AutoMergeDecision::Merge || backoff.is_exhausted(current.id, &head_sha) {
+        return None;
+    }
+    match repo::upstream_merge_state(db, current.direction_id).await {
+        super::UpstreamStatus::None | super::UpstreamStatus::Merged => {}
+        other => {
+            eprintln!(
+                "[weft][automerge] pr #{}: upstream changed to {other:?} before merge — aborting",
+                current.id
+            );
+            return None;
+        }
+    }
 
     // Step 6: the ONE mutating call, off the async runtime, using the FRESH
     // head_sha (never the stale row's) and the row's recorded host_base (GHE
     // support — review round 1 Codex P1: a prior version always targeted
     // `gh`'s own default host regardless of what was recorded at
     // registration).
-    let host_base = pr.host_base.clone();
-    let owner = pr.host_owner.clone();
-    let repo_name = pr.host_repo.clone();
-    let number = pr.number;
+    let host_base = current.host_base.clone();
+    let owner = current.host_owner.clone();
+    let repo_name = current.host_repo.clone();
+    let number = current.number;
     let head_sha_for_merge = head_sha.clone();
+    let merge_runner = merge_runner.clone();
     let merge_result = tokio::task::spawn_blocking(move || {
-        run_gh_merge(&host_base, &owner, &repo_name, number, &head_sha_for_merge)
+        merge_runner(&host_base, &owner, &repo_name, number, &head_sha_for_merge)
     })
     .await
     .unwrap_or_else(|join_err| Err(format!("internal: merge task join error: {join_err}")));
@@ -537,11 +606,45 @@ async fn maybe_merge_one(
     // Track consecutive failures per (row, head_sha) for step 3's backoff.
     let attempts_exhausted = match &merge_result {
         Ok(()) => {
-            backoff.record_success(pr.id);
+            backoff.record_success(current.id);
             false
         }
-        Err(_) => backoff.record_failure(pr.id, &head_sha),
+        Err(_) => backoff.record_failure(current.id, &head_sha),
     };
+
+    Some(MergeExecution {
+        pr: current,
+        head_sha,
+        merge_result,
+        attempts_exhausted,
+    })
+}
+
+/// Gate one row twice (pre-filter, then final authorization against fresh
+/// state), execute under the lifecycle fence, then confirm and record it.
+async fn maybe_merge_one(
+    app: &AppHandle,
+    db: &Db,
+    bus: &crate::bus::BusRegistry,
+    pr: pull_request::Model,
+    backoff: &MergeBackoffState,
+    resolver: HostResolver,
+    merge_runner: &MergeRunner,
+) {
+    let Some(host_kind) = HostKind::parse(&pr.host_kind) else {
+        return;
+    };
+    let Some(execution) =
+        evaluate_and_execute_merge(db, bus, pr, backoff, resolver, host_kind, merge_runner).await
+    else {
+        return;
+    };
+    let MergeExecution {
+        pr,
+        head_sha: _head_sha,
+        merge_result,
+        attempts_exhausted,
+    } = execution;
 
     // Step 7: regardless of outcome, one more fresh read (same injected
     // resolver as step 4) + persist + marker.
@@ -802,6 +905,45 @@ mod tests {
     use super::*;
     use crate::host::{CiStatus, ConflictStatus, MergeReadiness, PrHost, PrSnapshot, ReviewStatus};
     use sea_orm::ConnectionTrait;
+
+    type EvaluationProbe = (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+
+    fn evaluation_probe_map(
+    ) -> &'static std::sync::Mutex<std::collections::HashMap<i32, EvaluationProbe>> {
+        static PROBES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<i32, EvaluationProbe>>,
+        > = std::sync::OnceLock::new();
+        PROBES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn arm_after_automerge_evaluation_probe(
+        pr_id: i32,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        evaluation_probe_map()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(pr_id, (reached_tx, resume_rx));
+        (reached_rx, resume_tx)
+    }
+
+    pub(super) async fn after_automerge_evaluation_probe(pr_id: i32) {
+        let probe = evaluation_probe_map()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&pr_id);
+        if let Some((reached_tx, resume_rx)) = probe {
+            let _ = reached_tx.send(());
+            let _ = resume_rx.await;
+        }
+    }
 
     // --- run_gh_merge: guards that must fire before any process spawns ----
 
@@ -1115,11 +1257,21 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = repo::create_session(
+            db,
+            direction.id,
+            repo_ref.id,
+            "codex",
+            "/tmp/widgets-pr-source",
+        )
+        .await
+        .unwrap();
         let pr = repo::register_pull_request(
             db,
             thread.id,
             direction.id,
             repo_ref.id,
+            Some(session.id),
             "github",
             "github.com",
             "weft-automerge-seam-test-fixture",
@@ -1193,6 +1345,80 @@ mod tests {
         let verdict = evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_fully_ready).await;
 
         assert_eq!(verdict, RowVerdict::Merge { head_sha: "fresh_sha_fully_ready".to_string() });
+    }
+
+    #[tokio::test]
+    async fn final_revalidation_invokes_the_injected_merge_runner_once_with_fresh_head() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let bus = crate::bus::BusRegistry::new();
+        let backoff = MergeBackoffState::default();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let runner: MergeRunner = std::sync::Arc::new(move |_, _, _, number, head_sha| {
+            assert_eq!(number, 42);
+            assert_eq!(head_sha, "fresh_sha_fully_ready");
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+
+        let execution = evaluate_and_execute_merge(
+            &db,
+            &bus,
+            pr,
+            &backoff,
+            resolver_fresh_fully_ready,
+            HostKind::GitHub,
+            &runner,
+        )
+        .await
+        .expect("ready row should execute");
+        assert!(execution.merge_result.is_ok());
+        assert_eq!(execution.head_sha, "fresh_sha_fully_ready");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn final_revalidation_refuses_merge_after_thread_delete_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("automerge-delete-race.sqlite");
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        let pr = seam_fixture(&db).await;
+        let thread_id = pr.thread_id;
+        let backoff = MergeBackoffState::default();
+        let bus = std::sync::Arc::new(crate::bus::BusRegistry::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let runner: MergeRunner = std::sync::Arc::new(move |_, _, _, _, _| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let (reached, resume) = arm_after_automerge_evaluation_probe(pr.id);
+        let evaluate_db = db.clone();
+        let evaluate_bus = bus.clone();
+        let evaluate = tokio::spawn(async move {
+            evaluate_and_execute_merge(
+                &evaluate_db,
+                &evaluate_bus,
+                pr,
+                &backoff,
+                resolver_fresh_fully_ready,
+                HostKind::GitHub,
+                &runner,
+            )
+            .await
+        });
+        reached.await.unwrap();
+        repo::mark_thread_deleting(&db, thread_id).await.unwrap();
+        repo::delete_thread_cascade_with_human_cancellations(&db, thread_id)
+            .await
+            .unwrap();
+        let _ = resume.send(());
+
+        assert!(evaluate.await.unwrap().is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// THE FIX (Codex review, PR #159 automerge.rs:395): between `evaluate_row`'s upstream

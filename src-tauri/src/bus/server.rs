@@ -128,80 +128,85 @@ const UNKNOWN_ENGINE: &str = "unknown";
 ///     something this file confirms the way it confirms the other two.
 /// An explicit, well-formed deny (the same shape a human's real Deny answer
 /// produces) removes the ambiguity for all three regardless of exactly how
-/// each one's undocumented/unverified empty-response path behaves. Identity
-/// (thread/dir) comes from the URL path, not the body.
+/// each one's undocumented/unverified empty-response path behaves. Thread and
+/// direction come from the URL path, and a worker's exact session comes from
+/// Weft's injected query parameter — never from the body.
 async fn handle_ask(
     Path((thread, dir)): Path<(i32, String)>,
     Query(q): Query<HashMap<String, String>>,
     State(asks): State<AskRegistry>,
+    State(bus): State<BusRegistry>,
     State(db): State<Db>,
     Json(req): Json<Value>,
 ) -> Response {
     let tool = q.get("tool").map(|s| s.as_str()).unwrap_or(UNKNOWN_ENGINE);
+    let source_session_id = q.get("session_id").map(String::as_str);
     let tool_name = req
         .get("tool_name")
         .and_then(|v| v.as_str())
         .unwrap_or("tool");
 
-    // weft's OWN injected MCP tools are never permission-gated: the human
-    // governs them through weft's surfaces (Needs-you, the board, the
-    // direction-confirm flow), so a per-call prompt to read the task or post
-    // to the bus is pure interruption. Short-circuit before summarizing — but
-    // ONLY when weft actually injected this server for THIS session. A repo/user
-    // MCP server that reused a weft server name (e.g. its own `weft_planner`) in
-    // a session where weft never injected it must still surface the card.
-    if is_weft_internal_tool(tool_name) {
-        if let Some((server, _)) = split_internal_tool(tool_name) {
-            if session_injected(&db, thread, &dir, server).await {
-                return hook_decision("allow", "weft-internal tool (auto-approved)");
+    let (id, rx) = {
+        // Ask admission shares the exact same per-thread lifecycle gate and
+        // durable identity proof as bus tool calls. Keep the gate only through
+        // the auto verdict or atomic AskRegistry registration; the one-hour
+        // human wait below must never block deletion or an answer path.
+        let lifecycle_gate = bus.thread_lifecycle_gate(thread);
+        let _lifecycle = lifecycle_gate.lock().await;
+        let identity = match admit_bus_identity(&db, thread, &dir, source_session_id).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                return hook_decision(
+                    "deny",
+                    &format!("Invalid or deleted weft session — denied: {error}"),
+                );
             }
-        }
-    }
+        };
 
-    let (summary, detail, risk, action_key) = summarize(tool_name, req.get("tool_input"));
-
-    // A read-only BUILTIN of the engine itself (claude's Read/Grep/Glob, …) is
-    // waved through, so a turn that reads twenty files doesn't cost twenty
-    // human clicks (issue #96's 23-minute freeze). Closed allowlist, and every
-    // condition below can only SUBTRACT approvals — see `bus::builtin_allow`
-    // for why this lives here instead of in the hook's matcher.
-    //
-    // Distinct from issue #103's read-only grant below, and deliberately
-    // narrower: that one is a HUMAN's explicit "trust every read-only action in
-    // this session/issue" and then covers the whole `ReadOnly` tier (a `pwd`
-    // Bash, an MCP read). This is the zero-configuration default for a handful
-    // of named builtins, so it also demands containment — which is why it can
-    // apply without anyone having granted anything.
-    match builtin_allow::safe_scope(tool, tool_name) {
-        // Nothing to point anywhere: the name alone settles it, so this needs
-        // neither the risk verdict nor the session's directories.
-        Some(builtin_allow::SafeScope::NoTarget) => {
-            return hook_decision("allow", "read-only builtin (auto-approved)");
-        }
-        // The arguments decide. BOTH the independent risk verdict (which is
-        // what still catches a credential-shaped file living INSIDE the
-        // worktree, e.g. its own `.env`) and containment in the session's own
-        // directories must agree before skipping the human.
-        Some(builtin_allow::SafeScope::ReadOnlyPath) => {
-            if risk == crate::ask::RiskLevel::ReadOnly {
-                let roots = session_roots(&db, thread, &dir).await;
-                if builtin_allow::paths_contained(req.get("tool_input"), &roots) {
-                    return hook_decision("allow", "read-only builtin (auto-approved)");
+        // weft's OWN injected MCP tools are never permission-gated: the human
+        // governs them through weft's surfaces (Needs-you, the board, the
+        // direction-confirm flow), so a per-call prompt to read the task or post
+        // to the bus is pure interruption. Short-circuit before summarizing — but
+        // ONLY when weft actually injected this server for THIS exact session. A
+        // repo/user MCP server that reused a weft server name must still surface.
+        if is_weft_internal_tool(tool_name) {
+            if let Some((server, _)) = split_internal_tool(tool_name) {
+                if session_injected(&db, thread, &dir, identity, server).await {
+                    return hook_decision("allow", "weft-internal tool (auto-approved)");
                 }
             }
         }
-        None => {}
-    }
 
-    // A standing rule (full access / always-allow / issue #103's read-only
-    // batch-or-issue grant) decides without surfacing. Matches on the
-    // canonical action_key, NOT the (possibly lossy) summary; `risk` gates the
-    // read-only grants (never widens Full/Always, which ignore it entirely).
-    if asks.auto_decision(thread, &dir, risk, &action_key) == Some(Decision::Allow) {
-        return hook_decision("allow", "Auto-approved by a weft rule");
-    }
+        let (summary, detail, risk, action_key) = summarize(tool_name, req.get("tool_input"));
 
-    let (id, rx) = asks.request(thread, &dir, tool, &summary, &detail, risk, &action_key);
+        // A read-only BUILTIN of the engine itself (claude's Read/Grep/Glob, …)
+        // is waved through, so a turn that reads twenty files doesn't cost
+        // twenty human clicks. Identity and deletion markers have already been
+        // proven under the lifecycle gate above, before this branch can allow.
+        match builtin_allow::safe_scope(tool, tool_name) {
+            Some(builtin_allow::SafeScope::NoTarget) => {
+                return hook_decision("allow", "read-only builtin (auto-approved)");
+            }
+            Some(builtin_allow::SafeScope::ReadOnlyPath) => {
+                if risk == crate::ask::RiskLevel::ReadOnly {
+                    let roots = session_roots(&db, thread, identity).await;
+                    if builtin_allow::paths_contained(req.get("tool_input"), &roots) {
+                        return hook_decision("allow", "read-only builtin (auto-approved)");
+                    }
+                }
+            }
+            None => {}
+        }
+
+        // A standing rule (full access / always-allow / issue #103's read-only
+        // batch-or-issue grant) decides without surfacing. Matches on the exact
+        // action key, but only after the exact live identity proof above.
+        if asks.auto_decision(thread, &dir, risk, &action_key) == Some(Decision::Allow) {
+            return hook_decision("allow", "Auto-approved by a weft rule");
+        }
+
+        asks.request(thread, &dir, tool, &summary, &detail, risk, &action_key)
+    };
 
     match tokio::time::timeout(ASK_WAIT, rx).await {
         Ok(Ok(decision)) => {
@@ -217,7 +222,10 @@ async fn handle_ask(
         // function's doc for why an empty body is the wrong fallback here.
         _ => {
             asks.cancel(id);
-            hook_decision("deny", "No answer in time — denied by default (weft ask bridge)")
+            hook_decision(
+                "deny",
+                "No answer in time — denied by default (weft ask bridge)",
+            )
         }
     }
 }
@@ -293,8 +301,7 @@ fn split_internal_tool(tool_name: &str) -> Option<(&str, &str)> {
 /// skips the permission card for these; everything else (including a weft server
 /// name paired with an unknown tool, and `answer_permission`) surfaces normally.
 fn is_weft_internal_tool(tool_name: &str) -> bool {
-    split_internal_tool(tool_name)
-        .is_some_and(|pair| AUTO_APPROVED_INTERNAL_TOOLS.contains(&pair))
+    split_internal_tool(tool_name).is_some_and(|pair| AUTO_APPROVED_INTERNAL_TOOLS.contains(&pair))
 }
 
 /// The weft servers a lead-family session injects, by thread `kind`. MIRRORS the
@@ -311,30 +318,29 @@ fn session_servers_for_kind(kind: &str) -> &'static [&'static str] {
     }
 }
 
-/// Whether weft injected `server` for the session identified by (thread, dir).
-/// A worker lane (its ask `dir` is a direction id, not `LEAD`) injects only the
-/// bus. The lead family keys off the thread kind and FAILS CLOSED: if the thread
-/// can't be resolved — a deleted thread, a DB error, an engine/hook outliving its
-/// thread — nothing is auto-approved and the tool surfaces the Needs-you card.
-async fn session_injected(db: &Db, thread: i32, dir: &str, server: &str) -> bool {
-    if dir != crate::bus::LEAD {
-        // Worker lane: only the bus, and only when `dir` is a REAL direction of
-        // this thread. Fail closed for a stale/deleted direction or a forged
-        // route (an engine/hook outliving its direction, a leftover .weft-ask).
-        if server != "weft_bus" {
-            return false;
+/// Whether weft injected `server` for the already-admitted exact identity. A
+/// worker lane injects only the bus; the lead family keys off the thread kind
+/// and fails closed if that row can no longer be resolved.
+async fn session_injected(
+    db: &Db,
+    thread: i32,
+    dir: &str,
+    identity: AdmittedBusIdentity,
+    server: &str,
+) -> bool {
+    match identity {
+        AdmittedBusIdentity::Worker { direction_id, .. } => {
+            server == "weft_bus" && dir == direction_id.to_string()
         }
-        let Ok(direction_id) = dir.parse::<i32>() else {
-            return false;
-        };
-        return matches!(
-            crate::store::repo::get_direction(db, direction_id).await,
-            Ok(Some(d)) if d.thread_id == thread
-        );
-    }
-    match crate::store::repo::get_thread(db, thread).await {
-        Ok(Some(t)) => session_servers_for_kind(&t.kind).contains(&server),
-        _ => false,
+        AdmittedBusIdentity::Lead => {
+            if dir != crate::bus::LEAD {
+                return false;
+            }
+            match crate::store::repo::get_thread(db, thread).await {
+                Ok(Some(thread)) => session_servers_for_kind(&thread.kind).contains(&server),
+                _ => false,
+            }
+        }
     }
 }
 
@@ -342,12 +348,10 @@ async fn session_injected(db: &Db, thread: i32, dir: &str, server: &str) -> bool
 /// directory and additional directories" that claude's own permission model
 /// scopes `Read`/`Grep`/`Glob` to, expressed in weft's terms.
 ///
-/// Derived from weft's OWN database, never from the hook payload: identity is
-/// the (thread, dir) pair in the URL path, and the paths come from the rows
-/// weft wrote when it created the session. A payload field (`cwd`) or an
-/// injected route file would both be things a repo could plant — see the
-/// planted-`.weft-codex-ask-url` defense in `codex::ensure_codex_hook_in` for
-/// the same threat.
+/// Derived from weft's OWN database and the already-admitted URL identity,
+/// never from the hook payload. A payload field (`cwd`) or an injected route
+/// file would both be things a repo could plant — see the planted
+/// `.weft-codex-ask-url` defense in `codex::ensure_codex_hook_in`.
 ///
 /// - Worker lane (`dir` is a direction id): that direction's worktrees, one per
 ///   repo it writes. NOT the canonical repos those worktrees came from —
@@ -364,24 +368,21 @@ async fn session_injected(db: &Db, thread: i32, dir: &str, server: &str) -> bool
 /// per path). A root that can't be canonicalized — deleted worktree, repo moved
 /// out from under weft — is DROPPED rather than compared as a raw string.
 ///
-/// FAILS CLOSED at every step: a DB error, a deleted thread/direction, or a
-/// direction belonging to a different thread all yield an empty (or narrowed)
-/// list, and `builtin_allow::paths_contained` then refuses every absolute path,
-/// so the call surfaces the Needs-you card exactly as it does today.
-async fn session_roots(db: &Db, thread: i32, dir: &str) -> Vec<std::path::PathBuf> {
+/// FAILS CLOSED at every step: a DB error yields an empty (or narrowed) list,
+/// and `builtin_allow::paths_contained` then refuses every absolute path.
+async fn session_roots(
+    db: &Db,
+    thread: i32,
+    identity: AdmittedBusIdentity,
+) -> Vec<std::path::PathBuf> {
     let mut roots: Vec<std::path::PathBuf> = Vec::new();
-    if dir != crate::bus::LEAD {
-        let Ok(direction_id) = dir.parse::<i32>() else {
-            return roots;
-        };
-        // Same ownership check `session_injected` makes: a direction id that
-        // isn't THIS thread's is a stale or forged route, not a session.
-        match crate::store::repo::get_direction(db, direction_id).await {
-            Ok(Some(d)) if d.thread_id == thread => {}
-            _ => return roots,
-        }
+    if let AdmittedBusIdentity::Worker { direction_id, .. } = identity {
         if let Ok(worktrees) = crate::store::repo::list_worktrees(db, Some(direction_id)).await {
-            roots.extend(worktrees.into_iter().map(|w| std::path::PathBuf::from(w.path)));
+            roots.extend(
+                worktrees
+                    .into_iter()
+                    .map(|w| std::path::PathBuf::from(w.path)),
+            );
         }
         return canonicalized(roots);
     }
@@ -512,11 +513,139 @@ fn sse(value: Value) -> Response {
         .into_response()
 }
 
-// `thread`/`dir` come from the URL path, so an agent can't spoof its identity
-// via tool arguments; it does NOT defend against a local process forging the
-// path (no auth — local-first tradeoff).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmittedBusIdentity {
+    Lead,
+    Worker {
+        direction_id: i32,
+        session_id: i32,
+        repo_id: i32,
+    },
+}
+
+impl AdmittedBusIdentity {
+    fn direction_id(self) -> i32 {
+        match self {
+            Self::Lead => 0,
+            Self::Worker { direction_id, .. } => direction_id,
+        }
+    }
+
+    fn session_id(self) -> Option<i32> {
+        match self {
+            Self::Lead => None,
+            Self::Worker { session_id, .. } => Some(session_id),
+        }
+    }
+
+    fn repo_id(self) -> i32 {
+        match self {
+            Self::Lead => 0,
+            Self::Worker { repo_id, .. } => repo_id,
+        }
+    }
+}
+
+/// Resolve the exact identity baked into one injected bus URL and prove its
+/// complete durable parent chain is still live. Callers must hold this
+/// thread's [`BusRegistry::thread_lifecycle_gate`] from before this validation
+/// through the complete admitted bus-tool or Ask-Bridge registration.
+///
+/// A direction may have one session per repository. Consequently the session
+/// repo is intentionally allowed to differ from the direction's primary repo,
+/// but both repos must still exist in the thread's workspace and both deletion
+/// markers must be clear. This is what makes a deleted secondary session inert
+/// even while its direction and primary repo survive.
+async fn admit_bus_identity(
+    db: &Db,
+    thread_id: i32,
+    direction_scope: &str,
+    source_session_id: Option<&str>,
+) -> anyhow::Result<AdmittedBusIdentity> {
+    let thread = crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    if direction_scope == crate::bus::LEAD {
+        if source_session_id.is_some() {
+            anyhow::bail!("lead bus identity cannot carry a worker session");
+        }
+        return Ok(AdmittedBusIdentity::Lead);
+    }
+
+    let direction_id = direction_scope
+        .parse::<i32>()
+        .map_err(|_| anyhow::anyhow!("invalid direction scope '{direction_scope}'"))?;
+    let raw_session_id = source_session_id.ok_or_else(|| {
+        anyhow::anyhow!("worker bus identity is missing its exact source session")
+    })?;
+    let session_id = raw_session_id
+        .parse::<i32>()
+        .map_err(|_| anyhow::anyhow!("invalid session id '{raw_session_id}'"))?;
+
+    let direction = crate::store::repo::get_direction(db, direction_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
+    if direction.thread_id != thread_id {
+        anyhow::bail!("direction {direction_id} does not belong to thread {thread_id}");
+    }
+    let session = crate::store::repo::get_session(db, session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+    if session.direction_id != direction_id {
+        anyhow::bail!("session {session_id} does not belong to direction {direction_id}");
+    }
+
+    let direction_repo =
+        crate::store::repo::ensure_repo_workspace_accepts_writes(db, direction.repo_id).await?;
+    if direction_repo.workspace_id != thread.workspace_id {
+        anyhow::bail!(
+            "direction {direction_id} repo {} does not belong to thread {thread_id}'s workspace",
+            direction_repo.id
+        );
+    }
+    let session_repo =
+        crate::store::repo::ensure_repo_workspace_accepts_writes(db, session.repo_id).await?;
+    if session_repo.workspace_id != thread.workspace_id {
+        anyhow::bail!(
+            "session {session_id} repo {} does not belong to thread {thread_id}'s workspace",
+            session_repo.id
+        );
+    }
+
+    Ok(AdmittedBusIdentity::Worker {
+        direction_id,
+        session_id,
+        repo_id: session.repo_id,
+    })
+}
+
+async fn initialize_bus_session(
+    db: &Db,
+    bus: &BusRegistry,
+    thread_id: i32,
+    direction_scope: &str,
+    source_session_id: Option<&str>,
+) -> Value {
+    let lifecycle_gate = bus.thread_lifecycle_gate(thread_id);
+    let _lifecycle = lifecycle_gate.lock().await;
+    if let Err(error) = admit_bus_identity(db, thread_id, direction_scope, source_session_id).await
+    {
+        return text_result(format!("error: {error}"));
+    }
+    bus.join(thread_id, direction_scope);
+    json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": { "tools": { "listChanged": false } },
+        "serverInfo": { "name": "weft_bus", "version": "1.0.0" }
+    })
+}
+
+// `thread`/`dir` and the optional exact worker `session_id` come from Weft's
+// injected URL, so tool arguments cannot spoof identity. The session is still
+// checked against the path's direction/thread before any bus read or effect.
+// This does NOT defend against a local process forging the URL itself (no auth
+// — local-first tradeoff).
 async fn handle(
     Path((thread, dir)): Path<(i32, String)>,
+    Query(query): Query<HashMap<String, String>>,
     State(reg): State<BusRegistry>,
     State(db): State<Db>,
     Json(req): Json<Value>,
@@ -527,14 +656,10 @@ async fn handle(
         None => return StatusCode::ACCEPTED.into_response(),
     };
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    reg.join(thread, &dir);
+    let source_session_id = query.get("session_id").map(String::as_str);
 
     let result: Value = match method {
-        "initialize" => json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": "weft_bus", "version": "1.0.0" }
-        }),
+        "initialize" => initialize_bus_session(&db, &reg, thread, &dir, source_session_id).await,
         "tools/list" => json!({ "tools": tool_specs() }),
         "tools/call" => {
             let name = req
@@ -545,21 +670,7 @@ async fn handle(
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            // set_task_status and register_pr write the DB (the task is
-            // `dir`); the rest are in-memory bus ops.
-            if name == "set_task_status" {
-                let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                set_task_status_tool(&db, &dir, status).await
-            } else if name == "register_pr" {
-                let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                register_pr_tool(&db, thread, &dir, url, title).await
-            } else if name == "ask_human" {
-                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                ask_human_tool(&db, &reg, thread, &dir, text).await
-            } else {
-                call_tool(&db, &reg, thread, &dir, name, &args).await
-            }
+            dispatch_bus_tool_call(&db, &reg, thread, &dir, source_session_id, name, &args).await
         }
         _ => json!({}),
     };
@@ -567,11 +678,53 @@ async fn handle(
     sse(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
+/// Single admission/serialization point for every bus tool. The same
+/// per-thread lifecycle guard spans parent-chain validation, membership, all
+/// in-memory reads/effects, and durable writes. Deletion installs its marker
+/// before waiting for this guard, so a stale engine waiting behind a delete
+/// always observes the fence before it can touch the surviving bus.
+async fn dispatch_bus_tool_call(
+    db: &Db,
+    bus: &BusRegistry,
+    thread_id: i32,
+    direction_scope: &str,
+    source_session_id: Option<&str>,
+    name: &str,
+    args: &Value,
+) -> Value {
+    let lifecycle_gate = bus.thread_lifecycle_gate(thread_id);
+    let _lifecycle = lifecycle_gate.lock().await;
+    let identity = match admit_bus_identity(db, thread_id, direction_scope, source_session_id).await
+    {
+        Ok(identity) => identity,
+        Err(error) => return text_result(format!("error: {error}")),
+    };
+
+    bus.join(thread_id, direction_scope);
+    match name {
+        "set_task_status" => {
+            let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            set_task_status_tool(db, identity, status).await
+        }
+        "register_pr" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            register_pr_tool(db, thread_id, identity, url, title).await
+        }
+        "ask_human" => {
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            ask_human_tool(db, bus, thread_id, direction_scope, identity, text).await
+        }
+        _ => call_tool(db, bus, thread_id, direction_scope, name, args).await,
+    }
+}
+
 async fn ask_human_tool(
     db: &Db,
     bus: &BusRegistry,
     thread_id: i32,
     direction_scope: &str,
+    identity: AdmittedBusIdentity,
     text: &str,
 ) -> Value {
     let thread = match crate::store::repo::get_thread(db, thread_id).await {
@@ -579,26 +732,21 @@ async fn ask_human_tool(
         Ok(None) => return text_result(format!("error: thread {thread_id} not found")),
         Err(err) => return text_result(format!("error: {err}")),
     };
-    let direction_id = direction_scope.parse::<i32>().unwrap_or(0);
-    let source = match crate::store::repo::latest_human_request_source(
+    let direction_id = identity.direction_id();
+    let (source_session_id, source) = match crate::store::repo::human_request_source(
         db,
         thread_id,
-        direction_id,
+        direction_scope,
+        identity.session_id(),
     )
     .await
     {
         Ok(source) => source,
         Err(error) => return text_result(format!("error: {error}")),
     };
-    let (turn_id, source_message_id, source_session_id) = source
-        .map(|message| {
-            (
-                message.turn_id,
-                message.id,
-                message.session_id.unwrap_or_default(),
-            )
-        })
-        .unwrap_or((0, 0, 0));
+    let (turn_id, source_message_id) = source
+        .map(|message| (message.turn_id, message.id))
+        .unwrap_or((0, 0));
     match crate::store::repo::create_human_request(
         db,
         thread.workspace_id,
@@ -622,7 +770,9 @@ async fn ask_human_tool(
                 Ok(None) => false,
                 Err(error) => {
                     bus.cancel_open_asks_by_id(thread_id, id);
-                    return text_result(format!("error: could not verify durable question: {error}"));
+                    return text_result(format!(
+                        "error: could not verify durable question: {error}"
+                    ));
                 }
             };
             if !still_open {
@@ -642,19 +792,21 @@ async fn ask_human_tool(
 
 /// Bus tool: the agent sets its own task's lifecycle status. `dir` is the
 /// direction id from the URL path, so the agent can't move another task.
-async fn set_task_status_tool(db: &Db, dir: &str, status: &str) -> Value {
+async fn set_task_status_tool(db: &Db, identity: AdmittedBusIdentity, status: &str) -> Value {
     let allowed = ["queued", "planning", "working", "review", "done"];
     if !allowed.contains(&status) {
         return text_result(format!(
             "invalid status '{status}'; use one of: queued, planning, working, review, done"
         ));
     }
-    match dir.parse::<i32>() {
-        Ok(id) => match crate::store::repo::set_direction_status(db, id, status).await {
-            Ok(()) => text_result(format!("status set to {status}")),
-            Err(e) => text_result(format!("error: {e}")),
-        },
-        Err(_) => text_result("this session has no task to update".into()),
+    match identity {
+        AdmittedBusIdentity::Worker { direction_id, .. } => {
+            match crate::store::repo::set_direction_status(db, direction_id, status).await {
+                Ok(()) => text_result(format!("status set to {status}")),
+                Err(e) => text_result(format!("error: {e}")),
+            }
+        }
+        AdmittedBusIdentity::Lead => text_result("this session has no task to update".into()),
     }
 }
 
@@ -668,7 +820,13 @@ async fn set_task_status_tool(db: &Db, dir: &str, status: &str) -> Value {
 /// (`host::monitor::spawn_pr_watch`) picks up newly-registered rows on its
 /// own next sweep — this tool only ever writes the DB row, never calls a host
 /// API itself.
-async fn register_pr_tool(db: &Db, thread: i32, dir: &str, url: &str, title: &str) -> Value {
+async fn register_pr_tool(
+    db: &Db,
+    thread: i32,
+    identity: AdmittedBusIdentity,
+    url: &str,
+    title: &str,
+) -> Value {
     let Some(parts) = crate::host::parse_pr_url(url) else {
         return text_result(format!(
             "could not parse a PR/MR number and repo from '{url}' — expected a GitHub pull request URL (…/pull/N) or a GitLab merge request URL (…/-/merge_requests/N)"
@@ -684,16 +842,12 @@ async fn register_pr_tool(db: &Db, thread: i32, dir: &str, url: &str, title: &st
             parts.host_kind.native_noun()
         ));
     }
-    let direction_id = dir.parse::<i32>().unwrap_or(0);
-    let repo_id = match crate::store::repo::get_direction(db, direction_id).await {
-        Ok(Some(d)) => d.repo_id,
-        _ => 0,
-    };
     match crate::store::repo::register_pull_request(
         db,
         thread,
-        direction_id,
-        repo_id,
+        identity.direction_id(),
+        identity.repo_id(),
+        identity.session_id(),
         parts.host_kind.as_str(),
         &parts.host_base,
         &parts.owner,
@@ -801,13 +955,8 @@ async fn call_tool(
             if request_ids.is_empty() {
                 return text_result("error: request_ids required".into());
             }
-            match crate::store::repo::mark_human_answers_delivered(
-                db,
-                thread,
-                me,
-                &request_ids,
-            )
-            .await
+            match crate::store::repo::mark_human_answers_delivered(db, thread, me, &request_ids)
+                .await
             {
                 Ok(acknowledged) => {
                     let durable_ids: Vec<u64> = request_ids
@@ -993,9 +1142,11 @@ async fn reanalyze_after_register(
             .iter()
             .any(|r| std::path::Path::new(&r.local_git_path).exists())
     {
-        return Ok("Could not re-analyze: every repository's checkout is missing on disk \
+        return Ok(
+            "Could not re-analyze: every repository's checkout is missing on disk \
                    (moved or deleted). Restore the repos and try again."
-            .to_string());
+                .to_string(),
+        );
     }
     // Clicking 中止 interrupts the lead turn and calls `cancel_analysis(thread)`, which
     // trips the token; `reanalyze_workspace` checks it at safe points (between repos,
@@ -1072,8 +1223,14 @@ async fn curator_map_json(db: &Db, thread: i32) -> anyhow::Result<String> {
 async fn calibrate_edges_tool(db: &Db, thread: i32, args: &Value) -> Value {
     // i32::try_from (not a lossy `as i32`): a huge id like 4294967297 must NOT
     // wrap to a valid repo id and slip past the workspace membership check.
-    let from = args.get("from").and_then(|v| v.as_i64()).and_then(|n| i32::try_from(n).ok());
-    let to = args.get("to").and_then(|v| v.as_i64()).and_then(|n| i32::try_from(n).ok());
+    let from = args
+        .get("from")
+        .and_then(|v| v.as_i64())
+        .and_then(|n| i32::try_from(n).ok());
+    let to = args
+        .get("to")
+        .and_then(|v| v.as_i64())
+        .and_then(|n| i32::try_from(n).ok());
     let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     let via = args.get("via").and_then(|v| v.as_str()).unwrap_or("");
     let (Some(from), Some(to)) = (from, to) else {
@@ -1111,9 +1268,7 @@ async fn calibrate_edges_tool(db: &Db, thread: i32, args: &Value) -> Value {
         .map(|r| r.id)
         .collect();
     if !ws_ids.contains(&from) || !ws_ids.contains(&to) {
-        return text_result(
-            "from/to must be repo ids in this workspace (use get_repo_map)".into(),
-        );
+        return text_result("from/to must be repo ids in this workspace (use get_repo_map)".into());
     }
     match crate::store::repo::calibrate_repo_relation(db, from, to, kind, via, action).await {
         Ok(()) => {
@@ -1138,7 +1293,10 @@ async fn calibrate_edges_tool(db: &Db, thread: i32, args: &Value) -> Value {
 async fn set_classification_tool(db: &Db, thread: i32, args: &Value) -> Value {
     // i32::try_from (not lossy `as i32`): a huge id must NOT wrap to a valid repo id
     // and slip past the workspace membership check.
-    let repo = args.get("repo").and_then(|v| v.as_i64()).and_then(|n| i32::try_from(n).ok());
+    let repo = args
+        .get("repo")
+        .and_then(|v| v.as_i64())
+        .and_then(|n| i32::try_from(n).ok());
     let Some(repo) = repo else {
         return text_result("repo must be a valid repo id from get_repo_map".into());
     };
@@ -1257,7 +1415,10 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
 /// and count==0 as the settled "已撤回" line. Shared by propose + withdraw.
 async fn emit_proposal_row(db: &Db, thread: i32, rationale: &str, count: usize) {
     let content = serde_json::json!({ "rationale": rationale, "count": count }).to_string();
-    let turn = crate::store::repo::next_turn_id(db, thread).await.unwrap_or(1) - 1;
+    let turn = crate::store::repo::next_turn_id(db, thread)
+        .await
+        .unwrap_or(1)
+        - 1;
     if let Ok(m) = crate::store::repo::insert_lead_message(
         db,
         thread,
@@ -1476,7 +1637,7 @@ async fn restore_durable_human_requests(db: &Db, bus: &BusRegistry) -> anyhow::R
 mod tests {
     use super::{
         is_weft_internal_tool, planner_specs, register_pr_tool, serve, session_servers_for_kind,
-        summarize, tool_specs, UNKNOWN_ENGINE,
+        summarize, tool_specs, AdmittedBusIdentity, UNKNOWN_ENGINE,
     };
     use crate::ask::RiskLevel;
     use crate::store::Db;
@@ -1489,8 +1650,23 @@ mod tests {
         name: &str,
         arguments: Value,
     ) -> String {
+        bus_tool_text_for_session(base, thread, direction, None, name, arguments).await
+    }
+
+    async fn bus_tool_text_for_session(
+        base: &str,
+        thread: i32,
+        direction: &str,
+        session_id: Option<i32>,
+        name: &str,
+        arguments: Value,
+    ) -> String {
+        let mut url = format!("{base}/bus/{thread}/{direction}/mcp");
+        if let Some(session_id) = session_id {
+            url.push_str(&format!("?session_id={session_id}"));
+        }
         let response = reqwest::Client::new()
-            .post(format!("{base}/bus/{thread}/{direction}/mcp"))
+            .post(url)
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -1513,10 +1689,789 @@ mod tests {
             .to_string()
     }
 
+    fn ask_url_for_session(
+        base: &str,
+        thread: i32,
+        direction: &str,
+        session_id: Option<i32>,
+        tool: &str,
+    ) -> String {
+        let mut url = format!("{base}/ask/{thread}/{direction}?tool={tool}");
+        if let Some(session_id) = session_id {
+            url.push_str(&format!("&session_id={session_id}"));
+        }
+        url
+    }
+
+    async fn ask_decision_for_session(
+        base: &str,
+        thread: i32,
+        direction: &str,
+        session_id: Option<i32>,
+        tool: &str,
+        tool_name: &str,
+        tool_input: Value,
+    ) -> Value {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(ask_url_for_session(
+                base,
+                thread,
+                direction,
+                session_id,
+                tool,
+            ))
+            .json(&json!({
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    fn assert_ask_denied(response: &Value) {
+        assert_eq!(
+            response["hookSpecificOutput"]["permissionDecision"], "deny",
+            "invalid or deleting identities must fail closed: {response}"
+        );
+    }
+
+    struct BusIdentityFixture {
+        db: Db,
+        workspace_id: i32,
+        primary_repo_id: i32,
+        secondary_repo_id: i32,
+        thread_id: i32,
+        direction_id: i32,
+        primary_session_id: i32,
+        secondary_session_id: i32,
+    }
+
+    async fn bus_identity_fixture() -> BusIdentityFixture {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "bus identity")
+            .await
+            .unwrap();
+        let primary = crate::store::repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "primary",
+            "/tmp/bus-identity-primary",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let secondary = crate::store::repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "secondary",
+            "/tmp/bus-identity-secondary",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "bus identity issue",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let direction = crate::store::repo::create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "codex",
+            primary.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let primary_session = crate::store::repo::create_session(
+            &db,
+            direction.id,
+            primary.id,
+            "codex",
+            "/tmp/bus-identity-primary-wt",
+        )
+        .await
+        .unwrap();
+        let secondary_session = crate::store::repo::create_session(
+            &db,
+            direction.id,
+            secondary.id,
+            "codex",
+            "/tmp/bus-identity-secondary-wt",
+        )
+        .await
+        .unwrap();
+        BusIdentityFixture {
+            db,
+            workspace_id: workspace.id,
+            primary_repo_id: primary.id,
+            secondary_repo_id: secondary.id,
+            thread_id: thread.id,
+            direction_id: direction.id,
+            primary_session_id: primary_session.id,
+            secondary_session_id: secondary_session.id,
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_bridge_rejects_missing_wrong_or_forged_exact_session_without_side_effects() {
+        let fixture = bus_identity_fixture().await;
+        let other_thread = crate::store::repo::create_thread(
+            &fixture.db,
+            fixture.workspace_id,
+            "other ask issue",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let other_direction = crate::store::repo::create_direction(
+            &fixture.db,
+            fixture.thread_id,
+            "other ask direction",
+            "codex",
+            fixture.primary_repo_id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let other_session = crate::store::repo::create_session(
+            &fixture.db,
+            other_direction.id,
+            fixture.primary_repo_id,
+            "codex",
+            "/tmp/bus-identity-other-ask-wt",
+        )
+        .await
+        .unwrap();
+        let bus = crate::bus::BusRegistry::new();
+        let asks = crate::ask::AskRegistry::new();
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(asks.set_notifier(notify_tx).is_empty());
+        let (persist_tx, mut persist_rx) = tokio::sync::mpsc::unbounded_channel();
+        asks.set_persist_notifier(persist_tx);
+        let (base, _handle) = serve(bus, fixture.db.clone(), asks.clone()).await.unwrap();
+        let scope = fixture.direction_id.to_string();
+
+        let missing = ask_decision_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            None,
+            "claude",
+            "TodoWrite",
+            json!({ "todos": [] }),
+        )
+        .await;
+        assert_ask_denied(&missing);
+
+        let wrong = ask_decision_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(i32::MAX),
+            "claude",
+            "TodoWrite",
+            json!({ "todos": [] }),
+        )
+        .await;
+        assert_ask_denied(&wrong);
+
+        let wrong_direction = ask_decision_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(other_session.id),
+            "claude",
+            "TodoWrite",
+            json!({ "todos": [] }),
+        )
+        .await;
+        assert_ask_denied(&wrong_direction);
+
+        let wrong_thread = ask_decision_for_session(
+            &base,
+            other_thread.id,
+            &scope,
+            Some(fixture.primary_session_id),
+            "claude",
+            "TodoWrite",
+            json!({ "todos": [] }),
+        )
+        .await;
+        assert_ask_denied(&wrong_thread);
+
+        let forged_lead = ask_decision_for_session(
+            &base,
+            fixture.thread_id,
+            crate::bus::LEAD,
+            Some(fixture.primary_session_id),
+            "claude",
+            "TodoWrite",
+            json!({ "todos": [] }),
+        )
+        .await;
+        assert_ask_denied(&forged_lead);
+
+        assert!(asks.open().is_empty());
+        assert!(asks.snapshot_grants().is_empty());
+        assert_eq!(asks.read_only_grants(), crate::ask::ReadOnlyGrants::default());
+        assert!(notify_rx.try_recv().is_err());
+        assert!(persist_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ask_bridge_preserves_valid_lead_worker_internal_builtin_and_standing_allows() {
+        use crate::ask::{FullGrant, GrantSnapshot};
+
+        let fixture = bus_identity_fixture().await;
+        let bus = crate::bus::BusRegistry::new();
+        let asks = crate::ask::AskRegistry::new();
+        let scope = fixture.direction_id.to_string();
+        let (base, _handle) = serve(bus, fixture.db, asks.clone()).await.unwrap();
+
+        let lead = ask_decision_for_session(
+            &base,
+            fixture.thread_id,
+            crate::bus::LEAD,
+            None,
+            "claude",
+            "TodoWrite",
+            json!({ "todos": [] }),
+        )
+        .await;
+        assert_eq!(lead["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(
+            lead["hookSpecificOutput"]["permissionDecisionReason"],
+            "read-only builtin (auto-approved)"
+        );
+
+        let internal = ask_decision_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(fixture.primary_session_id),
+            "claude",
+            "mcp__weft_bus__bus_inbox",
+            json!({}),
+        )
+        .await;
+        assert_eq!(internal["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(
+            internal["hookSpecificOutput"]["permissionDecisionReason"],
+            "weft-internal tool (auto-approved)"
+        );
+
+        asks.seed_grants(GrantSnapshot {
+            full: vec![FullGrant {
+                thread: fixture.thread_id,
+                dir: scope.clone(),
+            }],
+            always: vec![],
+        });
+        let standing = ask_decision_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(fixture.secondary_session_id),
+            "claude",
+            "Bash",
+            json!({ "command": "touch admitted" }),
+        )
+        .await;
+        assert_eq!(standing["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(
+            standing["hookSpecificOutput"]["permissionDecisionReason"],
+            "Auto-approved by a weft rule"
+        );
+        assert!(asks.open().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ask_bridge_checks_every_delete_marker_before_internal_builtin_or_standing_allow() {
+        use crate::ask::{FullGrant, GrantSnapshot};
+
+        let fixture = bus_identity_fixture().await;
+        let bus = crate::bus::BusRegistry::new();
+        let asks = crate::ask::AskRegistry::new();
+        let scope = fixture.direction_id.to_string();
+        let seeded = GrantSnapshot {
+            full: vec![FullGrant {
+                thread: fixture.thread_id,
+                dir: scope.clone(),
+            }],
+            always: vec![],
+        };
+        asks.seed_grants(seeded.clone());
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(asks.set_notifier(notify_tx).is_empty());
+        let (persist_tx, mut persist_rx) = tokio::sync::mpsc::unbounded_channel();
+        asks.set_persist_notifier(persist_tx);
+        let (base, _handle) = serve(bus, fixture.db.clone(), asks.clone()).await.unwrap();
+
+        crate::store::repo::mark_thread_deleting(&fixture.db, fixture.thread_id)
+            .await
+            .unwrap();
+        let internal = ask_decision_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(fixture.secondary_session_id),
+            "claude",
+            "mcp__weft_bus__bus_inbox",
+            json!({}),
+        )
+        .await;
+        assert_ask_denied(&internal);
+        crate::store::repo::clear_thread_deleting(&fixture.db, fixture.thread_id)
+            .await
+            .unwrap();
+
+        crate::store::repo::mark_workspace_deleting(&fixture.db, fixture.workspace_id)
+            .await
+            .unwrap();
+        let standing = ask_decision_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(fixture.secondary_session_id),
+            "claude",
+            "Bash",
+            json!({ "command": "touch marker" }),
+        )
+        .await;
+        assert_ask_denied(&standing);
+        crate::store::repo::clear_workspace_deleting(&fixture.db, fixture.workspace_id)
+            .await
+            .unwrap();
+
+        crate::store::repo::mark_repo_deleting(&fixture.db, fixture.primary_repo_id)
+            .await
+            .unwrap();
+        let primary_repo = ask_decision_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(fixture.secondary_session_id),
+            "claude",
+            "TodoWrite",
+            json!({ "todos": [] }),
+        )
+        .await;
+        assert_ask_denied(&primary_repo);
+        crate::store::repo::clear_repo_deleting(&fixture.db, fixture.primary_repo_id)
+            .await
+            .unwrap();
+
+        crate::store::repo::mark_repo_deleting(&fixture.db, fixture.secondary_repo_id)
+            .await
+            .unwrap();
+        let session_repo = ask_decision_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(fixture.secondary_session_id),
+            "claude",
+            "TodoWrite",
+            json!({ "todos": [] }),
+        )
+        .await;
+        assert_ask_denied(&session_repo);
+
+        assert!(asks.open().is_empty());
+        assert_eq!(asks.snapshot_grants(), seeded);
+        assert!(notify_rx.try_recv().is_err());
+        assert!(persist_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ask_registration_uses_lifecycle_gate_but_releases_it_before_waiting() {
+        let fixture = bus_identity_fixture().await;
+        let bus = crate::bus::BusRegistry::new();
+        let asks = crate::ask::AskRegistry::new();
+        let (base, _handle) = serve(bus.clone(), fixture.db, asks.clone()).await.unwrap();
+        let held = bus
+            .thread_lifecycle_gate(fixture.thread_id)
+            .lock_owned()
+            .await;
+        let url = ask_url_for_session(
+            &base,
+            fixture.thread_id,
+            &fixture.direction_id.to_string(),
+            Some(fixture.secondary_session_id),
+            "claude",
+        );
+        let request = tokio::spawn(async move {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .post(url)
+                .json(&json!({
+                    "tool_name": "Bash",
+                    "tool_input": { "command": "touch gated" },
+                }))
+                .send()
+                .await
+                .unwrap()
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            asks.open().is_empty(),
+            "permission registration must wait behind the thread lifecycle gate"
+        );
+        drop(held);
+
+        let ask_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(ask) = asks.open().first() {
+                    break ask.id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("permission ask never registered after lifecycle release");
+        let waiting_guard = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            bus.thread_lifecycle_gate(fixture.thread_id).lock_owned(),
+        )
+        .await
+        .expect("the one-hour human wait must not retain the lifecycle gate");
+        drop(waiting_guard);
+
+        asks.cancel(ask_id);
+        let response = request.await.unwrap();
+        assert!(response.status().is_success());
+        assert_ask_denied(&response.json().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn bus_dispatch_admits_live_lead_primary_and_secondary_workers() {
+        let fixture = bus_identity_fixture().await;
+        let bus = crate::bus::BusRegistry::new();
+        let (base, _handle) = serve(
+            bus.clone(),
+            fixture.db.clone(),
+            crate::ask::AskRegistry::new(),
+        )
+        .await
+        .unwrap();
+        let scope = fixture.direction_id.to_string();
+
+        let lead = bus_tool_text(
+            &base,
+            fixture.thread_id,
+            crate::bus::LEAD,
+            "bus_post",
+            json!({ "to": scope, "text": "from lead" }),
+        )
+        .await;
+        assert!(lead.contains("posted to"), "got: {lead}");
+
+        let primary = bus_tool_text_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(fixture.primary_session_id),
+            "bus_post",
+            json!({ "to": "lead", "text": "from primary" }),
+        )
+        .await;
+        assert!(primary.contains("posted to lead"), "got: {primary}");
+
+        let secondary = bus_tool_text_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(fixture.secondary_session_id),
+            "bus_post",
+            json!({ "to": "lead", "text": "from secondary" }),
+        )
+        .await;
+        assert!(secondary.contains("posted to lead"), "got: {secondary}");
+        assert_eq!(bus.log(fixture.thread_id).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn bus_dispatch_rejects_missing_or_wrong_exact_session_identity() {
+        let fixture = bus_identity_fixture().await;
+        let other_direction = crate::store::repo::create_direction(
+            &fixture.db,
+            fixture.thread_id,
+            "other task",
+            "codex",
+            fixture.primary_repo_id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let other_session = crate::store::repo::create_session(
+            &fixture.db,
+            other_direction.id,
+            fixture.primary_repo_id,
+            "codex",
+            "/tmp/bus-identity-other-wt",
+        )
+        .await
+        .unwrap();
+        let other_thread = crate::store::repo::create_thread(
+            &fixture.db,
+            fixture.workspace_id,
+            "other issue",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let bus = crate::bus::BusRegistry::new();
+        let (base, _handle) = serve(
+            bus.clone(),
+            fixture.db.clone(),
+            crate::ask::AskRegistry::new(),
+        )
+        .await
+        .unwrap();
+        let scope = fixture.direction_id.to_string();
+
+        let missing = bus_tool_text(
+            &base,
+            fixture.thread_id,
+            &scope,
+            "bus_post",
+            json!({ "to": "lead", "text": "missing" }),
+        )
+        .await;
+        assert!(
+            missing.contains("missing its exact source session"),
+            "got: {missing}"
+        );
+
+        let wrong_session = bus_tool_text_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(other_session.id),
+            "bus_post",
+            json!({ "to": "lead", "text": "wrong session" }),
+        )
+        .await;
+        assert!(
+            wrong_session.contains("does not belong to direction"),
+            "got: {wrong_session}"
+        );
+
+        let wrong_thread = bus_tool_text_for_session(
+            &base,
+            other_thread.id,
+            &scope,
+            Some(fixture.primary_session_id),
+            "bus_post",
+            json!({ "to": "lead", "text": "wrong thread" }),
+        )
+        .await;
+        assert!(
+            wrong_thread.contains("does not belong to thread"),
+            "got: {wrong_thread}"
+        );
+
+        let forged_lead = bus_tool_text_for_session(
+            &base,
+            fixture.thread_id,
+            crate::bus::LEAD,
+            Some(fixture.primary_session_id),
+            "bus_post",
+            json!({ "to": &scope, "text": "forged lead" }),
+        )
+        .await;
+        assert!(
+            forged_lead.contains("lead bus identity cannot carry a worker session"),
+            "got: {forged_lead}"
+        );
+        assert!(bus.log(fixture.thread_id).is_empty());
+        assert!(bus.log(other_thread.id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_secondary_session_cannot_post_or_wake_surviving_thread() {
+        let fixture = bus_identity_fixture().await;
+        let bus = crate::bus::BusRegistry::new();
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        bus.set_wake_sender(wake_tx);
+        let (base, _handle) = serve(
+            bus.clone(),
+            fixture.db.clone(),
+            crate::ask::AskRegistry::new(),
+        )
+        .await
+        .unwrap();
+
+        crate::store::repo::mark_repo_deleting(&fixture.db, fixture.secondary_repo_id)
+            .await
+            .unwrap();
+        crate::store::repo::delete_repo_cascade_with_human_cancellations(
+            &fixture.db,
+            fixture.secondary_repo_id,
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::store::repo::get_direction(&fixture.db, fixture.direction_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "deleting a secondary repo must leave the primary direction alive"
+        );
+
+        let rejected = bus_tool_text_for_session(
+            &base,
+            fixture.thread_id,
+            &fixture.direction_id.to_string(),
+            Some(fixture.secondary_session_id),
+            "bus_post",
+            json!({ "to": "lead", "text": "late secondary post" }),
+        )
+        .await;
+        assert!(
+            rejected.contains("session") && rejected.contains("not found"),
+            "got: {rejected}"
+        );
+        assert!(bus.log(fixture.thread_id).is_empty());
+        assert!(bus.inbox(fixture.thread_id, crate::bus::LEAD).is_empty());
+        assert!(
+            wake_rx.try_recv().is_err(),
+            "rejected post must not wake the lead"
+        );
+    }
+
+    #[tokio::test]
+    async fn bus_dispatch_rejects_thread_workspace_and_both_repo_markers() {
+        let fixture = bus_identity_fixture().await;
+        let bus = crate::bus::BusRegistry::new();
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        bus.set_wake_sender(wake_tx);
+        let (base, _handle) = serve(
+            bus.clone(),
+            fixture.db.clone(),
+            crate::ask::AskRegistry::new(),
+        )
+        .await
+        .unwrap();
+        let scope = fixture.direction_id.to_string();
+
+        crate::store::repo::mark_thread_deleting(&fixture.db, fixture.thread_id)
+            .await
+            .unwrap();
+        let thread_rejected = bus_tool_text(
+            &base,
+            fixture.thread_id,
+            crate::bus::LEAD,
+            "bus_post",
+            json!({ "to": &scope, "text": "thread marker" }),
+        )
+        .await;
+        assert!(thread_rejected.contains("thread") && thread_rejected.contains("being deleted"));
+        crate::store::repo::clear_thread_deleting(&fixture.db, fixture.thread_id)
+            .await
+            .unwrap();
+
+        crate::store::repo::mark_workspace_deleting(&fixture.db, fixture.workspace_id)
+            .await
+            .unwrap();
+        let workspace_rejected = bus_tool_text_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(fixture.primary_session_id),
+            "bus_post",
+            json!({ "to": "lead", "text": "workspace marker" }),
+        )
+        .await;
+        assert!(
+            workspace_rejected.contains("workspace")
+                && workspace_rejected.contains("being deleted")
+        );
+        crate::store::repo::clear_workspace_deleting(&fixture.db, fixture.workspace_id)
+            .await
+            .unwrap();
+
+        crate::store::repo::mark_repo_deleting(&fixture.db, fixture.primary_repo_id)
+            .await
+            .unwrap();
+        let direction_repo_rejected = bus_tool_text_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(fixture.secondary_session_id),
+            "bus_post",
+            json!({ "to": "lead", "text": "primary repo marker" }),
+        )
+        .await;
+        assert!(
+            direction_repo_rejected.contains(&format!("repo {}", fixture.primary_repo_id))
+                && direction_repo_rejected.contains("being deleted")
+        );
+        crate::store::repo::clear_repo_deleting(&fixture.db, fixture.primary_repo_id)
+            .await
+            .unwrap();
+
+        crate::store::repo::mark_repo_deleting(&fixture.db, fixture.secondary_repo_id)
+            .await
+            .unwrap();
+        let session_repo_rejected = bus_tool_text_for_session(
+            &base,
+            fixture.thread_id,
+            &scope,
+            Some(fixture.secondary_session_id),
+            "bus_post",
+            json!({ "to": "lead", "text": "secondary repo marker" }),
+        )
+        .await;
+        assert!(
+            session_repo_rejected.contains(&format!("repo {}", fixture.secondary_repo_id))
+                && session_repo_rejected.contains("being deleted")
+        );
+        crate::store::repo::clear_repo_deleting(&fixture.db, fixture.secondary_repo_id)
+            .await
+            .unwrap();
+
+        assert!(bus.log(fixture.thread_id).is_empty());
+        assert!(bus.inbox(fixture.thread_id, crate::bus::LEAD).is_empty());
+        assert!(
+            wake_rx.try_recv().is_err(),
+            "rejected calls must not emit wakes"
+        );
+    }
+
     #[tokio::test]
     async fn durable_answer_replays_until_explicit_bus_ack() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        let workspace = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
         let repo_ref = crate::store::repo::add_repo_ref(
             &db,
             workspace.id,
@@ -1528,15 +2483,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let thread = crate::store::repo::create_thread(
-            &db,
-            workspace.id,
-            "Issue",
-            "feature",
-            "codex",
-        )
-        .await
-        .unwrap();
+        let thread =
+            crate::store::repo::create_thread(&db, workspace.id, "Issue", "feature", "codex")
+                .await
+                .unwrap();
         let direction = crate::store::repo::create_direction(
             &db,
             thread.id,
@@ -1546,6 +2496,15 @@ mod tests {
             "why",
             "impl-only",
             "",
+        )
+        .await
+        .unwrap();
+        let session = crate::store::repo::create_session(
+            &db,
+            direction.id,
+            repo_ref.id,
+            "codex",
+            "/tmp/durable-answer",
         )
         .await
         .unwrap();
@@ -1581,7 +2540,15 @@ mod tests {
             .unwrap();
 
         let first: Value = serde_json::from_str(
-            &bus_tool_text(&base, thread.id, &scope, "bus_inbox", json!({})).await,
+            &bus_tool_text_for_session(
+                &base,
+                thread.id,
+                &scope,
+                Some(session.id),
+                "bus_inbox",
+                json!({}),
+            )
+            .await,
         )
         .unwrap();
         assert_eq!(first.as_array().unwrap().len(), 1);
@@ -1599,7 +2566,15 @@ mod tests {
         // No ack: even though the in-memory inbox was drained, the DB outbox
         // replays the same stable request id instead of losing the answer.
         let replay: Value = serde_json::from_str(
-            &bus_tool_text(&base, thread.id, &scope, "bus_inbox", json!({})).await,
+            &bus_tool_text_for_session(
+                &base,
+                thread.id,
+                &scope,
+                Some(session.id),
+                "bus_inbox",
+                json!({}),
+            )
+            .await,
         )
         .unwrap();
         assert_eq!(replay[0]["request_id"], request.id);
@@ -1622,10 +2597,11 @@ mod tests {
             crate::store::repo::HUMAN_REQUEST_ANSWERED
         );
 
-        let ack = bus_tool_text(
+        let ack = bus_tool_text_for_session(
             &base,
             thread.id,
             &scope,
+            Some(session.id),
             "bus_ack",
             json!({ "request_ids": [request.id] }),
         )
@@ -1640,16 +2616,25 @@ mod tests {
             crate::store::repo::HUMAN_REQUEST_RESOLVED
         );
         let empty: Value = serde_json::from_str(
-            &bus_tool_text(&base, thread.id, &scope, "bus_inbox", json!({})).await,
+            &bus_tool_text_for_session(
+                &base,
+                thread.id,
+                &scope,
+                Some(session.id),
+                "bus_inbox",
+                json!({}),
+            )
+            .await,
         )
         .unwrap();
         assert!(empty.as_array().unwrap().is_empty());
 
         // Ack is idempotent and route-scoped.
-        let duplicate = bus_tool_text(
+        let duplicate = bus_tool_text_for_session(
             &base,
             thread.id,
             &scope,
+            Some(session.id),
             "bus_ack",
             json!({ "request_ids": [request.id] }),
         )
@@ -1660,7 +2645,9 @@ mod tests {
     #[tokio::test]
     async fn ask_human_persists_the_exact_completed_source_turn() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        let workspace = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
         let repo_ref = crate::store::repo::add_repo_ref(
             &db,
             workspace.id,
@@ -1672,15 +2659,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let thread = crate::store::repo::create_thread(
-            &db,
-            workspace.id,
-            "Issue",
-            "feature",
-            "codex",
-        )
-        .await
-        .unwrap();
+        let thread =
+            crate::store::repo::create_thread(&db, workspace.id, "Issue", "feature", "codex")
+                .await
+                .unwrap();
         let direction = crate::store::repo::create_direction(
             &db,
             thread.id,
@@ -1693,15 +2675,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let session = crate::store::repo::create_session(
-            &db,
-            direction.id,
-            repo_ref.id,
-            "codex",
-            "/tmp/cwd",
-        )
-        .await
-        .unwrap();
+        let session =
+            crate::store::repo::create_session(&db, direction.id, repo_ref.id, "codex", "/tmp/cwd")
+                .await
+                .unwrap();
         let source = crate::store::repo::insert_lead_message(
             &db,
             thread.id,
@@ -1727,6 +2704,30 @@ mod tests {
         .await
         .unwrap();
 
+        // A newer session in the same direction must not steal the source
+        // identity of the older engine that owns this injected URL.
+        let newer_session = crate::store::repo::create_session(
+            &db,
+            direction.id,
+            repo_ref.id,
+            "codex",
+            "/tmp/newer-cwd",
+        )
+        .await
+        .unwrap();
+        crate::store::repo::insert_lead_message(
+            &db,
+            thread.id,
+            Some(newer_session.id),
+            9,
+            "user",
+            "text",
+            r#"{"text":"newer session turn"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+
         let scope = direction.id.to_string();
         let (base, _handle) = serve(
             crate::bus::BusRegistry::new(),
@@ -1735,10 +2736,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let result = bus_tool_text(
+        let result = bus_tool_text_for_session(
             &base,
             thread.id,
             &scope,
+            Some(session.id),
             "ask_human",
             json!({ "text": "Which API?" }),
         )
@@ -1752,6 +2754,23 @@ mod tests {
         assert_eq!(requests[0].turn_id, source.turn_id);
         assert_eq!(requests[0].source_message_id, source.id);
         assert_eq!(requests[0].source_session_id, session.id);
+
+        let missing_identity = bus_tool_text(
+            &base,
+            thread.id,
+            &scope,
+            "ask_human",
+            json!({ "text": "Should fail closed" }),
+        )
+        .await;
+        assert!(missing_identity.contains("missing its exact source session"));
+        assert_eq!(
+            crate::store::repo::list_open_human_requests(&db, workspace.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// Issue #89: a Claude/opencode multi-line command truncates `summary` to
@@ -1764,8 +2783,8 @@ mod tests {
         assert_eq!(summary, "Run: npm test"); // display: first line only
         assert_eq!(detail, "npm test\nrm -rf /"); // full command, untruncated
         assert!(action_key.contains("rm -rf /")); // match key carries the WHOLE command
-        // issue #101: an unrecognized shell command is never waved through as
-        // read-only.
+                                                  // issue #101: an unrecognized shell command is never waved through as
+                                                  // read-only.
         assert_eq!(risk, RiskLevel::Write);
 
         // A different multi-line command sharing the same first line must yield a
@@ -1821,7 +2840,10 @@ mod tests {
         let (summary_b, _db, _risk_b, key_b) = summarize("WebFetch", Some(&b));
         assert_eq!(summary_a, "WebFetch"); // lossy tool-name-only display
         assert_eq!(summary_a, summary_b, "both display as just the tool name");
-        assert_ne!(key_a, key_b, "different args must yield different action keys");
+        assert_ne!(
+            key_a, key_b,
+            "different args must yield different action keys"
+        );
         // issue #101: WebFetch is network access regardless of the URL's args.
         assert_eq!(risk_a, RiskLevel::NetworkOrCredential);
     }
@@ -1894,7 +2916,9 @@ mod tests {
         // weft's own injected tools (unambiguous claude naming) → auto-allow.
         assert!(is_weft_internal_tool("mcp__weft_planner__get_test_cases"));
         assert!(is_weft_internal_tool("mcp__weft_planner__get_task"));
-        assert!(is_weft_internal_tool("mcp__weft_planner__propose_directions"));
+        assert!(is_weft_internal_tool(
+            "mcp__weft_planner__propose_directions"
+        ));
         assert!(is_weft_internal_tool("mcp__weft_bus__bus_inbox"));
         assert!(is_weft_internal_tool("mcp__weft_bus__bus_ack"));
         assert!(is_weft_internal_tool("mcp__weft_bus__set_task_status"));
@@ -1934,8 +2958,13 @@ mod tests {
     #[tokio::test]
     async fn register_pr_tool_rejects_an_unparseable_url() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        let result = register_pr_tool(&db, 1, "5", "not a valid pr url", "").await;
-        assert!(tool_text(&result).contains("could not parse"), "got: {}", tool_text(&result));
+        let result =
+            register_pr_tool(&db, 1, AdmittedBusIdentity::Lead, "not a valid pr url", "").await;
+        assert!(
+            tool_text(&result).contains("could not parse"),
+            "got: {}",
+            tool_text(&result)
+        );
     }
 
     /// End-to-end through the exact path an agent's `register_pr` call takes:
@@ -1946,7 +2975,9 @@ mod tests {
     #[tokio::test]
     async fn register_pr_tool_tracks_a_valid_github_pr_url() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
         let repo = crate::store::repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true)
             .await
             .unwrap();
@@ -1954,20 +2985,45 @@ mod tests {
             .await
             .unwrap();
         let dir = crate::store::repo::create_direction(
-            &db, thread.id, "task", "codex", repo.id, "why", "impl-only", "",
+            &db,
+            thread.id,
+            "task",
+            "codex",
+            repo.id,
+            "why",
+            "impl-only",
+            "",
         )
         .await
         .unwrap();
-
-        let result = register_pr_tool(
-            &db,
-            thread.id,
-            &dir.id.to_string(),
-            "https://github.com/acme/widgets/pull/9",
-            "my title",
+        let session =
+            crate::store::repo::create_session(&db, dir.id, repo.id, "codex", "/tmp/register-pr")
+                .await
+                .unwrap();
+        let (base, _handle) = serve(
+            crate::bus::BusRegistry::new(),
+            db.clone(),
+            crate::ask::AskRegistry::new(),
         )
-        .await;
-        assert!(tool_text(&result).contains("Pull request #9"), "got: {}", tool_text(&result));
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bus_tool_text_for_session(
+                &base,
+                thread.id,
+                &dir.id.to_string(),
+                Some(session.id),
+                "register_pr",
+                json!({
+                    "url": "https://github.com/acme/widgets/pull/9",
+                    "title": "my title",
+                }),
+            ),
+        )
+        .await
+        .expect("register_pr dispatch must not deadlock on the lifecycle gate");
+        assert!(result.contains("Pull request #9"), "got: {result}");
 
         let tracked = crate::store::repo::find_pull_request(&db, "github", "acme", "widgets", 9)
             .await
@@ -1986,20 +3042,25 @@ mod tests {
     #[tokio::test]
     async fn register_pr_tool_from_the_lead_falls_back_to_unset_direction() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
         let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "codex")
             .await
             .unwrap();
-
         let result = register_pr_tool(
             &db,
             thread.id,
-            "lead",
+            AdmittedBusIdentity::Lead,
             "https://github.com/acme/widgets/pull/1",
             "",
         )
         .await;
-        assert!(tool_text(&result).contains("Pull request #1"), "got: {}", tool_text(&result));
+        assert!(
+            tool_text(&result).contains("Pull request #1"),
+            "got: {}",
+            tool_text(&result)
+        );
         let tracked = crate::store::repo::find_pull_request(&db, "github", "acme", "widgets", 1)
             .await
             .unwrap()
@@ -2018,28 +3079,38 @@ mod tests {
     #[tokio::test]
     async fn register_pr_tool_rejects_an_unsupported_gitlab_host_without_creating_a_row() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
         let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "codex")
             .await
             .unwrap();
-
         let result = register_pr_tool(
             &db,
             thread.id,
-            "lead",
+            AdmittedBusIdentity::Lead,
             "https://gitlab.com/my-group/my-project/-/merge_requests/12",
             "",
         )
         .await;
         let text = tool_text(&result).to_lowercase();
-        assert!(text.contains("not registered"), "must clearly say it was not registered, got: {text}");
-        assert!(text.contains("support"), "must clearly explain WHY (unsupported host), got: {text}");
+        assert!(
+            text.contains("not registered"),
+            "must clearly say it was not registered, got: {text}"
+        );
+        assert!(
+            text.contains("support"),
+            "must clearly explain WHY (unsupported host), got: {text}"
+        );
 
         let tracked =
             crate::store::repo::find_pull_request(&db, "gitlab", "my-group", "my-project", 12)
                 .await
                 .unwrap();
-        assert!(tracked.is_none(), "an unsupported host must never create a trackable (and un-clearable) row");
+        assert!(
+            tracked.is_none(),
+            "an unsupported host must never create a trackable (and un-clearable) row"
+        );
     }
 
     #[test]
@@ -2056,7 +3127,9 @@ mod tests {
     fn permission_answering_tool_still_surfaces() {
         // answer_permission would let an agent erase a pending permission ask —
         // it must NOT be auto-approved even though weft injects weft_global.
-        assert!(!is_weft_internal_tool("mcp__weft_global__answer_permission"));
+        assert!(!is_weft_internal_tool(
+            "mcp__weft_global__answer_permission"
+        ));
     }
 
     #[test]
@@ -2149,10 +3222,20 @@ mod tests {
         let root = std::fs::canonicalize(&dir).unwrap();
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        let ws = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
-        crate::store::repo::add_repo_ref(&db, ws.id, "r", &root.to_string_lossy(), "main", "", true)
+        let ws = crate::store::repo::create_workspace(&db, "ws")
             .await
             .unwrap();
+        crate::store::repo::add_repo_ref(
+            &db,
+            ws.id,
+            "r",
+            &root.to_string_lossy(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
         let thread = crate::store::repo::create_thread(&db, ws.id, "t", "feature", "codex")
             .await
             .unwrap();

@@ -26,6 +26,7 @@ import { Input } from "../components/ui/Input";
 import { PermissionConfirmationCard } from "../components/ConfirmationCard";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { useRepoActions } from "../session/useRepoActions";
+import { attentionAge } from "./attentionTime";
 
 type PromptState = {
   title: string;
@@ -360,13 +361,14 @@ function ActionCard({
   icon: ReactNode;
   title: string;
   context: string;
-  createdAt: string;
+  createdAt: string | null;
   onOpen: () => void;
   tone?: "waiting" | "danger";
   children: ReactNode;
 }) {
   const { t } = useTranslation();
   const border = tone === "danger" ? "border-danger/40" : "border-waiting/40";
+  const age = agoIso(createdAt, t);
   return (
     <div className={cn("overflow-hidden rounded-[var(--radius-lg)] border bg-waiting/10", border)}>
       <div className="flex items-center gap-2 px-3.5 pt-3 text-[12px]">
@@ -375,10 +377,12 @@ function ActionCard({
           <span className="truncate font-medium text-ink transition-colors group-hover:text-brand">{title}</span>
           {context && <span className="truncate text-ink-muted">· {context}</span>}
         </button>
-        <span className="ml-auto whitespace-nowrap text-ink-faint tabular-nums">{agoIso(createdAt, t)}</span>
-        <button type="button" onClick={onOpen} aria-label={t("needs.openDirection")} className="-mr-1 grid h-6 w-6 shrink-0 place-items-center rounded text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink">
-          <ArrowUpRight size={14} />
-        </button>
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          {age ? <span className="whitespace-nowrap text-ink-faint tabular-nums">{age}</span> : null}
+          <button type="button" onClick={onOpen} aria-label={t("needs.openDirection")} className="-mr-1 grid h-6 w-6 place-items-center rounded text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink">
+            <ArrowUpRight size={14} />
+          </button>
+        </div>
       </div>
       {children}
     </div>
@@ -406,10 +410,19 @@ function agoSeconds(ts: number, t: TFunction): string {
   return agoFromMilliseconds(ts * 1000, t);
 }
 
-function agoIso(ts: string, t: TFunction): string {
-  const numeric = Number(ts);
-  const milliseconds = Number.isFinite(numeric) ? numeric * 1000 : Date.parse(ts);
-  return agoFromMilliseconds(milliseconds, t);
+function agoIso(ts: string | null, t: TFunction): string | null {
+  const age = attentionAge(ts);
+  if (age == null) return null;
+  switch (age.kind) {
+    case "just_now":
+      return t("time.justNow");
+    case "minutes":
+      return t("time.mAgo", { n: age.value });
+    case "hours":
+      return t("time.hAgo", { n: age.value });
+    case "days":
+      return t("time.dAgo", { n: age.value });
+  }
 }
 
 function agoFromMilliseconds(ts: number, t: TFunction): string {

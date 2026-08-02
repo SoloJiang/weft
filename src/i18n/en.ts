@@ -1118,6 +1118,7 @@ export const en = {
     repoUrlPlaceholder: "https://github.com/...",
     addedToast: "Repo {{name}} added",
     failedToast: "Failed: {{message}}",
+    staleCard: "This repository action is no longer current",
     noWorkspaceToast: "Could not prepare workspace",
   },
   slashLocal: {

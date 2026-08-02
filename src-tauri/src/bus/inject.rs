@@ -9,10 +9,18 @@ use std::path::Path;
 /// subcommand, e.g. `codex -c k=v resume <id>`).
 pub struct Injection {
     pub args: Vec<String>,
+    /// Per-engine environment overrides. Used for OpenCode's documented
+    /// OPENCODE_CONFIG_CONTENT so concurrent sessions in one worktree never
+    /// overwrite a shared opencode.json bus URL.
+    pub env: Vec<(String, String)>,
 }
 
-fn mcp_url(base: &str, thread: i32, dir: &str) -> String {
-    format!("{base}/bus/{thread}/{dir}/mcp")
+fn mcp_url(base: &str, thread: i32, dir: &str, session_id: Option<i32>) -> String {
+    let url = format!("{base}/bus/{thread}/{dir}/mcp");
+    match session_id {
+        Some(session_id) => format!("{url}?session_id={session_id}"),
+        None => url,
+    }
 }
 
 fn planner_url(base: &str, thread: i32) -> String {
@@ -27,17 +35,29 @@ fn global_url(base: &str) -> String {
     format!("{base}/global/mcp")
 }
 
-fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
-    format!("{base}/ask/{thread}/{dir}?tool={tool}")
+fn ask_url(
+    base: &str,
+    thread: i32,
+    dir: &str,
+    session_id: Option<i32>,
+    tool: &str,
+) -> String {
+    let url = format!("{base}/ask/{thread}/{dir}?tool={tool}");
+    match session_id {
+        Some(session_id) => format!("{url}&session_id={session_id}"),
+        None => url,
+    }
 }
 
 /// HTTP MCP servers Weft should pass on ACP `session/new|resume` for this
-/// engine role. Workers get `weft_bus`; lead also gets planner when `dir` is
-/// the lead lane; concierge/global callers pass `include_global`.
+/// engine role. Workers get `weft_bus` with their exact persisted session id;
+/// lead also gets planner when `dir` is the lead lane; concierge/global callers
+/// pass `include_global`.
 pub fn acp_mcp_servers(
     base: &str,
     thread: i32,
     dir: &str,
+    session_id: Option<i32>,
     include_bus: bool,
     include_planner: bool,
     include_global: bool,
@@ -48,7 +68,7 @@ pub fn acp_mcp_servers(
     if include_bus {
         out.push(crate::acp::McpServerSpec {
             name: "weft_bus".into(),
-            url: mcp_url(base, thread, dir),
+            url: mcp_url(base, thread, dir, session_id),
         });
     }
     if include_planner {
@@ -73,7 +93,7 @@ pub fn acp_mcp_servers(
 }
 
 /// The shared, FAIL-CLOSED tail of both bash ask-hook scripts — claude's
-/// per-worktree `.weft-ask-hook.sh` (below) and codex's global helper
+/// per-session `.weft-ask-hook[-<session>].sh` (below) and codex's global helper
 /// (`codex.rs::ensure_codex_hook_in`, which splices it in at
 /// `__DECIDE_OR_DENY__`). Expects `$resp` = curl's stdout and `$rc` = curl's
 /// exit status, prints exactly one PreToolUse decision, and always exits 0.
@@ -137,31 +157,57 @@ fi
 printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}' "$reason"
 exit 0"#;
 
-/// Install the Ask Bridge for a session. Claude gets a worktree-local
-/// PreToolUse settings file; Codex writes only a worktree route file consumed
-/// by Weft's stable global hook in `~/.codex/config.toml`; OpenCode bridges via
-/// its server `/event` plugin. ACP tools (omp) use `session/request_permission`
-/// instead — no worktree files. Best-effort: empty args if files can't be written.
-pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Injection {
+/// Install the Ask Bridge for one exact persisted session. Worker URLs carry
+/// `session_id`; lead-family callers pass `None` explicitly. Claude's worker
+/// script/settings filenames are session-specific so a later session sharing
+/// the worktree cannot rewrite the URL an already-running process launched
+/// with. Codex writes a worktree route file consumed by Weft's stable global
+/// hook; OpenCode bridges via its server plugin. ACP tools use
+/// `session/request_permission` instead. Best-effort: empty injection on write
+/// failure.
+pub fn inject_ask_hook(
+    base: &str,
+    thread: i32,
+    dir: &str,
+    session_id: Option<i32>,
+    tool: &str,
+    cwd: &Path,
+) -> Injection {
     if crate::acp::backend_for(tool).is_some() {
-        return Injection { args: vec![] };
+        return Injection {
+            args: vec![],
+            env: vec![],
+        };
     }
     if tool == "opencode" {
-        return inject_opencode_ask_plugin(base, thread, dir, cwd);
+        return inject_opencode_ask_plugin(base, thread, dir, session_id, cwd);
     }
     if tool != "claude" && tool != "codex" {
-        return Injection { args: vec![] };
+        return Injection {
+            args: vec![],
+            env: vec![],
+        };
     }
-    let url = ask_url(base, thread, dir, tool);
+    let url = ask_url(base, thread, dir, session_id, tool);
     if tool == "codex" {
         let route = cwd.join(".weft-codex-ask-url");
         if std::fs::write(&route, &url).is_err() {
-            return Injection { args: vec![] };
+            return Injection {
+                args: vec![],
+                env: vec![],
+            };
         }
         crate::git::git_exclude(cwd, ".weft-codex-ask-url");
-        return Injection { args: vec![] };
+        return Injection {
+            args: vec![],
+            env: vec![],
+        };
     }
-    let script = cwd.join(".weft-ask-hook.sh");
+    let suffix = session_id
+        .map(|session_id| format!("-{session_id}"))
+        .unwrap_or_default();
+    let script_name = format!(".weft-ask-hook{suffix}.sh");
+    let script = cwd.join(&script_name);
     // Reads the PreToolUse JSON on stdin, asks weft, echoes weft's decision JSON —
     // or, when weft doesn't answer with one, an explicit deny (fail-closed; see
     // HOOK_DECIDE_OR_DENY). -m matches the server's ASK_WAIT: hold the call until
@@ -173,18 +219,22 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
          {HOOK_DECIDE_OR_DENY}\n"
     );
     if std::fs::write(&script, body).is_err() {
-        return Injection { args: vec![] };
+        return Injection {
+            args: vec![],
+            env: vec![],
+        };
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
     }
-    crate::git::git_exclude(cwd, ".weft-ask-hook.sh");
+    crate::git::git_exclude(cwd, &script_name);
 
     match tool {
         "claude" => {
-            let settings = cwd.join(".weft-ask.settings.json");
+            let settings_name = format!(".weft-ask{suffix}.settings.json");
+            let settings = cwd.join(&settings_name);
             // The matcher STAYS a wildcard on purpose. Narrowing it to exclude
             // safe tools would look like the fix for the over-asking storm, but
             // a matcher is a positive filter: a name it doesn't match is never
@@ -207,18 +257,28 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
             )
             .is_err()
             {
-                return Injection { args: vec![] };
+                return Injection {
+                    args: vec![],
+                    env: vec![],
+                };
             }
-            crate::git::git_exclude(cwd, ".weft-ask.settings.json");
+            crate::git::git_exclude(cwd, &settings_name);
             Injection {
                 args: vec!["--settings".into(), settings.to_string_lossy().to_string()],
+                env: vec![],
             }
         }
         // Codex now warns loudly when --dangerously-bypass-hook-trust is used.
         // Do not inject Weft's PreToolUse hook through that bypass path; Codex's
         // own sandbox/approval mode remains authoritative for exec sessions.
-        "codex" => Injection { args: vec![] },
-        _ => Injection { args: vec![] },
+        "codex" => Injection {
+            args: vec![],
+            env: vec![],
+        },
+        _ => Injection {
+            args: vec![],
+            env: vec![],
+        },
     }
 }
 
@@ -230,23 +290,85 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
 /// launch flag). The plugin source lives in `weft-ask-plugin.js` (see its
 /// header for the fail-closed contract) so the node test can run that exact
 /// file; only `__URL__` is substituted here.
-fn inject_opencode_ask_plugin(base: &str, thread: i32, dir: &str, cwd: &Path) -> Injection {
-    let url = ask_url(base, thread, dir, "opencode");
+fn inject_opencode_ask_plugin(
+    base: &str,
+    thread: i32,
+    dir: &str,
+    session_id: Option<i32>,
+    cwd: &Path,
+) -> Injection {
+    let url = ask_url(base, thread, dir, session_id, "opencode");
     let plugins = cwd.join(".opencode").join("plugins");
     if std::fs::create_dir_all(&plugins).is_err() {
-        return Injection { args: vec![] };
+        return Injection {
+            args: vec![],
+            env: vec![],
+        };
     }
     let template = include_str!("weft-ask-plugin.js");
     let body = template.replace("__URL__", &url);
     let _ = std::fs::write(plugins.join("weft-ask.js"), body);
     crate::git::git_exclude(cwd, ".opencode/plugins/weft-ask.js");
-    Injection { args: vec![] }
+    Injection {
+        args: vec![],
+        env: vec![],
+    }
 }
 
 /// Build the thread-bus injection. `cwd` is the worktree (used for the claude
-/// temp config and the opencode merge). `dir` is the direction id as a string.
-pub fn inject(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Injection {
-    inject_mcp("weft_bus", "bus", &mcp_url(base, thread, dir), tool, cwd)
+/// temp config and the opencode merge). `dir` is the direction id as a string;
+/// workers must pass their exact session id and lead-family engines pass None.
+pub fn inject(
+    base: &str,
+    thread: i32,
+    dir: &str,
+    session_id: Option<i32>,
+    tool: &str,
+    cwd: &Path,
+) -> Injection {
+    if tool == "opencode" && session_id.is_some() {
+        return inject_opencode_session_bus(&mcp_url(base, thread, dir, session_id));
+    }
+    let stem = session_id
+        .map(|session_id| format!("bus-{session_id}"))
+        .unwrap_or_else(|| "bus".to_string());
+    inject_mcp(
+        "weft_bus",
+        &stem,
+        &mcp_url(base, thread, dir, session_id),
+        tool,
+        cwd,
+    )
+}
+
+fn inject_opencode_session_bus(url: &str) -> Injection {
+    let mut root = std::env::var("OPENCODE_CONFIG_CONTENT")
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(root_obj) = root.as_object_mut() else {
+        return Injection {
+            args: vec![],
+            env: vec![],
+        };
+    };
+    let mcp = root_obj
+        .entry("mcp".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !mcp.is_object() {
+        *mcp = serde_json::json!({});
+    }
+    if let Some(mcp_obj) = mcp.as_object_mut() {
+        mcp_obj.insert(
+            "weft_bus".to_string(),
+            serde_json::json!({ "type": "remote", "url": url, "enabled": true }),
+        );
+    }
+    Injection {
+        args: vec![],
+        env: vec![("OPENCODE_CONFIG_CONTENT".to_string(), root.to_string())],
+    }
 }
 
 /// Build the planner-MCP injection for a lead session (read-only planning).
@@ -285,7 +407,10 @@ pub fn inject_global(base: &str, tool: &str, cwd: &Path) -> Injection {
 fn inject_mcp(server: &str, stem: &str, url: &str, tool: &str, cwd: &Path) -> Injection {
     if crate::acp::backend_for(tool).is_some() {
         // MCP is supplied on session/new|resume, not via launch flags/files.
-        return Injection { args: vec![] };
+        return Injection {
+            args: vec![],
+            env: vec![],
+        };
     }
     match tool {
         "claude" => {
@@ -301,16 +426,24 @@ fn inject_mcp(server: &str, stem: &str, url: &str, tool: &str, cwd: &Path) -> In
             crate::git::git_exclude(cwd, &file);
             Injection {
                 args: vec!["--mcp-config".into(), cfg.to_string_lossy().to_string()],
+                env: vec![],
             }
         }
         "codex" => Injection {
             args: vec!["-c".into(), format!("mcp_servers.{server}.url={url}")],
+            env: vec![],
         },
         "opencode" => {
             merge_opencode_config(cwd, server, url);
-            Injection { args: vec![] }
+            Injection {
+                args: vec![],
+                env: vec![],
+            }
         }
-        _ => Injection { args: vec![] },
+        _ => Injection {
+            args: vec![],
+            env: vec![],
+        },
     }
 }
 
@@ -356,23 +489,48 @@ mod tests {
     fn claude_writes_mcp_config_and_flags() {
         let dir = std::env::temp_dir().join(format!("weft-inj-claude-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let inj = inject("http://127.0.0.1:9", 1, "10", "claude", &dir);
+        let inj = inject("http://127.0.0.1:9", 1, "10", Some(41), "claude", &dir);
         assert_eq!(inj.args[0], "--mcp-config");
-        let cfg = std::fs::read_to_string(dir.join(".weft-bus.mcp.json")).unwrap();
-        assert!(cfg.contains("weft_bus") && cfg.contains("/bus/1/10/mcp"));
+        let cfg = std::fs::read_to_string(dir.join(".weft-bus-41.mcp.json")).unwrap();
+        assert!(cfg.contains("weft_bus") && cfg.contains("/bus/1/10/mcp?session_id=41"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn codex_uses_config_override() {
-        let inj = inject("http://127.0.0.1:9", 2, "30", "codex", Path::new("/tmp"));
+        let inj = inject(
+            "http://127.0.0.1:9",
+            2,
+            "30",
+            Some(52),
+            "codex",
+            Path::new("/tmp"),
+        );
         assert_eq!(
             inj.args,
             vec![
                 "-c".to_string(),
-                "mcp_servers.weft_bus.url=http://127.0.0.1:9/bus/2/30/mcp".to_string()
+                "mcp_servers.weft_bus.url=http://127.0.0.1:9/bus/2/30/mcp?session_id=52"
+                    .to_string()
             ]
         );
+    }
+
+    #[test]
+    fn claude_worker_sessions_keep_separate_bus_configs() {
+        let dir = std::env::temp_dir().join(format!("weft-inj-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = inject("http://127.0.0.1:9", 2, "30", Some(51), "claude", &dir);
+        let second = inject("http://127.0.0.1:9", 2, "30", Some(52), "claude", &dir);
+
+        assert_ne!(first.args[1], second.args[1]);
+        let first_config = std::fs::read_to_string(&first.args[1]).unwrap();
+        let second_config = std::fs::read_to_string(&second.args[1]).unwrap();
+        assert!(first_config.contains("session_id=51"));
+        assert!(second_config.contains("session_id=52"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -395,18 +553,71 @@ mod tests {
     fn claude_ask_hook_wires_pretooluse_settings() {
         let dir = std::env::temp_dir().join(format!("weft-askh-c-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let inj = inject_ask_hook("http://127.0.0.1:9", 1, "10", "claude", &dir);
+        let inj = inject_ask_hook(
+            "http://127.0.0.1:9",
+            1,
+            "10",
+            Some(41),
+            "claude",
+            &dir,
+        );
         assert_eq!(inj.args[0], "--settings");
-        let script = std::fs::read_to_string(dir.join(".weft-ask-hook.sh")).unwrap();
-        assert!(script.contains("/ask/1/10?tool=claude"));
+        let script = std::fs::read_to_string(dir.join(".weft-ask-hook-41.sh")).unwrap();
+        assert!(script.contains("/ask/1/10?tool=claude&session_id=41"));
         let settings: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join(".weft-ask.settings.json")).unwrap(),
+            &std::fs::read_to_string(dir.join(".weft-ask-41.settings.json")).unwrap(),
         )
         .unwrap();
         assert!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains(".weft-ask-hook.sh"));
+            .contains(".weft-ask-hook-41.sh"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worker_ask_hook_bakes_the_exact_session_into_its_url() {
+        let dir = std::env::temp_dir().join(format!(
+            "weft-askh-worker-session-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let _ = inject_ask_hook(
+            "http://127.0.0.1:9",
+            1,
+            "10",
+            Some(41),
+            "claude",
+            &dir,
+        );
+        let script = std::fs::read_to_string(dir.join(".weft-ask-hook-41.sh")).unwrap();
+        assert!(script.contains("/ask/1/10?tool=claude&session_id=41"));
+        let settings = std::fs::read_to_string(dir.join(".weft-ask-41.settings.json")).unwrap();
+        assert!(settings.contains(".weft-ask-hook-41.sh"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lead_ask_hook_url_explicitly_has_no_worker_session() {
+        let dir = std::env::temp_dir().join(format!("weft-askh-lead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let _ = inject_ask_hook(
+            "http://127.0.0.1:9",
+            1,
+            crate::bus::LEAD,
+            None,
+            "claude",
+            &dir,
+        );
+        let script = std::fs::read_to_string(dir.join(".weft-ask-hook.sh")).unwrap();
+        assert!(script.contains("/ask/1/lead?tool=claude"));
+        assert!(!script.contains("session_id="));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -415,14 +626,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weft-askh-x-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let inj = inject_ask_hook("http://127.0.0.1:9", 2, "30", "codex", &dir);
+        let inj = inject_ask_hook(
+            "http://127.0.0.1:9",
+            2,
+            "30",
+            Some(52),
+            "codex",
+            &dir,
+        );
         assert!(
             inj.args.is_empty(),
             "global trusted hook needs no launch args"
         );
         assert_eq!(
             std::fs::read_to_string(dir.join(".weft-codex-ask-url")).unwrap(),
-            "http://127.0.0.1:9/ask/2/30?tool=codex"
+            "http://127.0.0.1:9/ask/2/30?tool=codex&session_id=52"
         );
         assert!(!dir.join(".weft-ask-hook.sh").exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -433,14 +651,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weft-inj-oask-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let inj = inject_ask_hook("http://127.0.0.1:9", 1, "10", "opencode", &dir);
+        let inj = inject_ask_hook(
+            "http://127.0.0.1:9",
+            1,
+            "10",
+            Some(41),
+            "opencode",
+            &dir,
+        );
         assert!(
             inj.args.is_empty(),
             "opencode plugin auto-loads, no launch flag"
         );
         let plugin = std::fs::read_to_string(dir.join(".opencode/plugins/weft-ask.js")).unwrap();
         assert!(plugin.contains("tool.execute.before"));
-        assert!(plugin.contains("/ask/1/10?tool=opencode"));
+        assert!(plugin.contains("/ask/1/10?tool=opencode&session_id=41"));
         assert!(plugin.contains("Denied in weft"));
         // The URL placeholder must be fully substituted — an unsubstituted
         // template would POST to a literal "__URL__" and (now) deny everything.
@@ -481,7 +706,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let base = format!("http://127.0.0.1:{}", closed_port());
-        let inj = inject_ask_hook(&base, 1, "10", "claude", &dir);
+        let inj = inject_ask_hook(&base, 1, crate::bus::LEAD, None, "claude", &dir);
         assert_eq!(inj.args[0], "--settings");
 
         let (stdout, code) = run_hook_script(
@@ -512,7 +737,9 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn claude_ask_hook_denies_a_decision_shaped_error_response() {
-        use crate::hook_test_support::{decision_body, decision_of, run_hook_script, serve_raw_once};
+        use crate::hook_test_support::{
+            decision_body, decision_of, run_hook_script, serve_raw_once,
+        };
         let body = decision_body("allow", false);
         let len = body.len();
         let base = serve_raw_once("HTTP/1.1 500 Internal Server Error", body, len).await;
@@ -520,7 +747,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weft-askh-500-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let _ = inject_ask_hook(&base, 1, "10", "claude", &dir);
+        let _ = inject_ask_hook(&base, 1, crate::bus::LEAD, None, "claude", &dir);
 
         let (stdout, code) = run_hook_script(
             &dir.join(".weft-ask-hook.sh"),
@@ -551,7 +778,9 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn claude_ask_hook_denies_an_answer_cut_off_after_the_verdict() {
-        use crate::hook_test_support::{decision_body, decision_of, run_hook_script, serve_raw_once};
+        use crate::hook_test_support::{
+            decision_body, decision_of, run_hook_script, serve_raw_once,
+        };
         let cut = decision_body("allow", true);
         // The fixture must defeat every gate EXCEPT `$rc`, or this test would pass
         // for the wrong reason.
@@ -567,7 +796,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weft-askh-cut-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let _ = inject_ask_hook(&base, 1, "10", "claude", &dir);
+        let _ = inject_ask_hook(&base, 1, crate::bus::LEAD, None, "claude", &dir);
 
         let (stdout, code) = run_hook_script(
             &dir.join(".weft-ask-hook.sh"),
@@ -594,6 +823,18 @@ mod tests {
         use crate::hook_test_support::{answer_first_ask, decision_of, run_hook_script};
         let asks = AskRegistry::new();
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "hook pass through")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "hook pass through",
+            "feature",
+            "claude",
+        )
+        .await
+        .unwrap();
         let (base, _h) =
             crate::bus::server::serve(crate::bus::BusRegistry::new(), db, asks.clone())
                 .await
@@ -602,7 +843,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weft-askh-live-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let _ = inject_ask_hook(&base, 1, "10", "claude", &dir);
+        let _ = inject_ask_hook(
+            &base,
+            thread.id,
+            crate::bus::LEAD,
+            None,
+            "claude",
+            &dir,
+        );
 
         // One task, two concurrent futures: the hook runs while the "human"
         // answers. No detached task to outlive the test, and the runner kills the
@@ -620,7 +868,6 @@ mod tests {
         assert_eq!(out["permissionDecisionReason"], "Approved in weft");
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 
     #[test]
     fn planner_codex_override_targets_planner_server() {
@@ -644,7 +891,7 @@ mod tests {
             r#"{"mcp":{"repo_own":{"type":"local","command":["x"]}}}"#,
         )
         .unwrap();
-        let inj = inject("http://127.0.0.1:9", 1, "10", "opencode", &dir);
+        let inj = inject("http://127.0.0.1:9", 1, "lead", None, "opencode", &dir);
         assert!(inj.args.is_empty());
         let merged: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("opencode.json")).unwrap())
@@ -655,6 +902,33 @@ mod tests {
             "repo's own server preserved"
         );
         assert_eq!(merged["mcp"]["weft_bus"]["type"], "remote");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_worker_uses_session_scoped_inline_config() {
+        let dir = std::env::temp_dir().join(format!("weft-inj-oc-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("opencode.json"),
+            r#"{"mcp":{"repo_own":{"type":"local","command":["x"]}}}"#,
+        )
+        .unwrap();
+
+        let inj = inject("http://127.0.0.1:9", 7, "19", Some(63), "opencode", &dir);
+
+        assert!(inj.args.is_empty());
+        assert_eq!(inj.env.len(), 1);
+        assert_eq!(inj.env[0].0, "OPENCODE_CONFIG_CONTENT");
+        let inline: serde_json::Value = serde_json::from_str(&inj.env[0].1).unwrap();
+        assert_eq!(
+            inline["mcp"]["weft_bus"]["url"],
+            "http://127.0.0.1:9/bus/7/19/mcp?session_id=63"
+        );
+        let project = std::fs::read_to_string(dir.join("opencode.json")).unwrap();
+        assert!(project.contains("repo_own"));
+        assert!(!project.contains("weft_bus"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -685,8 +959,8 @@ mod tests {
             &["git", "worktree", "add", "-q", wt.to_str().unwrap()],
         );
 
-        let _ = inject("http://127.0.0.1:9", 1, "1", "claude", &wt);
-        assert!(wt.join(".weft-bus.mcp.json").exists(), "file written");
+        let _ = inject("http://127.0.0.1:9", 1, "1", Some(74), "claude", &wt);
+        assert!(wt.join(".weft-bus-74.mcp.json").exists(), "file written");
         let status = Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(&wt)
@@ -694,7 +968,7 @@ mod tests {
             .unwrap();
         let s = String::from_utf8_lossy(&status.stdout);
         assert!(
-            !s.contains(".weft-bus.mcp.json"),
+            !s.contains(".weft-bus-74.mcp.json"),
             "injected file must be git-excluded, got: {s}"
         );
         let _ = std::fs::remove_dir_all(&root);

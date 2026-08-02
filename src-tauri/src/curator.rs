@@ -2416,7 +2416,14 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
             }
         }
         if markdown_covers_graph(&profiled_ids, &current_ids, &final_relations) {
-            let _ = repo::set_repo_map_doc(db, workspace_id, &md).await;
+            let expected_repo_ids = current_ids.iter().copied().collect::<Vec<_>>();
+            let _ = repo::set_repo_map_doc_if_repo_ids_match(
+                db,
+                workspace_id,
+                &expected_repo_ids,
+                &md,
+            )
+            .await;
         }
     }
     emit_graph_updated(workspace_id);

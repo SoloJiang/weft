@@ -369,33 +369,17 @@ async fn answer_durable_question(
     let Ok(request_id) = i32::try_from(ask_id) else {
         return Ok(false);
     };
-    let Some(request) = repo::get_human_request(db, request_id).await? else {
-        return Ok(false);
-    };
-    if request.thread_id != thread_id || request.status != repo::HUMAN_REQUEST_OPEN {
-        return Ok(false);
-    }
-    let Some(updated) = repo::answer_human_request(
+    Ok(crate::attention::answer_durable_human_request(
         db,
-        request.workspace_id,
-        request.id,
-        request.revision,
+        bus,
+        request_id,
+        Some(thread_id),
+        None,
+        None,
         text,
     )
     .await?
-    else {
-        return Ok(false);
-    };
-    if !bus.answer_ask(thread_id, ask_id, &updated.answer) {
-        bus.deliver_durable_answer(
-            thread_id,
-            ask_id,
-            &updated.direction_scope,
-            &updated.question,
-            &updated.answer,
-        );
-    }
-    Ok(true)
+    .is_some())
 }
 
 /// Push a message into the lead engine of `thread_id` from outside (Concierge).
