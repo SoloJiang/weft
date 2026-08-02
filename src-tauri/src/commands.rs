@@ -507,7 +507,7 @@ struct RepoActionAdmission {
     execution: entities::repo_action_execution::Model,
     _os_lock: repo::RepoActionOsLock,
     _lifecycle: Option<tokio::sync::OwnedMutexGuard<()>>,
-    _gate: tokio::sync::OwnedMutexGuard<()>,
+    _gate: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 fn acquire_repo_action_os_lock(execution_token: &str) -> R<repo::RepoActionOsLock> {
@@ -575,7 +575,7 @@ async fn admit_repo_action(
         execution,
         _os_lock: os_lock,
         _lifecycle: lifecycle,
-        _gate: gate,
+        _gate: Some(gate),
     }))
 }
 
@@ -605,10 +605,61 @@ async fn complete_admitted_repo_action(
     admission: &mut RepoActionAdmission,
     repo_ref: &entities::repo_ref::Model,
 ) -> R<()> {
+    // The long-running materialize/register phase owns the execution's OS lock
+    // and the claim gates. Drop only the async lifecycle/repo-action guards
+    // before waiting on the per-surface admission gate: visible send takes
+    // surface -> global-read, while destructive paths take global-write ->
+    // lifecycle. Holding lifecycle here while waiting on surface would create
+    // the cycle lifecycle -> surface -> global -> lifecycle. The OS lock stays
+    // held across this handoff, so delete/rewind/cleanup and duplicate action
+    // paths fail fast before they can enter the lifecycle gate.
+    drop(admission._lifecycle.take());
+    drop(admission._gate.take());
+    let serial = crate::lead_chat::engine::admission_gate_for_key(
+        crate::lead_chat::commands::lead_key(admission.execution.thread_id),
+    )
+    .lock_owned()
+    .await;
+    complete_admitted_repo_action_under_gate(db, admission, repo_ref, serial).await
+}
+
+async fn complete_admitted_repo_action_under_gate(
+    db: &Db,
+    admission: &mut RepoActionAdmission,
+    repo_ref: &entities::repo_ref::Model,
+    _serial: tokio::sync::OwnedMutexGuard<()>,
+) -> R<()> {
+    // Re-acquire in the canonical order while surface admission is held. Do
+    // not reuse the pre-materialize verdict: completion re-reads thread/repo,
+    // delete markers, action-card identity, and execution status inside its
+    // own transaction before committing the hidden outbox row.
+    let lifecycle_gate = crate::APP_HANDLE
+        .get()
+        .and_then(|app| app.try_state::<crate::bus::BusRegistry>())
+        .map(|bus| bus.thread_lifecycle_gate(admission.execution.thread_id));
+    let _lifecycle = match lifecycle_gate {
+        Some(gate) => Some(gate.lock_owned().await),
+        None => None,
+    };
+    let _gate = repo_action_gate(admission.execution.message_id)
+        .lock_owned()
+        .await;
     admission.execution = repo::complete_repo_action_execution(db, &admission.execution, repo_ref)
         .await
         .map_err(e)?;
     Ok(())
+}
+
+#[cfg(test)]
+async fn test_complete_admitted_repo_action_under_gate(
+    db: &Db,
+    admission: &mut RepoActionAdmission,
+    repo_ref: &entities::repo_ref::Model,
+    serial: tokio::sync::OwnedMutexGuard<()>,
+) -> R<()> {
+    drop(admission._lifecycle.take());
+    drop(admission._gate.take());
+    complete_admitted_repo_action_under_gate(db, admission, repo_ref, serial).await
 }
 
 /// Test-only production-path seam for a durable restart regression. It drives
@@ -4421,6 +4472,236 @@ mod tests {
         drop(admission);
         assert_repo_action_lock_handoff(&execution_token);
         (workspace, thread, card, execution, target)
+    }
+
+    async fn registered_new_repo_action(
+        db: &Db,
+        root: &std::path::Path,
+        action_id: &str,
+    ) -> (
+        entities::workspace::Model,
+        entities::thread::Model,
+        entities::lead_message::Model,
+        RepoActionAdmission,
+        entities::repo_ref::Model,
+    ) {
+        let destination = root.join(format!("{action_id}-dest"));
+        std::fs::create_dir_all(&destination).unwrap();
+        let destination = std::fs::canonicalize(destination).unwrap();
+        let target = destination.join("checkout");
+        let workspace = repo::create_workspace(db, &format!("ws-{action_id}"))
+            .await
+            .unwrap();
+        let thread = repo::create_thread(db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        use sea_orm::{ActiveModelTrait, Set};
+        static NEXT_TEST_ACTION_MESSAGE_ID: std::sync::atomic::AtomicI32 =
+            std::sync::atomic::AtomicI32::new(900_000);
+        let card = entities::lead_message::ActiveModel {
+            id: Set(NEXT_TEST_ACTION_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)),
+            thread_id: Set(thread.id),
+            session_id: Set(None),
+            turn_id: Set(1),
+            role: Set("assistant".to_string()),
+            kind: Set("action_card".to_string()),
+            content: Set(serde_json::json!({
+                "title": "Add the repository",
+                "actions": [{"id": action_id, "kind": "new", "label": "Run"}],
+            }).to_string()),
+            status: Set("complete".to_string()),
+            created_at: Set(String::new()),
+            seq: Set(None),
+            native_anchor: Set(None),
+            consumed_at: Set(None),
+        }
+        .insert(&db.0)
+        .await
+        .unwrap();
+        let fingerprint = repo_action_fingerprint(&["new", &target.to_string_lossy(), "checkout"]);
+        let mut admission = admit_repo_action(
+            db,
+            workspace.id,
+            Some(thread.id),
+            Some(card.id),
+            Some(action_id),
+            Some("new"),
+            "new",
+            &fingerprint,
+            &target,
+            Some(&destination),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let materialized = materialize_repo_action(db, &mut admission, crate::git::init_repo)
+            .await
+            .unwrap();
+        let repo_ref = register_repo_without_schedule(
+            db,
+            workspace.id,
+            "checkout",
+            &materialized.to_string_lossy(),
+            Some(&admission._os_lock),
+        )
+        .await
+        .unwrap();
+        (workspace, thread, card, admission, repo_ref)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completion_outbox_linearizes_before_visible_phase_one() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (workspace, thread, card, mut admission, repo_ref) =
+            registered_new_repo_action(&db, root.path(), "completion-fifo").await;
+        let key = crate::lead_chat::commands::lead_key(thread.id);
+        let serial = crate::lead_chat::engine::admission_gate_for_key(key)
+            .lock_owned()
+            .await;
+
+        let (scan_tx, mut scan_rx) = tokio::sync::oneshot::channel();
+        let (phase_release_tx, phase_release_rx) = tokio::sync::oneshot::channel();
+        let visible_db = db.clone();
+        let visible = tokio::spawn(async move {
+            // This is the visible send's actual surface admission boundary:
+            // pending durable rows are scanned while the gate is held, then
+            // Phase 1 persists the user row before releasing the gate.
+            let _surface = crate::lead_chat::engine::admission_gate_for_key(key)
+                .lock_owned()
+                .await;
+            let pending = repo::list_pending_lead_hidden_deliveries(
+                &visible_db,
+                Some(thread.id),
+            )
+            .await
+            .unwrap();
+            let _ = scan_tx.send(pending);
+            phase_release_rx.await.unwrap();
+            repo::insert_lead_message(
+                &visible_db,
+                thread.id,
+                None,
+                2,
+                "user",
+                "text",
+                r#"{"text":"new user instruction"}"#,
+                "complete",
+            )
+            .await
+            .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(30),
+                &mut scan_rx,
+            )
+            .await
+            .is_err(),
+            "visible send must stop at the surface gate while completion owns it"
+        );
+
+        // Use the same completion body as production after its surface gate
+        // has been acquired. The visible task cannot scan until this commit
+        // releases the gate, so it must observe repo feedback first.
+        test_complete_admitted_repo_action_under_gate(&db, &mut admission, &repo_ref, serial)
+            .await
+            .unwrap();
+        let pending = scan_rx.await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source_kind, "repo_action");
+        assert_eq!(pending[0].source_id, admission.execution.id);
+        phase_release_tx.send(()).unwrap();
+        let user = visible.await.unwrap();
+        assert_eq!(user.turn_id, 2);
+        assert_eq!(user.role, "user");
+        assert!(
+            repo::get_lead_hidden_delivery_by_dedupe(
+                &db,
+                &format!("repo_action:{}", admission.execution.id),
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(
+            repo::get_repo_action_execution(&db, card.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .feedback_state,
+            repo::REPO_ACTION_FEEDBACK_PENDING
+        );
+        assert_eq!(workspace.id, admission.execution.workspace_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completion_gate_handoff_releases_action_gate_and_rechecks_delete_fence() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (_workspace, thread, card, mut admission, repo_ref) =
+            registered_new_repo_action(&db, root.path(), "completion-fence").await;
+        let key = crate::lead_chat::commands::lead_key(thread.id);
+        let serial = crate::lead_chat::engine::admission_gate_for_key(key)
+            .lock_owned()
+            .await;
+        let db_for_completion = db.clone();
+        let completion = tokio::spawn(async move {
+            complete_admitted_repo_action(&db_for_completion, &mut admission, &repo_ref).await
+        });
+
+        // The completion task must drop its long-lived repo-action guard before
+        // waiting on the occupied surface gate. Acquiring this probe guard is
+        // the deterministic handoff point; a task that kept `_gate` would
+        // deadlock here while the test holds `serial`.
+        let mut probe = None;
+        for _ in 0..20 {
+            if let Ok(guard) = tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                repo_action_gate(card.id).lock_owned(),
+            )
+            .await
+            {
+                probe = Some(guard);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            probe.is_some(),
+            "completion must release repo-action gate before waiting on surface admission"
+        );
+        drop(probe);
+
+        // A fresh delete marker is installed while completion waits. The
+        // completion transaction must re-read this fence after reacquiring
+        // surface -> lifecycle -> repo-action, rather than committing from the
+        // pre-materialize verdict.
+        repo::mark_thread_deleting(&db, thread.id).await.unwrap();
+        drop(serial);
+        let error = completion.await.unwrap().unwrap_err();
+        assert_eq!(error, "action_card_stale");
+        assert!(
+            repo::list_pending_lead_hidden_deliveries(&db, Some(thread.id))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let execution = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, repo::REPO_ACTION_MATERIALIZED);
+        assert_eq!(execution.feedback_state, repo::REPO_ACTION_FEEDBACK_NONE);
+        let content: serde_json::Value = serde_json::from_str(
+            &repo::get_lead_message(&db, card.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+        )
+        .unwrap();
+        assert!(content.get("resolved").is_none());
     }
 
     #[tokio::test]
