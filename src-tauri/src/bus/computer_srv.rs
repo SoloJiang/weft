@@ -2886,7 +2886,18 @@ async fn write_audit_line_locked(path: &std::path::Path, line: &str) {
     let Ok(mut file) = open_audit_file_for_append(path).await else {
         return;
     };
-    let _ = file.write_all(line.as_bytes()).await;
+    if file.write_all(line.as_bytes()).await.is_ok() {
+        // `tokio::fs::File` buffers writes and does NOT flush on drop:
+        // dropping the handle right after `write_all` (as the guard releases
+        // at the end of this function) can lose the just-written line when its
+        // background write op hasn't completed yet — an intermittent
+        // single-line loss under concurrent appends (observed as a flaky
+        // failure of `concurrent_appends_serialize_through_rotation_...`).
+        // Flush inside the critical section so every audit line is durable
+        // before the lock releases and the next writer's rotate/size-check
+        // runs against the fully-written file.
+        let _ = file.flush().await;
+    }
 }
 
 /// Single-file rotation cap for `computer-audit.jsonl` (issue #160 round-10

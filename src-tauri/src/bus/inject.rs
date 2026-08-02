@@ -548,13 +548,41 @@ fn set_owner_only_windows(path: &Path, bytes: &[u8]) -> bool {
         return false;
     }
     drop(w);
-    // Atomic replace only after the temp holds the complete, flushed, already
-    // owner-locked bytes: any earlier failure above left `path` untouched.
-    if std::fs::rename(&tmp, path).is_err() {
+    // Replace `path` with the owner-locked temp only after it holds the
+    // complete, flushed bytes. issue #160 round-19 P1 (Codex inject.rs:553):
+    // `std::fs::rename` FAILS on Windows when the destination already exists —
+    // and OpenCode's generic MCP injection (and Claude reinjection) can write a
+    // config at this exact path FIRST, so a plain rename would fail on the very
+    // first computer-use injection and silently leave the tool unconfigured.
+    // `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` atomically replaces the
+    // destination while preserving the temp's owner-only ACL. Fail-closed on
+    // error (remove the temp, write nothing).
+    if !windows_replace_existing(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
     true
+}
+
+/// Atomically replace `to` with `from` on Windows via `MoveFileExW`
+/// (`MOVEFILE_REPLACE_EXISTING`), preserving `from`'s ACL — issue #160
+/// round-19 P1 (Codex inject.rs:553). Unlike `std::fs::rename`, this succeeds
+/// when `to` already exists (the common case: a prior generic-MCP or reinject
+/// write). Returns whether the replace succeeded.
+#[cfg(windows)]
+fn windows_replace_existing(from: &Path, to: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+    let wide = |p: &Path| -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let from_w = wide(from);
+    let to_w = wide(to);
+    // SAFETY: both buffers are null-terminated and live for the whole call.
+    unsafe {
+        MoveFileExW(PCWSTR(from_w.as_ptr()), PCWSTR(to_w.as_ptr()), MOVEFILE_REPLACE_EXISTING).is_ok()
+    }
 }
 
 /// Stamp an open file HANDLE with a PROTECTED DACL granting full control to

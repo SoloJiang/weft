@@ -450,8 +450,9 @@ fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
 /// reachable X server or the protocol round-trip fails; never panics.
 #[cfg(target_os = "linux")]
 fn activate_window_x11(id: u32) -> Result<(), ComputerError> {
+    use std::time::Duration;
     use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt, EventMask};
+    use x11rb::protocol::xproto::{AtomEnum, ClientMessageEvent, ConnectionExt, EventMask};
 
     let err = |e: String| ComputerError::Unsupported(e);
     let (conn, screen_num) = x11rb::connect(None).map_err(|e| err(e.to_string()))?;
@@ -481,7 +482,32 @@ fn activate_window_x11(id: u32) -> Result<(), ComputerError> {
     )
     .map_err(|e| err(e.to_string()))?;
     conn.flush().map_err(|e| err(e.to_string()))?;
-    Ok(())
+
+    // issue #160 round-19 P1 (Codex os.rs:414): transport success is NOT
+    // activation. A compliant window manager processes the request
+    // ASYNCHRONOUSLY and MAY refuse a focus-stealing activation outright.
+    // Reporting `Ok` on send-success alone would let a click land on whatever
+    // app is really foreground while the input arms' identity re-resolve still
+    // passes (it checks the target's identity, never the ACTIVE window). So
+    // confirm the target actually became `_NET_ACTIVE_WINDOW` on the root,
+    // with a bounded poll; if it never does, return `Err` so
+    // `activate_window_impl` falls back to the CLI tools and, failing those,
+    // fails closed — never injecting into an unconfirmed foreground.
+    for _ in 0..25 {
+        let reply = conn
+            .get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)
+            .map_err(|e| err(e.to_string()))?
+            .reply()
+            .map_err(|e| err(e.to_string()))?;
+        if reply.value32().and_then(|mut it| it.next()) == Some(id) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err(err(format!(
+        "window {id} did not become the active window within the timeout — the window manager may \
+         reject focus-stealing activation requests"
+    )))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
