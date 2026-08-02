@@ -2995,14 +2995,84 @@ mod tests {
     /// M0037: code_checkpoint exists after migration and round-trips a row.
     #[tokio::test]
     async fn m0037_code_checkpoint_table_created() {
-        use crate::store::repo::{code_checkpoint_for, insert_code_checkpoint};
+        use crate::store::repo::{
+            code_checkpoint_for, create_direction, create_session, create_thread,
+            insert_code_checkpoint, insert_lead_message, record_worktree,
+        };
         use crate::store::Db;
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        let c = insert_code_checkpoint(&db, 1, 7, 100, 1, "shadow-sha", "head-sha", "[\"gen\"]", "idx-1")
+        let workspace = crate::store::repo::create_workspace(&db, "m0037").await.unwrap();
+        let repo = crate::store::repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/m0037-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
             .await
             .unwrap();
-        let found = code_checkpoint_for(&db, 1, 100).await.unwrap().unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "task",
+            "codex",
+            repo.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/m0037-session")
+            .await
+            .unwrap();
+        let worktree = record_worktree(
+            &db,
+            repo.id,
+            direction.id,
+            "m0037",
+            "/tmp/m0037-worktree",
+            true,
+            true,
+            "",
+        )
+        .await
+        .unwrap();
+        let message = insert_lead_message(
+            &db,
+            thread.id,
+            Some(session.id),
+            1,
+            "user",
+            "text",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let c = insert_code_checkpoint(
+            &db,
+            worktree.id,
+            session.id,
+            message.id,
+            message.turn_id,
+            "shadow-sha",
+            "head-sha",
+            "[\"gen\"]",
+            "idx-1",
+        )
+            .await
+            .unwrap();
+        let found = code_checkpoint_for(&db, worktree.id, message.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.id, c.id);
         assert_eq!(found.shadow_sha, "shadow-sha");
         assert_eq!(found.head_sha, "head-sha");

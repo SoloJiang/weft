@@ -7498,6 +7498,14 @@ mod tests {
         (ws, repo, thread, direction)
     }
 
+    async fn worker_session_fixture(db: &Db) -> (thread::Model, session::Model) {
+        let (_, repo, thread, direction) = worker_fixture(db).await;
+        let session = create_session(db, direction.id, repo.id, "codex", "/tmp/session")
+            .await
+            .unwrap();
+        (thread, session)
+    }
+
     async fn worker_pr_source(db: &Db, direction_id: i32, repo_id: i32) -> Option<i32> {
         create_session(db, direction_id, repo_id, "codex", "/tmp/pr-source")
             .await
@@ -8652,11 +8660,13 @@ mod tests {
     #[tokio::test]
     async fn stale_streaming_messages_mark_interrupted_on_reopen() {
         let db = mem().await;
-        let t = live_thread(&db).await;
+        let (thread, session) = worker_session_fixture(&db).await;
+        let t = thread.id;
+        let session_id = session.id;
         let streaming = insert_lead_message(
             &db,
             t,
-            Some(9),
+            Some(session_id),
             1,
             "assistant",
             "text",
@@ -8668,7 +8678,7 @@ mod tests {
         let queued = insert_lead_message(
             &db,
             t,
-            Some(9),
+            Some(session_id),
             2,
             "user",
             "text",
@@ -8678,7 +8688,7 @@ mod tests {
         .await
         .unwrap();
 
-        mark_incomplete_turns_interrupted(&db, t, Some(9))
+        mark_incomplete_turns_interrupted(&db, t, Some(session_id))
             .await
             .unwrap();
 
@@ -8758,7 +8768,8 @@ mod tests {
     #[tokio::test]
     async fn queued_status_updates_are_session_scoped() {
         let db = mem().await;
-        let t = live_thread(&db).await;
+        let (thread, session) = worker_session_fixture(&db).await;
+        let t = thread.id;
         let lead = insert_lead_message(
             &db,
             t,
@@ -8774,7 +8785,7 @@ mod tests {
         let worker = insert_lead_message(
             &db,
             t,
-            Some(3),
+            Some(session.id),
             1,
             "user",
             "text",
@@ -8784,7 +8795,7 @@ mod tests {
         .await
         .unwrap();
 
-        let completed = complete_queued(&db, t, Some(3)).await.unwrap().unwrap();
+        let completed = complete_queued(&db, t, Some(session.id)).await.unwrap().unwrap();
         assert_eq!(completed.id, worker.id);
         let failed = set_queued_status(&db, t, None, "interrupted")
             .await
@@ -8808,11 +8819,12 @@ mod tests {
     #[tokio::test]
     async fn lead_message_anchor_roundtrip() {
         let db = mem().await;
-        let t = live_thread(&db).await;
+        let (thread, session) = worker_session_fixture(&db).await;
+        let t = thread.id;
         let m = insert_lead_message(
             &db,
             t,
-            Some(7),
+            Some(session.id),
             1,
             "user",
             "text",
@@ -8830,30 +8842,55 @@ mod tests {
     #[tokio::test]
     async fn truncate_lead_messages_scoped_to_thread_and_session() {
         let db = mem().await;
-        let t = live_thread(&db).await;
+        let (thread, session) = worker_session_fixture(&db).await;
+        let t = thread.id;
+        let other_session = {
+            let direction = get_direction(&db, session.direction_id).await.unwrap().unwrap();
+            create_session(&db, direction.id, session.repo_id, "codex", "/tmp/other-session")
+                .await
+                .unwrap()
+        };
         // Target session: one row before the cut, then the cut row itself, a
         // later assistant row, and a queued row (the abandoned future).
-        let keep = insert_lead_message(&db, t, Some(7), 1, "user", "text", "{}", "complete")
+        let keep = insert_lead_message(&db, t, Some(session.id), 1, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        let cut = insert_lead_message(&db, t, Some(7), 2, "user", "text", "{}", "complete")
+        let cut = insert_lead_message(&db, t, Some(session.id), 2, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        let after = insert_lead_message(&db, t, Some(7), 2, "assistant", "text", "{}", "complete")
+        let after = insert_lead_message(
+            &db,
+            t,
+            Some(session.id),
+            2,
+            "assistant",
+            "text",
+            "{}",
+            "complete",
+        )
             .await
             .unwrap();
-        let queued = insert_lead_message(&db, t, Some(7), 3, "user", "text", "{}", "queued")
+        let queued = insert_lead_message(&db, t, Some(session.id), 3, "user", "text", "{}", "queued")
             .await
             .unwrap();
         // Same thread, other session + lead rows (higher ids) must survive.
-        let other = insert_lead_message(&db, t, Some(8), 1, "user", "text", "{}", "complete")
+        let other = insert_lead_message(
+            &db,
+            t,
+            Some(other_session.id),
+            1,
+            "user",
+            "text",
+            "{}",
+            "complete",
+        )
             .await
             .unwrap();
         let lead = insert_lead_message(&db, t, None, 1, "user", "text", "{}", "complete")
             .await
             .unwrap();
 
-        let deleted = truncate_lead_messages(&db.0, t, Some(7), cut.id)
+        let deleted = truncate_lead_messages(&db.0, t, Some(session.id), cut.id)
             .await
             .unwrap();
         assert_eq!(deleted.len(), 3);
@@ -8884,32 +8921,33 @@ mod tests {
     #[tokio::test]
     async fn truncate_lead_messages_follows_delivery_order() {
         let db = mem().await;
-        let t = live_thread(&db).await;
+        let (thread, session) = worker_session_fixture(&db).await;
+        let t = thread.id;
         // Production shape: turn 1 completes; b and a queue behind it; the
         // queue delivers a FIRST (a.seq < b.seq), then b. Reply rows are
         // inserted as their turns run, so b (queued first) holds a smaller id
         // than a yet displays after a's whole exchange.
-        let first = insert_lead_message(&db, t, Some(7), 1, "user", "text", "{}", "complete")
+        let first = insert_lead_message(&db, t, Some(session.id), 1, "user", "text", "{}", "complete")
             .await
             .unwrap();
         let first_reply =
-            insert_lead_message(&db, t, Some(7), 1, "assistant", "text", "{}", "complete")
+            insert_lead_message(&db, t, Some(session.id), 1, "assistant", "text", "{}", "complete")
                 .await
                 .unwrap();
-        let b = insert_lead_message(&db, t, Some(7), 2, "user", "text", "{}", "complete")
+        let b = insert_lead_message(&db, t, Some(session.id), 2, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        let a = insert_lead_message(&db, t, Some(7), 3, "user", "text", "{}", "complete")
+        let a = insert_lead_message(&db, t, Some(session.id), 3, "user", "text", "{}", "complete")
             .await
             .unwrap();
         assign_delivery_seq(&db, t, a.id).await.unwrap(); // a dequeued first
         let a_reply =
-            insert_lead_message(&db, t, Some(7), 3, "assistant", "text", "{}", "complete")
+            insert_lead_message(&db, t, Some(session.id), 3, "assistant", "text", "{}", "complete")
                 .await
                 .unwrap();
         assign_delivery_seq(&db, t, b.id).await.unwrap(); // b dequeued second
         let b_reply =
-            insert_lead_message(&db, t, Some(7), 2, "assistant", "text", "{}", "complete")
+            insert_lead_message(&db, t, Some(session.id), 2, "assistant", "text", "{}", "complete")
                 .await
                 .unwrap();
 
@@ -8929,7 +8967,7 @@ mod tests {
 
         // Rewind to before b: only b and b_reply may go — an id-based cut
         // (id >= b.id) would also kill a and a_reply.
-        let deleted = truncate_lead_messages(&db.0, t, Some(7), b.id)
+        let deleted = truncate_lead_messages(&db.0, t, Some(session.id), b.id)
             .await
             .unwrap();
         assert_eq!(deleted, vec![b.id, b_reply.id]);
@@ -9256,42 +9294,159 @@ mod tests {
     #[tokio::test]
     async fn code_checkpoint_insert_lookup_truncate() {
         let db = mem().await;
-        // Rows need no live worktree/session (no FKs), so plain literals do.
-        let c1 =
-            insert_code_checkpoint(&db, 11, 7, 100, 1, "sha-1", "head-1", "[\"gen\"]", "idx-1")
-                .await
-                .unwrap();
-        insert_code_checkpoint(&db, 11, 7, 200, 2, "sha-2", "head-2", "[]", "")
+        let (_, repo, thread, direction) = worker_fixture(&db).await;
+        let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/checkpoint")
             .await
             .unwrap();
-        insert_code_checkpoint(&db, 22, 8, 100, 1, "sha-other", "head-other", "[]", "")
+        let worktree = record_worktree(
+            &db,
+            repo.id,
+            direction.id,
+            "checkpoint",
+            "/tmp/checkpoint-wt",
+            true,
+            true,
+            "",
+        )
+        .await
+        .unwrap();
+        let first_message = insert_lead_message(
+            &db,
+            thread.id,
+            Some(session.id),
+            1,
+            "user",
+            "text",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let second_message = insert_lead_message(
+            &db,
+            thread.id,
+            Some(session.id),
+            2,
+            "user",
+            "text",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let other_session = create_session(&db, direction.id, repo.id, "codex", "/tmp/checkpoint-other")
             .await
             .unwrap();
+        let other_worktree = record_worktree(
+            &db,
+            repo.id,
+            direction.id,
+            "checkpoint-other",
+            "/tmp/checkpoint-other-wt",
+            true,
+            true,
+            "",
+        )
+        .await
+        .unwrap();
+        let other_message = insert_lead_message(
+            &db,
+            thread.id,
+            Some(other_session.id),
+            1,
+            "user",
+            "text",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
 
-        let found = code_checkpoint_for(&db, 11, 100).await.unwrap().unwrap();
+        let c1 = insert_code_checkpoint(
+            &db,
+            worktree.id,
+            session.id,
+            first_message.id,
+            first_message.turn_id,
+            "sha-1",
+            "head-1",
+            "[\"gen\"]",
+            "idx-1",
+        )
+        .await
+        .unwrap();
+        insert_code_checkpoint(
+            &db,
+            worktree.id,
+            session.id,
+            second_message.id,
+            second_message.turn_id,
+            "sha-2",
+            "head-2",
+            "[]",
+            "",
+        )
+        .await
+        .unwrap();
+        insert_code_checkpoint(
+            &db,
+            other_worktree.id,
+            other_session.id,
+            other_message.id,
+            other_message.turn_id,
+            "sha-other",
+            "head-other",
+            "[]",
+            "",
+        )
+        .await
+        .unwrap();
+
+        let found = code_checkpoint_for(&db, worktree.id, first_message.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.id, c1.id);
         assert_eq!(found.shadow_sha, "sha-1");
         assert_eq!(found.head_sha, "head-1");
         assert_eq!(found.nested_repos, "[\"gen\"]");
-        assert_eq!(found.session_id, 7);
+        assert_eq!(found.session_id, session.id);
         assert_eq!(found.turn_id, 1);
-        assert!(code_checkpoint_for(&db, 11, 999).await.unwrap().is_none());
+        assert!(code_checkpoint_for(&db, worktree.id, 999)
+            .await
+            .unwrap()
+            .is_none());
 
         // Truncate drops the checkpoints keyed by the deleted timeline rows of
         // THIS worktree only.
-        let deleted = truncate_code_checkpoints(&db.0, 11, &[100, 200])
+        let deleted = truncate_code_checkpoints(
+            &db.0,
+            worktree.id,
+            &[first_message.id, second_message.id],
+        )
             .await
             .unwrap();
         assert_eq!(deleted, 2);
-        assert!(code_checkpoint_for(&db, 11, 100).await.unwrap().is_none());
+        assert!(code_checkpoint_for(&db, worktree.id, first_message.id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(
-            code_checkpoint_for(&db, 22, 100).await.unwrap().is_some(),
+            code_checkpoint_for(&db, other_worktree.id, other_message.id)
+                .await
+                .unwrap()
+                .is_some(),
             "other worktree untouched"
         );
 
-        let deleted = delete_code_checkpoints_for_worktree(&db, 22).await.unwrap();
+        let deleted = delete_code_checkpoints_for_worktree(&db, other_worktree.id)
+            .await
+            .unwrap();
         assert_eq!(deleted, 1);
-        assert!(code_checkpoint_for(&db, 22, 100).await.unwrap().is_none());
+        assert!(code_checkpoint_for(&db, other_worktree.id, other_message.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -9994,8 +10149,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let keep_ws = create_workspace(&db, "keep me").await.unwrap();
-        let keep_thread = create_thread(&db, keep_ws.id, "keep issue", "feature", "claude")
+        let keep_thread = create_thread(&db, ws.id, "keep issue", "feature", "claude")
             .await
             .unwrap();
         let external_direction = create_direction(
@@ -10047,7 +10201,7 @@ mod tests {
         .unwrap_err();
         assert!(deleting_direction_err
             .to_string()
-            .contains(&format!("workspace {} is being deleted", ws.id)));
+            .contains("direction_write_fenced_or_stale"));
 
         let deleting_repo_direction_err = create_direction(
             &db,
@@ -10063,7 +10217,7 @@ mod tests {
         .unwrap_err();
         assert!(deleting_repo_direction_err
             .to_string()
-            .contains(&format!("workspace {} is being deleted", ws.id)));
+            .contains("direction_write_fenced_or_stale"));
 
         let deleting_worktree_err = record_worktree(
             &db,
@@ -12225,7 +12379,9 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err.to_string().contains("not found"));
+        assert!(err
+            .to_string()
+            .contains("no longer accepts profile writes"));
         assert!(get_repo_profile(&db, r.id).await.unwrap().is_none());
     }
 
@@ -12660,8 +12816,28 @@ mod tests {
     async fn a_pr_with_no_owning_direction_reports_none_not_unknown() {
         let db = mem().await;
         // Mirrors `register_pr_tool_from_the_lead_falls_back_to_unset_direction`'s DB state:
-        // `direction_id = 0`, no direction row exists at all.
-        register_open_pr(&db, 0, 1).await;
+        // `direction_id = 0`, no direction row exists at all. The lead still has a
+        // real thread owner; only the optional direction axis is intentionally absent.
+        let workspace = create_workspace(&db, "ws-lead-pr").await.unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        register_pull_request(
+            &db,
+            thread.id,
+            0,
+            0,
+            None,
+            "github",
+            "github.com",
+            "o",
+            "r",
+            1,
+            "",
+            "",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             upstream_merge_state(&db, 0).await,

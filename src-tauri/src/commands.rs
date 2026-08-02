@@ -6719,7 +6719,7 @@ mod tests {
         .unwrap_err();
         assert!(direction_error
             .to_string()
-            .contains(&format!("repo {} is being deleted", target_repo.id)));
+            .contains("direction_write_fenced_or_stale"));
         repo::clear_repo_deleting(&db, target_repo.id)
             .await
             .unwrap();
@@ -7526,7 +7526,7 @@ mod tests {
         let target_path = init_main_repo(root.path(), "materialized-target");
         let (workspace, thread, target_message, card) =
             rewind_repo_action_card(&db, "rewind-materialized", "clone").await;
-        let token = "0123456789abcdef0123456789abcdef01234567";
+        let token = new_repo_action_token();
         let staging_path = root
             .path()
             .join(format!(".weft-repo-action-{token}.staging"));
@@ -7540,7 +7540,7 @@ mod tests {
             action_kind: "clone",
             expected_action_kind: "clone",
             invocation_fingerprint: "rewind-materialized-fingerprint",
-            execution_token: token,
+            execution_token: &token,
             target_path: &target_text,
             staging_path: &staging_text,
         };
@@ -7548,10 +7548,10 @@ mod tests {
             .await
             .unwrap();
         std::fs::create_dir_all(&staging_path).unwrap();
-        let owner = repo_action_owner_path(&staging_path, token).unwrap();
-        write_token_file(&owner, token, true).unwrap();
-        write_repo_action_target_marker(&target_path, token).unwrap();
-        let execution = repo::mark_repo_action_materialized(&db, execution.id, token)
+        let owner = repo_action_owner_path(&staging_path, &token).unwrap();
+        write_token_file(&owner, &token, true).unwrap();
+        write_repo_action_target_marker(&target_path, &token).unwrap();
+        let execution = repo::mark_repo_action_materialized(&db, execution.id, &token)
             .await
             .unwrap();
         let registered = repo::add_repo_ref(
