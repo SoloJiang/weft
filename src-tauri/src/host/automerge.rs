@@ -320,6 +320,7 @@ async fn evaluate_row(
     let now = repo::now_unix();
     let stored_lifecycle = gate::parse_lifecycle(&pr.lifecycle);
     let stored_ci = gate::parse_ci(&pr.ci_status);
+    let stored_threads = gate::parse_threads(&pr.thread_status);
     let stored_readiness = gate::parse_readiness(&pr.merge_readiness);
     let age = gate::age_secs(&pr.last_checked_at, &now);
     let pre_decision = gate::decide_auto_merge(
@@ -331,6 +332,7 @@ async fn evaluate_row(
         host_kind,
         stored_lifecycle,
         &stored_ci,
+        &stored_threads,
         &stored_readiness,
         pr.probe_fail_count,
         age,
@@ -392,8 +394,13 @@ async fn evaluate_row(
     // Re-resolved here rather than trusting the swept row: this is the
     // pre-merge confirmation, and an upstream can have moved since the sweep.
     let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
-    let fresh_readiness =
-        judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict, &upstream);
+    let fresh_readiness = judge::merge_readiness(
+        &snapshot.ci,
+        &snapshot.review,
+        &snapshot.threads,
+        &snapshot.conflict,
+        &upstream,
+    );
     if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, &snapshot, &fresh_readiness).await {
         eprintln!(
             "[weft][automerge] pr #{}: could not save pre-merge confirmation snapshot: {e}",
@@ -412,6 +419,7 @@ async fn evaluate_row(
         host_kind,
         Some(snapshot.lifecycle),
         &snapshot.ci,
+        &snapshot.threads,
         &fresh_readiness,
         0,
         0,
@@ -565,7 +573,7 @@ async fn maybe_merge_one(
     let (state, state_error) = match &confirmed {
         Ok(s) => {
             let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
-            let r = judge::merge_readiness(&s.ci, &s.review, &s.conflict, &upstream);
+            let r = judge::merge_readiness(&s.ci, &s.review, &s.threads, &s.conflict, &upstream);
             if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, s, &r).await {
                 eprintln!(
                     "[weft][automerge] pr #{}: could not save confirmation snapshot: {e}",
@@ -801,7 +809,9 @@ fn is_enabled(raw: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{CiStatus, ConflictStatus, MergeReadiness, PrHost, PrSnapshot, ReviewStatus};
+    use crate::host::{
+        CiStatus, ConflictStatus, MergeReadiness, PrHost, PrSnapshot, ReviewStatus, ThreadStatus,
+    };
     use sea_orm::ConnectionTrait;
 
     // --- run_gh_merge: guards that must fire before any process spawns ----
@@ -1025,6 +1035,24 @@ mod tests {
             lifecycle: PrLifecycle::Open,
             ci: CiStatus::Failing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
+            conflict: ConflictStatus::Clean,
+        })))
+    }
+
+    /// A fresh read showing a NEW review round opened since the stored
+    /// snapshot: still open, still green, still approved — and now with
+    /// unresolved threads.
+    fn resolver_fresh_threads_unresolved(_: HostKind) -> Result<Box<dyn PrHost>, HostError> {
+        Ok(Box::new(FakeHost(PrSnapshot {
+            head_sha: "fresh_sha_threads_unresolved".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: PrLifecycle::Open,
+            ci: CiStatus::Passing,
+            review: ReviewStatus::Approved,
+            threads: ThreadStatus::Unresolved { count: 2 },
             conflict: ConflictStatus::Clean,
         })))
     }
@@ -1038,6 +1066,7 @@ mod tests {
             lifecycle: PrLifecycle::Merged,
             ci: CiStatus::Passing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         })))
     }
@@ -1051,6 +1080,7 @@ mod tests {
             lifecycle: PrLifecycle::Open,
             ci: CiStatus::Passing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         })))
     }
@@ -1139,6 +1169,7 @@ mod tests {
             lifecycle: PrLifecycle::Open,
             ci: CiStatus::Passing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         };
         repo::apply_pull_request_snapshot(db, pr.id, &stored, &MergeReadiness::Ready).await.unwrap();
@@ -1165,6 +1196,35 @@ mod tests {
         let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
         assert_eq!(reloaded.head_sha, "fresh_sha_ci_failing");
         assert_eq!(gate::parse_ci(&reloaded.ci_status), CiStatus::Failing);
+    }
+
+    /// The scenario this whole axis exists for, end-to-end through the real
+    /// evaluation path rather than the pure gate alone: a reviewer opens a
+    /// new round between two sweeps. The stored row still reads Ready from
+    /// before, CI is still green, GitHub still says APPROVED — the ONLY thing
+    /// that changed is that threads are open. Without the axis this merged.
+    #[tokio::test]
+    async fn evaluate_row_refuses_when_the_fresh_read_shows_unresolved_review_threads() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let backoff = MergeBackoffState::default();
+
+        let verdict =
+            evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_threads_unresolved).await;
+
+        assert_eq!(
+            verdict,
+            RowVerdict::Skip,
+            "open review threads must stop an otherwise-ready merge"
+        );
+        // And the fresh reading is persisted, proving the refusal came from
+        // the live read rather than from the row never being re-evaluated.
+        let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.head_sha, "fresh_sha_threads_unresolved");
+        assert_eq!(
+            gate::parse_threads(&reloaded.thread_status),
+            ThreadStatus::Unresolved { count: 2 }
+        );
     }
 
     #[tokio::test]

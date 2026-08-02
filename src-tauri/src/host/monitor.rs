@@ -185,8 +185,13 @@ async fn apply_probe_result(
             // early. `direction_id == 0` (a legacy row) resolves to Unknown,
             // which is the honest answer for a PR whose task we cannot find.
             let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
-            let readiness =
-                judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict, &upstream);
+            let readiness = judge::merge_readiness(
+                &snapshot.ci,
+                &snapshot.review,
+                &snapshot.threads,
+                &snapshot.conflict,
+                &upstream,
+            );
             let changed = snapshot_changed(pr, snapshot, &readiness);
             if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, snapshot, &readiness).await {
                 eprintln!("[weft][host] pr #{}: could not save snapshot: {e}", pr.id);
@@ -369,12 +374,14 @@ fn emit_pr_changed(app: &AppHandle, pr: &pull_request::Model) {
 fn snapshot_changed(old: &pull_request::Model, snapshot: &PrSnapshot, readiness: &MergeReadiness) -> bool {
     let new_ci = serde_json::to_string(&snapshot.ci).unwrap_or_default();
     let new_review = serde_json::to_string(&snapshot.review).unwrap_or_default();
+    let new_threads = serde_json::to_string(&snapshot.threads).unwrap_or_default();
     let new_conflict = serde_json::to_string(&snapshot.conflict).unwrap_or_default();
     let new_readiness = serde_json::to_string(readiness).unwrap_or_default();
     old.head_sha != snapshot.head_sha
         || old.lifecycle != snapshot.lifecycle.as_str()
         || old.ci_status != new_ci
         || old.review_status != new_review
+        || old.thread_status != new_threads
         || old.conflict_status != new_conflict
         || old.merge_readiness != new_readiness
 }
@@ -382,7 +389,7 @@ fn snapshot_changed(old: &pull_request::Model, snapshot: &PrSnapshot, readiness:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{CiStatus, ConflictStatus, HostError, PrLifecycle, ReviewStatus};
+    use crate::host::{CiStatus, ConflictStatus, HostError, PrLifecycle, ReviewStatus, ThreadStatus};
 
     // --- P1-A: the give-up boundary must never strand a row silently -----
 
@@ -452,6 +459,7 @@ mod tests {
             lifecycle: "open".to_string(),
             ci_status: serde_json::to_string(&CiStatus::Passing).unwrap(),
             review_status: serde_json::to_string(&ReviewStatus::Approved).unwrap(),
+            thread_status: serde_json::to_string(&ThreadStatus::AllResolved).unwrap(),
             conflict_status: serde_json::to_string(&ConflictStatus::Clean).unwrap(),
             merge_readiness: serde_json::to_string(&MergeReadiness::Ready).unwrap(),
             last_checked_at: "100".to_string(),
@@ -470,6 +478,7 @@ mod tests {
             lifecycle: PrLifecycle::Open,
             ci: CiStatus::Passing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         }
     }

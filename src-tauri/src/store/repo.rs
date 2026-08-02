@@ -4321,6 +4321,7 @@ pub async fn apply_pull_request_snapshot(
     a.lifecycle = Set(snapshot.lifecycle.as_str().to_string());
     a.ci_status = Set(serde_json::to_string(&snapshot.ci).unwrap_or_default());
     a.review_status = Set(serde_json::to_string(&snapshot.review).unwrap_or_default());
+    a.thread_status = Set(serde_json::to_string(&snapshot.threads).unwrap_or_default());
     a.conflict_status = Set(serde_json::to_string(&snapshot.conflict).unwrap_or_default());
     a.merge_readiness = Set(serde_json::to_string(readiness).unwrap_or_default());
     a.last_checked_at = Set(now());
@@ -8208,6 +8209,7 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
@@ -8252,6 +8254,7 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
@@ -8315,6 +8318,7 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
@@ -8354,6 +8358,7 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
@@ -8399,6 +8404,7 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
@@ -8449,6 +8455,7 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         apply_pull_request_snapshot(&db, matching.id, &matching_snapshot, &crate::host::MergeReadiness::Ready)
@@ -8465,6 +8472,7 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         apply_pull_request_snapshot(&db, unrelated.id, &unrelated_snapshot, &crate::host::MergeReadiness::Ready)
@@ -8509,6 +8517,7 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
@@ -8803,6 +8812,7 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         apply_pull_request_snapshot(&db, first.id, &snapshot, &crate::host::MergeReadiness::Ready)
@@ -8851,6 +8861,7 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Closed,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         apply_pull_request_snapshot(&db, closed.id, &closed_snapshot, &crate::host::MergeReadiness::Ready)
@@ -8873,6 +8884,7 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         apply_pull_request_snapshot(&db, merged.id, &merged_snapshot, &crate::host::MergeReadiness::Ready)
@@ -9155,12 +9167,14 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Open,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         let readiness =
             crate::host::judge::merge_readiness(
                 &snapshot.ci,
                 &snapshot.review,
+                &snapshot.threads,
                 &snapshot.conflict,
                 &host::UpstreamStatus::None,
             );
@@ -9229,11 +9243,13 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Open,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         let readiness = crate::host::judge::merge_readiness(
                 &snapshot.ci,
                 &snapshot.review,
+                &snapshot.threads,
                 &snapshot.conflict,
                 &host::UpstreamStatus::None,
             );
@@ -9266,11 +9282,13 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Open,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         let readiness = crate::host::judge::merge_readiness(
                 &snapshot.ci,
                 &snapshot.review,
+                &snapshot.threads,
                 &snapshot.conflict,
                 &host::UpstreamStatus::None,
             );
