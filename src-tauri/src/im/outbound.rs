@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DingTalkCopy {
+    pub locale: String,
     pub permission_title: String,
     pub permission_reply_command: String,
     pub verdict_allowed: String,
@@ -46,6 +47,9 @@ pub struct DingTalkCopy {
 impl DingTalkCopy {
     pub fn validate(&self) -> anyhow::Result<()> {
         const MAX_FIELD_CHARS: usize = 2_000;
+        if !matches!(self.locale.as_str(), "en" | "zh") {
+            anyhow::bail!("DingTalk copy locale must be en or zh");
+        }
         let fields = [
             ("permissionTitle", self.permission_title.as_str()),
             (
@@ -439,6 +443,7 @@ mod tests {
 
     fn dingtalk_copy() -> DingTalkCopy {
         DingTalkCopy {
+            locale: "zh".into(),
             permission_title: "权限请求".into(),
             permission_reply_command: "复制一条命令回复：".into(),
             verdict_allowed: "已允许 ✓".into(),
@@ -611,6 +616,12 @@ mod tests {
         let summary = dingtalk_resync_summary(&copy, &[(7, "Run tests".into())]);
         assert!(summary.contains("1 项待处理"));
         assert!(summary.contains("#7 Run tests"));
+
+        let invalid_locale = DingTalkCopy {
+            locale: "fr".into(),
+            ..copy.clone()
+        };
+        assert!(invalid_locale.validate().is_err());
 
         let invalid = DingTalkCopy {
             permission_title: String::new(),

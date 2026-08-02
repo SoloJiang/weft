@@ -1112,6 +1112,7 @@ function ImSettings() {
 
   async function selectProvider(next: ImProviderId) {
     if (next === provider || saving) return;
+    setSaving(true);
     setLoaded(false);
     try {
       await api.imSetProvider(next);
@@ -1119,12 +1120,15 @@ function ImSettings() {
       setStatus(await api.imStatus());
     } finally {
       setLoaded(true);
+      setSaving(false);
     }
   }
 
   // 开关 = 启用/断开。乐观翻转：展开/收起即时响应，后台再落库重启桥。
   async function toggle(on: boolean) {
+    if (saving) return;
     const prev = enabled;
+    setSaving(true);
     setEnabled(on);
     try {
       await api.imSetEnabled(provider, on);
@@ -1132,6 +1136,8 @@ function ImSettings() {
     } catch (err) {
       setEnabled(prev);
       throw err;
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -1139,6 +1145,7 @@ function ImSettings() {
   const dirty = appId.trim() !== savedAppId.trim() || secret.length > 0;
 
   async function reconnect() {
+    if (saving) return;
     const prevStatus = status;
     setSaving(true);
     setStatus("connecting");

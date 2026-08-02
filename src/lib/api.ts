@@ -518,6 +518,7 @@ export const api = {
 };
 
 export interface DingTalkCopy {
+  locale: "en" | "zh";
   permissionTitle: string;
   permissionReplyCommand: string;
   verdictAllowed: string;

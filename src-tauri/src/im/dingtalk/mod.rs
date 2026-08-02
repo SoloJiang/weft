@@ -128,6 +128,9 @@ impl DingTalkChannel {
         if sender_user_id.is_empty() {
             return;
         }
+        let Some(chat_type) = message.normalized_chat_type() else {
+            return;
+        };
         let now = Instant::now();
         let mut contexts = self
             .inner
@@ -151,7 +154,7 @@ impl DingTalkChannel {
             ReplyContext {
                 session_webhook: message.session_webhook.clone(),
                 expires_at_ms: message.session_webhook_expired_time,
-                chat_type: message.normalized_chat_type().to_string(),
+                chat_type: chat_type.to_string(),
                 chat_id: message.group_conversation_id().to_string(),
                 thread_id: message.thread_id().map(str::to_string),
                 sender_user_id,
@@ -598,6 +601,7 @@ mod tests {
 
     fn copy() -> super::super::outbound::DingTalkCopy {
         super::super::outbound::DingTalkCopy {
+            locale: "en".into(),
             permission_title: "permission".into(),
             permission_reply_command: "reply".into(),
             verdict_allowed: "allowed".into(),

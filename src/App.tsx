@@ -32,6 +32,7 @@ function ImMessageCopySync() {
 
   useEffect(() => {
     const copy: DingTalkCopy = {
+      locale,
       permissionTitle: t("imMessages.permissionTitle"),
       permissionReplyCommand: t("imMessages.permissionReplyCommand"),
       verdictAllowed: t("imMessages.verdictAllowed"),

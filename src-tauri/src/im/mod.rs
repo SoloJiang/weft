@@ -1038,8 +1038,8 @@ async fn drain_inbound_reactions(
 use std::sync::Arc;
 use tauri::Manager;
 
-/// IM 出站文案默认语言。后端无持久化 UI 语言设置（lang 是 lead/worker 的
-/// 逐命令入参），桥侧固定中文优先（项目主语言）。
+/// Providers without synchronized copy use the project-default Chinese locale.
+/// DingTalk carries the active WebView locale in `DingTalkCopy` instead.
 const IM_LANG: &str = "zh";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1193,13 +1193,18 @@ where
     }
 }
 
-/// 启动（或重启）桥：读设置→不 ready 则置 disabled；ready 则装通知器、起出站
-/// 消费与 ws 入站两个任务。设置变更后再次调用即可（代际号淘汰旧任务）。
+/// 启动（或重启）桥：同步起新代并淘汰旧任务，再异步读设置；不 ready 则置
+/// disabled，ready 则装通知器、起出站消费与 ws 入站两个任务。
 /// 通知器在「不 ready 提前返回」前不安装——避免 disabled 时仍堆积事件。
 pub fn spawn(app: tauri::AppHandle) {
+    // Bump before scheduling so a settings command cannot return (or yield to
+    // another callback) while the provider it just retired is still live.
+    let (generation, cards, acks, mut generation_cancel) = {
+        let bridge = app.state::<ImBridge>();
+        bridge.bump()
+    };
     tauri::async_runtime::spawn(async move {
         let bridge = app.state::<ImBridge>();
-        let (generation, cards, acks, mut generation_cancel) = bridge.bump();
         let db = app.state::<crate::store::Db>().inner().clone();
 
         let settings = match ImSettings::load(&db).await {
@@ -1277,6 +1282,11 @@ pub fn spawn(app: tauri::AppHandle) {
                 }
             }
         };
+        let notice_lang = dingtalk_copy
+            .as_ref()
+            .map(|copy| copy.locale.as_str())
+            .unwrap_or(IM_LANG)
+            .to_string();
 
         // 入站 👀 reaction 是回执增强，不应挡住消息进入 lead engine。所有飞书
         // reaction REST 调用放到独立 worker 串行处理；失败只影响回执，不影响投递。
@@ -1340,7 +1350,12 @@ pub fn spawn(app: tauri::AppHandle) {
             return;
         };
         {
-            let (db2, ch, cards2) = (db.clone(), channel.clone(), cards.clone());
+            let (db2, ch, cards2, notice_lang2) = (
+                db.clone(),
+                channel.clone(),
+                cards.clone(),
+                notice_lang.clone(),
+            );
             let mut notifier_cancel = generation_cancel.clone();
             tauri::async_runtime::spawn(async move {
                 // 先补发快照里的已开 Ask（挂接前就 open 的，不会再有 Opened 事件）。
@@ -1364,6 +1379,7 @@ pub fn spawn(app: tauri::AppHandle) {
                         &db2,
                         ch.as_ref(),
                         &cards2,
+                        &notice_lang2,
                     );
                     if run_until_generation_cancelled(&mut notifier_cancel, operation)
                         .await
@@ -1388,7 +1404,8 @@ pub fn spawn(app: tauri::AppHandle) {
                                 consume_ask_event(ev, &db2, ch.as_ref(), &cards2).await;
                             }
                             BridgeNotifyEvent::Human(ev) => {
-                                consume_human_event(ev, &db2, ch.as_ref(), &cards2).await;
+                                consume_human_event(ev, &db2, ch.as_ref(), &cards2, &notice_lang2)
+                                    .await;
                             }
                         }
                     };
@@ -1788,6 +1805,7 @@ async fn consume_human_event(
     db: &crate::store::Db,
     ch: &dyn Channel,
     cards: &tokio::sync::Mutex<CardIndex>,
+    lang: &str,
 ) {
     let owner = match ImSettings::load(db).await {
         Ok(s) => s.allow_open_ids.into_iter().next(),
@@ -1827,8 +1845,8 @@ async fn consume_human_event(
                 // Background tasks post a stable token rather than prose (they
                 // have no locale); render it here, or a remote human receives
                 // the raw `acp.force_reset_notice`.
-                let body = crate::bus::notice_text::resolve(&ask.text, IM_LANG)
-                    .unwrap_or(ask.text.as_str());
+                let body =
+                    crate::bus::notice_text::resolve(&ask.text, lang).unwrap_or(ask.text.as_str());
                 let notice = format!("{title} · {from}\n{body}");
                 if let Err(e) = ch.send_text(&owner, &notice).await {
                     eprintln!("[weft][im] send stall notice: {e}");
@@ -1842,9 +1860,8 @@ async fn consume_human_event(
                     ask.id,
                     &title,
                     &from,
-                    crate::bus::notice_text::resolve(&ask.text, IM_LANG)
-                        .unwrap_or(ask.text.as_str()),
-                    IM_LANG,
+                    crate::bus::notice_text::resolve(&ask.text, lang).unwrap_or(ask.text.as_str()),
+                    lang,
                 )
                 .await
             {
@@ -1859,14 +1876,14 @@ async fn consume_human_event(
             ..
         } => {
             if let Some(mid) = cards.lock().await.take_human(thread, ask_id) {
-                if let Err(e) = ch.resolve_human_question_card(&mid, &text, IM_LANG).await {
+                if let Err(e) = ch.resolve_human_question_card(&mid, &text, lang).await {
                     eprintln!("[weft][im] patch human resolved card: {e}");
                 }
             }
         }
         crate::bus::state::HumanAskEvent::Cancelled { thread, ask_id } => {
             if let Some(mid) = cards.lock().await.take_human(thread, ask_id) {
-                if let Err(e) = ch.cancel_human_question_card(&mid, IM_LANG).await {
+                if let Err(e) = ch.cancel_human_question_card(&mid, lang).await {
                     eprintln!("[weft][im] patch human cancelled card: {e}");
                 }
             }
@@ -2758,6 +2775,7 @@ mod tests {
     async fn dingtalk_concierge_thread_title_uses_synchronized_copy() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let copy = outbound::DingTalkCopy {
+            locale: "en".into(),
             concierge_dm_prefix: "DingTalk DM".into(),
             concierge_group_prefix: "DingTalk group".into(),
             ..Default::default()
@@ -2785,6 +2803,7 @@ mod tests {
     struct CountingChannel {
         cards: std::sync::atomic::AtomicUsize,
         texts: std::sync::atomic::AtomicUsize,
+        text_bodies: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -2796,8 +2815,9 @@ mod tests {
         async fn patch_card(&self, _m: &str, _c: serde_json::Value) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn send_text(&self, _o: &str, _t: &str) -> anyhow::Result<()> {
+        async fn send_text(&self, _o: &str, text: &str) -> anyhow::Result<()> {
             self.texts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.text_bodies.lock().unwrap().push(text.to_string());
             Ok(())
         }
         async fn send_chat_text(&self, _c: &str, _t: &str) -> anyhow::Result<String> {
@@ -2860,6 +2880,7 @@ mod tests {
             &db,
             &ch,
             &cards,
+            IM_LANG,
         )
         .await;
         assert_eq!(cards_sent(), 1, "answerable → one answer card");
@@ -2873,6 +2894,7 @@ mod tests {
             &db,
             &ch,
             &cards,
+            IM_LANG,
         )
         .await;
         assert_eq!(cards_sent(), 1, "notice must not open an answer card");
@@ -2882,6 +2904,27 @@ mod tests {
             cards.lock().await.take_human(th.id, 2).is_none(),
             "notice must not be recorded in CardIndex",
         );
+
+        let mut force_reset = mk(3, false);
+        force_reset.text = crate::lead_chat::engine::ACP_FORCE_RESET_NOTICE.to_string();
+        consume_human_event(
+            HumanAskEvent::Asked {
+                thread: th.id,
+                ask: force_reset,
+            },
+            &db,
+            &ch,
+            &cards,
+            "en",
+        )
+        .await;
+        let expected = crate::bus::notice_text::resolve(
+            crate::lead_chat::engine::ACP_FORCE_RESET_NOTICE,
+            "en",
+        )
+        .unwrap();
+        let bodies = ch.text_bodies.lock().unwrap();
+        assert!(bodies.last().is_some_and(|body| body.ends_with(expected)));
     }
 
     #[derive(Default)]

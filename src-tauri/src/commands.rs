@@ -2654,6 +2654,14 @@ async fn persist_feishu_scan_credentials(
     .await
 }
 
+async fn persist_im_enabled(
+    db: &Db,
+    provider: crate::im::ImProvider,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    repo::set_setting(db, provider.enabled_key(), if enabled { "1" } else { "0" }).await
+}
+
 #[tauri::command]
 pub async fn im_set_provider(
     app: tauri::AppHandle,
@@ -2702,14 +2710,10 @@ pub async fn im_set_enabled(
     enabled: bool,
 ) -> R<()> {
     let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
-    repo::set_setting(&db, crate::im::K_PROVIDER, provider.as_str())
-        .await
-        .map_err(e)?;
-    repo::set_setting(
-        &db,
-        provider.enabled_key(),
-        if enabled { "1" } else { "0" },
-    )
+    // Toggling a named provider must not select it. A delayed toggle can race a
+    // newer provider choice; keeping K_PROVIDER untouched makes that newer
+    // choice authoritative while still preserving this provider's enabled bit.
+    persist_im_enabled(&db, provider, enabled)
         .await
         .map_err(e)?;
     crate::im::spawn(app);
@@ -2958,6 +2962,33 @@ pub async fn db_change_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn toggling_named_im_provider_does_not_select_it() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+
+        persist_im_enabled(&db, crate::im::ImProvider::Feishu, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_PROVIDER)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("dingtalk")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_ENABLED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
 
     #[tokio::test]
     async fn late_feishu_scan_credentials_keep_newer_dingtalk_selection() {

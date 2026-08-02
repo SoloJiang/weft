@@ -193,6 +193,7 @@ async fn dingtalk_bind_route_persists_native_thread_channel() {
         seed_message_id: "msg_bind".into(),
     };
     let copy = im::outbound::DingTalkCopy {
+        locale: "zh".into(),
         bind_thread_prefix: "已绑定钉钉 thread 到".into(),
         ..Default::default()
     };

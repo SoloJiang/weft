@@ -55,10 +55,11 @@ impl RobotMessage {
         }
     }
 
-    pub fn normalized_chat_type(&self) -> &'static str {
+    pub fn normalized_chat_type(&self) -> Option<&'static str> {
         match self.conversation_type.trim().to_ascii_lowercase().as_str() {
-            "2" | "group" => "group",
-            _ => "p2p",
+            "1" | "p2p" => Some("p2p"),
+            "2" | "group" => Some("group"),
+            _ => None,
         }
     }
 
@@ -145,7 +146,7 @@ pub fn to_inbound(message: &RobotMessage) -> Option<Inbound> {
     if sender_open_id.is_empty() || chat_id.is_empty() || message_id.is_empty() || text.is_empty() {
         return None;
     }
-    let chat_type = message.normalized_chat_type();
+    let chat_type = message.normalized_chat_type()?;
     let thread_id = if chat_type == "group" {
         message.thread_id().map(str::to_string)
     } else {
@@ -447,6 +448,22 @@ mod tests {
         message.msgtype = "text".into();
         message.msg_id.clear();
         assert!(to_inbound(&message).is_none());
+    }
+
+    #[test]
+    fn missing_and_unknown_conversation_types_are_dropped() {
+        let missing: RobotMessage = serde_json::from_value(json!({
+            "conversationId": "cid_group",
+            "msgId": "msg_1",
+            "senderStaffId": "staff_1",
+            "msgtype": "text",
+            "text": { "content": "推进一下" }
+        }))
+        .unwrap();
+        assert!(to_inbound(&missing).is_none());
+
+        let unknown = text_message("unexpected");
+        assert!(to_inbound(&unknown).is_none());
     }
 
     #[test]
