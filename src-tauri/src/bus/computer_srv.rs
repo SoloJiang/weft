@@ -298,18 +298,26 @@ fn session_token_generation(thread: i32, dir: &str, wt: Option<i32>) -> u64 {
         .unwrap_or(0)
 }
 
-/// Invalidate every previously-minted bearer for `(thread, dir, wt)` — see
-/// [`session_token_generations`]. Called by each injection path
+/// Invalidate every previously-minted bearer for `(thread, dir, wt)` AND
+/// render the replacement's token, in ONE critical section on
+/// [`session_token_generations`] — the injection paths
 /// (`bus::inject::inject_computer` and the ACP `acp_mcp_servers` computer
-/// arm) immediately before it renders the replacement session's token.
-/// `#[doc(hidden)] pub` for the same sibling-module/cross-crate-test reason
-/// as [`computer_session_token`].
+/// arm) use exactly the returned value. Bump and render must be atomic:
+/// with them split, two overlapping injections for the same identity could
+/// interleave as rotate(A)→rotate(B)→mint(A)→mint(B), handing BOTH children
+/// a currently-valid latest-generation bearer — the stale child would keep
+/// desktop access under standing grants, exactly what rotation exists to
+/// revoke. Held across the render, each injection's token is pinned to its
+/// OWN bump: whichever rotation lands last is the only one that still
+/// verifies. `#[doc(hidden)] pub` for the same sibling-module/
+/// cross-crate-test reason as [`computer_session_token`].
 #[doc(hidden)]
-pub fn rotate_computer_session_token(thread: i32, dir: &str, wt: Option<i32>) {
+pub fn rotate_and_mint_computer_session_token(thread: i32, dir: &str, wt: Option<i32>) -> String {
     let mut generations =
         session_token_generations().lock().unwrap_or_else(|e| e.into_inner());
     let slot = generations.entry((thread, dir.to_string(), wt)).or_insert(0);
     *slot = slot.wrapping_add(1);
+    render_computer_session_token(thread, dir, wt, *slot)
 }
 
 /// The ONE place this module's HMAC key material gets constructed — shared by
@@ -324,6 +332,19 @@ pub fn rotate_computer_session_token(thread: i32, dir: &str, wt: Option<i32>) {
 /// `.expect()`/`.unwrap()`) per CLAUDE.md's ban on panicking in a
 /// production path.
 fn computer_token_mac(thread: i32, dir: &str, wt: Option<i32>) -> Option<HmacSha256> {
+    computer_token_mac_at(thread, dir, wt, session_token_generation(thread, dir, wt))
+}
+
+/// [`computer_token_mac`] with an EXPLICIT generation — the mint side of an
+/// atomic rotation renders under the generation its own bump produced (see
+/// [`rotate_and_mint_computer_session_token`]), while verification always
+/// goes through [`computer_token_mac`]'s current-generation read.
+fn computer_token_mac_at(
+    thread: i32,
+    dir: &str,
+    wt: Option<i32>,
+    generation: u64,
+) -> Option<HmacSha256> {
     let secret = computer_endpoint_secret()?;
     let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).ok()?;
     // the
@@ -342,13 +363,22 @@ fn computer_token_mac(thread: i32, dir: &str, wt: Option<i32>) -> Option<HmacSha
         Some(id) => format!("wt{id}"),
         None => "none".to_string(),
     };
-    // The identity's CURRENT token generation is part of the MAC input: a
-    // token minted before the latest [`rotate_computer_session_token`] call
-    // for this identity no longer recomputes, so a replaced session's bearer
-    // dies at the entry gate — see [`session_token_generations`].
-    let generation = session_token_generation(thread, dir, wt);
+    // The identity's token generation is part of the MAC input: a token
+    // minted before the latest rotation for this identity no longer
+    // recomputes, so a replaced session's bearer dies at the entry gate —
+    // see [`session_token_generations`].
     mac.update(format!("{thread}/{dir}/{wt_repr}/g{generation}").as_bytes());
     Some(mac)
+}
+
+/// Render the hex token for one explicit generation — shared by
+/// [`computer_session_token`] (current generation) and the atomic
+/// [`rotate_and_mint_computer_session_token`] (its own just-bumped one).
+fn render_computer_session_token(thread: i32, dir: &str, wt: Option<i32>, generation: u64) -> String {
+    match computer_token_mac_at(thread, dir, wt, generation) {
+        Some(mac) => hex::encode(mac.finalize().into_bytes()),
+        None => "token-mac-unavailable-not-valid-hex".to_string(),
+    }
 }
 
 /// The per-session token [`inject::computer_url`] appends as `&key=<token>`
@@ -375,10 +405,7 @@ fn computer_token_mac(thread: i32, dir: &str, wt: Option<i32>) -> Option<HmacSha
 /// accepting) an empty/predictable token.
 #[doc(hidden)]
 pub fn computer_session_token(thread: i32, dir: &str, wt: Option<i32>) -> String {
-    match computer_token_mac(thread, dir, wt) {
-        Some(mac) => hex::encode(mac.finalize().into_bytes()),
-        None => "token-mac-unavailable-not-valid-hex".to_string(),
-    }
+    render_computer_session_token(thread, dir, wt, session_token_generation(thread, dir, wt))
 }
 
 /// Constant-time verification of a caller-supplied `key` against the token
@@ -3813,45 +3840,39 @@ fn rotate_audit_at_size(path: &std::path::Path, max_bytes: u64) {
 /// whatever mode it already had; only fresh files (and rotated-away originals
 /// — see `rotate_if_full`) get the tightened default.
 async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    #[cfg(unix)]
-    options.mode(0o600);
-    // on Windows, a freshly
-    // CREATED audit file (the first append, or the new live file after each
-    // rotation) must get the same owner-only protection unix gets from `0o600`
-    // above — otherwise it inherits a permissive `WEFT_HOME` directory ACL and
-    // exposes window titles/actions/coordinates/outcomes to other local
-    // accounts. Detect creation up front so the ACL is applied ONCE (re-stamping
-    // it on every append would be pure overhead); on a `try_exists` error, treat
-    // it as new and apply anyway (fail toward protecting).
+    // On Windows the owner-only DACL rides the CREATION call itself
+    // (`create_file_owner_only`) — a freshly created audit file (the first
+    // append, or the new live file after each rotation) never exists for
+    // even an instant under a permissive `WEFT_HOME` inherited ACL that
+    // would expose window titles/actions/coordinates/outcomes to other
+    // local accounts, and there is no post-create stamp another account's
+    // pre-held handle could survive. An already-existing file keeps the ACL
+    // its own creation (through this same primitive) stamped. Fail-CLOSED:
+    // when the owner-only creation fails, this one line goes unlogged
+    // (the caller's best-effort contract) rather than writing through a
+    // permissive ACL.
     #[cfg(windows)]
-    let is_new = !tokio::fs::try_exists(path).await.unwrap_or(false);
-    let file = options.open(path).await?;
-    #[cfg(windows)]
-    if is_new {
-        use std::os::windows::io::AsRawHandle;
-        // fail CLOSED
-        // when the owner-only ACL cannot be applied — matching the screenshot
-        // and secret-config writers, and superseding the earlier best-effort
-        // stance. The audit records window titles, actions, coordinates and
-        // outcomes; on a shared machine a filesystem that rejects the DACL
-        // operation would otherwise leave those readable to other accounts
-        // through the permissive ACL inherited from `WEFT_HOME`, despite the
-        // documented owner-only protection. Close and remove the freshly
-        // created file so no permissive-ACL artifact survives; the caller's
-        // best-effort contract turns this into "this one line goes unlogged".
-        if !crate::bus::inject::restrict_handle_to_owner(file.as_raw_handle()) {
-            drop(file);
-            let _ = tokio::fs::remove_file(path).await;
-            return Err(std::io::Error::other(
-                "audit file ACL restriction failed — refusing to write through a permissive ACL",
-            ));
-        }
+    {
+        return match crate::bus::inject::create_file_owner_only(
+            path,
+            crate::bus::inject::OwnerOnlyCreate::AppendOrCreate,
+        ) {
+            Some(file) => Ok(tokio::fs::File::from_std(file)),
+            None => Err(std::io::Error::other(
+                "audit file owner-only creation failed — refusing to write through a permissive ACL",
+            )),
+        };
     }
-    Ok(file)
+    #[cfg(not(windows))]
+    {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options.open(path).await
+    }
 }
 
 /// The session's own Weft-managed output root for `(thread, dir[, wt])`,
@@ -4597,18 +4618,41 @@ mod tests {
         assert!(verify_computer_token(933_001, "70", Some(1), &old), "current render verifies");
         let sibling = computer_session_token(933_001, "70", Some(2));
 
-        rotate_computer_session_token(933_001, "70", Some(1));
+        let fresh = rotate_and_mint_computer_session_token(933_001, "70", Some(1));
 
         assert!(
             !verify_computer_token(933_001, "70", Some(1), &old),
             "the pre-rotation bearer must be refused once the identity was re-injected"
         );
-        let fresh = computer_session_token(933_001, "70", Some(1));
         assert_ne!(old, fresh, "the replacement session's bearer is a different token");
         assert!(verify_computer_token(933_001, "70", Some(1), &fresh), "only the fresh one verifies");
+        assert_eq!(
+            fresh,
+            computer_session_token(933_001, "70", Some(1)),
+            "the atomic mint IS the current render — no separate re-read needed"
+        );
         assert!(
             verify_computer_token(933_001, "70", Some(2), &sibling),
             "a sibling worktree's own bearer must survive the rotation"
+        );
+    }
+
+    /// Bump and render share one critical section: each of two back-to-back
+    /// rotations mints its OWN generation's token, so overlapping injections
+    /// can never both end up holding the latest-generation bearer — at most
+    /// the LAST rotation's token verifies.
+    #[test]
+    fn overlapping_rotations_never_share_the_latest_bearer() {
+        let first = rotate_and_mint_computer_session_token(933_101, "70", None);
+        let second = rotate_and_mint_computer_session_token(933_101, "70", None);
+        assert_ne!(first, second, "each rotation mints its own generation's token");
+        assert!(
+            !verify_computer_token(933_101, "70", None, &first),
+            "the earlier rotation's bearer must already be dead"
+        );
+        assert!(
+            verify_computer_token(933_101, "70", None, &second),
+            "only the last rotation's bearer verifies"
         );
     }
 

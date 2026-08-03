@@ -179,8 +179,20 @@ fn computer_url(base: &str, thread: i32, dir: &str, wt: Option<i32>) -> String {
     // the bearer is minted for the EXACT `wt` this
     // URL embeds (see `computer_srv::computer_token_mac`), so a worker that
     // later swaps its own `?wt=` to a sibling's id presents a token that no
-    // longer matches and is rejected server-side.
+    // longer matches and is rejected server-side. Current-generation render —
+    // the INJECTION paths never call this; each carries the token its own
+    // atomic rotate-and-mint produced (see `computer_url_with_key`).
     let key = crate::bus::computer_srv::computer_session_token(thread, dir, wt);
+    computer_url_with_key(base, thread, dir, wt, &key)
+}
+
+/// [`computer_url`] with an explicit, already-minted bearer — the shape the
+/// injection paths use so the URL carries EXACTLY the token their own atomic
+/// rotate-and-mint produced, never a separately re-read one: two overlapping
+/// injections that each rotated and THEN re-read would both render the
+/// LATEST generation, keeping the stale child's bearer alive alongside the
+/// replacement's.
+fn computer_url_with_key(base: &str, thread: i32, dir: &str, wt: Option<i32>, key: &str) -> String {
     match wt {
         Some(id) => format!("{base}/computer/{thread}/{dir}/mcp?wt={id}&key={key}"),
         None => format!("{base}/computer/{thread}/{dir}/mcp?key={key}"),
@@ -238,14 +250,15 @@ pub fn acp_mcp_servers(
     }
     if include_computer {
         // An ACP session establishment replaces this identity's previous
-        // child — rotating BEFORE minting invalidates every bearer issued to
-        // the predecessor (see
-        // `computer_srv::rotate_computer_session_token`), same as
-        // `inject_computer` does for the non-ACP engines.
-        crate::bus::computer_srv::rotate_computer_session_token(thread, dir, computer_wt);
+        // child — the ATOMIC rotate-and-mint invalidates every bearer issued
+        // to the predecessor and pins THIS injection's URL to its own bump
+        // (see `computer_srv::rotate_and_mint_computer_session_token`), same
+        // as `inject_computer` does for the non-ACP engines.
+        let key =
+            crate::bus::computer_srv::rotate_and_mint_computer_session_token(thread, dir, computer_wt);
         out.push(crate::acp::McpServerSpec {
             name: "weft_computer".into(),
-            url: computer_url(base, thread, dir, computer_wt),
+            url: computer_url_with_key(base, thread, dir, computer_wt, &key),
         });
     }
     out
@@ -575,12 +588,14 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, wt: Optio
     }
     // This injection belongs to a NEW child for `(thread, dir, wt)` — a
     // spawn, a rerun, a resume under a new persisted session, or an engine
-    // switch. Rotating BEFORE minting renders the replacement's token under
-    // a fresh generation, which invalidates every token issued to the child
-    // it replaces (see `computer_srv::rotate_computer_session_token`) — the
-    // old process's bearer gets a bare 401 from then on.
-    crate::bus::computer_srv::rotate_computer_session_token(thread, dir, wt);
-    let url = computer_url(base, thread, dir, wt);
+    // switch. The ATOMIC rotate-and-mint renders the replacement's token
+    // under the generation its own bump produced, which invalidates every
+    // token issued to the child it replaces (a bare 401 from then on) and —
+    // because bump and render share one critical section — can never hand
+    // two overlapping injections the same latest-generation bearer (see
+    // `computer_srv::rotate_and_mint_computer_session_token`).
+    let key = crate::bus::computer_srv::rotate_and_mint_computer_session_token(thread, dir, wt);
+    let url = computer_url_with_key(base, thread, dir, wt, &key);
     match tool {
         "claude" => inject_computer_claude(thread, dir, wt, &url),
         // codex is the ONE tool
@@ -609,10 +624,10 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, wt: Optio
                     "-c".into(),
                     format!("mcp_servers.weft_computer.bearer_token_env_var={COMPUTER_TOKEN_ENV_VAR}"),
                 ],
-                env: vec![(
-                    COMPUTER_TOKEN_ENV_VAR.to_string(),
-                    crate::bus::computer_srv::computer_session_token(thread, dir, wt),
-                )],
+                // The SAME token this injection's atomic rotate-and-mint
+                // produced above — never a separate re-read, which could
+                // render a LATER overlapping injection's generation.
+                env: vec![(COMPUTER_TOKEN_ENV_VAR.to_string(), key.clone())],
             }
         }
         // The bearer-carrying URL rides the OPENCODE_CONFIG_CONTENT
@@ -742,17 +757,17 @@ fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> bool {
 /// Windows owner-only atomic write
 /// — the `#[cfg(windows)]` counterpart of the unix
 /// `create_new(0o600)` path in [`write_owner_only_atomic`]. Writes to a
-/// pid-stamped temp beside `path`, applies an owner-only PROTECTED DACL to the
-/// open handle BEFORE any secret bytes land, writes+flushes, then atomically
-/// replaces `path`. Fail-CLOSED at every step: any failure removes the temp
-/// and returns `false` (the caller then injects nothing) so a bearer token is
-/// NEVER left on disk under the checkout directory's inherited ACL, which on a
-/// shared/traversable Windows checkout could otherwise be read by another
-/// local account.
+/// pid-stamped temp beside `path`, CREATED with an owner-only PROTECTED DACL
+/// supplied on the creation call itself (see [`create_file_owner_only`] —
+/// never created first and tightened afterward), writes+flushes, then
+/// atomically replaces `path`. Fail-CLOSED at every step: any failure
+/// removes the temp and returns `false` (the caller then injects nothing) so
+/// a bearer token is NEVER on disk under the directory's inherited ACL — not
+/// even for the instant a create-then-tighten sequence would leave open on a
+/// shared/traversable Windows checkout.
 #[cfg(windows)]
 fn set_owner_only_windows(path: &Path, bytes: &[u8]) -> bool {
     use std::io::Write as _;
-    use std::os::windows::io::AsRawHandle;
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
@@ -767,16 +782,12 @@ fn set_owner_only_windows(path: &Path, bytes: &[u8]) -> bool {
     };
     let tmp = path.with_file_name(format!(".{name}.{}.{seq}.weft-tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp); // best-effort: clear a stale temp from a crashed run
-    let Ok(file) = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) else {
+    // The owner-only DACL rides the CREATION call itself — there is no
+    // instant in which the temp exists under the directory's inherited ACL
+    // for another account to open and hold; see `create_file_owner_only`.
+    let Some(file) = create_file_owner_only(&tmp, OwnerOnlyCreate::CreateNew) else {
         return false;
     };
-    // Lock the DACL down to the current user ONLY, before the bearer is
-    // written — if that can't be guaranteed, write nothing.
-    if !restrict_handle_to_owner(file.as_raw_handle()) {
-        drop(file);
-        let _ = std::fs::remove_file(&tmp);
-        return false;
-    }
     let mut w = std::io::BufWriter::new(file);
     if w.write_all(bytes).is_err() || w.flush().is_err() {
         drop(w);
@@ -821,103 +832,164 @@ fn windows_replace_existing(from: &Path, to: &Path) -> bool {
     }
 }
 
-/// Stamp an open file HANDLE with a PROTECTED DACL granting full control to
-/// ONLY the current process user's SID. The
-/// `PROTECTED_DACL_SECURITY_INFORMATION` flag also strips inherited ACEs, so a
-/// permissive parent-directory ACL on a shared checkout can't leave the file
-/// readable by other accounts. Returns `false` on ANY failure — the caller
-/// treats that as "could not secure the file" and acts accordingly.
-///
-/// `pub(crate)` because it is the ONE Windows owner-only-file primitive shared
-/// across every place unix uses a `0o600` create: the secret-config writer
-/// here, plus the screenshot save (`computer::screenshot_resolved`)
-/// and the audit log (`bus::computer_srv::open_audit_file_for_
-/// append`).
+/// Build a DACL granting full control to ONLY the current process user's
+/// SID — the shared core of [`create_file_owner_only`]. The returned ACL is
+/// self-contained (`SetEntriesInAclW` copies the SID into it) and MUST be
+/// released with `LocalFree` by the caller. `None` on ANY failure.
 #[cfg(windows)]
-pub(crate) fn restrict_handle_to_owner(handle: std::os::windows::io::RawHandle) -> bool {
+unsafe fn owner_only_dacl() -> Option<*mut windows::Win32::Security::ACL> {
     use windows::core::PWSTR;
-    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::Authorization::{
-        SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS,
-        SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+        SetEntriesInAclW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS, TRUSTEE_IS_SID,
+        TRUSTEE_IS_USER, TRUSTEE_W,
     };
-    use windows::Win32::Security::{
-        GetTokenInformation, TokenUser, ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, PSID,
-        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
-    };
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, ACE_FLAGS, ACL, PSID, TOKEN_QUERY, TOKEN_USER};
     use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    // SAFETY: each pointer below is either a live stack local or a heap buffer
-    // kept alive for the duration of the call that reads it; the process token
-    // handle and the ACL allocated by `SetEntriesInAclW` are released on every
-    // return path. Any Win32 failure short-circuits to `false`.
-    unsafe {
-        let mut token = HANDLE(core::ptr::null_mut());
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
-            return false;
-        }
-        // Two-call idiom: first sizes the TOKEN_USER buffer, then fills it.
-        let mut needed: u32 = 0;
-        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
-        if needed == 0 {
-            let _ = CloseHandle(token);
-            return false;
-        }
-        let mut buf = vec![0u8; needed as usize];
-        let filled = GetTokenInformation(
-            token,
-            TokenUser,
-            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
-            needed,
-            &mut needed,
-        )
-        .is_ok();
+    let mut token = HANDLE(core::ptr::null_mut());
+    if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+        return None;
+    }
+    // Two-call idiom: first sizes the TOKEN_USER buffer, then fills it.
+    let mut needed: u32 = 0;
+    let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+    if needed == 0 {
         let _ = CloseHandle(token);
-        if !filled {
-            return false;
-        }
-        // The SID points INTO `buf`, which must stay alive until after
-        // `SetEntriesInAclW` copies it into the new ACL below.
-        let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
-        let sid: PSID = token_user.User.Sid;
-        if sid.0.is_null() {
-            return false;
-        }
+        return None;
+    }
+    let mut buf = vec![0u8; needed as usize];
+    let filled = GetTokenInformation(
+        token,
+        TokenUser,
+        Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+        needed,
+        &mut needed,
+    )
+    .is_ok();
+    let _ = CloseHandle(token);
+    if !filled {
+        return None;
+    }
+    // The SID points INTO `buf`, which must stay alive until after
+    // `SetEntriesInAclW` copies it into the new ACL below.
+    let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
+    let sid: PSID = token_user.User.Sid;
+    if sid.0.is_null() {
+        return None;
+    }
 
-        let ea = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: FILE_ALL_ACCESS.0,
-            grfAccessMode: SET_ACCESS,
-            grfInheritance: ACE_FLAGS(0), // NO_INHERITANCE
-            Trustee: TRUSTEE_W {
-                pMultipleTrustee: core::ptr::null_mut(),
-                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_USER,
-                // For TRUSTEE_IS_SID, `ptstrName` is reinterpreted as the SID
-                // pointer (documented Win32 idiom).
-                ptstrName: PWSTR(sid.0 as *mut u16),
-            },
+    let ea = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_ALL_ACCESS.0,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: ACE_FLAGS(0), // NO_INHERITANCE
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: core::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            // For TRUSTEE_IS_SID, `ptstrName` is reinterpreted as the SID
+            // pointer (documented Win32 idiom).
+            ptstrName: PWSTR(sid.0 as *mut u16),
+        },
+    };
+
+    let mut new_dacl: *mut ACL = core::ptr::null_mut();
+    if SetEntriesInAclW(Some(core::slice::from_ref(&ea)), None, &mut new_dacl).0 != 0
+        || new_dacl.is_null()
+    {
+        return None;
+    }
+    Some(new_dacl)
+}
+
+/// How [`create_file_owner_only`] opens the file — the two shapes the three
+/// owner-only writers need.
+#[cfg(windows)]
+pub(crate) enum OwnerOnlyCreate {
+    /// Fail if the path already exists — the secret-config temp and the
+    /// screenshot writers, mirroring unix `create_new`.
+    CreateNew,
+    /// Append, creating if absent — the audit log. An already-existing file
+    /// keeps the ACL its OWN creation (through this same primitive) stamped.
+    AppendOrCreate,
+}
+
+/// Create `path` with an owner-only DACL supplied ON THE CREATION CALL
+/// ITSELF, via `SECURITY_ATTRIBUTES` on `CreateFileW` — the Windows
+/// counterpart of the unix single-syscall `create_new + mode(0o600)`.
+/// Creating first and tightening afterward leaves an instant in which the
+/// file exists under the destination directory's inherited (possibly
+/// other-account-readable) ACL — another account monitoring the directory
+/// can open the predictable new entry in that instant and RETAIN its read
+/// handle across the later tightening, reading every secret byte written
+/// afterward despite the tightening "succeeding". An explicit DACL in the
+/// creation security descriptor is applied verbatim (inherited ACEs from
+/// the parent are not merged in), so no such instant exists. Returns `None`
+/// on any failure — every caller fails closed.
+///
+/// `pub(crate)` because it is the ONE Windows owner-only-file primitive
+/// shared across every place unix uses a `0o600` create: the secret-config
+/// writer here, plus the screenshot save (`computer::screenshot_resolved`)
+/// and the audit log (`bus::computer_srv::open_audit_file_for_append`).
+#[cfg(windows)]
+pub(crate) fn create_file_owner_only(path: &Path, mode: OwnerOnlyCreate) -> Option<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GENERIC_WRITE, LocalFree, HLOCAL};
+    use windows::Win32::Security::{
+        InitializeSecurityDescriptor, SetSecurityDescriptorDacl, ACL, PSECURITY_DESCRIPTOR,
+        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_REVISION,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_NEW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE,
+        FILE_SHARE_READ, OPEN_ALWAYS,
+    };
+
+    // SAFETY: every pointer below is a stack local (or the `LocalFree`-owned
+    // ACL) kept alive for the duration of the call that reads it; the ACL is
+    // released on every return path after `CreateFileW` (which copies what it
+    // needs into the file's own security descriptor). Any Win32 failure
+    // short-circuits to `None`.
+    unsafe {
+        let dacl = owner_only_dacl()?;
+        let free_dacl = || {
+            let _ = LocalFree(Some(HLOCAL(dacl as *mut core::ffi::c_void)));
         };
-
-        let mut new_dacl: *mut ACL = core::ptr::null_mut();
-        if SetEntriesInAclW(Some(core::slice::from_ref(&ea)), None, &mut new_dacl).0 != 0
-            || new_dacl.is_null()
+        let mut sd = SECURITY_DESCRIPTOR::default();
+        let psd = PSECURITY_DESCRIPTOR(&mut sd as *mut SECURITY_DESCRIPTOR as *mut core::ffi::c_void);
+        if InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION).is_err()
+            || SetSecurityDescriptorDacl(psd, true, Some(dacl as *const ACL), false).is_err()
         {
-            return false;
+            free_dacl();
+            return None;
         }
-
-        let set = SetSecurityInfo(
-            HANDLE(handle),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(new_dacl as *const ACL),
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: psd.0,
+            bInheritHandle: false.into(),
+        };
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let (access, share, disposition) = match mode {
+            OwnerOnlyCreate::CreateNew => (GENERIC_WRITE.0, FILE_SHARE_MODE(0), CREATE_NEW),
+            OwnerOnlyCreate::AppendOrCreate => (FILE_APPEND_DATA.0, FILE_SHARE_READ, OPEN_ALWAYS),
+        };
+        let created = CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            access,
+            share,
+            Some(&sa),
+            disposition,
+            FILE_ATTRIBUTE_NORMAL,
             None,
         );
-        let _ = LocalFree(Some(HLOCAL(new_dacl as *mut core::ffi::c_void)));
-        set.0 == 0
+        free_dacl();
+        match created {
+            Ok(handle) => Some(std::fs::File::from_raw_handle(handle.0 as _)),
+            Err(_) => None,
+        }
     }
 }
 

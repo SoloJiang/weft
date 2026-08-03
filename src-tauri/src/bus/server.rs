@@ -332,28 +332,26 @@ const AUTO_APPROVED_INTERNAL_TOOLS: &[(&str, &str)] = &[
 /// (fail-safe). Auto-approving opencode internals would need an unambiguous
 /// server-identity signal, which the flat tool name alone doesn't carry.
 ///
-/// ONE named exception: the literal string
-/// `weft_computer_computer` — opencode's flattened form of `weft_computer`'s
-/// `computer` tool — IS recognized, unlike every other opencode-flattened
-/// name. This is safe specifically because it is unambiguous: there is no
-/// server literally named `weft` with a tool named `computer_computer`
-/// (weft never injects a bare `weft` server), and no OTHER weft server name
-/// is a prefix of `weft_computer` that could also split this string into a
-/// real `(server, tool)` pair. It is the one literal this repo can vouch for
-/// by construction, not a general relaxation of the ambiguity rule above —
-/// see `AUTO_APPROVED_INTERNAL_TOOLS`'s own doc for WHY recognizing it here
-/// matters (avoiding a double card once the server-side gate owns approval).
-/// codex's own MCP tool-naming convention for a hook payload is NOT
-/// independently confirmed from this repo's code (unlike claude's and
-/// opencode's, both verified against real hook/plugin output) — if its shape
-/// differs from both of the above, a codex-driven `weft_computer` call may
-/// still double-card until that shape is confirmed and given its own case
-/// here. That is a known, currently-tolerated limitation, not a correctness
-/// bug: the server-side gate still owns the actual approval either way.
+/// The opencode-flattened literal `weft_computer_computer` is deliberately
+/// NOT special-cased, even though it is the flat form of weft's own
+/// `weft_computer`/`computer`: WEFT never injects a bare `weft` server, but
+/// the SUB-REPO's own opencode config can — a repository shipping a server
+/// named `weft` with a tool named `computer_computer` flattens to the
+/// IDENTICAL string, and that foreign, repo-controlled tool never passes
+/// `computer_srv`'s server-side approval gate, so auto-approving the name
+/// here would execute repository-chosen behavior with no Needs-you decision
+/// anywhere. A flat name carries no provenance, so it stays gated like every
+/// other opencode-flattened name; the cost is that an opencode-driven
+/// `weft_computer` call cards at this hook layer AND at the server-side gate
+/// (a double card — safe, merely redundant). The claude-style
+/// `mcp__<server>__<tool>` shape stays recognized: its delimiters make the
+/// split itself unambiguous, and weft's own `--mcp-config` injection owns
+/// the `weft_computer` server name binding for claude sessions. codex's own
+/// MCP tool-naming convention for a hook payload is NOT independently
+/// confirmed from this repo's code — a codex-driven `weft_computer` call may
+/// double-card until that shape is confirmed. Either way the server-side
+/// gate owns the actual approval.
 fn split_internal_tool(tool_name: &str) -> Option<(&str, &str)> {
-    if tool_name == "weft_computer_computer" {
-        return Some(("weft_computer", "computer"));
-    }
     tool_name
         .strip_prefix("mcp__")
         .and_then(|rest| rest.split_once("__"))
@@ -512,11 +510,10 @@ fn hook_decision(decision: &str, reason: &str) -> Response {
 /// "computer: <action>" (M2-B) — see the dedicated branch below.
 ///
 /// KNOWN LIMITATION shared with the rest of this function's MCP recognition:
-/// the `computer` branch keys off `split_internal_tool`, which parses the
-/// claude-style `mcp__<server>__<tool>` name AND the one opencode-flattened
-/// literal `weft_computer_computer` it special-cases (see that function's
-/// doc for why that ONE literal is safe to recognize). A codex-flattened
-/// name for the same tool — shape not confirmed from this repo's own code —
+/// the `computer` branch keys off `split_internal_tool`, which parses ONLY
+/// the claude-style `mcp__<server>__<tool>` name (see that function's doc
+/// for why the opencode-flattened literal is deliberately not recognized).
+/// An opencode- or codex-flattened name for the same tool
 /// is NOT recognized here and falls through to the generic MCP branch below,
 /// surfacing as `Unknown` risk rather than the GUI-specific tier. In
 /// practice this branch rarely fires at all anymore: the
@@ -565,9 +562,9 @@ pub(crate) fn summarize(
     // nor `file_path` branch below recognizes, so it needs its own
     // tool-name-keyed branch ahead of them. ONLY the claude-style
     // `mcp__weft_computer__computer` name is recognized here —
-    // `split_internal_tool`'s doc explains why a codex/opencode-flattened
-    // name (`weft_computer_computer`) is NOT: it falls through to the
-    // generic MCP branch below and surfaces as `Unknown` risk, a known
+    // `split_internal_tool`'s doc explains why the codex/opencode-flattened
+    // names are NOT: they fall through to the
+    // generic MCP branch below and surface as `Unknown` risk, a known
     // limitation this function shares with the rest of its MCP recognition.
     if split_internal_tool(tool_name) == Some(("weft_computer", "computer")) {
         let action = s("action").unwrap_or_default();
@@ -3268,16 +3265,24 @@ mod tests {
         assert_ne!(summary, "computer: left_click");
     }
 
-    /// `weft_computer_computer` (opencode's flattened
-    /// form) is the ONE opencode-shaped name `split_internal_tool` special-
-    /// cases as unambiguous — so `summarize`'s Gui branch, which delegates to
-    /// it, now recognizes this literal too, not just the claude-style name.
+    /// The opencode-flattened literal must NOT be recognized as weft's own
+    /// computer tool anywhere: a repository's own opencode config can expose
+    /// a server named `weft` with a tool named `computer_computer`, whose
+    /// flat form is the identical string — that foreign tool never passes
+    /// the server-side approval gate, so it must card here like any other
+    /// MCP call, never ride the internal-tool auto-approve.
     #[test]
-    fn summarize_recognizes_the_opencode_flattened_weft_computer_literal() {
+    fn the_opencode_flattened_weft_computer_literal_stays_gated() {
         let input = json!({"action": "left_click"});
-        let (summary, _detail, risk, _action_key) = summarize("weft_computer_computer", Some(&input));
-        assert_eq!(summary, "computer: left_click");
-        assert_eq!(risk, RiskLevel::Write);
+        let (summary, _detail, _risk, _action_key) = summarize("weft_computer_computer", Some(&input));
+        assert_ne!(
+            summary, "computer: left_click",
+            "the ambiguous flat name must fall through to the generic MCP branch"
+        );
+        assert!(
+            !is_weft_internal_tool("weft_computer_computer"),
+            "an ambiguous flat name must never auto-approve"
+        );
     }
 
     #[test]
@@ -3329,15 +3334,16 @@ mod tests {
         assert!(is_weft_internal_tool("mcp__weft_global__list_workspaces"));
     }
 
-    /// Both name shapes `split_internal_tool`
-    /// recognizes for `weft_computer` — claude's `mcp__<server>__<tool>` and
-    /// the one opencode-flattened literal — auto-approve at this hook layer
-    /// (see `AUTO_APPROVED_INTERNAL_TOOLS`'s doc: the server-side gate owns
-    /// real approval now, this only avoids a double card).
+    /// Only claude's `mcp__<server>__<tool>` shape auto-approves for
+    /// `weft_computer` at this hook layer (see
+    /// `AUTO_APPROVED_INTERNAL_TOOLS`'s doc: the server-side gate owns real
+    /// approval, this only avoids a double card); the opencode-flattened
+    /// literal is ambiguous and stays gated — see
+    /// `the_opencode_flattened_weft_computer_literal_stays_gated`.
     #[test]
-    fn weft_internal_recognizes_both_weft_computer_name_shapes() {
+    fn weft_internal_recognizes_only_the_claude_weft_computer_name_shape() {
         assert!(is_weft_internal_tool("mcp__weft_computer__computer"));
-        assert!(is_weft_internal_tool("weft_computer_computer"));
+        assert!(!is_weft_internal_tool("weft_computer_computer"));
     }
 
     /// Issue #110: `register_pr` is a pure metadata/bookkeeping write (same

@@ -1102,27 +1102,26 @@ pub fn screenshot_resolved(
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsRawHandle;
-        // create the PNG
-        // with an owner-only DACL BEFORE any pixels are written — the Windows
-        // analog of the unix `0o600` create above. Otherwise `image.save`
-        // creates it under the (possibly permissive) inherited directory ACL,
-        // leaving captured mail/browser/password-manager pixels readable by
-        // other local accounts on a shared/traversable `WEFT_HOME`. Fail-CLOSED:
-        // if the file can't be locked down, remove it and error rather than
-        // leave an unprotected capture on disk.
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| ComputerError::Io(e.to_string()))?;
-        if !crate::bus::inject::restrict_handle_to_owner(file.as_raw_handle()) {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(ComputerError::Io(
-                "could not apply an owner-only ACL to the screenshot file".into(),
-            ));
-        }
+        // Create the PNG WITH an owner-only DACL on the creation call itself
+        // — the Windows analog of the unix `0o600` create above. A plain
+        // create would put it under the (possibly permissive) inherited
+        // directory ACL — even a create-then-tighten sequence leaves an
+        // instant in which another local account can open (and KEEP open)
+        // captured mail/browser/password-manager pixels on a shared
+        // `WEFT_HOME`; see `bus::inject::create_file_owner_only`.
+        // Fail-CLOSED: no file is created at all when it can't be locked
+        // down.
+        let file = match crate::bus::inject::create_file_owner_only(
+            &path,
+            crate::bus::inject::OwnerOnlyCreate::CreateNew,
+        ) {
+            Some(file) => file,
+            None => {
+                return Err(ComputerError::Io(
+                    "could not create the screenshot file with an owner-only ACL".into(),
+                ));
+            }
+        };
         let mut w = std::io::BufWriter::new(file);
         // Same `cleanup_on_err` + explicit-flush guarantee as the unix branch.
         cleanup_on_err(&path, || {
@@ -1430,6 +1429,24 @@ struct ControlHolderState {
     /// is most likely to want them. [`InputFlightGuard`]'s `Drop` removes a
     /// doomed holder the instant the injection lands.
     doomed: bool,
+    /// Identifies THIS hold instance, minted fresh for every new hold (never
+    /// for a renewal) — the post-registration `escape_ready` confirmation and
+    /// the failed-registration rollback both match on it, never on the
+    /// `(thread, dir, wt)` triple alone: a replacement hold for the SAME
+    /// triple (the original expired mid-registration, a new acquire won the
+    /// vacant slot) must not be confirmed ready by the OLD acquire's still-
+    /// running round-trip — its own registration is still queued (or about to
+    /// fail/unregister), and a triple-only match would let a same-route call
+    /// start injecting with no confirmed kill switch — nor torn down by the
+    /// old acquire's rollback.
+    hold_nonce: u64,
+}
+
+/// See [`ControlHolderState::hold_nonce`] — process-wide, monotonically
+/// increasing, never reused within a process lifetime.
+fn next_hold_nonce() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::SeqCst)
 }
 
 /// A snapshot of who currently holds the computer-use control lease, for
@@ -1611,6 +1628,10 @@ fn now_ms() -> u64 {
 pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), ComputerError> {
     let now = std::time::Instant::now();
     let sync_needed;
+    // The nonce of OUR OWN fresh hold — only meaningful when `sync_needed`;
+    // the confirmation/rollback below match on it so they can never touch a
+    // REPLACEMENT hold that won this triple's slot mid-registration.
+    let mut my_nonce = 0;
     {
         let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
         // refuse any
@@ -1688,6 +1709,7 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
         // Every other reachable path is a fresh hold and always starts
         // `escape_ready: false`.
         if sync_needed {
+            my_nonce = next_hold_nonce();
             *guard = Some(ControlHolderState {
                 thread,
                 dir: dir.to_string(),
@@ -1696,6 +1718,7 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
                 expires_at_ms: now_ms().saturating_add(CONTROL_LEASE_MS),
                 escape_ready: false,
                 doomed: false,
+                hold_nonce: my_nonce,
             });
         } else if let Some(holder) = guard.as_mut() {
             holder.expires_at = lease_deadline(now);
@@ -1728,12 +1751,11 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
         if !permitted {
             // Roll back: never grant control without a working kill switch
             // once a real subsystem exists and it just failed to register.
-            // Only clears OUR OWN just-stored hold — if some other caller
-            // already raced in and overwrote it, this leaves that one alone.
-            let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-            if matches!(guard.as_ref(), Some(h) if h.thread == thread && h.dir == dir && h.wt == wt) {
-                *guard = None;
-            }
+            // Only clears OUR OWN just-stored hold — matched by hold nonce,
+            // so a REPLACEMENT hold that won this SAME triple's slot while
+            // our registration ran (its own confirmation still pending) is
+            // left alone, exactly like any other caller's hold.
+            rollback_unconfirmed_hold(my_nonce);
             return Err(ComputerError::EscapeUnavailable);
         }
         // registration for THIS fresh hold is now
@@ -1749,26 +1771,45 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
         // `holder_is_live` alone: an unconfirmed hold still counts as live
         // for `Busy` purposes, but that says nothing about who owns the slot
         // once this call resumes).
-        let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_mut() {
-            Some(h) if h.thread == thread && h.dir == dir && h.wt == wt => {
-                h.escape_ready = true;
-            }
-            _ => {
-                // Someone else's fresh hold won this slot while our own
-                // registration was in flight — our lease is gone.
-                // `EscapeRegistrationPending` here (rather than
-                // `EscapeUnavailable`) is deliberate: nothing failed
-                // PERMANENTLY — the OS-level registration this call just ran
-                // actually succeeded — so the right instruction to the
-                // caller is the same "retry me" contract as the pending-
-                // renewal refusal above, not "the kill switch itself is
-                // unavailable".
-                return Err(ComputerError::EscapeRegistrationPending);
-            }
-        }
+        confirm_escape_ready_for_hold(my_nonce)?;
     }
     Ok(())
+}
+
+/// Flip [`ControlHolderState::escape_ready`] for EXACTLY the hold instance
+/// `nonce` names — never for whatever holder happens to occupy the triple's
+/// slot now. A replacement hold for the SAME `(thread, dir, wt)` (the
+/// original lapsed mid-registration and a new acquire won the vacancy) has
+/// its OWN registration still queued behind this one on `shortcut_mutex`;
+/// confirming it here would let a same-route call read `escape_ready ==
+/// true` and start injecting before — or despite — that registration's own
+/// outcome. On any mismatch (slot empty, another triple, a replacement
+/// instance): `EscapeRegistrationPending` — nothing failed PERMANENTLY (the
+/// OS-level registration this call just ran actually succeeded), so the
+/// right instruction to the caller is the same "retry me" contract as the
+/// pending-renewal refusal in [`acquire_control`], not "the kill switch
+/// itself is unavailable".
+fn confirm_escape_ready_for_hold(nonce: u64) -> Result<(), ComputerError> {
+    let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_mut() {
+        Some(h) if h.hold_nonce == nonce => {
+            h.escape_ready = true;
+            Ok(())
+        }
+        _ => Err(ComputerError::EscapeRegistrationPending),
+    }
+}
+
+/// Remove EXACTLY the hold instance `nonce` names — the failed-registration
+/// rollback half of [`confirm_escape_ready_for_hold`]'s contract. A
+/// replacement hold occupying the same triple is someone else's live
+/// acquisition mid-flight; tearing it down here would yank a slot its owner
+/// legitimately won.
+fn rollback_unconfirmed_hold(nonce: u64) {
+    let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(guard.as_ref(), Some(h) if h.hold_nonce == nonce) {
+        *guard = None;
+    }
 }
 
 /// The single lease judgment the final pre-backend recheck needs, read in
@@ -4431,6 +4472,62 @@ mod tests {
         clear_control();
     }
 
+    /// The confirmation and rollback of a fresh hold's Escape registration
+    /// bind to the HOLD INSTANCE (its nonce), never the triple: a
+    /// replacement hold that won the same `(thread, dir, wt)` slot while the
+    /// original's registration round-trip was still running must not be
+    /// confirmed ready by that stale round-trip — its own registration is
+    /// still pending — nor torn down by the stale rollback.
+    #[test]
+    fn escape_confirmation_and_rollback_bind_to_the_hold_instance_not_the_triple() {
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_control();
+
+        // Hold A: stored, registration "in flight" (escape_ready false).
+        let nonce_a = next_hold_nonce();
+        let store = |nonce: u64| {
+            let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(ControlHolderState {
+                thread: 920_301,
+                dir: "esc-nonce".to_string(),
+                wt: None,
+                expires_at: lease_deadline(std::time::Instant::now()),
+                expires_at_ms: now_ms().saturating_add(CONTROL_LEASE_MS),
+                escape_ready: false,
+                doomed: false,
+                hold_nonce: nonce,
+            });
+        };
+        store(nonce_a);
+
+        // A lapsed; hold B (SAME triple, new instance) won the vacant slot.
+        let nonce_b = next_hold_nonce();
+        store(nonce_b);
+
+        // A's stale confirmation must refuse and must NOT mark B ready.
+        assert!(matches!(
+            confirm_escape_ready_for_hold(nonce_a),
+            Err(ComputerError::EscapeRegistrationPending)
+        ));
+        {
+            let guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            let ready = matches!(guard.as_ref(), Some(h) if h.escape_ready);
+            assert!(!ready, "the replacement hold must stay unconfirmed until ITS OWN round-trip");
+        }
+        // A's stale rollback must NOT tear B down.
+        rollback_unconfirmed_hold(nonce_a);
+        assert!(control_state().is_some(), "the replacement hold must survive the stale rollback");
+
+        // B's own confirmation works; B's own rollback (before confirm) would
+        // have removed exactly B.
+        confirm_escape_ready_for_hold(nonce_b).expect("the owning hold confirms normally");
+        {
+            let guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(matches!(guard.as_ref(), Some(h) if h.escape_ready && h.hold_nonce == nonce_b));
+        }
+        clear_control();
+    }
+
     /// The end-to-end property the escape_ready flag exists for: a holder whose OWN
     /// registration is still in flight (`escape_ready: false`) must not be
     /// inherited by ANY later `acquire_control` call — not a same-holder
@@ -4453,6 +4550,7 @@ mod tests {
                 expires_at_ms: now_ms().saturating_add(CONTROL_LEASE_MS),
                 escape_ready: false,
                 doomed: false,
+                hold_nonce: next_hold_nonce(),
             });
         }
 

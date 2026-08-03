@@ -288,7 +288,14 @@ pub fn dingtalk_permission_text(ask: &crate::ask::Ask, copy: &DingTalkCopy) -> S
         "{} · {title}\n{}\n{who}\n\n{}\n\n{}\n/allow {}\n/deny {}\n/always {}\n/full {}",
         copy.permission_title,
         clamp_with_marker(&ask.summary, 200, &copy.truncated_marker),
-        clamp_with_marker(&ask.detail, 3000, &copy.truncated_marker),
+        // 与 Lark 卡一致：出站 IM 一律用脱敏视图(有则)——这条消息在人回答
+        // 之前就发到了第三方,`type` 的 detail 是将要键入的原文(密码等),
+        // 原样外发等于在拒绝之前已经泄露。本地桌面卡才展示完整 detail。
+        clamp_with_marker(
+            ask.detail_redacted.as_deref().unwrap_or(&ask.detail),
+            3000,
+            &copy.truncated_marker,
+        ),
         copy.permission_reply_command,
         ask.id,
         ask.id,
@@ -550,6 +557,25 @@ mod tests {
         let s = perm_card(&a, "zh").to_string();
         assert!(!s.contains("hunter2"), "the raw detail must never reach the outbound card: {s}");
         assert!(s.contains("text_redacted"), "{s}");
+    }
+
+    /// The DingTalk permission text has the same outbound-redaction contract
+    /// as the Lark card: `detail_redacted` (when set) is what leaves the
+    /// machine — this message reaches DingTalk BEFORE the human answers, so
+    /// a `type` action's literal keystrokes must never ride it; absent, the
+    /// full detail falls through unchanged.
+    #[test]
+    fn dingtalk_permission_text_uses_detail_redacted_over_detail_when_present() {
+        let mut a = ask();
+        a.detail = "hunter2".into();
+        a.detail_redacted = Some("{\"text_redacted\":true,\"text_chars\":7}".into());
+        let s = dingtalk_permission_text(&a, &dingtalk_copy());
+        assert!(!s.contains("hunter2"), "the raw detail must never reach DingTalk: {s}");
+        assert!(s.contains("text_redacted"), "{s}");
+
+        let plain = ask();
+        let s = dingtalk_permission_text(&plain, &dingtalk_copy());
+        assert!(s.contains("npm test"), "no redaction set — the full detail falls through: {s}");
     }
 
     /// The common case (no redaction needed) is untouched: `detail_redacted`
