@@ -1385,6 +1385,20 @@ struct ControlHolderState {
     /// sibling is a DIFFERENT holder — the same `(thread, dir, wt)` triple the
     /// per-session bearer already binds (round-13/14).
     wt: Option<i32>,
+    /// The AUTHORITATIVE lease deadline, on the monotonic clock (issue #160
+    /// round-29 P2, Codex mod.rs:1625). This used to be the epoch-ms value
+    /// below: a wall-clock correction BACKWARD after acquisition (NTP step, a
+    /// manual change, resume-time correction) then kept the nominal 30s lease
+    /// live for the whole rollback — the old session could keep renewing while
+    /// every other session got `Busy`, and the Escape registration/banner
+    /// stayed armed far longer than promised. `Instant` is immune to clock
+    /// adjustments, so every LIVENESS judgment ([`holder_is_live`]'s callers)
+    /// now reads this; the epoch-ms field below survives ONLY as the
+    /// serialized display estimate.
+    expires_at: std::time::Instant,
+    /// Display-only wall-clock estimate of the same deadline, for the
+    /// serialized [`ControlHolder`] snapshot the Settings banner reads. NEVER
+    /// consulted for liveness — see `expires_at` above.
     expires_at_ms: u64,
     /// Whether THIS hold's OS-level global Escape shortcut registration has
     /// actually finished and passed [`escape_guard_permits_control`] (issue
@@ -1443,10 +1457,13 @@ fn input_in_flight() -> bool {
     INPUT_IN_FLIGHT.load(Ordering::SeqCst)
 }
 
-/// Whether a control-lease holder recorded at `expires_at_ms` should still be
-/// treated as live at `now` — issue #160 round-12 P1 #4 (Codex 1198).
+/// Whether a control-lease holder with monotonic deadline `expires_at` should
+/// still be treated as live at `now` — issue #160 round-12 P1 #4 (Codex 1198);
+/// both instants come from the monotonic clock since round-29 P2 (see
+/// [`ControlHolderState::expires_at`]'s doc for the backward-correction hazard
+/// the epoch-ms comparison had).
 /// Normally just "hasn't hit its `CONTROL_LEASE_MS` sliding-window expiry
-/// yet", but ALSO true, regardless of `expires_at_ms`, whenever
+/// yet", but ALSO true, regardless of the deadline, whenever
 /// [`input_in_flight`] is true: a synchronous injection (a long `type`, or a
 /// blocking OS backend call) can legitimately run past `CONTROL_LEASE_MS`
 /// while still actively driving the desktop, and treating that as "expired"
@@ -1471,8 +1488,19 @@ fn input_in_flight() -> bool {
 /// that would need the backend's own input calls broken into cancellable
 /// chunks, a larger change tracked separately (see round-5's own notes on
 /// this).
-fn holder_is_live(expires_at_ms: u64, now: u64) -> bool {
-    expires_at_ms > now || input_in_flight()
+fn holder_is_live(expires_at: std::time::Instant, now: std::time::Instant) -> bool {
+    expires_at > now || input_in_flight()
+}
+
+/// `now + CONTROL_LEASE_MS` on the monotonic clock. `checked_add` (never a
+/// bare `+`, which panics on overflow): unreachable in practice — the
+/// monotonic clock would have to sit within 30s of its representable maximum
+/// — but the fallback is `now` itself, i.e. an ALREADY-EXPIRED lease, which
+/// fails closed (denies control) rather than ever granting one that outlives
+/// its window.
+fn lease_deadline(now: std::time::Instant) -> std::time::Instant {
+    now.checked_add(std::time::Duration::from_millis(CONTROL_LEASE_MS))
+        .unwrap_or(now)
 }
 
 fn control_mutex() -> &'static Mutex<Option<ControlHolderState>> {
@@ -1565,7 +1593,7 @@ fn now_ms() -> u64 {
 /// and a registration that hangs forever still self-heals via the normal 30s
 /// lease expiry rather than wedging the desktop.
 pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), ComputerError> {
-    let now = now_ms();
+    let now = std::time::Instant::now();
     let sync_needed;
     {
         let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
@@ -1577,7 +1605,7 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
                 // gets `Busy` below rather than silently renewing this lease.
                 let is_same_holder =
                     holder.thread == thread && holder.dir == dir && holder.wt == wt;
-                let is_live = holder_is_live(holder.expires_at_ms, now);
+                let is_live = holder_is_live(holder.expires_at, now);
                 if is_live && !is_same_holder {
                     return Err(ComputerError::Busy {
                         thread: holder.thread,
@@ -1622,11 +1650,13 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
                 thread,
                 dir: dir.to_string(),
                 wt,
-                expires_at_ms: now + CONTROL_LEASE_MS,
+                expires_at: lease_deadline(now),
+                expires_at_ms: now_ms().saturating_add(CONTROL_LEASE_MS),
                 escape_ready: false,
             });
         } else if let Some(holder) = guard.as_mut() {
-            holder.expires_at_ms = now + CONTROL_LEASE_MS;
+            holder.expires_at = lease_deadline(now);
+            holder.expires_at_ms = now_ms().saturating_add(CONTROL_LEASE_MS);
         }
     }
     // Synced OUTSIDE the mutex guard (issue #160 review R1 #5): the Escape
@@ -1720,9 +1750,9 @@ pub fn release_control(thread: i32, dir: &str, wt: Option<i32>) {
 /// [`control_state`] is still the only production entry point.
 fn control_state_detect_and_clear_if_expired() -> (Option<ControlHolder>, bool) {
     let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-    let now = now_ms();
+    let now = std::time::Instant::now();
     match guard.as_ref() {
-        Some(h) if holder_is_live(h.expires_at_ms, now) => (
+        Some(h) if holder_is_live(h.expires_at, now) => (
             Some(ControlHolder {
                 thread: h.thread,
                 dir: h.dir.clone(),
@@ -2141,10 +2171,10 @@ static ESCAPE_REGISTER_OK: AtomicBool = AtomicBool::new(true);
 /// raced in with now-outdated decisions.
 fn sync_shortcut_state() {
     let _serialize = shortcut_mutex().lock().unwrap_or_else(|e| e.into_inner());
-    let now = now_ms();
+    let now = std::time::Instant::now();
     let holder_live = {
         let guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-        matches!(guard.as_ref(), Some(h) if holder_is_live(h.expires_at_ms, now))
+        matches!(guard.as_ref(), Some(h) if holder_is_live(h.expires_at, now))
     };
     if holder_live {
         #[cfg(test)]
@@ -2457,6 +2487,16 @@ fn key_token(part: &str) -> Result<KeyToken, ComputerError> {
 mod tests {
     use super::*;
     use crate::store::Db;
+
+    /// A monotonic deadline strictly in the past — the round-29 replacement
+    /// for the old `now_ms().saturating_sub(1)` expiry-forcing writes. The
+    /// `checked_sub` fallback (`now` itself) still reads as expired:
+    /// [`holder_is_live`] requires `expires_at > now`, and the clock can only
+    /// have advanced by the time it re-reads `now`.
+    fn expired_deadline() -> std::time::Instant {
+        let now = std::time::Instant::now();
+        now.checked_sub(std::time::Duration::from_millis(1)).unwrap_or(now)
+    }
 
     fn window(id: u32, app: &str, title: &str) -> WindowInfo {
         WindowInfo {
@@ -3466,12 +3506,12 @@ mod tests {
 
         // A manually-expired lease reads as absent (and is cleaned up) —
         // simulated by acquiring, then reaching into the internal state to
-        // force `expires_at_ms` into the past instead of sleeping 30s.
+        // force the monotonic deadline into the past instead of sleeping 30s.
         acquire_control(1, "10", None).unwrap();
         {
             let mut guard = control_mutex().lock().unwrap();
             if let Some(h) = guard.as_mut() {
-                h.expires_at_ms = now_ms().saturating_sub(1);
+                h.expires_at = expired_deadline();
             }
         }
         assert!(control_state().is_none(), "expired lease must read as absent");
@@ -3565,7 +3605,7 @@ mod tests {
         {
             let mut guard = control_mutex().lock().unwrap();
             if let Some(h) = guard.as_mut() {
-                h.expires_at_ms = now_ms().saturating_sub(1);
+                h.expires_at = expired_deadline();
             }
         }
 
@@ -3914,7 +3954,7 @@ mod tests {
         {
             let mut g = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(h) = g.as_mut() {
-                h.expires_at_ms = now_ms().saturating_sub(1);
+                h.expires_at = expired_deadline();
             }
         }
 
@@ -4047,14 +4087,14 @@ mod tests {
     fn acquire_control_pending_registration_blocks_same_holder_renewal() {
         let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         clear_control();
-        let now = now_ms();
         {
             let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(ControlHolderState {
                 thread: 920_201,
                 dir: "esc-pending".to_string(),
                 wt: None,
-                expires_at_ms: now + CONTROL_LEASE_MS,
+                expires_at: lease_deadline(std::time::Instant::now()),
+                expires_at_ms: now_ms().saturating_add(CONTROL_LEASE_MS),
                 escape_ready: false,
             });
         }
@@ -4098,6 +4138,40 @@ mod tests {
             "a same-holder renewal must succeed once escape_ready is true"
         );
 
+        clear_control();
+    }
+
+    /// issue #160 round-29 P2 (Codex mod.rs:1625): lease liveness is judged on
+    /// the MONOTONIC deadline alone — the serialized wall-clock estimate is
+    /// display-only. Simulated backward clock correction: the wall-clock
+    /// mirror claims the lease has practically forever left while the
+    /// monotonic deadline has passed; the holder must read as EXPIRED (a
+    /// wall-clock comparison would have kept it live for the whole rollback,
+    /// wedging every other session on `Busy` and keeping the Escape
+    /// registration/banner armed past the promised 30s).
+    #[test]
+    fn lease_liveness_ignores_the_wall_clock_mirror() {
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_control();
+        acquire_control(920_301, "clock-rollback", None).unwrap();
+        {
+            let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(h) = guard.as_mut() {
+                h.expires_at = expired_deadline();
+                h.expires_at_ms = u64::MAX;
+            }
+        }
+
+        assert!(
+            control_state().is_none(),
+            "an expired monotonic deadline must expire the lease no matter what the \
+             wall-clock mirror claims"
+        );
+        // And the slot is genuinely free: a different session acquires it.
+        assert!(
+            acquire_control(920_302, "clock-rollback-next", None).is_ok(),
+            "the expired lease must not hold the next session to Busy"
+        );
         clear_control();
     }
 

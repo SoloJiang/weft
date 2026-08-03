@@ -5472,6 +5472,12 @@ fn acp_permission_risk(
         // ReadOnly, injected input is Write, anything unrecognized stays
         // Unknown. Same closed word list the weft_computer MCP path uses.
         PermissionIntent::Gui { action } => crate::ask::classify_gui_action(action),
+        // issue #160 round-29 P1: defensive only — the ACP consumer replies
+        // AllowOnce for this intent before any risk is ever computed (see the
+        // handler's own carve-out), so this arm is never reached in
+        // production. The honest tier is still the action word's own, same as
+        // the Gui arm above, so nothing downstream could ever under-tier it.
+        PermissionIntent::WeftComputerMcp { action } => crate::ask::classify_gui_action(action),
         PermissionIntent::Other { kind } => {
             crate::ask::classify_risk(crate::ask::RiskSignal::Other {
                 tool_name: kind,
@@ -5536,6 +5542,27 @@ fn acp_permission_risk(
 /// plain `#[test]`.
 fn is_gui_intent(intent: &crate::acp::permission::PermissionIntent) -> bool {
     matches!(intent, crate::acp::permission::PermissionIntent::Gui { .. })
+}
+
+/// issue #160 round-29 P1 (Codex permission.rs:173): whether this permission
+/// request is for weft's OWN injected `weft_computer` MCP tool — see
+/// `permission::PermissionIntent::WeftComputerMcp`'s doc (and
+/// `is_weft_computer_mcp_call`'s, for the strict title recognition and its
+/// trust argument). The ACP consumer auto-ALLOWS these, checked BEFORE the
+/// `is_gui_intent` rejection above would match the same `rawInput.action`
+/// shape: the call's real side effect is an HTTP request to weft's own
+/// `bus::computer_srv` gate chain (enabled check, approval card, control
+/// lease, throttle, Stop, audit), so rejecting it broke every omp-side
+/// computer-use action that omp permission-gates, and carding it here would
+/// double-card what that server already cards — the same reasoning
+/// `bus::server::AUTO_APPROVED_INTERNAL_TOOLS` records for this exact tool
+/// on the claude/opencode hook path. Pure and synchronous for the same
+/// unit-testability reason as `is_gui_intent` above.
+fn is_weft_computer_mcp_intent(intent: &crate::acp::permission::PermissionIntent) -> bool {
+    matches!(
+        intent,
+        crate::acp::permission::PermissionIntent::WeftComputerMcp { .. }
+    )
 }
 
 /// How much of the reasoning stream the busy-line chip shows.
@@ -5884,6 +5911,19 @@ async fn acp_consumer(
                 if reject_now {
                     client
                         .reply_permission(&request_id, &options, crate::acp::Want::RejectOnce)
+                        .await;
+                    continue;
+                }
+                // issue #160 round-29 P1 (Codex permission.rs:173): weft's
+                // OWN injected `weft_computer` MCP tool is auto-allowed,
+                // BEFORE the native-GUI rejection below (whose broadened
+                // `rawInput.action` match would otherwise swallow it) — the
+                // server-side gate chain owns the real approval. See
+                // `is_weft_computer_mcp_intent`'s doc for the full rationale
+                // and the strict provenance recognition behind the intent.
+                if is_weft_computer_mcp_intent(&intent) {
+                    client
+                        .reply_permission(&request_id, &options, crate::acp::Want::AllowOnce)
                         .await;
                     continue;
                 }
@@ -10181,6 +10221,31 @@ mod tests {
         assert!(!is_gui_intent(&PermissionIntent::Write { paths: Vec::new() }));
         assert!(!is_gui_intent(&PermissionIntent::Network));
         assert!(!is_gui_intent(&PermissionIntent::Other { kind: "think".into() }));
+        // issue #160 round-29 P1: the injected weft_computer MCP intent must
+        // NEVER hit the native-GUI rejection — it has its own auto-allow arm.
+        assert!(!is_gui_intent(&PermissionIntent::WeftComputerMcp {
+            action: "left_click".into()
+        }));
+    }
+
+    /// issue #160 round-29 P1 (Codex permission.rs:173): the auto-allow
+    /// carve-out matches EXACTLY the injected-MCP intent variant — every other
+    /// intent (the native Gui one above all) keeps its existing handling.
+    #[test]
+    fn is_weft_computer_mcp_intent_matches_only_its_own_variant() {
+        use crate::acp::permission::PermissionIntent;
+
+        assert!(is_weft_computer_mcp_intent(&PermissionIntent::WeftComputerMcp {
+            action: "screenshot".into()
+        }));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Gui {
+            action: "screenshot".into()
+        }));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Command("echo".into())));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Read { paths: Vec::new() }));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Write { paths: Vec::new() }));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Network));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Other { kind: "think".into() }));
     }
 
     /// An image-only message is addressable in ACP and not in claude, and the

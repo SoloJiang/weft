@@ -2868,7 +2868,26 @@ async fn activate_and_recheck(
     wt: Option<i32>,
     window_id: u32,
 ) -> Result<(), String> {
-    on_blocking(move || activate_target(window_id)).await??;
+    // issue #160 round-29 P2 (Codex computer_srv.rs:2871): run the SAME
+    // synchronous latch/lease recheck the final injection closures run,
+    // INSIDE this closure, immediately before the activation call. Activation
+    // is itself a desktop-control side effect — it raises and FOCUSES the
+    // target application — and the only checks before it (the caller's
+    // `recheck_after_guard` after acquiring `input_flight_guard`) ran before
+    // this closure was scheduled: an Emergency Stop, route deletion (which
+    // clears the lease — round-23), or lease expiry landing while the
+    // preceding resolution or THIS closure sat queued on the blocking pool
+    // would otherwise still let a stopped/deleted session steal foreground
+    // focus, with only the LATER post-activation recheck stopping the
+    // click/type that follows. `recheck_stop_and_lease_before_backend` is
+    // lock-only/synchronous, so it runs at the last instant on the same
+    // thread as the activation call itself.
+    let dir_owned = dir.to_string();
+    on_blocking(move || {
+        recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
+        activate_target(window_id)
+    })
+    .await??;
     recheck_after_guard(db, asks, thread, dir, wt).await
 }
 
@@ -7771,6 +7790,35 @@ mod tests {
         );
 
         mock.windows_sequence.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        computer::clear_emergency_stop(computer::stop_generation());
+    }
+
+    /// issue #160 round-29 P2 (Codex computer_srv.rs:2871): `activate_and_
+    /// recheck` re-runs the synchronous stop/lease recheck INSIDE its blocking
+    /// closure, immediately before the activation call — a Stop that lands
+    /// while the closure sits queued must prevent the target window from ever
+    /// being raised/focused, not merely the click/type that would follow.
+    #[tokio::test]
+    async fn activation_fails_closed_after_stop_without_raising_the_target_window() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        computer::clear_emergency_stop(computer::stop_generation());
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let asks = AskRegistry::new();
+
+        computer::trip_stop_latch();
+        let err = activate_and_recheck(&db, &asks, 904_502, "lead", None, 42)
+            .await
+            .expect_err("a tripped stop latch must fail activation closed");
+        assert!(err.contains("disabled"), "expected the disabled rejection, got: {err}");
+        assert!(
+            mock.actions.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "the closure must refuse BEFORE activate_window raises/focuses anything"
+        );
+
         computer::clear_emergency_stop(computer::stop_generation());
     }
 

@@ -120,6 +120,19 @@ pub enum PermissionIntent {
     /// `weft_computer`'s MCP path (`bus::server::summarize`) uses, so a
     /// `left_click` reads as the same tier from either route.
     Gui { action: String },
+    /// A call to weft's OWN injected `weft_computer` MCP tool (issue #160
+    /// round-29 P1, Codex permission.rs:173) — recognized by the unambiguous
+    /// server-qualified tool-name forms in the title (see
+    /// [`is_weft_computer_mcp_call`]) and pulled out BEFORE the native-GUI
+    /// classification, which would otherwise match the same
+    /// `rawInput.action` shape and reject it. The request's actual side
+    /// effect is an HTTP call to weft's own `bus::computer_srv` gate chain
+    /// (enabled check, approval card, control lease, throttle, Stop, audit),
+    /// so the ACP consumer auto-allows it rather than rejecting it as a
+    /// native GUI action or double-carding what that server already cards —
+    /// the exact posture `bus::server`'s `AUTO_APPROVED_INTERNAL_TOOLS`
+    /// takes for this same tool on the claude/opencode hook path.
+    WeftComputerMcp { action: String },
     /// Anything else; carries the ACP tool kind so the card can name it.
     Other { kind: String },
 }
@@ -171,6 +184,41 @@ fn is_gui_tool_call(tc: &Value) -> bool {
         .and_then(|r| r.get("action"))
         .and_then(|a| a.as_str())
         .is_some_and(crate::ask::is_known_gui_action)
+}
+
+/// Whether this toolCall is weft's OWN injected `weft_computer` MCP tool
+/// (issue #160 round-29 P1, Codex permission.rs:173). The round-27 broadening
+/// of [`is_gui_tool_call`] (any `rawInput.action` naming a known GUI verb)
+/// also matches the injected MCP tool's OWN argument shape — its `rawInput`
+/// IS `{"action": "left_click", ...}` — so without this carve-out, an agent
+/// that permission-gates its MCP calls (omp can) had every legitimate
+/// `weft_computer` call rejected by the native-GUI gate before weft's own
+/// server-side permission chain ever saw it.
+///
+/// Recognized STRICTLY by the two server-qualified tool-name forms this repo
+/// can vouch for — claude-style `mcp__weft_computer__computer` (unambiguous
+/// `__` delimiters) and the one vouched flattened literal
+/// `weft_computer_computer` — mirroring `bus::server::split_internal_tool`'s
+/// exact rule AND its documented limitation: an agent whose MCP tool naming
+/// differs (unconfirmed for omp today, exactly like codex there) is NOT
+/// matched, so its computer calls keep the fail-closed native rejection until
+/// the real shape is confirmed on a live transcript and added here. That
+/// asymmetry is deliberate: an unrecognized form breaks the feature LOUDLY (a
+/// rejected call the agent reports), while a guessed form could quietly
+/// wave through something that isn't the weft server at all.
+///
+/// Trust note: the title is authored by the agent RUNTIME describing its own
+/// tool call (the model picks tools/arguments; it does not name them), which
+/// is the same provenance the hook paths trust for their runtime-reported
+/// `mcp__weft_computer__computer` tool names — and no agent runtime titles a
+/// NATIVE built-in tool with another server's qualified MCP name. Allowing
+/// is also bounded: approval releases whatever call the runtime actually
+/// routed, and a genuinely MCP-routed call lands on weft's own gate chain.
+fn is_weft_computer_mcp_call(tc: &Value) -> bool {
+    matches!(
+        tc.get("title").and_then(|t| t.as_str()),
+        Some("mcp__weft_computer__computer") | Some("weft_computer_computer")
+    )
 }
 
 /// The GUI/computer-use action name for a `computer`/`browser` toolCall: the
@@ -243,6 +291,19 @@ pub fn intent_from_params(params: &Value) -> PermissionIntent {
         .and_then(|c| c.as_str())
     {
         return PermissionIntent::Command(cmd.to_string());
+    }
+    // issue #160 round-29 P1: weft's own injected `weft_computer` MCP tool,
+    // pulled out BEFORE the native-GUI branch below (its rawInput carries the
+    // same `action` shape that branch matches — see
+    // `is_weft_computer_mcp_call`'s doc). AFTER the command check above,
+    // deliberately: a payload carrying BOTH a weft-computer title and a
+    // `rawInput.command` classifies as the shell command it would run —
+    // carded as one, never auto-allowed.
+    if is_weft_computer_mcp_call(tc) {
+        let raw = tc.get("rawInput").cloned().unwrap_or(Value::Null);
+        return PermissionIntent::WeftComputerMcp {
+            action: gui_action(&raw, kind),
+        };
     }
     // omp's built-in computer/browser tool (M2-B, see `is_gui_tool_call`'s
     // doc): its rawInput carries an `action`, a shape none of the `kind`
@@ -317,6 +378,16 @@ pub fn intent_key_from_params(params: &Value) -> String {
         .and_then(|k| k.as_str())
         .unwrap_or("tool");
     let raw = tc.get("rawInput").cloned().unwrap_or(Value::Null);
+    // Mirrors `intent_from_params`'s round-29 carve-out, INCLUDING its
+    // command-first precedence (the `command` guard here — a weft-titled
+    // payload carrying `rawInput.command` classifies as the shell command it
+    // would run, so it must key as one too). Defensive only: the ACP consumer
+    // auto-allows this intent before any grant is ever recorded, so this key
+    // never persists — but if that ever changes, a weft-MCP grant must not
+    // share a bucket with a native `gui:*` one.
+    if is_weft_computer_mcp_call(tc) && raw.get("command").and_then(|c| c.as_str()).is_none() {
+        return format!("weft_computer:{}", gui_action(&raw, kind));
+    }
     // Mirrors `intent_from_params`'s own Gui carve-out: an Always grant for a
     // GUI action is scoped to the ACTION (`gui:screenshot`, `gui:left_click`,
     // …), not lumped into one coarse `tool`/`other` bucket the way `intent_key`
@@ -899,6 +970,81 @@ mod tests {
             PermissionIntent::Read { paths: Vec::new() },
             "an unrecognized action must not be misclassified as GUI"
         );
+    }
+
+    /// issue #160 round-29 P1 (Codex permission.rs:173): a permission request
+    /// for weft's OWN injected `weft_computer` MCP tool — recognized by its
+    /// server-qualified tool-name title — is NOT a native GUI intent, even
+    /// though its `rawInput` carries the exact `action` shape the round-25
+    /// broadening matches. It classifies as `WeftComputerMcp` (auto-allowed by
+    /// the ACP consumer; the server-side gate chain owns the real approval)
+    /// instead of being rejected before weft's own server ever sees the call.
+    #[test]
+    fn a_weft_computer_mcp_titled_call_classifies_as_mcp_not_gui() {
+        for title in ["mcp__weft_computer__computer", "weft_computer_computer"] {
+            let params = json!({
+                "toolCall": {
+                    "title": title,
+                    "kind": "other",
+                    "rawInput": { "action": "left_click", "window": "notes", "coordinate": [1, 2] }
+                }
+            });
+            assert_eq!(
+                intent_from_params(&params),
+                PermissionIntent::WeftComputerMcp { action: "left_click".into() },
+                "{title:?} must classify as the injected MCP tool, not native GUI"
+            );
+            assert_eq!(
+                intent_key_from_params(&params),
+                "weft_computer:left_click",
+                "its (defensive) key must never share the native gui:* bucket"
+            );
+        }
+    }
+
+    /// The round-29 carve-out keeps `intent_from_params`'s command-first
+    /// precedence: a weft-computer-titled payload smuggling a
+    /// `rawInput.command` classifies (and keys) as the shell command it would
+    /// run — carded as one, never auto-allowed as an MCP computer call.
+    #[test]
+    fn a_weft_computer_title_with_a_command_is_still_a_command() {
+        let params = json!({
+            "toolCall": {
+                "title": "mcp__weft_computer__computer",
+                "kind": "execute",
+                "rawInput": { "command": "rm -rf /" }
+            }
+        });
+        assert_eq!(
+            intent_from_params(&params),
+            PermissionIntent::Command("rm -rf /".into())
+        );
+        assert_eq!(
+            intent_key_from_params(&params),
+            intent_key("execute", &json!({ "command": "rm -rf /" })),
+            "the key must follow the command precedence too, not the weft_computer carve-out"
+        );
+    }
+
+    /// Exact-name recognition only — near-miss titles (another server whose
+    /// name embeds `weft_computer`, or a bare `weft_computer`) keep the
+    /// fail-closed native-GUI rejection their `rawInput.action` earns them.
+    #[test]
+    fn a_near_miss_weft_computer_title_stays_native_gui() {
+        for title in ["weft_computer", "mcp__weft_computer2__computer", "my_weft_computer_computer"] {
+            let params = json!({
+                "toolCall": {
+                    "title": title,
+                    "kind": "other",
+                    "rawInput": { "action": "left_click" }
+                }
+            });
+            assert_eq!(
+                intent_from_params(&params),
+                PermissionIntent::Gui { action: "left_click".into() },
+                "{title:?} must NOT be recognized as the injected weft_computer tool"
+            );
+        }
     }
 
     /// Always-grant is scoped to the ACTION for a GUI intent, not lumped
