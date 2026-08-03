@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FolderTree, GitCompare, Info } from "lucide-react";
-import { isInFlight, isPendingNeed, useStore } from "../state/store";
+import { isInFlight, useStore } from "../state/store";
 import { api } from "../lib/api";
 import { readOnlyRevokeDir, readOnlyScopeOf } from "../lib/grants";
 import type { EnabledSkill, ObserveRef, RewindMode } from "../lib/types";
@@ -237,11 +237,8 @@ export function WorkerConversation() {
     threadId != null && sid != null
       ? (leadMessages[threadId] ?? []).filter((m) => m.session_id === sid)
       : [];
-  // Only real questions get an inline reply box — a self-clearing NOTICE
-  // (isPendingNeed = false) has no answer to give, and the backend refuses it
-  // (answer_ask), so including it here would let the user type into a box that
-  // silently errors on submit.
-  const openAsks = needs.filter((n) => n.direction_id === directionId && isPendingNeed(n));
+  // The local `needs` subset contains durable free-text questions only.
+  const openAsks = needs.filter((n) => n.direction_id === directionId);
   const nativeId = live?.nativeId ?? ref?.native_id ?? null;
   // Prefer the live engine's worktree — available synchronously on slot switch,
   // unlike the async `ref` — so relative file refs resolve against this worker.
@@ -355,7 +352,7 @@ export function WorkerConversation() {
         {openAsks.length > 0 && (
           <div className="border-b border-border bg-surface/60 px-3 py-2">
             {openAsks.map((a) => (
-              <AskInline key={a.ask_id} text={a.text} onAnswer={(txt) => void answerAsk(a, txt)} />
+              <AskInline key={a.id} text={a.text} onAnswer={(txt) => void answerAsk(a, txt)} />
             ))}
           </div>
         )}

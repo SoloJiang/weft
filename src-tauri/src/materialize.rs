@@ -449,9 +449,33 @@ pub async fn materialize_direction(
     }
 }
 
+/// Return whether an owned checkout target can be removed safely. A missing
+/// path is harmless: `git worktree remove` will only prune stale registration.
+/// Existing targets must be real directories strictly inside this Weft home's
+/// managed worktree root. Refuse symlink aliases and canonical escapes.
+fn owned_checkout_may_be_removed(repo_path: &Path, worktree_path: &Path) -> bool {
+    let metadata = match std::fs::symlink_metadata(worktree_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    if metadata.file_type().is_symlink() {
+        return false;
+    }
+
+    let Ok(root) = std::fs::canonicalize(worktree_root(repo_path)) else {
+        return false;
+    };
+    let Ok(target) = std::fs::canonicalize(worktree_path) else {
+        return false;
+    };
+    target != root && target.starts_with(root)
+}
+
 /// Physically remove worktrees and their namespaced branches (called during
-/// cascade delete). `removed` is the (worktree_id, repo_id, path, branch,
-/// created_branch, created_checkout) list returned by the repo cascade fns.
+/// cascade delete). Every path needed for cleanup was captured by the delete
+/// transaction, so this post-commit phase never depends on rows that a racing
+/// repo/workspace deletion may already have removed.
 /// Per the zero-accumulation principle the worktree's namespaced branch is torn
 /// down too — but ONLY when weft created it (`created_branch`); a pre-existing
 /// branch the worktree merely checked out (the `-b` fallback) is preserved.
@@ -459,36 +483,50 @@ pub async fn materialize_direction(
 /// true — a reused pre-existing path must survive cascade cleanup. Each
 /// worktree's code-checkpoint shadow repo goes with it (its DB rows were
 /// already deleted by the cascade).
-pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, i32, String, String, bool, bool)]) -> Result<()> {
-    use sea_orm::EntityTrait;
-    for (wt_id, repo_id, path, branch, created_branch, created_checkout) in removed {
-        crate::checkpoint::remove_shadow(*wt_id);
-        if let Some(r) = entities::repo_ref::Entity::find_by_id(*repo_id)
-            .one(&db.0)
-            .await?
-        {
-            let repo_path = std::path::Path::new(&r.local_git_path);
-            if *created_checkout {
-                if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(path)) {
-                    eprintln!("[weft] worktree remove failed for {path}: {e}");
-                }
-            } else {
-                // A reused (non-weft) checkout: keep the directory + contents AND its
-                // git-worktree registration (so it stays a usable worktree), but LOCK it
-                // so the orphan-worktree GC — which reclaims registered, no-longer-DB-tracked
-                // worktrees under weft's root — skips it after the TTL once this row is
-                // dropped. The lock lives in the repo's git metadata, so it also survives a
-                // later repo re-add (which would otherwise re-orphan the checkout).
-                let _ = git::lock_worktree(repo_path, std::path::Path::new(path));
+pub async fn cleanup_removed_worktrees(removed: &[repo::RemovedWorktree]) -> Result<()> {
+    for effect in removed {
+        let op_lock = crate::checkpoint::op_lock(effect.worktree_id);
+        let _op = op_lock.lock().await;
+        crate::checkpoint::remove_shadow(effect.worktree_id);
+
+        let repo_path = Path::new(&effect.repo_local_git_path);
+        let worktree_path = Path::new(&effect.worktree_path);
+        if effect.created_checkout {
+            if !owned_checkout_may_be_removed(repo_path, worktree_path) {
+                eprintln!(
+                    "[weft] refusing to remove owned checkout outside the managed root: {}",
+                    effect.worktree_path
+                );
+                continue;
             }
-            if *created_branch {
-                if let Err(e) = git::delete_branch(repo_path, branch) {
-                    eprintln!("[weft] branch delete failed for {branch}: {e}");
-                }
+            if let Err(error) = git::remove_worktree(repo_path, worktree_path) {
+                eprintln!(
+                    "[weft] worktree remove failed for {}: {error}",
+                    effect.worktree_path
+                );
+            }
+        } else {
+            // A reused (non-weft) checkout: keep the directory + contents AND its
+            // git-worktree registration (so it stays a usable worktree), but LOCK it
+            // so the orphan-worktree GC skips it after the row is dropped.
+            let _ = git::lock_worktree(repo_path, worktree_path);
+        }
+        if effect.created_branch {
+            if let Err(error) = git::delete_branch(repo_path, &effect.branch) {
+                eprintln!(
+                    "[weft] branch delete failed for {}: {error}",
+                    effect.branch
+                );
             }
         }
     }
     Ok(())
+}
+
+/// Compatibility entrypoint for callers that still have a database handle.
+/// Cleanup itself is entirely driven by the committed effect snapshot.
+pub async fn cleanup_worktrees(_db: &Db, removed: &[repo::RemovedWorktree]) -> Result<()> {
+    cleanup_removed_worktrees(removed).await
 }
 
 /// Fully tear down a direction created during a confirm that then failed:
@@ -2856,7 +2894,15 @@ mod tests {
             .await.unwrap();
 
         // Cascade cleanup of a reused (created_checkout=false, created_branch=false) entry.
-        let removed = vec![(1, r.id, wt.to_string_lossy().to_string(), "feat/reused".to_string(), false, false)];
+        let removed = vec![repo::RemovedWorktree {
+            worktree_id: 1,
+            repo_id: r.id,
+            repo_local_git_path: repo_path.to_string_lossy().into_owned(),
+            worktree_path: wt.to_string_lossy().into_owned(),
+            branch: "feat/reused".to_string(),
+            created_branch: false,
+            created_checkout: false,
+        }];
         cleanup_worktrees(&db, &removed).await.unwrap();
 
         // Dir + contents survive...
@@ -2922,6 +2968,226 @@ mod tests {
         cleanup_worktrees(&db, &removed).await.unwrap();
 
         assert!(wt_path.exists(), "R18-2: reused checkout dir must survive cascade cleanup");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn cleanup_effect_survives_repo_delete_while_waiting_for_the_worktree_lock() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-cleanup-race-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "repo",
+            repo_path.to_str().unwrap(),
+            &main,
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "task",
+            "codex",
+            repo_ref.id,
+            "reason",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let worktree = materialize_direction(&db, direction.id).await.unwrap().remove(0);
+        let worktree_path = std::path::PathBuf::from(&worktree.path);
+        let branch = worktree.branch.clone();
+        let shadow = crate::checkpoint::shadow_repo_for(worktree.id).unwrap();
+        std::fs::create_dir_all(&shadow).unwrap();
+        std::fs::write(shadow.join("sentinel"), "checkpoint").unwrap();
+        let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
+
+        let held = crate::checkpoint::op_lock(worktree.id).lock_owned().await;
+        let cleanup = tokio::spawn(async move { cleanup_removed_worktrees(&removed).await });
+        tokio::task::yield_now().await;
+        assert!(!cleanup.is_finished(), "cleanup must wait for the worktree op lock");
+
+        repo::delete_repo_cascade(&db, repo_ref.id).await.unwrap();
+        assert!(repo::get_repo(&db, repo_ref.id).await.unwrap().is_none());
+        drop(held);
+        cleanup.await.unwrap().unwrap();
+
+        assert!(!worktree_path.exists(), "owned checkout removed from the snapshotted repo");
+        assert!(!crate::git::local_branch_exists(&repo_path, &branch));
+        assert!(!shadow.exists(), "checkpoint shadow removed with the effect");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn cleanup_effect_locks_a_reused_checkout_after_its_repo_row_is_deleted() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-cleanup-reused-race-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let reused_path = root.join("user-checkout");
+        crate::git::add_worktree_synced(
+            &repo_path,
+            "feature/reused",
+            &reused_path,
+            &main,
+            false,
+        )
+        .unwrap();
+        std::fs::write(reused_path.join("user.txt"), "keep me").unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "repo",
+            repo_path.to_str().unwrap(),
+            &main,
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "task",
+            "codex",
+            repo_ref.id,
+            "reason",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        repo::record_worktree(
+            &db,
+            repo_ref.id,
+            direction.id,
+            "feature/reused",
+            &reused_path.to_string_lossy(),
+            false,
+            false,
+            "",
+        )
+        .await
+        .unwrap();
+        let removed = repo::delete_thread_cascade(&db, thread.id).await.unwrap();
+        repo::delete_repo_cascade(&db, repo_ref.id).await.unwrap();
+
+        cleanup_removed_worktrees(&removed).await.unwrap();
+
+        assert!(reused_path.join("user.txt").exists());
+        assert!(crate::git::is_registered_worktree(
+            &repo_path,
+            &reused_path,
+            "feature/reused"
+        ));
+        assert!(crate::git::is_worktree_locked(&repo_path, &reused_path));
+        assert!(crate::git::local_branch_exists(&repo_path, "feature/reused"));
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_effect_refuses_owned_checkout_paths_outside_the_managed_root() {
+        use std::os::unix::fs::symlink;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-cleanup-containment-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let outside = root.join("outside-user-worktree");
+        crate::git::add_worktree_synced(
+            &repo_path,
+            "feature/outside",
+            &outside,
+            &main,
+            false,
+        )
+        .unwrap();
+        std::fs::write(outside.join("user.txt"), "keep me").unwrap();
+        let managed_root = worktree_root(&repo_path);
+        std::fs::create_dir_all(&managed_root).unwrap();
+        let escaped_alias = managed_root.join("escaped-link");
+        symlink(&outside, &escaped_alias).unwrap();
+        let removed = vec![
+            repo::RemovedWorktree {
+                worktree_id: 1,
+                repo_id: 1,
+                repo_local_git_path: repo_path.to_string_lossy().into_owned(),
+                worktree_path: outside.to_string_lossy().into_owned(),
+                branch: "feature/outside".to_string(),
+                created_branch: true,
+                created_checkout: true,
+            },
+            repo::RemovedWorktree {
+                worktree_id: 2,
+                repo_id: 1,
+                repo_local_git_path: repo_path.to_string_lossy().into_owned(),
+                worktree_path: escaped_alias.to_string_lossy().into_owned(),
+                branch: "feature/outside".to_string(),
+                created_branch: true,
+                created_checkout: true,
+            },
+        ];
+
+        cleanup_removed_worktrees(&removed).await.unwrap();
+
+        assert!(outside.join("user.txt").exists(), "external checkout must survive");
+        assert!(crate::git::is_registered_worktree(
+            &repo_path,
+            &outside,
+            "feature/outside"
+        ));
 
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);

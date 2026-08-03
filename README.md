@@ -69,7 +69,7 @@ Weft works with the tools and repositories you already trust.
 Weft treats long-running desktop automation as a product problem, not an
 afterthought. It can prevent idle sleep while sessions run, keep the machine
 awake for remote IM commands when the bridge is enabled, mirror asks to
-Feishu/Lark, and back up the local SQLite state as encrypted snapshots to a
+Feishu/Lark or DingTalk, and back up the local SQLite state as encrypted snapshots to a
 private Git remote with a separate Recovery Key.
 
 ## Similar products
@@ -81,7 +81,7 @@ agents and trust it gets done.**
 You give a requirement; Weft works out which repos to touch and why, and waits
 for your go-ahead before it writes. Several agents stay aligned like one small
 team while you follow a single issue. When an agent gets stuck it comes to you —
-and you can keep steering from Feishu/Lark after you close the laptop. Every
+and you can keep steering from Feishu/Lark or DingTalk after you close the laptop. Every
 change lands in its own isolated copy, so your main branch stays clean and the
 diff is one glance to review, with encrypted backups you can restore on a new
 machine.
@@ -118,21 +118,29 @@ The human handles exceptions, not the assembly line.
 ## Operate from chat when you are away
 
 <p align="center">
-  <img src="assets/diagrams/im-en.svg" alt="IM remote control: Feishu cards mirror permission asks and agent questions" width="940" />
+  <img src="assets/diagrams/im-en.svg" alt="IM remote control mirrors permission asks and agent questions" width="940" />
 </p>
 
-Workers can mirror permission asks and agent questions to Feishu/Lark as
-interactive cards. Replying on mobile resolves the same underlying ask the
-desktop UI would resolve, and both surfaces patch to the same final state.
-You can also use a Feishu/Lark reply thread as the remote room for a Weft issue:
-send `/topic <issue-id>` in a group to create or reuse the thread, or send
-`/bind <issue-id>` inside an existing reply thread. Messages in that thread
-route back into the issue's lead conversation.
+Choose Feishu/Lark or DingTalk in Settings; credentials for both stay isolated
+locally while one bridge is active. Permission asks and agent questions resolve
+the same underlying state as the desktop UI. Feishu uses replyable cards and
+issue topics. DingTalk uses Stream Mode with explicit `/allow`, `/deny`,
+`/always`, `/full`, and `/answer` commands, so approvals remain deterministic
+without relying on quote metadata.
+
+For issue rooms, send `/topic <issue-id>` in a Feishu group to create a topic,
+or `/bind <issue-id>` inside an existing Feishu topic. DingTalk topic circles
+expose a stable `openConvThreadId`: create or open a DingTalk thread, then send
+`/bind <issue-id>` while mentioning the bot inside it. Later thread messages that
+mention the bot route into the issue lead, and replies use that inbound message's
+temporary session webhook to return to the same thread. DingTalk's proactive group
+API accepts a parent `openConversationId`, not `openConvThreadId`, so Weft never
+substitutes the parent group ID or misaddresses the thread ID as a group ID.
 
 The bridge currently covers:
 
 - Permission asks and agent questions.
-- Issue-to-Feishu reply thread routes for lead messages.
+- Feishu topic routes and DingTalk `openConvThreadId` routes for lead messages.
 - Concierge-style direct chat backed by the `weft_global` MCP tools.
 - Online resync summaries for pending Needs-you items.
 
@@ -170,7 +178,7 @@ observe/diff views, settings, and Needs-you queue.
 - **Multi-repo planning:** add, clone, or create workspace repos; the lead reads the repo map and proposes repo-scoped work with reasons.
 - **Native execution:** each approved work item gets a repo-native worktree and branch; Claude Code, Codex, and OpenCode workers run as native CLI sessions.
 - **Controlled collaboration:** planner MCP, Ask Bridge, local MCP Bus, queueing, interrupt, resume, slash commands, and attachments all stay under one issue.
-- **Remote reachability:** Feishu/Lark cards handle permission asks and agent questions; reply threads can manage issue conversations and route messages back to the lead.
+- **Remote reachability:** Feishu/Lark or DingTalk handle permission asks and agent questions; Feishu topics and DingTalk threads route issue messages back to the lead.
 - **Review surface:** materialized worktrees expose diffs and pre-PR checks, with sidecar observation for Claude jsonl, Codex rollout jsonl, and OpenCode SQLite.
 - **Team configuration:** git-backed skill sources, personal skill preservation, global/workspace enablement, and per-repo effective skills/rules preview.
 - **Long-run safety:** keep-awake, remote standby, and encrypted `weft.db` backups to a private Git remote with schedule, on-exit backup, restore, and Recovery Key export.
@@ -206,7 +214,7 @@ src-tauri/src/
   lead_chat/            headless agent session engine
     sentinels.rs        parse <weft:action_card> / <weft:list_repos/> markers
     repo_state.rs       <repo_state> snapshot injected into the lead prompt
-  im/                   IM bridge (Channel trait + Feishu adapter, ws + cards)
+  im/                   IM bridge (Channel trait + Feishu/DingTalk adapters)
   store/                SQLite/SeaORM entities and migrations
   bus/                  local MCP/thread bus + human-ask notifier
   ask.rs                permission Ask registry (desktop + IM mirrored)

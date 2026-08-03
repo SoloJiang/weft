@@ -17,7 +17,7 @@ import {
   SquarePen,
   Trash2,
 } from "lucide-react";
-import { isPendingNeed, pendingNeedsCount, useStore } from "../state/store";
+import { attentionThreadId, pendingNeedsCount, useStore } from "../state/store";
 import { selectThreadActivity } from "../state/threadActivity";
 import type { Thread } from "../lib/types";
 import { cn } from "../lib/cn";
@@ -48,14 +48,10 @@ export function WorkspaceNav() {
     activeThreadId,
     showNeeds,
     openNeeds,
-    needs,
-    asks,
-    writeTriggers,
+    attentionItems,
     setNavCollapsed,
   } = useStore();
-  // Live workspace-wide pending count for the Needs-you focal entry. Excludes
-  // self-clearing stall notices (not real asks) — see pendingNeedsCount.
-  const needsCount = pendingNeedsCount(needs, asks, writeTriggers);
+  const needsCount = pendingNeedsCount(attentionItems);
   const [dlg, setDlg] = useState<null | "ws" | "repo" | "thread">(null);
   // Both rename surfaces store only an id and derive `initial` from the live
   // slice — so concurrent updates flow through instead of being captured.
@@ -344,8 +340,7 @@ function ThreadRow({ thread, onRename }: { thread: Thread; onRename: (id: number
     selectThread,
     deleteThread,
     sessions,
-    needs,
-    asks,
+    attentionItems,
     leadTurn,
   } = useStore();
   const { t } = useTranslation();
@@ -356,9 +351,7 @@ function ThreadRow({ thread, onRename }: { thread: Thread; onRename: (id: number
     directionIds: (directionsByThread[thread.id] ?? []).map((d) => d.id),
     leadState: leadTurn[thread.id]?.state,
   });
-  const needsYou =
-    needs.some((n) => n.thread_id === thread.id && isPendingNeed(n)) ||
-    asks.some((a) => a.thread === thread.id);
+  const needsYou = attentionItems.some((item) => attentionThreadId(item) === thread.id);
 
   return (
     <li className="group relative">

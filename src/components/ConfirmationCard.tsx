@@ -216,7 +216,7 @@ function AskScreenshotPreview({ src }: { readonly src: string }) {
  *  so a new `RiskLevel` variant is a compile error here until handled.
  *  `read_only` reuses `success` (calm/safe); `write` reuses `approval`
  *  (already this codebase's "an approval that involves changing something"
- *  hue — see `WriteTriggerRow`); `network_or_credential` is the most severe,
+ *  hue); `network_or_credential` is the most severe,
  *  `danger`; `unknown` is deliberately neutral `idle` — neither reassuring
  *  green nor alarming red, because the honest answer is "we can't tell". */
 const RISK_STYLE: Record<RiskLevel, { color: string; ring: string }> = {

@@ -1,19 +1,21 @@
 //! All DB reads/writes go through here. Keeps SeaORM specifics out of commands.
 
 use super::entities::{
-    app_setting, code_checkpoint, direction, im_route, lead_message, plan, pull_request,
-    repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread, workspace,
-    worktree,
+    app_setting, code_checkpoint, direction, human_card_terminal_outbox, human_request, im_route,
+    lead_hidden_delivery, lead_message, plan, pull_request, repo_action_execution, repo_profile,
+    repo_ref, session,
+    skill_enable, skill_source, test_plan, thread, workspace, worktree,
 };
 use super::Db;
+use crate::host;
 use crate::slug::unique_slug;
 use anyhow::Result;
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-    TryIntoModel,
+    sea_query::{Alias, Expr, OnConflict},
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, NotSet, QueryFilter,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::collections::HashMap;
-use crate::host;
 
 /// A manual route selected for a reused direction before its first native
 /// conversation. `session_id` is present only when an interrupted initial
@@ -26,17 +28,1134 @@ pub struct InitialDirectionRoutePin {
     pub tool: String,
 }
 
+pub const HUMAN_REQUEST_OPEN: &str = "open";
+pub const HUMAN_REQUEST_ANSWERED: &str = "answered";
+pub const HUMAN_REQUEST_RESOLVED: &str = "resolved";
+pub const HUMAN_REQUEST_CANCELLED: &str = "cancelled";
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HumanRequestImRoute {
+    pub channel: String,
+    pub account: String,
+    pub owner: String,
+    pub message_id: String,
+    /// Last human_request revision whose terminal card was successfully
+    /// patched on this provider route. Missing on legacy JSON => 0/retry.
+    #[serde(default)]
+    pub terminal_revision: i32,
+}
+
+async fn upsert_human_card_terminal_outbox_on<C: ConnectionTrait>(
+    connection: &C,
+    request_id: i32,
+    thread_id: i32,
+    route: &HumanRequestImRoute,
+    terminal_status: &str,
+    answer: &str,
+    terminal_revision: i32,
+    delivered: bool,
+) -> Result<()> {
+    if route.message_id.trim().is_empty()
+        || route.channel.trim().is_empty()
+        || route.account.trim().is_empty()
+        || route.owner.trim().is_empty()
+        || terminal_revision <= 0
+    {
+        return Ok(());
+    }
+    let timestamp = now();
+    human_card_terminal_outbox::Entity::insert(human_card_terminal_outbox::ActiveModel {
+        id: NotSet,
+        request_id: Set(request_id),
+        thread_id: Set(thread_id),
+        channel: Set(route.channel.clone()),
+        account: Set(route.account.clone()),
+        owner: Set(route.owner.clone()),
+        message_id: Set(route.message_id.clone()),
+        terminal_status: Set(terminal_status.to_string()),
+        answer: Set(answer.to_string()),
+        terminal_revision: Set(terminal_revision),
+        delivered: Set(delivered),
+        created_at: Set(timestamp.clone()),
+        updated_at: Set(timestamp),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            human_card_terminal_outbox::Column::Channel,
+            human_card_terminal_outbox::Column::Account,
+            human_card_terminal_outbox::Column::Owner,
+            human_card_terminal_outbox::Column::MessageId,
+        ])
+        .update_columns([
+            human_card_terminal_outbox::Column::RequestId,
+            human_card_terminal_outbox::Column::ThreadId,
+            human_card_terminal_outbox::Column::TerminalStatus,
+            human_card_terminal_outbox::Column::Answer,
+            human_card_terminal_outbox::Column::TerminalRevision,
+            human_card_terminal_outbox::Column::Delivered,
+            human_card_terminal_outbox::Column::UpdatedAt,
+        ])
+        .action_and_where(
+            Expr::col((
+                Alias::new("excluded"),
+                human_card_terminal_outbox::Column::TerminalRevision,
+            ))
+            .gt(Expr::col((
+                Alias::new("human_card_terminal_outbox"),
+                human_card_terminal_outbox::Column::TerminalRevision,
+            )))
+            .or(Expr::col((
+                Alias::new("excluded"),
+                human_card_terminal_outbox::Column::TerminalRevision,
+            ))
+            .eq(Expr::col((
+                Alias::new("human_card_terminal_outbox"),
+                human_card_terminal_outbox::Column::TerminalRevision,
+            )))
+            .and(
+                Expr::col((
+                    Alias::new("human_card_terminal_outbox"),
+                    human_card_terminal_outbox::Column::Delivered,
+                ))
+                .eq(false),
+            )),
+        )
+        .to_owned(),
+    )
+    .exec_without_returning(connection)
+    .await?;
+    Ok(())
+}
+
+pub async fn queue_human_card_terminal_outbox(
+    db: &Db,
+    request_id: i32,
+    thread_id: i32,
+    route: &HumanRequestImRoute,
+    terminal_status: &str,
+    answer: &str,
+    terminal_revision: i32,
+) -> Result<()> {
+    upsert_human_card_terminal_outbox_on(
+        &db.0,
+        request_id,
+        thread_id,
+        route,
+        terminal_status,
+        answer,
+        terminal_revision,
+        false,
+    )
+    .await
+}
+
+pub async fn list_human_card_terminal_outbox(
+    db: &Db,
+    channel: &str,
+    account: &str,
+    owner: &str,
+) -> Result<Vec<human_card_terminal_outbox::Model>> {
+    Ok(human_card_terminal_outbox::Entity::find()
+        .filter(human_card_terminal_outbox::Column::Channel.eq(channel))
+        .filter(human_card_terminal_outbox::Column::Account.eq(account))
+        .filter(human_card_terminal_outbox::Column::Owner.eq(owner))
+        .order_by_asc(human_card_terminal_outbox::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn list_human_card_terminal_outbox_for_channel_account(
+    db: &Db,
+    channel: &str,
+    account: &str,
+) -> Result<Vec<human_card_terminal_outbox::Model>> {
+    Ok(human_card_terminal_outbox::Entity::find()
+        .filter(human_card_terminal_outbox::Column::Channel.eq(channel))
+        .filter(human_card_terminal_outbox::Column::Account.eq(account))
+        .order_by_asc(human_card_terminal_outbox::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn list_pending_human_card_terminal_outbox(
+    db: &Db,
+    channel: &str,
+    account: &str,
+    owner: &str,
+) -> Result<Vec<human_card_terminal_outbox::Model>> {
+    Ok(list_human_card_terminal_outbox(db, channel, account, owner)
+        .await?
+        .into_iter()
+        .filter(|row| !row.delivered)
+        .collect())
+}
+
+pub async fn get_human_card_terminal_outbox_for_route(
+    db: &Db,
+    route: &HumanRequestImRoute,
+) -> Result<Option<human_card_terminal_outbox::Model>> {
+    Ok(human_card_terminal_outbox::Entity::find()
+        .filter(human_card_terminal_outbox::Column::Channel.eq(&route.channel))
+        .filter(human_card_terminal_outbox::Column::Account.eq(&route.account))
+        .filter(human_card_terminal_outbox::Column::Owner.eq(&route.owner))
+        .filter(human_card_terminal_outbox::Column::MessageId.eq(&route.message_id))
+        .one(&db.0)
+        .await?)
+}
+
+pub async fn mark_human_card_terminal_outbox_delivered(
+    db: &Db,
+    outbox_id: i32,
+    terminal_status: &str,
+    terminal_revision: i32,
+) -> Result<bool> {
+    let updated = human_card_terminal_outbox::Entity::update_many()
+        .col_expr(
+            human_card_terminal_outbox::Column::Delivered,
+            Expr::value(true),
+        )
+        .col_expr(human_card_terminal_outbox::Column::Answer, Expr::value(""))
+        .col_expr(
+            human_card_terminal_outbox::Column::UpdatedAt,
+            Expr::value(now()),
+        )
+        .filter(human_card_terminal_outbox::Column::Id.eq(outbox_id))
+        .filter(human_card_terminal_outbox::Column::TerminalStatus.eq(terminal_status))
+        .filter(human_card_terminal_outbox::Column::TerminalRevision.eq(terminal_revision))
+        .filter(human_card_terminal_outbox::Column::Delivered.eq(false))
+        .exec(&db.0)
+        .await?;
+    Ok(updated.rows_affected == 1)
+}
+
+pub const LEAD_HIDDEN_DELIVERY_PENDING: &str = "pending";
+pub const LEAD_HIDDEN_DELIVERY_CONSUMED: &str = "consumed";
+
+/// Insert-or-load one durable hidden lead delivery. Only source kinds with a
+/// stable source row identity are accepted; ordinary feedback stays ephemeral.
+/// The dedupe key is the application-level idempotency boundary: retries and
+/// concurrent clicks must reuse the original row and payload rather than
+/// enqueue a second turn.
+#[cfg(test)]
+pub(crate) async fn enqueue_lead_hidden_delivery(
+    db: &Db,
+    thread_id: i32,
+    source_kind: &str,
+    source_id: i32,
+    dedupe_key: &str,
+    payload: &str,
+) -> Result<lead_hidden_delivery::Model> {
+    enqueue_lead_hidden_delivery_on(
+        &db.0,
+        thread_id,
+        source_kind,
+        source_id,
+        dedupe_key,
+        payload,
+    )
+    .await
+}
+
+async fn enqueue_lead_hidden_delivery_on<C: ConnectionTrait>(
+    connection: &C,
+    thread_id: i32,
+    source_kind: &str,
+    source_id: i32,
+    dedupe_key: &str,
+    payload: &str,
+) -> Result<lead_hidden_delivery::Model> {
+    if thread_id <= 0
+        || source_id <= 0
+        || !matches!(source_kind, "plan_decision" | "repo_action")
+        || dedupe_key.trim().is_empty()
+        || payload.trim().is_empty()
+    {
+        anyhow::bail!("invalid hidden lead delivery identity");
+    }
+    let timestamp = now();
+    lead_hidden_delivery::Entity::insert(lead_hidden_delivery::ActiveModel {
+        id: NotSet,
+        thread_id: Set(thread_id),
+        source_kind: Set(source_kind.to_string()),
+        source_id: Set(source_id),
+        dedupe_key: Set(dedupe_key.to_string()),
+        payload: Set(payload.to_string()),
+        state: Set(LEAD_HIDDEN_DELIVERY_PENDING.to_string()),
+        created_at: Set(timestamp.clone()),
+        updated_at: Set(timestamp),
+    })
+    .on_conflict(
+        OnConflict::column(lead_hidden_delivery::Column::DedupeKey)
+            .do_nothing()
+            .to_owned(),
+    )
+    .exec_without_returning(connection)
+    .await?;
+    let row = lead_hidden_delivery::Entity::find()
+        .filter(lead_hidden_delivery::Column::DedupeKey.eq(dedupe_key))
+        .one(connection)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("hidden lead delivery disappeared after enqueue"))?;
+    if row.thread_id != thread_id
+        || row.source_kind != source_kind
+        || row.source_id != source_id
+        || row.payload != payload
+    {
+        anyhow::bail!("hidden lead delivery identity changed");
+    }
+    Ok(row)
+}
+
+fn repo_action_feedback_payload_is_canonical(
+    execution: &repo_action_execution::Model,
+    payload: &serde_json::Value,
+) -> bool {
+    payload.get("tool").and_then(serde_json::Value::as_str) == Some("repo_action")
+        && payload.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+        && payload
+            .get("execution_id")
+            .and_then(serde_json::Value::as_i64)
+            == Some(i64::from(execution.id))
+        && payload
+            .get("workspace_id")
+            .and_then(serde_json::Value::as_i64)
+            == Some(i64::from(execution.workspace_id))
+        && payload
+            .get("repo_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<i64>().ok())
+            == Some(i64::from(execution.repo_id))
+        && payload.get("action_id").and_then(serde_json::Value::as_str)
+            == Some(execution.action_id.as_str())
+        && payload.get("kind").and_then(serde_json::Value::as_str)
+            == Some(execution.action_kind.as_str())
+        && payload.get("name").and_then(serde_json::Value::as_str)
+            == Some(execution.repo_name.as_str())
+        && payload
+            .get("local_git_path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty())
+}
+
+/// Insert the canonical repo-action hidden row on the caller's existing
+/// transaction. Completion uses this as its final write before commit, while
+/// startup/journal repair reuses the same idempotent path when an older row is
+/// missing. A delivered journal is never resurrected here: only the pending
+/// feedback state still represents an unacknowledged agent handoff.
+async fn enqueue_repo_action_feedback_for_completed_on<C: ConnectionTrait>(
+    connection: &C,
+    execution: &repo_action_execution::Model,
+) -> Result<Option<lead_hidden_delivery::Model>> {
+    if execution.status != REPO_ACTION_COMPLETED
+        || execution.feedback_state != REPO_ACTION_FEEDBACK_PENDING
+    {
+        return Ok(None);
+    }
+    let payload: serde_json::Value = serde_json::from_str(&execution.feedback_payload)
+        .map_err(|error| anyhow::anyhow!("invalid repo action feedback payload: {error}"))?;
+    if !repo_action_feedback_payload_is_canonical(execution, &payload) {
+        anyhow::bail!("repo action feedback journal payload is not canonical");
+    }
+    let delivery = enqueue_lead_hidden_delivery_on(
+        connection,
+        execution.thread_id,
+        "repo_action",
+        execution.id,
+        &format!("repo_action:{}", execution.id),
+        &execution.feedback_payload,
+    )
+    .await?;
+    Ok(Some(delivery))
+}
+
+/// Load the authoritative completed repo-action journal and enqueue its exact
+/// canonical feedback payload. No caller-supplied thread or payload is trusted;
+/// the journal row is re-read inside the same transaction as the hidden outbox
+/// insert, so a public command cannot poison `repo_action:{execution_id}`.
+pub(crate) async fn enqueue_repo_action_feedback_from_journal(
+    db: &Db,
+    execution_id: i32,
+) -> Result<Option<lead_hidden_delivery::Model>> {
+    let txn = db.0.begin().await?;
+    let Some(execution) = repo_action_execution::Entity::find_by_id(execution_id)
+        .one(&txn)
+        .await?
+    else {
+        txn.rollback().await?;
+        return Ok(None);
+    };
+    let Some(delivery) = enqueue_repo_action_feedback_for_completed_on(&txn, &execution).await?
+    else {
+        txn.rollback().await?;
+        return Ok(None);
+    };
+    txn.commit().await?;
+    Ok(Some(delivery))
+}
+
+pub async fn get_lead_hidden_delivery(
+    db: &Db,
+    delivery_id: i32,
+) -> Result<Option<lead_hidden_delivery::Model>> {
+    Ok(lead_hidden_delivery::Entity::find_by_id(delivery_id)
+        .one(&db.0)
+        .await?)
+}
+
+pub async fn get_lead_hidden_delivery_by_dedupe(
+    db: &Db,
+    dedupe_key: &str,
+) -> Result<Option<lead_hidden_delivery::Model>> {
+    Ok(lead_hidden_delivery::Entity::find()
+        .filter(lead_hidden_delivery::Column::DedupeKey.eq(dedupe_key))
+        .one(&db.0)
+        .await?)
+}
+
+pub async fn list_pending_lead_hidden_deliveries(
+    db: &Db,
+    thread_id: Option<i32>,
+) -> Result<Vec<lead_hidden_delivery::Model>> {
+    let query = lead_hidden_delivery::Entity::find()
+        .filter(lead_hidden_delivery::Column::State.eq(LEAD_HIDDEN_DELIVERY_PENDING))
+        .order_by_asc(lead_hidden_delivery::Column::Id);
+    let query = match thread_id {
+        Some(thread_id) => query.filter(lead_hidden_delivery::Column::ThreadId.eq(thread_id)),
+        None => query,
+    };
+    Ok(query.all(&db.0).await?)
+}
+
+/// A thread/workspace rewind or deletion must suppress hidden inputs in the
+/// same transaction as the timeline mutation. No stale engine may replay a
+/// decision after its owning conversation has been removed.
+pub async fn delete_lead_hidden_deliveries_for_thread_on<C: ConnectionTrait>(
+    connection: &C,
+    thread_id: i32,
+) -> Result<u64> {
+    Ok(lead_hidden_delivery::Entity::delete_many()
+        .filter(lead_hidden_delivery::Column::ThreadId.eq(thread_id))
+        .exec(connection)
+        .await?
+        .rows_affected)
+}
+
+pub async fn delete_lead_hidden_deliveries_for_thread(
+    db: &Db,
+    thread_id: i32,
+) -> Result<u64> {
+    delete_lead_hidden_deliveries_for_thread_on(&db.0, thread_id).await
+}
+
+/// Mark a hidden delivery consumed only after the engine reports activity.
+/// Repo-action feedback is advanced in this SAME transaction, so a crash can
+/// leave both durable rows pending but can never publish a delivered receipt
+/// before agent consumption.
+pub async fn consume_lead_hidden_delivery(
+    db: &Db,
+    delivery_id: i32,
+) -> Result<Option<lead_hidden_delivery::Model>> {
+    let txn = db.0.begin().await?;
+    let Some(row) = lead_hidden_delivery::Entity::find_by_id(delivery_id)
+        .one(&txn)
+        .await?
+    else {
+        txn.rollback().await?;
+        return Ok(None);
+    };
+    if row.state == LEAD_HIDDEN_DELIVERY_CONSUMED {
+        if row.source_kind == "repo_action" {
+            if let Some(execution) = repo_action_execution::Entity::find_by_id(row.source_id)
+                .one(&txn)
+                .await?
+            {
+                if execution.feedback_state == REPO_ACTION_FEEDBACK_PENDING {
+                    txn.rollback().await?;
+                    anyhow::bail!(
+                        "consumed hidden lead delivery has pending repo action feedback"
+                    );
+                }
+            }
+        }
+        txn.rollback().await?;
+        return Ok(None);
+    }
+    let updated = lead_hidden_delivery::Entity::update_many()
+        .col_expr(
+            lead_hidden_delivery::Column::State,
+            Expr::value(LEAD_HIDDEN_DELIVERY_CONSUMED),
+        )
+        .col_expr(
+            lead_hidden_delivery::Column::UpdatedAt,
+            Expr::value(now()),
+        )
+        .filter(lead_hidden_delivery::Column::Id.eq(delivery_id))
+        .filter(lead_hidden_delivery::Column::State.eq(LEAD_HIDDEN_DELIVERY_PENDING))
+        .exec(&txn)
+        .await?;
+    if updated.rows_affected != 1 {
+        txn.rollback().await?;
+        anyhow::bail!("hidden lead delivery consumption CAS lost");
+    }
+    if row.source_kind == "repo_action" {
+        let Some(execution) = repo_action_execution::Entity::find_by_id(row.source_id)
+            .one(&txn)
+            .await?
+        else {
+            txn.rollback().await?;
+            anyhow::bail!("repo action feedback journal disappeared before receipt");
+        };
+        if execution.status != REPO_ACTION_COMPLETED {
+            txn.rollback().await?;
+            anyhow::bail!("repo action feedback is not completed");
+        }
+        if execution.feedback_state == REPO_ACTION_FEEDBACK_PENDING {
+            let feedback = repo_action_execution::Entity::update_many()
+                .col_expr(
+                    repo_action_execution::Column::FeedbackState,
+                    Expr::value(REPO_ACTION_FEEDBACK_DELIVERED),
+                )
+                .col_expr(repo_action_execution::Column::UpdatedAt, Expr::value(now()))
+                .filter(repo_action_execution::Column::Id.eq(row.source_id))
+                .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_COMPLETED))
+                .filter(
+                    repo_action_execution::Column::FeedbackState.eq(REPO_ACTION_FEEDBACK_PENDING),
+                )
+                .exec(&txn)
+                .await?;
+            if feedback.rows_affected != 1 {
+                txn.rollback().await?;
+                anyhow::bail!("repo action feedback receipt CAS lost");
+            }
+        } else if execution.feedback_state != REPO_ACTION_FEEDBACK_DELIVERED {
+            txn.rollback().await?;
+            anyhow::bail!("repo action feedback state is not pending");
+        }
+        if repo_ref::Entity::find_by_id(execution.repo_id)
+            .one(&txn)
+            .await?
+            .is_none()
+        {
+            repo_action_execution::Entity::delete_many()
+                .filter(repo_action_execution::Column::Id.eq(execution.id))
+                .filter(
+                    repo_action_execution::Column::ExecutionToken
+                        .eq(&execution.execution_token),
+                )
+                .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_COMPLETED))
+                .filter(
+                    repo_action_execution::Column::FeedbackState
+                        .eq(REPO_ACTION_FEEDBACK_DELIVERED),
+                )
+                .exec(&txn)
+                .await?;
+        }
+    }
+    txn.commit().await?;
+    Ok(Some(row))
+}
+
+fn same_human_request_im_route(left: &HumanRequestImRoute, right: &HumanRequestImRoute) -> bool {
+    left.channel == right.channel
+        && left.account == right.account
+        && left.owner == right.owner
+        && left.message_id == right.message_id
+}
+
+async fn human_request_source_matches(
+    db: &Db,
+    thread_id: i32,
+    turn_id: i32,
+    source_message_id: i32,
+    source_session_id: i32,
+) -> Result<bool> {
+    if source_message_id == 0 {
+        return Ok(true);
+    }
+    let mut query = lead_message::Entity::find_by_id(source_message_id)
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::TurnId.eq(turn_id))
+        .filter(lead_message::Column::Role.eq("user"))
+        .filter(lead_message::Column::Status.eq("complete"));
+    query = if source_session_id == 0 {
+        query.filter(lead_message::Column::SessionId.is_null())
+    } else {
+        query.filter(lead_message::Column::SessionId.eq(source_session_id))
+    };
+    Ok(query.one(&db.0).await?.is_some())
+}
+
+/// Create one durable free-text question. Questions from the same agent scope
+/// are independent unless a future transport supplies an explicit retry key;
+/// creating a second question must never make the first one unanswerable.
+pub async fn create_human_request(
+    db: &Db,
+    workspace_id: i32,
+    thread_id: i32,
+    direction_scope: &str,
+    direction_id: i32,
+    turn_id: i32,
+    source_message_id: i32,
+    source_session_id: i32,
+    question: &str,
+) -> Result<human_request::Model> {
+    if question.trim().is_empty() {
+        anyhow::bail!("human question cannot be empty");
+    }
+    let thread = get_thread(db, thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
+    if thread.workspace_id != workspace_id {
+        anyhow::bail!("thread {thread_id} does not belong to workspace {workspace_id}");
+    }
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    if direction_id == 0 {
+        if !matches!(direction_scope, "" | "lead") {
+            anyhow::bail!("invalid lead question scope '{direction_scope}'");
+        }
+    } else {
+        let direction = get_direction(db, direction_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
+        if direction.thread_id != thread_id || direction_scope != direction_id.to_string() {
+            anyhow::bail!(
+                "direction {direction_id} does not match thread {thread_id} and scope '{direction_scope}'"
+            );
+        }
+    }
+    if !human_request_source_matches(db, thread_id, turn_id, source_message_id, source_session_id)
+        .await?
+    {
+        anyhow::bail!("source turn for human question no longer exists");
+    }
+
+    let stamp = now();
+    let inserted = human_request::ActiveModel {
+        id: NotSet,
+        workspace_id: Set(workspace_id),
+        thread_id: Set(thread_id),
+        direction_id: Set(direction_id),
+        direction_scope: Set(direction_scope.to_string()),
+        turn_id: Set(turn_id),
+        source_message_id: Set(source_message_id),
+        source_session_id: Set(source_session_id),
+        question: Set(question.trim().to_string()),
+        status: Set(HUMAN_REQUEST_OPEN.to_string()),
+        answer: Set(String::new()),
+        im_routes: Set("[]".to_string()),
+        revision: Set(1),
+        created_at: Set(stamp.clone()),
+        updated_at: Set(stamp),
+    }
+    .insert(&db.0)
+    .await?;
+    let accepted = match ensure_thread_workspace_accepts_writes(db, thread_id).await {
+        Ok(_) => {
+            human_request_source_matches(
+                db,
+                thread_id,
+                turn_id,
+                source_message_id,
+                source_session_id,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    match accepted {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = human_request::Entity::delete_by_id(inserted.id)
+                .exec(&db.0)
+                .await;
+            anyhow::bail!("source turn for human question no longer exists");
+        }
+        Err(error) => {
+            let _ = human_request::Entity::delete_by_id(inserted.id)
+                .exec(&db.0)
+                .await;
+            return Err(error);
+        }
+    }
+    Ok(inserted)
+}
+
+/// Validate the exact engine identity carried by an injected bus URL and
+/// resolve the completed user row that opened its current turn. A queued
+/// mid-turn revision is deliberately excluded: it belongs to the next turn and
+/// must not become the rewind identity of this request.
+///
+/// Worker identity is never inferred from the direction's latest session. A
+/// direction can retain multiple repo sessions, so guessing would attach an
+/// older engine's question to whichever session happened to be created last.
+pub async fn human_request_source(
+    db: &Db,
+    thread_id: i32,
+    direction_scope: &str,
+    source_session_id: Option<i32>,
+) -> Result<(i32, Option<lead_message::Model>)> {
+    use sea_orm::Order;
+
+    let session_id = if matches!(direction_scope, "" | "lead") {
+        if source_session_id.is_some() {
+            anyhow::bail!("lead bus identity cannot carry a worker session");
+        }
+        None
+    } else {
+        let direction_id = direction_scope
+            .parse::<i32>()
+            .map_err(|_| anyhow::anyhow!("invalid direction scope '{direction_scope}'"))?;
+        let direction = get_direction(db, direction_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
+        if direction.thread_id != thread_id {
+            anyhow::bail!("direction {direction_id} does not belong to thread {thread_id}");
+        }
+        let source_session_id = source_session_id
+            .ok_or_else(|| anyhow::anyhow!("worker bus identity is missing its source session"))?;
+        let session = get_session(db, source_session_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("session {source_session_id} not found"))?;
+        if session.direction_id != direction_id {
+            anyhow::bail!(
+                "session {source_session_id} does not belong to direction {direction_id}"
+            );
+        }
+        Some(source_session_id)
+    };
+    let mut query = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Role.eq("user"))
+        .filter(lead_message::Column::Status.eq("complete"));
+    query = match session_id {
+        Some(session_id) => query.filter(lead_message::Column::SessionId.eq(session_id)),
+        None => query.filter(lead_message::Column::SessionId.is_null()),
+    };
+    let source = query
+        .order_by(Expr::cust("COALESCE(seq, id)"), Order::Desc)
+        .order_by_desc(lead_message::Column::Id)
+        .one(&db.0)
+        .await?;
+    Ok((session_id.unwrap_or_default(), source))
+}
+
+pub async fn list_open_human_requests(
+    db: &Db,
+    workspace_id: i32,
+) -> Result<Vec<human_request::Model>> {
+    Ok(human_request::Entity::find()
+        .filter(human_request::Column::WorkspaceId.eq(workspace_id))
+        .filter(human_request::Column::Status.eq(HUMAN_REQUEST_OPEN))
+        .order_by_asc(human_request::Column::CreatedAt)
+        .order_by_asc(human_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn list_all_open_human_requests(db: &Db) -> Result<Vec<human_request::Model>> {
+    Ok(human_request::Entity::find()
+        .filter(human_request::Column::Status.eq(HUMAN_REQUEST_OPEN))
+        .order_by_asc(human_request::Column::CreatedAt)
+        .order_by_asc(human_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+/// Questions that must be reconstructed into the in-memory bus at startup:
+/// open rows become answerable asks; answered rows become pending inbox
+/// messages until an explicit `bus_ack` acknowledges delivery.
+pub async fn list_pending_human_requests(db: &Db) -> Result<Vec<human_request::Model>> {
+    Ok(human_request::Entity::find()
+        .filter(human_request::Column::Status.is_in([HUMAN_REQUEST_OPEN, HUMAN_REQUEST_ANSWERED]))
+        .filter(Expr::cust(
+            "EXISTS (SELECT 1 FROM thread WHERE thread.id = human_request.thread_id)",
+        ))
+        .order_by_asc(human_request::Column::CreatedAt)
+        .order_by_asc(human_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+/// Answered rows are replayed into the transcript trail at boot with an
+/// ask-id dedupe guard. Include delivered rows too: the process may have died
+/// after the agent consumed the inbox but before the async trail insert landed.
+pub async fn list_answered_human_requests(db: &Db) -> Result<Vec<human_request::Model>> {
+    Ok(human_request::Entity::find()
+        .filter(
+            human_request::Column::Status.is_in([HUMAN_REQUEST_ANSWERED, HUMAN_REQUEST_RESOLVED]),
+        )
+        .filter(human_request::Column::Answer.ne(""))
+        .filter(Expr::cust(
+            "EXISTS (SELECT 1 FROM thread WHERE thread.id = human_request.thread_id)",
+        ))
+        .order_by_asc(human_request::Column::CreatedAt)
+        .order_by_asc(human_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+/// At-least-once outbox read for one authenticated bus route. `bus_inbox`
+/// merges these rows with its process-local inbox on every call; only an
+/// explicit `bus_ack` removes them from durable replay.
+pub async fn list_pending_human_answers_for_scope(
+    db: &Db,
+    thread_id: i32,
+    direction_scope: &str,
+) -> Result<Vec<human_request::Model>> {
+    Ok(human_request::Entity::find()
+        .filter(human_request::Column::ThreadId.eq(thread_id))
+        .filter(human_request::Column::DirectionScope.eq(direction_scope))
+        .filter(human_request::Column::Status.eq(HUMAN_REQUEST_ANSWERED))
+        .order_by_asc(human_request::Column::UpdatedAt)
+        .order_by_asc(human_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn get_human_request(db: &Db, request_id: i32) -> Result<Option<human_request::Model>> {
+    Ok(human_request::Entity::find_by_id(request_id)
+        .one(&db.0)
+        .await?)
+}
+
+pub async fn list_human_request_im_routes(db: &Db) -> Result<Vec<human_request::Model>> {
+    Ok(human_request::Entity::find()
+        .filter(human_request::Column::ImRoutes.ne("[]"))
+        .filter(human_request::Column::ImRoutes.ne(""))
+        .filter(Expr::cust(
+            "EXISTS (SELECT 1 FROM thread WHERE thread.id = human_request.thread_id)",
+        ))
+        .order_by_asc(human_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn record_human_request_im_route(
+    db: &Db,
+    request_id: i32,
+    route: &HumanRequestImRoute,
+) -> Result<bool> {
+    if route.message_id.trim().is_empty()
+        || route.channel.trim().is_empty()
+        || route.account.trim().is_empty()
+        || route.owner.trim().is_empty()
+    {
+        return Ok(false);
+    }
+    for _ in 0..4 {
+        let Some(request) = get_human_request(db, request_id).await? else {
+            return Ok(false);
+        };
+        let mut routes = serde_json::from_str::<Vec<HumanRequestImRoute>>(&request.im_routes)
+            .unwrap_or_default();
+        if routes
+            .iter()
+            .any(|existing| same_human_request_im_route(existing, route))
+        {
+            return Ok(true);
+        }
+        routes.push(route.clone());
+        let encoded = serde_json::to_string(&routes)?;
+        let updated = human_request::Entity::update_many()
+            .col_expr(human_request::Column::ImRoutes, Expr::value(encoded))
+            .filter(human_request::Column::Id.eq(request_id))
+            .filter(human_request::Column::Revision.eq(request.revision))
+            .filter(human_request::Column::ImRoutes.eq(request.im_routes))
+            .exec(&db.0)
+            .await?;
+        if updated.rows_affected == 1 {
+            return Ok(true);
+        }
+    }
+    anyhow::bail!("human question IM routes changed too many times concurrently")
+}
+
+/// Record the provider receipt only after a terminal card patch succeeds. The
+/// JSON CAS composes with concurrent route delivery and other patch receipts;
+/// a crash before this write leaves the older revision in place so startup
+/// retries exactly that route.
+pub async fn mark_human_request_im_route_terminal(
+    db: &Db,
+    request_id: i32,
+    message_id: &str,
+    terminal_revision: i32,
+) -> Result<bool> {
+    if message_id.trim().is_empty() || terminal_revision <= 0 {
+        return Ok(false);
+    }
+    for _ in 0..4 {
+        let Some(request) = get_human_request(db, request_id).await? else {
+            return Ok(false);
+        };
+        if request.revision != terminal_revision {
+            return Ok(false);
+        }
+        let mut routes = serde_json::from_str::<Vec<HumanRequestImRoute>>(&request.im_routes)
+            .unwrap_or_default();
+        let mut found = false;
+        let mut changed = false;
+        for route in &mut routes {
+            if route.message_id != message_id {
+                continue;
+            }
+            found = true;
+            if route.terminal_revision < terminal_revision {
+                route.terminal_revision = terminal_revision;
+                changed = true;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+        if !changed {
+            return Ok(true);
+        }
+        let encoded = serde_json::to_string(&routes)?;
+        let updated = human_request::Entity::update_many()
+            .col_expr(human_request::Column::ImRoutes, Expr::value(encoded))
+            .filter(human_request::Column::Id.eq(request_id))
+            .filter(human_request::Column::Revision.eq(terminal_revision))
+            .filter(human_request::Column::ImRoutes.eq(request.im_routes))
+            .exec(&db.0)
+            .await?;
+        if updated.rows_affected == 1 {
+            return Ok(true);
+        }
+    }
+    anyhow::bail!("human question IM terminal receipts changed too many times concurrently")
+}
+
+/// OCC transition for an answer. `answered` means the text is durably stored
+/// but remains pending until the asking agent consumes it through `bus_inbox`.
+/// `None` means stale, wrong workspace, or no longer open; no bus message
+/// should be delivered in that case.
+pub async fn answer_human_request(
+    db: &Db,
+    workspace_id: i32,
+    request_id: i32,
+    expected_revision: i32,
+    answer: &str,
+) -> Result<Option<human_request::Model>> {
+    if answer.trim().is_empty() {
+        anyhow::bail!("human answer cannot be empty");
+    }
+    let updated = human_request::Entity::update_many()
+        .col_expr(
+            human_request::Column::Status,
+            Expr::value(HUMAN_REQUEST_ANSWERED),
+        )
+        .col_expr(human_request::Column::Answer, Expr::value(answer.trim()))
+        .col_expr(
+            human_request::Column::Revision,
+            Expr::col(human_request::Column::Revision).add(1),
+        )
+        .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
+        .filter(human_request::Column::Id.eq(request_id))
+        .filter(human_request::Column::WorkspaceId.eq(workspace_id))
+        .filter(human_request::Column::Status.eq(HUMAN_REQUEST_OPEN))
+        .filter(human_request::Column::Revision.eq(expected_revision))
+        .exec(&db.0)
+        .await?;
+    if updated.rows_affected == 0 {
+        return Ok(None);
+    }
+    Ok(human_request::Entity::find_by_id(request_id)
+        .one(&db.0)
+        .await?)
+}
+
+/// Receipt written by `bus_ack` after the agent has incorporated durable answer
+/// messages. Until this succeeds the database stays `answered`, so every inbox
+/// read and process restart can replay them.
+pub async fn mark_human_answers_delivered(
+    db: &Db,
+    thread_id: i32,
+    direction_scope: &str,
+    request_ids: &[i32],
+) -> Result<u64> {
+    if request_ids.is_empty() {
+        return Ok(0);
+    }
+    let updated = human_request::Entity::update_many()
+        .col_expr(
+            human_request::Column::Status,
+            Expr::value(HUMAN_REQUEST_RESOLVED),
+        )
+        .col_expr(
+            human_request::Column::Revision,
+            Expr::col(human_request::Column::Revision).add(1),
+        )
+        .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
+        .filter(human_request::Column::Id.is_in(request_ids.iter().copied()))
+        .filter(human_request::Column::ThreadId.eq(thread_id))
+        .filter(human_request::Column::DirectionScope.eq(direction_scope))
+        .filter(human_request::Column::Status.eq(HUMAN_REQUEST_ANSWERED))
+        .exec(&db.0)
+        .await?;
+    Ok(updated.rows_affected)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancelledHumanRequest {
+    pub request_id: i32,
+    pub thread_id: i32,
+}
+
+#[derive(Clone)]
+enum HumanRequestCancelScope {
+    Thread(i32),
+    Direction(i32),
+    SourceSessions(Vec<i32>),
+}
+
+async fn cancel_human_requests_in_scope_on<C: ConnectionTrait>(
+    connection: &C,
+    scope: HumanRequestCancelScope,
+) -> Result<Vec<CancelledHumanRequest>> {
+    if matches!(&scope, HumanRequestCancelScope::SourceSessions(ids) if ids.is_empty()) {
+        return Ok(Vec::new());
+    }
+    let candidates = match scope {
+        HumanRequestCancelScope::Thread(thread_id) => {
+            human_request::Entity::find().filter(human_request::Column::ThreadId.eq(thread_id))
+        }
+        HumanRequestCancelScope::Direction(direction_id) => human_request::Entity::find()
+            .filter(human_request::Column::DirectionId.eq(direction_id)),
+        HumanRequestCancelScope::SourceSessions(session_ids) => human_request::Entity::find()
+            .filter(human_request::Column::SourceSessionId.is_in(session_ids)),
+    }
+    .filter(human_request::Column::Status.is_in([
+        HUMAN_REQUEST_OPEN,
+        HUMAN_REQUEST_ANSWERED,
+        HUMAN_REQUEST_RESOLVED,
+    ]))
+    .order_by_asc(human_request::Column::Id)
+    .all(connection)
+    .await?;
+    let mut cancelled = Vec::new();
+    for request in candidates {
+        let routes = serde_json::from_str::<Vec<HumanRequestImRoute>>(&request.im_routes)
+            .unwrap_or_default();
+        if request.status == HUMAN_REQUEST_RESOLVED {
+            // A resolved card needs no deletion repaint, but its provider
+            // message id must outlive the request row. Persist an already-
+            // delivered tombstone when the preceding answered revision has a
+            // provider receipt. Otherwise preserve a pending resolved patch;
+            // its answer is scrubbed as soon as delivery succeeds. Either row
+            // keeps historical replies on the stale-answer path after restart.
+            for route in routes {
+                let delivered = route.terminal_revision > 0
+                    && route.terminal_revision.saturating_add(1) >= request.revision;
+                let answer = if delivered {
+                    ""
+                } else {
+                    request.answer.as_str()
+                };
+                upsert_human_card_terminal_outbox_on(
+                    connection,
+                    request.id,
+                    request.thread_id,
+                    &route,
+                    HUMAN_REQUEST_RESOLVED,
+                    answer,
+                    request.revision,
+                    delivered,
+                )
+                .await?;
+            }
+            continue;
+        }
+        let terminal_revision = request.revision.saturating_add(1);
+        let updated = human_request::Entity::update_many()
+            .col_expr(
+                human_request::Column::Status,
+                Expr::value(HUMAN_REQUEST_CANCELLED),
+            )
+            .col_expr(
+                human_request::Column::Revision,
+                Expr::value(terminal_revision),
+            )
+            .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
+            .filter(human_request::Column::Id.eq(request.id))
+            .filter(human_request::Column::Revision.eq(request.revision))
+            .filter(
+                human_request::Column::Status.is_in([HUMAN_REQUEST_OPEN, HUMAN_REQUEST_ANSWERED]),
+            )
+            .exec(connection)
+            .await?;
+        if updated.rows_affected != 1 {
+            continue;
+        }
+        for route in routes {
+            upsert_human_card_terminal_outbox_on(
+                connection,
+                request.id,
+                request.thread_id,
+                &route,
+                HUMAN_REQUEST_CANCELLED,
+                "",
+                terminal_revision,
+                false,
+            )
+            .await?;
+        }
+        cancelled.push(CancelledHumanRequest {
+            request_id: request.id,
+            thread_id: request.thread_id,
+        });
+    }
+    Ok(cancelled)
+}
+
+async fn cancel_human_requests_in_scope(
+    db: &Db,
+    scope: HumanRequestCancelScope,
+) -> Result<Vec<CancelledHumanRequest>> {
+    let txn = db.0.begin().await?;
+    let cancelled = cancel_human_requests_in_scope_on(&txn, scope).await?;
+    txn.commit().await?;
+    Ok(cancelled)
+}
+
+pub async fn cancel_open_human_requests_for_thread(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
+    Ok(
+        cancel_human_requests_in_scope(db, HumanRequestCancelScope::Thread(thread_id))
+            .await?
+            .into_iter()
+            .map(|request| request.request_id)
+            .collect(),
+    )
+}
+
+pub async fn cancel_open_human_requests_for_direction(
+    db: &Db,
+    direction_id: i32,
+) -> Result<Vec<i32>> {
+    Ok(
+        cancel_human_requests_in_scope(db, HumanRequestCancelScope::Direction(direction_id))
+            .await?
+            .into_iter()
+            .map(|request| request.request_id)
+            .collect(),
+    )
+}
+
+pub async fn cancel_open_human_requests_for_source_sessions(
+    db: &Db,
+    session_ids: &[i32],
+) -> Result<Vec<CancelledHumanRequest>> {
+    cancel_human_requests_in_scope(
+        db,
+        HumanRequestCancelScope::SourceSessions(session_ids.to_vec()),
+    )
+    .await
+}
+
 /// Test-only DB-write failure injection.
 ///
-/// Why it exists: several already-shipped degradation paths differ from their
-/// happy path ONLY when a single store write fails while the writes around it
-/// succeed. `lead_chat::engine::recover_from_freeze`'s marker-gated native-id
-/// clear (issue #93, PR #133) is the canonical one — and a mutation run proved
-/// the entire suite stayed green with that gate deleted, because nothing in this
-/// crate could make one chosen write fail on demand. The alternative, faking the
-/// post-failure DB rows by hand, is worse than no test at all: it asserts a
-/// shape production may never produce (a lesson this repo has already paid for).
-/// This makes the REAL write return a REAL `Err`.
+/// Why it exists: several degradation paths differ from their happy path only
+/// when one store write fails while neighboring writes succeed. This makes the
+/// real selected write return a real `Err` without fabricating impossible rows.
 ///
 /// Boundary — why it cannot leak into production:
 ///   * The module is `#[cfg(test)]`, so it exists only while this crate is
@@ -112,6 +1231,17 @@ fn now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("{secs}")
+}
+
+/// Fractional unix seconds for PR failure episodes. Unlike the general row
+/// timestamp, this must distinguish a retry followed by another immediate
+/// failure streak in the same second so the new Retry action gets a new stable
+/// identity.
+fn now_precise() -> String {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos())
 }
 
 /// Unix-secs as string, for skill_source.last_synced.
@@ -202,6 +1332,14 @@ fn workspace_deleting_key(workspace_id: i32) -> String {
     format!("workspace.deleting.{workspace_id}")
 }
 
+fn repo_deleting_key(repo_id: i32) -> String {
+    format!("repo.deleting.{repo_id}")
+}
+
+fn thread_deleting_key(thread_id: i32) -> String {
+    format!("thread.deleting.{thread_id}")
+}
+
 pub async fn mark_workspace_deleting(db: &Db, workspace_id: i32) -> Result<()> {
     ensure_workspace_exists(db, workspace_id).await?;
     set_setting(db, &workspace_deleting_key(workspace_id), "1").await
@@ -211,9 +1349,34 @@ pub async fn clear_workspace_deleting(db: &Db, workspace_id: i32) -> Result<()> 
     delete_setting(db, &workspace_deleting_key(workspace_id)).await
 }
 
+pub async fn mark_repo_deleting(db: &Db, repo_id: i32) -> Result<()> {
+    if get_repo(db, repo_id).await?.is_none() {
+        anyhow::bail!("repo {repo_id} not found");
+    }
+    set_setting(db, &repo_deleting_key(repo_id), "1").await
+}
+
+pub async fn clear_repo_deleting(db: &Db, repo_id: i32) -> Result<()> {
+    delete_setting(db, &repo_deleting_key(repo_id)).await
+}
+
+pub async fn mark_thread_deleting(db: &Db, thread_id: i32) -> Result<()> {
+    if get_thread(db, thread_id).await?.is_none() {
+        anyhow::bail!("thread {thread_id} not found");
+    }
+    set_setting(db, &thread_deleting_key(thread_id), "1").await
+}
+
+pub async fn clear_thread_deleting(db: &Db, thread_id: i32) -> Result<()> {
+    delete_setting(db, &thread_deleting_key(thread_id)).await
+}
+
 async fn ensure_workspace_accepts_writes(db: &Db, workspace_id: i32) -> Result<()> {
     ensure_workspace_exists(db, workspace_id).await?;
-    if get_setting(db, &workspace_deleting_key(workspace_id)).await?.is_some() {
+    if get_setting(db, &workspace_deleting_key(workspace_id))
+        .await?
+        .is_some()
+    {
         anyhow::bail!("workspace {workspace_id} is being deleted");
     }
     Ok(())
@@ -227,6 +1390,12 @@ pub async fn ensure_thread_workspace_accepts_writes(
         .one(&db.0)
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
+    if get_setting(db, &thread_deleting_key(thread_id))
+        .await?
+        .is_some()
+    {
+        anyhow::bail!("thread {thread_id} is being deleted");
+    }
     ensure_workspace_accepts_writes(db, t.workspace_id).await?;
     Ok(t)
 }
@@ -239,6 +1408,12 @@ pub async fn ensure_repo_workspace_accepts_writes(
         .one(&db.0)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
+    if get_setting(db, &repo_deleting_key(repo_id))
+        .await?
+        .is_some()
+    {
+        anyhow::bail!("repo {repo_id} is being deleted");
+    }
     ensure_workspace_accepts_writes(db, repo_ref.workspace_id).await?;
     Ok(repo_ref)
 }
@@ -383,6 +1558,32 @@ pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Persist a related settings bundle in one transaction. Credential tuples
+/// must never become visible half-written (for example a new app id paired
+/// with an old secret) when scan and manual-save flows overlap.
+pub async fn set_settings_atomic(db: &Db, settings: &[(&str, &str)]) -> Result<()> {
+    if settings.is_empty() {
+        return Ok(());
+    }
+    let txn = db.0.begin().await?;
+    for (key, value) in settings {
+        let model = app_setting::ActiveModel {
+            key: Set((*key).to_string()),
+            value: Set((*value).to_string()),
+        };
+        app_setting::Entity::insert(model)
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::column(app_setting::Column::Key)
+                    .update_column(app_setting::Column::Value)
+                    .to_owned(),
+            )
+            .exec(&txn)
+            .await?;
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
 /// Remove an app_setting row. No-op when the key is absent. Used to clear a
 /// stored value entirely so `get_setting` reads `None` again — distinct from
 /// `set_setting(key, "")`, which would still read as `Some("")`.
@@ -428,13 +1629,19 @@ pub async fn set_tool_command(
 
     if apply_to_existing {
         thread::Entity::update_many()
-            .col_expr(thread::Column::LeadCommand, Expr::value(Option::<String>::None))
+            .col_expr(
+                thread::Column::LeadCommand,
+                Expr::value(Option::<String>::None),
+            )
             .filter(thread::Column::LeadTool.eq(tool))
             .filter(thread::Column::LeadCommand.is_not_null())
             .exec(&db.0)
             .await?;
         session::Entity::update_many()
-            .col_expr(session::Column::Command, Expr::value(Option::<String>::None))
+            .col_expr(
+                session::Column::Command,
+                Expr::value(Option::<String>::None),
+            )
             .filter(session::Column::Tool.eq(tool))
             .filter(session::Column::Command.is_not_null())
             .exec(&db.0)
@@ -476,6 +1683,71 @@ fn repo_map_doc_key(workspace_id: i32) -> String {
 /// Persist the analyst-synthesized markdown repo-map for a workspace.
 pub async fn set_repo_map_doc(db: &Db, workspace_id: i32, markdown: &str) -> Result<()> {
     set_setting(db, &repo_map_doc_key(workspace_id), markdown).await
+}
+
+/// Publish a long-running curator pass only if the workspace still has the
+/// exact repository set the pass revalidated. The workspace no-op UPDATE takes
+/// SQLite's writer lock before the final repo read, so repo/workspace deletion
+/// either commits first (set mismatch / missing workspace) or commits later and
+/// clears this document in its own cascade transaction.
+pub async fn set_repo_map_doc_if_repo_ids_match(
+    db: &Db,
+    workspace_id: i32,
+    expected_repo_ids: &[i32],
+    markdown: &str,
+) -> Result<bool> {
+    use sea_orm::TransactionTrait;
+
+    let txn = db.0.begin().await?;
+    let locked = workspace::Entity::update_many()
+        .col_expr(
+            workspace::Column::Name,
+            Expr::col(workspace::Column::Name).into(),
+        )
+        .filter(workspace::Column::Id.eq(workspace_id))
+        .exec(&txn)
+        .await?;
+    if locked.rows_affected != 1 {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    let deleting = app_setting::Entity::find_by_id(workspace_deleting_key(workspace_id))
+        .one(&txn)
+        .await?
+        .is_some();
+    if deleting {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    let mut current = repo_ref::Entity::find()
+        .filter(repo_ref::Column::WorkspaceId.eq(workspace_id))
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|repo| repo.id)
+        .collect::<Vec<_>>();
+    let mut expected = expected_repo_ids.to_vec();
+    current.sort_unstable();
+    expected.sort_unstable();
+    if current != expected {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    let key = repo_map_doc_key(workspace_id);
+    if let Some(existing) = app_setting::Entity::find_by_id(&key).one(&txn).await? {
+        let mut active: app_setting::ActiveModel = existing.into();
+        active.value = Set(markdown.to_string());
+        active.update(&txn).await?;
+    } else {
+        app_setting::ActiveModel {
+            key: Set(key),
+            value: Set(markdown.to_string()),
+        }
+        .insert(&txn)
+        .await?;
+    }
+    txn.commit().await?;
+    Ok(true)
 }
 
 /// Read the analyst-synthesized markdown repo-map for a workspace.
@@ -521,7 +1793,10 @@ pub async fn curator_thread_for_workspace(db: &Db, workspace_id: i32) -> Result<
 /// thread is `kind="curator"` so board views can filter it out.
 pub async fn ensure_curator_thread(db: &Db, workspace_id: i32, lead_tool: &str) -> Result<i32> {
     let key = curator_thread_key(workspace_id);
-    if let Some(id) = get_setting(db, &key).await?.and_then(|s| s.parse::<i32>().ok()) {
+    if let Some(id) = get_setting(db, &key)
+        .await?
+        .and_then(|s| s.parse::<i32>().ok())
+    {
         if let Some(t) = get_thread(db, id).await? {
             if t.kind == "curator" {
                 return Ok(id);
@@ -548,6 +1823,56 @@ pub async fn add_repo_ref(
     remote_url: &str,
     base_ref_is_default: bool,
 ) -> Result<repo_ref::Model> {
+    add_repo_ref_on(
+        db,
+        workspace_id,
+        name,
+        local_git_path,
+        base_ref,
+        remote_url,
+        base_ref_is_default,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn add_repo_ref_with_action_lock(
+    db: &Db,
+    workspace_id: i32,
+    name: &str,
+    local_git_path: &str,
+    base_ref: &str,
+    remote_url: &str,
+    base_ref_is_default: bool,
+    action_lock: &RepoActionOsLock,
+) -> Result<repo_ref::Model> {
+    add_repo_ref_on(
+        db,
+        workspace_id,
+        name,
+        local_git_path,
+        base_ref,
+        remote_url,
+        base_ref_is_default,
+        Some(action_lock),
+    )
+    .await
+}
+
+async fn add_repo_ref_on(
+    db: &Db,
+    workspace_id: i32,
+    name: &str,
+    local_git_path: &str,
+    base_ref: &str,
+    remote_url: &str,
+    base_ref_is_default: bool,
+    held_action_lock: Option<&RepoActionOsLock>,
+) -> Result<repo_ref::Model> {
+    let _registration_lock = acquire_repo_action_target_registration_lock(
+        std::path::Path::new(local_git_path),
+        held_action_lock,
+    )?;
     ensure_workspace_accepts_writes(db, workspace_id).await?;
     let existing = repo_ref::Entity::find()
         .filter(repo_ref::Column::WorkspaceId.eq(workspace_id))
@@ -588,7 +1913,9 @@ pub async fn add_repo_ref(
     };
     let inserted = m.insert(&db.0).await?;
     if let Err(err) = ensure_workspace_accepts_writes(db, workspace_id).await {
-        let _ = repo_ref::Entity::delete_by_id(inserted.id).exec(&db.0).await;
+        let _ = repo_ref::Entity::delete_by_id(inserted.id)
+            .exec(&db.0)
+            .await;
         return Err(err);
     }
     Ok(inserted)
@@ -675,11 +2002,7 @@ pub async fn get_thread(db: &Db, thread_id: i32) -> Result<Option<thread::Model>
 /// Refresh an initial automatic lead route only while no manual choice has
 /// landed. The conditional write prevents a stale resolver result from
 /// overwriting a concurrent manual pin.
-pub async fn refresh_unpinned_thread_route(
-    db: &Db,
-    thread_id: i32,
-    tool: &str,
-) -> Result<bool> {
+pub async fn refresh_unpinned_thread_route(db: &Db, thread_id: i32, tool: &str) -> Result<bool> {
     let write = thread::Entity::update_many()
         .col_expr(thread::Column::LeadTool, Expr::value(tool.to_string()))
         .filter(thread::Column::Id.eq(thread_id))
@@ -766,10 +2089,8 @@ macro_rules! probe_after_first_statement {
 /// clears `lead_command`: a per-tool alias pin (e.g. `claude` → `cc-claude`)
 /// is meaningless once `lead_tool` names a DIFFERENT tool identity, and
 /// carrying it forward would silently try to spawn the old alias as the new
-/// tool's binary. Does NOT touch `native_id` or any live in-memory engine —
-/// the caller (lead_chat::commands::switch_lead_tool) owns that half of the
-/// switch (tear down the live engine, clear native id, reconstruct fresh) so
-/// this stays a plain, independently-testable field update. No-op fields
+/// tool's binary. The tool/model/command/native-id update is atomic; the caller
+/// owns live engine teardown and reconstruction. No-op fields
 /// (same tool, same model) still write through — callers may use this to
 /// force-reload an engine so an externally-edited CLI config takes effect.
 pub async fn switch_lead_engine_txn(
@@ -809,8 +2130,14 @@ pub async fn switch_lead_engine_txn_with_pin(
     // `rows_affected` carries the "thread is gone" case that the read used to.
     let touched = thread::Entity::update_many()
         .col_expr(thread::Column::LeadTool, Expr::value(tool))
-        .col_expr(thread::Column::LeadCommand, Expr::value(Option::<String>::None))
-        .col_expr(thread::Column::LeadModel, Expr::value(model.map(str::to_string)))
+        .col_expr(
+            thread::Column::LeadCommand,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            thread::Column::LeadModel,
+            Expr::value(model.map(str::to_string)),
+        )
         .col_expr(thread::Column::EnginePinned, Expr::value(pinned))
         .filter(thread::Column::Id.eq(thread_id))
         .exec(&txn)
@@ -836,21 +2163,15 @@ pub async fn switch_lead_engine_txn_with_pin(
             obj.remove("native_id");
         }
         if v.as_object().is_some_and(|o| o.is_empty()) {
-            lead_message::Entity::delete_by_id(meta.id).exec(&txn).await?;
+            lead_message::Entity::delete_by_id(meta.id)
+                .exec(&txn)
+                .await?;
         } else {
             let mut ma: lead_message::ActiveModel = meta.into();
             ma.content = Set(v.to_string());
             ma.update(&txn).await?;
         }
     }
-    // …and the grace marker is written in the SAME commit. This is the whole
-    // fix: "the native id is gone" and "there is evidence this surface ran"
-    // are two halves of one invariant (`revive::has_resumable_context`), and a
-    // transaction is what makes them unable to disagree. Everything else this
-    // PR tried — stamping first and gating, retracting on failure, a pending
-    // kind promoted later — existed only to make an EARLIER stamp safe, and
-    // none of it is needed once the two writes are atomic.
-    insert_marker_row(&txn, thread_id, None, MARKER_KIND_RECOVERED).await?;
     txn.commit().await?;
     Ok(())
 }
@@ -862,15 +2183,74 @@ pub async fn get_plan(db: &Db, thread_id: i32) -> Result<Option<plan::Model>> {
         .await?)
 }
 
-async fn ensure_plan_write_survived_workspace_fence(db: &Db, thread_id: i32) -> Result<()> {
-    if let Err(err) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
-        let _ = plan::Entity::delete_many()
-            .filter(plan::Column::ThreadId.eq(thread_id))
-            .exec(&db.0)
-            .await;
-        return Err(err);
-    }
-    Ok(())
+async fn update_plan_proposal_and_status_cas_on<C: ConnectionTrait>(
+    connection: &C,
+    thread_id: i32,
+    new_proposal: &str,
+    new_status: &str,
+    expected_proposal: &str,
+    expected_status: &str,
+) -> Result<u64> {
+    let updated = connection
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "UPDATE plan SET proposal = ?, status = ? \
+             WHERE thread_id = ? AND proposal = ? AND status = ? \
+               AND EXISTS (\
+                 SELECT 1 FROM thread t \
+                 JOIN workspace w ON w.id = t.workspace_id \
+                 WHERE t.id = plan.thread_id \
+                   AND NOT EXISTS (\
+                     SELECT 1 FROM app_setting a WHERE a.key IN (\
+                       'thread.deleting.' || t.id,\
+                       'workspace.deleting.' || w.id\
+                     )\
+                   )\
+               )",
+            [
+                new_proposal.into(),
+                new_status.into(),
+                thread_id.into(),
+                expected_proposal.into(),
+                expected_status.into(),
+            ],
+        ))
+        .await?;
+    Ok(updated.rows_affected())
+}
+
+async fn update_plan_status_cas_on<C: ConnectionTrait>(
+    connection: &C,
+    thread_id: i32,
+    new_status: &str,
+    expected_proposal: &str,
+    expected_status: &str,
+) -> Result<u64> {
+    let updated = connection
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "UPDATE plan SET status = ? \
+             WHERE thread_id = ? AND proposal = ? AND status = ? \
+               AND EXISTS (\
+                 SELECT 1 FROM thread t \
+                 JOIN workspace w ON w.id = t.workspace_id \
+                 WHERE t.id = plan.thread_id \
+                   AND NOT EXISTS (\
+                     SELECT 1 FROM app_setting a WHERE a.key IN (\
+                       'thread.deleting.' || t.id,\
+                       'workspace.deleting.' || w.id\
+                     )\
+                   )\
+               )",
+            [
+                new_status.into(),
+                thread_id.into(),
+                expected_proposal.into(),
+                expected_status.into(),
+            ],
+        ))
+        .await?;
+    Ok(updated.rows_affected())
 }
 
 /// Insert or update a thread's plan/proposal.
@@ -881,21 +2261,48 @@ pub async fn upsert_plan(
     status: &str,
     created_at: &str,
 ) -> Result<plan::Model> {
-    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-    let mut a = match get_plan(db, thread_id).await? {
-        Some(m) => m.into(),
-        None => plan::ActiveModel {
-            thread_id: Set(thread_id),
-            created_at: Set(created_at.to_string()),
-            ..Default::default()
-        },
-    };
-    a.proposal = Set(proposal.to_string());
-    a.status = Set(status.to_string());
-    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-    let saved = a.save(&db.0).await?.try_into_model()?;
-    ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
-    Ok(saved)
+    let written = db
+        .0
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO plan (thread_id, proposal, status, created_at) \
+             SELECT t.id, ?, ?, ? FROM thread t \
+             JOIN workspace w ON w.id = t.workspace_id \
+             WHERE t.id = ? \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM app_setting a WHERE a.key IN (\
+                   'thread.deleting.' || t.id,\
+                   'workspace.deleting.' || w.id\
+                 )\
+               ) \
+             ON CONFLICT(thread_id) DO UPDATE SET \
+               proposal = excluded.proposal, status = excluded.status \
+             WHERE EXISTS (\
+               SELECT 1 FROM thread t \
+               JOIN workspace w ON w.id = t.workspace_id \
+               WHERE t.id = plan.thread_id \
+                 AND NOT EXISTS (\
+                   SELECT 1 FROM app_setting a WHERE a.key IN (\
+                     'thread.deleting.' || t.id,\
+                     'workspace.deleting.' || w.id\
+                   )\
+                 )\
+             )",
+            [
+                proposal.into(),
+                status.into(),
+                created_at.into(),
+                thread_id.into(),
+            ],
+        ))
+        .await?;
+    if written.rows_affected() == 0 {
+        ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+        anyhow::bail!("plan_write_fenced_or_stale: thread {thread_id}");
+    }
+    get_plan(db, thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("plan_write_fenced_or_stale: thread {thread_id}"))
 }
 
 /// Set a plan's `created_at`, which doubles as the proposal VERSION ("last proposed at").
@@ -904,15 +2311,31 @@ pub async fn upsert_plan(
 /// `created_at` on update — the targeted-edit / CAS / test-seam paths rely on that.) No-op if the
 /// plan row is absent.
 pub async fn set_plan_created_at(db: &Db, thread_id: i32, created_at: &str) -> Result<()> {
-    use sea_orm::sea_query::Expr;
-    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-    let res = plan::Entity::update_many()
-        .col_expr(plan::Column::CreatedAt, Expr::value(created_at.to_string()))
-        .filter(plan::Column::ThreadId.eq(thread_id))
-        .exec(&db.0)
+    let updated = db
+        .0
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "UPDATE plan SET created_at = ? \
+             WHERE thread_id = ? \
+               AND EXISTS (\
+                 SELECT 1 FROM thread t \
+                 JOIN workspace w ON w.id = t.workspace_id \
+                 WHERE t.id = plan.thread_id \
+                   AND NOT EXISTS (\
+                     SELECT 1 FROM app_setting a WHERE a.key IN (\
+                       'thread.deleting.' || t.id,\
+                       'workspace.deleting.' || w.id\
+                     )\
+                   )\
+               )",
+            [created_at.into(), thread_id.into()],
+        ))
         .await?;
-    if res.rows_affected > 0 {
-        ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    if updated.rows_affected() == 0 {
+        ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+        if get_plan(db, thread_id).await?.is_some() {
+            anyhow::bail!("plan_write_fenced_or_stale: thread {thread_id}");
+        }
     }
     Ok(())
 }
@@ -931,26 +2354,20 @@ pub async fn update_plan_proposal_cas(
     expected: &str,
     status: &str,
 ) -> Result<bool> {
-    use sea_orm::sea_query::Expr;
-    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-    let res = plan::Entity::update_many()
-        .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
-        .col_expr(plan::Column::Status, Expr::value(status.to_string()))
-        .filter(plan::Column::ThreadId.eq(thread_id))
-        .filter(plan::Column::Proposal.eq(expected))
-        // Pin status too: a targeted edit reads the plan at one status; if `confirm`
-        // flips that SAME proposal JSON to "confirmed" before this CAS runs, the
-        // proposal predicate still matches and the SET would write the stale status
-        // back, reopening a materialized plan. Predicating on the read status makes
-        // a drifted row match 0 rows (rejecting the edit) while an in-status edit is
-        // a no-op on the status column (SET writes the same value).
-        .filter(plan::Column::Status.eq(status))
-        .exec(&db.0)
-        .await?;
-    if res.rows_affected > 0 {
-        ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    let updated = update_plan_proposal_and_status_cas_on(
+        &db.0,
+        thread_id,
+        new_proposal,
+        status,
+        expected,
+        status,
+    )
+    .await?;
+    if updated == 0 {
+        ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+        return Ok(false);
     }
-    Ok(res.rows_affected > 0)
+    Ok(true)
 }
 
 /// Persist one selected route under a transaction that has already claimed the
@@ -1002,9 +2419,7 @@ async fn pin_initial_direction_route(
         .one(txn)
         .await?;
     let can_refresh_session = latest_session.is_some_and(|session| {
-        session.id == session_id
-            && session.native_session_id.is_none()
-            && !session.engine_pinned
+        session.id == session_id && session.native_session_id.is_none() && !session.engine_pinned
     });
     if !can_refresh_session {
         anyhow::bail!(
@@ -1016,7 +2431,10 @@ async fn pin_initial_direction_route(
     let session_write = session::Entity::update_many()
         .col_expr(session::Column::Tool, Expr::value(pin.tool.clone()))
         .col_expr(session::Column::EnginePinned, Expr::value(true))
-        .col_expr(session::Column::Command, Expr::value(Option::<String>::None))
+        .col_expr(
+            session::Column::Command,
+            Expr::value(Option::<String>::None),
+        )
         .col_expr(session::Column::Model, Expr::value(Option::<String>::None))
         .col_expr(
             session::Column::NativeSessionId,
@@ -1029,9 +2447,7 @@ async fn pin_initial_direction_route(
         .exec(txn)
         .await?;
     if session_write.rows_affected == 0 {
-        anyhow::bail!(
-            "session {session_id} became established while {operation} its manual route"
-        );
+        anyhow::bail!("session {session_id} became established while {operation} its manual route");
     }
     Ok(())
 }
@@ -1052,18 +2468,19 @@ pub async fn commit_reused_approval_with_direction_pin_cas(
 ) -> Result<bool> {
     use sea_orm::TransactionTrait;
 
-    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let txn = db.0.begin().await?;
-    let plan_write = plan::Entity::update_many()
-        .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
-        .col_expr(plan::Column::Status, Expr::value(expected_status.to_string()))
-        .filter(plan::Column::ThreadId.eq(thread_id))
-        .filter(plan::Column::Proposal.eq(expected_proposal))
-        .filter(plan::Column::Status.eq(expected_status))
-        .exec(&txn)
-        .await?;
-    if plan_write.rows_affected == 0 {
+    let plan_write = update_plan_proposal_and_status_cas_on(
+        &txn,
+        thread_id,
+        new_proposal,
+        expected_status,
+        expected_proposal,
+        expected_status,
+    )
+    .await?;
+    if plan_write == 0 {
         txn.rollback().await?;
+        ensure_thread_workspace_accepts_writes(db, thread_id).await?;
         return Ok(false);
     }
 
@@ -1073,7 +2490,6 @@ pub async fn commit_reused_approval_with_direction_pin_cas(
     }
 
     txn.commit().await?;
-    ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
     Ok(true)
 }
 
@@ -1095,19 +2511,19 @@ pub async fn mark_plan_confirmed_cas(
     expected_proposal: &str,
     expected_status: &str,
 ) -> Result<bool> {
-    use sea_orm::sea_query::Expr;
-    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-    let res = plan::Entity::update_many()
-        .col_expr(plan::Column::Status, Expr::value("confirmed"))
-        .filter(plan::Column::ThreadId.eq(thread_id))
-        .filter(plan::Column::Proposal.eq(expected_proposal))
-        .filter(plan::Column::Status.eq(expected_status))
-        .exec(&db.0)
-        .await?;
-    if res.rows_affected > 0 {
-        ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    let updated = update_plan_status_cas_on(
+        &db.0,
+        thread_id,
+        "confirmed",
+        expected_proposal,
+        expected_status,
+    )
+    .await?;
+    if updated == 0 {
+        ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+        return Ok(false);
     }
-    Ok(res.rows_affected > 0)
+    Ok(true)
 }
 
 /// Like `mark_plan_confirmed_cas`, but ALSO rewrites the proposal to `new_proposal` in the same
@@ -1124,20 +2540,20 @@ pub async fn commit_confirmed_plan_cas(
     expected_proposal: &str,
     expected_status: &str,
 ) -> Result<bool> {
-    use sea_orm::sea_query::Expr;
-    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-    let res = plan::Entity::update_many()
-        .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
-        .col_expr(plan::Column::Status, Expr::value("confirmed"))
-        .filter(plan::Column::ThreadId.eq(thread_id))
-        .filter(plan::Column::Proposal.eq(expected_proposal))
-        .filter(plan::Column::Status.eq(expected_status))
-        .exec(&db.0)
-        .await?;
-    if res.rows_affected > 0 {
-        ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    let updated = update_plan_proposal_and_status_cas_on(
+        &db.0,
+        thread_id,
+        new_proposal,
+        "confirmed",
+        expected_proposal,
+        expected_status,
+    )
+    .await?;
+    if updated == 0 {
+        ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+        return Ok(false);
     }
-    Ok(res.rows_affected > 0)
+    Ok(true)
 }
 
 /// Commit a confirmed plan and the manual route pins selected for reused,
@@ -1154,18 +2570,19 @@ pub async fn commit_confirmed_plan_with_direction_pins_cas(
 ) -> Result<bool> {
     use sea_orm::TransactionTrait;
 
-    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let txn = db.0.begin().await?;
-    let plan_write = plan::Entity::update_many()
-        .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
-        .col_expr(plan::Column::Status, Expr::value("confirmed"))
-        .filter(plan::Column::ThreadId.eq(thread_id))
-        .filter(plan::Column::Proposal.eq(expected_proposal))
-        .filter(plan::Column::Status.eq(expected_status))
-        .exec(&txn)
-        .await?;
-    if plan_write.rows_affected == 0 {
+    let plan_write = update_plan_proposal_and_status_cas_on(
+        &txn,
+        thread_id,
+        new_proposal,
+        "confirmed",
+        expected_proposal,
+        expected_status,
+    )
+    .await?;
+    if plan_write == 0 {
         txn.rollback().await?;
+        ensure_thread_workspace_accepts_writes(db, thread_id).await?;
         return Ok(false);
     }
 
@@ -1174,14 +2591,15 @@ pub async fn commit_confirmed_plan_with_direction_pins_cas(
         // holds SQLite's writer lock before this read. A worker session that
         // committed first is visible here; one that starts later must wait for
         // this pin and then re-read the current direction route before insert.
-        if let Err(err) = pin_initial_direction_route(&txn, thread_id, manual_pin, "confirming").await {
+        if let Err(err) =
+            pin_initial_direction_route(&txn, thread_id, manual_pin, "confirming").await
+        {
             let _ = txn.rollback().await;
             return Err(err);
         }
     }
 
     txn.commit().await?;
-    ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
     Ok(true)
 }
 
@@ -1208,28 +2626,48 @@ pub async fn upsert_repo_profile(
     source: &str,
     profiled_commit: &str,
 ) -> Result<repo_profile::Model> {
-    if get_repo(db, repo_id).await?.is_none() {
-        anyhow::bail!("repo {repo_id} not found");
+    use sea_orm::ConnectionTrait;
+    // One conditional upsert is the late-curator fence. A classifier that
+    // started before repo/workspace deletion may finish afterwards; checking
+    // existence in a separate SELECT would let its blocked INSERT recreate a
+    // dangling profile once the cascade commits.
+    let written =
+        db.0.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO repo_profile \
+             (repo_id, role, stack, summary, published, deps, source, profiled_commit, \
+              relations, components, analysis_state, analysis_error, category, domains, \
+              layer, layer_rank) \
+             SELECT r.id, ?, ?, ?, '[]', '[]', ?, ?, '[]', ?, 'idle', NULL, '', '[]', '', 0 \
+             FROM repo_ref r \
+             WHERE r.id = ? \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM app_setting a WHERE a.key IN (\
+                   'repo.deleting.' || r.id, \
+                   'workspace.deleting.' || r.workspace_id\
+                 )\
+               ) \
+             ON CONFLICT(repo_id) DO UPDATE SET \
+               role = excluded.role, stack = excluded.stack, summary = excluded.summary, \
+               published = '[]', deps = '[]', source = excluded.source, \
+               profiled_commit = excluded.profiled_commit, components = excluded.components",
+            [
+                tier.into(),
+                stack.into(),
+                summary.into(),
+                source.into(),
+                profiled_commit.into(),
+                components.into(),
+                repo_id.into(),
+            ],
+        ))
+        .await?;
+    if written.rows_affected() == 0 {
+        anyhow::bail!("repo {repo_id} no longer accepts profile writes");
     }
-    let mut a = match get_repo_profile(db, repo_id).await? {
-        Some(m) => m.into(),
-        None => repo_profile::ActiveModel {
-            repo_id: Set(repo_id),
-            relations: Set("[]".to_string()),
-            published: Set("[]".to_string()),
-            deps: Set("[]".to_string()),
-            ..Default::default()
-        },
-    };
-    a.role = Set(tier.to_string());
-    a.stack = Set(stack.to_string());
-    a.summary = Set(summary.to_string());
-    a.components = Set(components.to_string());
-    a.published = Set("[]".to_string());
-    a.deps = Set("[]".to_string());
-    a.source = Set(source.to_string());
-    a.profiled_commit = Set(profiled_commit.to_string());
-    Ok(a.save(&db.0).await?.try_into_model()?)
+    get_repo_profile(db, repo_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("profile for repo {repo_id} disappeared after upsert"))
 }
 
 /// Persist the agent curator's inferred relations (JSON array of
@@ -1376,7 +2814,33 @@ pub async fn set_repo_base_ref(db: &Db, repo_id: i32, base_ref: &str) -> Result<
 /// Repoint a repo at a new local checkout path. Used when remote-dedup matches a
 /// row whose old checkout has gone missing — we keep the fresh clone and update
 /// the row rather than orphaning the user. Returns the updated row; None if gone.
-pub async fn set_repo_path(db: &Db, repo_id: i32, local_git_path: &str) -> Result<Option<repo_ref::Model>> {
+pub async fn set_repo_path(
+    db: &Db,
+    repo_id: i32,
+    local_git_path: &str,
+) -> Result<Option<repo_ref::Model>> {
+    set_repo_path_on(db, repo_id, local_git_path, None).await
+}
+
+pub(crate) async fn set_repo_path_with_action_lock(
+    db: &Db,
+    repo_id: i32,
+    local_git_path: &str,
+    action_lock: &RepoActionOsLock,
+) -> Result<Option<repo_ref::Model>> {
+    set_repo_path_on(db, repo_id, local_git_path, Some(action_lock)).await
+}
+
+async fn set_repo_path_on(
+    db: &Db,
+    repo_id: i32,
+    local_git_path: &str,
+    held_action_lock: Option<&RepoActionOsLock>,
+) -> Result<Option<repo_ref::Model>> {
+    let _registration_lock = acquire_repo_action_target_registration_lock(
+        std::path::Path::new(local_git_path),
+        held_action_lock,
+    )?;
     if let Some(m) = repo_ref::Entity::find_by_id(repo_id).one(&db.0).await? {
         let mut a: repo_ref::ActiveModel = m.into();
         a.local_git_path = Set(local_git_path.to_string());
@@ -1455,11 +2919,18 @@ pub async fn list_directions(db: &Db, thread_id: i32) -> Result<Vec<direction::M
 /// Delete a direction row (and any worktree rows referencing it). Used to roll back
 /// a half-created direction when materialize fails, so a corrected retry starts clean.
 pub async fn delete_direction(db: &Db, direction_id: i32) -> Result<()> {
+    cancel_open_human_requests_for_direction(db, direction_id).await?;
+    human_request::Entity::delete_many()
+        .filter(human_request::Column::DirectionId.eq(direction_id))
+        .exec(&db.0)
+        .await?;
     worktree::Entity::delete_many()
         .filter(worktree::Column::DirectionId.eq(direction_id))
         .exec(&db.0)
         .await?;
-    direction::Entity::delete_by_id(direction_id).exec(&db.0).await?;
+    direction::Entity::delete_by_id(direction_id)
+        .exec(&db.0)
+        .await?;
     Ok(())
 }
 
@@ -1506,8 +2977,11 @@ pub async fn create_direction_with_engine_pin(
     let t = thread::Entity::find_by_id(thread_id)
         .one(&db.0)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
-    ensure_workspace_accepts_writes(db, t.workspace_id).await?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "direction_write_fenced_or_stale: thread {thread_id}, repo {repo_id}"
+            )
+        })?;
     let existing: Vec<String> = direction::Entity::find()
         .filter(direction::Column::ThreadId.eq(thread_id))
         .all(&db.0)
@@ -1515,7 +2989,14 @@ pub async fn create_direction_with_engine_pin(
         .into_iter()
         .map(|d| d.slug)
         .collect();
-    let repo_ref = ensure_repo_workspace_accepts_writes(db, repo_id).await?;
+    let repo_ref = repo_ref::Entity::find_by_id(repo_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "direction_write_fenced_or_stale: thread {thread_id}, repo {repo_id}"
+            )
+        })?;
     let slug = unique_slug(name, &existing);
     let branch_title = if t.title.trim().is_empty() {
         name
@@ -1540,34 +3021,59 @@ pub async fn create_direction_with_engine_pin(
         branch_title,
         &reserved,
     );
-    ensure_workspace_accepts_writes(db, t.workspace_id).await?;
-    let dir = direction::ActiveModel {
-        thread_id: Set(thread_id),
-        name: Set(name.to_string()),
-        slug: Set(slug),
-        tool: Set(tool.to_string()),
-        branch: Set(branch),
-        status: Set("queued".to_string()),
-        repo_id: Set(repo_id),
-        reason: Set(reason.to_string()),
-        engine_pinned: Set(engine_pinned),
-        mandate: Set(normalize_mandate(mandate).to_string()),
-        base_branch: Set(base_branch.trim().to_string()),
-        target_branch: Set(base_branch.trim().to_string()),
-        created_at: Set(now()),
-        ..Default::default()
+    #[cfg(test)]
+    tests::before_direction_insert_write_probe(thread_id, name).await;
+    let base_branch = base_branch.trim();
+    let inserted = db
+        .0
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO direction (\
+               thread_id, name, slug, tool, branch, status, repo_id, reason, \
+               depends_on_direction_id, engine_pinned, mandate, target_branch, \
+               base_branch, created_at\
+             ) \
+             SELECT t.id, ?, ?, ?, ?, 'queued', r.id, ?, 0, ?, ?, ?, ?, ? \
+             FROM thread t \
+             JOIN workspace w ON w.id = t.workspace_id \
+             JOIN repo_ref r ON r.id = ? AND r.workspace_id = w.id \
+             WHERE t.id = ? \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM app_setting a WHERE a.key IN (\
+                   'thread.deleting.' || t.id,\
+                   'workspace.deleting.' || w.id,\
+                   'repo.deleting.' || r.id\
+                 )\
+               )",
+            [
+                name.into(),
+                slug.into(),
+                tool.into(),
+                branch.into(),
+                reason.into(),
+                engine_pinned.into(),
+                normalize_mandate(mandate).into(),
+                base_branch.into(),
+                base_branch.into(),
+                now().into(),
+                repo_id.into(),
+                thread_id.into(),
+            ],
+        ))
+        .await?;
+    if inserted.rows_affected() == 0 {
+        anyhow::bail!("direction_write_fenced_or_stale: thread {thread_id}, repo {repo_id}");
     }
-    .insert(&db.0)
-    .await?;
-    let accepted = match ensure_workspace_accepts_writes(db, t.workspace_id).await {
-        Ok(_) => ensure_repo_workspace_accepts_writes(db, repo_id).await.map(|_| ()),
-        Err(err) => Err(err),
-    };
-    if let Err(err) = accepted {
-        let _ = delete_direction(db, dir.id).await;
-        return Err(err);
-    }
-    Ok(dir)
+    let direction_id = i32::try_from(inserted.last_insert_id())
+        .map_err(|_| anyhow::anyhow!("direction id out of i32 range"))?;
+    direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "direction_write_fenced_or_stale: thread {thread_id}, repo {repo_id}"
+            )
+        })
 }
 
 /// Anything that isn't explicitly "impl-only" is the default "plan+impl".
@@ -1641,18 +3147,17 @@ pub(crate) const UNRESOLVED_UPSTREAM_SENTINEL: i32 = -2;
 /// non-zero id — it never collides with `direction_id` (a real row's id) or
 /// with a real chain (the sentinel has no row, so `creates_cycle`'s walk
 /// dead-ends there immediately).
-pub async fn set_direction_upstream(
-    db: &Db,
-    direction_id: i32,
-    upstream_id: i32,
-) -> Result<()> {
+pub async fn set_direction_upstream(db: &Db, direction_id: i32, upstream_id: i32) -> Result<()> {
     if upstream_id == direction_id {
         anyhow::bail!("a task cannot depend on itself");
     }
     if creates_cycle(db, direction_id, upstream_id).await? {
         anyhow::bail!("this would create a dependency cycle");
     }
-    let Some(row) = direction::Entity::find_by_id(direction_id).one(&db.0).await? else {
+    let Some(row) = direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+    else {
         return Ok(());
     };
     let mut a: direction::ActiveModel = row.into();
@@ -1687,11 +3192,7 @@ async fn creates_cycle(db: &Db, direction_id: i32, upstream_id: i32) -> Result<b
     }
 }
 
-pub async fn set_direction_engine_pinned(
-    db: &Db,
-    direction_id: i32,
-    pinned: bool,
-) -> Result<()> {
+pub async fn set_direction_engine_pinned(db: &Db, direction_id: i32, pinned: bool) -> Result<()> {
     direction::Entity::update_many()
         .col_expr(direction::Column::EnginePinned, Expr::value(pinned))
         .filter(direction::Column::Id.eq(direction_id))
@@ -1741,7 +3242,10 @@ pub async fn refresh_unpinned_direction_route_with_pin(
         let session_write = session::Entity::update_many()
             .col_expr(session::Column::Tool, Expr::value(tool))
             .col_expr(session::Column::EnginePinned, Expr::value(engine_pinned))
-            .col_expr(session::Column::Command, Expr::value(Option::<String>::None))
+            .col_expr(
+                session::Column::Command,
+                Expr::value(Option::<String>::None),
+            )
             .col_expr(session::Column::Model, Expr::value(Option::<String>::None))
             .col_expr(
                 session::Column::NativeSessionId,
@@ -1894,12 +3398,6 @@ pub async fn switch_worker_engine_txn_with_pin(
         anyhow::bail!("direction {direction_id} not found");
     }
     probe_after_first_statement!();
-    let thread_id = direction::Entity::find_by_id(direction_id)
-        .one(&txn)
-        .await?
-        .map(|d| d.thread_id)
-        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} vanished mid-transaction"))?;
-
     if let Some(s) = session::Entity::find_by_id(session_id).one(&txn).await? {
         let mut sa: session::ActiveModel = s.into();
         sa.tool = Set(tool.to_string());
@@ -1915,8 +3413,6 @@ pub async fn switch_worker_engine_txn_with_pin(
         sa.native_session_id = Set(None);
         sa.update(&txn).await?;
     }
-    // Same commit as the writes above — see the lead twin.
-    insert_marker_row(&txn, thread_id, Some(session_id), MARKER_KIND_RECOVERED).await?;
     txn.commit().await?;
     Ok(())
 }
@@ -1946,11 +3442,7 @@ pub async fn direction_target_branch(db: &Db, direction_id: i32) -> Result<(Stri
 
 /// Persist a direction's diff target branch. Trimmed; "" means "use the repo
 /// default". No-op if the direction is gone.
-pub async fn set_direction_target_branch(
-    db: &Db,
-    direction_id: i32,
-    target: &str,
-) -> Result<()> {
+pub async fn set_direction_target_branch(db: &Db, direction_id: i32, target: &str) -> Result<()> {
     if let Some(d) = direction::Entity::find_by_id(direction_id)
         .one(&db.0)
         .await?
@@ -1964,11 +3456,7 @@ pub async fn set_direction_target_branch(
 
 /// Persist a direction's base branch (the immutable ref its worktree was branched
 /// off). Set once at materialize for the default-base case; not user-editable after.
-pub async fn set_direction_base_branch(
-    db: &Db,
-    direction_id: i32,
-    base: &str,
-) -> Result<()> {
+pub async fn set_direction_base_branch(db: &Db, direction_id: i32, base: &str) -> Result<()> {
     if let Some(d) = direction::Entity::find_by_id(direction_id)
         .one(&db.0)
         .await?
@@ -2009,11 +3497,7 @@ pub async fn record_worktree(
         .one(&db.0)
         .await?
         .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
-    let thread = thread::Entity::find_by_id(direction.thread_id)
-        .one(&db.0)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("thread {} not found", direction.thread_id))?;
-    ensure_workspace_accepts_writes(db, thread.workspace_id).await?;
+    ensure_thread_workspace_accepts_writes(db, direction.thread_id).await?;
     ensure_repo_workspace_accepts_writes(db, repo_id).await?;
     let inserted = worktree::ActiveModel {
         repo_id: Set(repo_id),
@@ -2028,12 +3512,16 @@ pub async fn record_worktree(
     }
     .insert(&db.0)
     .await?;
-    let accepted = match ensure_workspace_accepts_writes(db, thread.workspace_id).await {
-        Ok(_) => ensure_repo_workspace_accepts_writes(db, repo_id).await.map(|_| ()),
+    let accepted = match ensure_thread_workspace_accepts_writes(db, direction.thread_id).await {
+        Ok(_) => ensure_repo_workspace_accepts_writes(db, repo_id)
+            .await
+            .map(|_| ()),
         Err(err) => Err(err),
     };
     if let Err(err) = accepted {
-        let _ = worktree::Entity::delete_by_id(inserted.id).exec(&db.0).await;
+        let _ = worktree::Entity::delete_by_id(inserted.id)
+            .exec(&db.0)
+            .await;
         return Err(err);
     }
     Ok(inserted)
@@ -2044,11 +3532,7 @@ pub async fn record_worktree(
 /// base_commit was still empty (legacy/reuse) — so the new fork point becomes the stable
 /// ancestry anchor. Callers MUST NOT overwrite a non-empty base_commit: the ORIGINAL fork
 /// point is the authoritative one.
-pub async fn set_worktree_base_commit(
-    db: &Db,
-    worktree_id: i32,
-    base_commit: &str,
-) -> Result<()> {
+pub async fn set_worktree_base_commit(db: &Db, worktree_id: i32, base_commit: &str) -> Result<()> {
     worktree::ActiveModel {
         id: Set(worktree_id),
         base_commit: Set(base_commit.to_string()),
@@ -2101,221 +3585,744 @@ pub async fn worktree_for(
         .await?)
 }
 
-/// Remove a repo from a workspace and all Weft state derived from it: its
-/// profile, the directions bound to it (a direction has one write repo) with
-/// their sessions, and its worktree rows. Returns the worktrees
-/// (worktree_id, repo_id, path, branch, created_branch, created_checkout) the
-/// caller must physically `git worktree remove` — DB rows are gone after this.
-/// `created_branch` gates whether the branch is deleted; `created_checkout`
-/// gates whether `git worktree remove` is called (a reused pre-existing
-/// checkout path must survive). NEVER touches the user's actual repo directory
-/// at `local_git_path`.
-pub async fn delete_repo_cascade(
-    db: &Db,
-    repo_id: i32,
-) -> Result<Vec<(i32, i32, String, String, bool, bool)>> {
-    // The workspace's repo-map doc enumerates repos/edges, so removing a repo makes
-    // it stale. Capture the workspace before the repo_ref row is deleted below; the
-    // doc is invalidated at the end (it regenerates on the next analysis pass or a
-    // manual Regenerate). Nothing else clears it on delete, so without this the map
-    // pane keeps showing the deleted repo until a later manual analysis.
-    let workspace_id = get_repo(db, repo_id).await?.map(|r| r.workspace_id);
-    // Worktrees registered for this repo (each direction's worktree is keyed to
-    // its write repo, so this covers the bound directions' worktrees too).
-    let removed: Vec<(i32, i32, String, String, bool, bool)> = worktree::Entity::find()
-        .filter(worktree::Column::RepoId.eq(repo_id))
-        .all(&db.0)
-        .await?
-        .into_iter()
-        .map(|w| (w.id, w.repo_id, w.path, w.branch, w.created_branch, w.created_checkout))
-        .collect();
-    // Sessions of the directions bound to this repo, plus any keyed to the repo.
-    let dirs = direction::Entity::find()
-        .filter(direction::Column::RepoId.eq(repo_id))
-        .all(&db.0)
-        .await?;
-    for d in &dirs {
-        session::Entity::delete_many()
-            .filter(session::Column::DirectionId.eq(d.id))
-            .exec(&db.0)
-            .await?;
-    }
-    session::Entity::delete_many()
-        .filter(session::Column::RepoId.eq(repo_id))
-        .exec(&db.0)
-        .await?;
-    // Code checkpoints die with their worktrees (rows here; the caller removes
-    // the shadow repos — see delete_repo).
-    for (wt_id, ..) in &removed {
-        delete_code_checkpoints_for_worktree(db, *wt_id).await?;
-    }
-    worktree::Entity::delete_many()
-        .filter(worktree::Column::RepoId.eq(repo_id))
-        .exec(&db.0)
-        .await?;
-    direction::Entity::delete_many()
-        .filter(direction::Column::RepoId.eq(repo_id))
-        .exec(&db.0)
-        .await?;
-    repo_profile::Entity::delete_many()
-        .filter(repo_profile::Column::RepoId.eq(repo_id))
-        .exec(&db.0)
-        .await?;
-    // issue #110 T3 review: a tracked PR/MR row (`register_pr`) has no FK to
-    // cascade it away, and until this fix nothing deleted it when its repo
-    // went away — the auto-merge sweep would keep tracking (and could keep
-    // merging) a PR whose repo the user just deleted. See
-    // `delete_thread_cascade`'s matching fix for the full reasoning.
-    pull_request::Entity::delete_many()
-        .filter(pull_request::Column::RepoId.eq(repo_id))
-        .exec(&db.0)
-        .await?;
-    repo_ref::Entity::delete_by_id(repo_id).exec(&db.0).await?;
-    // Best-effort: invalidate the now-stale workspace map doc (see top of fn).
-    if let Some(ws) = workspace_id {
-        let _ = clear_repo_map_doc(db, ws).await;
-    }
-    Ok(removed)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovedWorktree {
+    pub worktree_id: i32,
+    pub repo_id: i32,
+    pub repo_local_git_path: String,
+    pub worktree_path: String,
+    pub branch: String,
+    pub created_branch: bool,
+    pub created_checkout: bool,
 }
 
-/// Delete a workspace and every Weft-owned row under it. Returns worktree
-/// cleanup tuples for the command layer, which still owns filesystem cleanup.
-/// The canonical user repos at `repo_ref.local_git_path` are never removed.
-pub async fn delete_workspace_cascade(
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoActionCleanupPlan {
+    pub execution_id: i32,
+    pub execution_token: String,
+    pub expected_status: String,
+    pub preserve_target: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoActionRewindPlan {
+    pub execution_id: i32,
+    pub execution_token: String,
+    pub thread_id: i32,
+    pub message_id: i32,
+    pub expected_status: String,
+    pub expected_feedback_state: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoDeleteEffects {
+    pub workspace_id: i32,
+    pub removed_worktrees: Vec<RemovedWorktree>,
+    pub cancelled_requests: Vec<CancelledHumanRequest>,
+    /// `(thread_id, direction_id)` rows removed wholesale. A direction with
+    /// only a secondary session in this repo is deliberately absent.
+    pub removed_directions: Vec<(i32, i32)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceDeleteEffects {
+    pub removed_worktrees: Vec<RemovedWorktree>,
+    pub cancelled_requests: Vec<CancelledHumanRequest>,
+    pub removed_threads: Vec<i32>,
+    pub removed_directions: Vec<(i32, i32)>,
+}
+
+async fn snapshot_removed_worktrees_on<C>(
+    db: &C,
+    worktrees: &[worktree::Model],
+) -> Result<Vec<RemovedWorktree>>
+where
+    C: ConnectionTrait,
+{
+    if worktrees.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let repo_ids = worktrees
+        .iter()
+        .map(|worktree| worktree.repo_id)
+        .collect::<std::collections::HashSet<_>>();
+    let repo_paths = repo_ref::Entity::find()
+        .filter(repo_ref::Column::Id.is_in(repo_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|repo| (repo.id, repo.local_git_path))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    worktrees
+        .iter()
+        .map(|worktree| {
+            let repo_local_git_path = repo_paths
+                .get(&worktree.repo_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "worktree repo {} is missing while preparing delete cleanup",
+                        worktree.repo_id
+                    )
+                })?;
+            Ok(RemovedWorktree {
+                worktree_id: worktree.id,
+                repo_id: worktree.repo_id,
+                repo_local_git_path,
+                worktree_path: worktree.path.clone(),
+                branch: worktree.branch.clone(),
+                created_branch: worktree.created_branch,
+                created_checkout: worktree.created_checkout,
+            })
+        })
+        .collect()
+}
+
+fn repo_action_paths_match(left: &str, right: &str) -> bool {
+    let left_path = std::path::Path::new(left);
+    let right_path = std::path::Path::new(right);
+    match (
+        std::fs::canonicalize(left_path),
+        std::fs::canonicalize(right_path),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left_path == right_path,
+    }
+}
+
+async fn repo_action_target_is_registered_on<C>(
+    db: &C,
+    execution: &repo_action_execution::Model,
+) -> Result<bool>
+where
+    C: ConnectionTrait,
+{
+    let repos = repo_ref::Entity::find()
+        .filter(repo_ref::Column::WorkspaceId.eq(execution.workspace_id))
+        .all(db)
+        .await?;
+    Ok(repos
+        .iter()
+        .any(|repo_ref| repo_action_paths_match(&execution.target_path, &repo_ref.local_git_path)))
+}
+
+async fn stage_repo_action_cleanup_on<C>(
+    db: &C,
+    executions: Vec<repo_action_execution::Model>,
+    plans: Option<&[RepoActionCleanupPlan]>,
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let mut matched_plans = std::collections::HashSet::new();
+    for execution in executions {
+        let planned_preserve_target = if let Some(plans) = plans {
+            let Some(plan) = plans.iter().find(|plan| plan.execution_id == execution.id) else {
+                anyhow::bail!("repository action cleanup plan is missing");
+            };
+            if plan.execution_token != execution.execution_token
+                || plan.expected_status != execution.status
+                || !matched_plans.insert(plan.execution_id)
+            {
+                anyhow::bail!("repository action cleanup ownership changed before delete");
+            }
+            plan.preserve_target
+        } else {
+            false
+        };
+        // A pre-lock plan is only a preservation lower bound. Re-read the
+        // execution and repo_ref snapshot while the cascade owns SQLite's
+        // writer transaction so a checkout registered after planning cannot be
+        // turned into a destructive post-commit cleanup.
+        let preserve_target = planned_preserve_target
+            || execution.cleanup_preserve_target
+            || repo_action_target_is_registered_on(db, &execution).await?;
+        let staged = repo_action_execution::Entity::update_many()
+            .col_expr(
+                repo_action_execution::Column::Status,
+                Expr::value(REPO_ACTION_CLEANUP_PENDING),
+            )
+            .col_expr(
+                repo_action_execution::Column::CleanupPreserveTarget,
+                Expr::value(preserve_target),
+            )
+            .col_expr(repo_action_execution::Column::UpdatedAt, Expr::value(now()))
+            .filter(repo_action_execution::Column::Id.eq(execution.id))
+            .filter(repo_action_execution::Column::ExecutionToken.eq(&execution.execution_token))
+            .filter(repo_action_execution::Column::Status.eq(&execution.status))
+            .exec(db)
+            .await?;
+        if staged.rows_affected != 1 {
+            anyhow::bail!("repository action cleanup ownership changed before delete");
+        }
+    }
+    if plans.is_some_and(|plans| plans.len() != matched_plans.len()) {
+        anyhow::bail!("repository action cleanup plan is outside the delete scope");
+    }
+    Ok(())
+}
+
+/// Atomically remove one repo's database footprint and prepare every durable
+/// human-card terminal effect. Nothing process-local is mutated here: callers
+/// apply the returned effects only after this transaction commits.
+pub async fn delete_repo_cascade_with_human_cancellations(
+    db: &Db,
+    repo_id: i32,
+) -> Result<RepoDeleteEffects> {
+    let txn = db.0.begin().await?;
+    // Write first: once this guarded no-op acquires SQLite's writer lock, every
+    // scope query below describes the same deletion snapshot.
+    let locked = repo_ref::Entity::update_many()
+        .col_expr(
+            repo_ref::Column::Name,
+            Expr::col(repo_ref::Column::Name).into(),
+        )
+        .filter(repo_ref::Column::Id.eq(repo_id))
+        .exec(&txn)
+        .await?;
+    if locked.rows_affected != 1 {
+        txn.rollback().await?;
+        anyhow::bail!("repo {repo_id} not found");
+    }
+    let repo_model = repo_ref::Entity::find_by_id(repo_id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
+    let directions = direction::Entity::find()
+        .filter(direction::Column::RepoId.eq(repo_id))
+        .all(&txn)
+        .await?;
+    let direction_ids = directions
+        .iter()
+        .map(|direction| direction.id)
+        .collect::<Vec<_>>();
+    let removed_directions = directions
+        .iter()
+        .map(|direction| (direction.thread_id, direction.id))
+        .collect::<Vec<_>>();
+
+    let mut session_scope = Condition::any().add(session::Column::RepoId.eq(repo_id));
+    if !direction_ids.is_empty() {
+        session_scope =
+            session_scope.add(session::Column::DirectionId.is_in(direction_ids.clone()));
+    }
+    let sessions = session::Entity::find()
+        .filter(session_scope)
+        .all(&txn)
+        .await?;
+    let session_ids = sessions
+        .iter()
+        .map(|session| session.id)
+        .collect::<Vec<_>>();
+    let session_only_ids = sessions
+        .iter()
+        .filter(|session| !direction_ids.contains(&session.direction_id))
+        .map(|session| session.id)
+        .collect::<Vec<_>>();
+
+    let mut cancelled_requests = Vec::new();
+    for direction_id in &direction_ids {
+        cancelled_requests.extend(
+            cancel_human_requests_in_scope_on(
+                &txn,
+                HumanRequestCancelScope::Direction(*direction_id),
+            )
+            .await?,
+        );
+    }
+    cancelled_requests.extend(
+        cancel_human_requests_in_scope_on(
+            &txn,
+            HumanRequestCancelScope::SourceSessions(session_only_ids),
+        )
+        .await?,
+    );
+
+    let mut worktree_scope = Condition::any().add(worktree::Column::RepoId.eq(repo_id));
+    if !direction_ids.is_empty() {
+        worktree_scope =
+            worktree_scope.add(worktree::Column::DirectionId.is_in(direction_ids.clone()));
+    }
+    let worktrees = worktree::Entity::find()
+        .filter(worktree_scope)
+        .all(&txn)
+        .await?;
+    let worktree_ids = worktrees
+        .iter()
+        .map(|worktree| worktree.id)
+        .collect::<Vec<_>>();
+    let removed_worktrees = snapshot_removed_worktrees_on(&txn, &worktrees).await?;
+
+    if !worktree_ids.is_empty() {
+        code_checkpoint::Entity::delete_many()
+            .filter(code_checkpoint::Column::WorktreeId.is_in(worktree_ids.clone()))
+            .exec(&txn)
+            .await?;
+        worktree::Entity::delete_many()
+            .filter(worktree::Column::Id.is_in(worktree_ids))
+            .exec(&txn)
+            .await?;
+    }
+    if !session_ids.is_empty() {
+        // Worker transcript rows are session-owned. Keeping them after the
+        // session disappears leaves dangling session_id/source provenance.
+        lead_message::Entity::delete_many()
+            .filter(lead_message::Column::SessionId.is_in(session_ids.clone()))
+            .exec(&txn)
+            .await?;
+        session::Entity::delete_many()
+            .filter(session::Column::Id.is_in(session_ids))
+            .exec(&txn)
+            .await?;
+    }
+    if !direction_ids.is_empty() {
+        human_request::Entity::delete_many()
+            .filter(human_request::Column::DirectionId.is_in(direction_ids.clone()))
+            .exec(&txn)
+            .await?;
+        direction::Entity::delete_many()
+            .filter(direction::Column::Id.is_in(direction_ids.clone()))
+            .exec(&txn)
+            .await?;
+    }
+    repo_profile::Entity::delete_many()
+        .filter(repo_profile::Column::RepoId.eq(repo_id))
+        .exec(&txn)
+        .await?;
+    let mut pr_scope = Condition::any().add(pull_request::Column::RepoId.eq(repo_id));
+    if !direction_ids.is_empty() {
+        pr_scope = pr_scope.add(
+            pull_request::Column::DirectionId.is_in(direction_ids.clone()),
+        );
+    }
+    pull_request::Entity::delete_many()
+        .filter(pr_scope)
+        .exec(&txn)
+        .await?;
+    let deleted_repo_action_ids = repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::RepoId.eq(repo_id))
+        .filter(repo_action_execution::Column::FeedbackState.ne(REPO_ACTION_FEEDBACK_PENDING))
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|execution| execution.id)
+        .collect::<Vec<_>>();
+    if !deleted_repo_action_ids.is_empty() {
+        lead_hidden_delivery::Entity::delete_many()
+            .filter(lead_hidden_delivery::Column::SourceKind.eq("repo_action"))
+            .filter(
+                lead_hidden_delivery::Column::SourceId
+                    .is_in(deleted_repo_action_ids),
+            )
+            .exec(&txn)
+            .await?;
+    }
+    repo_action_execution::Entity::delete_many()
+        .filter(repo_action_execution::Column::RepoId.eq(repo_id))
+        .filter(repo_action_execution::Column::FeedbackState.ne(REPO_ACTION_FEEDBACK_PENDING))
+        .exec(&txn)
+        .await?;
+    repo_ref::Entity::delete_by_id(repo_id).exec(&txn).await?;
+    app_setting::Entity::delete_many()
+        .filter(app_setting::Column::Key.is_in([
+            repo_map_doc_key(repo_model.workspace_id),
+            repo_deleting_key(repo_id),
+        ]))
+        .exec(&txn)
+        .await?;
+    txn.commit().await?;
+
+    Ok(RepoDeleteEffects {
+        workspace_id: repo_model.workspace_id,
+        removed_worktrees,
+        cancelled_requests,
+        removed_directions,
+    })
+}
+
+/// Compatibility wrapper for store callers that do not own process-local bus
+/// state. The command path uses the effects-returning variant above.
+pub async fn delete_repo_cascade(db: &Db, repo_id: i32) -> Result<Vec<RemovedWorktree>> {
+    mark_repo_deleting(db, repo_id).await?;
+    match delete_repo_cascade_with_human_cancellations(db, repo_id).await {
+        Ok(effects) => Ok(effects.removed_worktrees),
+        Err(error) => {
+            let _ = clear_repo_deleting(db, repo_id).await;
+            Err(error)
+        }
+    }
+}
+
+/// Atomically delete a workspace and every database row it owns, including
+/// durable cancellation/outbox effects for external directions that use one
+/// of its repos. Process-local bus/permission effects happen after commit.
+pub async fn delete_workspace_cascade_with_human_cancellations(
     db: &Db,
     workspace_id: i32,
-) -> Result<Vec<(i32, i32, String, String, bool, bool)>> {
-    mark_workspace_deleting(db, workspace_id).await?;
+) -> Result<WorkspaceDeleteEffects> {
+    delete_workspace_cascade_with_action_cleanups(db, workspace_id, None).await
+}
 
-    let repos = list_repos(db, workspace_id).await?;
-    let repo_ids: Vec<i32> = repos.iter().map(|r| r.id).collect();
-    let threads = list_threads(db, workspace_id).await?;
-    let thread_ids: Vec<i32> = threads.iter().map(|t| t.id).collect();
-    let mut directions = Vec::new();
-    for thread_id in &thread_ids {
-        directions.extend(list_directions(db, *thread_id).await?);
+pub async fn delete_workspace_cascade_with_human_cancellations_and_action_cleanups(
+    db: &Db,
+    workspace_id: i32,
+    action_cleanup_plans: &[RepoActionCleanupPlan],
+) -> Result<WorkspaceDeleteEffects> {
+    delete_workspace_cascade_with_action_cleanups(db, workspace_id, Some(action_cleanup_plans))
+        .await
+}
+
+async fn delete_workspace_cascade_with_action_cleanups(
+    db: &Db,
+    workspace_id: i32,
+    action_cleanup_plans: Option<&[RepoActionCleanupPlan]>,
+) -> Result<WorkspaceDeleteEffects> {
+    let txn = db.0.begin().await?;
+    let locked = workspace::Entity::update_many()
+        .col_expr(
+            workspace::Column::Name,
+            Expr::col(workspace::Column::Name).into(),
+        )
+        .filter(workspace::Column::Id.eq(workspace_id))
+        .exec(&txn)
+        .await?;
+    if locked.rows_affected != 1 {
+        txn.rollback().await?;
+        anyhow::bail!("workspace {workspace_id} not found");
     }
-    let direction_ids: Vec<i32> = directions.iter().map(|d| d.id).collect();
-    let repo_session_ids: Vec<i32> = if repo_ids.is_empty() {
+
+    let repo_ids = repo_ref::Entity::find()
+        .filter(repo_ref::Column::WorkspaceId.eq(workspace_id))
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|repo| repo.id)
+        .collect::<Vec<_>>();
+    let removed_threads = thread::Entity::find()
+        .filter(thread::Column::WorkspaceId.eq(workspace_id))
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|thread| thread.id)
+        .collect::<Vec<_>>();
+    let action_cleanups = repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::WorkspaceId.eq(workspace_id))
+        .filter(
+            repo_action_execution::Column::Status
+                .is_in([REPO_ACTION_PENDING, REPO_ACTION_MATERIALIZED]),
+        )
+        .all(&txn)
+        .await?;
+    stage_repo_action_cleanup_on(&txn, action_cleanups, action_cleanup_plans).await?;
+
+    // Only rows anchored to threads that are actually removed may be deleted
+    // regardless of feedback state. A legacy cross-workspace execution can
+    // point at a surviving external thread; its pending feedback and hidden
+    // outbox must remain until the first engine activity consumes the receipt.
+    // Non-pending external rows are safe to clean up with their exact hidden
+    // source rows once the owning workspace/repo is gone.
+    let mut deleted_repo_action_ids = Vec::new();
+    if !removed_threads.is_empty() {
+        deleted_repo_action_ids.extend(
+            repo_action_execution::Entity::find()
+                .filter(repo_action_execution::Column::ThreadId.is_in(removed_threads.clone()))
+                .filter(repo_action_execution::Column::Status.ne(REPO_ACTION_CLEANUP_PENDING))
+                .all(&txn)
+                .await?
+                .into_iter()
+                .map(|execution| execution.id),
+        );
+    }
+    let mut surviving_workspace_scope = Condition::all()
+        .add(repo_action_execution::Column::WorkspaceId.eq(workspace_id))
+        .add(repo_action_execution::Column::Status.ne(REPO_ACTION_CLEANUP_PENDING))
+        .add(
+            repo_action_execution::Column::FeedbackState
+                .ne(REPO_ACTION_FEEDBACK_PENDING),
+        );
+    if !removed_threads.is_empty() {
+        surviving_workspace_scope = surviving_workspace_scope.add(
+            repo_action_execution::Column::ThreadId.is_not_in(removed_threads.clone()),
+        );
+    }
+    deleted_repo_action_ids.extend(
+        repo_action_execution::Entity::find()
+            .filter(surviving_workspace_scope)
+            .all(&txn)
+            .await?
+            .into_iter()
+            .map(|execution| execution.id),
+    );
+    deleted_repo_action_ids.sort_unstable();
+    deleted_repo_action_ids.dedup();
+
+    let mut direction_scope = Condition::any();
+    if !removed_threads.is_empty() {
+        direction_scope =
+            direction_scope.add(direction::Column::ThreadId.is_in(removed_threads.clone()));
+    }
+    if !repo_ids.is_empty() {
+        direction_scope = direction_scope.add(direction::Column::RepoId.is_in(repo_ids.clone()));
+    }
+    let directions = if removed_threads.is_empty() && repo_ids.is_empty() {
+        Vec::new()
+    } else {
+        direction::Entity::find()
+            .filter(direction_scope)
+            .all(&txn)
+            .await?
+    };
+    let direction_ids = directions
+        .iter()
+        .map(|direction| direction.id)
+        .collect::<Vec<_>>();
+    let removed_directions = directions
+        .iter()
+        .map(|direction| (direction.thread_id, direction.id))
+        .collect::<Vec<_>>();
+
+    let mut session_scope = Condition::any();
+    if !repo_ids.is_empty() {
+        session_scope = session_scope.add(session::Column::RepoId.is_in(repo_ids.clone()));
+    }
+    if !direction_ids.is_empty() {
+        session_scope =
+            session_scope.add(session::Column::DirectionId.is_in(direction_ids.clone()));
+    }
+    let sessions = if repo_ids.is_empty() && direction_ids.is_empty() {
         Vec::new()
     } else {
         session::Entity::find()
-            .filter(session::Column::RepoId.is_in(repo_ids.clone()))
-            .all(&db.0)
+            .filter(session_scope)
+            .all(&txn)
             .await?
-            .into_iter()
-            .map(|s| s.id)
-            .collect()
     };
+    let session_ids = sessions
+        .iter()
+        .map(|session| session.id)
+        .collect::<Vec<_>>();
+    let session_only_ids = sessions
+        .iter()
+        .filter(|session| !direction_ids.contains(&session.direction_id))
+        .map(|session| session.id)
+        .collect::<Vec<_>>();
 
-    let mut removed = Vec::new();
-    for worktree in worktree::Entity::find().all(&db.0).await? {
-        if repo_ids.contains(&worktree.repo_id) || direction_ids.contains(&worktree.direction_id) {
-            removed.push((
-                worktree.id,
-                worktree.repo_id,
-                worktree.path,
-                worktree.branch,
-                worktree.created_branch,
-                worktree.created_checkout,
-            ));
-        }
+    let mut cancelled_requests = Vec::new();
+    for thread_id in &removed_threads {
+        cancelled_requests.extend(
+            cancel_human_requests_in_scope_on(&txn, HumanRequestCancelScope::Thread(*thread_id))
+                .await?,
+        );
     }
-    // Code checkpoints die with their worktrees (rows here; the caller removes
-    // the shadow repos — see cleanup_worktrees).
-    for (wt_id, ..) in &removed {
-        delete_code_checkpoints_for_worktree(db, *wt_id).await?;
+    for direction in directions
+        .iter()
+        .filter(|direction| !removed_threads.contains(&direction.thread_id))
+    {
+        cancelled_requests.extend(
+            cancel_human_requests_in_scope_on(
+                &txn,
+                HumanRequestCancelScope::Direction(direction.id),
+            )
+            .await?,
+        );
     }
+    cancelled_requests.extend(
+        cancel_human_requests_in_scope_on(
+            &txn,
+            HumanRequestCancelScope::SourceSessions(session_only_ids),
+        )
+        .await?,
+    );
 
-    for thread_id in &thread_ids {
-        im_route::Entity::delete_many()
-            .filter(im_route::Column::ThreadId.eq(*thread_id))
-            .exec(&db.0)
-            .await?;
-        lead_message::Entity::delete_many()
-            .filter(lead_message::Column::ThreadId.eq(*thread_id))
-            .exec(&db.0)
-            .await?;
-        plan::Entity::delete_many()
-            .filter(plan::Column::ThreadId.eq(*thread_id))
-            .exec(&db.0)
-            .await?;
-        test_plan::Entity::delete_many()
-            .filter(test_plan::Column::ThreadId.eq(*thread_id))
-            .exec(&db.0)
-            .await?;
-        // issue #110 T3 review: see `delete_thread_cascade`'s matching fix —
-        // a tracked PR/MR row has no FK to cascade it away on its own.
-        pull_request::Entity::delete_many()
-            .filter(pull_request::Column::ThreadId.eq(*thread_id))
-            .exec(&db.0)
-            .await?;
+    let mut worktree_scope = Condition::any();
+    if !repo_ids.is_empty() {
+        worktree_scope = worktree_scope.add(worktree::Column::RepoId.is_in(repo_ids.clone()));
     }
-    if !repo_session_ids.is_empty() {
-        lead_message::Entity::delete_many()
-            .filter(lead_message::Column::SessionId.is_in(repo_session_ids.clone()))
-            .exec(&db.0)
-            .await?;
+    if !direction_ids.is_empty() {
+        worktree_scope =
+            worktree_scope.add(worktree::Column::DirectionId.is_in(direction_ids.clone()));
     }
+    let worktrees = if repo_ids.is_empty() && direction_ids.is_empty() {
+        Vec::new()
+    } else {
+        worktree::Entity::find()
+            .filter(worktree_scope)
+            .all(&txn)
+            .await?
+    };
+    let worktree_ids = worktrees
+        .iter()
+        .map(|worktree| worktree.id)
+        .collect::<Vec<_>>();
+    let removed_worktrees = snapshot_removed_worktrees_on(&txn, &worktrees).await?;
 
-    for direction_id in &direction_ids {
-        session::Entity::delete_many()
-            .filter(session::Column::DirectionId.eq(*direction_id))
-            .exec(&db.0)
+    if !worktree_ids.is_empty() {
+        code_checkpoint::Entity::delete_many()
+            .filter(code_checkpoint::Column::WorktreeId.is_in(worktree_ids.clone()))
+            .exec(&txn)
             .await?;
         worktree::Entity::delete_many()
-            .filter(worktree::Column::DirectionId.eq(*direction_id))
-            .exec(&db.0)
+            .filter(worktree::Column::Id.is_in(worktree_ids))
+            .exec(&txn)
             .await?;
-        direction::Entity::delete_by_id(*direction_id).exec(&db.0).await?;
     }
-
-    for repo_id in &repo_ids {
-        session::Entity::delete_many()
-            .filter(session::Column::RepoId.eq(*repo_id))
-            .exec(&db.0)
+    if !session_ids.is_empty() {
+        lead_message::Entity::delete_many()
+            .filter(lead_message::Column::SessionId.is_in(session_ids.clone()))
+            .exec(&txn)
             .await?;
-        worktree::Entity::delete_many()
-            .filter(worktree::Column::RepoId.eq(*repo_id))
-            .exec(&db.0)
+        session::Entity::delete_many()
+            .filter(session::Column::Id.is_in(session_ids))
+            .exec(&txn)
+            .await?;
+    }
+    if !direction_ids.is_empty() {
+        human_request::Entity::delete_many()
+            .filter(human_request::Column::DirectionId.is_in(direction_ids.clone()))
+            .exec(&txn)
             .await?;
         direction::Entity::delete_many()
-            .filter(direction::Column::RepoId.eq(*repo_id))
-            .exec(&db.0)
+            .filter(direction::Column::Id.is_in(direction_ids.clone()))
+            .exec(&txn)
             .await?;
+    }
+    if !removed_threads.is_empty() {
+        human_request::Entity::delete_many()
+            .filter(human_request::Column::ThreadId.is_in(removed_threads.clone()))
+            .exec(&txn)
+            .await?;
+        im_route::Entity::delete_many()
+            .filter(im_route::Column::ThreadId.is_in(removed_threads.clone()))
+            .exec(&txn)
+            .await?;
+        lead_message::Entity::delete_many()
+            .filter(lead_message::Column::ThreadId.is_in(removed_threads.clone()))
+            .exec(&txn)
+            .await?;
+        plan::Entity::delete_many()
+            .filter(plan::Column::ThreadId.is_in(removed_threads.clone()))
+            .exec(&txn)
+            .await?;
+        test_plan::Entity::delete_many()
+            .filter(test_plan::Column::ThreadId.is_in(removed_threads.clone()))
+            .exec(&txn)
+            .await?;
+        lead_hidden_delivery::Entity::delete_many()
+            .filter(lead_hidden_delivery::Column::ThreadId.is_in(removed_threads.clone()))
+            .exec(&txn)
+            .await?;
+    }
+    if !deleted_repo_action_ids.is_empty() {
+        lead_hidden_delivery::Entity::delete_many()
+            .filter(lead_hidden_delivery::Column::SourceKind.eq("repo_action"))
+            .filter(
+                lead_hidden_delivery::Column::SourceId
+                    .is_in(deleted_repo_action_ids.clone()),
+            )
+            .exec(&txn)
+            .await?;
+    }
+    let mut pr_scope = Condition::any();
+    if !removed_threads.is_empty() {
+        pr_scope = pr_scope.add(pull_request::Column::ThreadId.is_in(removed_threads.clone()));
+    }
+    if !repo_ids.is_empty() {
+        pr_scope = pr_scope.add(pull_request::Column::RepoId.is_in(repo_ids.clone()));
+    }
+    if !direction_ids.is_empty() {
+        pr_scope = pr_scope.add(pull_request::Column::DirectionId.is_in(direction_ids.clone()));
+    }
+    if !removed_threads.is_empty() || !repo_ids.is_empty() || !direction_ids.is_empty() {
+        pull_request::Entity::delete_many()
+            .filter(pr_scope)
+            .exec(&txn)
+            .await?;
+    }
+    if !repo_ids.is_empty() {
         repo_profile::Entity::delete_many()
-            .filter(repo_profile::Column::RepoId.eq(*repo_id))
-            .exec(&db.0)
+            .filter(repo_profile::Column::RepoId.is_in(repo_ids.clone()))
+            .exec(&txn)
             .await?;
-        repo_ref::Entity::delete_by_id(*repo_id).exec(&db.0).await?;
+        repo_ref::Entity::delete_many()
+            .filter(repo_ref::Column::Id.is_in(repo_ids))
+            .exec(&txn)
+            .await?;
     }
-
-    for thread_id in &thread_ids {
-        thread::Entity::delete_by_id(*thread_id).exec(&db.0).await?;
+    if !removed_threads.is_empty() {
+        thread::Entity::delete_many()
+            .filter(thread::Column::Id.is_in(removed_threads.clone()))
+            .exec(&txn)
+            .await?;
     }
-
     skill_enable::Entity::delete_many()
         .filter(skill_enable::Column::Scope.eq(format!("ws:{workspace_id}")))
-        .exec(&db.0)
+        .exec(&txn)
         .await?;
-    let _ = clear_repo_map_doc(db, workspace_id).await;
-    let _ = delete_setting(db, &curator_thread_key(workspace_id)).await;
-    workspace::Entity::delete_by_id(workspace_id).exec(&db.0).await?;
-    let _ = clear_workspace_deleting(db, workspace_id).await;
+    if !deleted_repo_action_ids.is_empty() {
+        repo_action_execution::Entity::delete_many()
+            .filter(repo_action_execution::Column::Id.is_in(deleted_repo_action_ids))
+            .exec(&txn)
+            .await?;
+    }
+    app_setting::Entity::delete_many()
+        .filter(app_setting::Column::Key.is_in([
+            repo_map_doc_key(workspace_id),
+            curator_thread_key(workspace_id),
+            workspace_deleting_key(workspace_id),
+        ]))
+        .exec(&txn)
+        .await?;
+    workspace::Entity::delete_by_id(workspace_id)
+        .exec(&txn)
+        .await?;
+    txn.commit().await?;
 
-    Ok(removed)
+    Ok(WorkspaceDeleteEffects {
+        removed_worktrees,
+        cancelled_requests,
+        removed_threads,
+        removed_directions,
+    })
+}
+
+pub async fn delete_workspace_cascade(db: &Db, workspace_id: i32) -> Result<Vec<RemovedWorktree>> {
+    mark_workspace_deleting(db, workspace_id).await?;
+    match delete_workspace_cascade_with_human_cancellations(db, workspace_id).await {
+        Ok(effects) => Ok(effects.removed_worktrees),
+        Err(error) => {
+            let _ = clear_workspace_deleting(db, workspace_id).await;
+            Err(error)
+        }
+    }
 }
 
 /// Delete a thread and everything under it. Returns the worktree paths that the
 /// caller must physically remove via git (DB rows are gone after this).
-/// Each tuple is (worktree_id, repo_id, path, branch, created_branch,
-/// created_checkout): `created_branch` gates branch deletion; `created_checkout`
-/// gates worktree directory removal (a reused pre-existing checkout must
-/// survive); `worktree_id` names the shadow repo of code checkpoints to remove.
-pub async fn delete_thread_cascade(
+/// Each effect includes the repo path captured by this same transaction;
+/// `created_branch` gates branch deletion, `created_checkout` gates worktree
+/// directory removal, and `worktree_id` names the checkpoint shadow to remove.
+pub async fn delete_thread_cascade_with_human_cancellations(
     db: &Db,
     thread_id: i32,
-) -> Result<Vec<(i32, i32, String, String, bool, bool)>> {
+) -> Result<(Vec<RemovedWorktree>, Vec<CancelledHumanRequest>)> {
+    delete_thread_cascade_with_action_cleanups(db, thread_id, None).await
+}
+
+pub async fn delete_thread_cascade_with_human_cancellations_and_action_cleanups(
+    db: &Db,
+    thread_id: i32,
+    action_cleanup_plans: &[RepoActionCleanupPlan],
+) -> Result<(Vec<RemovedWorktree>, Vec<CancelledHumanRequest>)> {
+    delete_thread_cascade_with_action_cleanups(db, thread_id, Some(action_cleanup_plans)).await
+}
+
+async fn delete_thread_cascade_with_action_cleanups(
+    db: &Db,
+    thread_id: i32,
+    action_cleanup_plans: Option<&[RepoActionCleanupPlan]>,
+) -> Result<(Vec<RemovedWorktree>, Vec<CancelledHumanRequest>)> {
     use sea_orm::TransactionTrait;
     // One TRANSACTION for the whole cascade. Atomicity gives both halves of
     // the safety story at once: concurrent writers can't observe (and race)
@@ -2324,19 +4331,45 @@ pub async fn delete_thread_cascade(
     // retryable issue instead of stranding orphaned owned rows whose anchor
     // is already gone.
     let txn = db.0.begin().await?;
+    let locked = thread::Entity::update_many()
+        .col_expr(
+            thread::Column::Title,
+            Expr::col(thread::Column::Title).into(),
+        )
+        .filter(thread::Column::Id.eq(thread_id))
+        .exec(&txn)
+        .await?;
+    if locked.rows_affected != 1 {
+        txn.rollback().await?;
+        anyhow::bail!("thread {thread_id} not found");
+    }
+    // Terminal provider work and the source-row cascade share this transaction.
+    // A failed delete therefore leaves every question answerable and emits no
+    // deletion tombstone; a successful delete cannot lose the terminal card
+    // state in the gap between two commits.
+    let cancelled =
+        cancel_human_requests_in_scope_on(&txn, HumanRequestCancelScope::Thread(thread_id)).await?;
+    let action_cleanups = repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::ThreadId.eq(thread_id))
+        .filter(
+            repo_action_execution::Column::Status
+                .is_in([REPO_ACTION_PENDING, REPO_ACTION_MATERIALIZED]),
+        )
+        .all(&txn)
+        .await?;
+    stage_repo_action_cleanup_on(&txn, action_cleanups, action_cleanup_plans).await?;
     let dirs = direction::Entity::find()
         .filter(direction::Column::ThreadId.eq(thread_id))
         .all(&txn)
         .await?;
-    // (worktree_id, repo_id, worktree path, branch, created_branch, created_checkout)
-    let mut removed: Vec<(i32, i32, String, String, bool, bool)> = Vec::new();
+    let mut removed = Vec::new();
     for d in &dirs {
         let wts = worktree::Entity::find()
             .filter(worktree::Column::DirectionId.eq(d.id))
             .all(&txn)
             .await?;
+        removed.extend(snapshot_removed_worktrees_on(&txn, &wts).await?);
         for w in wts {
-            removed.push((w.id, w.repo_id, w.path.clone(), w.branch.clone(), w.created_branch, w.created_checkout));
             // Code checkpoints die with their worktree (the shadow repo itself
             // is removed by the caller's cleanup pass).
             code_checkpoint::Entity::delete_many()
@@ -2376,6 +4409,14 @@ pub async fn delete_thread_cascade(
         .filter(test_plan::Column::ThreadId.eq(thread_id))
         .exec(&txn)
         .await?;
+    lead_hidden_delivery::Entity::delete_many()
+        .filter(lead_hidden_delivery::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
+    human_request::Entity::delete_many()
+        .filter(human_request::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
     // issue #110 T3 review: a tracked PR/MR row (`register_pr` /
     // `crate::host::monitor`/`crate::host::automerge`) has no FK relation to
     // this thread, so without this it would silently outlive the issue that
@@ -2387,8 +4428,31 @@ pub async fn delete_thread_cascade(
         .filter(pull_request::Column::ThreadId.eq(thread_id))
         .exec(&txn)
         .await?;
+    repo_action_execution::Entity::delete_many()
+        .filter(repo_action_execution::Column::ThreadId.eq(thread_id))
+        .filter(repo_action_execution::Column::Status.ne(REPO_ACTION_CLEANUP_PENDING))
+        .exec(&txn)
+        .await?;
+    app_setting::Entity::delete_many()
+        .filter(app_setting::Column::Key.eq(thread_deleting_key(thread_id)))
+        .exec(&txn)
+        .await?;
     txn.commit().await?;
-    Ok(removed)
+    Ok((removed, cancelled))
+}
+
+pub async fn delete_thread_cascade(
+    db: &Db,
+    thread_id: i32,
+) -> Result<Vec<RemovedWorktree>> {
+    mark_thread_deleting(db, thread_id).await?;
+    match delete_thread_cascade_with_human_cancellations(db, thread_id).await {
+        Ok((removed, _)) => Ok(removed),
+        Err(error) => {
+            let _ = clear_thread_deleting(db, thread_id).await;
+            Err(error)
+        }
+    }
 }
 
 pub async fn create_session(
@@ -2414,7 +4478,9 @@ pub async fn create_session(
     .insert(&db.0)
     .await?;
     let accepted = match ensure_thread_workspace_accepts_writes(db, direction.thread_id).await {
-        Ok(_) => ensure_repo_workspace_accepts_writes(db, repo_id).await.map(|_| ()),
+        Ok(_) => ensure_repo_workspace_accepts_writes(db, repo_id)
+            .await
+            .map(|_| ()),
         Err(err) => Err(err),
     };
     if let Err(err) = accepted {
@@ -2474,7 +4540,9 @@ pub async fn create_session_for_current_direction(
     txn.commit().await?;
 
     let accepted = match ensure_thread_workspace_accepts_writes(db, direction.thread_id).await {
-        Ok(_) => ensure_repo_workspace_accepts_writes(db, repo_id).await.map(|_| ()),
+        Ok(_) => ensure_repo_workspace_accepts_writes(db, repo_id)
+            .await
+            .map(|_| ()),
         Err(err) => Err(err),
     };
     if let Err(err) = accepted {
@@ -2512,157 +4580,6 @@ pub async fn set_session_native_id_opt(
         a.update(&db.0).await?;
     }
     Ok(())
-}
-
-/// Stamp a (thread, session) as having just gone through the turn-freeze
-/// auto-recovery (issue #93): an invisible timeline marker row (`kind`
-/// excluded from the frontend's text/tool timeline allowlist, same as
-/// `"meta"`). `session_id = None` for the lead. Uses the SAME
-/// deletion-fenced insert as the rest of the timeline (`insert_lead_message`),
-/// so a thread deleted mid-recovery can't leave an orphaned row.
-///
-/// This row IS the issue #116 coordination point: its `created_at`, read back
-/// via [`last_turn_freeze_recovery_secs`], is what
-/// `lead_chat::revive::freeze_recovery_state` consults to withhold a
-/// just-self-healed lead/worker from the idle re-drive for one grace window,
-/// rather than racing this recovery straight back into the same wedge.
-///
-/// History, because the shape here only makes sense with it (review round 4,
-/// P2): #116 originally landed WITHOUT that consult — `revive.rs` never read
-/// this marker, and the getter had no caller outside this file's own
-/// round-trip test. What kept the re-drive off a just-recovered direction in
-/// the meantime was an unrelated SIDE EFFECT: `recover_from_freeze` also
-/// clears the session's `native_session_id` (see `set_session_native_id_opt` /
-/// `set_lead_native_id_opt`), and `revive::stalled_direction_ids` only selects
-/// a direction whose `native_session_id.is_some()`. Real protection, but
-/// accidental — it depended entirely on THAT field staying cleared at THAT
-/// moment, and would have vanished silently under a refactor that stopped
-/// clearing it, or a re-drive path that stopped gating on it. The grace window
-/// no longer RIDES on that: it reads this marker directly, and has tests that
-/// go red if the read is removed.
-///
-/// The native-id clear is still there, but it is NOT a second guard — `revive`
-/// deliberately stopped treating a missing native id as "not selectable",
-/// because that is what made a freeze-recovered session invisible to the
-/// re-drive forever instead of for one window. The dependency now runs the
-/// other way: `recover_from_freeze` clears the id ONLY if this row was
-/// stamped, since this row is the sole evidence separating "never ran" from
-/// "ran, and the recovery cleared its id" (`revive::has_resumable_context`).
-/// Clearing after a failed stamp would erase that evidence and strand the
-/// session permanently.
-///
-/// Reused (not just freeze recovery) by `lead_chat::commands::{switch_lead_tool,
-/// switch_worker_tool}` (issue #96/#98, adversarial re-review of PR #139, P2):
-/// a deliberate engine/model switch also clears the native id and lands the
-/// engine at idle, which is the EXACT shape `revive`'s stall sweep looks for —
-/// without this stamp, a thread/session that had EVER gone through a genuine
-/// freeze-recovery at any point in its (possibly much older) history would
-/// read `has_resumable_context() == true` from that stale marker alone once
-/// its OWN grace window had long since elapsed, letting the very next sweep
-/// tick (every 60s) auto-redrive the freshly-switched, not-yet-human-verified
-/// engine into a "resume stalled work" prompt — a false positive with no
-/// connection to the switch that just happened. Calling this on a switch too
-/// re-stamps the grace window with the CURRENT time, so `revive`'s existing
-/// (unmodified) cooldown check holds off exactly the way it already does
-/// after a real freeze recovery. The name stays freeze-scoped (renaming would
-/// touch `recover_from_freeze`'s established call site for no behavioral
-/// gain); read it as "the native context was deliberately reset and the next
-/// automated re-drive should back off for one grace window", of which a
-/// self-healed freeze is one cause and a human-initiated switch is another.
-///
-/// The switch path gates on this row the same way `recover_from_freeze` does,
-/// only harder: `lead_chat::commands::persist_switch` stamps it FIRST and
-/// aborts the entire switch if it fails, because a switch cannot fall back on
-/// "skip the clear and let it stall again" — by then the id belongs to an
-/// engine the thread no longer runs. Both writers therefore honour the same
-/// contract: this row exists before the native id is allowed to go missing.
-/// The grace marker's kind. Written by a freeze auto-recovery
-/// ([`mark_turn_freeze_recovered`]) and by an engine/model switch — the latter
-/// from inside its own transaction, so the row and the native-id clear it
-/// vouches for commit together.
-pub const MARKER_KIND_RECOVERED: &str = "turn_freeze_recovered";
-/// One grace-marker row, deletion-fenced like every other timeline insert.
-/// Generic over the connection so the switch transactions can use it
-/// inside the switch's transaction.
-async fn insert_marker_row<C: sea_orm::ConnectionTrait>(
-    conn: &C,
-    thread_id: i32,
-    session_id: Option<i32>,
-    kind: &str,
-) -> Result<i32> {
-    let res = conn
-        .execute(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "INSERT INTO lead_message \
-             (thread_id, session_id, turn_id, role, kind, content, status, created_at) \
-             SELECT ?, ?, 0, 'system', ?, '{}', 'complete', ? \
-             WHERE EXISTS (SELECT 1 FROM thread WHERE id = ?)",
-            [
-                thread_id.into(),
-                session_id.into(),
-                kind.into(),
-                now().into(),
-                thread_id.into(),
-            ],
-        ))
-        .await?;
-    if res.rows_affected() == 0 {
-        anyhow::bail!("thread {thread_id} no longer exists (deleted)");
-    }
-    i32::try_from(res.last_insert_id()).map_err(|_| anyhow::anyhow!("marker id out of i32 range"))
-}
-
-pub async fn mark_turn_freeze_recovered(
-    db: &Db,
-    thread_id: i32,
-    session_id: Option<i32>,
-) -> Result<()> {
-    // Seam point: the failure this write's CALLERS must degrade correctly for
-    // (`engine::stamp_freeze_marker` → the gated native-id clear) has no other
-    // way to be reached from a test. See `fail_write`'s doc for the boundary.
-    fail_write!("mark_turn_freeze_recovered");
-    insert_lead_message(
-        db,
-        thread_id,
-        session_id,
-        0,
-        "system",
-        MARKER_KIND_RECOVERED,
-        "{}",
-        "complete",
-    )
-    .await?;
-    Ok(())
-}
-
-/// The most recent turn-freeze auto-recovery for a (thread, session), as
-/// unix-seconds (same clock as `now()`/`created_at`) — the read side of
-/// [`mark_turn_freeze_recovered`]. `None` if it never happened (the common
-/// case) or the stamp fails to parse (defensive — never panics on a bad row).
-pub async fn last_turn_freeze_recovery_secs(
-    db: &Db,
-    thread_id: i32,
-    session_id: Option<i32>,
-) -> Result<Option<u64>> {
-    last_marker_secs(db, thread_id, session_id, MARKER_KIND_RECOVERED).await
-}
-
-/// Newest marker of one kind for a (thread, session), as unix-seconds.
-async fn last_marker_secs(
-    db: &Db,
-    thread_id: i32,
-    session_id: Option<i32>,
-    kind: &str,
-) -> Result<Option<u64>> {
-    let q = lead_message::Entity::find()
-        .filter(lead_message::Column::ThreadId.eq(thread_id))
-        .filter(lead_message::Column::Kind.eq(kind))
-        .order_by_desc(lead_message::Column::Id);
-    let q = match session_id {
-        Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
-        None => q.filter(lead_message::Column::SessionId.is_null()),
-    };
-    Ok(q.one(&db.0).await?.and_then(|m| m.created_at.parse().ok()))
 }
 
 /// Set a worker session's activity status directly. Unlike
@@ -2750,6 +4667,13 @@ pub async fn sessions_for_thread(db: &Db, thread_id: i32) -> Result<Vec<session:
         .await?)
 }
 
+pub async fn sessions_for_direction(db: &Db, direction_id: i32) -> Result<Vec<session::Model>> {
+    Ok(session::Entity::find()
+        .filter(session::Column::DirectionId.eq(direction_id))
+        .all(&db.0)
+        .await?)
+}
+
 pub async fn sessions_for_repo(db: &Db, repo_id: i32) -> Result<Vec<session::Model>> {
     Ok(session::Entity::find()
         .filter(session::Column::RepoId.eq(repo_id))
@@ -2809,29 +4733,65 @@ pub async fn insert_lead_message(
     // This is the single INSERT choke point (set_lead_status /
     // set_lead_native_id route their meta inserts through here); UPDATE-shaped
     // writes are naturally fenced — their rows are gone.
-    let res = db
-        .0
-        .execute(sea_orm::Statement::from_sql_and_values(
+    let mut values = vec![
+        thread_id.into(),
+        session_id.into(),
+        turn_id.into(),
+        role.into(),
+        kind.into(),
+        content.into(),
+        status.into(),
+        now().into(),
+    ];
+    let predicate = if let Some(session_id) = session_id {
+        values.push(session_id.into());
+        values.push(thread_id.into());
+        "EXISTS (\
+             SELECT 1 FROM session s \
+             JOIN direction d ON d.id = s.direction_id \
+             JOIN thread t ON t.id = d.thread_id \
+             JOIN repo_ref sr ON sr.id = s.repo_id \
+             WHERE s.id = ? AND t.id = ? \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM app_setting a WHERE a.key IN (\
+                   'thread.deleting.' || t.id, \
+                   'workspace.deleting.' || t.workspace_id, \
+                   'repo.deleting.' || s.repo_id, \
+                   'repo.deleting.' || d.repo_id\
+                 )\
+               )\
+             )"
+    } else {
+        values.push(thread_id.into());
+        "EXISTS (\
+             SELECT 1 FROM thread t WHERE t.id = ? \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM app_setting a WHERE a.key IN (\
+                   'thread.deleting.' || t.id, \
+                   'workspace.deleting.' || t.workspace_id\
+                 )\
+               )\
+             )"
+    };
+    let sql = format!(
+        "INSERT INTO lead_message \
+         (thread_id, session_id, turn_id, role, kind, content, status, created_at) \
+         SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE {predicate}"
+    );
+    let res =
+        db.0.execute(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Sqlite,
-            "INSERT INTO lead_message \
-             (thread_id, session_id, turn_id, role, kind, content, status, created_at) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ? \
-             WHERE EXISTS (SELECT 1 FROM thread WHERE id = ?)",
-            [
-                thread_id.into(),
-                session_id.into(),
-                turn_id.into(),
-                role.into(),
-                kind.into(),
-                content.into(),
-                status.into(),
-                now().into(),
-                thread_id.into(),
-            ],
+            sql,
+            values,
         ))
         .await?;
     if res.rows_affected() == 0 {
-        anyhow::bail!("thread {thread_id} no longer exists (deleted)");
+        match session_id {
+            Some(session_id) => anyhow::bail!(
+                "session {session_id} no longer has a writable thread/direction/repo owner"
+            ),
+            None => anyhow::bail!("thread {thread_id} no longer accepts messages"),
+        }
     }
     let id = i32::try_from(res.last_insert_id())
         .map_err(|_| anyhow::anyhow!("lead_message id out of i32 range"))?;
@@ -2921,19 +4881,59 @@ pub async fn insert_code_checkpoint(
     nested_repos: &str,
     index_tree: &str,
 ) -> Result<code_checkpoint::Model> {
-    let a = code_checkpoint::ActiveModel {
-        worktree_id: Set(worktree_id),
-        session_id: Set(session_id),
-        lead_message_id: Set(lead_message_id),
-        turn_id: Set(turn_id),
-        shadow_sha: Set(shadow_sha.to_string()),
-        head_sha: Set(head_sha.to_string()),
-        nested_repos: Set(nested_repos.to_string()),
-        index_tree: Set(index_tree.to_string()),
-        created_at: Set(now()),
-        ..Default::default()
-    };
-    Ok(a.insert(&db.0).await?)
+    use sea_orm::ConnectionTrait;
+    let inserted =
+        db.0.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO code_checkpoint \
+             (worktree_id, session_id, lead_message_id, turn_id, shadow_sha, head_sha, \
+              nested_repos, index_tree, created_at) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? \
+             WHERE EXISTS (\
+               SELECT 1 FROM worktree w \
+               JOIN session s ON s.direction_id = w.direction_id AND s.repo_id = w.repo_id \
+               JOIN direction d ON d.id = s.direction_id \
+               JOIN thread t ON t.id = d.thread_id \
+               JOIN repo_ref r ON r.id = s.repo_id \
+               JOIN lead_message lm ON lm.session_id = s.id AND lm.thread_id = t.id \
+               WHERE w.id = ? AND s.id = ? AND lm.id = ? AND lm.turn_id = ? \
+                 AND NOT EXISTS (\
+                   SELECT 1 FROM app_setting a WHERE a.key IN (\
+                     'thread.deleting.' || t.id, \
+                     'workspace.deleting.' || t.workspace_id, \
+                     'repo.deleting.' || s.repo_id, \
+                     'repo.deleting.' || d.repo_id\
+                   )\
+                 )\
+             )",
+            [
+                worktree_id.into(),
+                session_id.into(),
+                lead_message_id.into(),
+                turn_id.into(),
+                shadow_sha.into(),
+                head_sha.into(),
+                nested_repos.into(),
+                index_tree.into(),
+                now().into(),
+                worktree_id.into(),
+                session_id.into(),
+                lead_message_id.into(),
+                turn_id.into(),
+            ],
+        ))
+        .await?;
+    if inserted.rows_affected() == 0 {
+        anyhow::bail!(
+            "checkpoint owner disappeared for worktree {worktree_id}, session {session_id}, message {lead_message_id}"
+        );
+    }
+    let id = i32::try_from(inserted.last_insert_id())
+        .map_err(|_| anyhow::anyhow!("code_checkpoint id out of i32 range"))?;
+    code_checkpoint::Entity::find_by_id(id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("inserted code_checkpoint {id} not found"))
 }
 
 /// The checkpoint recorded for one turn's opening user row — a code rewind's
@@ -2971,10 +4971,87 @@ pub async fn truncate_code_checkpoints(
         .rows_affected)
 }
 
+async fn reconcile_rewound_repo_actions_on<C>(
+    db: &C,
+    thread_id: i32,
+    deleted_message_ids: &[i32],
+    cleanup_plans: &[RepoActionCleanupPlan],
+    rewind_plans: &[RepoActionRewindPlan],
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let executions = if deleted_message_ids.is_empty() {
+        Vec::new()
+    } else {
+        repo_action_execution::Entity::find()
+            .filter(repo_action_execution::Column::ThreadId.eq(thread_id))
+            .filter(
+                repo_action_execution::Column::MessageId
+                    .is_in(deleted_message_ids.iter().copied()),
+            )
+            .filter(repo_action_execution::Column::Status.is_in([
+                REPO_ACTION_PENDING,
+                REPO_ACTION_MATERIALIZED,
+                REPO_ACTION_COMPLETED,
+            ]))
+            .all(db)
+            .await?
+    };
+    let mut matched_plans = std::collections::HashSet::new();
+    let mut unfinished = Vec::new();
+    for execution in executions {
+        let Some(plan) = rewind_plans
+            .iter()
+            .find(|plan| plan.execution_id == execution.id)
+        else {
+            anyhow::bail!("rewind repository action plan is missing");
+        };
+        let exact = plan.execution_token == execution.execution_token
+            && plan.thread_id == execution.thread_id
+            && plan.message_id == execution.message_id
+            && plan.expected_status == execution.status
+            && plan.expected_feedback_state == execution.feedback_state
+            && matched_plans.insert(plan.execution_id);
+        if !exact {
+            anyhow::bail!("repository action changed before rewind");
+        }
+        if matches!(
+            execution.status.as_str(),
+            REPO_ACTION_PENDING | REPO_ACTION_MATERIALIZED
+        ) {
+            unfinished.push(execution);
+            continue;
+        }
+
+        let deleted = repo_action_execution::Entity::delete_many()
+            .filter(repo_action_execution::Column::Id.eq(execution.id))
+            .filter(
+                repo_action_execution::Column::ExecutionToken.eq(&execution.execution_token),
+            )
+            .filter(repo_action_execution::Column::ThreadId.eq(thread_id))
+            .filter(repo_action_execution::Column::MessageId.eq(execution.message_id))
+            .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_COMPLETED))
+            .filter(
+                repo_action_execution::Column::FeedbackState.eq(&execution.feedback_state),
+            )
+            .exec(db)
+            .await?;
+        if deleted.rows_affected != 1 {
+            anyhow::bail!("completed repository action changed before rewind");
+        }
+    }
+    if rewind_plans.len() != matched_plans.len() {
+        anyhow::bail!("rewind repository action plan is outside the truncated timeline");
+    }
+    stage_repo_action_cleanup_on(db, unfinished, Some(cleanup_plans)).await
+}
+
 /// Conversation rewind's persistence in ONE transaction: timeline truncation,
-/// the code-checkpoint sweep, and the fork's native id (worker session row or
-/// lead meta row). Any failure rolls ALL of it back — never a truncated
-/// timeline still pointing at the old native history (review P1).
+/// the code-checkpoint sweep, cancellation of durable questions from the
+/// abandoned agent scope, and the fork's native id (worker session row or lead
+/// meta row). Any failure rolls ALL of it back — never a truncated timeline
+/// that can resurrect a stale question or still points at old native history.
 pub async fn rewind_persist(
     db: &Db,
     thread_id: i32,
@@ -2982,12 +5059,137 @@ pub async fn rewind_persist(
     from_message_id: i32,
     worktree_id: Option<i32>,
     native_id: Option<&str>,
-) -> Result<Vec<i32>> {
+) -> Result<(Vec<i32>, Vec<i32>)> {
+    rewind_persist_with_repo_actions(
+        db,
+        thread_id,
+        session_id,
+        from_message_id,
+        worktree_id,
+        native_id,
+        &[],
+        &[],
+    )
+    .await
+}
+
+pub async fn rewind_persist_with_repo_actions(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    from_message_id: i32,
+    worktree_id: Option<i32>,
+    native_id: Option<&str>,
+    action_cleanup_plans: &[RepoActionCleanupPlan],
+    action_rewind_plans: &[RepoActionRewindPlan],
+) -> Result<(Vec<i32>, Vec<i32>)> {
     use sea_orm::TransactionTrait;
     let txn = db.0.begin().await?;
     let deleted_ids = truncate_lead_messages(&txn, thread_id, session_id, from_message_id).await?;
+    let rewind_action_ids = if deleted_ids.is_empty() {
+        Vec::new()
+    } else {
+        repo_action_execution::Entity::find()
+            .filter(repo_action_execution::Column::ThreadId.eq(thread_id))
+            .filter(repo_action_execution::Column::MessageId.is_in(deleted_ids.iter().copied()))
+            .all(&txn)
+            .await?
+            .into_iter()
+            .map(|execution| execution.id)
+            .collect::<Vec<_>>()
+    };
+    reconcile_rewound_repo_actions_on(
+        &txn,
+        thread_id,
+        &deleted_ids,
+        action_cleanup_plans,
+        action_rewind_plans,
+    )
+    .await?;
+    if !deleted_ids.is_empty() {
+        lead_hidden_delivery::Entity::delete_many()
+            .filter(lead_hidden_delivery::Column::ThreadId.eq(thread_id))
+            .filter(
+                Condition::any()
+                    .add(
+                        lead_hidden_delivery::Column::SourceKind
+                            .eq("plan_decision")
+                            .and(
+                                lead_hidden_delivery::Column::SourceId
+                                    .is_in(deleted_ids.iter().copied()),
+                            ),
+                    )
+                    .add(
+                        lead_hidden_delivery::Column::SourceKind
+                            .eq("repo_action")
+                            .and(
+                                lead_hidden_delivery::Column::SourceId
+                                    .is_in(rewind_action_ids),
+                            ),
+                    ),
+            )
+            .exec(&txn)
+            .await?;
+    }
     if let Some(w) = worktree_id {
         truncate_code_checkpoints(&txn, w, &deleted_ids).await?;
+    }
+    let cancelled_requests = if deleted_ids.is_empty() {
+        Vec::new()
+    } else {
+        human_request::Entity::find()
+            .filter(human_request::Column::ThreadId.eq(thread_id))
+            .filter(human_request::Column::SourceMessageId.is_in(deleted_ids.iter().copied()))
+            .filter(human_request::Column::Status.is_in([
+                HUMAN_REQUEST_OPEN,
+                HUMAN_REQUEST_ANSWERED,
+                HUMAN_REQUEST_RESOLVED,
+            ]))
+            .order_by_asc(human_request::Column::Id)
+            .all(&txn)
+            .await?
+    };
+    let mut cancelled_request_ids = Vec::new();
+    for request in cancelled_requests {
+        let terminal_revision = request.revision.saturating_add(1);
+        let updated = human_request::Entity::update_many()
+            .col_expr(
+                human_request::Column::Status,
+                Expr::value(HUMAN_REQUEST_CANCELLED),
+            )
+            .col_expr(
+                human_request::Column::Revision,
+                Expr::value(terminal_revision),
+            )
+            .col_expr(human_request::Column::UpdatedAt, Expr::value(now()))
+            .filter(human_request::Column::Id.eq(request.id))
+            .filter(human_request::Column::Revision.eq(request.revision))
+            .filter(human_request::Column::Status.is_in([
+                HUMAN_REQUEST_OPEN,
+                HUMAN_REQUEST_ANSWERED,
+                HUMAN_REQUEST_RESOLVED,
+            ]))
+            .exec(&txn)
+            .await?;
+        if updated.rows_affected != 1 {
+            continue;
+        }
+        let routes = serde_json::from_str::<Vec<HumanRequestImRoute>>(&request.im_routes)
+            .unwrap_or_default();
+        for route in routes {
+            upsert_human_card_terminal_outbox_on(
+                &txn,
+                request.id,
+                request.thread_id,
+                &route,
+                HUMAN_REQUEST_CANCELLED,
+                "",
+                terminal_revision,
+                false,
+            )
+            .await?;
+        }
+        cancelled_request_ids.push(request.id);
     }
     match session_id {
         Some(sid) => {
@@ -3000,7 +5202,7 @@ pub async fn rewind_persist(
         None => set_lead_native_id_txn(&txn, thread_id, native_id).await?,
     }
     txn.commit().await?;
-    Ok(deleted_ids)
+    Ok((deleted_ids, cancelled_request_ids))
 }
 
 /// The lead native-id write inside [`rewind_persist`]'s transaction — mirrors
@@ -3091,35 +5293,50 @@ pub async fn upsert_test_plan(
     content: &str,
     source: &str,
 ) -> Result<test_plan::Model> {
-    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-    let written = if let Some(existing) = test_plan::Entity::find()
-        .filter(test_plan::Column::ThreadId.eq(thread_id))
-        .one(&db.0)
-        .await?
-    {
-        let mut a: test_plan::ActiveModel = existing.into();
-        a.content = Set(content.to_string());
-        a.source = Set(source.to_string());
-        a.updated_at = Set(now_millis());
-        a.update(&db.0).await?
-    } else {
-        let a = test_plan::ActiveModel {
-            thread_id: Set(thread_id),
-            content: Set(content.to_string()),
-            source: Set(source.to_string()),
-            updated_at: Set(now_millis()),
-            ..Default::default()
-        };
-        a.insert(&db.0).await?
-    };
-    // Post-write fence (same shape as create_thread/add_repo_ref): a cascade
-    // that passed its test_plan delete pass between our pre-check and this
-    // write would leave this row an unreachable orphan — re-check and undo.
-    if let Err(err) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
-        let _ = test_plan::Entity::delete_by_id(written.id).exec(&db.0).await;
-        return Err(err);
+    let timestamp = now_millis();
+    let written = db
+        .0
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO test_plan (thread_id, content, source, updated_at) \
+             SELECT t.id, ?, ?, ? FROM thread t \
+             JOIN workspace w ON w.id = t.workspace_id \
+             WHERE t.id = ? \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM app_setting a WHERE a.key IN (\
+                   'thread.deleting.' || t.id,\
+                   'workspace.deleting.' || w.id\
+                 )\
+               ) \
+             ON CONFLICT(thread_id) DO UPDATE SET \
+               content = excluded.content, source = excluded.source, \
+               updated_at = excluded.updated_at \
+             WHERE EXISTS (\
+               SELECT 1 FROM thread t \
+               JOIN workspace w ON w.id = t.workspace_id \
+               WHERE t.id = test_plan.thread_id \
+                 AND NOT EXISTS (\
+                   SELECT 1 FROM app_setting a WHERE a.key IN (\
+                     'thread.deleting.' || t.id,\
+                     'workspace.deleting.' || w.id\
+                   )\
+                 )\
+             )",
+            [
+                content.into(),
+                source.into(),
+                timestamp.into(),
+                thread_id.into(),
+            ],
+        ))
+        .await?;
+    if written.rows_affected() == 0 {
+        ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+        anyhow::bail!("test_plan_write_fenced_or_stale: thread {thread_id}");
     }
-    Ok(written)
+    get_test_plan(db, thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("test_plan_write_fenced_or_stale: thread {thread_id}"))
 }
 
 /// Lead-emit upsert with an ATOMIC supersede check: the condition rides the SQL
@@ -3133,21 +5350,49 @@ pub async fn lead_upsert_test_plan(
     content: &str,
     turn_started_millis: u64,
 ) -> Result<bool> {
-    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-    let updated = test_plan::Entity::update_many()
-        .col_expr(test_plan::Column::Content, Expr::value(content))
-        .col_expr(test_plan::Column::Source, Expr::value("lead"))
-        .col_expr(test_plan::Column::UpdatedAt, Expr::value(now_millis()))
-        .filter(test_plan::Column::ThreadId.eq(thread_id))
-        .filter(Expr::cust_with_values(
-            // updated_at holds decimal digits only; CAST keeps legacy
-            // second-resolution rows (shorter strings) comparing numerically.
-            "NOT (source = 'user' AND CAST(updated_at AS INTEGER) >= ?)",
-            [turn_started_millis as i64],
+    let timestamp = now_millis();
+    let written = db
+        .0
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO test_plan (thread_id, content, source, updated_at) \
+             SELECT t.id, ?, 'lead', ? FROM thread t \
+             JOIN workspace w ON w.id = t.workspace_id \
+             WHERE t.id = ? \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM app_setting a WHERE a.key IN (\
+                   'thread.deleting.' || t.id,\
+                   'workspace.deleting.' || w.id\
+                 )\
+               ) \
+             ON CONFLICT(thread_id) DO UPDATE SET \
+               content = excluded.content, source = excluded.source, \
+               updated_at = excluded.updated_at \
+             WHERE NOT (\
+               test_plan.source = 'user' \
+               AND CAST(test_plan.updated_at AS INTEGER) >= ?\
+             ) \
+               AND EXISTS (\
+                 SELECT 1 FROM thread t \
+                 JOIN workspace w ON w.id = t.workspace_id \
+                 WHERE t.id = test_plan.thread_id \
+                   AND NOT EXISTS (\
+                     SELECT 1 FROM app_setting a WHERE a.key IN (\
+                       'thread.deleting.' || t.id,\
+                       'workspace.deleting.' || w.id\
+                     )\
+                   )\
+               )",
+            [
+                content.into(),
+                timestamp.into(),
+                thread_id.into(),
+                (turn_started_millis as i64).into(),
+            ],
         ))
-        .exec(&db.0)
         .await?;
-    if updated.rows_affected == 0 {
+    if written.rows_affected() == 0 {
+        ensure_thread_workspace_accepts_writes(db, thread_id).await?;
         let exists = test_plan::Entity::find()
             .filter(test_plan::Column::ThreadId.eq(thread_id))
             .one(&db.0)
@@ -3156,31 +5401,7 @@ pub async fn lead_upsert_test_plan(
         if exists {
             return Ok(false); // superseded by a newer user save
         }
-        // First document for this thread. A user save racing this insert hits
-        // the UNIQUE(thread_id) — that specific conflict means "superseded".
-        // Anything else (locked db, I/O, schema) is a real failure and must
-        // propagate, not masquerade as a user edit winning.
-        let a = test_plan::ActiveModel {
-            thread_id: Set(thread_id),
-            content: Set(content.to_string()),
-            source: Set("lead".to_string()),
-            updated_at: Set(now_millis()),
-            ..Default::default()
-        };
-        if let Err(e) = a.insert(&db.0).await {
-            if e.to_string().contains("UNIQUE constraint failed") {
-                return Ok(false);
-            }
-            return Err(e.into());
-        }
-    }
-    // Post-write fence, mirroring upsert_test_plan.
-    if let Err(err) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
-        let _ = test_plan::Entity::delete_many()
-            .filter(test_plan::Column::ThreadId.eq(thread_id))
-            .exec(&db.0)
-            .await;
-        return Err(err);
+        anyhow::bail!("test_plan_write_fenced_or_stale: thread {thread_id}");
     }
     Ok(true)
 }
@@ -3234,11 +5455,791 @@ pub async fn resolve_action_card(
     let mut v: serde_json::Value =
         serde_json::from_str(&m.content).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = v.as_object_mut() {
-        obj.insert("resolved".into(), serde_json::Value::String(name.to_string()));
+        obj.insert(
+            "resolved".into(),
+            serde_json::Value::String(name.to_string()),
+        );
     }
     let mut a: lead_message::ActiveModel = m.into();
     a.content = Set(v.to_string());
     Ok(Some(a.update(&db.0).await?))
+}
+
+/// Persist a plan approval and resolve its exact actionable card atomically.
+/// The hidden delivery row is the handoff boundary: once this transaction
+/// commits, the card may leave Needs even if the lead process is stopped or
+/// crashes before the agent consumes the decision.
+pub async fn enqueue_plan_decision_and_resolve(
+    db: &Db,
+    thread_id: i32,
+    message_id: i32,
+    allow_proposed_scope: bool,
+) -> Result<Option<(lead_message::Model, lead_hidden_delivery::Model)>> {
+    let txn = db.0.begin().await?;
+    if let Some(existing) = lead_hidden_delivery::Entity::find()
+        .filter(lead_hidden_delivery::Column::DedupeKey.eq(format!("plan_decision:{message_id}")))
+        .one(&txn)
+        .await?
+    {
+        let existing_scope = serde_json::from_str::<serde_json::Value>(&existing.payload)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("allow_proposed_scope")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false);
+        if existing_scope != allow_proposed_scope {
+            txn.rollback().await?;
+            return Ok(None);
+        }
+        let card = lead_message::Entity::find_by_id(message_id).one(&txn).await?;
+        txn.commit().await?;
+        return Ok(card.map(|card| (card, existing)));
+    }
+    let Some(card) = latest_actionable_attention_card_on(&txn, thread_id).await? else {
+        txn.rollback().await?;
+        return Ok(None);
+    };
+    if card.id != message_id
+        || card.kind != "plan_card"
+        || card.role != "assistant"
+        || card.session_id.is_some()
+        || action_card_is_resolved(&card.content)
+    {
+        txn.rollback().await?;
+        return Ok(None);
+    }
+    let has_proposed_scope = plan::Entity::find()
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .one(&txn)
+        .await?
+        .is_some_and(|row| row.status == "proposed" && !row.proposal.trim().is_empty());
+    if has_proposed_scope != allow_proposed_scope {
+        txn.rollback().await?;
+        return Ok(None);
+    }
+    let title = serde_json::from_str::<serde_json::Value>(&card.content)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let payload = serde_json::json!({
+        "tool": "plan_decision",
+        "status": "approved",
+        "title": title,
+        "message_id": message_id,
+        "allow_proposed_scope": allow_proposed_scope,
+    })
+    .to_string();
+    let delivery = enqueue_lead_hidden_delivery_on(
+        &txn,
+        thread_id,
+        "plan_decision",
+        message_id,
+        &format!("plan_decision:{message_id}"),
+        &payload,
+    )
+    .await?;
+
+    let resolved_label = if title.trim().is_empty() {
+        "Plan"
+    } else {
+        title.as_str()
+    };
+    let mut content: serde_json::Value = serde_json::from_str(&card.content)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = content.as_object_mut() {
+        object.insert(
+            "resolved".into(),
+            serde_json::Value::String(resolved_label.to_string()),
+        );
+    }
+    let updated = lead_message::Entity::update_many()
+        .col_expr(
+            lead_message::Column::Content,
+            Expr::value(content.to_string()),
+        )
+        .filter(lead_message::Column::Id.eq(message_id))
+        .filter(lead_message::Column::Kind.eq("plan_card"))
+        .filter(lead_message::Column::Role.eq("assistant"))
+        .filter(lead_message::Column::SessionId.is_null())
+        .filter(lead_message::Column::Status.eq("complete"))
+        .filter(lead_message::Column::Content.eq(card.content.clone()))
+        .exec(&txn)
+        .await?;
+    if updated.rows_affected != 1 {
+        txn.rollback().await?;
+        return Ok(None);
+    }
+    let resolved = lead_message::Entity::find_by_id(message_id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("plan card disappeared while approving"))?;
+    txn.commit().await?;
+    Ok(Some((resolved, delivery)))
+}
+
+pub const REPO_ACTION_PENDING: &str = "pending";
+pub const REPO_ACTION_MATERIALIZED: &str = "materialized";
+pub const REPO_ACTION_COMPLETED: &str = "completed";
+pub const REPO_ACTION_CLEANUP_PENDING: &str = "cleanup_pending";
+pub(crate) const REPO_ACTION_TOKEN_MARKER: &str = "weft-action-token";
+
+#[derive(Debug)]
+pub(crate) struct RepoActionOsLock {
+    execution_token: String,
+    _file: std::fs::File,
+}
+
+#[cfg(test)]
+impl Drop for RepoActionOsLock {
+    fn drop(&mut self) {
+        // Keep test lock handoffs deterministic on macOS: explicitly release
+        // the advisory lock before the descriptor is closed, so a parallel
+        // test cannot observe the old owner during the next immediate probe.
+        let _ = fs2::FileExt::unlock(&self._file);
+    }
+}
+
+fn repo_action_lock_home() -> Result<std::path::PathBuf> {
+    #[cfg(test)]
+    let home = std::env::temp_dir().join("weft-repo-action-test-locks");
+    #[cfg(not(test))]
+    let home = crate::paths::weft_home()
+        .map_err(|error| anyhow::anyhow!("cannot resolve repository action lock home: {error}"))?
+        .join("repo-action-locks");
+    std::fs::create_dir_all(&home)
+        .map_err(|error| anyhow::anyhow!("cannot create repository action lock home: {error}"))?;
+    Ok(home)
+}
+
+pub(crate) fn acquire_repo_action_os_lock(execution_token: &str) -> Result<RepoActionOsLock> {
+    use fs2::FileExt;
+
+    if execution_token.len() != 40 || !execution_token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("repository action lock token is invalid");
+    }
+    let path = repo_action_lock_home()?.join(format!("{execution_token}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("cannot open repository action lock: {error}"))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(RepoActionOsLock {
+            execution_token: execution_token.to_string(),
+            _file: file,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            anyhow::bail!("action_card_in_progress")
+        }
+        Err(error) => anyhow::bail!("cannot lock repository action: {error}"),
+    }
+}
+
+fn repo_action_target_token(path: &std::path::Path) -> Option<String> {
+    let git_dir = path.join(".git");
+    let marker = git_dir.join(REPO_ACTION_TOKEN_MARKER);
+    let git_meta = std::fs::symlink_metadata(&git_dir).ok()?;
+    let marker_meta = std::fs::symlink_metadata(&marker).ok()?;
+    if !git_meta.file_type().is_dir() || !marker_meta.file_type().is_file() {
+        return None;
+    }
+    let token = std::fs::read_to_string(marker).ok()?;
+    if token.len() != 40 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(token)
+}
+
+pub(crate) fn acquire_repo_action_target_registration_lock(
+    path: &std::path::Path,
+    held_action_lock: Option<&RepoActionOsLock>,
+) -> Result<Option<RepoActionOsLock>> {
+    let Some(execution_token) = repo_action_target_token(path) else {
+        return Ok(None);
+    };
+    if held_action_lock.is_some_and(|held| held.execution_token == execution_token) {
+        return Ok(None);
+    }
+    acquire_repo_action_os_lock(&execution_token).map(Some)
+}
+pub const REPO_ACTION_FEEDBACK_NONE: &str = "none";
+pub const REPO_ACTION_FEEDBACK_PENDING: &str = "pending";
+pub const REPO_ACTION_FEEDBACK_DELIVERED: &str = "delivered";
+
+/// All persisted invocation identity for a repository action. `execution_token`
+/// and `staging_path` are candidates used only when this call wins the unique
+/// `message_id` insert; an exact retry receives the already-persisted values.
+pub struct RepoActionClaimRequest<'a> {
+    pub workspace_id: i32,
+    pub thread_id: i32,
+    pub message_id: i32,
+    pub action_id: &'a str,
+    pub action_kind: &'a str,
+    pub expected_action_kind: &'a str,
+    pub invocation_fingerprint: &'a str,
+    pub execution_token: &'a str,
+    pub target_path: &'a str,
+    pub staging_path: &'a str,
+}
+
+fn action_card_contains_action(content: &str, action_id: &str, action_kind: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| value.get("actions").cloned())
+        .and_then(|actions| actions.as_array().cloned())
+        .is_some_and(|actions| {
+            actions.iter().any(|action| {
+                action.get("id").and_then(serde_json::Value::as_str) == Some(action_id)
+                    && action.get("kind").and_then(serde_json::Value::as_str) == Some(action_kind)
+            })
+        })
+}
+
+fn action_card_is_resolved(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| value.get("resolved").cloned())
+        .is_some_and(|value| match value {
+            serde_json::Value::Bool(resolved) => resolved,
+            serde_json::Value::String(label) => !label.trim().is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        })
+}
+
+async fn repo_action_scope_is_deleting_on<C: ConnectionTrait>(
+    connection: &C,
+    workspace_id: i32,
+    thread_id: i32,
+) -> Result<bool> {
+    Ok(app_setting::Entity::find()
+        .filter(app_setting::Column::Key.is_in([
+            workspace_deleting_key(workspace_id),
+            thread_deleting_key(thread_id),
+        ]))
+        .one(connection)
+        .await?
+        .is_some())
+}
+
+fn execution_matches_request(
+    execution: &repo_action_execution::Model,
+    request: &RepoActionClaimRequest<'_>,
+) -> bool {
+    execution.workspace_id == request.workspace_id
+        && execution.thread_id == request.thread_id
+        && execution.message_id == request.message_id
+        && execution.action_id == request.action_id
+        && execution.action_kind == request.action_kind
+        && execution.invocation_fingerprint == request.invocation_fingerprint
+        && execution.target_path == request.target_path
+}
+
+fn execution_has_valid_status(execution: &repo_action_execution::Model) -> bool {
+    matches!(
+        execution.status.as_str(),
+        REPO_ACTION_PENDING | REPO_ACTION_MATERIALIZED | REPO_ACTION_COMPLETED
+    )
+}
+
+/// Linearize one repository action-card invocation in a write-first SQLite
+/// transaction. The no-op card UPDATE is deliberately the first statement:
+/// it obtains the database write reservation before any latest/unresolved or
+/// exact-action read, eliminating the validate-then-insert IPC race.
+pub async fn claim_repo_action_execution(
+    db: &Db,
+    request: &RepoActionClaimRequest<'_>,
+) -> Result<repo_action_execution::Model> {
+    let txn = db.0.begin().await?;
+    let locked = lead_message::Entity::update_many()
+        .col_expr(
+            lead_message::Column::Content,
+            Expr::col(lead_message::Column::Content).into(),
+        )
+        .filter(lead_message::Column::Id.eq(request.message_id))
+        .exec(&txn)
+        .await?;
+    if locked.rows_affected != 1 {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    }
+
+    let message = lead_message::Entity::find_by_id(request.message_id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("action_card_stale"))?;
+    let thread = thread::Entity::find_by_id(request.thread_id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("action_card_stale"))?;
+    let exact_card_identity = request.action_kind == request.expected_action_kind
+        && thread.workspace_id == request.workspace_id
+        && message.thread_id == request.thread_id
+        && message.kind == "action_card"
+        && message.role == "assistant"
+        && message.session_id.is_none()
+        && action_card_contains_action(&message.content, request.action_id, request.action_kind);
+    if !exact_card_identity {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    }
+    if repo_action_scope_is_deleting_on(&txn, request.workspace_id, request.thread_id).await? {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    }
+
+    if let Some(existing) = repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::MessageId.eq(request.message_id))
+        .one(&txn)
+        .await?
+    {
+        if !execution_matches_request(&existing, request) || !execution_has_valid_status(&existing)
+        {
+            txn.rollback().await?;
+            anyhow::bail!("action_card_stale");
+        }
+        txn.commit().await?;
+        return Ok(existing);
+    }
+
+    let latest = latest_actionable_attention_card_on(&txn, request.thread_id).await?;
+    let actionable = latest.is_some_and(|latest| {
+        latest.id == request.message_id
+            && latest.kind == "action_card"
+            && latest.role == "assistant"
+            && latest.session_id.is_none()
+            && !action_card_is_resolved(&latest.content)
+            && action_card_contains_action(&latest.content, request.action_id, request.action_kind)
+    });
+    if !actionable {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    }
+
+    let timestamp = now();
+    let execution = repo_action_execution::ActiveModel {
+        id: NotSet,
+        workspace_id: Set(request.workspace_id),
+        thread_id: Set(request.thread_id),
+        message_id: Set(request.message_id),
+        action_id: Set(request.action_id.to_string()),
+        action_kind: Set(request.action_kind.to_string()),
+        invocation_fingerprint: Set(request.invocation_fingerprint.to_string()),
+        execution_token: Set(request.execution_token.to_string()),
+        status: Set(REPO_ACTION_PENDING.to_string()),
+        target_path: Set(request.target_path.to_string()),
+        staging_path: Set(request.staging_path.to_string()),
+        repo_id: Set(0),
+        repo_name: Set(String::new()),
+        feedback_state: Set(REPO_ACTION_FEEDBACK_NONE.to_string()),
+        feedback_payload: Set(String::new()),
+        cleanup_preserve_target: Set(false),
+        created_at: Set(timestamp.clone()),
+        updated_at: Set(timestamp),
+    }
+    .insert(&txn)
+    .await?;
+    txn.commit().await?;
+    Ok(execution)
+}
+
+pub async fn get_repo_action_execution(
+    db: &Db,
+    message_id: i32,
+) -> Result<Option<repo_action_execution::Model>> {
+    Ok(repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::MessageId.eq(message_id))
+        .one(&db.0)
+        .await?)
+}
+
+pub async fn get_repo_action_execution_by_id(
+    db: &Db,
+    execution_id: i32,
+) -> Result<Option<repo_action_execution::Model>> {
+    Ok(repo_action_execution::Entity::find_by_id(execution_id)
+        .one(&db.0)
+        .await?)
+}
+
+pub async fn pending_repo_action_feedback(
+    db: &Db,
+    thread_id: Option<i32>,
+) -> Result<Vec<repo_action_execution::Model>> {
+    let query = repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_COMPLETED))
+        .filter(repo_action_execution::Column::FeedbackState.eq(REPO_ACTION_FEEDBACK_PENDING));
+    let query = match thread_id {
+        Some(thread_id) => query.filter(repo_action_execution::Column::ThreadId.eq(thread_id)),
+        None => query,
+    };
+    Ok(query
+        .order_by_asc(repo_action_execution::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn pending_repo_action_feedback_for_repo(
+    db: &Db,
+    repo_id: i32,
+) -> Result<Vec<repo_action_execution::Model>> {
+    Ok(repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::RepoId.eq(repo_id))
+        .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_COMPLETED))
+        .filter(repo_action_execution::Column::FeedbackState.eq(REPO_ACTION_FEEDBACK_PENDING))
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn unfinished_repo_action_executions_for_thread(
+    db: &Db,
+    thread_id: i32,
+) -> Result<Vec<repo_action_execution::Model>> {
+    Ok(repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::ThreadId.eq(thread_id))
+        .filter(
+            repo_action_execution::Column::Status
+                .is_in([REPO_ACTION_PENDING, REPO_ACTION_MATERIALIZED]),
+        )
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn unfinished_repo_action_executions_for_workspace(
+    db: &Db,
+    workspace_id: i32,
+) -> Result<Vec<repo_action_execution::Model>> {
+    Ok(repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::WorkspaceId.eq(workspace_id))
+        .filter(
+            repo_action_execution::Column::Status
+                .is_in([REPO_ACTION_PENDING, REPO_ACTION_MATERIALIZED]),
+        )
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn repo_action_executions_requiring_lock_for_message_ids(
+    db: &Db,
+    thread_id: i32,
+    message_ids: &[i32],
+) -> Result<Vec<repo_action_execution::Model>> {
+    if message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::ThreadId.eq(thread_id))
+        .filter(repo_action_execution::Column::MessageId.is_in(message_ids.iter().copied()))
+        .filter(repo_action_execution::Column::Status.is_in([
+            REPO_ACTION_PENDING,
+            REPO_ACTION_MATERIALIZED,
+            REPO_ACTION_COMPLETED,
+        ]))
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn repo_action_executions_requiring_lock_for_thread(
+    db: &Db,
+    thread_id: i32,
+) -> Result<Vec<repo_action_execution::Model>> {
+    Ok(repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::ThreadId.eq(thread_id))
+        .filter(
+            Condition::any()
+                .add(
+                    repo_action_execution::Column::Status
+                        .is_in([REPO_ACTION_PENDING, REPO_ACTION_MATERIALIZED]),
+                )
+                .add(repo_action_execution::Column::FeedbackState.eq(REPO_ACTION_FEEDBACK_PENDING)),
+        )
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn repo_action_executions_requiring_lock_for_workspace(
+    db: &Db,
+    workspace_id: i32,
+) -> Result<Vec<repo_action_execution::Model>> {
+    Ok(repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::WorkspaceId.eq(workspace_id))
+        .filter(
+            Condition::any()
+                .add(
+                    repo_action_execution::Column::Status
+                        .is_in([REPO_ACTION_PENDING, REPO_ACTION_MATERIALIZED]),
+                )
+                .add(repo_action_execution::Column::FeedbackState.eq(REPO_ACTION_FEEDBACK_PENDING)),
+        )
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn pending_repo_action_cleanups(db: &Db) -> Result<Vec<repo_action_execution::Model>> {
+    Ok(repo_action_execution::Entity::find()
+        .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_CLEANUP_PENDING))
+        .order_by_asc(repo_action_execution::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn delete_repo_action_cleanup_record(
+    db: &Db,
+    execution_id: i32,
+    execution_token: &str,
+) -> Result<bool> {
+    let deleted = repo_action_execution::Entity::delete_many()
+        .filter(repo_action_execution::Column::Id.eq(execution_id))
+        .filter(repo_action_execution::Column::ExecutionToken.eq(execution_token))
+        .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_CLEANUP_PENDING))
+        .exec(&db.0)
+        .await?;
+    Ok(deleted.rows_affected == 1)
+}
+
+/// Advance an exact owned execution after its filesystem target exists. A
+/// retry after the UPDATE committed is a no-op; a completed row is also
+/// returned so a concurrent exact replay can load its original repository.
+pub async fn mark_repo_action_materialized(
+    db: &Db,
+    execution_id: i32,
+    execution_token: &str,
+) -> Result<repo_action_execution::Model> {
+    repo_action_execution::Entity::update_many()
+        .col_expr(
+            repo_action_execution::Column::Status,
+            Expr::value(REPO_ACTION_MATERIALIZED),
+        )
+        .col_expr(repo_action_execution::Column::UpdatedAt, Expr::value(now()))
+        .filter(repo_action_execution::Column::Id.eq(execution_id))
+        .filter(repo_action_execution::Column::ExecutionToken.eq(execution_token))
+        .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_PENDING))
+        .exec(&db.0)
+        .await?;
+    let execution = repo_action_execution::Entity::find_by_id(execution_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("action_card_stale"))?;
+    if execution.execution_token != execution_token
+        || !matches!(
+            execution.status.as_str(),
+            REPO_ACTION_MATERIALIZED | REPO_ACTION_COMPLETED
+        )
+    {
+        anyhow::bail!("action_card_stale");
+    }
+    Ok(execution)
+}
+
+/// Transfer a failed pending action to the durable cleanup journal before any
+/// filesystem record is removed. The row is acknowledged separately only
+/// after token-owned staging/target cleanup succeeds.
+pub async fn stage_pending_repo_action_cleanup(
+    db: &Db,
+    execution_id: i32,
+    execution_token: &str,
+    preserve_target: bool,
+) -> Result<repo_action_execution::Model> {
+    let updated = repo_action_execution::Entity::update_many()
+        .col_expr(
+            repo_action_execution::Column::Status,
+            Expr::value(REPO_ACTION_CLEANUP_PENDING),
+        )
+        .col_expr(
+            repo_action_execution::Column::CleanupPreserveTarget,
+            Expr::value(preserve_target),
+        )
+        .col_expr(repo_action_execution::Column::UpdatedAt, Expr::value(now()))
+        .filter(repo_action_execution::Column::Id.eq(execution_id))
+        .filter(repo_action_execution::Column::ExecutionToken.eq(execution_token))
+        .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_PENDING))
+        .exec(&db.0)
+        .await?;
+    if updated.rows_affected != 1 {
+        anyhow::bail!("action_card_stale");
+    }
+    repo_action_execution::Entity::find_by_id(execution_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("action_card_stale"))
+}
+
+/// Resolve the exact action and complete its exact execution in one commit.
+/// Repository registration intentionally happens before this transaction and
+/// is idempotent; no SQLite transaction is held across git clone/init.
+pub async fn complete_repo_action_execution(
+    db: &Db,
+    expected: &repo_action_execution::Model,
+    completed_repo: &repo_ref::Model,
+) -> Result<repo_action_execution::Model> {
+    let txn = db.0.begin().await?;
+    let locked = repo_action_execution::Entity::update_many()
+        .col_expr(
+            repo_action_execution::Column::UpdatedAt,
+            Expr::col(repo_action_execution::Column::UpdatedAt).into(),
+        )
+        .filter(repo_action_execution::Column::Id.eq(expected.id))
+        .filter(repo_action_execution::Column::ExecutionToken.eq(&expected.execution_token))
+        .filter(repo_action_execution::Column::WorkspaceId.eq(expected.workspace_id))
+        .filter(repo_action_execution::Column::ThreadId.eq(expected.thread_id))
+        .filter(repo_action_execution::Column::MessageId.eq(expected.message_id))
+        .filter(repo_action_execution::Column::ActionId.eq(&expected.action_id))
+        .filter(repo_action_execution::Column::ActionKind.eq(&expected.action_kind))
+        .filter(
+            repo_action_execution::Column::InvocationFingerprint
+                .eq(&expected.invocation_fingerprint),
+        )
+        .filter(repo_action_execution::Column::TargetPath.eq(&expected.target_path))
+        .exec(&txn)
+        .await?;
+    if locked.rows_affected != 1 {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    }
+    let execution = repo_action_execution::Entity::find_by_id(expected.id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("action_card_stale"))?;
+    if execution.status == REPO_ACTION_COMPLETED {
+        if execution.feedback_state == REPO_ACTION_FEEDBACK_PENDING {
+            if let Err(error) =
+                enqueue_repo_action_feedback_for_completed_on(&txn, &execution).await
+            {
+                let _ = txn.rollback().await;
+                return Err(error);
+            }
+        }
+        txn.commit().await?;
+        return Ok(execution);
+    }
+    if execution.status != REPO_ACTION_MATERIALIZED
+        || completed_repo.workspace_id != execution.workspace_id
+    {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    }
+    let Some(owner_thread) = thread::Entity::find_by_id(execution.thread_id)
+        .one(&txn)
+        .await?
+    else {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    };
+    if owner_thread.workspace_id != execution.workspace_id
+        || repo_action_scope_is_deleting_on(&txn, execution.workspace_id, execution.thread_id)
+            .await?
+    {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    }
+    let persisted_repo = repo_ref::Entity::find_by_id(completed_repo.id)
+        .one(&txn)
+        .await?;
+    if persisted_repo.as_ref() != Some(completed_repo) {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    }
+
+    let message = lead_message::Entity::find_by_id(execution.message_id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("action_card_stale"))?;
+    let exact_unresolved_action = message.thread_id == execution.thread_id
+        && message.kind == "action_card"
+        && message.role == "assistant"
+        && message.status == "complete"
+        && message.session_id.is_none()
+        && !action_card_is_resolved(&message.content)
+        && action_card_contains_action(
+            &message.content,
+            &execution.action_id,
+            &execution.action_kind,
+        );
+    if !exact_unresolved_action {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    }
+    let mut content: serde_json::Value = serde_json::from_str(&message.content)?;
+    let Some(object) = content.as_object_mut() else {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    };
+    object.insert(
+        "resolved".to_string(),
+        serde_json::Value::String(completed_repo.name.clone()),
+    );
+    let mut active_message: lead_message::ActiveModel = message.into();
+    active_message.content = Set(content.to_string());
+    active_message.update(&txn).await?;
+
+    let feedback_payload = serde_json::json!({
+        "tool": "repo_action",
+        "action_id": execution.action_id.clone(),
+        "kind": execution.action_kind.clone(),
+        "status": "ok",
+        "execution_id": execution.id,
+        "workspace_id": execution.workspace_id,
+        "repo_id": completed_repo.id.to_string(),
+        "name": completed_repo.name.clone(),
+        "local_git_path": completed_repo.local_git_path.clone(),
+    })
+    .to_string();
+    let preserve_completed_target = execution.target_path == completed_repo.local_git_path;
+
+    let completed = repo_action_execution::Entity::update_many()
+        .col_expr(
+            repo_action_execution::Column::Status,
+            Expr::value(REPO_ACTION_COMPLETED),
+        )
+        .col_expr(
+            repo_action_execution::Column::RepoId,
+            Expr::value(completed_repo.id),
+        )
+        .col_expr(
+            repo_action_execution::Column::RepoName,
+            Expr::value(completed_repo.name.clone()),
+        )
+        .col_expr(
+            repo_action_execution::Column::FeedbackState,
+            Expr::value(REPO_ACTION_FEEDBACK_PENDING),
+        )
+        .col_expr(
+            repo_action_execution::Column::FeedbackPayload,
+            Expr::value(feedback_payload),
+        )
+        .col_expr(
+            repo_action_execution::Column::CleanupPreserveTarget,
+            Expr::value(preserve_completed_target),
+        )
+        .col_expr(repo_action_execution::Column::UpdatedAt, Expr::value(now()))
+        .filter(repo_action_execution::Column::Id.eq(execution.id))
+        .filter(repo_action_execution::Column::ExecutionToken.eq(&execution.execution_token))
+        .filter(repo_action_execution::Column::Status.eq(REPO_ACTION_MATERIALIZED))
+        .exec(&txn)
+        .await?;
+    if completed.rows_affected != 1 {
+        txn.rollback().await?;
+        anyhow::bail!("action_card_stale");
+    }
+    let completed = repo_action_execution::Entity::find_by_id(execution.id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("action_card_stale"))?;
+    if let Err(error) = enqueue_repo_action_feedback_for_completed_on(&txn, &completed).await {
+        let _ = txn.rollback().await;
+        return Err(error);
+    }
+    txn.commit().await?;
+    Ok(completed)
 }
 
 /// Close rows left `streaming` by a previous app process. Live turn state is
@@ -3278,6 +6279,204 @@ pub async fn list_lead_messages(db: &Db, thread_id: i32) -> Result<Vec<lead_mess
         .await?)
 }
 
+pub async fn get_lead_message(db: &Db, message_id: i32) -> Result<Option<lead_message::Model>> {
+    Ok(lead_message::Entity::find_by_id(message_id)
+        .one(&db.0)
+        .await?)
+}
+
+/// Atomically insert one durable human-answer trail row if the request still
+/// belongs to a live source conversation. The status/source/session checks and
+/// request-id dedupe share the INSERT statement with the write, so rewind or
+/// cascade deletion either happens entirely before it (insert refused) or
+/// entirely after it (the cascade/truncation removes the inserted row).
+pub async fn insert_human_answer_trail(
+    db: &Db,
+    thread_id: i32,
+    request_id: i32,
+    session_id: Option<i32>,
+    content: &str,
+) -> Result<Option<lead_message::Model>> {
+    use sea_orm::ConnectionTrait;
+
+    let inserted = db
+        .0
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO lead_message \
+             (thread_id, session_id, turn_id, role, kind, content, status, created_at) \
+             SELECT ?, ?, \
+                    MAX(1, COALESCE((SELECT MAX(turn_id) FROM lead_message WHERE thread_id = ?), 0)), \
+                    'system', 'settled', ?, 'complete', ? \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM human_request hr \
+                 WHERE hr.id = ? \
+                   AND hr.thread_id = ? \
+                   AND hr.status IN (?, ?) \
+                   AND ( \
+                       (hr.direction_id = 0 AND ? IS NULL) \
+                       OR (hr.direction_id > 0 AND ? IS NOT NULL AND EXISTS ( \
+                           SELECT 1 FROM session s \
+                           JOIN direction d ON d.id = s.direction_id \
+                           WHERE s.id = ? \
+                             AND s.direction_id = hr.direction_id \
+                             AND d.thread_id = hr.thread_id \
+                       )) \
+                   ) \
+                   AND (hr.source_message_id = 0 OR EXISTS ( \
+                       SELECT 1 FROM lead_message source \
+                       WHERE source.id = hr.source_message_id \
+                         AND source.thread_id = hr.thread_id \
+                         AND source.role = 'user' \
+                         AND source.status = 'complete' \
+                         AND source.turn_id = hr.turn_id \
+                         AND ( \
+                             (hr.source_session_id = 0 AND source.session_id IS NULL) \
+                             OR source.session_id = hr.source_session_id \
+                         ) \
+                   )) \
+             ) \
+               AND EXISTS (SELECT 1 FROM thread WHERE id = ?) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM lead_message \
+                   WHERE thread_id = ? \
+                     AND kind = 'settled' \
+                     AND json_valid(content) \
+                     AND json_extract(content, '$.request_id') = ? \
+               )",
+            [
+                thread_id.into(),
+                session_id.into(),
+                thread_id.into(),
+                content.into(),
+                now().into(),
+                request_id.into(),
+                thread_id.into(),
+                HUMAN_REQUEST_ANSWERED.into(),
+                HUMAN_REQUEST_RESOLVED.into(),
+                session_id.into(),
+                session_id.into(),
+                session_id.into(),
+                thread_id.into(),
+                thread_id.into(),
+                i64::from(request_id).into(),
+            ],
+        ))
+        .await?;
+    if inserted.rows_affected() == 0 {
+        return Ok(None);
+    }
+    let id = i32::try_from(inserted.last_insert_id())
+        .map_err(|_| anyhow::anyhow!("human-answer trail id overflow"))?;
+    Ok(lead_message::Entity::find_by_id(id).one(&db.0).await?)
+}
+
+/// Return the single lead-timeline card that can still be acted on from a
+/// global attention surface. This mirrors ChatTimeline's read-only guards
+/// without loading the complete transcript on every Needs refresh:
+/// only the latest top-level assistant interaction can remain actionable;
+/// same-turn tool/test-case rows are companion artifacts; and a queued or
+/// later user reply retires a plan card.
+async fn latest_actionable_attention_card_on<C: ConnectionTrait>(
+    connection: &C,
+    thread_id: i32,
+) -> Result<Option<lead_message::Model>> {
+    use sea_orm::Order;
+
+    let top_level_assistant = || {
+        lead_message::Entity::find()
+            .filter(lead_message::Column::ThreadId.eq(thread_id))
+            .filter(lead_message::Column::SessionId.is_null())
+            .filter(lead_message::Column::Role.eq("assistant"))
+            .filter(Expr::cust(
+                "(kind NOT IN ('text', 'tool') \
+                 OR CASE WHEN json_valid(content) \
+                         THEN COALESCE(json_extract(content, '$.agentThread'), '') \
+                         ELSE '' END = '')",
+            ))
+            .order_by(Expr::cust("COALESCE(seq, id)"), Order::Desc)
+            .order_by_desc(lead_message::Column::Id)
+    };
+
+    let Some(latest) = top_level_assistant().one(connection).await? else {
+        return Ok(None);
+    };
+    let candidate = if matches!(latest.kind.as_str(), "tool" | "test_cases") {
+        let candidate = top_level_assistant()
+            .filter(lead_message::Column::Kind.is_not_in(["tool", "test_cases"]))
+            .one(connection)
+            .await?;
+        candidate.filter(|row| row.turn_id == latest.turn_id)
+    } else {
+        Some(latest)
+    };
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    if !matches!(candidate.kind.as_str(), "plan_card" | "action_card") {
+        return Ok(None);
+    }
+    if candidate.kind == "plan_card" {
+        let order = candidate.seq.unwrap_or(i64::from(candidate.id));
+        let pending_user = lead_message::Entity::find()
+            .filter(lead_message::Column::ThreadId.eq(thread_id))
+            .filter(lead_message::Column::SessionId.is_null())
+            .filter(lead_message::Column::Role.eq("user"))
+            .filter(Expr::cust_with_values(
+                "status = 'queued' \
+                 OR COALESCE(seq, id) > ? \
+                 OR (COALESCE(seq, id) = ? AND id > ?)",
+                [order, order, i64::from(candidate.id)],
+            ))
+            .one(connection)
+            .await?
+            .is_some();
+        if pending_user {
+            return Ok(None);
+        }
+    }
+    Ok(Some(candidate))
+}
+
+pub async fn latest_actionable_attention_card(
+    db: &Db,
+    thread_id: i32,
+) -> Result<Option<lead_message::Model>> {
+    latest_actionable_attention_card_on(&db.0, thread_id).await
+}
+
+/// Action-time guard for plan/repo-card callbacks. Polling can leave a stale
+/// row enabled for a few seconds, so the backend must re-check both timeline
+/// position and the card's persisted resolved bit immediately before handing
+/// feedback to the agent.
+pub async fn attention_card_is_actionable(
+    db: &Db,
+    thread_id: i32,
+    message_id: i32,
+    expected_kind: &str,
+    allow_proposed_scope: bool,
+) -> Result<bool> {
+    let Some(message) = latest_actionable_attention_card(db, thread_id).await? else {
+        return Ok(false);
+    };
+    if message.id != message_id
+        || message.kind != expected_kind
+        || message.role != "assistant"
+        || message.session_id.is_some()
+    {
+        return Ok(false);
+    }
+    if expected_kind == "plan_card" {
+        let has_proposed_scope = get_plan(db, thread_id)
+            .await?
+            .is_some_and(|plan| plan.status == "proposed" && !plan.proposal.trim().is_empty());
+        if has_proposed_scope != allow_proposed_scope {
+            return Ok(false);
+        }
+    }
+    Ok(!action_card_is_resolved(&message.content))
+}
+
 /// The next turn number for a thread's timeline (1-based).
 pub async fn next_turn_id(db: &Db, thread_id: i32) -> Result<i32> {
     Ok(list_lead_messages(db, thread_id)
@@ -3305,7 +6504,10 @@ pub async fn complete_queued_by_id(
     db: &Db,
     message_id: i32,
 ) -> Result<Option<lead_message::Model>> {
-    let Some(m) = lead_message::Entity::find_by_id(message_id).one(&db.0).await? else {
+    let Some(m) = lead_message::Entity::find_by_id(message_id)
+        .one(&db.0)
+        .await?
+    else {
         return Ok(None);
     };
     if m.status != "queued" {
@@ -3349,7 +6551,10 @@ pub enum ConsumeMark {
 /// untouched — and the partial `Set` (see the stale-snapshot tests below)
 /// can't clobber a concurrent write to any OTHER column either.
 pub async fn mark_message_consumed(db: &Db, message_id: i32) -> Result<ConsumeMark> {
-    let Some(m) = lead_message::Entity::find_by_id(message_id).one(&db.0).await? else {
+    let Some(m) = lead_message::Entity::find_by_id(message_id)
+        .one(&db.0)
+        .await?
+    else {
         return Ok(ConsumeMark::NotEligible);
     };
     if m.consumed_at.is_some() {
@@ -3369,7 +6574,9 @@ pub async fn mark_message_consumed(db: &Db, message_id: i32) -> Result<ConsumeMa
 
 /// 删除一条消息行（仅用于取消未交付的 queued 行）。
 pub async fn delete_message(db: &Db, message_id: i32) -> Result<()> {
-    lead_message::Entity::delete_by_id(message_id).exec(&db.0).await?;
+    lead_message::Entity::delete_by_id(message_id)
+        .exec(&db.0)
+        .await?;
     Ok(())
 }
 
@@ -3391,9 +6598,8 @@ pub async fn assign_delivery_seq(db: &Db, thread_id: i32, message_id: i32) -> Re
         .unwrap_or(1);
     // Raw UPDATE: seq is not in the entity's ActiveModel update path in older
     // SeaORM versions; use a raw statement to avoid depending on the column ordering.
-    let updated = db
-        .0
-        .execute(sea_orm::Statement::from_sql_and_values(
+    let updated =
+        db.0.execute(sea_orm::Statement::from_sql_and_values(
             db.0.get_database_backend(),
             "UPDATE lead_message SET seq = ? WHERE id = ?",
             [next_seq.into(), message_id.into()],
@@ -3410,12 +6616,17 @@ pub async fn get_message(
     db: &Db,
     message_id: i32,
 ) -> Result<Option<crate::store::entities::lead_message::Model>> {
-    Ok(lead_message::Entity::find_by_id(message_id).one(&db.0).await?)
+    Ok(lead_message::Entity::find_by_id(message_id)
+        .one(&db.0)
+        .await?)
 }
 
 /// 覆盖一条消息行的 content（编辑排队消息文本用）。
 pub async fn update_message_content(db: &Db, message_id: i32, content: &str) -> Result<()> {
-    if let Some(m) = lead_message::Entity::find_by_id(message_id).one(&db.0).await? {
+    if let Some(m) = lead_message::Entity::find_by_id(message_id)
+        .one(&db.0)
+        .await?
+    {
         let mut a: lead_message::ActiveModel = m.into();
         a.content = Set(content.to_string());
         a.update(&db.0).await?;
@@ -3646,17 +6857,6 @@ pub async fn set_lead_status(db: &Db, thread_id: i32, status: &str) -> Result<()
 
 // ─────────────────────────── im_route (M2) ───────────────────────────
 
-async fn ensure_im_route_write_survived_workspace_fence(db: &Db, thread_id: i32) -> Result<()> {
-    if let Err(err) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
-        let _ = im_route::Entity::delete_many()
-            .filter(im_route::Column::ThreadId.eq(thread_id))
-            .exec(&db.0)
-            .await;
-        return Err(err);
-    }
-    Ok(())
-}
-
 /// Bind an issue (thread) to an IM thread. Upserts on `thread_id`: re-binding the
 /// same issue replaces its target. Returns the resulting row.
 pub async fn bind_im_route(
@@ -3666,34 +6866,52 @@ pub async fn bind_im_route(
     chat_id: &str,
     im_thread_ref: &str,
 ) -> Result<im_route::Model> {
-    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-    if let Some(existing) = im_route::Entity::find()
-        .filter(im_route::Column::ThreadId.eq(thread_id))
-        .one(&db.0)
-        .await?
-    {
-        let mut a: im_route::ActiveModel = existing.into();
-        a.channel = Set(channel.to_string());
-        a.chat_id = Set(chat_id.to_string());
-        a.im_thread_ref = Set(im_thread_ref.to_string());
+    let created_at = now();
+    let written = db
+        .0
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO im_route \
+             (channel, chat_id, im_thread_ref, thread_id, created_at) \
+             SELECT ?, ?, ?, t.id, ? FROM thread t \
+             JOIN workspace w ON w.id = t.workspace_id \
+             WHERE t.id = ? \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM app_setting a WHERE a.key IN (\
+                   'thread.deleting.' || t.id,\
+                   'workspace.deleting.' || w.id\
+                 )\
+               ) \
+             ON CONFLICT(thread_id) DO UPDATE SET \
+               channel = excluded.channel, chat_id = excluded.chat_id, \
+               im_thread_ref = excluded.im_thread_ref \
+             WHERE EXISTS (\
+               SELECT 1 FROM thread t \
+               JOIN workspace w ON w.id = t.workspace_id \
+               WHERE t.id = im_route.thread_id \
+                 AND NOT EXISTS (\
+                   SELECT 1 FROM app_setting a WHERE a.key IN (\
+                     'thread.deleting.' || t.id,\
+                     'workspace.deleting.' || w.id\
+                   )\
+                 )\
+             )",
+            [
+                channel.into(),
+                chat_id.into(),
+                im_thread_ref.into(),
+                created_at.into(),
+                thread_id.into(),
+            ],
+        ))
+        .await?;
+    if written.rows_affected() == 0 {
         ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-        let m = a.update(&db.0).await?;
-        ensure_im_route_write_survived_workspace_fence(db, thread_id).await?;
-        return Ok(m);
+        anyhow::bail!("im_route_write_fenced_or_stale: thread {thread_id}");
     }
-    let now = now();
-    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-    let am = im_route::ActiveModel {
-        channel: Set(channel.to_string()),
-        chat_id: Set(chat_id.to_string()),
-        im_thread_ref: Set(im_thread_ref.to_string()),
-        thread_id: Set(thread_id),
-        created_at: Set(now),
-        ..Default::default()
-    };
-    let m = am.insert(&db.0).await?.try_into_model()?;
-    ensure_im_route_write_survived_workspace_fence(db, thread_id).await?;
-    Ok(m)
+    im_route_of_thread(db, thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("im_route_write_fenced_or_stale: thread {thread_id}"))
 }
 
 pub async fn unbind_im_route(db: &Db, thread_id: i32) -> Result<()> {
@@ -3755,8 +6973,8 @@ pub async fn im_route_of_thread_ref(
 /// Find a tracked row by its natural host-side key. Registration upserts on
 /// this so re-registering the same PR/MR (e.g. after a restart, or a lead
 /// re-reporting it) updates context instead of duplicating the row.
-pub async fn find_pull_request(
-    db: &Db,
+async fn find_pull_request_on<C: ConnectionTrait>(
+    connection: &C,
     host_kind: &str,
     host_owner: &str,
     host_repo: &str,
@@ -3767,12 +6985,91 @@ pub async fn find_pull_request(
         .filter(pull_request::Column::HostOwner.eq(host_owner))
         .filter(pull_request::Column::HostRepo.eq(host_repo))
         .filter(pull_request::Column::Number.eq(number))
-        .one(&db.0)
+        .one(connection)
         .await?)
+}
+
+pub async fn find_pull_request(
+    db: &Db,
+    host_kind: &str,
+    host_owner: &str,
+    host_repo: &str,
+    number: i32,
+) -> Result<Option<pull_request::Model>> {
+    find_pull_request_on(&db.0, host_kind, host_owner, host_repo, number).await
 }
 
 pub async fn get_pull_request(db: &Db, id: i32) -> Result<Option<pull_request::Model>> {
     Ok(pull_request::Entity::find_by_id(id).one(&db.0).await?)
+}
+
+/// Reload the exact tracked row and prove its durable parent chain is still
+/// live immediately before an external merge side effect. The caller holds
+/// the process-wide per-thread lifecycle gate across this read and the merge;
+/// deletion markers are nevertheless checked because workspace/repo/thread
+/// delete installs its durable fence before waiting for that gate.
+pub async fn reload_pull_request_merge_candidate(
+    db: &Db,
+    expected: &pull_request::Model,
+    expected_head_sha: &str,
+) -> Result<Option<pull_request::Model>> {
+    let Some(current) = get_pull_request(db, expected.id).await? else {
+        return Ok(None);
+    };
+    let exact_row = current.thread_id == expected.thread_id
+        && current.direction_id == expected.direction_id
+        && current.repo_id == expected.repo_id
+        && current.host_kind == expected.host_kind
+        && current.host_base == expected.host_base
+        && current.host_owner == expected.host_owner
+        && current.host_repo == expected.host_repo
+        && current.number == expected.number
+        && current.head_sha == expected_head_sha;
+    if !exact_row {
+        return Ok(None);
+    }
+
+    let Some(owner_thread) = get_thread(db, current.thread_id).await? else {
+        return Ok(None);
+    };
+    if get_setting(db, &thread_deleting_key(owner_thread.id))
+        .await?
+        .is_some()
+        || get_setting(db, &workspace_deleting_key(owner_thread.workspace_id))
+            .await?
+            .is_some()
+    {
+        return Ok(None);
+    }
+
+    if current.direction_id == 0 && current.repo_id == 0 {
+        return Ok(Some(current));
+    }
+    if current.direction_id <= 0 || current.repo_id <= 0 {
+        return Ok(None);
+    }
+    let Some(owner_direction) = get_direction(db, current.direction_id).await? else {
+        return Ok(None);
+    };
+    let Some(owner_repo) = get_repo(db, current.repo_id).await? else {
+        return Ok(None);
+    };
+    let Some(primary_repo) = get_repo(db, owner_direction.repo_id).await? else {
+        return Ok(None);
+    };
+    if owner_direction.thread_id != owner_thread.id
+        || owner_repo.workspace_id != owner_thread.workspace_id
+        || primary_repo.workspace_id != owner_thread.workspace_id
+        || get_setting(db, &repo_deleting_key(owner_repo.id))
+            .await?
+            .is_some()
+        || get_setting(db, &repo_deleting_key(primary_repo.id))
+            .await?
+            .is_some()
+    {
+        return Ok(None);
+    }
+    Ok(Some(current))
 }
 
 /// Every row the monitor still needs to sweep — i.e. still `open` AND not
@@ -3846,7 +7143,8 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
     }
     if dir.depends_on_direction_id == UNRESOLVED_UPSTREAM_SENTINEL {
         return host::UpstreamStatus::Unknown {
-            reason: "上游任务尚未确定(可能还未审批,或依赖的名字有歧义),暂时无法判断是否可以合并".into(),
+            reason: "上游任务尚未确定(可能还未审批,或依赖的名字有歧义),暂时无法判断是否可以合并"
+                .into(),
         };
     }
     let upstream = match get_direction(db, dir.depends_on_direction_id).await {
@@ -3902,8 +7200,15 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
         let host_base = pr0.host_base.clone();
         let host_owner = pr0.host_owner.clone();
         let host_repo = pr0.host_repo.clone();
-        match all_prs_landed_on_live_default_branch(db, upstream.repo_id, &host_base, &host_owner, &host_repo, prs)
-            .await
+        match all_prs_landed_on_live_default_branch(
+            db,
+            upstream.repo_id,
+            &host_base,
+            &host_owner,
+            &host_repo,
+            prs,
+        )
+        .await
         {
             None => {
                 // Never optimistically release the merge on an unresolvable default
@@ -4063,7 +7368,12 @@ fn parse_remote_host_and_path(remote_url: &str) -> Option<RemoteHostPath> {
 /// `host:path`, whose port (if any) denotes an SSH port unrelated to the
 /// API's own HTTPS port — those keep skipping the port check entirely,
 /// exactly as the third round's fix intended.
-fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, host_repo: &str) -> bool {
+fn remote_matches_pr_host(
+    remote_url: &str,
+    host_base: &str,
+    host_owner: &str,
+    host_repo: &str,
+) -> bool {
     let host_base = host_base.trim();
     let host_owner = host_owner.trim();
     let host_repo = host_repo.trim();
@@ -4073,7 +7383,11 @@ fn remote_matches_pr_host(remote_url: &str, host_base: &str, host_owner: &str, h
     let Some(remote) = parse_remote_host_and_path(remote_url) else {
         return false;
     };
-    let expected_host = host_base.split(':').next().unwrap_or(host_base).to_lowercase();
+    let expected_host = host_base
+        .split(':')
+        .next()
+        .unwrap_or(host_base)
+        .to_lowercase();
     let expected_path = format!("{}/{}", host_owner.to_lowercase(), host_repo.to_lowercase());
     if remote.host != expected_host || remote.path != expected_path {
         return false;
@@ -4224,15 +7538,44 @@ pub async fn list_pull_requests_for_direction(
         .await?)
 }
 
-/// Register a newly-opened PR/MR, or refresh an already-tracked one's context
-/// (thread/direction/repo can legitimately change across a re-registration —
-/// e.g. a direction's PR reopened under a new task after a rebase-and-reopen).
+pub async fn list_pull_requests_for_workspace(
+    db: &Db,
+    workspace_id: i32,
+) -> Result<Vec<pull_request::Model>> {
+    let thread_ids: Vec<i32> = thread::Entity::find()
+        .select_only()
+        .column(thread::Column::Id)
+        .filter(thread::Column::WorkspaceId.eq(workspace_id))
+        .into_tuple()
+        .all(&db.0)
+        .await?;
+    if thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(pull_request::Entity::find()
+        .filter(pull_request::Column::ThreadId.is_in(thread_ids))
+        .order_by_asc(pull_request::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+/// Register a newly-opened PR/MR, or refresh the exact already-tracked row.
+///
+/// The first statement in the transaction is a conditional no-op write to the
+/// owning thread. It both reserves SQLite's writer slot and validates the
+/// complete durable parent chain before either the insert or refresh can run:
+/// worker registrations must name the exact injected session and its exact
+/// direction/thread/repo; lead registrations use the established
+/// `direction_id = repo_id = 0` convention and validate only the live thread.
+/// Deletion markers are part of the same predicate, so a delete that commits
+/// after an earlier preflight read cannot be followed by a dangling PR insert.
 #[allow(clippy::too_many_arguments)]
 pub async fn register_pull_request(
     db: &Db,
     thread_id: i32,
     direction_id: i32,
     repo_id: i32,
+    source_session_id: Option<i32>,
     host_kind: &str,
     host_base: &str,
     host_owner: &str,
@@ -4241,17 +7584,115 @@ pub async fn register_pull_request(
     url: &str,
     title: &str,
 ) -> Result<pull_request::Model> {
-    if let Some(existing) = find_pull_request(db, host_kind, host_owner, host_repo, number).await? {
-        let mut a: pull_request::ActiveModel = existing.into();
-        a.thread_id = Set(thread_id);
-        a.direction_id = Set(direction_id);
-        a.repo_id = Set(repo_id);
-        a.host_base = Set(host_base.to_string());
+    // This read is only a scheduling hint/test seam. It never authorizes the
+    // write: every parent and target check is repeated after the write-first
+    // transaction below has acquired SQLite's writer reservation.
+    let _existing_hint = find_pull_request(db, host_kind, host_owner, host_repo, number).await?;
+    #[cfg(test)]
+    tests::before_pull_request_registration_write_probe(host_owner, host_repo, number).await;
+
+    let txn = db.0.begin().await?;
+    let locked_parent = match source_session_id {
+        None if direction_id == 0 && repo_id == 0 => {
+            txn.execute(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "UPDATE thread SET title = title \
+                 WHERE id = ? \
+                   AND NOT EXISTS (\
+                     SELECT 1 FROM app_setting a WHERE a.key IN (\
+                       'thread.deleting.' || thread.id,\
+                       'workspace.deleting.' || thread.workspace_id\
+                     )\
+                   )",
+                [thread_id.into()],
+            ))
+            .await?
+        }
+        Some(session_id) if direction_id > 0 && repo_id > 0 => {
+            txn.execute(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "UPDATE thread SET title = title \
+                 WHERE id = ? \
+                   AND EXISTS (\
+                     SELECT 1 FROM direction d \
+                     JOIN session s ON s.direction_id = d.id \
+                     JOIN repo_ref r ON r.id = s.repo_id \
+                     JOIN repo_ref primary_repo ON primary_repo.id = d.repo_id \
+                     WHERE d.id = ? AND d.thread_id = thread.id \
+                       AND s.id = ? AND s.repo_id = ? \
+                       AND r.workspace_id = thread.workspace_id \
+                       AND primary_repo.workspace_id = thread.workspace_id \
+                       AND NOT EXISTS (\
+                         SELECT 1 FROM app_setting a \
+                         WHERE a.key = 'repo.deleting.' || d.repo_id\
+                       )\
+                   ) \
+                   AND NOT EXISTS (\
+                     SELECT 1 FROM app_setting a WHERE a.key IN (\
+                       'thread.deleting.' || thread.id,\
+                       'workspace.deleting.' || thread.workspace_id,\
+                       'repo.deleting.' || ?\
+                     )\
+                   )",
+                [
+                    thread_id.into(),
+                    direction_id.into(),
+                    session_id.into(),
+                    repo_id.into(),
+                    repo_id.into(),
+                ],
+            ))
+            .await?
+        }
+        None => {
+            txn.rollback().await?;
+            anyhow::bail!("worker PR registration is missing its exact source session");
+        }
+        Some(_) => {
+            txn.rollback().await?;
+            anyhow::bail!("lead PR registration cannot carry a worker session");
+        }
+    };
+    if locked_parent.rows_affected() != 1 {
+        txn.rollback().await?;
+        anyhow::bail!(
+            "PR registration parent disappeared or is being deleted for thread {thread_id}, direction {direction_id}, repo {repo_id}"
+        );
+    }
+
+    let persisted = if let Some(existing) =
+        find_pull_request_on(&txn, host_kind, host_owner, host_repo, number).await?
+    {
+        if existing.thread_id != thread_id
+            || existing.direction_id != direction_id
+            || existing.repo_id != repo_id
+        {
+            txn.rollback().await?;
+            anyhow::bail!(
+                "tracked PR/MR already belongs to a different thread, direction, or repo"
+            );
+        }
+
+        let mut update = pull_request::Entity::update_many()
+            .col_expr(
+                pull_request::Column::HostBase,
+                Expr::value(host_base.to_string()),
+            )
+            .col_expr(pull_request::Column::ProbeFailCount, Expr::value(0))
+            .filter(pull_request::Column::Id.eq(existing.id))
+            .filter(pull_request::Column::ThreadId.eq(thread_id))
+            .filter(pull_request::Column::DirectionId.eq(direction_id))
+            .filter(pull_request::Column::RepoId.eq(repo_id))
+            .filter(pull_request::Column::HostKind.eq(host_kind))
+            .filter(pull_request::Column::HostOwner.eq(host_owner))
+            .filter(pull_request::Column::HostRepo.eq(host_repo))
+            .filter(pull_request::Column::Number.eq(number))
+            .filter(pull_request::Column::CreatedAt.eq(existing.created_at.clone()));
         if !url.is_empty() {
-            a.url = Set(url.to_string());
+            update = update.col_expr(pull_request::Column::Url, Expr::value(url.to_string()));
         }
         if !title.is_empty() {
-            a.title = Set(title.to_string());
+            update = update.col_expr(pull_request::Column::Title, Expr::value(title.to_string()));
         }
         // A re-registration is this row's ONLY escape hatch once
         // `probe_fail_count` has crossed the monitor's give-up threshold
@@ -4265,25 +7706,138 @@ pub async fn register_pull_request(
         // alive but hit a transient failure streak (auth expired, an outage
         // longer than the threshold) would fall out of monitoring FOREVER
         // with no recovery path at all.
-        a.probe_fail_count = Set(0);
-        return Ok(a.update(&db.0).await?);
-    }
-    let a = pull_request::ActiveModel {
-        thread_id: Set(thread_id),
-        direction_id: Set(direction_id),
-        repo_id: Set(repo_id),
-        host_kind: Set(host_kind.to_string()),
-        host_base: Set(host_base.to_string()),
-        host_owner: Set(host_owner.to_string()),
-        host_repo: Set(host_repo.to_string()),
-        number: Set(number),
-        url: Set(url.to_string()),
-        title: Set(title.to_string()),
-        lifecycle: Set("open".to_string()),
-        created_at: Set(now()),
-        ..Default::default()
+        let refreshed = update.exec(&txn).await?;
+        if refreshed.rows_affected != 1 {
+            txn.rollback().await?;
+            anyhow::bail!("tracked PR/MR changed before its exact refresh could commit");
+        }
+        pull_request::Entity::find_by_id(existing.id)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("refreshed PR/MR {} disappeared", existing.id))?
+    } else {
+        pull_request::ActiveModel {
+            thread_id: Set(thread_id),
+            direction_id: Set(direction_id),
+            repo_id: Set(repo_id),
+            host_kind: Set(host_kind.to_string()),
+            host_base: Set(host_base.to_string()),
+            host_owner: Set(host_owner.to_string()),
+            host_repo: Set(host_repo.to_string()),
+            number: Set(number),
+            url: Set(url.to_string()),
+            title: Set(title.to_string()),
+            lifecycle: Set("open".to_string()),
+            created_at: Set(now()),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?
     };
-    Ok(a.insert(&db.0).await?)
+    txn.commit().await?;
+    Ok(persisted)
+}
+
+/// Reset tracking for an exact already-persisted row (the Needs-you Retry
+/// action). This is intentionally separate from agent registration: a human
+/// retry has no injected worker session identity, while a new/re-registered
+/// agent row must always prove that exact session in [`register_pull_request`].
+pub async fn refresh_pull_request_tracking(
+    db: &Db,
+    expected: &pull_request::Model,
+) -> Result<pull_request::Model> {
+    let txn = db.0.begin().await?;
+    let reserved = pull_request::Entity::update_many()
+        .col_expr(
+            pull_request::Column::ProbeFailCount,
+            Expr::col(pull_request::Column::ProbeFailCount).into(),
+        )
+        .filter(pull_request::Column::Id.eq(expected.id))
+        .filter(pull_request::Column::ThreadId.eq(expected.thread_id))
+        .filter(pull_request::Column::DirectionId.eq(expected.direction_id))
+        .filter(pull_request::Column::RepoId.eq(expected.repo_id))
+        .filter(pull_request::Column::HostKind.eq(&expected.host_kind))
+        .filter(pull_request::Column::HostOwner.eq(&expected.host_owner))
+        .filter(pull_request::Column::HostRepo.eq(&expected.host_repo))
+        .filter(pull_request::Column::Number.eq(expected.number))
+        .filter(pull_request::Column::CreatedAt.eq(&expected.created_at))
+        .filter(pull_request::Column::LastCheckedAt.eq(&expected.last_checked_at))
+        .filter(pull_request::Column::ProbeFailCount.eq(expected.probe_fail_count))
+        .exec(&txn)
+        .await?;
+    if reserved.rows_affected != 1 {
+        txn.rollback().await?;
+        anyhow::bail!("tracked PR/MR changed before Retry could refresh it");
+    }
+
+    let Some(owner_thread) = thread::Entity::find_by_id(expected.thread_id)
+        .one(&txn)
+        .await?
+    else {
+        txn.rollback().await?;
+        anyhow::bail!("tracked PR/MR owner thread disappeared");
+    };
+    let mut marker_keys = vec![
+        thread_deleting_key(owner_thread.id),
+        workspace_deleting_key(owner_thread.workspace_id),
+    ];
+    if expected.direction_id == 0 && expected.repo_id == 0 {
+        // Lead-owned row: the live thread is the complete parent contract.
+    } else {
+        let Some(direction) = direction::Entity::find_by_id(expected.direction_id)
+            .one(&txn)
+            .await?
+        else {
+            txn.rollback().await?;
+            anyhow::bail!("tracked PR/MR parent changed before Retry");
+        };
+        let owner_repo = repo_ref::Entity::find_by_id(expected.repo_id)
+            .one(&txn)
+            .await?;
+        let primary_repo = repo_ref::Entity::find_by_id(direction.repo_id)
+            .one(&txn)
+            .await?;
+        let exact_parent = direction.thread_id == expected.thread_id
+            && owner_repo
+                .as_ref()
+                .is_some_and(|repo_ref| repo_ref.workspace_id == owner_thread.workspace_id)
+            && primary_repo
+                .as_ref()
+                .is_some_and(|repo_ref| repo_ref.workspace_id == owner_thread.workspace_id);
+        if !exact_parent {
+            txn.rollback().await?;
+            anyhow::bail!("tracked PR/MR parent changed before Retry");
+        }
+        marker_keys.push(repo_deleting_key(expected.repo_id));
+        marker_keys.push(repo_deleting_key(direction.repo_id));
+    }
+    let deleting = app_setting::Entity::find()
+        .filter(app_setting::Column::Key.is_in(marker_keys))
+        .one(&txn)
+        .await?
+        .is_some();
+    if deleting {
+        txn.rollback().await?;
+        anyhow::bail!("tracked PR/MR parent is being deleted");
+    }
+
+    let reset = pull_request::Entity::update_many()
+        .col_expr(pull_request::Column::ProbeFailCount, Expr::value(0))
+        .filter(pull_request::Column::Id.eq(expected.id))
+        .filter(pull_request::Column::LastCheckedAt.eq(&expected.last_checked_at))
+        .filter(pull_request::Column::ProbeFailCount.eq(expected.probe_fail_count))
+        .exec(&txn)
+        .await?;
+    if reset.rows_affected != 1 {
+        txn.rollback().await?;
+        anyhow::bail!("tracked PR/MR changed before Retry could commit");
+    }
+    let refreshed = pull_request::Entity::find_by_id(expected.id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("refreshed PR/MR {} disappeared", expected.id))?;
+    txn.commit().await?;
+    Ok(refreshed)
 }
 
 /// Apply a freshly, SUCCESSFULLY fetched snapshot: overwrite every observed
@@ -4292,15 +7846,75 @@ pub async fn register_pull_request(
 /// `mark_pull_request_probe_error` for the failure counterpart, which
 /// deliberately leaves these observed fields untouched — a failed probe is a
 /// fact about the ATTEMPT, not new information about the PR/MR's real state.
+/// How a snapshot write should affect the consecutive-failure streak.
+///
+/// Three cases and not two, because the streak has TWO writers with different
+/// authority. `host::monitor` owns the give-up decision: it is the only loop
+/// that runs on every row, and the only one that posts the escalation notice.
+/// `host::automerge` also persists snapshots, but is not entitled to move the
+/// streak at all — Codex review round 3 P2 showed both directions of that
+/// going wrong. Reporting a partial read as complete there would zero the
+/// streak the monitor is accumulating; incrementing it there could carry a
+/// row from 9 to 10, past `list_open_pull_requests`'s threshold, so the
+/// monitor would never see the row again and would never post the
+/// action-required notice — the row would leave monitoring wearing a stale
+/// "still retrying" note forever.
+pub enum StreakUpdate<'a> {
+    /// Every axis was read — an unqualified success. Clears the streak and
+    /// the stored diagnostic.
+    Clear,
+    /// The fetch returned a snapshot but at least one axis came back
+    /// unreadable. Its readable axes are real and still worth persisting —
+    /// that is the whole reason a partial read is not simply discarded — but
+    /// it must extend the streak rather than clear it, or a permanently
+    /// unreadable axis would reset the counter every sweep and the give-up
+    /// threshold could never be reached (round 2 P2).
+    Extend(&'a str),
+    /// Persist the axes, touch neither the streak nor `last_error`. For a
+    /// writer that is not the monitor.
+    Leave,
+}
+
+/// Persist a freshly fetched snapshot. See [`StreakUpdate`] for the
+/// bookkeeping half, which is the part with the sharp edges.
+///
+/// Returns the row's resulting `probe_fail_count` so the monitor can apply
+/// the same give-up escalation `mark_pull_request_probe_error`'s callers do.
+/// Under [`StreakUpdate::Leave`] that is the value this call OBSERVED and
+/// deliberately did not write — a concurrent monitor increment may already
+/// have moved it, which is exactly why `Leave` does not write it back.
 pub async fn apply_pull_request_snapshot(
     db: &Db,
     id: i32,
     snapshot: &crate::host::PrSnapshot,
     readiness: &crate::host::MergeReadiness,
-) -> Result<()> {
+    streak: StreakUpdate<'_>,
+) -> Result<Option<i32>> {
     let Some(row) = pull_request::Entity::find_by_id(id).one(&db.0).await? else {
-        return Ok(());
+        return Ok(None);
     };
+    let (a, next_fail_count) = build_snapshot_update(row, snapshot, readiness, streak);
+    a.update(&db.0).await?;
+    Ok(Some(next_fail_count))
+}
+
+/// The pure half of [`apply_pull_request_snapshot`]: which columns the UPDATE
+/// will carry, and the resulting failure count.
+///
+/// Split out so the property that matters most about `StreakUpdate::Leave` is
+/// directly assertable — that it leaves the streak columns `NotSet`, so the
+/// statement does not mention them AT ALL. Writing back the value the read
+/// observed would look like a no-op and is not one: the monitor runs on its
+/// own loop and can increment between the two, and the stale write would
+/// silently undo it (Codex review round 4 P2). A race is not deterministically
+/// testable; "this column is absent from the UPDATE" is.
+fn build_snapshot_update(
+    row: pull_request::Model,
+    snapshot: &crate::host::PrSnapshot,
+    readiness: &crate::host::MergeReadiness,
+    streak: StreakUpdate<'_>,
+) -> (pull_request::ActiveModel, i32) {
+    let observed_fail_count = row.probe_fail_count;
     let mut a: pull_request::ActiveModel = row.into();
     a.head_sha = Set(snapshot.head_sha.clone());
     a.base_ref = Set(snapshot.base_ref.clone());
@@ -4313,31 +7927,60 @@ pub async fn apply_pull_request_snapshot(
     a.lifecycle = Set(snapshot.lifecycle.as_str().to_string());
     a.ci_status = Set(serde_json::to_string(&snapshot.ci).unwrap_or_default());
     a.review_status = Set(serde_json::to_string(&snapshot.review).unwrap_or_default());
+    a.thread_status = Set(serde_json::to_string(&snapshot.threads).unwrap_or_default());
     a.conflict_status = Set(serde_json::to_string(&snapshot.conflict).unwrap_or_default());
     a.merge_readiness = Set(serde_json::to_string(readiness).unwrap_or_default());
     a.last_checked_at = Set(now());
-    a.last_error = Set(String::new());
-    a.probe_fail_count = Set(0); // a success resets the consecutive-failure streak
-    a.update(&db.0).await?;
-    Ok(())
+    match streak {
+        // A partial read keeps its diagnostic visible for exactly the same
+        // reason a failed probe does — "we could not tell" must never look
+        // identical to "we checked and it was fine".
+        //
+        // An EMPTY reason would do precisely that: `last_error == ""` IS this
+        // column's sentinel for "no error", so storing a blank one leaves a
+        // row whose streak is climbing while its error column reads clean,
+        // and renders a notice with an empty diagnostic. A caller cannot be
+        // relied on never to produce one (`gh` killed by a signal writes no
+        // stderr at all — Codex review round 3 P2), so the guarantee is made
+        // here, at the single point that writes the column, rather than at
+        // each place a reason is built.
+        StreakUpdate::Extend(reason) => {
+            let reason = reason.trim();
+            a.last_error = Set(if reason.is_empty() {
+                "an axis could not be read, and the failure gave no reason".to_string()
+            } else {
+                reason.to_string()
+            });
+        }
+        StreakUpdate::Clear => a.last_error = Set(String::new()),
+        StreakUpdate::Leave => {}
+    }
+    let next_fail_count = match streak {
+        StreakUpdate::Clear => {
+            a.probe_fail_count = Set(0);
+            0
+        }
+        StreakUpdate::Extend(_) => {
+            let next = observed_fail_count.saturating_add(1);
+            a.probe_fail_count = Set(next);
+            next
+        }
+        StreakUpdate::Leave => observed_fail_count,
+    };
+    (a, next_fail_count)
 }
 
-/// Record a failed probe attempt without touching the last known snapshot,
-/// and bump the consecutive-failure streak (`list_open_pull_requests` stops
-/// sweeping the row once this reaches the caller's give-up threshold).
-/// Returns the NEW streak count (`None` if the row is gone) so the caller can
-/// tell whether THIS attempt is the one that just crossed the threshold — the
-/// monitor uses that to give the row's Needs-you notice honestly different
-/// wording ("stopped checking, here's how to resume") instead of repeating
-/// the same transient-failure text forever after tracking has actually
-/// stopped.
+/// Record a failed probe attempt without touching the last known snapshot and
+/// bump the consecutive-failure streak. `last_checked_at` is a precise,
+/// opaque failure-episode token here; after the threshold the canonical
+/// attention projection uses it for one OCC-scoped Retry action.
 pub async fn mark_pull_request_probe_error(db: &Db, id: i32, message: &str) -> Result<Option<i32>> {
     let Some(row) = pull_request::Entity::find_by_id(id).one(&db.0).await? else {
         return Ok(None);
     };
     let next_fail_count = row.probe_fail_count.saturating_add(1);
     let mut a: pull_request::ActiveModel = row.into();
-    a.last_checked_at = Set(now());
+    a.last_checked_at = Set(now_precise());
     a.last_error = Set(message.to_string());
     a.probe_fail_count = Set(next_fail_count);
     a.update(&db.0).await?;
@@ -4349,8 +7992,154 @@ mod tests {
     use super::*;
     use crate::store::Db;
 
+    type RegistrationProbe = (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+
+    type DirectionInsertProbe = (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+
+    fn direction_insert_probe_map(
+    ) -> &'static std::sync::Mutex<std::collections::HashMap<String, DirectionInsertProbe>> {
+        static PROBES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, DirectionInsertProbe>>,
+        > = std::sync::OnceLock::new();
+        PROBES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn direction_insert_probe_key(thread_id: i32, name: &str) -> String {
+        format!("{thread_id}:{name}")
+    }
+
+    fn arm_direction_insert_write_probe(
+        thread_id: i32,
+        name: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        direction_insert_probe_map()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                direction_insert_probe_key(thread_id, name),
+                (reached_tx, resume_rx),
+            );
+        (reached_rx, resume_tx)
+    }
+
+    pub(super) async fn before_direction_insert_write_probe(thread_id: i32, name: &str) {
+        let probe = direction_insert_probe_map()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&direction_insert_probe_key(thread_id, name));
+        if let Some((reached_tx, resume_rx)) = probe {
+            let _ = reached_tx.send(());
+            let _ = resume_rx.await;
+        }
+    }
+
+    fn registration_probe_map(
+    ) -> &'static std::sync::Mutex<std::collections::HashMap<String, RegistrationProbe>> {
+        static PROBES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, RegistrationProbe>>,
+        > = std::sync::OnceLock::new();
+        PROBES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn registration_probe_key(host_owner: &str, host_repo: &str, number: i32) -> String {
+        format!("{host_owner}/{host_repo}#{number}")
+    }
+
+    fn arm_pull_request_registration_write_probe(
+        host_owner: &str,
+        host_repo: &str,
+        number: i32,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        registration_probe_map()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                registration_probe_key(host_owner, host_repo, number),
+                (reached_tx, resume_rx),
+            );
+        (reached_rx, resume_tx)
+    }
+
+    pub(super) async fn before_pull_request_registration_write_probe(
+        host_owner: &str,
+        host_repo: &str,
+        number: i32,
+    ) {
+        let probe = registration_probe_map()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&registration_probe_key(host_owner, host_repo, number));
+        if let Some((reached_tx, resume_rx)) = probe {
+            let _ = reached_tx.send(());
+            let _ = resume_rx.await;
+        }
+    }
+
     async fn mem() -> Db {
         Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    async fn insert_test_repo_action_execution(
+        db: &Db,
+        id: i32,
+        workspace_id: i32,
+        thread_id: i32,
+        message_id: i32,
+        repo: &repo_ref::Model,
+        action_id: &str,
+        feedback_state: &str,
+    ) -> repo_action_execution::Model {
+        let payload = serde_json::json!({
+            "tool": "repo_action",
+            "action_id": action_id,
+            "kind": "add",
+            "status": "ok",
+            "execution_id": id,
+            "workspace_id": workspace_id,
+            "repo_id": repo.id.to_string(),
+            "name": repo.name,
+            "local_git_path": repo.local_git_path,
+        })
+        .to_string();
+        repo_action_execution::ActiveModel {
+            id: Set(id),
+            workspace_id: Set(workspace_id),
+            thread_id: Set(thread_id),
+            message_id: Set(message_id),
+            action_id: Set(action_id.to_string()),
+            action_kind: Set("add".to_string()),
+            invocation_fingerprint: Set(format!("fingerprint-{id}")),
+            execution_token: Set(format!("token-{id}")),
+            status: Set(REPO_ACTION_COMPLETED.to_string()),
+            target_path: Set(repo.local_git_path.clone()),
+            staging_path: Set(String::new()),
+            repo_id: Set(repo.id),
+            repo_name: Set(repo.name.clone()),
+            feedback_state: Set(feedback_state.to_string()),
+            feedback_payload: Set(payload),
+            cleanup_preserve_target: Set(false),
+            created_at: Set(now()),
+            updated_at: Set(now()),
+        }
+        .insert(&db.0)
+        .await
+        .unwrap()
     }
 
     /// A live thread id for message tests: insert_lead_message refuses to write
@@ -4364,9 +8153,36 @@ mod tests {
             .id
     }
 
+    async fn direction_parent_fixture(
+        db: &Db,
+        workspace_name: &str,
+    ) -> (workspace::Model, repo_ref::Model, thread::Model) {
+        let workspace = create_workspace(db, workspace_name).await.unwrap();
+        let repo = add_repo_ref(
+            db,
+            workspace.id,
+            "repo",
+            &format!("/tmp/{workspace_name}-repo"),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = create_thread(db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        (workspace, repo, thread)
+    }
+
     async fn worker_fixture(
         db: &Db,
-    ) -> (workspace::Model, repo_ref::Model, thread::Model, direction::Model) {
+    ) -> (
+        workspace::Model,
+        repo_ref::Model,
+        thread::Model,
+        direction::Model,
+    ) {
         let ws = create_workspace(db, "ws").await.unwrap();
         let repo = add_repo_ref(db, ws.id, "repo", "/tmp/repo", "main", "", true)
             .await
@@ -4374,82 +8190,34 @@ mod tests {
         let thread = create_thread(db, ws.id, "issue", "feature", "codex")
             .await
             .unwrap();
-        let direction =
-            create_direction(db, thread.id, "task", "codex", repo.id, "why", "impl-only", "")
-                .await
-                .unwrap();
+        let direction = create_direction(
+            db,
+            thread.id,
+            "task",
+            "codex",
+            repo.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
         (ws, repo, thread, direction)
     }
 
-    // ---- the test-only write-failure seam's own contract ----
-
-    /// The property every caller of [`fail_write`] depends on: arming ONE write
-    /// fails exactly that write and leaves its neighbours alone. Without that
-    /// selectivity the seam could not reproduce the situation the gated
-    /// degradation paths exist for — "this write failed, the ones around it
-    /// succeeded" — it would just look like a dead database.
-    #[tokio::test]
-    async fn fail_write_only_fails_the_armed_write() {
-        let db = mem().await;
-        let thread_id = live_thread(&db).await;
-
-        fail_write::while_failing("mark_turn_freeze_recovered", async {
-            assert!(
-                mark_turn_freeze_recovered(&db, thread_id, None).await.is_err(),
-                "the armed write must fail"
-            );
-            // A neighbour sharing the very same INSERT choke point
-            // (`insert_lead_message`) is untouched — the seam keys on the named
-            // write, not on the statement underneath it.
-            assert!(
-                insert_lead_message(&db, thread_id, None, 1, "assistant", "text", "{}", "complete")
-                    .await
-                    .is_ok(),
-                "an unarmed write through the same choke point must still succeed"
-            );
-            // …and so is the other write the freeze recovery performs around it.
-            assert!(set_lead_native_id_opt(&db, thread_id, None).await.is_ok());
-        })
-        .await;
+    async fn worker_session_fixture(db: &Db) -> (thread::Model, session::Model) {
+        let (_, repo, thread, direction) = worker_fixture(db).await;
+        let session = create_session(db, direction.id, repo.id, "codex", "/tmp/session")
+            .await
+            .unwrap();
+        (thread, session)
     }
 
-    /// Arming is scoped to the task that armed it, and ends with the scope:
-    /// nothing is left armed for the rest of the process (which is what lets
-    /// `cargo test`'s parallel threads arm freely without a serializing lock).
-    #[tokio::test]
-    async fn fail_write_arming_ends_with_its_scope() {
-        let db = mem().await;
-        let thread_id = live_thread(&db).await;
-
-        fail_write::while_failing("mark_turn_freeze_recovered", async {
-            assert!(mark_turn_freeze_recovered(&db, thread_id, None).await.is_err());
-        })
-        .await;
-
-        assert!(
-            mark_turn_freeze_recovered(&db, thread_id, None).await.is_ok(),
-            "outside the scope the same write must behave normally"
-        );
-    }
-
-    /// An armed write fails BEFORE it mutates anything — the seam has to model a
-    /// write that didn't happen, not a half-applied one, or every test built on
-    /// it would be asserting against a state production never reaches.
-    #[tokio::test]
-    async fn fail_write_leaves_no_partial_row() {
-        let db = mem().await;
-        let thread_id = live_thread(&db).await;
-
-        fail_write::while_failing("mark_turn_freeze_recovered", async {
-            let _ = mark_turn_freeze_recovered(&db, thread_id, None).await;
-        })
-        .await;
-
-        assert_eq!(
-            last_turn_freeze_recovery_secs(&db, thread_id, None).await.unwrap(),
-            None,
-            "no marker row may survive an injected failure"
-        );
+    async fn worker_pr_source(db: &Db, direction_id: i32, repo_id: i32) -> Option<i32> {
+        create_session(db, direction_id, repo_id, "codex", "/tmp/pr-source")
+            .await
+            .ok()
+            .map(|session| session.id)
     }
 
     #[tokio::test]
@@ -4473,7 +8241,10 @@ mod tests {
         let same_path = add_repo_ref(&db, ws.id, "renamed", "/code/web", "main", "", true)
             .await
             .unwrap();
-        assert_eq!(same_path.id, a.id, "same path must not create a second repo");
+        assert_eq!(
+            same_path.id, a.id,
+            "same path must not create a second repo"
+        );
 
         // Same remote (normalized: host-case + .git differ), DIFFERENT path — e.g.
         // the same GitHub repo cloned elsewhere → deduped to the first row.
@@ -4515,7 +8286,10 @@ mod tests {
         let l2 = add_repo_ref(&db, ws.id, "local-2", "/code/l2", "main", "", true)
             .await
             .unwrap();
-        assert_ne!(l1.id, l2.id, "empty remote must not collapse distinct repos");
+        assert_ne!(
+            l1.id, l2.id,
+            "empty remote must not collapse distinct repos"
+        );
 
         // Dedup is workspace-scoped: the same repo in another workspace is allowed.
         let ws2 = create_workspace(&db, "ws2").await.unwrap();
@@ -4552,7 +8326,10 @@ mod tests {
         let legacy = add_repo_ref(&db, ws.id, "web", "/code/web", "stale", "", false)
             .await
             .unwrap();
-        assert!(!legacy.base_ref_is_default, "precondition: legacy marker is false");
+        assert!(
+            !legacy.base_ref_is_default,
+            "precondition: legacy marker is false"
+        );
         assert_eq!(legacy.base_ref, "stale");
 
         // Re-add the SAME local path with a vetted default → repairs the row in place
@@ -4560,10 +8337,23 @@ mod tests {
         let repaired = add_repo_ref(&db, ws.id, "web", "/code/web", "develop", "", true)
             .await
             .unwrap();
-        assert_eq!(repaired.id, legacy.id, "re-add must repair in place, not insert");
-        assert!(repaired.base_ref_is_default, "vetted default repaired the marker");
-        assert_eq!(repaired.base_ref, "develop", "vetted base_ref was written through");
-        assert_eq!(list_repos(&db, ws.id).await.unwrap().len(), 1, "no duplicate row");
+        assert_eq!(
+            repaired.id, legacy.id,
+            "re-add must repair in place, not insert"
+        );
+        assert!(
+            repaired.base_ref_is_default,
+            "vetted default repaired the marker"
+        );
+        assert_eq!(
+            repaired.base_ref, "develop",
+            "vetted base_ref was written through"
+        );
+        assert_eq!(
+            list_repos(&db, ws.id).await.unwrap().len(),
+            1,
+            "no duplicate row"
+        );
 
         // Re-add again WITHOUT a vetted default (is_default=false) must NOT clobber the
         // now-true marker nor the vetted base_ref.
@@ -4615,12 +8405,14 @@ mod tests {
             .await
             .unwrap();
         // A stored workspace map doc (enumerates repos) must be invalidated on delete.
-        set_repo_map_doc(&db, ws.id, "## Inventory\n- a (backend)\n- b (backend)").await.unwrap();
+        set_repo_map_doc(&db, ws.id, "## Inventory\n- a (backend)\n- b (backend)")
+            .await
+            .unwrap();
 
         let removed = delete_repo_cascade(&db, a.id).await.unwrap();
         // returns repo `a`'s worktree(s) for the caller to physically remove
         assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].2, "/tmp/a-wt");
+        assert_eq!(removed[0].worktree_path, "/tmp/a-wt");
 
         // repo `a` + its profile/direction/session/worktree are gone…
         assert!(get_repo(&db, a.id).await.unwrap().is_none());
@@ -4639,20 +8431,139 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delete_repo_cascade_snapshots_an_external_worktree_repo_path() {
+        let db = mem().await;
+        let deleted_ws = create_workspace(&db, "delete repo workspace").await.unwrap();
+        let keep_ws = create_workspace(&db, "keep repo workspace").await.unwrap();
+        let deleted_repo =
+            add_repo_ref(&db, deleted_ws.id, "deleted", "/tmp/deleted", "main", "", true)
+                .await
+                .unwrap();
+        let external_repo =
+            add_repo_ref(&db, keep_ws.id, "external", "/tmp/external", "main", "", true)
+                .await
+                .unwrap();
+        let thread = create_thread(&db, deleted_ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "task",
+            "codex",
+            deleted_repo.id,
+            "reason",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let worktree = record_worktree(
+            &db,
+            external_repo.id,
+            direction.id,
+            "feature/external",
+            "/tmp/external-wt",
+            true,
+            true,
+            "",
+        )
+        .await
+        .unwrap();
+
+        let effects = delete_repo_cascade_with_human_cancellations(&db, deleted_repo.id)
+            .await
+            .unwrap();
+
+        assert_eq!(effects.removed_worktrees.len(), 1);
+        let removed = &effects.removed_worktrees[0];
+        assert_eq!(removed.worktree_id, worktree.id);
+        assert_eq!(removed.repo_id, external_repo.id);
+        assert_eq!(removed.repo_local_git_path, "/tmp/external");
+        assert_eq!(removed.worktree_path, "/tmp/external-wt");
+        assert!(get_repo(&db, external_repo.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_thread_cascade_rolls_back_when_a_worktree_repo_path_is_missing() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "workspace").await.unwrap();
+        let repo_ref = add_repo_ref(&db, ws.id, "repo", "/tmp/repo", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "task",
+            "codex",
+            repo_ref.id,
+            "reason",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let worktree = record_worktree(
+            &db,
+            repo_ref.id,
+            direction.id,
+            "feature/task",
+            "/tmp/repo-wt",
+            true,
+            true,
+            "",
+        )
+        .await
+        .unwrap();
+        repo_ref::Entity::delete_by_id(repo_ref.id)
+            .exec(&db.0)
+            .await
+            .unwrap();
+
+        let error = delete_thread_cascade(&db, thread.id).await.unwrap_err();
+
+        assert!(error.to_string().contains("worktree repo"));
+        assert!(get_thread(&db, thread.id).await.unwrap().is_some());
+        assert!(get_direction(&db, direction.id).await.unwrap().is_some());
+        assert!(worktree::Entity::find_by_id(worktree.id)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     /// issue #110 T3 review: same fix as `delete_thread_cascade_removes_
     /// tracked_pull_requests`, for a repo (rather than a whole issue) delete.
     #[tokio::test]
     async fn delete_repo_cascade_removes_tracked_pull_requests() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let t = create_thread(&db, ws.id, "T", "feature", "claude").await.unwrap();
-        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        let t = create_thread(&db, ws.id, "T", "feature", "claude")
+            .await
+            .unwrap();
+        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true)
+            .await
+            .unwrap();
         let dir = create_direction(&db, t.id, "d", "claude", a.id, "reason", "plan+impl", "")
             .await
             .unwrap();
         let pr = register_pull_request(
-            &db, t.id, dir.id, a.id, "github", "github.com", "acme", "widgets", 6,
-            "https://github.com/acme/widgets/pull/6", "fix bug",
+            &db,
+            t.id,
+            dir.id,
+            a.id,
+            worker_pr_source(&db, dir.id, a.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            6,
+            "https://github.com/acme/widgets/pull/6",
+            "fix bug",
         )
         .await
         .unwrap();
@@ -4670,23 +8581,34 @@ mod tests {
     async fn update_plan_proposal_cas_rejects_a_stale_write() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
-        upsert_plan(&db, t.id, "P1", "proposed", "t0").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+        upsert_plan(&db, t.id, "P1", "proposed", "t0")
+            .await
+            .unwrap();
         let plan_a = get_plan(&db, t.id).await.unwrap().unwrap(); // read v1 (proposal == "P1")
-        // A re-propose lands AFTER the read but before the CAS write.
-        upsert_plan(&db, t.id, "P2", "proposed", "t0").await.unwrap();
+                                                                  // A re-propose lands AFTER the read but before the CAS write.
+        upsert_plan(&db, t.id, "P2", "proposed", "t0")
+            .await
+            .unwrap();
         // A CAS expecting the STALE P1 must NOT apply (the live proposal is P2).
         assert!(
-            !update_plan_proposal_cas(&db, t.id, "P3", &plan_a.proposal, "proposed").await.unwrap(),
+            !update_plan_proposal_cas(&db, t.id, "P3", &plan_a.proposal, "proposed")
+                .await
+                .unwrap(),
             "CAS must reject a write whose expected proposal is stale"
         );
         assert_eq!(
-            get_plan(&db, t.id).await.unwrap().unwrap().proposal, "P2",
+            get_plan(&db, t.id).await.unwrap().unwrap().proposal,
+            "P2",
             "the stale write left the fresh re-propose intact"
         );
         // A CAS expecting the CURRENT P2 applies.
         assert!(
-            update_plan_proposal_cas(&db, t.id, "P3", "P2", "proposed").await.unwrap(),
+            update_plan_proposal_cas(&db, t.id, "P3", "P2", "proposed")
+                .await
+                .unwrap(),
             "CAS applies when expected matches the live proposal"
         );
         assert_eq!(get_plan(&db, t.id).await.unwrap().unwrap().proposal, "P3");
@@ -4699,36 +8621,50 @@ mod tests {
         // between must reject, so the fresh proposal isn't marked confirmed with stale lanes.
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
         upsert_plan(&db, t.id, "P1", "scoped", "t0").await.unwrap();
         // Stale proposal -> reject.
         assert!(
-            !mark_plan_confirmed_cas(&db, t.id, "P0", "scoped").await.unwrap(),
+            !mark_plan_confirmed_cas(&db, t.id, "P0", "scoped")
+                .await
+                .unwrap(),
             "must reject when the expected proposal differs (re-proposed)"
         );
         // Drifted status -> reject.
         assert!(
-            !mark_plan_confirmed_cas(&db, t.id, "P1", "proposed").await.unwrap(),
+            !mark_plan_confirmed_cas(&db, t.id, "P1", "proposed")
+                .await
+                .unwrap(),
             "must reject when the expected status differs"
         );
         assert_eq!(
-            get_plan(&db, t.id).await.unwrap().unwrap().status, "scoped",
+            get_plan(&db, t.id).await.unwrap().unwrap().status,
+            "scoped",
             "a rejected CAS left the status untouched"
         );
         // Matching proposal + status -> applies; status becomes confirmed, proposal untouched.
         assert!(
-            mark_plan_confirmed_cas(&db, t.id, "P1", "scoped").await.unwrap(),
+            mark_plan_confirmed_cas(&db, t.id, "P1", "scoped")
+                .await
+                .unwrap(),
             "must apply when proposal+status match"
         );
         let p = get_plan(&db, t.id).await.unwrap().unwrap();
         assert_eq!(p.status, "confirmed");
-        assert_eq!(p.proposal, "P1", "proposal left untouched by the status CAS");
+        assert_eq!(
+            p.proposal, "P1",
+            "proposal left untouched by the status CAS"
+        );
         // Absent plan -> false.
         let no_plan = create_thread(&db, ws.id, "no plan", "feature", "claude")
             .await
             .unwrap();
         assert!(
-            !mark_plan_confirmed_cas(&db, no_plan.id, "P1", "scoped").await.unwrap(),
+            !mark_plan_confirmed_cas(&db, no_plan.id, "P1", "scoped")
+                .await
+                .unwrap(),
             "must be false when the plan is absent"
         );
     }
@@ -4742,26 +8678,109 @@ mod tests {
     async fn update_plan_proposal_cas_preserves_confirmed_status() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
-        upsert_plan(&db, t.id, "P1", "proposed", "t0").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+        upsert_plan(&db, t.id, "P1", "proposed", "t0")
+            .await
+            .unwrap();
         // The edit read the plan while it was "proposed" (expected status = "proposed").
         // Meanwhile confirm marked the SAME proposal JSON "confirmed".
-        upsert_plan(&db, t.id, "P1", "confirmed", "t0").await.unwrap();
+        upsert_plan(&db, t.id, "P1", "confirmed", "t0")
+            .await
+            .unwrap();
         // A CAS whose expected proposal matches the live row but whose status differs
         // (live="confirmed", call passes "proposed") must NOT apply.
         assert!(
-            !update_plan_proposal_cas(&db, t.id, "P2", "P1", "proposed").await.unwrap(),
+            !update_plan_proposal_cas(&db, t.id, "P2", "P1", "proposed")
+                .await
+                .unwrap(),
             "CAS must reject when the live status drifted away from the expected status"
         );
         let after = get_plan(&db, t.id).await.unwrap().unwrap();
-        assert_eq!(after.proposal, "P1", "stale-status write must not touch the proposal");
-        assert_eq!(after.status, "confirmed", "the confirmed status must survive the rejected edit");
+        assert_eq!(
+            after.proposal, "P1",
+            "stale-status write must not touch the proposal"
+        );
+        assert_eq!(
+            after.status, "confirmed",
+            "the confirmed status must survive the rejected edit"
+        );
         // A CAS that agrees on BOTH proposal and the live status applies.
         assert!(
-            update_plan_proposal_cas(&db, t.id, "P2", "P1", "confirmed").await.unwrap(),
+            update_plan_proposal_cas(&db, t.id, "P2", "P1", "confirmed")
+                .await
+                .unwrap(),
             "CAS applies when both proposal and status match the live row"
         );
         assert_eq!(get_plan(&db, t.id).await.unwrap().unwrap().proposal, "P2");
+    }
+
+    #[tokio::test]
+    async fn plan_updates_preserve_existing_row_while_delete_marker_exists() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "plan fence").await.unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        let old = upsert_plan(&db, thread.id, "P_old", "proposed", "created_old")
+            .await
+            .unwrap();
+        mark_workspace_deleting(&db, ws.id).await.unwrap();
+
+        assert!(upsert_plan(&db, thread.id, "P_new", "confirmed", "created_new")
+            .await
+            .is_err());
+        assert!(set_plan_created_at(&db, thread.id, "created_new")
+            .await
+            .is_err());
+        assert!(update_plan_proposal_cas(&db, thread.id, "P_new", "P_old", "proposed")
+            .await
+            .is_err());
+        assert!(mark_plan_confirmed_cas(&db, thread.id, "P_old", "proposed")
+            .await
+            .is_err());
+        assert!(commit_confirmed_plan_cas(
+            &db,
+            thread.id,
+            "P_new",
+            "P_old",
+            "proposed"
+        )
+        .await
+        .is_err());
+        assert!(commit_confirmed_plan_with_direction_pins_cas(
+            &db,
+            thread.id,
+            "P_new",
+            "P_old",
+            "proposed",
+            &[]
+        )
+        .await
+        .is_err());
+        let unused_pin = InitialDirectionRoutePin {
+            direction_id: i32::MAX,
+            session_id: None,
+            tool: "codex".to_string(),
+        };
+        assert!(commit_reused_approval_with_direction_pin_cas(
+            &db,
+            thread.id,
+            "P_new",
+            "P_old",
+            "proposed",
+            &unused_pin
+        )
+        .await
+        .is_err());
+
+        clear_workspace_deleting(&db, ws.id).await.unwrap();
+        assert_eq!(
+            get_plan(&db, thread.id).await.unwrap().unwrap(),
+            old,
+            "a failed delete fence must leave the complete pre-existing plan intact"
+        );
     }
 
     /// the caller can gate branch deletion. A worktree row with created_branch=false
@@ -4773,8 +8792,12 @@ mod tests {
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let r = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true).await.unwrap();
-        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
         let d = create_direction(&db, t.id, "d", "claude", r.id, "x", "plan+impl", "")
             .await
             .unwrap();
@@ -4798,7 +8821,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(row.created_branch, "created_branch must default to true when unset");
+        assert!(
+            row.created_branch,
+            "created_branch must default to true when unset"
+        );
     }
 
     /// M0028: worktree.base_commit round-trips and an UNSET column defaults to "" (legacy/
@@ -4808,8 +8834,12 @@ mod tests {
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let r = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true).await.unwrap();
-        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
         let d = create_direction(&db, t.id, "d", "claude", r.id, "x", "plan+impl", "")
             .await
             .unwrap();
@@ -4834,24 +8864,44 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(legacy_row.base_commit, "", "base_commit must default to empty when unset");
+        assert_eq!(
+            legacy_row.base_commit, "",
+            "base_commit must default to empty when unset"
+        );
 
         // (2) record_worktree persists a non-empty base_commit, and set_worktree_base_commit
         // updates it — both round-trip through the column.
         let d2 = create_direction(&db, t.id, "d2", "claude", r.id, "x", "plan+impl", "")
             .await
             .unwrap();
-        let rec = record_worktree(&db, r.id, d2.id, "feat/rec", "/tmp/wt-rec", true, true, "abc123")
+        let rec = record_worktree(
+            &db,
+            r.id,
+            d2.id,
+            "feat/rec",
+            "/tmp/wt-rec",
+            true,
+            true,
+            "abc123",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rec.base_commit, "abc123",
+            "record_worktree persists base_commit"
+        );
+        set_worktree_base_commit(&db, rec.id, "def456")
             .await
             .unwrap();
-        assert_eq!(rec.base_commit, "abc123", "record_worktree persists base_commit");
-        set_worktree_base_commit(&db, rec.id, "def456").await.unwrap();
         let updated = worktree::Entity::find_by_id(rec.id)
             .one(&db.0)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(updated.base_commit, "def456", "set_worktree_base_commit updates the row");
+        assert_eq!(
+            updated.base_commit, "def456",
+            "set_worktree_base_commit updates the row"
+        );
     }
 
     /// (pre-existing branch reused by the -b fallback) must have its flag preserved.
@@ -4870,27 +8920,57 @@ mod tests {
             .unwrap();
 
         // Record one worktree with created_branch=false (pre-existing branch).
-        record_worktree(&db, r.id, dir.id, "feat/preexist", "/tmp/r-wt", false, true, "")
-            .await
-            .unwrap();
+        record_worktree(
+            &db,
+            r.id,
+            dir.id,
+            "feat/preexist",
+            "/tmp/r-wt",
+            false,
+            true,
+            "",
+        )
+        .await
+        .unwrap();
         // Record another with created_branch=true (weft-created branch).
         let dir2 = create_direction(&db, t.id, "d2", "claude", r.id, "reason2", "plan+impl", "")
             .await
             .unwrap();
-        record_worktree(&db, r.id, dir2.id, "feat/weft-created", "/tmp/r-wt2", true, true, "")
-            .await
-            .unwrap();
+        record_worktree(
+            &db,
+            r.id,
+            dir2.id,
+            "feat/weft-created",
+            "/tmp/r-wt2",
+            true,
+            true,
+            "",
+        )
+        .await
+        .unwrap();
 
         let removed = delete_repo_cascade(&db, r.id).await.unwrap();
         assert_eq!(removed.len(), 2);
 
-        // Both tuples must carry the correct created_branch flag.
-        let preexist = removed.iter().find(|t| t.2 == "/tmp/r-wt").unwrap();
-        assert!(!preexist.4, "pre-existing branch must have created_branch=false");
-        assert!(preexist.5, "created_checkout defaults to true");
-        let created = removed.iter().find(|t| t.2 == "/tmp/r-wt2").unwrap();
-        assert!(created.4, "weft-created branch must have created_branch=true");
-        assert!(created.5, "created_checkout defaults to true");
+        // Both effects must carry the correct ownership flags.
+        let preexist = removed
+            .iter()
+            .find(|effect| effect.worktree_path == "/tmp/r-wt")
+            .unwrap();
+        assert!(
+            !preexist.created_branch,
+            "pre-existing branch must have created_branch=false"
+        );
+        assert!(preexist.created_checkout, "created_checkout defaults to true");
+        let created = removed
+            .iter()
+            .find(|effect| effect.worktree_path == "/tmp/r-wt2")
+            .unwrap();
+        assert!(
+            created.created_branch,
+            "weft-created branch must have created_branch=true"
+        );
+        assert!(created.created_checkout, "created_checkout defaults to true");
     }
 
     #[tokio::test]
@@ -4900,21 +8980,39 @@ mod tests {
         // (→ tier/category fallback) until the next pass re-derives.
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let web = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true).await.unwrap();
-        let api = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true).await.unwrap();
-        upsert_repo_profile(&db, web.id, "frontend", "[]", "", "[]", "agent", "").await.unwrap();
-        upsert_repo_profile(&db, api.id, "backend", "[]", "", "[]", "agent", "").await.unwrap();
+        let web = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let api = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, web.id, "frontend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, api.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
         set_repo_layer_rank(&db, web.id, "Client", 5).await.unwrap();
-        set_repo_layer_rank(&db, api.id, "Service", 4).await.unwrap();
+        set_repo_layer_rank(&db, api.id, "Service", 4)
+            .await
+            .unwrap();
 
         calibrate_repo_relation(&db, web.id, api.id, "grpc", "Pricing.Quote", "add")
             .await
             .unwrap();
 
         let from = get_repo_profile(&db, web.id).await.unwrap().unwrap();
-        assert_eq!((from.layer.as_str(), from.layer_rank), ("", 0), "consumer layer cleared");
+        assert_eq!(
+            (from.layer.as_str(), from.layer_rank),
+            ("", 0),
+            "consumer layer cleared"
+        );
         let to = get_repo_profile(&db, api.id).await.unwrap().unwrap();
-        assert_eq!((to.layer.as_str(), to.layer_rank), ("", 0), "target layer cleared too");
+        assert_eq!(
+            (to.layer.as_str(), to.layer_rank),
+            ("", 0),
+            "target layer cleared too"
+        );
     }
 
     #[tokio::test]
@@ -4976,7 +9074,10 @@ mod tests {
             .unwrap();
         let rels = read(&db, lib.id).await;
         assert_eq!(rels.len(), 1, "calibration on a placeholder persists");
-        assert_eq!((rels[0].to, rels[0].kind.as_str(), rels[0].source.as_str()), (api.id, "http", "user"));
+        assert_eq!(
+            (rels[0].to, rels[0].kind.as_str(), rels[0].source.as_str()),
+            (api.id, "http", "user")
+        );
     }
 
     #[tokio::test]
@@ -4993,8 +9094,14 @@ mod tests {
         assert_eq!(a, b, "the same curator thread is reused");
         let t = get_thread(&db, a).await.unwrap().unwrap();
         assert_eq!(t.kind, "curator");
-        assert_eq!(t.lead_tool, "codex", "uses the provided default tool, not hard-coded claude");
-        assert!(t.engine_pinned, "reusing a curator must preserve a user pin");
+        assert_eq!(
+            t.lead_tool, "codex",
+            "uses the provided default tool, not hard-coded claude"
+        );
+        assert!(
+            t.engine_pinned,
+            "reusing a curator must preserve a user pin"
+        );
         // a normal issue coexists; the board view filters curator out.
         create_thread(&db, ws.id, "Real issue", "feature", "claude")
             .await
@@ -5075,17 +9182,41 @@ mod tests {
         let t = create_thread(&db, ws.id, "issue", "feature", "claude")
             .await
             .unwrap();
-        upsert_test_plan(&db, t.id, "# doc\n- case\n", "lead").await.unwrap();
-        insert_lead_message(&db, t.id, None, 1, "assistant", "text", "{\"text\":\"hi\"}", "complete")
+        upsert_test_plan(&db, t.id, "# doc\n- case\n", "lead")
+            .await
+            .unwrap();
+        insert_lead_message(
+            &db,
+            t.id,
+            None,
+            1,
+            "assistant",
+            "text",
+            "{\"text\":\"hi\"}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let request = create_human_request(&db, ws.id, t.id, "lead", 0, 1, 0, 0, "keep history?")
+            .await
+            .unwrap();
+        answer_human_request(&db, ws.id, request.id, request.revision, "yes")
+            .await
+            .unwrap()
+            .unwrap();
+        mark_human_answers_delivered(&db, t.id, "lead", &[request.id])
             .await
             .unwrap();
         delete_thread_cascade(&db, t.id).await.unwrap();
         assert!(get_test_plan(&db, t.id).await.unwrap().is_none());
         assert!(list_lead_messages(&db, t.id).await.unwrap().is_empty());
         assert!(get_thread(&db, t.id).await.unwrap().is_none());
+        assert!(get_human_request(&db, request.id).await.unwrap().is_none());
         // The write fence: a late save/sentinel can't recreate an orphan row.
         assert!(
-            upsert_test_plan(&db, t.id, "# late\n- x\n", "user").await.is_err(),
+            upsert_test_plan(&db, t.id, "# late\n- x\n", "user")
+                .await
+                .is_err(),
             "upsert after deletion must be rejected"
         );
         assert!(get_test_plan(&db, t.id).await.unwrap().is_none());
@@ -5101,7 +9232,9 @@ mod tests {
             .await
             .unwrap();
         assert!(get_test_plan(&db, t.id).await.unwrap().is_none());
-        let first = upsert_test_plan(&db, t.id, "# v1\n- a\n", "lead").await.unwrap();
+        let first = upsert_test_plan(&db, t.id, "# v1\n- a\n", "lead")
+            .await
+            .unwrap();
         assert_eq!(first.source, "lead");
         let second = upsert_test_plan(&db, t.id, "# v2\n- a\n- b\n", "user")
             .await
@@ -5110,6 +9243,45 @@ mod tests {
         let read = get_test_plan(&db, t.id).await.unwrap().expect("doc exists");
         assert_eq!(read.content, "# v2\n- a\n- b\n");
         assert_eq!(read.source, "user");
+    }
+
+    #[tokio::test]
+    async fn test_plan_writes_preserve_existing_row_while_delete_marker_exists() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "test plan fence").await.unwrap();
+        let thread = create_thread(&db, ws.id, "existing", "feature", "claude")
+            .await
+            .unwrap();
+        let old = upsert_test_plan(&db, thread.id, "# P_old\n- old", "user")
+            .await
+            .unwrap();
+        mark_thread_deleting(&db, thread.id).await.unwrap();
+
+        assert!(upsert_test_plan(&db, thread.id, "# P_new\n- new", "lead")
+            .await
+            .is_err());
+        assert!(lead_upsert_test_plan(&db, thread.id, "# P_new\n- new", u64::MAX)
+            .await
+            .is_err());
+        clear_thread_deleting(&db, thread.id).await.unwrap();
+        assert_eq!(
+            get_test_plan(&db, thread.id).await.unwrap().unwrap(),
+            old,
+            "a failed delete fence must leave the complete pre-existing test plan intact"
+        );
+
+        let fresh = create_thread(&db, ws.id, "fresh", "feature", "claude")
+            .await
+            .unwrap();
+        mark_workspace_deleting(&db, ws.id).await.unwrap();
+        assert!(upsert_test_plan(&db, fresh.id, "# first", "user")
+            .await
+            .is_err());
+        assert!(lead_upsert_test_plan(&db, fresh.id, "# first", 0)
+            .await
+            .is_err());
+        assert!(get_test_plan(&db, fresh.id).await.unwrap().is_none());
+        clear_workspace_deleting(&db, ws.id).await.unwrap();
     }
 
     /// The lead-emit CAS lives in the SQL predicate itself: a user row saved at
@@ -5123,9 +9295,13 @@ mod tests {
             .await
             .unwrap();
         // No row yet → insert.
-        assert!(lead_upsert_test_plan(&db, t.id, "# v1\n- a\n", 5_000).await.unwrap());
+        assert!(lead_upsert_test_plan(&db, t.id, "# v1\n- a\n", 5_000)
+            .await
+            .unwrap());
         // Simulate a USER save stamped at t=10_000ms.
-        upsert_test_plan(&db, t.id, "# user\n- edited\n", "user").await.unwrap();
+        upsert_test_plan(&db, t.id, "# user\n- edited\n", "user")
+            .await
+            .unwrap();
         test_plan::Entity::update_many()
             .col_expr(test_plan::Column::UpdatedAt, Expr::value("10000"))
             .filter(test_plan::Column::ThreadId.eq(t.id))
@@ -5133,14 +9309,20 @@ mod tests {
             .await
             .unwrap();
         // A turn that started BEFORE the save (t=9_000) is stale → rejected.
-        assert!(!lead_upsert_test_plan(&db, t.id, "# stale\n- x\n", 9_000).await.unwrap());
+        assert!(!lead_upsert_test_plan(&db, t.id, "# stale\n- x\n", 9_000)
+            .await
+            .unwrap());
         let row = get_test_plan(&db, t.id).await.unwrap().unwrap();
         assert_eq!(row.content, "# user\n- edited\n");
         assert_eq!(row.source, "user");
         // Same-millisecond boundary: still the user's (>= is conservative).
-        assert!(!lead_upsert_test_plan(&db, t.id, "# stale\n- x\n", 10_000).await.unwrap());
+        assert!(!lead_upsert_test_plan(&db, t.id, "# stale\n- x\n", 10_000)
+            .await
+            .unwrap());
         // A turn that started AFTER the save (t=11_000) saw it as input → wins.
-        assert!(lead_upsert_test_plan(&db, t.id, "# revised\n- y\n", 11_000).await.unwrap());
+        assert!(lead_upsert_test_plan(&db, t.id, "# revised\n- y\n", 11_000)
+            .await
+            .unwrap());
         let row = get_test_plan(&db, t.id).await.unwrap().unwrap();
         assert_eq!(row.source, "lead");
         assert_eq!(row.content, "# revised\n- y\n");
@@ -5170,9 +9352,13 @@ mod tests {
         let d = create_direction(&db, t.id, "dir", "claude", r.id, "why", "plan+impl", "")
             .await
             .unwrap();
-        let s = create_session(&db, d.id, r.id, "claude", "/tmp/cwd").await.unwrap();
+        let s = create_session(&db, d.id, r.id, "claude", "/tmp/cwd")
+            .await
+            .unwrap();
         assert_eq!(s.meta, "");
-        save_session_meta(&db, s.id, r#"{"model":"gpt-5"}"#).await.unwrap();
+        save_session_meta(&db, s.id, r#"{"model":"gpt-5"}"#)
+            .await
+            .unwrap();
         let s2 = get_session(&db, s.id).await.unwrap().unwrap();
         assert_eq!(s2.meta, r#"{"model":"gpt-5"}"#);
         save_session_meta(&db, 9999, "{}").await.unwrap();
@@ -5181,11 +9367,13 @@ mod tests {
     #[tokio::test]
     async fn stale_streaming_messages_mark_interrupted_on_reopen() {
         let db = mem().await;
-        let t = live_thread(&db).await;
+        let (thread, session) = worker_session_fixture(&db).await;
+        let t = thread.id;
+        let session_id = session.id;
         let streaming = insert_lead_message(
             &db,
             t,
-            Some(9),
+            Some(session_id),
             1,
             "assistant",
             "text",
@@ -5197,7 +9385,7 @@ mod tests {
         let queued = insert_lead_message(
             &db,
             t,
-            Some(9),
+            Some(session_id),
             2,
             "user",
             "text",
@@ -5207,7 +9395,7 @@ mod tests {
         .await
         .unwrap();
 
-        mark_incomplete_turns_interrupted(&db, t, Some(9))
+        mark_incomplete_turns_interrupted(&db, t, Some(session_id))
             .await
             .unwrap();
 
@@ -5287,7 +9475,8 @@ mod tests {
     #[tokio::test]
     async fn queued_status_updates_are_session_scoped() {
         let db = mem().await;
-        let t = live_thread(&db).await;
+        let (thread, session) = worker_session_fixture(&db).await;
+        let t = thread.id;
         let lead = insert_lead_message(
             &db,
             t,
@@ -5303,7 +9492,7 @@ mod tests {
         let worker = insert_lead_message(
             &db,
             t,
-            Some(3),
+            Some(session.id),
             1,
             "user",
             "text",
@@ -5313,7 +9502,7 @@ mod tests {
         .await
         .unwrap();
 
-        let completed = complete_queued(&db, t, Some(3)).await.unwrap().unwrap();
+        let completed = complete_queued(&db, t, Some(session.id)).await.unwrap().unwrap();
         assert_eq!(completed.id, worker.id);
         let failed = set_queued_status(&db, t, None, "interrupted")
             .await
@@ -5337,11 +9526,12 @@ mod tests {
     #[tokio::test]
     async fn lead_message_anchor_roundtrip() {
         let db = mem().await;
-        let t = live_thread(&db).await;
+        let (thread, session) = worker_session_fixture(&db).await;
+        let t = thread.id;
         let m = insert_lead_message(
             &db,
             t,
-            Some(7),
+            Some(session.id),
             1,
             "user",
             "text",
@@ -5359,34 +9549,63 @@ mod tests {
     #[tokio::test]
     async fn truncate_lead_messages_scoped_to_thread_and_session() {
         let db = mem().await;
-        let t = live_thread(&db).await;
+        let (thread, session) = worker_session_fixture(&db).await;
+        let t = thread.id;
+        let other_session = {
+            let direction = get_direction(&db, session.direction_id).await.unwrap().unwrap();
+            create_session(&db, direction.id, session.repo_id, "codex", "/tmp/other-session")
+                .await
+                .unwrap()
+        };
         // Target session: one row before the cut, then the cut row itself, a
         // later assistant row, and a queued row (the abandoned future).
-        let keep = insert_lead_message(&db, t, Some(7), 1, "user", "text", "{}", "complete")
+        let keep = insert_lead_message(&db, t, Some(session.id), 1, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        let cut = insert_lead_message(&db, t, Some(7), 2, "user", "text", "{}", "complete")
+        let cut = insert_lead_message(&db, t, Some(session.id), 2, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        let after = insert_lead_message(&db, t, Some(7), 2, "assistant", "text", "{}", "complete")
+        let after = insert_lead_message(
+            &db,
+            t,
+            Some(session.id),
+            2,
+            "assistant",
+            "text",
+            "{}",
+            "complete",
+        )
             .await
             .unwrap();
-        let queued = insert_lead_message(&db, t, Some(7), 3, "user", "text", "{}", "queued")
+        let queued = insert_lead_message(&db, t, Some(session.id), 3, "user", "text", "{}", "queued")
             .await
             .unwrap();
         // Same thread, other session + lead rows (higher ids) must survive.
-        let other = insert_lead_message(&db, t, Some(8), 1, "user", "text", "{}", "complete")
+        let other = insert_lead_message(
+            &db,
+            t,
+            Some(other_session.id),
+            1,
+            "user",
+            "text",
+            "{}",
+            "complete",
+        )
             .await
             .unwrap();
         let lead = insert_lead_message(&db, t, None, 1, "user", "text", "{}", "complete")
             .await
             .unwrap();
 
-        let deleted = truncate_lead_messages(&db.0, t, Some(7), cut.id)
+        let deleted = truncate_lead_messages(&db.0, t, Some(session.id), cut.id)
             .await
             .unwrap();
         assert_eq!(deleted.len(), 3);
-        assert!(deleted.contains(&cut.id) && deleted.contains(&after.id) && deleted.contains(&queued.id));
+        assert!(
+            deleted.contains(&cut.id)
+                && deleted.contains(&after.id)
+                && deleted.contains(&queued.id)
+        );
 
         let remaining: Vec<i32> = list_lead_messages(&db, t)
             .await
@@ -5409,31 +9628,35 @@ mod tests {
     #[tokio::test]
     async fn truncate_lead_messages_follows_delivery_order() {
         let db = mem().await;
-        let t = live_thread(&db).await;
+        let (thread, session) = worker_session_fixture(&db).await;
+        let t = thread.id;
         // Production shape: turn 1 completes; b and a queue behind it; the
         // queue delivers a FIRST (a.seq < b.seq), then b. Reply rows are
         // inserted as their turns run, so b (queued first) holds a smaller id
         // than a yet displays after a's whole exchange.
-        let first = insert_lead_message(&db, t, Some(7), 1, "user", "text", "{}", "complete")
+        let first = insert_lead_message(&db, t, Some(session.id), 1, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        let first_reply = insert_lead_message(&db, t, Some(7), 1, "assistant", "text", "{}", "complete")
+        let first_reply =
+            insert_lead_message(&db, t, Some(session.id), 1, "assistant", "text", "{}", "complete")
+                .await
+                .unwrap();
+        let b = insert_lead_message(&db, t, Some(session.id), 2, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        let b = insert_lead_message(&db, t, Some(7), 2, "user", "text", "{}", "complete")
-            .await
-            .unwrap();
-        let a = insert_lead_message(&db, t, Some(7), 3, "user", "text", "{}", "complete")
+        let a = insert_lead_message(&db, t, Some(session.id), 3, "user", "text", "{}", "complete")
             .await
             .unwrap();
         assign_delivery_seq(&db, t, a.id).await.unwrap(); // a dequeued first
-        let a_reply = insert_lead_message(&db, t, Some(7), 3, "assistant", "text", "{}", "complete")
-            .await
-            .unwrap();
+        let a_reply =
+            insert_lead_message(&db, t, Some(session.id), 3, "assistant", "text", "{}", "complete")
+                .await
+                .unwrap();
         assign_delivery_seq(&db, t, b.id).await.unwrap(); // b dequeued second
-        let b_reply = insert_lead_message(&db, t, Some(7), 2, "assistant", "text", "{}", "complete")
-            .await
-            .unwrap();
+        let b_reply =
+            insert_lead_message(&db, t, Some(session.id), 2, "assistant", "text", "{}", "complete")
+                .await
+                .unwrap();
 
         // Sanity: delivery order is first, first_reply, a, a_reply, b, b_reply
         // — with b.id < a.id despite b displaying later.
@@ -5451,7 +9674,7 @@ mod tests {
 
         // Rewind to before b: only b and b_reply may go — an id-based cut
         // (id >= b.id) would also kill a and a_reply.
-        let deleted = truncate_lead_messages(&db.0, t, Some(7), b.id)
+        let deleted = truncate_lead_messages(&db.0, t, Some(session.id), b.id)
             .await
             .unwrap();
         assert_eq!(deleted, vec![b.id, b_reply.id]);
@@ -5469,43 +9692,231 @@ mod tests {
     #[tokio::test]
     async fn rewind_persist_is_atomic_and_complete() {
         let db = mem().await;
-        let (_ws, r, _t, d) = worker_fixture(&db).await;
+        let (ws, r, _t, d) = worker_fixture(&db).await;
         let s = create_session(&db, d.id, r.id, "claude", "/tmp/cwd")
             .await
             .unwrap();
+        let worktree = record_worktree(
+            &db,
+            r.id,
+            d.id,
+            "feature/rewind-persist",
+            "/tmp/cwd",
+            true,
+            true,
+            "base",
+        )
+        .await
+        .unwrap();
         set_session_native_id_opt(&db, s.id, Some("old-native"))
             .await
             .unwrap();
         let t = d.thread_id;
+        let m0 = insert_lead_message(&db, t, Some(s.id), 0, "user", "text", "{}", "complete")
+            .await
+            .unwrap();
         let m1 = insert_lead_message(&db, t, Some(s.id), 1, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        insert_lead_message(&db, t, Some(s.id), 2, "user", "text", "{}", "complete")
+        let m2 = insert_lead_message(&db, t, Some(s.id), 2, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        insert_code_checkpoint(&db, 11, s.id, m1.id, 1, "sha-1", "head-1", "[]", "idx-1")
-            .await
-            .unwrap();
+        let kept_request = create_human_request(
+            &db,
+            ws.id,
+            t,
+            &d.id.to_string(),
+            d.id,
+            m0.turn_id,
+            m0.id,
+            s.id,
+            "kept question",
+        )
+        .await
+        .unwrap();
+        let cancelled_open = create_human_request(
+            &db,
+            ws.id,
+            t,
+            &d.id.to_string(),
+            d.id,
+            m1.turn_id,
+            m1.id,
+            s.id,
+            "abandoned open question",
+        )
+        .await
+        .unwrap();
+        let cancelled_answered = create_human_request(
+            &db,
+            ws.id,
+            t,
+            &d.id.to_string(),
+            d.id,
+            m2.turn_id,
+            m2.id,
+            s.id,
+            "abandoned answered question",
+        )
+        .await
+        .unwrap();
+        let cancelled_resolved = create_human_request(
+            &db,
+            ws.id,
+            t,
+            &d.id.to_string(),
+            d.id,
+            m2.turn_id,
+            m2.id,
+            s.id,
+            "abandoned delivered question",
+        )
+        .await
+        .unwrap();
+        answer_human_request(
+            &db,
+            ws.id,
+            cancelled_answered.id,
+            cancelled_answered.revision,
+            "answer",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        answer_human_request(
+            &db,
+            ws.id,
+            cancelled_resolved.id,
+            cancelled_resolved.revision,
+            "delivered answer",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mark_human_answers_delivered(&db, t, &d.id.to_string(), &[cancelled_resolved.id],)
+                .await
+                .unwrap(),
+            1
+        );
+        let resolved_trail = serde_json::json!({
+            "variant": "ask",
+            "request_id": cancelled_resolved.id,
+            "text": cancelled_resolved.question,
+            "answer": "delivered answer",
+        })
+        .to_string();
+        assert!(insert_human_answer_trail(
+            &db,
+            t,
+            cancelled_resolved.id,
+            Some(s.id),
+            &resolved_trail,
+        )
+        .await
+        .unwrap()
+        .is_some());
+        insert_code_checkpoint(
+            &db,
+            worktree.id,
+            s.id,
+            m1.id,
+            1,
+            "sha-1",
+            "head-1",
+            "[]",
+            "idx-1",
+        )
+        .await
+        .unwrap();
         // A checkpoint for the KEPT turn must survive the sweep.
-        insert_code_checkpoint(&db, 11, s.id, 999, 1, "sha-0", "head-0", "[]", "")
-            .await
-            .unwrap();
+        insert_code_checkpoint(
+            &db,
+            worktree.id,
+            s.id,
+            m0.id,
+            m0.turn_id,
+            "sha-0",
+            "head-0",
+            "[]",
+            "",
+        )
+        .await
+        .unwrap();
 
-        let deleted = rewind_persist(&db, t, Some(s.id), m1.id, Some(11), Some("new-native"))
-            .await
-            .unwrap();
-        assert_eq!(deleted.len(), 2, "both timeline rows deleted");
-        assert!(list_lead_messages(&db, t).await.unwrap().is_empty());
+        let (deleted, cancelled_requests) = rewind_persist(
+            &db,
+            t,
+            Some(s.id),
+            m1.id,
+            Some(worktree.id),
+            Some("new-native"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            deleted.len(),
+            3,
+            "future timeline rows and answer trail deleted"
+        );
+        assert_eq!(
+            std::collections::HashSet::<i32>::from_iter(cancelled_requests),
+            std::collections::HashSet::from([
+                cancelled_open.id,
+                cancelled_answered.id,
+                cancelled_resolved.id,
+            ])
+        );
+        assert_eq!(
+            get_human_request(&db, kept_request.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            HUMAN_REQUEST_OPEN
+        );
+        for request_id in [
+            cancelled_open.id,
+            cancelled_answered.id,
+            cancelled_resolved.id,
+        ] {
+            assert_eq!(
+                get_human_request(&db, request_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                HUMAN_REQUEST_CANCELLED
+            );
+        }
+        assert_eq!(list_lead_messages(&db, t).await.unwrap(), vec![m0.clone()]);
         assert!(
-            code_checkpoint_for(&db, 11, m1.id).await.unwrap().is_none(),
+            insert_human_answer_trail(&db, t, cancelled_resolved.id, Some(s.id), &resolved_trail,)
+                .await
+                .unwrap()
+                .is_none(),
+            "a late queued answer event cannot resurrect rewound trail"
+        );
+        assert!(
+            code_checkpoint_for(&db, worktree.id, m1.id)
+                .await
+                .unwrap()
+                .is_none(),
             "abandoned turn's checkpoint swept"
         );
         assert!(
-            code_checkpoint_for(&db, 11, 999).await.unwrap().is_some(),
+            code_checkpoint_for(&db, worktree.id, m0.id)
+                .await
+                .unwrap()
+                .is_some(),
             "unrelated checkpoint kept"
         );
         assert_eq!(
-            get_session(&db, s.id).await.unwrap().unwrap().native_session_id,
+            get_session(&db, s.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id,
             Some("new-native".to_string())
         );
     }
@@ -5521,12 +9932,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            get_session(&db, s.id).await.unwrap().unwrap().native_session_id,
+            get_session(&db, s.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id,
             Some("native-1".to_string())
         );
         set_session_native_id_opt(&db, s.id, None).await.unwrap();
         assert_eq!(
-            get_session(&db, s.id).await.unwrap().unwrap().native_session_id,
+            get_session(&db, s.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id,
             None
         );
     }
@@ -5568,7 +9987,9 @@ mod tests {
             .await
             .unwrap()
             .id;
-        set_lead_native_id_opt(&db, t2, Some("nat-x")).await.unwrap();
+        set_lead_native_id_opt(&db, t2, Some("nat-x"))
+            .await
+            .unwrap();
         assert_eq!(list_lead_messages(&db, t2).await.unwrap().len(), 1);
         set_lead_native_id_opt(&db, t2, None).await.unwrap();
         assert!(
@@ -5580,39 +10001,159 @@ mod tests {
     #[tokio::test]
     async fn code_checkpoint_insert_lookup_truncate() {
         let db = mem().await;
-        // Rows need no live worktree/session (no FKs), so plain literals do.
-        let c1 = insert_code_checkpoint(&db, 11, 7, 100, 1, "sha-1", "head-1", "[\"gen\"]", "idx-1")
+        let (_, repo, thread, direction) = worker_fixture(&db).await;
+        let session = create_session(&db, direction.id, repo.id, "codex", "/tmp/checkpoint")
             .await
             .unwrap();
-        insert_code_checkpoint(&db, 11, 7, 200, 2, "sha-2", "head-2", "[]", "")
+        let worktree = record_worktree(
+            &db,
+            repo.id,
+            direction.id,
+            "checkpoint",
+            "/tmp/checkpoint-wt",
+            true,
+            true,
+            "",
+        )
+        .await
+        .unwrap();
+        let first_message = insert_lead_message(
+            &db,
+            thread.id,
+            Some(session.id),
+            1,
+            "user",
+            "text",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let second_message = insert_lead_message(
+            &db,
+            thread.id,
+            Some(session.id),
+            2,
+            "user",
+            "text",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let other_session = create_session(&db, direction.id, repo.id, "codex", "/tmp/checkpoint-other")
             .await
             .unwrap();
-        insert_code_checkpoint(&db, 22, 8, 100, 1, "sha-other", "head-other", "[]", "")
-            .await
-            .unwrap();
+        let other_worktree = record_worktree(
+            &db,
+            repo.id,
+            direction.id,
+            "checkpoint-other",
+            "/tmp/checkpoint-other-wt",
+            true,
+            true,
+            "",
+        )
+        .await
+        .unwrap();
+        let other_message = insert_lead_message(
+            &db,
+            thread.id,
+            Some(other_session.id),
+            1,
+            "user",
+            "text",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
 
-        let found = code_checkpoint_for(&db, 11, 100).await.unwrap().unwrap();
+        let c1 = insert_code_checkpoint(
+            &db,
+            worktree.id,
+            session.id,
+            first_message.id,
+            first_message.turn_id,
+            "sha-1",
+            "head-1",
+            "[\"gen\"]",
+            "idx-1",
+        )
+        .await
+        .unwrap();
+        insert_code_checkpoint(
+            &db,
+            worktree.id,
+            session.id,
+            second_message.id,
+            second_message.turn_id,
+            "sha-2",
+            "head-2",
+            "[]",
+            "",
+        )
+        .await
+        .unwrap();
+        insert_code_checkpoint(
+            &db,
+            other_worktree.id,
+            other_session.id,
+            other_message.id,
+            other_message.turn_id,
+            "sha-other",
+            "head-other",
+            "[]",
+            "",
+        )
+        .await
+        .unwrap();
+
+        let found = code_checkpoint_for(&db, worktree.id, first_message.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.id, c1.id);
         assert_eq!(found.shadow_sha, "sha-1");
         assert_eq!(found.head_sha, "head-1");
         assert_eq!(found.nested_repos, "[\"gen\"]");
-        assert_eq!(found.session_id, 7);
+        assert_eq!(found.session_id, session.id);
         assert_eq!(found.turn_id, 1);
-        assert!(code_checkpoint_for(&db, 11, 999).await.unwrap().is_none());
+        assert!(code_checkpoint_for(&db, worktree.id, 999)
+            .await
+            .unwrap()
+            .is_none());
 
         // Truncate drops the checkpoints keyed by the deleted timeline rows of
         // THIS worktree only.
-        let deleted = truncate_code_checkpoints(&db.0, 11, &[100, 200]).await.unwrap();
+        let deleted = truncate_code_checkpoints(
+            &db.0,
+            worktree.id,
+            &[first_message.id, second_message.id],
+        )
+            .await
+            .unwrap();
         assert_eq!(deleted, 2);
-        assert!(code_checkpoint_for(&db, 11, 100).await.unwrap().is_none());
+        assert!(code_checkpoint_for(&db, worktree.id, first_message.id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(
-            code_checkpoint_for(&db, 22, 100).await.unwrap().is_some(),
+            code_checkpoint_for(&db, other_worktree.id, other_message.id)
+                .await
+                .unwrap()
+                .is_some(),
             "other worktree untouched"
         );
 
-        let deleted = delete_code_checkpoints_for_worktree(&db, 22).await.unwrap();
+        let deleted = delete_code_checkpoints_for_worktree(&db, other_worktree.id)
+            .await
+            .unwrap();
         assert_eq!(deleted, 1);
-        assert!(code_checkpoint_for(&db, 22, 100).await.unwrap().is_none());
+        assert!(code_checkpoint_for(&db, other_worktree.id, other_message.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -5713,6 +10254,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn im_route_update_preserves_existing_row_while_delete_marker_exists() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "im route fence").await.unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        let old = bind_im_route(&db, thread.id, "feishu", "chat_old", "thread_old")
+            .await
+            .unwrap();
+        mark_thread_deleting(&db, thread.id).await.unwrap();
+
+        assert!(bind_im_route(&db, thread.id, "feishu", "chat_new", "thread_new")
+            .await
+            .is_err());
+        clear_thread_deleting(&db, thread.id).await.unwrap();
+        assert_eq!(
+            im_route_of_thread(&db, thread.id).await.unwrap().unwrap(),
+            old,
+            "a failed delete fence must leave the complete pre-existing IM route intact"
+        );
+    }
+
+    #[tokio::test]
     async fn im_route_thread_ref_is_unique_across_issues() {
         // Same (channel, chat_id, im_thread_ref) cannot bind to two different issues.
         let db = mem().await;
@@ -5758,9 +10322,18 @@ mod tests {
         assert_eq!(dir.reason, "build the feature");
 
         // pretend it was materialized
-        record_worktree(&db, repo.id, dir.id, &dir.branch, "/tmp/wt", false, true, "")
-            .await
-            .unwrap();
+        record_worktree(
+            &db,
+            repo.id,
+            dir.id,
+            &dir.branch,
+            "/tmp/wt",
+            false,
+            true,
+            "",
+        )
+        .await
+        .unwrap();
         assert_eq!(list_worktrees(&db, Some(dir.id)).await.unwrap().len(), 1);
         let wt_id = list_worktrees(&db, Some(dir.id)).await.unwrap()[0].id;
         assert!(direction_repo_of(&db, dir.id).await.unwrap().is_some());
@@ -5769,18 +10342,54 @@ mod tests {
         let removed = delete_thread_cascade(&db, t.id).await.unwrap();
         assert_eq!(
             removed,
-            vec![(
-                wt_id,
-                repo.id,
-                "/tmp/wt".to_string(),
-                "feature/add-login".to_string(),
-                false,
-                true
-            )]
+            vec![RemovedWorktree {
+                worktree_id: wt_id,
+                repo_id: repo.id,
+                repo_local_git_path: "/tmp/x".to_string(),
+                worktree_path: "/tmp/wt".to_string(),
+                branch: "feature/add-login".to_string(),
+                created_branch: false,
+                created_checkout: true,
+            }]
         );
         assert_eq!(list_workspaces(&db).await.unwrap().len(), 1); // ws survives
         assert_eq!(list_threads(&db, ws.id).await.unwrap().len(), 0);
         assert_eq!(list_worktrees(&db, None).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_direction_removes_durable_question_history() {
+        let db = mem().await;
+        let (ws, _repo, _thread, direction) = worker_fixture(&db).await;
+        let request = create_human_request(
+            &db,
+            ws.id,
+            direction.thread_id,
+            &direction.id.to_string(),
+            direction.id,
+            0,
+            0,
+            0,
+            "retain this worker?",
+        )
+        .await
+        .unwrap();
+        answer_human_request(&db, ws.id, request.id, request.revision, "no")
+            .await
+            .unwrap()
+            .unwrap();
+        mark_human_answers_delivered(
+            &db,
+            direction.thread_id,
+            &direction.id.to_string(),
+            &[request.id],
+        )
+        .await
+        .unwrap();
+
+        delete_direction(&db, direction.id).await.unwrap();
+
+        assert!(get_human_request(&db, request.id).await.unwrap().is_none());
     }
 
     /// issue #110 T3 review: a tracked PR/MR row has no FK to the thread that
@@ -5791,14 +10400,28 @@ mod tests {
     async fn delete_thread_cascade_removes_tracked_pull_requests() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let t = create_thread(&db, ws.id, "T", "feature", "claude").await.unwrap();
-        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true).await.unwrap();
+        let t = create_thread(&db, ws.id, "T", "feature", "claude")
+            .await
+            .unwrap();
+        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true)
+            .await
+            .unwrap();
         let dir = create_direction(&db, t.id, "d", "claude", repo.id, "reason", "plan+impl", "")
             .await
             .unwrap();
         let pr = register_pull_request(
-            &db, t.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 5,
-            "https://github.com/acme/widgets/pull/5", "fix bug",
+            &db,
+            t.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            5,
+            "https://github.com/acme/widgets/pull/5",
+            "fix bug",
         )
         .await
         .unwrap();
@@ -5889,26 +10512,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_plan_rolls_back_when_delete_marker_appears_after_insert() {
-        use sea_orm::ConnectionTrait;
-
+    async fn upsert_plan_rejects_first_insert_while_delete_marker_exists() {
         let db = mem().await;
         let ws = create_workspace(&db, "delete me").await.unwrap();
         let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
             .await
             .unwrap();
-        db.0
-            .execute(sea_orm::Statement::from_string(
-                db.0.get_database_backend(),
-                format!(
-                    "CREATE TRIGGER plan_mark_deleting AFTER INSERT ON plan BEGIN \
-                     INSERT OR REPLACE INTO app_setting(key, value) \
-                     VALUES ('{}', '1'); END",
-                    workspace_deleting_key(ws.id)
-                ),
-            ))
-            .await
-            .unwrap();
+        mark_thread_deleting(&db, thread.id).await.unwrap();
 
         let err = upsert_plan(&db, thread.id, "{}", "proposed", "1")
             .await
@@ -5916,31 +10526,18 @@ mod tests {
 
         assert!(err
             .to_string()
-            .contains(&format!("workspace {} is being deleted", ws.id)));
+            .contains(&format!("thread {} is being deleted", thread.id)));
         assert!(get_plan(&db, thread.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn bind_im_route_rolls_back_when_delete_marker_appears_after_insert() {
-        use sea_orm::ConnectionTrait;
-
+    async fn bind_im_route_rejects_first_insert_while_delete_marker_exists() {
         let db = mem().await;
         let ws = create_workspace(&db, "delete me").await.unwrap();
         let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
             .await
             .unwrap();
-        db.0
-            .execute(sea_orm::Statement::from_string(
-                db.0.get_database_backend(),
-                format!(
-                    "CREATE TRIGGER im_route_mark_deleting AFTER INSERT ON im_route BEGIN \
-                     INSERT OR REPLACE INTO app_setting(key, value) \
-                     VALUES ('{}', '1'); END",
-                    workspace_deleting_key(ws.id)
-                ),
-            ))
-            .await
-            .unwrap();
+        mark_workspace_deleting(&db, ws.id).await.unwrap();
 
         let err = bind_im_route(&db, thread.id, "feishu", "chat", "thread")
             .await
@@ -5953,7 +10550,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_workspace_cascade_snapshots_an_external_repo_worktree_path() {
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let db = mem().await;
+        let deleted_ws = create_workspace(&db, "delete workspace").await.unwrap();
+        let keep_ws = create_workspace(&db, "keep workspace").await.unwrap();
+        let deleted_repo =
+            add_repo_ref(&db, deleted_ws.id, "local", "/tmp/local", "main", "", true)
+                .await
+                .unwrap();
+        let external_repo =
+            add_repo_ref(&db, keep_ws.id, "external", "/tmp/external", "main", "", true)
+                .await
+                .unwrap();
+        let thread = create_thread(&db, deleted_ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "external task",
+            "codex",
+            deleted_repo.id,
+            "reason",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        // Simulate a legacy/inconsistent row whose direction is in the deleted
+        // workspace but whose checkout belongs to a repo that must survive it.
+        let worktree = worktree::ActiveModel {
+            repo_id: Set(external_repo.id),
+            direction_id: Set(direction.id),
+            branch: Set("feature/external".to_string()),
+            path: Set("/tmp/external-wt".to_string()),
+            created_at: Set(now()),
+            created_branch: Set(true),
+            created_checkout: Set(true),
+            base_commit: Set(String::new()),
+            ..Default::default()
+        }
+        .insert(&db.0)
+        .await
+        .unwrap();
+
+        let effects = delete_workspace_cascade_with_human_cancellations(&db, deleted_ws.id)
+            .await
+            .unwrap();
+
+        assert_eq!(effects.removed_worktrees.len(), 1);
+        let removed = &effects.removed_worktrees[0];
+        assert_eq!(removed.worktree_id, worktree.id);
+        assert_eq!(removed.repo_id, external_repo.id);
+        assert_eq!(removed.repo_local_git_path, "/tmp/external");
+        assert_eq!(removed.worktree_path, "/tmp/external-wt");
+        assert!(get_repo(&db, external_repo.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn delete_workspace_cascade_removes_workspace_owned_state() {
+        use sea_orm::{ActiveModelTrait, Set};
+
         let db = mem().await;
         let ws = create_workspace(&db, "delete me").await.unwrap();
         let keep_ws = create_workspace(&db, "keep me").await.unwrap();
@@ -5993,22 +10652,39 @@ mod tests {
         )
         .await
         .unwrap();
-        let external_direction = create_direction(
-            &db,
-            keep_thread.id,
-            "external repo task",
-            "claude",
-            repo.id,
-            "change deleted repo",
-            "impl-only",
-            "",
-        )
+        // Preserve the legacy cross-workspace corruption this cascade test is
+        // meant to clean up without weakening today's constructor invariant.
+        let external_direction = direction::ActiveModel {
+            thread_id: Set(keep_thread.id),
+            name: Set("external repo task".to_string()),
+            slug: Set("external-repo-task".to_string()),
+            tool: Set("claude".to_string()),
+            branch: Set("feature/external-repo-task".to_string()),
+            status: Set("queued".to_string()),
+            repo_id: Set(repo.id),
+            reason: Set("change deleted repo".to_string()),
+            engine_pinned: Set(true),
+            mandate: Set("impl-only".to_string()),
+            created_at: Set(now()),
+            ..Default::default()
+        }
+        .insert(&db.0)
         .await
         .unwrap();
-        let external_session =
-            create_session(&db, external_direction.id, repo.id, "claude", "/tmp/external-wt")
-                .await
-                .unwrap();
+        let external_session = session::ActiveModel {
+            direction_id: Set(external_direction.id),
+            repo_id: Set(repo.id),
+            tool: Set("claude".to_string()),
+            engine_pinned: Set(true),
+            cwd: Set("/tmp/external-wt".to_string()),
+            native_session_id: Set(None),
+            status: Set("starting".to_string()),
+            created_at: Set(now()),
+            ..Default::default()
+        }
+        .insert(&db.0)
+        .await
+        .unwrap();
         upsert_plan(&db, thread.id, "{}", "proposed", "1")
             .await
             .unwrap();
@@ -6069,14 +10745,15 @@ mod tests {
 
         assert_eq!(
             removed,
-            vec![(
-                wt_id,
-                repo.id,
-                "/tmp/delete-wt".to_string(),
-                "feature/remove".to_string(),
-                true,
-                true,
-            )]
+            vec![RemovedWorktree {
+                worktree_id: wt_id,
+                repo_id: repo.id,
+                repo_local_git_path: "/tmp/delete-web".to_string(),
+                worktree_path: "/tmp/delete-wt".to_string(),
+                branch: "feature/remove".to_string(),
+                created_branch: true,
+                created_checkout: true,
+            }]
         );
         assert_eq!(list_workspaces(&db).await.unwrap(), vec![keep_ws.clone()]);
         assert_eq!(list_repos(&db, keep_ws.id).await.unwrap(), vec![keep_repo]);
@@ -6108,6 +10785,247 @@ mod tests {
         assert_eq!(scopes, vec![format!("ws:{}", keep_ws.id)]);
     }
 
+    /// Legacy cross-workspace outbox rows on a surviving external thread are
+    /// retained until an engine receipt, while non-pending rows are cleaned by
+    /// exact execution identity.
+    #[tokio::test]
+    async fn delete_workspace_preserves_external_pending_hidden_deliveries() {
+        let db = mem().await;
+        let deleted_ws = create_workspace(&db, "delete hidden workspace").await.unwrap();
+        let external_ws = create_workspace(&db, "external hidden workspace").await.unwrap();
+        let deleted_repo = add_repo_ref(
+            &db,
+            deleted_ws.id,
+            "deleted-repo",
+            "/tmp/deleted-hidden-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let external_repo = add_repo_ref(
+            &db,
+            external_ws.id,
+            "external-repo",
+            "/tmp/external-hidden-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let removed_thread = create_thread(&db, deleted_ws.id, "removed", "feature", "codex")
+            .await
+            .unwrap();
+        let external_thread = create_thread(&db, external_ws.id, "external", "feature", "codex")
+            .await
+            .unwrap();
+        direction::ActiveModel {
+            thread_id: Set(external_thread.id),
+            name: Set("legacy deleted repo direction".to_string()),
+            slug: Set("legacy-deleted-repo-direction".to_string()),
+            tool: Set("codex".to_string()),
+            branch: Set("feature/legacy-deleted-repo".to_string()),
+            status: Set("queued".to_string()),
+            repo_id: Set(deleted_repo.id),
+            reason: Set("legacy cross-workspace".to_string()),
+            engine_pinned: Set(true),
+            mandate: Set("impl-only".to_string()),
+            created_at: Set(now()),
+            ..Default::default()
+        }
+        .insert(&db.0)
+        .await
+        .unwrap();
+
+        let plan_message = insert_lead_message(
+            &db,
+            external_thread.id,
+            None,
+            1,
+            "assistant",
+            "plan_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let plan_hidden = enqueue_lead_hidden_delivery(
+            &db,
+            external_thread.id,
+            "plan_decision",
+            plan_message.id,
+            &format!("plan_decision:{}", plan_message.id),
+            &serde_json::json!({
+                "tool": "plan_decision",
+                "message_id": plan_message.id,
+                "status": "approved"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let external_message = insert_lead_message(
+            &db,
+            external_thread.id,
+            None,
+            2,
+            "assistant",
+            "action_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let external_execution = insert_test_repo_action_execution(
+            &db,
+            9001,
+            external_ws.id,
+            external_thread.id,
+            external_message.id,
+            &external_repo,
+            "external-action",
+            REPO_ACTION_FEEDBACK_PENDING,
+        )
+        .await;
+        let external_hidden =
+            enqueue_repo_action_feedback_from_journal(&db, external_execution.id)
+                .await
+                .unwrap()
+                .unwrap();
+
+        let related_message = insert_lead_message(
+            &db,
+            external_thread.id,
+            None,
+            3,
+            "assistant",
+            "action_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let related_execution = insert_test_repo_action_execution(
+            &db,
+            9002,
+            deleted_ws.id,
+            external_thread.id,
+            related_message.id,
+            &deleted_repo,
+            "related-action",
+            REPO_ACTION_FEEDBACK_PENDING,
+        )
+        .await;
+        let related_hidden =
+            enqueue_repo_action_feedback_from_journal(&db, related_execution.id)
+                .await
+                .unwrap()
+                .unwrap();
+
+        let delivered_message = insert_lead_message(
+            &db,
+            external_thread.id,
+            None,
+            4,
+            "assistant",
+            "action_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let delivered_execution = insert_test_repo_action_execution(
+            &db,
+            9003,
+            deleted_ws.id,
+            external_thread.id,
+            delivered_message.id,
+            &deleted_repo,
+            "delivered-action",
+            REPO_ACTION_FEEDBACK_DELIVERED,
+        )
+        .await;
+        let delivered_hidden = enqueue_lead_hidden_delivery(
+            &db,
+            external_thread.id,
+            "repo_action",
+            delivered_execution.id,
+            &format!("repo_action:{}", delivered_execution.id),
+            &delivered_execution.feedback_payload,
+        )
+        .await
+        .unwrap();
+
+        delete_workspace_cascade_with_human_cancellations(&db, deleted_ws.id)
+            .await
+            .unwrap();
+
+        assert!(get_thread(&db, removed_thread.id).await.unwrap().is_none());
+        assert!(get_thread(&db, external_thread.id).await.unwrap().is_some());
+        assert!(get_repo(&db, deleted_repo.id).await.unwrap().is_none());
+        assert!(get_repo(&db, external_repo.id).await.unwrap().is_some());
+        assert_eq!(
+            get_lead_hidden_delivery(&db, plan_hidden.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            LEAD_HIDDEN_DELIVERY_PENDING
+        );
+        assert_eq!(
+            get_lead_hidden_delivery(&db, external_hidden.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            LEAD_HIDDEN_DELIVERY_PENDING
+        );
+        assert!(get_repo_action_execution_by_id(&db, external_execution.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            get_repo_action_execution_by_id(&db, related_execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .feedback_state,
+            REPO_ACTION_FEEDBACK_PENDING
+        );
+        assert!(get_lead_hidden_delivery(&db, related_hidden.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_repo_action_execution_by_id(&db, delivered_execution.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(get_lead_hidden_delivery(&db, delivered_hidden.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        assert!(consume_lead_hidden_delivery(&db, related_hidden.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_repo_action_execution_by_id(&db, related_execution.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            get_lead_hidden_delivery(&db, related_hidden.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            LEAD_HIDDEN_DELIVERY_CONSUMED
+        );
+    }
+
     /// issue #110 T3 review: same fix as `delete_thread_cascade_removes_
     /// tracked_pull_requests`, for a whole-workspace delete.
     #[tokio::test]
@@ -6120,12 +11038,31 @@ mod tests {
         let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
             .await
             .unwrap();
-        let dir = create_direction(&db, thread.id, "d", "claude", repo.id, "reason", "plan+impl", "")
-            .await
-            .unwrap();
+        let dir = create_direction(
+            &db,
+            thread.id,
+            "d",
+            "claude",
+            repo.id,
+            "reason",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
         let pr = register_pull_request(
-            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 7,
-            "https://github.com/acme/widgets/pull/7", "fix bug",
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            7,
+            "https://github.com/acme/widgets/pull/7",
+            "fix bug",
         )
         .await
         .unwrap();
@@ -6160,8 +11097,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let keep_ws = create_workspace(&db, "keep me").await.unwrap();
-        let keep_thread = create_thread(&db, keep_ws.id, "keep issue", "feature", "claude")
+        let keep_thread = create_thread(&db, ws.id, "keep issue", "feature", "claude")
             .await
             .unwrap();
         let external_direction = create_direction(
@@ -6213,7 +11149,7 @@ mod tests {
         .unwrap_err();
         assert!(deleting_direction_err
             .to_string()
-            .contains(&format!("workspace {} is being deleted", ws.id)));
+            .contains("direction_write_fenced_or_stale"));
 
         let deleting_repo_direction_err = create_direction(
             &db,
@@ -6229,7 +11165,7 @@ mod tests {
         .unwrap_err();
         assert!(deleting_repo_direction_err
             .to_string()
-            .contains(&format!("workspace {} is being deleted", ws.id)));
+            .contains("direction_write_fenced_or_stale"));
 
         let deleting_worktree_err = record_worktree(
             &db,
@@ -6270,10 +11206,15 @@ mod tests {
             .to_string()
             .contains(&format!("workspace {} is being deleted", ws.id)));
 
-        let deleting_repo_session_err =
-            create_session(&db, external_direction.id, repo.id, "claude", "/tmp/external-wt")
-                .await
-                .unwrap_err();
+        let deleting_repo_session_err = create_session(
+            &db,
+            external_direction.id,
+            repo.id,
+            "claude",
+            "/tmp/external-wt",
+        )
+        .await
+        .unwrap_err();
         assert!(deleting_repo_session_err
             .to_string()
             .contains(&format!("workspace {} is being deleted", ws.id)));
@@ -6285,9 +11226,8 @@ mod tests {
             .to_string()
             .contains(&format!("workspace {} is being deleted", ws.id)));
 
-        let deleting_plan_created_at_err = set_plan_created_at(&db, thread.id, "2")
-            .await
-            .unwrap_err();
+        let deleting_plan_created_at_err =
+            set_plan_created_at(&db, thread.id, "2").await.unwrap_err();
         assert!(deleting_plan_created_at_err
             .to_string()
             .contains(&format!("workspace {} is being deleted", ws.id)));
@@ -6413,7 +11353,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t.lead_tool, "codex");
-        assert!(!t.engine_pinned, "the configured default is not a manual pin");
+        assert!(
+            !t.engine_pinned,
+            "the configured default is not a manual pin"
+        );
     }
 
     #[tokio::test]
@@ -6457,7 +11400,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            get_tool_commands(&db).await.unwrap().get("claude").map(String::as_str),
+            get_tool_commands(&db)
+                .await
+                .unwrap()
+                .get("claude")
+                .map(String::as_str),
             Some("cc-claude")
         );
 
@@ -6467,7 +11414,9 @@ mod tests {
         set_tool_command(&db, "claude", "cc-claude", true)
             .await
             .unwrap();
-        set_tool_command(&db, "claude", "claude", true).await.unwrap();
+        set_tool_command(&db, "claude", "claude", true)
+            .await
+            .unwrap();
         assert!(get_tool_commands(&db).await.unwrap().is_empty());
     }
 
@@ -6475,14 +11424,25 @@ mod tests {
     async fn apply_to_existing_false_pins_old_sessions_only() {
         let db = mem().await;
         let ws = create_workspace(&db, "w").await.unwrap();
-        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "", true).await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "", true)
+            .await
+            .unwrap();
         // An existing claude lead + worker, created before any alias.
         let old_thread = create_thread(&db, ws.id, "old", "feature", "claude")
             .await
             .unwrap();
-        let dir = create_direction(&db, old_thread.id, "d", "claude", repo.id, "why", "impl-only", "")
-            .await
-            .unwrap();
+        let dir = create_direction(
+            &db,
+            old_thread.id,
+            "d",
+            "claude",
+            repo.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
         let old_sess = create_session(&db, dir.id, repo.id, "claude", "/tmp/wt")
             .await
             .unwrap();
@@ -6530,7 +11490,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            get_thread(&db, old_thread.id).await.unwrap().unwrap().lead_command.as_deref(),
+            get_thread(&db, old_thread.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lead_command
+                .as_deref(),
             Some("claude")
         );
         // A later apply-to-existing clears the pin so the row follows the global map.
@@ -6538,7 +11503,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            get_thread(&db, old_thread.id).await.unwrap().unwrap().lead_command,
+            get_thread(&db, old_thread.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lead_command,
             None
         );
     }
@@ -6576,13 +11545,25 @@ mod tests {
     async fn switch_thread_tool_updates_identity_and_clears_stale_pin() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude")
+            .await
+            .unwrap();
         // A command alias pin for the OLD tool must not survive onto the new one.
         // `applyToExisting=false` pins the existing thread to its prior resolved
         // command ("claude") — see `apply_to_existing_true_clears_pins_so_rows_
         // follow_global` above for why `true` would instead CLEAR the pin.
-        set_tool_command(&db, "claude", "cc-claude", false).await.unwrap();
-        assert_eq!(get_thread(&db, t.id).await.unwrap().unwrap().lead_command.as_deref(), Some("claude"));
+        set_tool_command(&db, "claude", "cc-claude", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_thread(&db, t.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lead_command
+                .as_deref(),
+            Some("claude")
+        );
 
         switch_lead_engine_txn(&db, t.id, "codex", Some("gpt-5.5-high"))
             .await
@@ -6592,13 +11573,23 @@ mod tests {
         let switched = get_thread(&db, t.id).await.unwrap().unwrap();
         assert_eq!(switched.lead_tool, "codex");
         assert_eq!(switched.lead_model.as_deref(), Some("gpt-5.5-high"));
-        assert_eq!(switched.lead_command, None, "stale claude alias pin must be cleared");
+        assert_eq!(
+            switched.lead_command, None,
+            "stale claude alias pin must be cleared"
+        );
 
         // A model override clears the same way when the caller passes None.
-        switch_lead_engine_txn(&db, t.id, "codex", None).await.unwrap();
-        assert_eq!(get_thread(&db, t.id).await.unwrap().unwrap().lead_model, None);
+        switch_lead_engine_txn(&db, t.id, "codex", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_thread(&db, t.id).await.unwrap().unwrap().lead_model,
+            None
+        );
 
-        assert!(switch_lead_engine_txn(&db, 9999, "codex", None).await.is_err());
+        assert!(switch_lead_engine_txn(&db, 9999, "codex", None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -6608,11 +11599,15 @@ mod tests {
         let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
             .await
             .unwrap();
-        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude")
+            .await
+            .unwrap();
         let d = create_direction(&db, t.id, "main", "claude", repo.id, "r", "plan+impl", "")
             .await
             .unwrap();
-        let s = create_session(&db, d.id, repo.id, "claude", "/tmp/cwd").await.unwrap();
+        let s = create_session(&db, d.id, repo.id, "claude", "/tmp/cwd")
+            .await
+            .unwrap();
         set_session_native_id(&db, s.id, "native-1").await.unwrap();
         // A stale alias pin for the OLD tool must not survive the switch either.
         {
@@ -6636,12 +11631,19 @@ mod tests {
         // could fail on its own and leave the new tool paired with the OLD
         // engine's native id — a pair `worker_engine` would then try to resume
         // across engines. Atomic here, that pair cannot exist.
-        assert_eq!(s2.native_session_id, None, "the switch clears it in the same write");
+        assert_eq!(
+            s2.native_session_id, None,
+            "the switch clears it in the same write"
+        );
 
-        assert!(switch_worker_engine_txn(&db, 9999, s.id, "codex", None).await.is_err());
+        assert!(switch_worker_engine_txn(&db, 9999, s.id, "codex", None)
+            .await
+            .is_err());
         // A missing session is tolerated (not an error) on the session half —
         // see the function doc — as long as the direction is real.
-        assert!(switch_worker_engine_txn(&db, d.id, 9999, "codex", None).await.is_ok());
+        assert!(switch_worker_engine_txn(&db, d.id, 9999, "codex", None)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -6670,11 +11672,8 @@ mod tests {
             .await
             .unwrap();
         {
-            let mut active: session::ActiveModel = get_session(&db, session.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .into();
+            let mut active: session::ActiveModel =
+                get_session(&db, session.id).await.unwrap().unwrap().into();
             active.command = Set(Some("cc-codex".to_string()));
             active.model = Set(Some("gpt-5.5-high".to_string()));
             active.update(&db.0).await.unwrap();
@@ -6735,7 +11734,10 @@ mod tests {
         assert!(!unchanged_direction.engine_pinned);
         assert_eq!(unchanged_session.tool, "codex");
         assert!(!unchanged_session.engine_pinned);
-        assert_eq!(unchanged_session.native_session_id.as_deref(), Some("native-1"));
+        assert_eq!(
+            unchanged_session.native_session_id.as_deref(),
+            Some("native-1")
+        );
     }
 
     #[tokio::test]
@@ -6749,9 +11751,14 @@ mod tests {
         assert!(refresh_unpinned_thread_route(&db, thread.id, "claude")
             .await
             .unwrap());
-        assert_eq!(get_thread(&db, thread.id).await.unwrap().unwrap().lead_tool, "claude");
+        assert_eq!(
+            get_thread(&db, thread.id).await.unwrap().unwrap().lead_tool,
+            "claude"
+        );
 
-        set_thread_engine_pinned(&db, thread.id, true).await.unwrap();
+        set_thread_engine_pinned(&db, thread.id, true)
+            .await
+            .unwrap();
         assert!(!refresh_unpinned_thread_route(&db, thread.id, "codex")
             .await
             .unwrap());
@@ -6923,7 +11930,10 @@ mod tests {
         .unwrap();
 
         assert!(applied);
-        assert_eq!(get_plan(&db, thread.id).await.unwrap().unwrap().proposal, "after");
+        assert_eq!(
+            get_plan(&db, thread.id).await.unwrap().unwrap().proposal,
+            "after"
+        );
         let direction = get_direction(&db, direction.id).await.unwrap().unwrap();
         assert_eq!(direction.tool, "opencode");
         assert!(direction.engine_pinned);
@@ -7002,9 +12012,27 @@ mod tests {
         switch_worker_engine_txn_with_pin(&db, direction.id, session.id, "codex", None, false)
             .await
             .unwrap();
-        assert!(!get_thread(&db, thread.id).await.unwrap().unwrap().engine_pinned);
-        assert!(!get_direction(&db, direction.id).await.unwrap().unwrap().engine_pinned);
-        assert!(!get_session(&db, session.id).await.unwrap().unwrap().engine_pinned);
+        assert!(
+            !get_thread(&db, thread.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .engine_pinned
+        );
+        assert!(
+            !get_direction(&db, direction.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .engine_pinned
+        );
+        assert!(
+            !get_session(&db, session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .engine_pinned
+        );
 
         switch_lead_engine_txn(&db, thread.id, "claude", None)
             .await
@@ -7012,9 +12040,27 @@ mod tests {
         switch_worker_engine_txn(&db, direction.id, session.id, "claude", None)
             .await
             .unwrap();
-        assert!(get_thread(&db, thread.id).await.unwrap().unwrap().engine_pinned);
-        assert!(get_direction(&db, direction.id).await.unwrap().unwrap().engine_pinned);
-        assert!(get_session(&db, session.id).await.unwrap().unwrap().engine_pinned);
+        assert!(
+            get_thread(&db, thread.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .engine_pinned
+        );
+        assert!(
+            get_direction(&db, direction.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .engine_pinned
+        );
+        assert!(
+            get_session(&db, session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .engine_pinned
+        );
     }
 
     /// Two `Db` handles onto one WAL file, so a concurrent commit is a real
@@ -7022,16 +12068,25 @@ mod tests {
     /// handle just opens the same file.
     async fn shared_file_db(dir: &std::path::Path) -> (Db, Db) {
         use sea_orm::ConnectionTrait;
-        let url = format!("sqlite://{}?mode=rwc", dir.join("weft.db").to_string_lossy());
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.join("weft.db").to_string_lossy()
+        );
         let open = |url: String| async move {
             let conn = sea_orm::Database::connect(url).await.unwrap();
-            conn.execute_unprepared("PRAGMA journal_mode=WAL;").await.unwrap();
-            conn.execute_unprepared("PRAGMA busy_timeout=2000;").await.unwrap();
+            conn.execute_unprepared("PRAGMA journal_mode=WAL;")
+                .await
+                .unwrap();
+            conn.execute_unprepared("PRAGMA busy_timeout=2000;")
+                .await
+                .unwrap();
             conn
         };
         let a = open(url.clone()).await;
         use sea_orm_migration::MigratorTrait;
-        crate::store::migration::Migrator::up(&a, None).await.unwrap();
+        crate::store::migration::Migrator::up(&a, None)
+            .await
+            .unwrap();
         let b = open(url).await;
         (Db(a, false), Db(b, false))
     }
@@ -7060,10 +12115,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (a, probe) = shared_file_db(dir.path()).await;
         let ws = create_workspace(&a, "ws").await.unwrap();
-        let t = create_thread(&a, ws.id, "Issue", "feature", "claude").await.unwrap();
+        let t = create_thread(&a, ws.id, "Issue", "feature", "claude")
+            .await
+            .unwrap();
         // The probe must fail fast rather than wait for the lock, or it would
         // block until the parked transaction commits.
-        probe.0.execute_unprepared("PRAGMA busy_timeout=0;").await.unwrap();
+        probe
+            .0
+            .execute_unprepared("PRAGMA busy_timeout=0;")
+            .await
+            .unwrap();
 
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         // A third handle for the transaction itself, so `a` stays available
@@ -7074,7 +12135,10 @@ mod tests {
             let tid = t.id;
             tokio::spawn(async move {
                 txn_probe::AFTER_FIRST_STATEMENT
-                    .scope(barrier, switch_lead_engine_txn(&writer, tid, "codex", Some("opus")))
+                    .scope(
+                        barrier,
+                        switch_lead_engine_txn(&writer, tid, "codex", Some("opus")),
+                    )
                     .await
             })
         };
@@ -7093,11 +12157,13 @@ mod tests {
         );
 
         barrier.wait().await;
-        switching.await.expect("join").expect("the switch itself must succeed");
+        switching
+            .await
+            .expect("join")
+            .expect("the switch itself must succeed");
         let after = get_thread(&a, t.id).await.unwrap().unwrap();
         assert_eq!(after.lead_tool, "codex");
         assert_eq!(after.lead_model.as_deref(), Some("opus"));
-        assert!(last_turn_freeze_recovery_secs(&a, t.id, None).await.unwrap().is_some());
     }
 
     /// PR #140 round 6: the lead's tool/model write and its native-id clear are
@@ -7117,8 +12183,12 @@ mod tests {
         use sea_orm::ConnectionTrait;
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
-        set_lead_native_id(&db, t.id, "lead-native-1").await.unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude")
+            .await
+            .unwrap();
+        set_lead_native_id(&db, t.id, "lead-native-1")
+            .await
+            .unwrap();
 
         // Claimed BEFORE the table goes away — this is the switch's own step 0,
         // and the transaction below is what would have promoted it.
@@ -7126,7 +12196,10 @@ mod tests {
             .await
             .unwrap();
         let err = switch_lead_engine_txn(&db, t.id, "codex", Some("gpt-5.5-high")).await;
-        assert!(err.is_err(), "the native-id half must fail (table renamed away)");
+        assert!(
+            err.is_err(),
+            "the native-id half must fail (table renamed away)"
+        );
         db.0.execute_unprepared("ALTER TABLE lead_message_renamed_for_test RENAME TO lead_message")
             .await
             .unwrap();
@@ -7164,11 +12237,15 @@ mod tests {
         let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
             .await
             .unwrap();
-        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude")
+            .await
+            .unwrap();
         let d = create_direction(&db, t.id, "main", "claude", repo.id, "r", "plan+impl", "")
             .await
             .unwrap();
-        let s = create_session(&db, d.id, repo.id, "claude", "/tmp/cwd").await.unwrap();
+        let s = create_session(&db, d.id, repo.id, "claude", "/tmp/cwd")
+            .await
+            .unwrap();
 
         // Make the session half of the transaction fail with a real DB error
         // (not a simulated one) while leaving `direction` completely healthy.
@@ -7176,9 +12253,11 @@ mod tests {
             .await
             .unwrap();
 
-        let err =
-            switch_worker_engine_txn(&db, d.id, s.id, "opencode", Some("gpt-5.5-high")).await;
-        assert!(err.is_err(), "the session-table write must fail (table renamed away)");
+        let err = switch_worker_engine_txn(&db, d.id, s.id, "opencode", Some("gpt-5.5-high")).await;
+        assert!(
+            err.is_err(),
+            "the session-table write must fail (table renamed away)"
+        );
 
         // Restore the table so the read-back below (and any other test using
         // this connection) sees the schema it expects.
@@ -7192,7 +12271,10 @@ mod tests {
             "direction.tool must be ROLLED BACK, not left at the new value, when the session half fails"
         );
         let s2 = get_session(&db, s.id).await.unwrap().unwrap();
-        assert_eq!(s2.tool, "claude", "session.tool untouched — the write never committed");
+        assert_eq!(
+            s2.tool, "claude",
+            "session.tool untouched — the write never committed"
+        );
         assert_eq!(s2.model, None);
     }
 
@@ -7305,10 +12387,200 @@ mod tests {
         assert_eq!(list_skill_sources(&db).await.unwrap().len(), 2);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn create_direction_revalidates_thread_marker_at_insert() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("direction-insert-race.sqlite");
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        let (_workspace, repo, thread) = direction_parent_fixture(&db, "direction-race").await;
+        let direction_name = "late-constructor-race";
+        let (reached, resume) = arm_direction_insert_write_probe(thread.id, direction_name);
+        let creator_db = db.clone();
+        let thread_id = thread.id;
+        let repo_id = repo.id;
+        let creating = tokio::spawn(async move {
+            create_direction(
+                &creator_db,
+                thread_id,
+                direction_name,
+                "codex",
+                repo_id,
+                "why",
+                "impl-only",
+                "",
+            )
+            .await
+        });
+
+        reached.await.unwrap();
+        mark_thread_deleting(&db, thread.id).await.unwrap();
+        let _ = resume.send(());
+        let error = creating.await.unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("direction_write_fenced_or_stale"));
+        assert!(list_directions(&db, thread.id).await.unwrap().is_empty());
+        clear_thread_deleting(&db, thread.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_direction_rejects_repo_delete_marker() {
+        let db = mem().await;
+        let (_workspace, repo, thread) = direction_parent_fixture(&db, "direction-repo-fence").await;
+        mark_repo_deleting(&db, repo.id).await.unwrap();
+
+        let error = create_direction(
+            &db,
+            thread.id,
+            "blocked",
+            "codex",
+            repo.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("direction_write_fenced_or_stale"));
+        assert!(list_directions(&db, thread.id).await.unwrap().is_empty());
+        clear_repo_deleting(&db, repo.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_direction_rejects_workspace_delete_marker() {
+        let db = mem().await;
+        let (workspace, repo, thread) =
+            direction_parent_fixture(&db, "direction-workspace-fence").await;
+        mark_workspace_deleting(&db, workspace.id).await.unwrap();
+
+        let error = create_direction(
+            &db,
+            thread.id,
+            "blocked",
+            "codex",
+            repo.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("direction_write_fenced_or_stale"));
+        assert!(list_directions(&db, thread.id).await.unwrap().is_empty());
+        clear_workspace_deleting(&db, workspace.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_direction_rejects_a_repo_from_another_workspace() {
+        let db = mem().await;
+        let (_workspace, _repo, thread) = direction_parent_fixture(&db, "direction-owner").await;
+        let other_workspace = create_workspace(&db, "direction-other").await.unwrap();
+        let other_repo = add_repo_ref(
+            &db,
+            other_workspace.id,
+            "other",
+            "/tmp/direction-other-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+
+        let error = create_direction(
+            &db,
+            thread.id,
+            "cross-workspace",
+            "codex",
+            other_repo.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("direction_write_fenced_or_stale"));
+        assert!(list_directions(&db, thread.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_direction_after_successful_thread_delete_creates_no_orphan() {
+        let db = mem().await;
+        let (_workspace, repo, thread) = direction_parent_fixture(&db, "direction-deleted").await;
+        delete_thread_cascade(&db, thread.id).await.unwrap();
+
+        let error = create_direction(
+            &db,
+            thread.id,
+            "late",
+            "codex",
+            repo.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("direction_write_fenced_or_stale"));
+        assert!(list_directions(&db, thread.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_direction_retry_succeeds_after_failed_delete_clears_marker() {
+        use sea_orm::ConnectionTrait;
+
+        let db = mem().await;
+        let (_workspace, repo, thread) =
+            direction_parent_fixture(&db, "direction-delete-retry").await;
+        db.0
+            .execute_unprepared(
+                "CREATE TRIGGER fail_thread_delete BEFORE DELETE ON thread BEGIN \
+                 SELECT RAISE(ABORT, 'injected thread delete failure'); END",
+            )
+            .await
+            .unwrap();
+
+        let error = delete_thread_cascade(&db, thread.id).await.unwrap_err();
+        assert!(error.to_string().contains("injected thread delete failure"));
+        assert!(
+            get_setting(&db, &thread_deleting_key(thread.id))
+                .await
+                .unwrap()
+                .is_none(),
+            "the failed delete wrapper must clear its marker"
+        );
+        db.0
+            .execute_unprepared("DROP TRIGGER fail_thread_delete")
+            .await
+            .unwrap();
+
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "retry",
+            "codex",
+            repo.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(direction.thread_id, thread.id);
+        assert_eq!(direction.repo_id, repo.id);
+    }
+
     #[tokio::test]
     async fn create_direction_persists_base_and_defaults_target() {
         use std::process::Command as Cmd;
-        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("weft-cdbase-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let repo_path = root.join("api");
@@ -7318,18 +12590,40 @@ mod tests {
             vec!["config", "user.email", "t@t.t"],
             vec!["config", "user.name", "t"],
         ] {
-            Cmd::new("git").args(&args).current_dir(&repo_path).status().unwrap();
+            Cmd::new("git")
+                .args(&args)
+                .current_dir(&repo_path)
+                .status()
+                .unwrap();
         }
         std::fs::write(repo_path.join("README.md"), "# x\n").unwrap();
-        Cmd::new("git").args(["add", "-A"]).current_dir(&repo_path).status().unwrap();
-        Cmd::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo_path).status().unwrap();
+        Cmd::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo_path)
+            .status()
+            .unwrap();
+        Cmd::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&repo_path)
+            .status()
+            .unwrap();
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let r = add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true)
+        let r = add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            repo_path.to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let t = create_thread(&db, ws.id, "t1", "feature", "claude")
             .await
             .unwrap();
-        let t = create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
 
         // A concrete base → stored, and target_branch defaults to it.
         let d = create_direction_with_engine_pin(
@@ -7346,15 +12640,24 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(d.base_branch, "develop");
-        assert_eq!(d.target_branch, "develop", "target defaults to the chosen base");
-        assert!(d.engine_pinned, "the pin must be part of the inserted direction");
+        assert_eq!(
+            d.target_branch, "develop",
+            "target defaults to the chosen base"
+        );
+        assert!(
+            d.engine_pinned,
+            "the pin must be part of the inserted direction"
+        );
 
         // Empty base → both empty (each resolves to the repo default later).
         let d2 = create_direction(&db, t.id, "y", "claude", r.id, "r", "plan+impl", "")
             .await
             .unwrap();
         assert_eq!(d2.base_branch, "");
-        assert_eq!(d2.target_branch, "", "empty base leaves target empty (= repo default)");
+        assert_eq!(
+            d2.target_branch, "",
+            "empty base leaves target empty (= repo default)"
+        );
         assert!(!d2.engine_pinned);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -7404,7 +12707,10 @@ mod tests {
         assert_eq!(m.consumed_at, None, "fresh delivered row starts unconsumed");
         let consumed = expect_marked(mark_message_consumed(&db, m.id).await.unwrap());
         assert_eq!(consumed.id, m.id);
-        assert!(consumed.consumed_at.is_some(), "must stamp a millis timestamp");
+        assert!(
+            consumed.consumed_at.is_some(),
+            "must stamp a millis timestamp"
+        );
         // status is untouched — consumed_at is an orthogonal signal.
         assert_eq!(consumed.status, "complete");
     }
@@ -7425,8 +12731,15 @@ mod tests {
             matches!(second, ConsumeMark::AlreadyConsumed),
             "an already-consumed row must report AlreadyConsumed, not re-fire or read as retry-worthy"
         );
-        let still = lead_message::Entity::find_by_id(m.id).one(&db.0).await.unwrap().unwrap();
-        assert_eq!(still.consumed_at, first.consumed_at, "timestamp must not change");
+        let still = lead_message::Entity::find_by_id(m.id)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            still.consumed_at, first.consumed_at,
+            "timestamp must not change"
+        );
     }
 
     /// A still-queued row hasn't reached the agent yet — it cannot be marked
@@ -7448,7 +12761,11 @@ mod tests {
             matches!(res, ConsumeMark::NotEligible),
             "a queued row must be NotEligible (retry-worthy), not AlreadyConsumed"
         );
-        let still = lead_message::Entity::find_by_id(m.id).one(&db.0).await.unwrap().unwrap();
+        let still = lead_message::Entity::find_by_id(m.id)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(still.consumed_at, None);
     }
 
@@ -7522,7 +12839,9 @@ mod tests {
             .unwrap();
         // A "concurrent" write lands on a DIFFERENT column, after `m` above
         // was read as a snapshot with native_anchor == None.
-        set_lead_message_anchor(&db, m.id, "concurrent-anchor").await.unwrap();
+        set_lead_message_anchor(&db, m.id, "concurrent-anchor")
+            .await
+            .unwrap();
 
         // The exact stale-snapshot-then-partial-Set-then-update idiom shared
         // by mark_message_consumed / complete_queued_by_id, applied to `m`
@@ -7531,7 +12850,11 @@ mod tests {
         a.status = Set("interrupted".to_string());
         a.update(&db.0).await.unwrap();
 
-        let after = lead_message::Entity::find_by_id(1).one(&db.0).await.unwrap().unwrap();
+        let after = lead_message::Entity::find_by_id(1)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             after.native_anchor.as_deref(),
             Some("concurrent-anchor"),
@@ -7552,7 +12875,9 @@ mod tests {
         let m = insert_lead_message(&db, t, None, 1, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        set_lead_message_anchor(&db, m.id, "concurrent-anchor").await.unwrap();
+        set_lead_message_anchor(&db, m.id, "concurrent-anchor")
+            .await
+            .unwrap();
         let seq = assign_delivery_seq(&db, t, m.id).await.unwrap();
 
         let consumed = expect_marked(mark_message_consumed(&db, m.id).await.unwrap());
@@ -7562,8 +12887,15 @@ mod tests {
             Some("concurrent-anchor"),
             "must not clobber a concurrently-written rewind anchor"
         );
-        assert_eq!(consumed.seq, Some(seq), "must not clobber a concurrently-assigned delivery seq");
-        assert!(consumed.consumed_at.is_some(), "the actual mark must still land");
+        assert_eq!(
+            consumed.seq,
+            Some(seq),
+            "must not clobber a concurrently-assigned delivery seq"
+        );
+        assert!(
+            consumed.consumed_at.is_some(),
+            "the actual mark must still land"
+        );
     }
 
     /// M0030: analysis_state/error round-trip and upsert_repo_profile preserves them.
@@ -7670,14 +13002,18 @@ mod tests {
 
         // set_analysis_state("running") on a nonexistent repo must be a no-op —
         // it must NOT create an orphaned profile row.
-        set_analysis_state(&db, r.id, "running", None).await.unwrap();
+        set_analysis_state(&db, r.id, "running", None)
+            .await
+            .unwrap();
         assert!(
             get_repo_profile(&db, r.id).await.unwrap().is_none(),
             "set_analysis_state must not create a profile row for a deleted repo"
         );
 
         // Same for "failed".
-        set_analysis_state(&db, r.id, "failed", Some("timeout")).await.unwrap();
+        set_analysis_state(&db, r.id, "failed", Some("timeout"))
+            .await
+            .unwrap();
         assert!(
             get_repo_profile(&db, r.id).await.unwrap().is_none(),
             "set_analysis_state(failed) must not create a profile row for a deleted repo"
@@ -7719,15 +13055,22 @@ mod tests {
 
         // Seed profiles: running-repo gets analysis_state="running" via the
         // placeholder-creating path; idle-repo gets a full profile but stays idle.
-        set_analysis_state(&db, running.id, "running", None).await.unwrap();
-        upsert_repo_profile(&db, idle.id, "backend", "[]", "summary", "[]", "agent", "sha")
+        set_analysis_state(&db, running.id, "running", None)
             .await
             .unwrap();
+        upsert_repo_profile(
+            &db, idle.id, "backend", "[]", "summary", "[]", "agent", "sha",
+        )
+        .await
+        .unwrap();
         // idle-repo's analysis_state column defaults to "idle" — no explicit set needed.
 
         let got = repos_with_analysis_state(&db, "running").await.unwrap();
         assert_eq!(got.len(), 1, "only the running repo must be returned");
-        assert_eq!(got[0].id, running.id, "returned repo must be the running one");
+        assert_eq!(
+            got[0].id, running.id,
+            "returned repo must be the running one"
+        );
 
         // The idle-repo must NOT appear in the running results.
         assert!(
@@ -7759,14 +13102,20 @@ mod tests {
 
         // (2) A subsequent upsert_repo_profile (agent re-classify) must NOT clobber
         //     category/domains — they are preserved (Unchanged in the ActiveModel).
-        upsert_repo_profile(&db, r.id, "frontend", "[]", "new summary", "[]", "agent", "sha2")
-            .await
-            .unwrap();
+        upsert_repo_profile(
+            &db,
+            r.id,
+            "frontend",
+            "[]",
+            "new summary",
+            "[]",
+            "agent",
+            "sha2",
+        )
+        .await
+        .unwrap();
         let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
-        assert_eq!(
-            p.category, "biz",
-            "upsert must not reset category"
-        );
+        assert_eq!(p.category, "biz", "upsert must not reset category");
         assert_eq!(
             p.domains, r#"["orders","payments"]"#,
             "upsert must not reset domains"
@@ -7789,7 +13138,10 @@ mod tests {
             .await
             .unwrap();
         let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
-        assert_eq!(p.category, "", "fresh row: category defaults to empty string");
+        assert_eq!(
+            p.category, "",
+            "fresh row: category defaults to empty string"
+        );
         assert_eq!(p.domains, "[]", "fresh row: domains defaults to '[]'");
     }
 
@@ -7808,16 +13160,27 @@ mod tests {
             .unwrap();
 
         // (1) Set and read back layer/layer_rank.
-        set_repo_layer_rank(&db, r.id, "Core 核心", 3).await.unwrap();
+        set_repo_layer_rank(&db, r.id, "Core 核心", 3)
+            .await
+            .unwrap();
         let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.layer, "Core 核心");
         assert_eq!(p.layer_rank, 3);
 
         // (2) A subsequent upsert_repo_profile (per-repo re-classify) must NOT clobber
         //     layer/layer_rank — they are preserved (Unchanged in the ActiveModel).
-        upsert_repo_profile(&db, r.id, "frontend", "[]", "new summary", "[]", "agent", "sha2")
-            .await
-            .unwrap();
+        upsert_repo_profile(
+            &db,
+            r.id,
+            "frontend",
+            "[]",
+            "new summary",
+            "[]",
+            "agent",
+            "sha2",
+        )
+        .await
+        .unwrap();
         let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.layer, "Core 核心", "upsert must not reset layer");
         assert_eq!(p.layer_rank, 3, "upsert must not reset layer_rank");
@@ -7857,13 +13220,21 @@ mod tests {
         let md = "## Inventory\n- web (frontend): SPA\n\n## Domain index\n- auth: [api]";
         set_repo_map_doc(&db, ws.id, md).await.unwrap();
         let doc = get_repo_map_doc(&db, ws.id).await.unwrap();
-        assert_eq!(doc.as_deref(), Some(md), "retrieved doc must equal stored doc");
+        assert_eq!(
+            doc.as_deref(),
+            Some(md),
+            "retrieved doc must equal stored doc"
+        );
 
         // Overwrite with a new doc (upsert semantics).
         let md2 = "## Inventory v2\n- api (backend): REST API";
         set_repo_map_doc(&db, ws.id, md2).await.unwrap();
         let doc2 = get_repo_map_doc(&db, ws.id).await.unwrap();
-        assert_eq!(doc2.as_deref(), Some(md2), "second set overwrites the first");
+        assert_eq!(
+            doc2.as_deref(),
+            Some(md2),
+            "second set overwrites the first"
+        );
 
         // A different workspace id has its own slot — no cross-workspace bleed.
         let ws2 = create_workspace(&db, "ws2").await.unwrap();
@@ -7878,7 +13249,9 @@ mod tests {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
 
-        set_repo_map_doc(&db, ws.id, "## Inventory\n- web").await.unwrap();
+        set_repo_map_doc(&db, ws.id, "## Inventory\n- web")
+            .await
+            .unwrap();
         assert!(get_repo_map_doc(&db, ws.id).await.unwrap().is_some());
 
         clear_repo_map_doc(&db, ws.id).await.unwrap();
@@ -7899,8 +13272,12 @@ mod tests {
     async fn set_repo_relations_invalidates_map_doc() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let r = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
-        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
         set_repo_map_doc(&db, ws.id, "## old map").await.unwrap();
 
         set_repo_relations(&db, r.id, "[]").await.unwrap();
@@ -7915,11 +13292,16 @@ mod tests {
     async fn set_repo_relations_noops_when_repo_ref_was_deleted() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let r = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true)
+            .await
+            .unwrap();
         upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
             .await
             .unwrap();
-        repo_ref::Entity::delete_by_id(r.id).exec(&db.0).await.unwrap();
+        repo_ref::Entity::delete_by_id(r.id)
+            .exec(&db.0)
+            .await
+            .unwrap();
 
         set_repo_relations(&db, r.id, r#"[{"to":99,"kind":"http"}]"#)
             .await
@@ -7933,14 +13315,21 @@ mod tests {
     async fn upsert_repo_profile_rejects_deleted_repo_ref() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let r = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
-        repo_ref::Entity::delete_by_id(r.id).exec(&db.0).await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true)
+            .await
+            .unwrap();
+        repo_ref::Entity::delete_by_id(r.id)
+            .exec(&db.0)
+            .await
+            .unwrap();
 
         let err = upsert_repo_profile(&db, r.id, "backend", "[]", "summary", "[]", "agent", "")
             .await
             .unwrap_err();
 
-        assert!(err.to_string().contains("not found"));
+        assert!(err
+            .to_string()
+            .contains("no longer accepts profile writes"));
         assert!(get_repo_profile(&db, r.id).await.unwrap().is_none());
     }
 
@@ -7950,12 +13339,20 @@ mod tests {
     async fn calibrate_repo_relation_invalidates_map_doc() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
-        let b = add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "", true).await.unwrap();
-        upsert_repo_profile(&db, a.id, "backend", "[]", "", "[]", "agent", "").await.unwrap();
+        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true)
+            .await
+            .unwrap();
+        let b = add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, a.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
         set_repo_map_doc(&db, ws.id, "## old map").await.unwrap();
 
-        calibrate_repo_relation(&db, a.id, b.id, "http", "GET /x", "add").await.unwrap();
+        calibrate_repo_relation(&db, a.id, b.id, "http", "GET /x", "add")
+            .await
+            .unwrap();
 
         assert!(
             get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
@@ -7980,14 +13377,18 @@ mod tests {
         let r = add_repo_ref(db, ws.id, "api", repo_path, "main", "", true)
             .await
             .unwrap();
-        let t = create_thread(db, ws.id, "t", "feature", "claude").await.unwrap();
+        let t = create_thread(db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
         let producer = create_direction(db, t.id, "producer", "claude", r.id, "r", "impl-only", "")
             .await
             .unwrap();
         let consumer = create_direction(db, t.id, "consumer", "claude", r.id, "r", "impl-only", "")
             .await
             .unwrap();
-        set_direction_upstream(db, consumer.id, producer.id).await.unwrap();
+        set_direction_upstream(db, consumer.id, producer.id)
+            .await
+            .unwrap();
         (producer.id, consumer.id)
     }
 
@@ -8016,7 +13417,12 @@ mod tests {
             .current_dir(dir)
             .output()
             .unwrap();
-        assert!(out.status.success(), "cmd {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "cmd {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -8030,7 +13436,11 @@ mod tests {
     /// segment (so it naturally absorbs the long temp-dir prefix, exactly
     /// the same way a GitLab nested-subgroup path would — see
     /// `remote_matches_pr_host`'s doc on that).
-    fn make_bare_repo(root: &std::path::Path, name: &str, default_branch: &str) -> (std::path::PathBuf, String, String) {
+    fn make_bare_repo(
+        root: &std::path::Path,
+        name: &str,
+        default_branch: &str,
+    ) -> (std::path::PathBuf, String, String) {
         let repo = root.join(name).join("acme").join("api");
         std::fs::create_dir_all(&repo).unwrap();
         sh(&repo, &["git", "init", "-q"]);
@@ -8042,7 +13452,9 @@ mod tests {
         sh(&repo, &["git", "branch", "-M", default_branch]);
         let abs = repo.canonicalize().unwrap();
         let path_str = abs.to_str().unwrap().trim_start_matches('/').to_string();
-        let (owner, name) = path_str.rsplit_once('/').expect("temp path has multiple segments");
+        let (owner, name) = path_str
+            .rsplit_once('/')
+            .expect("temp path has multiple segments");
         (abs, owner.to_string(), name.to_string())
     }
 
@@ -8076,7 +13488,16 @@ mod tests {
     ) -> (std::path::PathBuf, String, String, String) {
         let (origin_abs, host_owner, host_repo) = make_bare_repo(root, "origin", default_branch);
         let clone = root.join("clone");
-        sh(root, &["git", "clone", "-q", &file_url(&origin_abs), clone.to_str().unwrap()]);
+        sh(
+            root,
+            &[
+                "git",
+                "clone",
+                "-q",
+                &file_url(&origin_abs),
+                clone.to_str().unwrap(),
+            ],
+        );
         sh(&clone, &["git", "config", "user.email", "t@t.t"]);
         sh(&clone, &["git", "config", "user.name", "t"]);
         (clone, "localhost".to_string(), host_owner, host_repo)
@@ -8097,11 +13518,211 @@ mod tests {
         host_owner: &str,
         host_repo: &str,
     ) -> pull_request::Model {
+        let direction = get_direction(db, direction_id).await.unwrap().unwrap();
+        let source_session_id = worker_pr_source(db, direction.id, direction.repo_id).await;
         register_pull_request(
-            db, 1, direction_id, 0, "github", host_base, host_owner, host_repo, number, "", "",
+            db,
+            direction.thread_id,
+            direction.id,
+            direction.repo_id,
+            source_session_id,
+            "github",
+            host_base,
+            host_owner,
+            host_repo,
+            number,
+            "",
+            "",
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn secondary_session_pr_registration_and_merge_revalidation_use_exact_repo() {
+        let db = mem().await;
+        let workspace = create_workspace(&db, "ws-secondary-pr").await.unwrap();
+        let primary = add_repo_ref(
+            &db,
+            workspace.id,
+            "primary",
+            "/tmp/secondary-pr-primary",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let secondary = add_repo_ref(
+            &db,
+            workspace.id,
+            "secondary",
+            "/tmp/secondary-pr-secondary",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "codex",
+            primary.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = create_session(
+            &db,
+            direction.id,
+            secondary.id,
+            "codex",
+            "/tmp/secondary-pr-worktree",
+        )
+        .await
+        .unwrap();
+
+        let tracked = register_pull_request(
+            &db,
+            thread.id,
+            direction.id,
+            secondary.id,
+            Some(session.id),
+            "github",
+            "github.com",
+            "owner",
+            "secondary",
+            17,
+            "https://github.com/owner/secondary/pull/17",
+            "Secondary change",
+        )
+        .await
+        .unwrap();
+        assert_eq!(tracked.repo_id, secondary.id);
+        assert_eq!(tracked.direction_id, direction.id);
+        assert!(reload_pull_request_merge_candidate(&db, &tracked, "")
+            .await
+            .unwrap()
+            .is_some());
+        let refreshed = refresh_pull_request_tracking(&db, &tracked).await.unwrap();
+        assert_eq!(refreshed.id, tracked.id);
+
+        mark_repo_deleting(&db, primary.id).await.unwrap();
+        assert!(reload_pull_request_merge_candidate(&db, &refreshed, "")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(register_pull_request(
+            &db,
+            thread.id,
+            direction.id,
+            secondary.id,
+            Some(session.id),
+            "github",
+            "github.com",
+            "owner",
+            "secondary",
+            17,
+            "https://github.com/owner/secondary/pull/17",
+            "Secondary change",
+        )
+        .await
+        .is_err());
+        clear_repo_deleting(&db, primary.id).await.unwrap();
+
+        delete_repo_cascade_with_human_cancellations(&db, primary.id)
+            .await
+            .unwrap();
+        assert!(get_pull_request(&db, tracked.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pull_request_registration_revalidates_parent_after_preflight_delete() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("pr-registration-race.sqlite");
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        let workspace = create_workspace(&db, "ws-pr-race").await.unwrap();
+        let repo_ref = add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/pr-registration-race",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "codex",
+            repo_ref.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = create_session(
+            &db,
+            direction.id,
+            repo_ref.id,
+            "codex",
+            "/tmp/pr-registration-race-worktree",
+        )
+        .await
+        .unwrap();
+        let (reached, resume) =
+            arm_pull_request_registration_write_probe("race-owner", "race-repo", 23);
+        let thread_id = thread.id;
+        let direction_id = direction.id;
+        let repo_id = repo_ref.id;
+        let session_id = session.id;
+        let registration_db = db.clone();
+        let registration = tokio::spawn(async move {
+            register_pull_request(
+                &registration_db,
+                thread_id,
+                direction_id,
+                repo_id,
+                Some(session_id),
+                "github",
+                "github.com",
+                "race-owner",
+                "race-repo",
+                23,
+                "https://github.com/race-owner/race-repo/pull/23",
+                "Race",
+            )
+            .await
+        });
+        reached.await.unwrap();
+        delete_thread_cascade_with_human_cancellations(&db, thread_id)
+            .await
+            .unwrap();
+        let _ = resume.send(());
+        let error = registration.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("parent disappeared"));
+        assert!(
+            find_pull_request(&db, "github", "race-owner", "race-repo", 23)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A task with no edge is `None` — the state that lets a PR merge. Every
@@ -8113,7 +13734,9 @@ mod tests {
         let r = add_repo_ref(&db, ws.id, "api", "/tmp/solo-api", "main", "", true)
             .await
             .unwrap();
-        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
         let d = create_direction(&db, t.id, "solo", "claude", r.id, "r", "impl-only", "")
             .await
             .unwrap();
@@ -8141,8 +13764,28 @@ mod tests {
     async fn a_pr_with_no_owning_direction_reports_none_not_unknown() {
         let db = mem().await;
         // Mirrors `register_pr_tool_from_the_lead_falls_back_to_unset_direction`'s DB state:
-        // `direction_id = 0`, no direction row exists at all.
-        register_open_pr(&db, 0, 1).await;
+        // `direction_id = 0`, no direction row exists at all. The lead still has a
+        // real thread owner; only the optional direction axis is intentionally absent.
+        let workspace = create_workspace(&db, "ws-lead-pr").await.unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        register_pull_request(
+            &db,
+            thread.id,
+            0,
+            0,
+            None,
+            "github",
+            "github.com",
+            "o",
+            "r",
+            1,
+            "",
+            "",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             upstream_merge_state(&db, 0).await,
@@ -8176,8 +13819,10 @@ mod tests {
     #[tokio::test]
     async fn an_upstream_pr_releases_the_consumer_only_once_merged() {
         let db = mem().await;
-        let root = std::env::temp_dir()
-            .join(format!("weft-upstream-merged-releases-once-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "weft-upstream-merged-releases-once-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let (clone_path, host_base, host_owner, host_repo) = make_repo_with_origin(&root, "main");
@@ -8200,9 +13845,10 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready, StreakUpdate::Clear)
             .await
             .unwrap();
 
@@ -8227,8 +13873,10 @@ mod tests {
     #[tokio::test]
     async fn a_merged_pr_targeting_a_non_default_branch_does_not_release_the_consumer() {
         let db = mem().await;
-        let root = std::env::temp_dir()
-            .join(format!("weft-upstream-merged-non-default-base-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "weft-upstream-merged-non-default-base-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let (clone_path, host_base, host_owner, host_repo) = make_repo_with_origin(&root, "main");
@@ -8244,9 +13892,10 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready, StreakUpdate::Clear)
             .await
             .unwrap();
 
@@ -8280,13 +13929,24 @@ mod tests {
     #[tokio::test]
     async fn a_merged_pr_whose_base_branch_was_later_renamed_stays_pending_not_merged() {
         let db = mem().await;
-        let root = std::env::temp_dir()
-            .join(format!("weft-upstream-renamed-default-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "weft-upstream-renamed-default-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let (origin_abs, host_owner, host_repo) = make_bare_repo(&root, "origin", "main");
         let clone_path = root.join("clone");
-        sh(&root, &["git", "clone", "-q", &file_url(&origin_abs), clone_path.to_str().unwrap()]);
+        sh(
+            &root,
+            &[
+                "git",
+                "clone",
+                "-q",
+                &file_url(&origin_abs),
+                clone_path.to_str().unwrap(),
+            ],
+        );
         sh(&clone_path, &["git", "config", "user.email", "t@t.t"]);
         sh(&clone_path, &["git", "config", "user.name", "t"]);
         let merged_sha = sh_out(&clone_path, &["git", "rev-parse", "HEAD"]);
@@ -8307,9 +13967,10 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready, StreakUpdate::Clear)
             .await
             .unwrap();
 
@@ -8346,9 +14007,10 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready, StreakUpdate::Clear)
             .await
             .unwrap();
 
@@ -8370,8 +14032,10 @@ mod tests {
     #[tokio::test]
     async fn a_local_clone_that_does_not_match_the_prs_host_identity_is_unknown_not_merged() {
         let db = mem().await;
-        let root = std::env::temp_dir()
-            .join(format!("weft-upstream-merged-mismatched-host-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "weft-upstream-merged-mismatched-host-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         // A REAL clone (host_base "localhost", host_owner/host_repo derived from the filesystem
@@ -8379,7 +14043,8 @@ mod tests {
         // "github.com", host_owner "o", host_repo "r" — register_open_pr's default) — a genuine
         // mismatch, not a manufactured one: no fixture trick is needed to make the clone's live
         // origin disagree with the PR's recorded host identity, it simply does.
-        let (clone_path, _host_base, _host_owner, _host_repo) = make_repo_with_origin(&root, "main");
+        let (clone_path, _host_base, _host_owner, _host_repo) =
+            make_repo_with_origin(&root, "main");
         let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
         let pr = register_open_pr(&db, producer, 1).await; // host_owner="o", host_repo="r", host_base="github.com"
 
@@ -8391,9 +14056,10 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready, StreakUpdate::Clear)
             .await
             .unwrap();
 
@@ -8419,19 +14085,31 @@ mod tests {
     /// repo the local checkout actually verified — a coincidental name match standing in for a
     /// real verification.
     #[tokio::test]
-    async fn a_merged_pr_targeting_an_unrelated_repo_is_unknown_not_merged_even_on_a_coincidental_base_ref() {
+    async fn a_merged_pr_targeting_an_unrelated_repo_is_unknown_not_merged_even_on_a_coincidental_base_ref(
+    ) {
         let db = mem().await;
-        let root = std::env::temp_dir()
-            .join(format!("weft-upstream-mixed-pr-identity-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "weft-upstream-mixed-pr-identity-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let (clone_path, host_base, host_owner, host_repo) = make_repo_with_origin(&root, "main");
         let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
         // #1 genuinely matches the local checkout's identity.
-        let matching = register_open_pr_at(&db, producer, 1, &host_base, &host_owner, &host_repo).await;
+        let matching =
+            register_open_pr_at(&db, producer, 1, &host_base, &host_owner, &host_repo).await;
         // #2 targets a COMPLETELY unrelated repo — registered against the SAME direction, which
         // nothing today prevents.
-        let unrelated = register_open_pr_at(&db, producer, 2, "localhost", "totally-unrelated-owner", "unrelated-repo").await;
+        let unrelated = register_open_pr_at(
+            &db,
+            producer,
+            2,
+            "localhost",
+            "totally-unrelated-owner",
+            "unrelated-repo",
+        )
+        .await;
 
         let matching_snapshot = crate::host::PrSnapshot {
             head_sha: "abc".into(),
@@ -8441,11 +14119,18 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, matching.id, &matching_snapshot, &crate::host::MergeReadiness::Ready)
-            .await
-            .unwrap();
+        apply_pull_request_snapshot(
+            &db,
+            matching.id,
+            &matching_snapshot,
+            &crate::host::MergeReadiness::Ready,
+            StreakUpdate::Clear,
+        )
+        .await
+        .unwrap();
         // The unrelated repo's PR merged into a branch that COINCIDENTALLY shares the real
         // checkout's default branch NAME ("main") — the exact false-positive shape this fix
         // closes.
@@ -8457,11 +14142,18 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, unrelated.id, &unrelated_snapshot, &crate::host::MergeReadiness::Ready)
-            .await
-            .unwrap();
+        apply_pull_request_snapshot(
+            &db,
+            unrelated.id,
+            &unrelated_snapshot,
+            &crate::host::MergeReadiness::Ready,
+            StreakUpdate::Clear,
+        )
+        .await
+        .unwrap();
 
         match upstream_merge_state(&db, consumer).await {
             crate::host::UpstreamStatus::Unknown { .. } => {}
@@ -8485,8 +14177,10 @@ mod tests {
     #[tokio::test]
     async fn upstream_merge_state_reflects_the_remote_being_repointed_after_registration() {
         let db = mem().await;
-        let root = std::env::temp_dir()
-            .join(format!("weft-upstream-repointed-remote-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "weft-upstream-repointed-remote-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         // live origin is a real, resolvable file:// repo whose derived identity is registered below
@@ -8501,9 +14195,10 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &crate::host::MergeReadiness::Ready, StreakUpdate::Clear)
             .await
             .unwrap();
 
@@ -8516,7 +14211,16 @@ mod tests {
         // Re-point the SAME checkout's origin to an unrelated repo — no DB write at all, only
         // `git remote set-url` on disk. `repo_ref.remote_url` (if this read it) would still say
         // whatever was captured at `add_repo_ref` time.
-        sh(&clone_path, &["git", "remote", "set-url", "origin", "https://github.com/someone-else/other-repo"]);
+        sh(
+            &clone_path,
+            &[
+                "git",
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/someone-else/other-repo",
+            ],
+        );
 
         match upstream_merge_state(&db, consumer).await {
             crate::host::UpstreamStatus::Unknown { .. } => {}
@@ -8544,33 +14248,63 @@ mod tests {
         /// hyphens — `other-acme` legitimately ending in `acme` is not a hypothetical.
         #[test]
         fn rejects_an_owner_that_merely_ends_with_the_expected_owner() {
-            assert!(!remote_matches_pr_host("https://github.com/other-acme/api.git", "github.com", "acme", "api"));
-            assert!(!remote_matches_pr_host("git@github.com:other-acme/api.git", "github.com", "acme", "api"));
+            assert!(!remote_matches_pr_host(
+                "https://github.com/other-acme/api.git",
+                "github.com",
+                "acme",
+                "api"
+            ));
+            assert!(!remote_matches_pr_host(
+                "git@github.com:other-acme/api.git",
+                "github.com",
+                "acme",
+                "api"
+            ));
         }
 
         /// The other direction: `acme-corp` starts with `acme` but is a different owner.
         #[test]
         fn rejects_an_owner_that_merely_starts_with_the_expected_owner() {
-            assert!(!remote_matches_pr_host("https://github.com/acme-corp/api.git", "github.com", "acme", "api"));
+            assert!(!remote_matches_pr_host(
+                "https://github.com/acme-corp/api.git",
+                "github.com",
+                "acme",
+                "api"
+            ));
         }
 
         /// `api-v2` shares a prefix with `api` but is a different repo.
         #[test]
         fn rejects_a_repo_that_merely_shares_a_prefix_with_the_expected_repo() {
-            assert!(!remote_matches_pr_host("https://github.com/acme/api-v2.git", "github.com", "acme", "api"));
+            assert!(!remote_matches_pr_host(
+                "https://github.com/acme/api-v2.git",
+                "github.com",
+                "acme",
+                "api"
+            ));
         }
 
         /// `mygitlab.com` CONTAINS `gitlab.com` as a substring but is a different host.
         #[test]
         fn rejects_a_host_that_merely_contains_the_expected_host_as_a_substring() {
-            assert!(!remote_matches_pr_host("https://mygitlab.com/o/r.git", "gitlab.com", "o", "r"));
+            assert!(!remote_matches_pr_host(
+                "https://mygitlab.com/o/r.git",
+                "gitlab.com",
+                "o",
+                "r"
+            ));
         }
 
         /// `gitlab.com.evil.tld` has `gitlab.com` as a PREFIX (a classic domain-spoofing
         /// shape) but is a different host entirely.
         #[test]
         fn rejects_a_host_that_merely_has_the_expected_host_as_a_prefix() {
-            assert!(!remote_matches_pr_host("https://gitlab.com.evil.tld/o/r.git", "gitlab.com", "o", "r"));
+            assert!(!remote_matches_pr_host(
+                "https://gitlab.com.evil.tld/o/r.git",
+                "gitlab.com",
+                "o",
+                "r"
+            ));
         }
 
         /// A GitLab nested-subgroup analogue of the owner-suffix collision: `host_owner` can
@@ -8631,7 +14365,8 @@ mod tests {
         /// match — both sides compare host WITHOUT a port, since SSH and HTTPS access to the
         /// SAME repo routinely use different ports.
         #[test]
-        fn accepts_a_self_hosted_host_base_with_an_explicit_port_regardless_of_the_remotes_own_port() {
+        fn accepts_a_self_hosted_host_base_with_an_explicit_port_regardless_of_the_remotes_own_port(
+        ) {
             assert!(remote_matches_pr_host(
                 "https://git.internal:8443/acme/api.git",
                 "git.internal:8443",
@@ -8690,7 +14425,8 @@ mod tests {
         /// not a "maybe the same install" case. See the near-miss pair below for the corrected
         /// behavior at both standard (443) and non-standard (8443) ports, from both sides.
         #[test]
-        fn rejects_an_https_remote_with_no_explicit_port_against_a_host_base_on_a_non_standard_port() {
+        fn rejects_an_https_remote_with_no_explicit_port_against_a_host_base_on_a_non_standard_port(
+        ) {
             assert!(!remote_matches_pr_host(
                 "https://gitlab.corp/acme/api.git",
                 "gitlab.corp:8443",
@@ -8766,15 +14502,35 @@ mod tests {
         #[test]
         fn rejects_empty_inputs() {
             assert!(!remote_matches_pr_host("", "github.com", "acme", "api"));
-            assert!(!remote_matches_pr_host("https://github.com/acme/api", "", "acme", "api"));
-            assert!(!remote_matches_pr_host("https://github.com/acme/api", "github.com", "", "api"));
-            assert!(!remote_matches_pr_host("https://github.com/acme/api", "github.com", "acme", ""));
+            assert!(!remote_matches_pr_host(
+                "https://github.com/acme/api",
+                "",
+                "acme",
+                "api"
+            ));
+            assert!(!remote_matches_pr_host(
+                "https://github.com/acme/api",
+                "github.com",
+                "",
+                "api"
+            ));
+            assert!(!remote_matches_pr_host(
+                "https://github.com/acme/api",
+                "github.com",
+                "acme",
+                ""
+            ));
         }
 
         /// A malformed/unrecognized remote shape (no scheme, no colon) must fail safe.
         #[test]
         fn rejects_an_unparseable_remote() {
-            assert!(!remote_matches_pr_host("not-a-remote-url", "github.com", "acme", "api"));
+            assert!(!remote_matches_pr_host(
+                "not-a-remote-url",
+                "github.com",
+                "acme",
+                "api"
+            ));
         }
     }
 
@@ -8795,11 +14551,18 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, first.id, &snapshot, &crate::host::MergeReadiness::Ready)
-            .await
-            .unwrap();
+        apply_pull_request_snapshot(
+            &db,
+            first.id,
+            &snapshot,
+            &crate::host::MergeReadiness::Ready,
+            StreakUpdate::Clear,
+        )
+        .await
+        .unwrap();
 
         assert!(
             matches!(
@@ -8824,14 +14587,18 @@ mod tests {
     #[tokio::test]
     async fn a_closed_without_merging_pr_still_blocks_the_consumer_even_with_a_later_merge() {
         let db = mem().await;
-        let root = std::env::temp_dir()
-            .join(format!("weft-upstream-closed-sibling-pr-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "weft-upstream-closed-sibling-pr-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let (clone_path, host_base, host_owner, host_repo) = make_repo_with_origin(&root, "main");
         let (producer, consumer) = ordered_pair_at(&db, clone_path.to_str().unwrap()).await;
-        let closed = register_open_pr_at(&db, producer, 1, &host_base, &host_owner, &host_repo).await;
-        let merged = register_open_pr_at(&db, producer, 2, &host_base, &host_owner, &host_repo).await;
+        let closed =
+            register_open_pr_at(&db, producer, 1, &host_base, &host_owner, &host_repo).await;
+        let merged =
+            register_open_pr_at(&db, producer, 2, &host_base, &host_owner, &host_repo).await;
 
         // #1 closes WITHOUT merging — could be a superseded retry, or could be a second
         // independently required PR that got abandoned. This store cannot tell which.
@@ -8843,11 +14610,18 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Closed,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, closed.id, &closed_snapshot, &crate::host::MergeReadiness::Ready)
-            .await
-            .unwrap();
+        apply_pull_request_snapshot(
+            &db,
+            closed.id,
+            &closed_snapshot,
+            &crate::host::MergeReadiness::Ready,
+            StreakUpdate::Clear,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(
                 upstream_merge_state(&db, consumer).await,
@@ -8865,11 +14639,18 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Merged,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
-        apply_pull_request_snapshot(&db, merged.id, &merged_snapshot, &crate::host::MergeReadiness::Ready)
-            .await
-            .unwrap();
+        apply_pull_request_snapshot(
+            &db,
+            merged.id,
+            &merged_snapshot,
+            &crate::host::MergeReadiness::Ready,
+            StreakUpdate::Clear,
+        )
+        .await
+        .unwrap();
 
         assert!(
             matches!(
@@ -8894,7 +14675,9 @@ mod tests {
         let r = add_repo_ref(&db, ws.id, "api", "/tmp/dangle-api", "main", "", true)
             .await
             .unwrap();
-        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
         let d = create_direction(&db, t.id, "consumer", "claude", r.id, "r", "impl-only", "")
             .await
             .unwrap();
@@ -8902,7 +14685,10 @@ mod tests {
 
         match upstream_merge_state(&db, d.id).await {
             crate::host::UpstreamStatus::Unknown { reason } => {
-                assert!(reason.contains("4242"), "reason names the missing id: {reason}");
+                assert!(
+                    reason.contains("4242"),
+                    "reason names the missing id: {reason}"
+                );
             }
             other => panic!("a dangling edge must be Unknown, got {other:?}"),
         }
@@ -8933,12 +14719,23 @@ mod tests {
         let r = add_repo_ref(db, ws.id, "api", "/tmp/cycle-api", "main", "", true)
             .await
             .unwrap();
-        let t = create_thread(db, ws.id, "t", "feature", "claude").await.unwrap();
+        let t = create_thread(db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
         let mut ids = Vec::with_capacity(count);
         for i in 0..count {
-            let d = create_direction(db, t.id, &format!("d{i}"), "claude", r.id, "r", "impl-only", "")
-                .await
-                .unwrap();
+            let d = create_direction(
+                db,
+                t.id,
+                &format!("d{i}"),
+                "claude",
+                r.id,
+                "r",
+                "impl-only",
+                "",
+            )
+            .await
+            .unwrap();
             ids.push(d.id);
         }
         ids
@@ -8967,7 +14764,10 @@ mod tests {
 
         // The rejected write must not have landed: B still has no upstream.
         let b_dir = get_direction(&db, b).await.unwrap().unwrap();
-        assert_eq!(b_dir.depends_on_direction_id, 0, "the rejected edge must not persist");
+        assert_eq!(
+            b_dir.depends_on_direction_id, 0,
+            "the rejected edge must not persist"
+        );
     }
 
     /// A single-upstream-per-task graph can still contain an arbitrarily LONG
@@ -8991,7 +14791,10 @@ mod tests {
         );
 
         let c_dir = get_direction(&db, c).await.unwrap().unwrap();
-        assert_eq!(c_dir.depends_on_direction_id, 0, "the rejected edge must not persist");
+        assert_eq!(
+            c_dir.depends_on_direction_id, 0,
+            "the rejected edge must not persist"
+        );
     }
 
     /// Two INDEPENDENT tasks pointing at the SAME upstream is a fan-in, not a
@@ -9003,8 +14806,12 @@ mod tests {
         let ids = bare_directions(&db, 3).await;
         let (producer, consumer_1, consumer_2) = (ids[0], ids[1], ids[2]);
 
-        set_direction_upstream(&db, consumer_1, producer).await.unwrap();
-        set_direction_upstream(&db, consumer_2, producer).await.unwrap();
+        set_direction_upstream(&db, consumer_1, producer)
+            .await
+            .unwrap();
+        set_direction_upstream(&db, consumer_2, producer)
+            .await
+            .unwrap();
 
         let c1 = get_direction(&db, consumer_1).await.unwrap().unwrap();
         let c2 = get_direction(&db, consumer_2).await.unwrap().unwrap();
@@ -9016,13 +14823,24 @@ mod tests {
     async fn next_turn_id_increments_from_last_row() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = create_workspace(&db, "ws_turn").await.unwrap();
-        let t = create_thread(&db, ws.id, "curator", "curator", "claude").await.unwrap();
+        let t = create_thread(&db, ws.id, "curator", "curator", "claude")
+            .await
+            .unwrap();
         // Empty thread → 1.
         assert_eq!(next_turn_id(&db, t.id).await.unwrap(), 1);
         // Insert a row with turn_id 4 → next is 5.
-        insert_lead_message(&db, t.id, None, 4, "user", "text", r#"{"text":"hi"}"#, "complete")
-            .await
-            .unwrap();
+        insert_lead_message(
+            &db,
+            t.id,
+            None,
+            4,
+            "user",
+            "text",
+            r#"{"text":"hi"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
         assert_eq!(next_turn_id(&db, t.id).await.unwrap(), 5);
     }
 
@@ -9034,15 +14852,42 @@ mod tests {
     async fn delivery_seq_overrides_id_order() {
         let db = mem().await;
         let t = live_thread(&db).await;
-        let a = insert_lead_message(&db, t, None, 1, "user", "text", r#"{"text":"A"}"#, "complete")
-            .await
-            .unwrap();
-        let b = insert_lead_message(&db, t, None, 2, "user", "text", r#"{"text":"B"}"#, "complete")
-            .await
-            .unwrap();
-        let c = insert_lead_message(&db, t, None, 3, "user", "text", r#"{"text":"C"}"#, "complete")
-            .await
-            .unwrap();
+        let a = insert_lead_message(
+            &db,
+            t,
+            None,
+            1,
+            "user",
+            "text",
+            r#"{"text":"A"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let b = insert_lead_message(
+            &db,
+            t,
+            None,
+            2,
+            "user",
+            "text",
+            r#"{"text":"B"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let c = insert_lead_message(
+            &db,
+            t,
+            None,
+            3,
+            "user",
+            "text",
+            r#"{"text":"C"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
 
         // Assign a delivery seq to B as if it was delivered after C (reorder scenario).
         // max(COALESCE(seq,id)) over [a.id, b.id, c.id] = c.id, so B.seq = c.id + 1.
@@ -9052,7 +14897,11 @@ mod tests {
         let msgs = list_lead_messages(&db, t).await.unwrap();
         let ids: Vec<i32> = msgs.iter().map(|m| m.id).collect();
         // COALESCE(seq, id) ordering: A → a.id, C → c.id, B → c.id+1
-        assert_eq!(ids, vec![a.id, c.id, b.id], "B must sort after C once its seq > C.id");
+        assert_eq!(
+            ids,
+            vec![a.id, c.id, b.id],
+            "B must sort after C once its seq > C.id"
+        );
     }
 
     // ---- pull_request (issue #110 T1) ----
@@ -9063,8 +14912,18 @@ mod tests {
         let (_ws, repo, thread, dir) = worker_fixture(&db).await;
 
         let first = register_pull_request(
-            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 42,
-            "https://github.com/acme/widgets/pull/42", "first title",
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            42,
+            "https://github.com/acme/widgets/pull/42",
+            "first title",
         )
         .await
         .unwrap();
@@ -9074,8 +14933,18 @@ mod tests {
         // Re-registering the SAME (host_kind, owner, repo, number) updates the
         // existing row instead of creating a second one.
         let second = register_pull_request(
-            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 42,
-            "https://github.com/acme/widgets/pull/42", "updated title",
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            42,
+            "https://github.com/acme/widgets/pull/42",
+            "updated title",
         )
         .await
         .unwrap();
@@ -9091,12 +14960,34 @@ mod tests {
         let db = mem().await;
         let (_ws, repo, thread, dir) = worker_fixture(&db).await;
         let open = register_pull_request(
-            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 1, "", "",
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            1,
+            "",
+            "",
         )
         .await
         .unwrap();
         let merged = register_pull_request(
-            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 2, "", "",
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            2,
+            "",
+            "",
         )
         .await
         .unwrap();
@@ -9117,26 +15008,56 @@ mod tests {
         let db = mem().await;
         let (_ws, repo, thread, dir) = worker_fixture(&db).await;
         let healthy = register_pull_request(
-            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 1, "", "",
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            1,
+            "",
+            "",
         )
         .await
         .unwrap();
         let broken = register_pull_request(
-            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 2, "", "",
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            2,
+            "",
+            "",
         )
         .await
         .unwrap();
 
         // Under the threshold: still swept.
-        mark_pull_request_probe_error(&db, broken.id, "blip").await.unwrap();
+        mark_pull_request_probe_error(&db, broken.id, "blip")
+            .await
+            .unwrap();
         let listed = list_open_pull_requests(&db, 2).await.unwrap();
         assert_eq!(listed.len(), 2, "a single failure must not stop the sweep");
 
         // At the threshold: no longer swept.
-        mark_pull_request_probe_error(&db, broken.id, "still broken").await.unwrap();
+        mark_pull_request_probe_error(&db, broken.id, "still broken")
+            .await
+            .unwrap();
         let listed = list_open_pull_requests(&db, 2).await.unwrap();
         let ids: Vec<i32> = listed.iter().map(|p| p.id).collect();
-        assert_eq!(ids, vec![healthy.id], "a row at the give-up threshold must fall out of the sweep");
+        assert_eq!(
+            ids,
+            vec![healthy.id],
+            "a row at the give-up threshold must fall out of the sweep"
+        );
 
         // A later SUCCESS resets the streak — the row rejoins the sweep.
         let snapshot = crate::host::PrSnapshot {
@@ -9147,18 +15068,306 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Open,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         let readiness =
             crate::host::judge::merge_readiness(
                 &snapshot.ci,
                 &snapshot.review,
+                &snapshot.threads,
                 &snapshot.conflict,
                 &host::UpstreamStatus::None,
             );
-        apply_pull_request_snapshot(&db, broken.id, &snapshot, &readiness).await.unwrap();
+        apply_pull_request_snapshot(&db, broken.id, &snapshot, &readiness, StreakUpdate::Clear)
+            .await
+            .unwrap();
         let listed = list_open_pull_requests(&db, 2).await.unwrap();
-        assert_eq!(listed.len(), 2, "a success must reset the failure streak and rejoin the sweep");
+        assert_eq!(
+            listed.len(),
+            2,
+            "a success must reset the failure streak and rejoin the sweep"
+        );
+    }
+
+    /// Codex review round 2 P2 (issue #110): a PARTIAL read must not reset
+    /// the failure streak.
+    ///
+    /// The reported shape: `gh api graphql` fails persistently (a token
+    /// without `reviewThreads` access, a GHE install that does not serve the
+    /// query) while `gh pr view` keeps succeeding. `fetch_status` then returns
+    /// `Ok` with `threads: Unknown` every sweep. If that counted as an
+    /// unqualified success it would zero the streak forever: the give-up
+    /// threshold could never be reached, the failing request would be retried
+    /// until the end of time, and the human would never be escalated past a
+    /// self-clearing "indeterminate" note.
+    #[tokio::test]
+    async fn a_partial_read_accumulates_the_failure_streak_instead_of_resetting_it() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let pr = register_pull_request(
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            7,
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+
+        let partial = crate::host::PrSnapshot {
+            head_sha: "aaa".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Open,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::Unknown { reason: "no access".to_string() },
+            conflict: crate::host::ConflictStatus::Clean,
+        };
+        // The snapshot itself decides it is partial, so the monitor and the
+        // auto-merge loop cannot disagree about what a given read was.
+        let axis_error = partial.unreadable_axis_error();
+        assert_eq!(axis_error, Some("no access"));
+
+        for expected in 1..=3 {
+            let count = apply_pull_request_snapshot(
+                &db,
+                pr.id,
+                &partial,
+                &crate::host::MergeReadiness::Indeterminate { reasons: vec!["x".to_string()] },
+                StreakUpdate::Extend(axis_error.unwrap()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(count, Some(expected), "each partial read must extend the streak");
+        }
+
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.probe_fail_count, 3);
+        assert_eq!(
+            reloaded.last_error, "no access",
+            "the diagnostic must stay visible — \"could not tell\" must never look like \"checked, fine\""
+        );
+        // The readable axes are still persisted: refusing to discard them is
+        // the entire reason a partial read is not simply an error.
+        assert_eq!(
+            crate::host::gate::parse_ci(&reloaded.ci_status),
+            crate::host::CiStatus::Passing
+        );
+        assert!(
+            list_open_pull_requests(&db, 3).await.unwrap().is_empty(),
+            "at the threshold the row must fall out of the sweep instead of retrying forever"
+        );
+
+        // And a later COMPLETE read clears it, so a transient failure heals.
+        let complete = crate::host::PrSnapshot {
+            threads: crate::host::ThreadStatus::AllResolved,
+            ..partial.clone()
+        };
+        assert_eq!(complete.unreadable_axis_error(), None);
+        let count = apply_pull_request_snapshot(
+            &db,
+            pr.id,
+            &complete,
+            &crate::host::MergeReadiness::Ready,
+            StreakUpdate::Clear,
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, Some(0), "a complete read resets the streak");
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.last_error, "", "and clears the diagnostic with it");
+    }
+
+    /// A snapshot whose thread axis failed to read — the PARTIAL shape.
+    fn partial_snapshot(reason: &str) -> crate::host::PrSnapshot {
+        crate::host::PrSnapshot {
+            head_sha: "aaa".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: crate::host::PrLifecycle::Open,
+            ci: crate::host::CiStatus::Passing,
+            review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::Unknown { reason: reason.to_string() },
+            conflict: crate::host::ConflictStatus::Clean,
+        }
+    }
+
+    /// Codex review round 3 P2: `last_error == ""` is this column's sentinel
+    /// for "no error", so an extending write must never leave it blank — that
+    /// would be a row whose failure streak is climbing while its error column
+    /// reads perfectly clean, and a notice rendering an empty diagnostic.
+    /// Guaranteed here, at the single point that writes the column, rather
+    /// than trusting every caller to build a non-empty reason (`gh` killed by
+    /// a signal writes no stderr at all).
+    #[tokio::test]
+    async fn an_extending_write_never_leaves_the_error_column_blank() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let pr = register_pull_request(
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            8,
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+        let snapshot = partial_snapshot("");
+
+        for blank in ["", "   ", "\n\t "] {
+            apply_pull_request_snapshot(
+                &db,
+                pr.id,
+                &snapshot,
+                &crate::host::MergeReadiness::Indeterminate { reasons: vec!["x".to_string()] },
+                StreakUpdate::Extend(blank),
+            )
+            .await
+            .unwrap();
+            let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+            assert!(
+                !reloaded.last_error.is_empty(),
+                "reason={blank:?} must not leave the column reading as \"no error\""
+            );
+        }
+    }
+
+    /// Codex review round 4 P2: under `Leave`, a monitor increment that lands
+    /// between this call's read and its write must SURVIVE.
+    ///
+    /// The original `Leave` read `probe_fail_count` and wrote the same value
+    /// back. That looks like a no-op and is not one — the monitor runs on its
+    /// own loop, so a concurrent increment would be silently undone and a
+    /// persistently failing query would never reach the give-up threshold:
+    /// the exact bug `Leave` was introduced to prevent, through a narrower
+    /// window.
+    ///
+    /// The race is made deterministic by splitting the read from the write
+    /// (`build_snapshot_update` is the pure half) and performing the
+    /// "concurrent" increment in between. Asserting on the `ActiveValue`
+    /// variant instead would prove nothing: `Model::into()` yields
+    /// `Unchanged`, and whether SeaORM omits `Unchanged` from the SET clause
+    /// is precisely the fact under test — so this exercises it against a real
+    /// database rather than restating an assumption about the ORM.
+    #[tokio::test]
+    async fn a_concurrent_increment_survives_a_leave_write() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let pr = register_pull_request(
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            11,
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+        mark_pull_request_probe_error(&db, pr.id, "monitor failure 1").await.unwrap();
+        let row = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(row.probe_fail_count, 1);
+
+        // The auto-merge loop reads the row...
+        let mut snapshot = partial_snapshot("ignored under Leave");
+        snapshot.head_sha = "landed_anyway".to_string();
+        let (a, reported) = build_snapshot_update(
+            row,
+            &snapshot,
+            &crate::host::MergeReadiness::Ready,
+            StreakUpdate::Leave,
+        );
+        assert_eq!(reported, 1, "it reports the count it observed");
+
+        // ...the monitor increments while that write is in flight...
+        mark_pull_request_probe_error(&db, pr.id, "monitor failure 2").await.unwrap();
+        assert_eq!(get_pull_request(&db, pr.id).await.unwrap().unwrap().probe_fail_count, 2);
+
+        // ...and the write lands.
+        a.update(&db.0).await.unwrap();
+
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.probe_fail_count, 2,
+            "the monitor's increment must survive — writing back the observed 1 would undo it \
+             and the give-up threshold would never be reached"
+        );
+        assert_eq!(
+            reloaded.last_error, "monitor failure 2",
+            "and the monitor's newer diagnostic must survive too"
+        );
+        assert_eq!(reloaded.head_sha, "landed_anyway", "while the axes still land");
+    }
+
+    /// `StreakUpdate::Leave` is what keeps the monitor the SOLE owner of the
+    /// give-up decision: the auto-merge loop persists axes through the same
+    /// function, and must be unable to move the streak in either direction.
+    #[tokio::test]
+    async fn leave_persists_the_axes_without_touching_the_streak_or_the_diagnostic() {
+        let db = mem().await;
+        let (_ws, repo, thread, dir) = worker_fixture(&db).await;
+        let pr = register_pull_request(
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            9,
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+        mark_pull_request_probe_error(&db, pr.id, "the monitor's own diagnostic").await.unwrap();
+        mark_pull_request_probe_error(&db, pr.id, "the monitor's own diagnostic").await.unwrap();
+
+        let mut snapshot = partial_snapshot("ignored by Leave");
+        snapshot.head_sha = "landed_anyway".to_string();
+        let count = apply_pull_request_snapshot(
+            &db,
+            pr.id,
+            &snapshot,
+            &crate::host::MergeReadiness::Ready,
+            StreakUpdate::Leave,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, Some(2), "reports the streak it found, having not moved it");
+        let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.probe_fail_count, 2, "neither cleared nor extended");
+        assert_eq!(
+            reloaded.last_error, "the monitor's own diagnostic",
+            "the monitor's diagnostic must survive a write from the other loop"
+        );
+        assert_eq!(reloaded.head_sha, "landed_anyway", "but the axes still land");
     }
 
     /// P1-A (issue #110 adversarial review, round 3): a success is not the
@@ -9173,7 +15382,18 @@ mod tests {
         let db = mem().await;
         let (_ws, repo, thread, dir) = worker_fixture(&db).await;
         let pr = register_pull_request(
-            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 4, "", "",
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            4,
+            "",
+            "",
         )
         .await
         .unwrap();
@@ -9181,23 +15401,48 @@ mod tests {
         // Push it past a small give-up threshold — simulating the dead end:
         // no success is coming (that's the whole point of "gave up"), so the
         // ONLY thing that can still touch this row is a fresh registration.
-        mark_pull_request_probe_error(&db, pr.id, "still broken").await.unwrap();
-        mark_pull_request_probe_error(&db, pr.id, "still broken").await.unwrap();
+        mark_pull_request_probe_error(&db, pr.id, "still broken")
+            .await
+            .unwrap();
+        mark_pull_request_probe_error(&db, pr.id, "still broken")
+            .await
+            .unwrap();
         let listed = list_open_pull_requests(&db, 2).await.unwrap();
-        assert!(listed.is_empty(), "must have fallen out of the sweep at the threshold");
+        assert!(
+            listed.is_empty(),
+            "must have fallen out of the sweep at the threshold"
+        );
 
         // Re-registering the SAME PR (natural key unchanged) must reset the
         // streak and bring it back into the sweep — the row was never
         // actually resolved, but the human/agent asked weft to try again.
         register_pull_request(
-            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 4, "", "",
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            4,
+            "",
+            "",
         )
         .await
         .unwrap();
         let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
-        assert_eq!(reloaded.probe_fail_count, 0, "re-registration must reset the streak");
+        assert_eq!(
+            reloaded.probe_fail_count, 0,
+            "re-registration must reset the streak"
+        );
         let listed = list_open_pull_requests(&db, 2).await.unwrap();
-        assert_eq!(listed.len(), 1, "the row must rejoin the sweep after re-registration");
+        assert_eq!(
+            listed.len(),
+            1,
+            "the row must rejoin the sweep after re-registration"
+        );
     }
 
     #[tokio::test]
@@ -9205,7 +15450,18 @@ mod tests {
         let db = mem().await;
         let (_ws, repo, thread, dir) = worker_fixture(&db).await;
         let pr = register_pull_request(
-            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 7, "", "",
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            7,
+            "",
+            "",
         )
         .await
         .unwrap();
@@ -9221,21 +15477,26 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Open,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         let readiness = crate::host::judge::merge_readiness(
                 &snapshot.ci,
                 &snapshot.review,
+                &snapshot.threads,
                 &snapshot.conflict,
                 &host::UpstreamStatus::None,
             );
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness)
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness, StreakUpdate::Clear)
             .await
             .unwrap();
 
         let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
         assert_eq!(reloaded.head_sha, "abc123");
-        assert_eq!(reloaded.last_error, "", "a successful apply clears any prior probe error");
+        assert_eq!(
+            reloaded.last_error, "",
+            "a successful apply clears any prior probe error"
+        );
         assert!(!reloaded.last_checked_at.is_empty());
         assert!(reloaded.ci_status.contains("passing"));
         assert!(reloaded.merge_readiness.contains("ready"));
@@ -9246,7 +15507,18 @@ mod tests {
         let db = mem().await;
         let (_ws, repo, thread, dir) = worker_fixture(&db).await;
         let pr = register_pull_request(
-            &db, thread.id, dir.id, repo.id, "github", "github.com", "acme", "widgets", 9, "", "",
+            &db,
+            thread.id,
+            dir.id,
+            repo.id,
+            worker_pr_source(&db, dir.id, repo.id).await,
+            "github",
+            "github.com",
+            "acme",
+            "widgets",
+            9,
+            "",
+            "",
         )
         .await
         .unwrap();
@@ -9258,15 +15530,17 @@ mod tests {
             lifecycle: crate::host::PrLifecycle::Open,
             ci: crate::host::CiStatus::Passing,
             review: crate::host::ReviewStatus::Approved,
+            threads: crate::host::ThreadStatus::AllResolved,
             conflict: crate::host::ConflictStatus::Clean,
         };
         let readiness = crate::host::judge::merge_readiness(
-                &snapshot.ci,
-                &snapshot.review,
-                &snapshot.conflict,
-                &host::UpstreamStatus::None,
-            );
-        apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness)
+            &snapshot.ci,
+            &snapshot.review,
+            &snapshot.threads,
+            &snapshot.conflict,
+            &host::UpstreamStatus::None,
+        );
+        apply_pull_request_snapshot(&db, pr.id, &snapshot, &readiness, StreakUpdate::Clear)
             .await
             .unwrap();
 
@@ -9276,7 +15550,379 @@ mod tests {
             .await
             .unwrap();
         let reloaded = get_pull_request(&db, pr.id).await.unwrap().unwrap();
-        assert_eq!(reloaded.head_sha, "known-good-sha", "probe failure must not blank the last known snapshot");
+        assert_eq!(
+            reloaded.head_sha, "known-good-sha",
+            "probe failure must not blank the last known snapshot"
+        );
         assert_eq!(reloaded.last_error, "network blip");
+    }
+
+    #[tokio::test]
+    async fn plan_decision_enqueue_resolve_is_idempotent_and_consumable() {
+        let db = mem().await;
+        let workspace = create_workspace(&db, "hidden-plan").await.unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let card = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "plan_card",
+            r#"{"title":"Ship it","requirements":[],"approach":"","split":[],"risks":[]}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let first = enqueue_plan_decision_and_resolve(&db, thread.id, card.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(action_card_is_resolved(&first.0.content));
+        assert_eq!(first.1.source_kind, "plan_decision");
+        assert_eq!(first.1.source_id, card.id);
+
+        let replay = enqueue_plan_decision_and_resolve(&db, thread.id, card.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.1.id, first.1.id);
+        assert_eq!(
+            list_pending_lead_hidden_deliveries(&db, Some(thread.id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let consumed = consume_lead_hidden_delivery(&db, first.1.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed.id, first.1.id);
+        assert!(
+            list_pending_lead_hidden_deliveries(&db, Some(thread.id))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_action_journal_enqueue_rejects_unready_or_tampered_rows() {
+        let db = mem().await;
+        let workspace = create_workspace(&db, "journal-guard").await.unwrap();
+        let repo = add_repo_ref(&db, workspace.id, "repo", "/tmp/journal-guard", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        assert!(enqueue_repo_action_feedback_from_journal(&db, 9999)
+            .await
+            .unwrap()
+            .is_none());
+
+        let pending_message = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "action_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let pending = insert_test_repo_action_execution(
+            &db,
+            9100,
+            workspace.id,
+            thread.id,
+            pending_message.id,
+            &repo,
+            "pending",
+            REPO_ACTION_FEEDBACK_PENDING,
+        )
+        .await;
+        let mut pending_active: repo_action_execution::ActiveModel = pending.into();
+        pending_active.status = Set(REPO_ACTION_PENDING.to_string());
+        pending_active.update(&db.0).await.unwrap();
+        assert!(enqueue_repo_action_feedback_from_journal(&db, 9100)
+            .await
+            .unwrap()
+            .is_none());
+
+        let delivered_message = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            2,
+            "assistant",
+            "action_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let delivered = insert_test_repo_action_execution(
+            &db,
+            9101,
+            workspace.id,
+            thread.id,
+            delivered_message.id,
+            &repo,
+            "delivered",
+            REPO_ACTION_FEEDBACK_DELIVERED,
+        )
+        .await;
+        assert!(enqueue_repo_action_feedback_from_journal(&db, delivered.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let tampered_message = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            3,
+            "assistant",
+            "action_card",
+            "{}",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let tampered = insert_test_repo_action_execution(
+            &db,
+            9102,
+            workspace.id,
+            thread.id,
+            tampered_message.id,
+            &repo,
+            "tampered",
+            REPO_ACTION_FEEDBACK_PENDING,
+        )
+        .await;
+        let mut tampered_payload: serde_json::Value =
+            serde_json::from_str(&tampered.feedback_payload).unwrap();
+        tampered_payload["workspace_id"] = serde_json::json!(workspace.id + 1000);
+        let mut tampered_active: repo_action_execution::ActiveModel = tampered.clone().into();
+        tampered_active.feedback_payload = Set(tampered_payload.to_string());
+        tampered_active.update(&db.0).await.unwrap();
+        assert!(enqueue_repo_action_feedback_from_journal(&db, tampered.id)
+            .await
+            .is_err());
+        assert!(get_lead_hidden_delivery_by_dedupe(&db, "repo_action:9102")
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut repaired_active: repo_action_execution::ActiveModel = tampered.into();
+        repaired_active.feedback_payload = Set(serde_json::json!({
+            "tool": "repo_action",
+            "action_id": "tampered",
+            "kind": "add",
+            "status": "ok",
+            "execution_id": 9102,
+            "workspace_id": workspace.id,
+            "repo_id": repo.id.to_string(),
+            "name": repo.name,
+            "local_git_path": repo.local_git_path,
+        }).to_string());
+        repaired_active.update(&db.0).await.unwrap();
+        assert!(enqueue_repo_action_feedback_from_journal(&db, 9102)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn repo_action_completion_rolls_back_when_hidden_outbox_insert_fails() {
+        let db = mem().await;
+        let workspace = create_workspace(&db, "atomic-complete").await.unwrap();
+        let repo = add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/atomic-complete",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let card = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "action_card",
+            r#"{"title":"Add repo","actions":[{"id":"atomic","kind":"add","label":"Run"}]}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let execution = insert_test_repo_action_execution(
+            &db,
+            9201,
+            workspace.id,
+            thread.id,
+            card.id,
+            &repo,
+            "atomic",
+            REPO_ACTION_FEEDBACK_NONE,
+        )
+        .await;
+        let mut materialized: repo_action_execution::ActiveModel = execution.clone().into();
+        materialized.status = Set(REPO_ACTION_MATERIALIZED.to_string());
+        materialized.feedback_payload = Set(String::new());
+        let execution = materialized.update(&db.0).await.unwrap();
+
+        db.0
+            .execute_unprepared(
+                "CREATE TRIGGER fail_hidden_delivery_insert BEFORE INSERT ON lead_hidden_delivery \
+                 BEGIN SELECT RAISE(ABORT, 'forced hidden outbox failure'); END;",
+            )
+            .await
+            .unwrap();
+        let error = complete_repo_action_execution(&db, &execution, &repo)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("forced hidden outbox failure"));
+
+        let retained = get_repo_action_execution_by_id(&db, execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.status, REPO_ACTION_MATERIALIZED);
+        assert_eq!(retained.feedback_state, REPO_ACTION_FEEDBACK_NONE);
+        assert!(!action_card_is_resolved(
+            &get_lead_message(&db, card.id).await.unwrap().unwrap().content
+        ));
+        assert!(get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{}", execution.id)
+        )
+        .await
+        .unwrap()
+        .is_none());
+        db.0
+            .execute_unprepared("DROP TRIGGER fail_hidden_delivery_insert")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn secondary_repo_delete_preserves_unrelated_hidden_plan_delivery() {
+        let db = mem().await;
+        let workspace = create_workspace(&db, "hidden-repo").await.unwrap();
+        let keep = add_repo_ref(&db, workspace.id, "keep", "/tmp/hidden-keep", "main", "", true)
+            .await
+            .unwrap();
+        let remove =
+            add_repo_ref(&db, workspace.id, "remove", "/tmp/hidden-remove", "main", "", true)
+                .await
+                .unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        create_direction(
+            &db,
+            thread.id,
+            "remove lane",
+            "codex",
+            remove.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let delivery = enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "plan_decision",
+            123,
+            "plan_decision:123",
+            r#"{"tool":"plan_decision","message_id":123}"#,
+        )
+        .await
+        .unwrap();
+        delete_repo_cascade_with_human_cancellations(&db, remove.id)
+            .await
+            .unwrap();
+        assert!(get_repo(&db, keep.id).await.unwrap().is_some());
+        assert!(get_lead_hidden_delivery(&db, delivery.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn later_rewind_preserves_hidden_delivery_for_retained_plan_card() {
+        let db = mem().await;
+        let workspace = create_workspace(&db, "hidden-rewind").await.unwrap();
+        let thread = create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let retained = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "plan_card",
+            r#"{"title":"Retained"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let cut = insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            2,
+            "assistant",
+            "plan_card",
+            r#"{"title":"Abandoned"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let retained_delivery = enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "plan_decision",
+            retained.id,
+            &format!("plan_decision:{}", retained.id),
+            &format!(r#"{{"tool":"plan_decision","message_id":{}}}"#, retained.id),
+        )
+        .await
+        .unwrap();
+        let abandoned_delivery = enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "plan_decision",
+            cut.id,
+            &format!("plan_decision:{}", cut.id),
+            &format!(r#"{{"tool":"plan_decision","message_id":{}}}"#, cut.id),
+        )
+        .await
+        .unwrap();
+        rewind_persist(&db, thread.id, None, cut.id, None, None)
+            .await
+            .unwrap();
+        assert!(get_lead_hidden_delivery(&db, retained_delivery.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_lead_hidden_delivery(&db, abandoned_delivery.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

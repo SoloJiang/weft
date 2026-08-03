@@ -30,8 +30,9 @@
 //!      an earlier row in the same sweep pass). Only a `Merge` verdict here
 //!      proceeds — step 1's verdict never directly authorizes anything.
 //!   6. [`run_gh_merge`] — `gh pr merge --squash --match-head-commit <sha>`,
-//!      off the async runtime (`spawn_blocking`). The ONE new `Command::new`
-//!      in this entire feature, using the head_sha from step 4's fresh read.
+//!      off the async runtime (`spawn_blocking`) through the bounded process
+//!      helper. The ONE new `Command::new` in this entire feature, using the
+//!      head_sha from step 4's fresh read.
 //!      `--match-head-commit` makes GitHub itself refuse the merge if the
 //!      head has moved AGAIN since step 4, closing the last sliver of gap
 //!      between "we just confirmed this" and "the API call executes".
@@ -86,7 +87,11 @@
 //! file does not rely on `gh`'s own idempotency for that guarantee).
 
 use std::collections::HashMap;
-use std::process::Command;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -114,8 +119,8 @@ const PR_AUTOMERGE_SWEEP_DEFAULT_SECS: u64 = 60;
 /// refuses to even attempt a fresh check on its stored `Ready` verdict, even
 /// with zero recorded probe failures (`probe_fail_count == 0`) — the OTHER
 /// way a row's `Ready` column can outlive its truth: not a failing probe
-/// (see `gate::AutoMergeSkipReason::ProbeFailing`), but a STALLED one (the
-/// sweep loop itself wedged, or the whole process was suspended for hours
+/// (see `gate::AutoMergeSkipReason::ProbeFailing`), but missing fresh polling
+/// (the sweep loop wedged, or the whole process was suspended for hours
 /// and just resumed). Ten sweep intervals at `host::monitor`'s own default
 /// cadence — generous enough to ride out ordinary scheduling jitter, far
 /// short of "hours-old". The FINAL authorization (step 5 in this module's
@@ -133,6 +138,12 @@ const MAX_READY_AGE_SECS: i64 = 600;
 /// a human clicking the Needs-you "Retry" button (`commands::
 /// retry_pr_tracking_core`).
 const MAX_MERGE_ATTEMPTS_PER_HEAD: u32 = 3;
+
+/// Hard deadline for the one mutating host command. This is intentionally a
+/// transport bound, not an agent wall-time/watchdog policy: a stuck `gh pr
+/// merge` must release Weft's lifecycle/admission locks, while agent turns keep
+/// their own independent budgets.
+const MERGE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Cloneable handle to the per-(row, head_sha) merge-FAILURE backoff table
 /// (step 3, this module's doc) — Tauri-managed state (`.manage(...)` in
@@ -255,6 +266,11 @@ async fn run_automerge_sweep(app: &AppHandle) {
         return;
     };
     let backoff = backoff.inner().clone();
+    let Some(bus) = app.try_state::<crate::bus::BusRegistry>() else {
+        return;
+    };
+    let bus = bus.inner().clone();
+    let merge_runner: MergeRunner = std::sync::Arc::new(run_gh_merge);
 
     // No probe-failure ceiling here (`i32::MAX`, effectively "don't exclude
     // anything at the query level") — unlike `host::monitor`'s own sweep,
@@ -271,7 +287,16 @@ async fn run_automerge_sweep(app: &AppHandle) {
         }
     };
     for pr in open {
-        maybe_merge_one(app, &db, pr, &backoff, super::resolve_host).await;
+        maybe_merge_one(
+            app,
+            &db,
+            &bus,
+            pr,
+            &backoff,
+            super::resolve_host,
+            &merge_runner,
+        )
+        .await;
     }
 }
 
@@ -287,6 +312,10 @@ async fn run_automerge_sweep(app: &AppHandle) {
 /// read-only boundary (`host/mod.rs`'s module doc) means `monitor.rs` stays
 /// untouched, byte-for-byte, by this file's own follow-up work.
 type HostResolver = fn(HostKind) -> Result<Box<dyn super::PrHost>, HostError>;
+
+type MergeRunner = std::sync::Arc<
+    dyn Fn(&str, &str, &str, i32, &str) -> Result<(), String> + Send + Sync + 'static,
+>;
 
 /// [`evaluate_row`]'s return: whether `maybe_merge_one` should actually
 /// attempt [`run_gh_merge`], and if so, against exactly which `head_sha` —
@@ -320,6 +349,7 @@ async fn evaluate_row(
     let now = repo::now_unix();
     let stored_lifecycle = gate::parse_lifecycle(&pr.lifecycle);
     let stored_ci = gate::parse_ci(&pr.ci_status);
+    let stored_threads = gate::parse_threads(&pr.thread_status);
     let stored_readiness = gate::parse_readiness(&pr.merge_readiness);
     let age = gate::age_secs(&pr.last_checked_at, &now);
     let pre_decision = gate::decide_auto_merge(
@@ -331,6 +361,7 @@ async fn evaluate_row(
         host_kind,
         stored_lifecycle,
         &stored_ci,
+        &stored_threads,
         &stored_readiness,
         pr.probe_fail_count,
         age,
@@ -392,9 +423,31 @@ async fn evaluate_row(
     // Re-resolved here rather than trusting the swept row: this is the
     // pre-merge confirmation, and an upstream can have moved since the sweep.
     let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
-    let fresh_readiness =
-        judge::merge_readiness(&snapshot.ci, &snapshot.review, &snapshot.conflict, &upstream);
-    if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, &snapshot, &fresh_readiness).await {
+    let fresh_readiness = judge::merge_readiness(
+        &snapshot.ci,
+        &snapshot.review,
+        &snapshot.threads,
+        &snapshot.conflict,
+        &upstream,
+    );
+    // This loop persists the axes but is NOT entitled to move the failure
+    // streak in either direction (`StreakUpdate::Leave`). `host::monitor` owns
+    // that bookkeeping because it is the only loop that runs on every row and
+    // the only one that posts the escalation notice — Codex review round 3 P2
+    // showed both ways this goes wrong from here: clearing the streak would
+    // erase what the monitor is accumulating, and incrementing it could carry
+    // a row from 9 to 10, past `list_open_pull_requests`'s threshold, so the
+    // monitor would never see that row again and never post the
+    // action-required notice.
+    if let Err(e) = repo::apply_pull_request_snapshot(
+        db,
+        pr.id,
+        &snapshot,
+        &fresh_readiness,
+        repo::StreakUpdate::Leave,
+    )
+    .await
+    {
         eprintln!(
             "[weft][automerge] pr #{}: could not save pre-merge confirmation snapshot: {e}",
             pr.id
@@ -412,6 +465,7 @@ async fn evaluate_row(
         host_kind,
         Some(snapshot.lifecycle),
         &snapshot.ci,
+        &snapshot.threads,
         &fresh_readiness,
         0,
         0,
@@ -434,7 +488,7 @@ async fn evaluate_row(
     // PR's OWN head commit moving, never this LOCAL fact. Without this, a re-proposal that
     // adds or replaces this consumer's dependency in the window between the read above and
     // `run_gh_merge` actually executing would merge a consumer whose upstream just changed,
-    // with no backstop at all — CI/review/conflict staleness in that same window is at least
+    // with no backstop at all — CI/review/threads/conflict staleness in that same window is at least
     // partly covered by GitHub's OWN branch-protection enforcement, but this axis is purely a
     // Weft-side invariant that only Weft can protect. This is INTENTIONALLY separate from (and
     // does not touch) `record_upstream_edges`'s two-pass write-ordering mechanism (round 5+6):
@@ -498,39 +552,105 @@ async fn evaluate_row(
 /// Gate one row twice (pre-filter, then final authorization against fresh
 /// state — both in [`evaluate_row`]), and if it clears both, execute +
 /// confirm + record the merge attempt. No-op (silently) for every `Skip`
-/// verdict — a blocked or indeterminate row already has `host::monitor`'s own
-/// Needs-you notice telling the human why, when that is warranted; this
-/// feature only speaks up when it actually ACTS (see
+/// verdict — the monitor keeps the tracked row's readiness state current; this
+/// feature only speaks up when it actually acts (see
 /// `insert_automerge_marker`'s doc). See this module's own doc for the full
 /// numbered flow, and [`evaluate_row`]'s doc for why steps 1-5 live there.
-async fn maybe_merge_one(
-    app: &AppHandle,
+struct MergeExecution {
+    pr: pull_request::Model,
+    head_sha: String,
+    merge_result: Result<(), String>,
+    attempts_exhausted: bool,
+}
+
+/// Evaluate one row, then linearize the final external side effect with every
+/// thread/repo/workspace deletion path. The lifecycle guard is acquired only
+/// after the live host evaluation, then held across exact row/head/parent/
+/// marker revalidation and the complete merge runner call.
+async fn evaluate_and_execute_merge(
     db: &Db,
+    bus: &crate::bus::BusRegistry,
     pr: pull_request::Model,
     backoff: &MergeBackoffState,
     resolver: HostResolver,
-) {
-    let Some(host_kind) = HostKind::parse(&pr.host_kind) else {
-        return; // unrecognized host_kind on the row — nothing sane to do
-    };
-
+    host_kind: HostKind,
+    merge_runner: &MergeRunner,
+) -> Option<MergeExecution> {
     let head_sha = match evaluate_row(db, &pr, host_kind, backoff, resolver).await {
-        RowVerdict::Skip => return,
+        RowVerdict::Skip => return None,
         RowVerdict::Merge { head_sha } => head_sha,
     };
+
+    #[cfg(test)]
+    tests::after_automerge_evaluation_probe(pr.id).await;
+
+    let lifecycle_gate = bus.thread_lifecycle_gate(pr.thread_id);
+    // The live host evaluation above intentionally runs outside this fence, but
+    // a concurrent repository action may hold it while its own bounded work is
+    // in flight. Do not wait on that action with a ready verdict in hand: the
+    // external CI/review state can change while we wait, and the SQLite reload
+    // below only protects the local snapshot. Defer this row to the next sweep
+    // so it gets another fresh host read instead of authorizing from stale data.
+    let _lifecycle = match lifecycle_gate.try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            eprintln!(
+                "[weft][automerge] pr #{}: lifecycle gate busy; deferring merge to next sweep",
+                pr.id
+            );
+            return None;
+        }
+    };
+    let current = match repo::reload_pull_request_merge_candidate(db, &pr, &head_sha).await {
+        Ok(Some(current)) => current,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln!(
+                "[weft][automerge] pr #{}: final parent revalidation failed: {error}",
+                pr.id
+            );
+            return None;
+        }
+    };
+    let now = repo::now_unix();
+    let current_decision = gate::decide_auto_merge(
+        auto_merge_enabled(db).await,
+        host_kind,
+        gate::parse_lifecycle(&current.lifecycle),
+        &gate::parse_ci(&current.ci_status),
+        &gate::parse_threads(&current.thread_status),
+        &gate::parse_readiness(&current.merge_readiness),
+        current.probe_fail_count,
+        gate::age_secs(&current.last_checked_at, &now),
+        MAX_READY_AGE_SECS,
+    );
+    if current_decision != AutoMergeDecision::Merge || backoff.is_exhausted(current.id, &head_sha) {
+        return None;
+    }
+    match repo::upstream_merge_state(db, current.direction_id).await {
+        super::UpstreamStatus::None | super::UpstreamStatus::Merged => {}
+        other => {
+            eprintln!(
+                "[weft][automerge] pr #{}: upstream changed to {other:?} before merge — aborting",
+                current.id
+            );
+            return None;
+        }
+    }
 
     // Step 6: the ONE mutating call, off the async runtime, using the FRESH
     // head_sha (never the stale row's) and the row's recorded host_base (GHE
     // support — review round 1 Codex P1: a prior version always targeted
     // `gh`'s own default host regardless of what was recorded at
     // registration).
-    let host_base = pr.host_base.clone();
-    let owner = pr.host_owner.clone();
-    let repo_name = pr.host_repo.clone();
-    let number = pr.number;
+    let host_base = current.host_base.clone();
+    let owner = current.host_owner.clone();
+    let repo_name = current.host_repo.clone();
+    let number = current.number;
     let head_sha_for_merge = head_sha.clone();
+    let merge_runner = merge_runner.clone();
     let merge_result = tokio::task::spawn_blocking(move || {
-        run_gh_merge(&host_base, &owner, &repo_name, number, &head_sha_for_merge)
+        merge_runner(&host_base, &owner, &repo_name, number, &head_sha_for_merge)
     })
     .await
     .unwrap_or_else(|join_err| Err(format!("internal: merge task join error: {join_err}")));
@@ -538,11 +658,45 @@ async fn maybe_merge_one(
     // Track consecutive failures per (row, head_sha) for step 3's backoff.
     let attempts_exhausted = match &merge_result {
         Ok(()) => {
-            backoff.record_success(pr.id);
+            backoff.record_success(current.id);
             false
         }
-        Err(_) => backoff.record_failure(pr.id, &head_sha),
+        Err(_) => backoff.record_failure(current.id, &head_sha),
     };
+
+    Some(MergeExecution {
+        pr: current,
+        head_sha,
+        merge_result,
+        attempts_exhausted,
+    })
+}
+
+/// Gate one row twice (pre-filter, then final authorization against fresh
+/// state), execute under the lifecycle fence, then confirm and record it.
+async fn maybe_merge_one(
+    app: &AppHandle,
+    db: &Db,
+    bus: &crate::bus::BusRegistry,
+    pr: pull_request::Model,
+    backoff: &MergeBackoffState,
+    resolver: HostResolver,
+    merge_runner: &MergeRunner,
+) {
+    let Some(host_kind) = HostKind::parse(&pr.host_kind) else {
+        return;
+    };
+    let Some(execution) =
+        evaluate_and_execute_merge(db, bus, pr, backoff, resolver, host_kind, merge_runner).await
+    else {
+        return;
+    };
+    let MergeExecution {
+        pr,
+        head_sha: _head_sha,
+        merge_result,
+        attempts_exhausted,
+    } = execution;
 
     // Step 7: regardless of outcome, one more fresh read (same injected
     // resolver as step 4) + persist + marker.
@@ -565,8 +719,10 @@ async fn maybe_merge_one(
     let (state, state_error) = match &confirmed {
         Ok(s) => {
             let upstream = repo::upstream_merge_state(db, pr.direction_id).await;
-            let r = judge::merge_readiness(&s.ci, &s.review, &s.conflict, &upstream);
-            if let Err(e) = repo::apply_pull_request_snapshot(db, pr.id, s, &r).await {
+            let r = judge::merge_readiness(&s.ci, &s.review, &s.threads, &s.conflict, &upstream);
+            if let Err(e) =
+                repo::apply_pull_request_snapshot(db, pr.id, s, &r, repo::StreakUpdate::Leave).await
+            {
                 eprintln!(
                     "[weft][automerge] pr #{}: could not save confirmation snapshot: {e}",
                     pr.id
@@ -622,11 +778,130 @@ fn lifecycle_state_tag(lifecycle: PrLifecycle) -> &'static str {
     }
 }
 
+/// Result of a bounded child invocation. Regular temporary files capture both
+/// streams while the parent polls the child, so a descendant that inherits a
+/// handle cannot hold the helper hostage after the direct child exits.
+struct BoundedCommandOutput {
+    output: Output,
+    timed_out: bool,
+    #[cfg(test)]
+    pid: u32,
+}
+
+fn read_capture(file: &mut File) -> std::io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Run a child with a real process-level deadline. The timeout is enforced by
+/// polling the actual child, not by timing out the `spawn_blocking` future: the
+/// latter would only abandon the Rust waiter while leaving the `gh` child
+/// alive and the lifecycle guard held. On Unix the child is its own process
+/// group so helpers spawned by `gh` die with it; Windows always kills and waits
+/// for the direct child. In every case this function waits/reaps that child
+/// before it returns.
+fn run_bounded_command(
+    mut command: Command,
+    timeout: Duration,
+) -> std::io::Result<BoundedCommandOutput> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // Safety: `setpgid` runs in the child between fork and exec, before
+        // it can share any application state with another thread.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    // Do not use pipes here: a descendant may inherit a pipe handle after
+    // the direct child exits, making any EOF-based reader wait past the
+    // deadline. Regular files let us read the bytes currently captured after
+    // wait/reap without depending on descendants closing their handles.
+    let mut stdout_file = tempfile::tempfile()?;
+    let stdout_child = stdout_file.try_clone()?;
+    let mut stderr_file = tempfile::tempfile()?;
+    let stderr_child = stderr_file.try_clone()?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_child))
+        .stderr(Stdio::from(stderr_child));
+    let child = command.spawn()?;
+    let pid = child.id();
+    let mut child = child;
+    let deadline = Instant::now() + timeout;
+    let (status, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status, false),
+            Ok(None) if Instant::now() >= deadline => {
+                // On Unix this first kills the complete process group. The
+                // direct-child kill below is still required on Windows and is
+                // harmless if the group kill already removed the child.
+                kill_bounded_process(pid);
+                let _ = child.kill();
+                let status = child.wait()?;
+                break (status, true);
+            }
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(error) => {
+                // Do not leak a child if polling itself fails. Best-effort
+                // termination is followed by a wait/reap before returning the
+                // original polling error.
+                kill_bounded_process(pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+    };
+    let stdout = read_capture(&mut stdout_file)?;
+    let stderr = read_capture(&mut stderr_file)?;
+    Ok(BoundedCommandOutput {
+        output: Output {
+            status,
+            stdout,
+            stderr,
+        },
+        timed_out,
+        #[cfg(test)]
+        pid,
+    })
+}
+
+#[cfg(unix)]
+fn kill_bounded_process(pid: u32) {
+    // Negative PID targets the process group created by `setpgid` above.
+    unsafe {
+        let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+        // Keep a direct-child fallback in case a platform rejected setpgid.
+        let _ = libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_bounded_process(_pid: u32) {
+    // Windows has no process-group signal equivalent exposed by std. The
+    // caller's direct `Child::kill` + `Child::wait` is the bounded guarantee;
+    // deliberately avoid an unbounded `taskkill` subprocess in the deadline
+    // path.
+}
+
 /// The ONE mutating call in this entire feature — `gh pr merge`. Nothing in
 /// `host::monitor` / `host::github` / `host::judge` / `host::gate` ever calls
 /// this, and this file only calls it (via `spawn_blocking` — review round 1
-/// Codex P2: a synchronous `Command::output()` call directly on the async
-/// runtime would occupy a Tokio worker for the whole `gh` round trip) from
+/// Codex P2: synchronous child I/O directly on the async runtime would occupy
+/// a Tokio worker for the whole `gh` round trip) from
 /// `maybe_merge_one`, gated by TWO `gate::decide_auto_merge` calls (both in
 /// `evaluate_row`), the second against data read immediately before this
 /// call.
@@ -647,6 +922,17 @@ fn lifecycle_state_tag(lifecycle: PrLifecycle) -> &'static str {
 /// (review round 1 Codex P1; Codex review, PR #159 repo.rs:3873 — the status-fetch path used
 /// to skip this entirely).
 fn run_gh_merge(host_base: &str, owner: &str, repo: &str, number: i32, head_sha: &str) -> Result<(), String> {
+    run_gh_merge_with_timeout(host_base, owner, repo, number, head_sha, MERGE_COMMAND_TIMEOUT)
+}
+
+fn run_gh_merge_with_timeout(
+    host_base: &str,
+    owner: &str,
+    repo: &str,
+    number: i32,
+    head_sha: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let repo_arg = super::qualified_repo_slug(host_base, owner, repo)?;
     // A `Ready` verdict can only ever be produced from a SUCCESSFUL snapshot
     // (which always sets a real `head_sha`), so this should be unreachable
@@ -655,22 +941,28 @@ fn run_gh_merge(host_base: &str, owner: &str, repo: &str, number: i32, head_sha:
     if head_sha.is_empty() {
         return Err("refusing to merge: no confirmed head_sha on record".to_string());
     }
-    let out = Command::new("gh")
+    let mut command = Command::new("gh");
+    command
         .args(build_merge_args(&repo_arg, number, head_sha))
         // Checks run user tooling that a GUI launch's minimal PATH can't
         // resolve (Homebrew/local installs of `gh`) — same reasoning as
         // `github::GitHubHost::fetch_status` / `check::run_check`.
-        .env("PATH", crate::detect::tool_path())
-        .output();
-    let out = match out {
-        Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        .env("PATH", crate::detect::tool_path());
+    let bounded = match run_bounded_command(command, timeout) {
+        Ok(result) => result,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err("gh is not installed".to_string())
         }
-        Err(e) => return Err(e.to_string()),
+        Err(error) => return Err(error.to_string()),
     };
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    if bounded.timed_out {
+        return Err(format!(
+            "gh pr merge timed out after {}s",
+            timeout.as_secs()
+        ));
+    }
+    if !bounded.output.status.success() {
+        let stderr = String::from_utf8_lossy(&bounded.output.stderr);
         return Err(stderr.trim().to_string());
     }
     Ok(())
@@ -801,8 +1093,49 @@ fn is_enabled(raw: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{CiStatus, ConflictStatus, MergeReadiness, PrHost, PrSnapshot, ReviewStatus};
+    use crate::host::{
+        CiStatus, ConflictStatus, MergeReadiness, PrHost, PrSnapshot, ReviewStatus, ThreadStatus,
+    };
     use sea_orm::ConnectionTrait;
+
+    type EvaluationProbe = (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+
+    fn evaluation_probe_map(
+    ) -> &'static std::sync::Mutex<std::collections::HashMap<i32, EvaluationProbe>> {
+        static PROBES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<i32, EvaluationProbe>>,
+        > = std::sync::OnceLock::new();
+        PROBES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn arm_after_automerge_evaluation_probe(
+        pr_id: i32,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        evaluation_probe_map()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(pr_id, (reached_tx, resume_rx));
+        (reached_rx, resume_tx)
+    }
+
+    pub(super) async fn after_automerge_evaluation_probe(pr_id: i32) {
+        let probe = evaluation_probe_map()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&pr_id);
+        if let Some((reached_tx, resume_rx)) = probe {
+            let _ = reached_tx.send(());
+            let _ = resume_rx.await;
+        }
+    }
 
     // --- run_gh_merge: guards that must fire before any process spawns ----
 
@@ -833,6 +1166,114 @@ mod tests {
             Err(message) => assert!(message.contains("head_sha"), "got: {message}"),
             Ok(()) => panic!("expected the empty-head_sha guard to fire"),
         }
+    }
+
+    fn hanging_command() -> Command {
+        #[cfg(unix)]
+        {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            command
+        }
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("ping");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        }
+    }
+
+    #[cfg(unix)]
+    fn parent_exits_with_a_living_descendant(pid_path: &std::path::Path) -> Command {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s' \"$$\" > \"$1\"; (printf descendant-out; printf descendant-err >&2; sleep 30) & sleep 0.1; exit 0",
+            "sh",
+            pid_path.to_str().expect("the temporary pid path should be valid UTF-8"),
+        ]);
+        command
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        // `kill(pid, 0)` is a read-only existence check. `EPERM` still means
+        // the process exists but is not signalable by this test user.
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[test]
+    fn bounded_command_kills_and_reaps_a_hanging_child() {
+        let started = Instant::now();
+        let result = run_bounded_command(hanging_command(), Duration::from_millis(100))
+            .expect("the bounded helper should return the killed child's status");
+        assert!(result.timed_out, "the deadline must be reported to the caller");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a bounded command must not wait for the fixture's full sleep"
+        );
+        assert!(!result.output.status.success());
+        #[cfg(unix)]
+        assert!(!process_is_alive(result.pid), "the timed-out child must be reaped and gone");
+    }
+
+    #[test]
+    fn bounded_command_drains_and_preserves_normal_output() {
+        #[cfg(unix)]
+        let mut command = Command::new("sh");
+        #[cfg(windows)]
+        let mut command = Command::new("cmd");
+        #[cfg(unix)]
+        command.args(["-c", "printf bounded-ok; printf bounded-err >&2"]);
+        #[cfg(windows)]
+        command.args(["/C", "echo bounded-ok & echo bounded-err 1>&2"]);
+        let result = run_bounded_command(command, Duration::from_secs(1))
+            .expect("the normal command should complete");
+        assert!(!result.timed_out);
+        assert!(result.output.status.success());
+        assert_eq!(String::from_utf8_lossy(&result.output.stdout).trim(), "bounded-ok");
+        assert_eq!(String::from_utf8_lossy(&result.output.stderr).trim(), "bounded-err");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_does_not_wait_for_a_descendant_that_inherits_output_handles() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_path = root.path().join("direct-child.pid");
+        let command = parent_exits_with_a_living_descendant(&pid_path);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let helper = thread::spawn(move || {
+            let result = run_bounded_command(command, Duration::from_secs(5));
+            let _ = result_tx.send(result);
+        });
+
+        let started = Instant::now();
+        let result = match result_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => result.expect("the parent-exit fixture should run"),
+            Err(error) => {
+                if let Some(pid) = std::fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<u32>().ok())
+                {
+                    kill_bounded_process(pid);
+                }
+                let _ = helper.join();
+                panic!("bounded helper waited on a descendant: {error}");
+            }
+        };
+        kill_bounded_process(result.pid);
+        helper
+            .join()
+            .expect("the bounded helper thread should terminate");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the direct child's exit must not turn into an EOF wait"
+        );
+        assert!(!result.timed_out);
+        assert!(result.output.status.success());
+        assert!(String::from_utf8_lossy(&result.output.stdout).contains("descendant-out"));
+        assert!(String::from_utf8_lossy(&result.output.stderr).contains("descendant-err"));
     }
 
     // --- build_merge_args: the head-consistency enforcement must actually
@@ -1025,6 +1466,39 @@ mod tests {
             lifecycle: PrLifecycle::Open,
             ci: CiStatus::Failing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
+            conflict: ConflictStatus::Clean,
+        })))
+    }
+
+    /// A fresh read showing a NEW review round opened since the stored
+    /// snapshot: still open, still green, still approved — and now with
+    /// unresolved threads.
+    fn resolver_fresh_threads_unresolved(_: HostKind) -> Result<Box<dyn PrHost>, HostError> {
+        Ok(Box::new(FakeHost(PrSnapshot {
+            head_sha: "fresh_sha_threads_unresolved".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: PrLifecycle::Open,
+            ci: CiStatus::Passing,
+            review: ReviewStatus::Approved,
+            threads: ThreadStatus::Unresolved { count: 2 },
+            conflict: ConflictStatus::Clean,
+        })))
+    }
+
+    /// A fresh read whose thread query failed — the PARTIAL-read shape.
+    fn resolver_fresh_threads_unknown(_: HostKind) -> Result<Box<dyn PrHost>, HostError> {
+        Ok(Box::new(FakeHost(PrSnapshot {
+            head_sha: "fresh_sha_threads_unknown".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: PrLifecycle::Open,
+            ci: CiStatus::Passing,
+            review: ReviewStatus::Approved,
+            threads: ThreadStatus::Unknown { reason: "no access".to_string() },
             conflict: ConflictStatus::Clean,
         })))
     }
@@ -1038,6 +1512,7 @@ mod tests {
             lifecycle: PrLifecycle::Merged,
             ci: CiStatus::Passing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         })))
     }
@@ -1051,8 +1526,58 @@ mod tests {
             lifecycle: PrLifecycle::Open,
             ci: CiStatus::Passing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         })))
+    }
+
+    fn lifecycle_race_ready_snapshot() -> PrSnapshot {
+        PrSnapshot {
+            head_sha: "fresh_sha_lifecycle_race".to_string(),
+            base_ref: "main".to_string(),
+            url: String::new(),
+            title: String::new(),
+            lifecycle: PrLifecycle::Open,
+            ci: CiStatus::Passing,
+            review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
+            conflict: ConflictStatus::Clean,
+        }
+    }
+
+    /// Mutable host state for the lifecycle-gate race seam below. The
+    /// resolver signature is intentionally a plain function pointer, so the
+    /// state lives behind a test-only process-local mutex and is changed only
+    /// after the fresh read has reached `after_automerge_evaluation_probe`.
+    fn lifecycle_race_snapshot() -> &'static std::sync::Mutex<PrSnapshot> {
+        static SNAPSHOT: std::sync::OnceLock<std::sync::Mutex<PrSnapshot>> =
+            std::sync::OnceLock::new();
+        SNAPSHOT.get_or_init(|| std::sync::Mutex::new(lifecycle_race_ready_snapshot()))
+    }
+
+    fn set_lifecycle_race_snapshot(snapshot: PrSnapshot) {
+        *lifecycle_race_snapshot()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = snapshot;
+    }
+
+    struct MutableLifecycleRaceHost;
+
+    impl PrHost for MutableLifecycleRaceHost {
+        fn kind(&self) -> HostKind {
+            HostKind::GitHub
+        }
+
+        fn fetch_status(&self, _target: &PrTarget) -> Result<PrSnapshot, HostError> {
+            Ok(lifecycle_race_snapshot()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone())
+        }
+    }
+
+    fn resolver_fresh_lifecycle_race(_: HostKind) -> Result<Box<dyn PrHost>, HostError> {
+        Ok(Box::new(MutableLifecycleRaceHost))
     }
 
     /// Test-only seam (mirrors `planner::tests::between_upstream_passes_probe`): lets a test
@@ -1116,11 +1641,21 @@ mod tests {
         )
         .await
         .unwrap();
+        let session = repo::create_session(
+            db,
+            direction.id,
+            repo_ref.id,
+            "codex",
+            "/tmp/widgets-pr-source",
+        )
+        .await
+        .unwrap();
         let pr = repo::register_pull_request(
             db,
             thread.id,
             direction.id,
             repo_ref.id,
+            Some(session.id),
             "github",
             "github.com",
             "weft-automerge-seam-test-fixture",
@@ -1139,9 +1674,12 @@ mod tests {
             lifecycle: PrLifecycle::Open,
             ci: CiStatus::Passing,
             review: ReviewStatus::Approved,
+            threads: ThreadStatus::AllResolved,
             conflict: ConflictStatus::Clean,
         };
-        repo::apply_pull_request_snapshot(db, pr.id, &stored, &MergeReadiness::Ready).await.unwrap();
+        repo::apply_pull_request_snapshot(db, pr.id, &stored, &MergeReadiness::Ready, repo::StreakUpdate::Clear)
+            .await
+            .unwrap();
         repo::set_setting(db, K_AUTO_MERGE_ENABLED, "1").await.unwrap();
         repo::get_pull_request(db, pr.id).await.unwrap().unwrap()
     }
@@ -1165,6 +1703,96 @@ mod tests {
         let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
         assert_eq!(reloaded.head_sha, "fresh_sha_ci_failing");
         assert_eq!(gate::parse_ci(&reloaded.ci_status), CiStatus::Failing);
+    }
+
+    /// The scenario this whole axis exists for, end-to-end through the real
+    /// evaluation path rather than the pure gate alone: a reviewer opens a
+    /// new round between two sweeps. The stored row still reads Ready from
+    /// before, CI is still green, GitHub still says APPROVED — the ONLY thing
+    /// that changed is that threads are open. Without the axis this merged.
+    #[tokio::test]
+    async fn evaluate_row_refuses_when_the_fresh_read_shows_unresolved_review_threads() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let backoff = MergeBackoffState::default();
+
+        let verdict =
+            evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_threads_unresolved).await;
+
+        assert_eq!(
+            verdict,
+            RowVerdict::Skip,
+            "open review threads must stop an otherwise-ready merge"
+        );
+        // And the fresh reading is persisted, proving the refusal came from
+        // the live read rather than from the row never being re-evaluated.
+        let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.head_sha, "fresh_sha_threads_unresolved");
+        assert_eq!(
+            gate::parse_threads(&reloaded.thread_status),
+            ThreadStatus::Unresolved { count: 2 }
+        );
+    }
+
+    /// This loop is the SECOND writer of `probe_fail_count`, and that makes
+    /// it able to silently undo the monitor's give-up bookkeeping: if it
+    /// reported a partial read as an unqualified success, it would zero the
+    /// streak the monitor is accumulating on every one of its own sweeps, so
+    /// a permanently unreadable thread axis would never reach the threshold
+    /// — the Codex round 2 P2 bug, reintroduced through this path whenever
+    /// auto-merge happens to be enabled. Both writers derive it from the same
+    /// `PrSnapshot::unreadable_axis_error`, and this is what pins that.
+    #[tokio::test]
+    async fn a_partial_fresh_read_leaves_the_monitors_failure_streak_untouched() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let backoff = MergeBackoffState::default();
+        assert_eq!(pr.probe_fail_count, 0, "the row this loop LOADED had a clean streak");
+
+        // The reported race, made deterministic: between this loop loading
+        // the row and writing its snapshot, the monitor observed nine
+        // consecutive failures. `apply_pull_request_snapshot` re-reads the
+        // CURRENT row, so an incrementing write here would take it to 10 —
+        // past `list_open_pull_requests`'s threshold — and because only the
+        // monitor posts the action-required notice AND its next query
+        // excludes rows at the threshold, the row would leave monitoring
+        // wearing its stale "still retrying" note, permanently.
+        let threshold = crate::host::monitor::MAX_CONSECUTIVE_PROBE_FAILURES;
+        for _ in 0..(threshold - 1) {
+            repo::mark_pull_request_probe_error(&db, pr.id, "monitor saw this fail").await.unwrap();
+        }
+        assert!(
+            !repo::list_open_pull_requests(&db, threshold).await.unwrap().is_empty(),
+            "still inside the sweep at one below the threshold"
+        );
+
+        // `pr` is deliberately the STALE copy, exactly as the real loop holds
+        // it — its `probe_fail_count` of 0 is what gets it past the
+        // pre-filter in the first place.
+        let verdict =
+            evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_threads_unknown).await;
+        assert_eq!(verdict, RowVerdict::Skip, "an unreadable axis can never authorize a merge");
+
+        let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.probe_fail_count,
+            threshold - 1,
+            "this loop must not move the streak in EITHER direction — not clear it (which would \
+             erase what the monitor is accumulating) and not extend it (which would push the row \
+             out of the sweep with no escalation notice ever posted)"
+        );
+        assert_eq!(
+            reloaded.last_error, "monitor saw this fail",
+            "and must not overwrite the monitor's diagnostic"
+        );
+        assert!(
+            !repo::list_open_pull_requests(&db, threshold).await.unwrap().is_empty(),
+            "the row must still be swept, so the monitor can reach the threshold itself and \
+             actually post the action-required notice"
+        );
+        // The readable axes still landed — that is why a partial read is
+        // persisted at all rather than thrown away.
+        assert_eq!(reloaded.head_sha, "fresh_sha_threads_unknown");
     }
 
     #[tokio::test]
@@ -1194,6 +1822,395 @@ mod tests {
         let verdict = evaluate_row(&db, &pr, HostKind::GitHub, &backoff, resolver_fresh_fully_ready).await;
 
         assert_eq!(verdict, RowVerdict::Merge { head_sha: "fresh_sha_fully_ready".to_string() });
+    }
+
+    #[tokio::test]
+    async fn final_revalidation_invokes_the_injected_merge_runner_once_with_fresh_head() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let bus = crate::bus::BusRegistry::new();
+        let backoff = MergeBackoffState::default();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let runner: MergeRunner = std::sync::Arc::new(move |_, _, _, number, head_sha| {
+            assert_eq!(number, 42);
+            assert_eq!(head_sha, "fresh_sha_fully_ready");
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+
+        let execution = evaluate_and_execute_merge(
+            &db,
+            &bus,
+            pr,
+            &backoff,
+            resolver_fresh_fully_ready,
+            HostKind::GitHub,
+            &runner,
+        )
+        .await
+        .expect("ready row should execute");
+        assert!(execution.merge_result.is_ok());
+        assert_eq!(execution.head_sha, "fresh_sha_fully_ready");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn busy_lifecycle_gate_defers_same_sha_drift_until_the_next_fresh_evaluation() {
+        // The first fresh read is ready, but the lifecycle fence is already
+        // held by a concurrent repository action. Change only the host
+        // verdict (keep the exact same head SHA) while the evaluation is
+        // paused at the production seam immediately before lock acquisition.
+        // The busy attempt must not wait and must not invoke the merge runner;
+        // after release, the next sweep must fetch the changed host state and
+        // refuse it again. Exercise each verdict that can reopen this window:
+        // unresolved threads, changes requested, and failing CI.
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let pr = seam_fixture(&db).await;
+        let bus = std::sync::Arc::new(crate::bus::BusRegistry::new());
+        let backoff = MergeBackoffState::default();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let runner: MergeRunner = std::sync::Arc::new(move |_, _, _, _, _| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+
+        let bad_states = [
+            (
+                "unresolved review threads",
+                PrSnapshot {
+                    head_sha: "fresh_sha_lifecycle_race".to_string(),
+                    base_ref: "main".to_string(),
+                    url: String::new(),
+                    title: String::new(),
+                    lifecycle: PrLifecycle::Open,
+                    ci: CiStatus::Passing,
+                    review: ReviewStatus::Approved,
+                    threads: ThreadStatus::Unresolved { count: 1 },
+                    conflict: ConflictStatus::Clean,
+                },
+            ),
+            (
+                "changes requested",
+                PrSnapshot {
+                    head_sha: "fresh_sha_lifecycle_race".to_string(),
+                    base_ref: "main".to_string(),
+                    url: String::new(),
+                    title: String::new(),
+                    lifecycle: PrLifecycle::Open,
+                    ci: CiStatus::Passing,
+                    review: ReviewStatus::ChangesRequested,
+                    threads: ThreadStatus::AllResolved,
+                    conflict: ConflictStatus::Clean,
+                },
+            ),
+            (
+                "failing CI",
+                PrSnapshot {
+                    head_sha: "fresh_sha_lifecycle_race".to_string(),
+                    base_ref: "main".to_string(),
+                    url: String::new(),
+                    title: String::new(),
+                    lifecycle: PrLifecycle::Open,
+                    ci: CiStatus::Failing,
+                    review: ReviewStatus::Approved,
+                    threads: ThreadStatus::AllResolved,
+                    conflict: ConflictStatus::Clean,
+                },
+            ),
+        ];
+
+        for (label, bad_snapshot) in bad_states {
+            set_lifecycle_race_snapshot(lifecycle_race_ready_snapshot());
+            let lifecycle = bus.thread_lifecycle_gate(pr.thread_id).lock_owned().await;
+            let (reached, resume) = arm_after_automerge_evaluation_probe(pr.id);
+            let evaluate_db = db.clone();
+            let evaluate_bus = bus.clone();
+            let evaluate_backoff = backoff.clone();
+            let evaluate_pr = pr.clone();
+            let evaluate_runner = runner.clone();
+            let mut evaluate = tokio::spawn(async move {
+                evaluate_and_execute_merge(
+                    &evaluate_db,
+                    &evaluate_bus,
+                    evaluate_pr,
+                    &evaluate_backoff,
+                    resolver_fresh_lifecycle_race,
+                    HostKind::GitHub,
+                    &evaluate_runner,
+                )
+                .await
+            });
+
+            reached.await.expect("fresh evaluation should reach the probe");
+            set_lifecycle_race_snapshot(bad_snapshot);
+            resume.send(()).expect("evaluation should still be paused");
+            let first = tokio::time::timeout(Duration::from_secs(1), &mut evaluate)
+                .await
+                .unwrap_or_else(|_| panic!("busy lifecycle gate must defer {label} without waiting"))
+                .expect("the evaluation task should not panic");
+            assert!(
+                first.is_none(),
+                "the busy lifecycle gate must skip {label} instead of running the merge"
+            );
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the merge runner must stay untouched while the lifecycle gate is busy ({label})"
+            );
+            drop(lifecycle);
+
+            let next = evaluate_and_execute_merge(
+                &db,
+                &bus,
+                pr.clone(),
+                &backoff,
+                resolver_fresh_lifecycle_race,
+                HostKind::GitHub,
+                &runner,
+            )
+            .await;
+            assert!(
+                next.is_none(),
+                "the next fresh evaluation must refuse the changed host verdict ({label})"
+            );
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no merge runner call is allowed after the changed host verdict ({label})"
+            );
+        }
+
+        // Do not leak a failing verdict into another test that happens to use
+        // this process-local resolver seam.
+        set_lifecycle_race_snapshot(lifecycle_race_ready_snapshot());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn final_revalidation_refuses_merge_after_thread_delete_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("automerge-delete-race.sqlite");
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        let pr = seam_fixture(&db).await;
+        let thread_id = pr.thread_id;
+        let backoff = MergeBackoffState::default();
+        let bus = std::sync::Arc::new(crate::bus::BusRegistry::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let runner: MergeRunner = std::sync::Arc::new(move |_, _, _, _, _| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let (reached, resume) = arm_after_automerge_evaluation_probe(pr.id);
+        let evaluate_db = db.clone();
+        let evaluate_bus = bus.clone();
+        let evaluate = tokio::spawn(async move {
+            evaluate_and_execute_merge(
+                &evaluate_db,
+                &evaluate_bus,
+                pr,
+                &backoff,
+                resolver_fresh_fully_ready,
+                HostKind::GitHub,
+                &runner,
+            )
+            .await
+        });
+        reached.await.unwrap();
+        repo::mark_thread_deleting(&db, thread_id).await.unwrap();
+        repo::delete_thread_cascade_with_human_cancellations(&db, thread_id)
+            .await
+            .unwrap();
+        let _ = resume.send(());
+
+        assert!(evaluate.await.unwrap().is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A real timed-out merge must release the thread lifecycle fence before
+    /// returning. Exercise the production lock order around that call at the
+    /// same time: delete takes global write -> lifecycle, while a visible send
+    /// takes surface -> global read. Keep delete held after it reaches the
+    /// lifecycle and verify that send only completes once the global writer
+    /// releases, then reacquire every guard to prove no lock leaked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn timed_out_merge_releases_lifecycle_and_admission_guards() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("automerge-timeout-locks.sqlite");
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        let pr = seam_fixture(&db).await;
+        let thread_id = pr.thread_id;
+
+        // Keep this surface key unique across the parallel crate test suite;
+        // the lock choreography itself still uses the exact production gate.
+        static NEXT_TEST_ADMISSION_KEY: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(-10_000);
+        let admission_key = NEXT_TEST_ADMISSION_KEY.fetch_sub(
+            1,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let bus = std::sync::Arc::new(crate::bus::BusRegistry::new());
+        let engine_state = std::sync::Arc::new(crate::lead_chat::engine::LeadChatState::default());
+        let backoff = MergeBackoffState::default();
+
+        let (runner_started_tx, runner_started_rx) = tokio::sync::oneshot::channel();
+        let runner_started = std::sync::Arc::new(std::sync::Mutex::new(Some(runner_started_tx)));
+        let runner_started_for_call = runner_started.clone();
+        let runner: MergeRunner = std::sync::Arc::new(move |_, _, _, _, _| {
+            let signal = runner_started_for_call
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(signal) = signal {
+                let _ = signal.send(());
+            }
+            let bounded = run_bounded_command(hanging_command(), Duration::from_millis(500))
+                .map_err(|error| error.to_string())?;
+            if bounded.timed_out {
+                return Err("gh pr merge timed out after 500ms".to_string());
+            }
+            if bounded.output.status.success() {
+                Ok(())
+            } else {
+                Err("bounded merge fixture exited unsuccessfully".to_string())
+            }
+        });
+
+        let evaluate_db = db.clone();
+        let evaluate_bus = bus.clone();
+        let evaluate_backoff = backoff.clone();
+        let evaluate_runner = runner.clone();
+        let evaluate_pr = pr.clone();
+        let evaluate = tokio::spawn(async move {
+            evaluate_and_execute_merge(
+                &evaluate_db,
+                &evaluate_bus,
+                evaluate_pr,
+                &evaluate_backoff,
+                resolver_fresh_fully_ready,
+                HostKind::GitHub,
+                &evaluate_runner,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), runner_started_rx)
+            .await
+            .expect("the merge runner should start while holding lifecycle")
+            .expect("the runner-start signal should remain connected");
+
+        let surface_hold = crate::lead_chat::engine::admission_gate_for_key(admission_key)
+            .lock_owned()
+            .await;
+
+        let (send_done_tx, mut send_done_rx) = tokio::sync::oneshot::channel();
+        let send_state = engine_state.clone();
+        let send_task = tokio::spawn(async move {
+            let _surface = crate::lead_chat::engine::admission_gate_for_key(admission_key)
+                .lock_owned()
+                .await;
+            let _read = send_state.engine_admission_read().await;
+            let _ = send_done_tx.send(());
+        });
+
+        let (delete_write_tx, mut delete_write_rx) = tokio::sync::oneshot::channel();
+        let (delete_lifecycle_tx, mut delete_lifecycle_rx) = tokio::sync::oneshot::channel();
+        let (delete_release_tx, delete_release_rx) = tokio::sync::oneshot::channel();
+        let delete_db = db.clone();
+        let delete_state = engine_state.clone();
+        let delete_bus = bus.clone();
+        let delete_task = tokio::spawn(async move {
+            repo::mark_thread_deleting(&delete_db, thread_id)
+                .await
+                .unwrap();
+            let _write = delete_state.engine_admission_write().await;
+            let _ = delete_write_tx.send(());
+            let _lifecycle = delete_bus.thread_lifecycle_gate(thread_id).lock_owned().await;
+            let _ = delete_lifecycle_tx.send(());
+            let _ = delete_release_rx.await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), &mut delete_write_rx)
+            .await
+            .expect("delete should acquire global write before lifecycle")
+            .expect("delete write signal should remain connected");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut delete_lifecycle_rx)
+                .await
+                .is_err(),
+            "delete must wait on the merge lifecycle gate"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send_done_rx)
+                .await
+                .is_err(),
+            "send must wait on the held surface gate"
+        );
+
+        let execution = tokio::time::timeout(Duration::from_secs(2), evaluate)
+            .await
+            .expect("the real bounded merge runner must finish before its fixture sleeps")
+            .expect("the evaluation task should not panic")
+            .expect("the ready row should produce a merge execution");
+        let merge_error = execution
+            .merge_result
+            .expect_err("the hanging fixture must report a timeout failure");
+        assert!(merge_error.contains("timed out"), "got: {merge_error}");
+
+        tokio::time::timeout(Duration::from_secs(1), &mut delete_lifecycle_rx)
+            .await
+            .expect("the lifecycle guard must release after the timeout")
+            .expect("delete lifecycle signal should remain connected");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send_done_rx)
+                .await
+                .is_err(),
+            "send should still wait while delete owns global write"
+        );
+
+        drop(surface_hold);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send_done_rx)
+                .await
+                .is_err(),
+            "send must wait on delete's global write even after surface release"
+        );
+
+        delete_release_tx
+            .send(())
+            .expect("delete should still be holding its write/lifecycle guards");
+        tokio::time::timeout(Duration::from_secs(1), &mut send_done_rx)
+            .await
+            .expect("send should acquire surface and global read after delete")
+            .expect("send completion signal should remain connected");
+        delete_task.await.unwrap();
+        send_task.await.unwrap();
+
+        let _surface = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::lead_chat::engine::admission_gate_for_key(admission_key).lock_owned(),
+        )
+        .await
+        .expect("surface admission must be released");
+        let read = tokio::time::timeout(Duration::from_secs(1), engine_state.engine_admission_read())
+            .await
+            .expect("global read admission must be released");
+        drop(read);
+        let write = tokio::time::timeout(Duration::from_secs(1), engine_state.engine_admission_write())
+            .await
+            .expect("global write admission must be released");
+        drop(write);
+        let _lifecycle = tokio::time::timeout(
+            Duration::from_secs(1),
+            bus.thread_lifecycle_gate(thread_id).lock_owned(),
+        )
+        .await
+        .expect("lifecycle admission must be released");
     }
 
     /// THE FIX (Codex review, PR #159 automerge.rs:395): between `evaluate_row`'s upstream

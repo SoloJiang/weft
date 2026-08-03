@@ -133,7 +133,7 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
       // exactly as it always has. A failed plan-approve stops here (already toasted by
       // approvePlanCard) instead of silently continuing into confirmProposal.
       if (confirmMode === "planAndScope" && planCard) {
-        const delivered = await approvePlanCard(tid, planCard.message.id, planCard.title);
+        const delivered = await approvePlanCard(tid, planCard.message.id, true);
         if (!delivered) return;
       }
       await confirmProposal(confirmState.manualTool);

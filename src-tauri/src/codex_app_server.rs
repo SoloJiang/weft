@@ -970,8 +970,8 @@ impl Client {
                         self.route_resolved(tid.as_deref(), ThreadMsg::Event(ev))
                             .await;
                     } else if method.ends_with("/outputDelta") {
-                        // A long command is still producing output; keep the turn
-                        // marked alive so the idle watchdog doesn't kill it.
+                        // A long command is still producing output; forward its
+                        // activity telemetry.
                         self.route_resolved(tid.as_deref(), ThreadMsg::Heartbeat)
                             .await;
                     } else if method == "serverRequest/resolved" {
@@ -996,7 +996,7 @@ impl Client {
                     // server→client request also blocks the turn until answered, but
                     // it needs interactive content Weft can't collect (elicitation,
                     // requestUserInput, future kinds) — decline so the turn proceeds
-                    // instead of hanging until a watchdog.
+                    // instead of leaving the request unresolved.
                     if is_approval_request(&method) {
                         let tid = params["threadId"].as_str().map(String::from);
                         self.route_resolved(

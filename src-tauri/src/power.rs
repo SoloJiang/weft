@@ -187,8 +187,7 @@ pub fn set_standby(app: &tauri::AppHandle, on: bool) {
 /// Every 30s: is any live engine's turn busy? Feeds `PowerGuard::sweep`, which
 /// also expires the linger. The event hooks give instant acquire; this loop is
 /// the release path and the safety net — a crashed engine can't leak the
-/// assertion past one interval + linger. Deliberately NOT piggybacked on
-/// `spawn_watchdog`: that loop short-circuits when both guardrail caps are 0.
+/// assertion past one interval + linger.
 pub fn spawn_sweep(app: tauri::AppHandle) {
     use tauri::Manager as _;
     tauri::async_runtime::spawn(async move {

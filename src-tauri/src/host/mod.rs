@@ -2,11 +2,13 @@
 //! PR/MR's review state, computed ONCE here and never re-derived from raw
 //! host vocabulary anywhere past this module. A `PrHost` implementation
 //! translates its host's native shapes — GitHub's check-run `conclusion` /
-//! `reviewDecision` / `mergeable`; a future GitLab backend's pipeline
-//! `status` / discussion `resolved` / `merge_status` — into the types below.
+//! `reviewDecision` / `reviewThreads.isResolved` / `mergeable`; a future
+//! GitLab backend's pipeline `status` / approvals / discussion `resolved` /
+//! `merge_status` — into the types below.
 //! Nothing outside `host::github` (and, later, a `host::gitlab`) may branch on
 //! a host-native string; the DB row, the monitor, and the judgement in
-//! [`judge`] only ever see [`CiStatus`] / [`ReviewStatus`] / [`ConflictStatus`].
+//! [`judge`] only ever see [`CiStatus`] / [`ReviewStatus`] / [`ThreadStatus`] /
+//! [`ConflictStatus`].
 //!
 //! MVP ships only [`github::GitHubHost`] (via the `gh` CLI, inheriting the
 //! user's own login — zero credential management, same tradeoff the repo's
@@ -135,16 +137,42 @@ pub struct PrTarget {
 /// the formatting it protects, means a future THIRD caller cannot forget it the way the
 /// status-fetch path once forgot to fold in `host_base` at all.
 pub fn qualified_repo_slug(host_base: &str, owner: &str, repo: &str) -> Result<String, String> {
-    if host_base.contains('/') || owner.contains('/') || repo.contains('/') {
-        return Err(format!(
-            "refusing to target a repo slug with an embedded '/' (host_base={host_base:?}, owner={owner:?}, repo={repo:?}) — this would be reinterpreted as a host override"
-        ));
-    }
+    reject_host_override(host_base, owner, repo)?;
     Ok(if host_base.is_empty() {
         format!("{owner}/{repo}")
     } else {
         format!("{host_base}/{owner}/{repo}")
     })
+}
+
+/// The shared guard behind [`qualified_repo_slug`] and [`api_hostname`] — the
+/// two ways this crate tells `gh` which server to talk to. Extracted rather
+/// than duplicated precisely because [`qualified_repo_slug`]'s own doc names
+/// centralization as the point: a second host-selecting call site that
+/// re-implemented (or forgot) the check would recreate the SSRF this guard
+/// exists to close, and be just as invisible as the drift that doc describes.
+fn reject_host_override(host_base: &str, owner: &str, repo: &str) -> Result<(), String> {
+    if host_base.contains('/') || owner.contains('/') || repo.contains('/') {
+        return Err(format!(
+            "refusing to target a repo slug with an embedded '/' (host_base={host_base:?}, owner={owner:?}, repo={repo:?}) — this would be reinterpreted as a host override"
+        ));
+    }
+    Ok(())
+}
+
+/// The `--hostname` argument for a `gh api` call, which — unlike `gh pr view
+/// --repo` — has no `[HOST/]OWNER/REPO` argument to fold the recorded host
+/// into, so a GHE row needs it passed separately or the call silently queries
+/// `gh`'s own configured default host instead (exactly the drift
+/// [`PrTarget`]'s doc records as a real bug on the status-read path).
+///
+/// `None` means "pass no `--hostname` at all", which is what a `host_base` of
+/// `""` (a github.com row, or one from before that field existed) must do —
+/// identical to [`qualified_repo_slug`]'s own two-segment fallback, and a
+/// no-op for the overwhelming majority of checkouts.
+pub fn api_hostname(host_base: &str, owner: &str, repo: &str) -> Result<Option<String>, String> {
+    reject_host_override(host_base, owner, repo)?;
+    Ok(if host_base.is_empty() { None } else { Some(host_base.to_string()) })
 }
 
 /// Lifecycle of the change unit itself — distinct from merge READINESS, which
@@ -201,33 +229,69 @@ pub enum CiStatus {
 /// a future GitLab backend simply never produces that variant, which is
 /// honest (it's a real GitHub-specific signal), not a conflation.
 ///
-/// MVP scope note: GitHub's mapping (`github::review_of`) does not walk
-/// `reviewThreads.isResolved` — that needs paginated GraphQL with a
-/// documented prior pagination bug in this very repo (dropping the newest/
-/// unresolved threads past 100) — so it reports `unresolved_discussions:
-/// None` (honestly unknown), never `Some(false)` ("definitely none
-/// unresolved", which it never checked). A repo-specific convention layered
-/// on top of either host's raw signal (e.g. a review-bot's 👍 reaction
-/// counting as "all clear") stays the calling agent's job per its own
-/// CLAUDE.md, not this neutral state machine's.
+/// "Are there open discussion threads" is deliberately NOT a sub-field of
+/// this enum but its own axis ([`ThreadStatus`]) — see that type's doc. A
+/// repo-specific convention layered on top of either host's raw signal (e.g.
+/// a review-bot's 👍 reaction counting as "all clear") stays the calling
+/// agent's job per its own CLAUDE.md, not this neutral state machine's.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ReviewStatus {
     Unknown { reason: String },
     /// GitHub-only: a maintainer explicitly requested changes.
     ChangesRequested,
-    /// Not (yet) approved. `unresolved_discussions` is the SEPARATE "are
-    /// there open discussion threads" signal, kept apart from approval so
-    /// neither backend has to force one into the other:
-    /// - `None` — this backend doesn't check thread-resolution at all
-    ///   (GitHub, this MVP: confirmed live against this repo's own PRs while
-    ///   building this — an open, otherwise-healthy PR reports
-    ///   `reviewDecision: ""`, i.e. not-yet-reviewed, which says nothing
-    ///   about discussion threads).
-    /// - `Some(_)` — a backend that actually knows (a future GitLab backend,
-    ///   from its Discussions API).
-    AwaitingApproval { unresolved_discussions: Option<bool> },
+    /// Not (yet) approved. Confirmed live against this repo's own PRs: an
+    /// open, otherwise-healthy PR reports `reviewDecision: ""`, i.e.
+    /// not-yet-reviewed — which says nothing about discussion threads, and
+    /// is why those are a separate axis rather than a field in here.
+    AwaitingApproval,
     Approved,
+}
+
+/// Whether every review discussion thread on the change is resolved — the
+/// axis that turns this repo's own CLAUDE.md closure bar ("unresolved review
+/// threads are handled") into something the state machine can actually check,
+/// rather than prose an agent has to remember.
+///
+/// Its own axis, NOT a sub-field of [`ReviewStatus`]. The two are genuinely
+/// independent facts on both hosts — GitHub's `reviewDecision` can read
+/// `APPROVED` with a dozen threads still open, and GitLab sources approval
+/// (Approvals API) and thread resolution (Discussions API's per-note
+/// `resolved`) from two different endpoints entirely. An earlier version of
+/// this module modelled it as `AwaitingApproval { unresolved_discussions }`,
+/// which structurally could not express the case that matters most for an
+/// unattended merge: approved AND still unresolved. Hanging the same optional
+/// field off every variant instead would have been the "re-derive the same
+/// booleans at every call site" shape this repo's CLAUDE.md rules out.
+///
+/// [`Unknown`] and [`AllResolved`] are never conflated, for the same reason
+/// [`CiStatus::Unknown`] and [`CiStatus::NotConfigured`] aren't: a count that
+/// silently degraded to zero is indistinguishable from an all-clear, and it
+/// degrades in the one direction that ends a review early. `github::
+/// parse_review_threads_json` fails loud into `Unknown` on every read it
+/// cannot fully account for — including a page stream that stops while its
+/// last page still reports `hasNextPage`.
+///
+/// [`Unknown`]: ThreadStatus::Unknown
+/// [`AllResolved`]: ThreadStatus::AllResolved
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ThreadStatus {
+    /// This backend does not check thread resolution at all. Vacuously
+    /// non-blocking for the Needs-you verdict (same spirit as
+    /// `CiStatus::NotConfigured`) — but NOT enough for the auto-merge gate,
+    /// which demands a positive [`AllResolved`](ThreadStatus::AllResolved).
+    /// No backend produces this today; it is what a future GitLab backend
+    /// reports until it wires up the Discussions API, and what a stored row
+    /// written before this axis existed can never silently masquerade as.
+    Unchecked,
+    /// The read was attempted and could not be trusted to be complete.
+    Unknown { reason: String },
+    /// Every thread on the change is resolved — positively confirmed over a
+    /// fully-paginated read, not inferred from an absent signal.
+    AllResolved,
+    /// `count` threads are still open. Blocking.
+    Unresolved { count: u32 },
 }
 
 /// Conflict signal, normalized from either host's mergeability computation.
@@ -266,8 +330,8 @@ pub enum UpstreamStatus {
 
 /// The `truly mergeable` bar (this repo's CLAUDE.md "GitHub Remote Review
 /// Workflow" section), turned into code instead of prose: CI green × review
-/// clear/approved × no conflict. See `judge::merge_readiness` for the
-/// (mutation-tested) derivation.
+/// clear/approved × every discussion thread resolved × no conflict. See
+/// `judge::merge_readiness` for the (mutation-tested) derivation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum MergeReadiness {
@@ -289,7 +353,43 @@ pub struct PrSnapshot {
     pub lifecycle: PrLifecycle,
     pub ci: CiStatus,
     pub review: ReviewStatus,
+    pub threads: ThreadStatus,
     pub conflict: ConflictStatus,
+}
+
+impl PrSnapshot {
+    /// Why this otherwise-successful fetch could not read every axis, or
+    /// `None` when it read them all — the difference between a COMPLETE and a
+    /// PARTIAL probe (see `store::repo::apply_pull_request_snapshot`, which
+    /// only resets the consecutive-failure streak for a complete one).
+    ///
+    /// Lives on the snapshot rather than inside `host::monitor` (its only
+    /// caller today — `host::automerge` persists snapshots but is not
+    /// entitled to move the streak at all, see `repo::StreakUpdate`) because
+    /// it answers a question about the SNAPSHOT, not about the sweep: is
+    /// every axis here a real reading? Adding a sixth axis with an
+    /// unreadable state then has one obvious place to declare that, instead
+    /// of the monitor re-deriving axis semantics it does not own.
+    ///
+    /// ONLY the review-thread axis qualifies, and only its `Unknown` variant.
+    /// That is deliberate: [`ThreadStatus::Unknown`] means a REQUEST failed
+    /// (`gh api graphql` errored, or its output could not be trusted
+    /// complete), whereas the other axes' `Unknown` variants mean the host
+    /// answered and its answer was "not determined yet" —
+    /// [`ConflictStatus::Unknown`] in particular is a common, transient,
+    /// entirely healthy state GitHub reports for seconds after every push.
+    /// Counting those would march a perfectly healthy PR toward the give-up
+    /// threshold. [`ThreadStatus::Unchecked`] is likewise not a failure: it
+    /// means a backend does not implement the axis at all, which no amount of
+    /// retrying changes.
+    pub fn unreadable_axis_error(&self) -> Option<&str> {
+        match &self.threads {
+            ThreadStatus::Unknown { reason } => Some(reason.as_str()),
+            ThreadStatus::Unchecked
+            | ThreadStatus::AllResolved
+            | ThreadStatus::Unresolved { .. } => None,
+        }
+    }
 }
 
 /// Why a fetch failed — always surfaced honestly (`monitor` never treats this
@@ -524,6 +624,43 @@ mod tests {
                 Ok(slug) => panic!(
                     "expected the embedded-slash guard to fire for host_base={host_base:?} \
                      owner={owner:?} repo={repo:?}, got a slug instead: {slug:?}"
+                ),
+            }
+        }
+    }
+
+    /// The `gh api` path must resolve its host exactly like the `gh pr view`
+    /// path does — that the two agreed was not free, it is what PR #159's
+    /// review caught them failing to do.
+    #[test]
+    fn api_hostname_mirrors_the_slug_builders_host_resolution() {
+        assert_eq!(
+            api_hostname("github.acme-corp.com", "acme", "widgets").unwrap(),
+            Some("github.acme-corp.com".to_string())
+        );
+        assert_eq!(
+            api_hostname("", "acme", "widgets").unwrap(),
+            None,
+            "an empty host_base must pass NO --hostname, matching gh's own default-host behavior"
+        );
+    }
+
+    /// The shared guard has to fire on this path too — a `--hostname` built
+    /// from an unchecked string is the same host-override vector the slug
+    /// form has, and this call site is the reason the check was extracted
+    /// rather than left inline in `qualified_repo_slug`.
+    #[test]
+    fn api_hostname_refuses_an_embedded_slash_in_any_of_the_three_inputs() {
+        for (host_base, owner, repo) in [
+            ("evil.example.org/extra", "acme", "widgets"),
+            ("", "evil.example.org/acme", "widgets"),
+            ("", "acme", "evil.example.org/widgets"),
+        ] {
+            match api_hostname(host_base, owner, repo) {
+                Err(message) => assert!(message.contains("host override"), "got: {message}"),
+                Ok(h) => panic!(
+                    "expected the embedded-slash guard to fire for host_base={host_base:?} \
+                     owner={owner:?} repo={repo:?}, got {h:?}"
                 ),
             }
         }

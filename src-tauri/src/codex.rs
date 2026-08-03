@@ -811,15 +811,62 @@ mod tests {
         use crate::hook_test_support::{answer_first_ask, decision_of};
         let asks = AskRegistry::new();
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = crate::store::repo::create_workspace(&db, "codex-hook")
+            .await
+            .unwrap();
+        let repo = crate::store::repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/codex-hook-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            workspace.id,
+            "issue",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let direction = crate::store::repo::create_direction(
+            &db,
+            thread.id,
+            "task",
+            "codex",
+            repo.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = crate::store::repo::create_session(
+            &db,
+            direction.id,
+            repo.id,
+            "codex",
+            "/tmp/codex-hook-session",
+        )
+        .await
+        .unwrap();
         let (base, _h) =
-            crate::bus::server::serve(crate::bus::BusRegistry::new(), db, asks.clone())
+            crate::bus::server::serve(crate::bus::BusRegistry::new(), db.clone(), asks.clone())
                 .await
                 .unwrap();
 
         // One task, two concurrent futures: the hook runs while the "human"
         // answers. No detached task to outlive the test, and the runner kills the
         // script if it somehow never exits.
-        let url = format!("{base}/ask/2/30?tool=codex");
+        let url = format!(
+            "{base}/ask/{}/{}?tool=codex&session_id={}",
+            thread.id, direction.id, session.id
+        );
         let ((stdout, code), ()) = tokio::join!(
             run_helper("hook-live", Some(&url), true),
             answer_first_ask(&asks, Answer::Allow),

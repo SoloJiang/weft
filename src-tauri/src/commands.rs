@@ -42,8 +42,8 @@ fn reject_occupied_repo_target(path: &std::path::Path) -> R<()> {
 fn ensure_path_under_dest(path: &std::path::Path, dest: &std::path::Path) -> R<()> {
     let dest_canon = std::fs::canonicalize(dest)
         .map_err(|_| "destination directory does not exist or is not accessible")?;
-    let path_canon = std::fs::canonicalize(path)
-        .map_err(|_| "created repo path could not be resolved")?;
+    let path_canon =
+        std::fs::canonicalize(path).map_err(|_| "created repo path could not be resolved")?;
     if !path_canon.starts_with(&dest_canon) {
         return Err("repo path resolved outside the destination directory".into());
     }
@@ -68,9 +68,7 @@ fn validate_repo_name(name: &str) -> R<()> {
         .chars()
         .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_' || c == ' ')
     {
-        return Err(
-            "repo name may only contain letters, digits, spaces, '.', '-', '_'".into(),
-        );
+        return Err("repo name may only contain letters, digits, spaces, '.', '-', '_'".into());
     }
     Ok(())
 }
@@ -140,159 +138,198 @@ fn clear_control_if_route_doomed(doomed_routes: &std::collections::HashSet<(i32,
     }
 }
 
-async fn delete_workspace_after_fence(
-    app: tauri::AppHandle,
-    db: &Db,
-    workspace_id: i32,
-) -> R<()> {
-    stop_workspace_engines(&app, db, workspace_id).await?;
-    cancel_workspace_asks(db, app.state::<crate::ask::AskRegistry>().inner(), workspace_id)
-        .await?;
-    cancel_workspace_human_asks(
+async fn delete_workspace_after_fence(app: tauri::AppHandle, db: &Db, workspace_id: i32) -> R<()> {
+    let action_cleanups = lock_repo_action_cleanups(
         db,
-        app.state::<crate::bus::BusRegistry>().inner(),
-        workspace_id,
+        repo::repo_action_executions_requiring_lock_for_workspace(db, workspace_id)
+            .await
+            .map_err(e)?,
     )
     .await?;
-    let mut repo_paths: std::collections::HashMap<i32, String> = repo::list_repos(db, workspace_id)
+    let action_cleanup_plans = repo_action_cleanup_plans(&action_cleanups);
+    let engine_state = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let engine_admission = engine_state.engine_admission_write().await;
+    // Resolve the complete stop set while rows still exist, but do not mutate
+    // a running engine until the DB cascade commits. The workspace deletion
+    // marker already fences new engine admission; a failed cascade can now
+    // clear that marker and leave every live turn untouched.
+    let engine_keys = workspace_engine_keys(db, workspace_id).await?;
+    let repo_ids = repo::list_repos(db, workspace_id)
         .await
         .map_err(e)?
         .into_iter()
-        .map(|repo| (repo.id, repo.local_git_path))
-        .collect();
-    for repo_id in repo_paths.keys() {
-        crate::curator::run_forget(*repo_id);
+        .map(|repo| repo.id)
+        .collect::<Vec<_>>();
+    let bus = app.state::<crate::bus::BusRegistry>();
+    let scope = workspace_ask_scope(db, workspace_id).await?;
+    let affected_threads = scope.affected_thread_ids();
+    let lifecycle_guards = lock_thread_lifecycles(&bus, &affected_threads).await;
+    let mut closing_asks = std::collections::BTreeMap::new();
+    for thread_id in &scope.thread_ids {
+        let (_, ask_ids) = bus.begin_thread_close(*thread_id);
+        closing_asks.insert(*thread_id, ask_ids);
     }
-    // issue #160 round-22 (Codex computer_srv.rs:385 + commands.rs:1462):
-    // collect this workspace's thread ids BEFORE the cascade removes their rows,
-    // so the bulk delete can revoke each thread's computer routes AND drop its
-    // computer-output subtree — `delete_thread` does both for the single-thread
-    // path, but this bulk path previously did neither, leaving stale valid
-    // bearers accepted and screenshots/audit logs orphaned under
-    // `WEFT_HOME/computer/<thread>`.
-    let doomed_threads: Vec<i32> = repo::list_threads(db, workspace_id)
-        .await
-        .map_err(e)?
-        .into_iter()
-        .map(|t| t.id)
-        .collect();
-    // issue #160 round-23 P1 (Codex commands.rs:756): publish the route
-    // revocations BEFORE the destructive cascade, not after. Otherwise an
-    // in-flight computer call whose thread is deleted mid-cascade slips through
-    // — its thread isn't in the revocation set yet, so both `recheck_after_guard`
-    // and the final `recheck_stop_and_lease_before_backend` skip it — and reaches
-    // the desktop after its rows are gone. Roll the revocations back if the
-    // cascade itself fails, so a still-live session isn't fail-closed forever.
-    // issue #160 round-24 P2 (Codex commands.rs:803): snapshot the prior
-    // revocation state so a failed cascade restores EXACTLY what was there — a
-    // blanket un-revoke would drop a revocation an earlier successful delete had
-    // already published for one of these threads.
+    // issue #160 round-22/23 P1 (Codex computer_srv.rs:385 + commands.rs:756):
+    // publish computer-route revocations for every thread this bulk delete
+    // removes BEFORE the destructive cascade — an in-flight computer call whose
+    // thread is deleted mid-cascade would otherwise slip past both
+    // `recheck_after_guard` and the final `recheck_stop_and_lease_before_backend`
+    // (its thread isn't in the revocation set yet) and reach the desktop after
+    // its rows are gone. round-24 P2 (commands.rs:803): snapshot the prior state
+    // so a failed cascade restores EXACTLY what was there — a blanket un-revoke
+    // would drop a revocation an earlier successful delete already published.
+    // round-23 P1 (computer_srv.rs:2608): also clear the control lease if a
+    // doomed route holds it, so the final lease recheck fails closed.
+    let doomed_threads: Vec<i32> = scope.thread_ids.iter().copied().collect();
     let revocation_undo = crate::bus::computer_srv::snapshot_revocations(&doomed_threads);
     for thread_id in &doomed_threads {
         crate::bus::computer_srv::revoke_computer_routes(*thread_id);
     }
     clear_control_if_doomed(&doomed_threads);
-    let removed = match repo::delete_workspace_cascade(db, workspace_id).await {
-        Ok(removed) => removed,
-        Err(err) => {
+    let effects = match repo::delete_workspace_cascade_with_human_cancellations_and_action_cleanups(
+        db,
+        workspace_id,
+        &action_cleanup_plans,
+    )
+    .await
+    {
+        Ok(effects) => effects,
+        Err(error) => {
+            for thread_id in &scope.thread_ids {
+                bus.rollback_thread_close(*thread_id);
+            }
             crate::bus::computer_srv::restore_revocations(revocation_undo);
-            return Err(e(err));
+            return Err(e(error));
         }
     };
-    // Output cleanup runs only after the rows are actually gone.
-    for thread_id in &doomed_threads {
+    stop_engines_by_key(&app, &engine_keys).await;
+    drop(engine_admission);
+    apply_committed_bus_delete_effects(
+        &bus,
+        &effects.cancelled_requests,
+        &effects.removed_threads,
+        &effects.removed_directions,
+        &closing_asks,
+    );
+    purge_committed_permission_effects(
+        app.state::<crate::ask::AskRegistry>().inner(),
+        &effects.removed_threads,
+        &effects.removed_directions,
+    )
+    .await?;
+    // issue #160 round-22: drop each removed thread's computer-use output
+    // subtree (`WEFT_HOME/computer/<thread>/`) — only after the rows are
+    // actually gone; best-effort, never gates the delete.
+    for thread_id in &effects.removed_threads {
         crate::bus::computer_srv::remove_computer_output_for_thread(*thread_id);
     }
-    extend_removed_repo_paths(db, &mut repo_paths, &removed).await?;
-    for (wt_id, repo_id, path, branch, created_branch, created_checkout) in &removed {
-        // The worktree's code-checkpoint shadow repo goes with it (its rows
-        // were already deleted by the cascade).
-        crate::checkpoint::remove_shadow(*wt_id);
-        let Some(repo_path) = repo_paths.get(repo_id) else {
-            continue;
-        };
-        let repo_path = std::path::Path::new(repo_path);
-        if *created_checkout {
-            if let Err(err) = crate::git::remove_worktree(repo_path, std::path::Path::new(path)) {
-                eprintln!("[weft] worktree remove failed for {path}: {err}");
-            }
-        } else {
-            let _ = crate::git::lock_worktree(repo_path, std::path::Path::new(path));
-        }
-        if *created_branch {
-            if let Err(err) = crate::git::delete_branch(repo_path, branch) {
-                eprintln!("[weft] branch delete failed for {branch}: {err}");
-            }
-        }
+    cleanup_locked_repo_actions(db, &action_cleanups).await;
+    drop(lifecycle_guards);
+    for repo_id in repo_ids {
+        crate::curator::run_forget(repo_id);
     }
-    Ok(())
+    materialize::cleanup_removed_worktrees(&effects.removed_worktrees)
+        .await
+        .map_err(e)
 }
 
-async fn extend_removed_repo_paths(
-    db: &Db,
-    repo_paths: &mut std::collections::HashMap<i32, String>,
-    removed: &[(i32, i32, String, String, bool, bool)],
-) -> R<()> {
-    for (_, repo_id, _, _, _, _) in removed {
-        if repo_paths.contains_key(repo_id) {
-            continue;
-        }
-        if let Some(repo_ref) = repo::get_repo(db, *repo_id).await.map_err(e)? {
-            repo_paths.insert(*repo_id, repo_ref.local_git_path);
-        }
-    }
-    Ok(())
+fn human_cancel_event_ids(in_memory: Vec<u64>, durable: &[i32]) -> Vec<u64> {
+    let mut ids = in_memory
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    ids.extend(
+        durable
+            .iter()
+            .filter_map(|request_id| u64::try_from(*request_id).ok()),
+    );
+    ids.into_iter().collect()
 }
 
-async fn cancel_workspace_human_asks(
-    db: &Db,
+async fn lock_thread_lifecycles(
     bus: &crate::bus::BusRegistry,
-    workspace_id: i32,
-) -> R<()> {
-    let scope = workspace_ask_scope(db, workspace_id).await?;
-    for thread_id in &scope.thread_ids {
-        bus.cancel_open_asks(*thread_id);
+    thread_ids: &std::collections::BTreeSet<i32>,
+) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+    let mut guards = Vec::with_capacity(thread_ids.len());
+    for thread_id in thread_ids {
+        guards.push(bus.thread_lifecycle_gate(*thread_id).lock_owned().await);
     }
-    for (thread_id, from) in &scope.direction_routes {
-        if !scope.thread_ids.contains(thread_id) {
-            bus.cancel_open_asks_from(*thread_id, from);
-        }
-    }
-    Ok(())
+    guards
 }
 
-/// Clear this workspace's entire footprint in the AskRegistry: cancel its open
-/// asks AND drop its threads' standing grants (full/always). The workspace delete
-/// cascade bypasses the per-issue `delete_thread` path, so — mirroring what that
-/// path does per issue — grants are revoked here too, or a deleted workspace would
-/// leave persisted authorization behind (and a later-reused thread id could inherit
-/// it).
-async fn cancel_workspace_asks(
-    db: &Db,
+fn apply_committed_bus_delete_effects(
+    bus: &crate::bus::BusRegistry,
+    cancelled_requests: &[repo::CancelledHumanRequest],
+    removed_threads: &[i32],
+    removed_directions: &[(i32, i32)],
+    closing_asks: &std::collections::BTreeMap<i32, Vec<u64>>,
+) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let removed_thread_ids = removed_threads.iter().copied().collect::<BTreeSet<_>>();
+    let mut events = BTreeMap::<i32, BTreeSet<u64>>::new();
+    for request in cancelled_requests {
+        if let Ok(request_id) = u64::try_from(request.request_id) {
+            events
+                .entry(request.thread_id)
+                .or_default()
+                .insert(request_id);
+        }
+    }
+
+    for thread_id in removed_threads {
+        bus.apply_thread_human_cancellation(*thread_id);
+        events
+            .entry(*thread_id)
+            .or_default()
+            .extend(closing_asks.get(thread_id).into_iter().flatten().copied());
+    }
+    for (thread_id, request_ids) in &events {
+        if removed_thread_ids.contains(thread_id) {
+            continue;
+        }
+        let ids = request_ids.iter().copied().collect::<Vec<_>>();
+        bus.apply_human_cancellations_by_id(*thread_id, &ids);
+    }
+    for (thread_id, direction_id) in removed_directions {
+        if removed_thread_ids.contains(thread_id) {
+            continue;
+        }
+        events
+            .entry(*thread_id)
+            .or_default()
+            .extend(bus.apply_direction_human_cancellation(*thread_id, &direction_id.to_string()));
+    }
+    for (thread_id, ask_ids) in events {
+        let ask_ids = ask_ids.into_iter().collect::<Vec<_>>();
+        bus.notify_cancelled_asks(thread_id, &ask_ids);
+    }
+    for thread_id in removed_threads {
+        bus.commit_thread_close(*thread_id);
+    }
+}
+
+async fn purge_committed_permission_effects(
     asks: &crate::ask::AskRegistry,
-    workspace_id: i32,
+    removed_threads: &[i32],
+    removed_directions: &[(i32, i32)],
 ) -> R<()> {
-    let scope = workspace_ask_scope(db, workspace_id).await?;
+    let removed_thread_ids = removed_threads
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
     for ask in asks.open() {
-        if scope.thread_ids.contains(&ask.thread)
-            || scope.direction_routes.contains(&(ask.thread, ask.dir.clone()))
-        {
+        if removed_thread_ids.contains(&ask.thread) {
             asks.cancel(ask.id);
         }
     }
-    for thread_id in &scope.thread_ids {
+    for thread_id in removed_threads {
         asks.revoke_thread(*thread_id);
     }
-    // Repo-routed directions live in OTHER workspaces' threads (this workspace owns
-    // the repo they use); the cascade deletes those directions, so revoke just their
-    // (thread, dir) grants — mirroring the open-ask cancellation scope above — else a
-    // later reused direction id inherits the deleted task's access.
-    for (thread_id, dir) in &scope.direction_routes {
-        if !scope.thread_ids.contains(thread_id) {
-            asks.revoke_grant(*thread_id, dir, None);
+    for (thread_id, direction_id) in removed_directions {
+        if !removed_thread_ids.contains(thread_id) {
+            asks.purge_dir(*thread_id, &direction_id.to_string());
         }
     }
-    // best-effort durable clear (revokes already reached the writer via emit)
     let _ = crate::auth_persist::flush(asks).await;
     Ok(())
 }
@@ -303,6 +340,18 @@ struct WorkspaceAskScope {
     direction_routes: std::collections::BTreeSet<(i32, String)>,
 }
 
+impl WorkspaceAskScope {
+    fn affected_thread_ids(&self) -> std::collections::BTreeSet<i32> {
+        let mut thread_ids = self.thread_ids.clone();
+        thread_ids.extend(
+            self.direction_routes
+                .iter()
+                .map(|(thread_id, _)| *thread_id),
+        );
+        thread_ids
+    }
+}
+
 async fn workspace_ask_scope(db: &Db, workspace_id: i32) -> R<WorkspaceAskScope> {
     let threads = repo::list_threads(db, workspace_id).await.map_err(e)?;
     let repos = repo::list_repos(db, workspace_id).await.map_err(e)?;
@@ -311,6 +360,14 @@ async fn workspace_ask_scope(db: &Db, workspace_id: i32) -> R<WorkspaceAskScope>
         scope.thread_ids.insert(thread.id);
     }
     for repo_ref in repos {
+        for direction in repo::directions_for_repo(db, repo_ref.id)
+            .await
+            .map_err(e)?
+        {
+            scope
+                .direction_routes
+                .insert((direction.thread_id, direction.id.to_string()));
+        }
         for session in repo::sessions_for_repo(db, repo_ref.id).await.map_err(e)? {
             if let Some(direction) = repo::get_direction(db, session.direction_id)
                 .await
@@ -325,21 +382,20 @@ async fn workspace_ask_scope(db: &Db, workspace_id: i32) -> R<WorkspaceAskScope>
     Ok(scope)
 }
 
-async fn stop_workspace_engines(app: &tauri::AppHandle, db: &Db, workspace_id: i32) -> R<()> {
+async fn stop_engines_by_key(app: &tauri::AppHandle, keys: &std::collections::BTreeSet<i64>) {
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
-    let keys = workspace_engine_keys(db, workspace_id).await?;
     for key in keys {
-        if let Some(eng) = state.remove(key) {
-            crate::lead_chat::engine::stop(app, &eng).await;
+        if let Some(eng) = state.remove(*key) {
+            // Destructive callers hold the global engine-admission write
+            // fence. Do not call the public stop wrapper here: it acquires
+            // the per-surface gate after the write lock, inverting normal
+            // surface-gate -> global-read admission order.
+            crate::lead_chat::engine::stop_under_engine_admission(app, &eng).await;
         }
     }
-    Ok(())
 }
 
-async fn workspace_engine_keys(
-    db: &Db,
-    workspace_id: i32,
-) -> R<std::collections::BTreeSet<i64>> {
+async fn workspace_engine_keys(db: &Db, workspace_id: i32) -> R<std::collections::BTreeSet<i64>> {
     let threads = repo::list_threads(db, workspace_id).await.map_err(e)?;
     let repos = repo::list_repos(db, workspace_id).await.map_err(e)?;
     let mut keys = std::collections::BTreeSet::<i64>::new();
@@ -354,8 +410,32 @@ async fn workspace_engine_keys(
         for session in repo::sessions_for_repo(db, repo.id).await.map_err(e)? {
             keys.insert(session.id as i64);
         }
+        for direction in repo::directions_for_repo(db, repo.id).await.map_err(e)? {
+            for session in repo::sessions_for_direction(db, direction.id)
+                .await
+                .map_err(e)?
+            {
+                keys.insert(session.id as i64);
+            }
+        }
     }
     Ok(keys)
+}
+
+async fn repo_engine_keys(db: &Db, repo_id: i32) -> R<std::collections::BTreeSet<i64>> {
+    let mut session_ids = std::collections::BTreeSet::new();
+    for session in repo::sessions_for_repo(db, repo_id).await.map_err(e)? {
+        session_ids.insert(session.id);
+    }
+    for direction in repo::directions_for_repo(db, repo_id).await.map_err(e)? {
+        for session in repo::sessions_for_direction(db, direction.id)
+            .await
+            .map_err(e)?
+        {
+            session_ids.insert(session.id);
+        }
+    }
+    Ok(session_ids.into_iter().map(i64::from).collect())
 }
 
 /// Engine registry keys for ONE thread: the lead (`-thread_id`) plus every
@@ -401,15 +481,849 @@ pub async fn ensure_default_workspace(db: State<'_, Db>) -> R<i32> {
     ensure_default_workspace_inner(&db).await
 }
 
+fn repo_action_gate(message_id: i32) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+    static GATES: OnceLock<Mutex<std::collections::HashMap<i32, Weak<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let gates = GATES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut gates = gates.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(gate) = gates.get(&message_id).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(message_id, Arc::downgrade(&gate));
+    gate
+}
+
+fn repo_action_guard_is_present(
+    thread_id: Option<i32>,
+    message_id: Option<i32>,
+    action_id: Option<&str>,
+    action_kind: Option<&str>,
+) -> R<bool> {
+    match (thread_id, message_id, action_id, action_kind) {
+        (None, None, None, None) => Ok(false),
+        (Some(_), Some(_), Some(_), Some(_)) => Ok(true),
+        _ => Err("action_card_stale".to_string()),
+    }
+}
+
+fn normalized_existing_repo_target(path: &str) -> R<std::path::PathBuf> {
+    let path = std::path::Path::new(path);
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(e)?.join(path)
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalized_repo_destination(dest: &str) -> R<std::path::PathBuf> {
+    let canonical = std::fs::canonicalize(dest)
+        .map_err(|_| "destination directory does not exist or is not accessible".to_string())?;
+    if !canonical.is_dir() {
+        return Err("destination is not a directory".to_string());
+    }
+    Ok(canonical)
+}
+
+fn repo_action_fingerprint(parts: &[&str]) -> String {
+    use sha1::{Digest, Sha1};
+
+    let mut digest = Sha1::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn new_repo_action_token() -> String {
+    use rand::RngCore;
+
+    let mut token = [0_u8; 20];
+    rand::thread_rng().fill_bytes(&mut token);
+    hex::encode(token)
+}
+
+struct RepoActionAdmission {
+    execution: entities::repo_action_execution::Model,
+    _os_lock: repo::RepoActionOsLock,
+    _lifecycle: Option<tokio::sync::OwnedMutexGuard<()>>,
+    _gate: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+fn acquire_repo_action_os_lock(execution_token: &str) -> R<repo::RepoActionOsLock> {
+    repo::acquire_repo_action_os_lock(execution_token).map_err(e)
+}
+
+async fn admit_repo_action(
+    db: &Db,
+    workspace_id: i32,
+    thread_id: Option<i32>,
+    message_id: Option<i32>,
+    action_id: Option<&str>,
+    action_kind: Option<&str>,
+    expected_action_kind: &str,
+    invocation_fingerprint: &str,
+    target_path: &std::path::Path,
+    staging_parent: Option<&std::path::Path>,
+) -> R<Option<RepoActionAdmission>> {
+    if !repo_action_guard_is_present(thread_id, message_id, action_id, action_kind)? {
+        return Ok(None);
+    }
+    let Some(thread_id) = thread_id else {
+        return Err("action_card_stale".to_string());
+    };
+    let Some(message_id) = message_id else {
+        return Err("action_card_stale".to_string());
+    };
+    let Some(action_id) = action_id else {
+        return Err("action_card_stale".to_string());
+    };
+    let Some(action_kind) = action_kind else {
+        return Err("action_card_stale".to_string());
+    };
+    let lifecycle_gate = crate::APP_HANDLE
+        .get()
+        .and_then(|app| app.try_state::<crate::bus::BusRegistry>())
+        .map(|bus| bus.thread_lifecycle_gate(thread_id));
+    let lifecycle = if let Some(gate) = lifecycle_gate {
+        Some(gate.lock_owned().await)
+    } else {
+        None
+    };
+    let gate = repo_action_gate(message_id).lock_owned().await;
+    let candidate_token = new_repo_action_token();
+    let candidate_staging = staging_parent
+        .map(|parent| parent.join(format!(".weft-repo-action-{candidate_token}.staging")))
+        .unwrap_or_default();
+    let request = repo::RepoActionClaimRequest {
+        workspace_id,
+        thread_id,
+        message_id,
+        action_id,
+        action_kind,
+        expected_action_kind,
+        invocation_fingerprint,
+        execution_token: &candidate_token,
+        target_path: &target_path.to_string_lossy(),
+        staging_path: &candidate_staging.to_string_lossy(),
+    };
+    let execution = repo::claim_repo_action_execution(db, &request)
+        .await
+        .map_err(e)?;
+    let os_lock = acquire_repo_action_os_lock(&execution.execution_token)?;
+    Ok(Some(RepoActionAdmission {
+        execution,
+        _os_lock: os_lock,
+        _lifecycle: lifecycle,
+        _gate: Some(gate),
+    }))
+}
+
+async fn completed_repo_for_admission(
+    db: &Db,
+    admission: &RepoActionAdmission,
+) -> R<Option<entities::repo_ref::Model>> {
+    if admission.execution.status != repo::REPO_ACTION_COMPLETED {
+        return Ok(None);
+    }
+    let Some(repo_ref) = repo::get_repo(db, admission.execution.repo_id)
+        .await
+        .map_err(e)?
+    else {
+        return Err("action_card_stale".to_string());
+    };
+    if repo_ref.workspace_id != admission.execution.workspace_id
+        || repo_ref.name != admission.execution.repo_name
+    {
+        return Err("action_card_stale".to_string());
+    }
+    Ok(Some(repo_ref))
+}
+
+async fn complete_admitted_repo_action(
+    db: &Db,
+    admission: &mut RepoActionAdmission,
+    repo_ref: &entities::repo_ref::Model,
+) -> R<()> {
+    // The long-running materialize/register phase owns the execution's OS lock
+    // and the claim gates. Drop only the async lifecycle/repo-action guards
+    // before waiting on the per-surface admission gate: visible send takes
+    // surface -> global-read, while destructive paths take global-write ->
+    // lifecycle. Holding lifecycle here while waiting on surface would create
+    // the cycle lifecycle -> surface -> global -> lifecycle. The OS lock stays
+    // held across this handoff, so delete/rewind/cleanup and duplicate action
+    // paths fail fast before they can enter the lifecycle gate.
+    drop(admission._lifecycle.take());
+    drop(admission._gate.take());
+    let serial = crate::lead_chat::engine::admission_gate_for_key(
+        crate::lead_chat::commands::lead_key(admission.execution.thread_id),
+    )
+    .lock_owned()
+    .await;
+    complete_admitted_repo_action_under_gate(db, admission, repo_ref, serial).await
+}
+
+async fn complete_admitted_repo_action_under_gate(
+    db: &Db,
+    admission: &mut RepoActionAdmission,
+    repo_ref: &entities::repo_ref::Model,
+    _serial: tokio::sync::OwnedMutexGuard<()>,
+) -> R<()> {
+    // Re-acquire in the canonical order while surface admission is held. Do
+    // not reuse the pre-materialize verdict: completion re-reads thread/repo,
+    // delete markers, action-card identity, and execution status inside its
+    // own transaction before committing the hidden outbox row.
+    let lifecycle_gate = crate::APP_HANDLE
+        .get()
+        .and_then(|app| app.try_state::<crate::bus::BusRegistry>())
+        .map(|bus| bus.thread_lifecycle_gate(admission.execution.thread_id));
+    let _lifecycle = match lifecycle_gate {
+        Some(gate) => Some(gate.lock_owned().await),
+        None => None,
+    };
+    let _gate = repo_action_gate(admission.execution.message_id)
+        .lock_owned()
+        .await;
+    admission.execution = repo::complete_repo_action_execution(db, &admission.execution, repo_ref)
+        .await
+        .map_err(e)?;
+    Ok(())
+}
+
+#[cfg(test)]
+async fn test_complete_admitted_repo_action_under_gate(
+    db: &Db,
+    admission: &mut RepoActionAdmission,
+    repo_ref: &entities::repo_ref::Model,
+    serial: tokio::sync::OwnedMutexGuard<()>,
+) -> R<()> {
+    drop(admission._lifecycle.take());
+    drop(admission._gate.take());
+    complete_admitted_repo_action_under_gate(db, admission, repo_ref, serial).await
+}
+
+/// Test-only production-path seam for a durable restart regression. It drives
+/// the same claim → materialize → register → complete sequence as the guarded
+/// `new` repository command, including the completion transaction's atomic
+/// hidden-row insert.
+#[cfg(test)]
+pub(crate) async fn test_complete_repo_action_for_restart(
+    db: &Db,
+    workspace_id: i32,
+    thread_id: i32,
+    message_id: i32,
+    action_id: &str,
+    target: &std::path::Path,
+) -> R<entities::repo_action_execution::Model> {
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| "action_card_stale".to_string())?;
+    let target = std::fs::canonicalize(target.parent().unwrap_or(target))
+        .map_err(|error| error.to_string())?
+        .join(file_name);
+    let fingerprint = repo_action_fingerprint(&["new", &target.to_string_lossy(), "checkout"]);
+    let admission = admit_repo_action(
+        db,
+        workspace_id,
+        Some(thread_id),
+        Some(message_id),
+        Some(action_id),
+        Some("new"),
+        "new",
+        &fingerprint,
+        &target,
+        target.parent(),
+    )
+    .await?;
+    let Some(mut admission) = admission else {
+        return Err("action_card_stale".to_string());
+    };
+    let materialized = materialize_repo_action(db, &mut admission, crate::git::init_repo).await?;
+    let repo_ref = register_repo_without_schedule(
+        db,
+        workspace_id,
+        "checkout",
+        &materialized.to_string_lossy(),
+        Some(&admission._os_lock),
+    )
+    .await?;
+    complete_admitted_repo_action(db, &mut admission, &repo_ref).await?;
+    Ok(admission.execution)
+}
+
+const REPO_ACTION_TOKEN_MARKER: &str = "weft-action-token";
+
+fn repo_action_target_has_token(path: &std::path::Path, token: &str) -> bool {
+    let git_dir = path.join(".git");
+    let marker = git_dir.join(REPO_ACTION_TOKEN_MARKER);
+    let Ok(git_meta) = std::fs::symlink_metadata(&git_dir) else {
+        return false;
+    };
+    let Ok(marker_meta) = std::fs::symlink_metadata(&marker) else {
+        return false;
+    };
+    if !git_meta.file_type().is_dir() || !marker_meta.file_type().is_file() {
+        return false;
+    }
+    std::fs::read_to_string(marker).is_ok_and(|stored| stored == token)
+}
+
+fn repo_action_owner_path(staging: &std::path::Path, token: &str) -> R<std::path::PathBuf> {
+    let Some(parent) = staging.parent() else {
+        return Err("action_card_stale".to_string());
+    };
+    Ok(parent.join(format!(".weft-repo-action-{token}.owner")))
+}
+
+fn token_file_matches(path: &std::path::Path, token: &str) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    meta.file_type().is_file() && std::fs::read_to_string(path).is_ok_and(|stored| stored == token)
+}
+
+fn write_token_file(path: &std::path::Path, token: &str, create_new: bool) -> R<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("cannot write repository action marker: {error}"))?;
+    file.write_all(token.as_bytes())
+        .map_err(|error| format!("cannot write repository action marker: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("cannot persist repository action marker: {error}"))
+}
+
+fn write_repo_action_target_marker(path: &std::path::Path, token: &str) -> R<()> {
+    let git_dir = path.join(".git");
+    let meta = std::fs::symlink_metadata(&git_dir)
+        .map_err(|_| "created repository has no .git directory".to_string())?;
+    if !meta.file_type().is_dir() {
+        return Err("created repository has an unsafe .git path".to_string());
+    }
+    let marker = git_dir.join(REPO_ACTION_TOKEN_MARKER);
+    if marker.exists() {
+        if token_file_matches(&marker, token) {
+            return Ok(());
+        }
+        return Err("created repository has a foreign action marker".to_string());
+    }
+    write_token_file(&marker, token, true)
+}
+
+fn cleanup_owned_staging_checked(execution: &entities::repo_action_execution::Model) -> R<()> {
+    if execution.staging_path.is_empty() {
+        return Ok(());
+    }
+    let staging = std::path::Path::new(&execution.staging_path);
+    let Ok(owner) = repo_action_owner_path(staging, &execution.execution_token) else {
+        return Ok(());
+    };
+    let owns_staging = token_file_matches(&owner, &execution.execution_token)
+        || repo_action_target_has_token(staging, &execution.execution_token);
+    if owns_staging && staging.exists() {
+        std::fs::remove_dir_all(staging)
+            .map_err(|error| format!("cannot remove repository action staging path: {error}"))?;
+    }
+    if token_file_matches(&owner, &execution.execution_token) {
+        std::fs::remove_file(owner)
+            .map_err(|error| format!("cannot remove repository action owner marker: {error}"))?;
+    }
+    Ok(())
+}
+
+fn cleanup_owned_target_checked(execution: &entities::repo_action_execution::Model) -> R<()> {
+    let target = std::path::Path::new(&execution.target_path);
+    if repo_action_target_has_token(target, &execution.execution_token) {
+        std::fs::remove_dir_all(target)
+            .map_err(|error| format!("cannot remove repository action target: {error}"))?;
+    }
+    Ok(())
+}
+
+fn cleanup_owned_target_marker_checked(
+    execution: &entities::repo_action_execution::Model,
+) -> R<()> {
+    let marker = std::path::Path::new(&execution.target_path)
+        .join(".git")
+        .join(REPO_ACTION_TOKEN_MARKER);
+    if token_file_matches(&marker, &execution.execution_token) {
+        std::fs::remove_file(marker)
+            .map_err(|error| format!("cannot remove repository action target marker: {error}"))?;
+    }
+    Ok(())
+}
+
+fn repo_paths_match(left: &str, right: &str) -> bool {
+    let left_path = std::path::Path::new(left);
+    let right_path = std::path::Path::new(right);
+    match (
+        std::fs::canonicalize(left_path),
+        std::fs::canonicalize(right_path),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left_path == right_path,
+    }
+}
+
+pub(crate) struct LockedRepoActionCleanup {
+    execution: entities::repo_action_execution::Model,
+    target_is_registered: bool,
+    _lock: repo::RepoActionOsLock,
+}
+
+pub(crate) async fn lock_repo_action_cleanups(
+    db: &Db,
+    mut executions: Vec<entities::repo_action_execution::Model>,
+) -> R<Vec<LockedRepoActionCleanup>> {
+    executions.sort_by(|left, right| left.execution_token.cmp(&right.execution_token));
+    let mut locked = Vec::with_capacity(executions.len());
+    for observed in executions {
+        let lock = acquire_repo_action_os_lock(&observed.execution_token).map_err(|error| {
+            if error == "action_card_in_progress" {
+                "repository action is still in progress".to_string()
+            } else {
+                error
+            }
+        })?;
+        let Some(execution) = repo::get_repo_action_execution_by_id(db, observed.id)
+            .await
+            .map_err(e)?
+        else {
+            continue;
+        };
+        if execution.execution_token != observed.execution_token {
+            return Err("repository action cleanup ownership changed".to_string());
+        }
+        let target_is_registered = if execution.status == repo::REPO_ACTION_CLEANUP_PENDING {
+            execution.cleanup_preserve_target
+        } else {
+            let repos = repo::list_repos(db, execution.workspace_id)
+                .await
+                .map_err(e)?;
+            repos
+                .iter()
+                .any(|repo_ref| repo_paths_match(&execution.target_path, &repo_ref.local_git_path))
+        };
+        locked.push(LockedRepoActionCleanup {
+            execution,
+            target_is_registered,
+            _lock: lock,
+        });
+    }
+    Ok(locked)
+}
+
+pub(crate) fn repo_action_cleanup_plans(
+    locked: &[LockedRepoActionCleanup],
+) -> Vec<repo::RepoActionCleanupPlan> {
+    locked
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.execution.status.as_str(),
+                repo::REPO_ACTION_PENDING | repo::REPO_ACTION_MATERIALIZED
+            )
+        })
+        .map(|item| repo::RepoActionCleanupPlan {
+            execution_id: item.execution.id,
+            execution_token: item.execution.execution_token.clone(),
+            expected_status: item.execution.status.clone(),
+            preserve_target: item.target_is_registered,
+        })
+        .collect()
+}
+
+pub(crate) fn repo_action_rewind_plans(
+    locked: &[LockedRepoActionCleanup],
+) -> Vec<repo::RepoActionRewindPlan> {
+    locked
+        .iter()
+        .map(|item| repo::RepoActionRewindPlan {
+            execution_id: item.execution.id,
+            execution_token: item.execution.execution_token.clone(),
+            thread_id: item.execution.thread_id,
+            message_id: item.execution.message_id,
+            expected_status: item.execution.status.clone(),
+            expected_feedback_state: item.execution.feedback_state.clone(),
+        })
+        .collect()
+}
+
+async fn cleanup_locked_repo_action_with<F>(
+    db: &Db,
+    item: &LockedRepoActionCleanup,
+    cleanup: F,
+) -> R<()>
+where
+    F: FnOnce(&entities::repo_action_execution::Model, bool) -> R<()>,
+{
+    if item.execution.status == repo::REPO_ACTION_COMPLETED {
+        return Ok(());
+    }
+    let Some(current) = repo::get_repo_action_execution_by_id(db, item.execution.id)
+        .await
+        .map_err(e)?
+    else {
+        return Ok(());
+    };
+    if current.execution_token != item.execution.execution_token
+        || current.status != repo::REPO_ACTION_CLEANUP_PENDING
+    {
+        return Err("repository action cleanup record changed before cleanup".to_string());
+    }
+    cleanup(&current, current.cleanup_preserve_target)?;
+    if !repo::delete_repo_action_cleanup_record(db, current.id, &current.execution_token)
+        .await
+        .map_err(e)?
+    {
+        return Err("repository action cleanup record changed before acknowledgement".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) async fn cleanup_locked_repo_actions(db: &Db, locked: &[LockedRepoActionCleanup]) {
+    for item in locked {
+        let cleanup =
+            cleanup_locked_repo_action_with(db, item, |execution, target_is_registered| {
+                cleanup_owned_staging_checked(execution)?;
+                if target_is_registered {
+                    cleanup_owned_target_marker_checked(execution)
+                } else {
+                    cleanup_owned_target_checked(execution)
+                }
+            })
+            .await;
+        if let Err(error) = cleanup {
+            eprintln!(
+                "[weft] repository action cleanup {} retained for retry: {error}",
+                item.execution.id
+            );
+        }
+    }
+}
+
+pub(crate) fn spawn_pending_repo_action_cleanups(db: Db) {
+    tauri::async_runtime::spawn(async move {
+        let executions = match repo::pending_repo_action_cleanups(&db).await {
+            Ok(executions) => executions,
+            Err(error) => {
+                eprintln!("[weft] list pending repository action cleanups failed: {error}");
+                return;
+            }
+        };
+        for execution in executions {
+            match lock_repo_action_cleanups(&db, vec![execution]).await {
+                Ok(locked) => cleanup_locked_repo_actions(&db, &locked).await,
+                Err(error) => eprintln!(
+                    "[weft] repository action cleanup retry could not acquire ownership: {error}"
+                ),
+            }
+        }
+    });
+}
+
+async fn abandon_pending_repo_action(
+    db: &Db,
+    admission: &RepoActionAdmission,
+    cleanup_target: bool,
+    error: String,
+) -> String {
+    let cleanup = match repo::stage_pending_repo_action_cleanup(
+        db,
+        admission.execution.id,
+        &admission.execution.execution_token,
+        !cleanup_target,
+    )
+    .await
+    {
+        Ok(cleanup) => cleanup,
+        Err(stage_error) => {
+            return format!("{error}; failed to retain repository action cleanup: {stage_error}");
+        }
+    };
+    let cleanup_result = cleanup_owned_staging_checked(&cleanup).and_then(|()| {
+        if cleanup.cleanup_preserve_target {
+            cleanup_owned_target_marker_checked(&cleanup)
+        } else {
+            cleanup_owned_target_checked(&cleanup)
+        }
+    });
+    if let Err(cleanup_error) = cleanup_result {
+        return format!("{error}; cleanup retained for retry: {cleanup_error}");
+    }
+    match repo::delete_repo_action_cleanup_record(db, cleanup.id, &cleanup.execution_token).await {
+        Ok(true) => error,
+        Ok(false) => format!("{error}; cleanup acknowledgement changed before commit"),
+        Err(cleanup_error) => {
+            format!("{error}; cleanup acknowledgement retained for retry: {cleanup_error}")
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn repo_action_c_path(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repository action path contains NUL",
+        )
+    })
+}
+
+/// Promote a completed sibling staging directory without ever replacing a
+/// target that appeared after the preflight. Staging and target share a parent,
+/// so the platform primitive is also the single-filesystem atomic commit.
+fn promote_repo_action_noreplace(
+    staging: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let staging = repo_action_c_path(staging)?;
+        let target = repo_action_c_path(target)?;
+        let result = unsafe {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                staging.as_ptr(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let staging = repo_action_c_path(staging)?;
+        let target = repo_action_c_path(target)?;
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                staging.as_ptr(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "Kernel32")]
+        extern "system" {
+            fn MoveFileExW(
+                existing_file_name: *const u16,
+                new_file_name: *const u16,
+                flags: u32,
+            ) -> i32;
+        }
+
+        fn wide_path(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
+            let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+            if encoded.contains(&0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "repository action path contains NUL",
+                ));
+            }
+            encoded.push(0);
+            Ok(encoded)
+        }
+
+        let staging = wide_path(staging)?;
+        let target = wide_path(target)?;
+        // flags=0 deliberately omits MOVEFILE_REPLACE_EXISTING.
+        let result = unsafe { MoveFileExW(staging.as_ptr(), target.as_ptr(), 0) };
+        if result != 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = (staging, target);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace repository promotion is unsupported on this platform",
+        ))
+    }
+}
+
+/// Materialize clone/init work through a token-owned sibling staging path, then
+/// atomically rename it into place. A target marker is the only evidence that
+/// an occupied final directory belongs to this execution.
+async fn materialize_repo_action<F>(
+    db: &Db,
+    admission: &mut RepoActionAdmission,
+    mutation: F,
+) -> R<std::path::PathBuf>
+where
+    F: FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
+{
+    let target = std::path::PathBuf::from(&admission.execution.target_path);
+    let staging = std::path::PathBuf::from(&admission.execution.staging_path);
+    let token = admission.execution.execution_token.clone();
+    let Some(parent) = target.parent() else {
+        return Err("action_card_stale".to_string());
+    };
+    let expected_staging = parent.join(format!(".weft-repo-action-{token}.staging"));
+    if staging != expected_staging || staging == target {
+        return Err("action_card_stale".to_string());
+    }
+
+    if admission.execution.status == repo::REPO_ACTION_COMPLETED {
+        return Ok(target);
+    }
+    if admission.execution.status == repo::REPO_ACTION_MATERIALIZED {
+        if repo_action_target_has_token(&target, &token) {
+            return Ok(target);
+        }
+        return Err("action_card_stale".to_string());
+    }
+    if admission.execution.status != repo::REPO_ACTION_PENDING {
+        return Err("action_card_stale".to_string());
+    }
+
+    if std::fs::symlink_metadata(&target).is_ok() {
+        if repo_action_target_has_token(&target, &token) {
+            cleanup_owned_staging_checked(&admission.execution)?;
+            admission.execution =
+                repo::mark_repo_action_materialized(db, admission.execution.id, &token)
+                    .await
+                    .map_err(e)?;
+            return Ok(target);
+        }
+        let error = format!(
+            "repo path already exists and is not owned by this action: {}",
+            target.display()
+        );
+        return Err(abandon_pending_repo_action(db, admission, false, error).await);
+    }
+
+    let owner = repo_action_owner_path(&staging, &token)?;
+    if staging.exists() {
+        if repo_action_target_has_token(&staging, &token) {
+            // Git completed before a crash; continue with the atomic promotion.
+        } else if token_file_matches(&owner, &token) {
+            std::fs::remove_dir_all(&staging).map_err(|error| {
+                format!("cannot clean interrupted repository staging path: {error}")
+            })?;
+        } else {
+            let error = format!(
+                "repository staging path is occupied by another owner: {}",
+                staging.display()
+            );
+            return Err(abandon_pending_repo_action(db, admission, false, error).await);
+        }
+    }
+
+    if !staging.exists() {
+        if owner.exists() && !token_file_matches(&owner, &token) {
+            let error = format!(
+                "repository staging marker is occupied by another owner: {}",
+                owner.display()
+            );
+            return Err(abandon_pending_repo_action(db, admission, false, error).await);
+        }
+        if token_file_matches(&owner, &token) {
+            std::fs::remove_file(&owner)
+                .map_err(|error| format!("cannot reset repository staging marker: {error}"))?;
+        }
+        if let Err(error) = write_token_file(&owner, &token, true) {
+            let error = abandon_pending_repo_action(db, admission, false, error).await;
+            return Err(error);
+        }
+        let staging_for_mutation = staging.clone();
+        let mutation_result = tokio::task::spawn_blocking(move || mutation(&staging_for_mutation))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(e));
+        if let Err(error) = mutation_result {
+            let error = abandon_pending_repo_action(db, admission, false, error).await;
+            return Err(error);
+        }
+        if let Err(error) = write_repo_action_target_marker(&staging, &token) {
+            let error = abandon_pending_repo_action(db, admission, false, error).await;
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = promote_repo_action_noreplace(&staging, &target) {
+        let message = format!("cannot atomically install repository: {error}");
+        let message = abandon_pending_repo_action(db, admission, false, message).await;
+        return Err(message);
+    }
+    if token_file_matches(&owner, &token) {
+        let _ = std::fs::remove_file(&owner);
+    }
+    if let Err(error) = ensure_path_under_dest(&target, parent) {
+        let error = abandon_pending_repo_action(db, admission, true, error).await;
+        return Err(error);
+    }
+
+    // From this point onward, failures retain both claim and target marker.
+    // The exact retry recognizes the marker and cannot re-run clone/init.
+    admission.execution = repo::mark_repo_action_materialized(db, admission.execution.id, &token)
+        .await
+        .map_err(e)?;
+    Ok(target)
+}
+
 /// Register an existing local git repo: validate, record, profile. Shared by
 /// add (existing) / clone / create — they all converge on "a path weft refs".
-async fn register_repo(
+async fn register_repo_without_schedule(
     db: &Db,
     workspace_id: i32,
     name: &str,
     path: &str,
+    held_action_lock: Option<&repo::RepoActionOsLock>,
 ) -> R<entities::repo_ref::Model> {
     let p = std::path::Path::new(path);
+    // A cleanup owns the same token lock from planning through post-commit
+    // filesystem removal. Join that protocol before validating or persisting a
+    // marker-bearing target, and keep the guard through every registration
+    // write so cleanup and adoption have one linearization order.
+    let registration_lock =
+        repo::acquire_repo_action_target_registration_lock(p, held_action_lock).map_err(e)?;
+    let held_action_lock = registration_lock.as_ref().or(held_action_lock);
     if !crate::git::is_git_repo(p) {
         return Err("not a git repository".into());
     }
@@ -446,15 +1360,23 @@ async fn register_repo(
     //     local-only repo with no remote still dedups by path.
     for existing in repo::list_repos(db, workspace_id).await.map_err(e)? {
         if existing.remote_url.is_empty() {
-            if let Some(rem) = crate::git::remote_url(std::path::Path::new(&existing.local_git_path))
+            if let Some(rem) =
+                crate::git::remote_url(std::path::Path::new(&existing.local_git_path))
             {
-                let _ = repo::set_repo_remote(db, existing.id, &crate::git::redact_remote(&rem)).await;
+                let _ =
+                    repo::set_repo_remote(db, existing.id, &crate::git::redact_remote(&rem)).await;
             }
         }
         if let Ok(canon) = std::fs::canonicalize(&existing.local_git_path) {
             let canon = canon.to_string_lossy();
             if canon != existing.local_git_path {
-                let _ = repo::set_repo_path(db, existing.id, &canon).await;
+                let _ = match held_action_lock {
+                    Some(action_lock) => {
+                        repo::set_repo_path_with_action_lock(db, existing.id, &canon, action_lock)
+                            .await
+                    }
+                    None => repo::set_repo_path(db, existing.id, &canon).await,
+                };
             }
         }
     }
@@ -464,16 +1386,33 @@ async fn register_repo(
     // base is whatever happened to be checked out / the "main" last-resort, which is NOT
     // vetted; marking it is_default=true would make the offline fallback
     // (`recorded_base_or_default`) trust it over the main/master chain (R47-2).
-    let mut r = repo::add_repo_ref(
-        db,
-        workspace_id,
-        name,
-        &canonical,
-        &base,
-        &remote,
-        base_is_vetted_default,
-    )
-    .await
+    let mut r = match held_action_lock {
+        Some(action_lock) => {
+            repo::add_repo_ref_with_action_lock(
+                db,
+                workspace_id,
+                name,
+                &canonical,
+                &base,
+                &remote,
+                base_is_vetted_default,
+                action_lock,
+            )
+            .await
+        }
+        None => {
+            repo::add_repo_ref(
+                db,
+                workspace_id,
+                name,
+                &canonical,
+                &base,
+                &remote,
+                base_is_vetted_default,
+            )
+            .await
+        }
+    }
     .map_err(e)?;
     // If dedup resolved to an EXISTING row (by remote) at a different path whose
     // checkout is gone, repoint it to the path the user just gave us — a local add
@@ -483,7 +1422,13 @@ async fn register_repo(
     if r.local_git_path != canonical
         && !crate::git::is_git_repo(std::path::Path::new(&r.local_git_path))
     {
-        if let Ok(Some(updated)) = repo::set_repo_path(db, r.id, &canonical).await {
+        let update = match held_action_lock {
+            Some(action_lock) => {
+                repo::set_repo_path_with_action_lock(db, r.id, &canonical, action_lock).await
+            }
+            None => repo::set_repo_path(db, r.id, &canonical).await,
+        };
+        if let Ok(Some(updated)) = update {
             r = updated;
             // Repointed from a DEAD checkout to this live one: forget the stale
             // "checkout not found" failure so the auto pass below reclassifies the
@@ -510,23 +1455,304 @@ async fn register_repo(
     if matches!(repo::get_repo_profile(db, r.id).await, Ok(None)) {
         let _ = repo::upsert_repo_profile(db, r.id, "", "[]", "", "[]", "agent", "").await;
     }
-    // Fire-and-forget the agent curator over the whole workspace so the new repo
-    // gets a deep per-repo classification and cross-repo relations refresh.
-    // Read-only, coalesced (a batch add runs one pass), and best-effort — it
-    // never blocks the add. Not forced: an add shouldn't retry OTHER repos' failures.
-    // No-op outside a running app (`maybe_schedule_backfill`'s gate): with no App
-    // built, `tauri::async_runtime::spawn` still runs this on a fallback runtime,
-    // so a unit test calling `register_repo` would leak a live pass that outlives
-    // the test body, mutates the process-global pass-gate/run-state registries
-    // (shared across tests via small fresh-DB ids), and can launch a real agent.
+    Ok(r)
+}
+
+/// Schedule only after a guarded execution's completion commit. Exact completed
+/// replays schedule again as a crash-safe nudge; the curator coalesces duplicates.
+fn schedule_repo_curator(db: &Db, repo_ref: &entities::repo_ref::Model) {
     if crate::APP_HANDLE.get().is_some() {
         let db_bg = db.clone();
-        let ws = r.workspace_id;
+        let ws = repo_ref.workspace_id;
         tauri::async_runtime::spawn(async move {
             crate::curator::analyze_workspace_coalesced(&db_bg, ws, false).await;
         });
     }
+}
+
+/// Legacy/guardless registration keeps its existing eager scheduling behavior.
+async fn register_repo(
+    db: &Db,
+    workspace_id: i32,
+    name: &str,
+    path: &str,
+) -> R<entities::repo_ref::Model> {
+    let r = register_repo_without_schedule(db, workspace_id, name, path, None).await?;
+    schedule_repo_curator(db, &r);
     Ok(r)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepoActionExecutionOutcome {
+    FreshlyCompleted,
+    Replayed,
+}
+
+#[derive(Debug)]
+struct RepoActionInvocationResult {
+    repo: entities::repo_ref::Model,
+    outcome: RepoActionExecutionOutcome,
+    execution_id: Option<i32>,
+}
+
+#[derive(serde::Serialize)]
+pub struct RepoActionCommandResult {
+    pub execution_outcome: &'static str,
+    pub repo: Option<entities::repo_ref::Model>,
+}
+
+impl From<RepoActionInvocationResult> for RepoActionCommandResult {
+    fn from(result: RepoActionInvocationResult) -> Self {
+        let execution_outcome = match result.outcome {
+            RepoActionExecutionOutcome::FreshlyCompleted => "freshly_completed",
+            RepoActionExecutionOutcome::Replayed => "replayed",
+        };
+        Self {
+            execution_outcome,
+            repo: Some(result.repo),
+        }
+    }
+}
+
+fn repo_action_in_progress_result() -> RepoActionCommandResult {
+    RepoActionCommandResult {
+        execution_outcome: "in_progress",
+        repo: None,
+    }
+}
+
+async fn drain_repo_action_feedback_with<F, Fut>(db: &Db, execution_id: i32, deliver: F) -> R<bool>
+where
+    F: FnOnce(i32, serde_json::Value) -> Fut,
+    Fut: std::future::Future<Output = R<bool>>,
+{
+    let Some(snapshot) = repo::get_repo_action_execution_by_id(db, execution_id)
+        .await
+        .map_err(e)?
+    else {
+        return Ok(true);
+    };
+    if snapshot.status != repo::REPO_ACTION_COMPLETED
+        || snapshot.feedback_state != repo::REPO_ACTION_FEEDBACK_PENDING
+    {
+        return Ok(true);
+    }
+    let _lock = match acquire_repo_action_os_lock(&snapshot.execution_token) {
+        Ok(lock) => lock,
+        Err(error) if error == "action_card_in_progress" => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let Some(current) = repo::get_repo_action_execution_by_id(db, execution_id)
+        .await
+        .map_err(e)?
+    else {
+        return Ok(true);
+    };
+    if current.execution_token != snapshot.execution_token
+        || current.status != repo::REPO_ACTION_COMPLETED
+        || current.feedback_state != repo::REPO_ACTION_FEEDBACK_PENDING
+    {
+        return Ok(true);
+    }
+    cleanup_completed_execution_target(&current)?;
+    let payload: serde_json::Value = serde_json::from_str(&current.feedback_payload)
+        .map_err(|error| format!("invalid repository action feedback payload: {error}"))?;
+    if !deliver(current.thread_id, payload).await? {
+        return Ok(false);
+    }
+    if let Some(hidden) = repo::get_lead_hidden_delivery_by_dedupe(
+        db,
+        &format!("repo_action:{}", current.id),
+    )
+    .await
+    .map_err(e)?
+    {
+        // `post_lead_tool_result_inner` has durably accepted the payload, but
+        // this is not a delivery receipt. The engine's first activity consumes
+        // the hidden row and advances feedback_state in one transaction.
+        return Ok(hidden.state == repo::LEAD_HIDDEN_DELIVERY_CONSUMED);
+    }
+    // A successful callback is only an attempt to enqueue the durable hidden
+    // row. Without that row there is no engine activity receipt, so the
+    // journal must remain pending for a retry rather than being acknowledged
+    // on the strength of a caller-supplied payload.
+    Ok(false)
+}
+
+async fn drain_repo_action_feedback_once(db: &Db, execution_id: i32) -> R<bool> {
+    let Some(app) = crate::APP_HANDLE.get().cloned() else {
+        return Ok(false);
+    };
+    let db_for_delivery = db.clone();
+    drain_repo_action_feedback_with(db, execution_id, move |_, _| {
+        let app = app.clone();
+        let db = db_for_delivery.clone();
+        async move {
+            crate::lead_chat::commands::post_repo_action_feedback_from_journal(
+                &app,
+                &db,
+                execution_id,
+                "en",
+            )
+            .await
+        }
+    })
+    .await
+}
+
+fn spawn_repo_action_feedback_drain(db: Db, execution_id: i32) {
+    tauri::async_runtime::spawn(async move {
+        for delay in [0_u64, 1_000, 5_000, 30_000] {
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+            match drain_repo_action_feedback_once(&db, execution_id).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!(
+                        "[weft] repository action feedback {execution_id} delivery failed: {error}"
+                    );
+                }
+            }
+        }
+    });
+}
+
+pub(crate) fn spawn_pending_repo_action_feedback(db: Db, thread_id: Option<i32>) {
+    tauri::async_runtime::spawn(async move {
+        match restore_pending_repo_action_feedback_once(&db, thread_id).await {
+            Ok(retry_ids) => {
+                for execution_id in retry_ids {
+                    spawn_repo_action_feedback_drain(db.clone(), execution_id);
+                }
+            }
+            Err(error) => eprintln!("[weft] list pending repository action feedback failed: {error}"),
+        }
+    });
+}
+
+/// Perform one synchronous startup pass over the repository-action journal.
+/// This is intentionally separate from the delayed retry loop: boot revive
+/// awaits this pass before scanning hidden lead rows, so an older repo-action
+/// row is materialized before a later plan decision can be admitted. A false
+/// or failed delivery remains retryable and is returned to the caller; the
+/// durable hidden row, when accepted, is still pending until the engine emits
+/// its activity receipt.
+pub(crate) async fn restore_pending_repo_action_feedback_once(
+    db: &Db,
+    thread_id: Option<i32>,
+) -> Result<Vec<i32>, String> {
+    let executions = repo::pending_repo_action_feedback(db, thread_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut retry_ids = Vec::new();
+    for execution in executions {
+        match drain_repo_action_feedback_once(db, execution.id).await {
+            Ok(true) => {}
+            Ok(false) | Err(_) => retry_ids.push(execution.id),
+        }
+    }
+    Ok(retry_ids)
+}
+
+async fn add_repo_ref_inner(
+    db: &Db,
+    workspace_id: i32,
+    name: String,
+    local_git_path: String,
+    thread_id: Option<i32>,
+    message_id: Option<i32>,
+    action_id: Option<String>,
+    action_kind: Option<String>,
+) -> R<RepoActionInvocationResult> {
+    let guarded = repo_action_guard_is_present(
+        thread_id,
+        message_id,
+        action_id.as_deref(),
+        action_kind.as_deref(),
+    )?;
+    if !guarded {
+        let repo = register_repo(db, workspace_id, &name, &local_git_path).await?;
+        return Ok(RepoActionInvocationResult {
+            repo,
+            outcome: RepoActionExecutionOutcome::FreshlyCompleted,
+            execution_id: None,
+        });
+    }
+
+    let target = normalized_existing_repo_target(&local_git_path)?;
+    let target_text = target.to_string_lossy().into_owned();
+    let fingerprint = repo_action_fingerprint(&["add", &target_text, &name]);
+    let admission = admit_repo_action(
+        db,
+        workspace_id,
+        thread_id,
+        message_id,
+        action_id.as_deref(),
+        action_kind.as_deref(),
+        "add",
+        &fingerprint,
+        &target,
+        None,
+    )
+    .await?;
+    let Some(mut admission) = admission else {
+        return Err("action_card_stale".to_string());
+    };
+    if let Some(repo_ref) = completed_repo_for_admission(db, &admission).await? {
+        cleanup_completed_action_target(&admission, &repo_ref)?;
+        schedule_repo_curator(db, &repo_ref);
+        return Ok(RepoActionInvocationResult {
+            repo: repo_ref,
+            outcome: RepoActionExecutionOutcome::Replayed,
+            execution_id: Some(admission.execution.id),
+        });
+    }
+    if admission.execution.status == repo::REPO_ACTION_PENDING {
+        if !crate::git::is_git_repo(&target) {
+            let error = abandon_pending_repo_action(
+                db,
+                &admission,
+                false,
+                "not a git repository".to_string(),
+            )
+            .await;
+            return Err(error);
+        }
+        admission.execution = repo::mark_repo_action_materialized(
+            db,
+            admission.execution.id,
+            &admission.execution.execution_token,
+        )
+        .await
+        .map_err(e)?;
+    }
+    if let Some(repo_ref) = completed_repo_for_admission(db, &admission).await? {
+        cleanup_completed_action_target(&admission, &repo_ref)?;
+        schedule_repo_curator(db, &repo_ref);
+        return Ok(RepoActionInvocationResult {
+            repo: repo_ref,
+            outcome: RepoActionExecutionOutcome::Replayed,
+            execution_id: Some(admission.execution.id),
+        });
+    }
+    let repo_ref = register_repo_without_schedule(
+        db,
+        workspace_id,
+        &name,
+        &target_text,
+        Some(&admission._os_lock),
+    )
+    .await?;
+    complete_admitted_repo_action(db, &mut admission, &repo_ref).await?;
+    cleanup_completed_action_target(&admission, &repo_ref)?;
+    schedule_repo_curator(db, &repo_ref);
+    Ok(RepoActionInvocationResult {
+        repo: repo_ref,
+        outcome: RepoActionExecutionOutcome::FreshlyCompleted,
+        execution_id: Some(admission.execution.id),
+    })
 }
 
 #[tauri::command]
@@ -535,8 +1761,32 @@ pub async fn add_repo_ref(
     workspace_id: i32,
     name: String,
     local_git_path: String,
-) -> R<entities::repo_ref::Model> {
-    register_repo(&db, workspace_id, &name, &local_git_path).await
+    thread_id: Option<i32>,
+    message_id: Option<i32>,
+    action_id: Option<String>,
+    action_kind: Option<String>,
+) -> R<RepoActionCommandResult> {
+    match add_repo_ref_inner(
+        &db,
+        workspace_id,
+        name,
+        local_git_path,
+        thread_id,
+        message_id,
+        action_id,
+        action_kind,
+    )
+    .await
+    {
+        Ok(result) => {
+            if let Some(execution_id) = result.execution_id {
+                spawn_repo_action_feedback_drain(db.inner().clone(), execution_id);
+            }
+            Ok(result.into())
+        }
+        Err(error) if error == "action_card_in_progress" => Ok(repo_action_in_progress_result()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Cheap pre-check used by first-run onboarding to validate every picked folder
@@ -548,6 +1798,124 @@ pub fn check_git_repo(path: String) -> bool {
 }
 
 /// Clone a remote git URL into `<dest>/<name>`, then register it.
+fn cleanup_completed_action_target(
+    admission: &RepoActionAdmission,
+    _repo_ref: &entities::repo_ref::Model,
+) -> R<()> {
+    cleanup_completed_execution_target(&admission.execution)
+}
+
+fn cleanup_completed_execution_target(execution: &entities::repo_action_execution::Model) -> R<()> {
+    if execution.cleanup_preserve_target {
+        cleanup_owned_target_marker_checked(execution)?;
+    } else {
+        cleanup_owned_target_checked(execution)?;
+    }
+    Ok(())
+}
+
+async fn clone_repo_inner(
+    db: &Db,
+    workspace_id: i32,
+    url: String,
+    dest: String,
+    name: String,
+    thread_id: Option<i32>,
+    message_id: Option<i32>,
+    action_id: Option<String>,
+    action_kind: Option<String>,
+) -> R<RepoActionInvocationResult> {
+    validate_repo_name(&name)?;
+    let guarded = repo_action_guard_is_present(
+        thread_id,
+        message_id,
+        action_id.as_deref(),
+        action_kind.as_deref(),
+    )?;
+    if !guarded {
+        let path = std::path::Path::new(&dest).join(&name);
+        reject_occupied_repo_target(&path)?;
+        let p = path.clone();
+        tokio::task::spawn_blocking(move || crate::git::clone_repo(&url, &p))
+            .await
+            .map_err(|err| err.to_string())?
+            .map_err(e)?;
+        ensure_path_under_dest(&path, std::path::Path::new(&dest))?;
+        let r = register_repo(db, workspace_id, &name, &path.to_string_lossy()).await?;
+        let cloned = std::fs::canonicalize(&path).ok();
+        let registered = std::fs::canonicalize(&r.local_git_path).ok();
+        if cloned.is_some() && cloned != registered {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+        return Ok(RepoActionInvocationResult {
+            repo: r,
+            outcome: RepoActionExecutionOutcome::FreshlyCompleted,
+            execution_id: None,
+        });
+    }
+
+    let destination = normalized_repo_destination(&dest)?;
+    let path = destination.join(&name);
+    let path_text = path.to_string_lossy().into_owned();
+    let normalized_remote = crate::git::redact_remote(url.trim());
+    let fingerprint = repo_action_fingerprint(&["clone", &normalized_remote, &path_text, &name]);
+    let admission = admit_repo_action(
+        db,
+        workspace_id,
+        thread_id,
+        message_id,
+        action_id.as_deref(),
+        action_kind.as_deref(),
+        "clone",
+        &fingerprint,
+        &path,
+        Some(&destination),
+    )
+    .await?;
+    let Some(mut admission) = admission else {
+        return Err("action_card_stale".to_string());
+    };
+    if let Some(repo_ref) = completed_repo_for_admission(db, &admission).await? {
+        cleanup_completed_action_target(&admission, &repo_ref)?;
+        schedule_repo_curator(db, &repo_ref);
+        return Ok(RepoActionInvocationResult {
+            repo: repo_ref,
+            outcome: RepoActionExecutionOutcome::Replayed,
+            execution_id: Some(admission.execution.id),
+        });
+    }
+    let clone_url = url;
+    let materialized = materialize_repo_action(db, &mut admission, move |staging| {
+        crate::git::clone_repo(&clone_url, staging)
+    })
+    .await?;
+    if let Some(repo_ref) = completed_repo_for_admission(db, &admission).await? {
+        cleanup_completed_action_target(&admission, &repo_ref)?;
+        schedule_repo_curator(db, &repo_ref);
+        return Ok(RepoActionInvocationResult {
+            repo: repo_ref,
+            outcome: RepoActionExecutionOutcome::Replayed,
+            execution_id: Some(admission.execution.id),
+        });
+    }
+    let repo_ref = register_repo_without_schedule(
+        db,
+        workspace_id,
+        &name,
+        &materialized.to_string_lossy(),
+        Some(&admission._os_lock),
+    )
+    .await?;
+    complete_admitted_repo_action(db, &mut admission, &repo_ref).await?;
+    cleanup_completed_action_target(&admission, &repo_ref)?;
+    schedule_repo_curator(db, &repo_ref);
+    Ok(RepoActionInvocationResult {
+        repo: repo_ref,
+        outcome: RepoActionExecutionOutcome::FreshlyCompleted,
+        execution_id: Some(admission.execution.id),
+    })
+}
+
 #[tauri::command]
 pub async fn clone_repo(
     db: State<'_, Db>,
@@ -555,49 +1923,160 @@ pub async fn clone_repo(
     url: String,
     dest: String,
     name: String,
-) -> R<entities::repo_ref::Model> {
-    validate_repo_name(&name)?;
-    let path = std::path::Path::new(&dest).join(&name);
-    reject_occupied_repo_target(&path)?;
-    let p = path.clone();
-    tokio::task::spawn_blocking(move || crate::git::clone_repo(&url, &p))
-        .await
-        .map_err(|err| err.to_string())?
-        .map_err(e)?;
-    ensure_path_under_dest(&path, std::path::Path::new(&dest))?;
-    let r = register_repo(&db, workspace_id, &name, &path.to_string_lossy()).await?;
-    // If the row points somewhere other than the dir we just cloned, dedup
-    // resolved to a DIFFERENT live repo (a dead-checkout match was already
-    // repointed to this clone inside register_repo, so paths would match here) —
-    // the fresh clone is a redundant duplicate, so remove it rather than leaving
-    // an orphan dir on disk.
-    let cloned = std::fs::canonicalize(&path).ok();
-    let registered = std::fs::canonicalize(&r.local_git_path).ok();
-    if cloned.is_some() && cloned != registered {
-        let _ = std::fs::remove_dir_all(&path);
+    thread_id: Option<i32>,
+    message_id: Option<i32>,
+    action_id: Option<String>,
+    action_kind: Option<String>,
+) -> R<RepoActionCommandResult> {
+    match clone_repo_inner(
+        &db,
+        workspace_id,
+        url,
+        dest,
+        name,
+        thread_id,
+        message_id,
+        action_id,
+        action_kind,
+    )
+    .await
+    {
+        Ok(result) => {
+            if let Some(execution_id) = result.execution_id {
+                spawn_repo_action_feedback_drain(db.inner().clone(), execution_id);
+            }
+            Ok(result.into())
+        }
+        Err(error) if error == "action_card_in_progress" => Ok(repo_action_in_progress_result()),
+        Err(error) => Err(error),
     }
-    Ok(r)
 }
 
 /// Create a new git repo at `<dest>/<name>` (init + empty initial commit), then
 /// register it.
+async fn create_repo_inner(
+    db: &Db,
+    workspace_id: i32,
+    name: String,
+    dest: String,
+    thread_id: Option<i32>,
+    message_id: Option<i32>,
+    action_id: Option<String>,
+    action_kind: Option<String>,
+) -> R<RepoActionInvocationResult> {
+    validate_repo_name(&name)?;
+    let guarded = repo_action_guard_is_present(
+        thread_id,
+        message_id,
+        action_id.as_deref(),
+        action_kind.as_deref(),
+    )?;
+    if !guarded {
+        let path = std::path::Path::new(&dest).join(&name);
+        reject_occupied_repo_target(&path)?;
+        let p = path.clone();
+        tokio::task::spawn_blocking(move || crate::git::init_repo(&p))
+            .await
+            .map_err(|err| err.to_string())?
+            .map_err(e)?;
+        ensure_path_under_dest(&path, std::path::Path::new(&dest))?;
+        let repo = register_repo(db, workspace_id, &name, &path.to_string_lossy()).await?;
+        return Ok(RepoActionInvocationResult {
+            repo,
+            outcome: RepoActionExecutionOutcome::FreshlyCompleted,
+            execution_id: None,
+        });
+    }
+
+    let destination = normalized_repo_destination(&dest)?;
+    let path = destination.join(&name);
+    let path_text = path.to_string_lossy().into_owned();
+    let fingerprint = repo_action_fingerprint(&["new", &path_text, &name]);
+    let admission = admit_repo_action(
+        db,
+        workspace_id,
+        thread_id,
+        message_id,
+        action_id.as_deref(),
+        action_kind.as_deref(),
+        "new",
+        &fingerprint,
+        &path,
+        Some(&destination),
+    )
+    .await?;
+    let Some(mut admission) = admission else {
+        return Err("action_card_stale".to_string());
+    };
+    if let Some(repo_ref) = completed_repo_for_admission(db, &admission).await? {
+        cleanup_completed_action_target(&admission, &repo_ref)?;
+        schedule_repo_curator(db, &repo_ref);
+        return Ok(RepoActionInvocationResult {
+            repo: repo_ref,
+            outcome: RepoActionExecutionOutcome::Replayed,
+            execution_id: Some(admission.execution.id),
+        });
+    }
+    let materialized = materialize_repo_action(db, &mut admission, crate::git::init_repo).await?;
+    if let Some(repo_ref) = completed_repo_for_admission(db, &admission).await? {
+        cleanup_completed_action_target(&admission, &repo_ref)?;
+        schedule_repo_curator(db, &repo_ref);
+        return Ok(RepoActionInvocationResult {
+            repo: repo_ref,
+            outcome: RepoActionExecutionOutcome::Replayed,
+            execution_id: Some(admission.execution.id),
+        });
+    }
+    let repo_ref = register_repo_without_schedule(
+        db,
+        workspace_id,
+        &name,
+        &materialized.to_string_lossy(),
+        Some(&admission._os_lock),
+    )
+    .await?;
+    complete_admitted_repo_action(db, &mut admission, &repo_ref).await?;
+    cleanup_completed_action_target(&admission, &repo_ref)?;
+    schedule_repo_curator(db, &repo_ref);
+    Ok(RepoActionInvocationResult {
+        repo: repo_ref,
+        outcome: RepoActionExecutionOutcome::FreshlyCompleted,
+        execution_id: Some(admission.execution.id),
+    })
+}
+
 #[tauri::command]
 pub async fn create_repo(
     db: State<'_, Db>,
     workspace_id: i32,
     name: String,
     dest: String,
-) -> R<entities::repo_ref::Model> {
-    validate_repo_name(&name)?;
-    let path = std::path::Path::new(&dest).join(&name);
-    reject_occupied_repo_target(&path)?;
-    let p = path.clone();
-    tokio::task::spawn_blocking(move || crate::git::init_repo(&p))
-        .await
-        .map_err(|err| err.to_string())?
-        .map_err(e)?;
-    ensure_path_under_dest(&path, std::path::Path::new(&dest))?;
-    register_repo(&db, workspace_id, &name, &path.to_string_lossy()).await
+    thread_id: Option<i32>,
+    message_id: Option<i32>,
+    action_id: Option<String>,
+    action_kind: Option<String>,
+) -> R<RepoActionCommandResult> {
+    match create_repo_inner(
+        &db,
+        workspace_id,
+        name,
+        dest,
+        thread_id,
+        message_id,
+        action_id,
+        action_kind,
+    )
+    .await
+    {
+        Ok(result) => {
+            if let Some(execution_id) = result.execution_id {
+                spawn_repo_action_feedback_drain(db.inner().clone(), execution_id);
+            }
+            Ok(result.into())
+        }
+        Err(error) if error == "action_card_in_progress" => Ok(repo_action_in_progress_result()),
+        Err(error) => Err(error),
+    }
 }
 
 #[tauri::command]
@@ -666,12 +2145,20 @@ async fn reanalyze_deps_inner(
             .iter()
             .any(|r| std::path::Path::new(&r.local_git_path).exists())
     {
-        return Ok(ReanalyzeReport { all_missing: true, cancelled: false, unanalyzed: Vec::new() });
+        return Ok(ReanalyzeReport {
+            all_missing: true,
+            cancelled: false,
+            unanalyzed: Vec::new(),
+        });
     }
     // A Stop during the (possibly slow) preflight already tripped the token — honor it
     // before starting the pass rather than running a pass the user just cancelled.
     if token.load(std::sync::atomic::Ordering::SeqCst) {
-        return Ok(ReanalyzeReport { all_missing: false, cancelled: true, unanalyzed: Vec::new() });
+        return Ok(ReanalyzeReport {
+            all_missing: false,
+            cancelled: true,
+            unanalyzed: Vec::new(),
+        });
     }
     // Run the CANCELLABLE forced pass (`reanalyze_workspace`) under the workspace-keyed
     // token so the toolbar's Stop (`cancel_reanalyze_workspace_deps`) can interrupt it —
@@ -685,7 +2172,11 @@ async fn reanalyze_deps_inner(
     } else {
         crate::curator::unanalyzed_repo_names(db, workspace_id).await
     };
-    Ok(ReanalyzeReport { all_missing: false, cancelled, unanalyzed })
+    Ok(ReanalyzeReport {
+        all_missing: false,
+        cancelled,
+        unanalyzed,
+    })
 }
 
 /// Stop an in-flight "Analyze deps" forced pass for a workspace (trips its cancel
@@ -725,15 +2216,8 @@ pub async fn open_curator_chat(db: State<'_, Db>, workspace_id: i32) -> R<i32> {
     let thread_id = repo::ensure_curator_thread(&db, workspace_id, &tool)
         .await
         .map_err(e)?;
-    crate::engine_routing::record_decision(
-        &db,
-        thread_id,
-        None,
-        None,
-        "curator_start",
-        &route,
-    )
-    .await;
+    crate::engine_routing::record_decision(&db, thread_id, None, None, "curator_start", &route)
+        .await;
     Ok(thread_id)
 }
 
@@ -744,34 +2228,24 @@ pub async fn get_repo_map_doc(db: State<'_, Db>, workspace_id: i32) -> R<Option<
     repo::get_repo_map_doc(&db, workspace_id).await.map_err(e)
 }
 
-/// Purge the AskRegistry footprint of every direction a repo delete removes: cancel
-/// their still-open asks (else a card answered Full/Always after the cascade would
-/// persist a FRESH grant for a removed id) AND revoke their standing grants. Covers
-/// BOTH directions bound to the repo (`directions_for_repo`) and directions with a
-/// session using it (`sessions_for_repo` — the repo-routed case `workspace_ask_scope`
-/// also handles), since `delete_repo_cascade` deletes both. delete_repo's cascade
-/// bypasses `delete_thread`, so this closes the id-reuse-inheritance gap.
-async fn purge_repo_ask_footprint(
-    db: &Db,
-    asks: &crate::ask::AskRegistry,
-    repo_id: i32,
-) -> R<()> {
-    use std::collections::BTreeSet;
-    let mut targets: BTreeSet<(i32, i32)> = BTreeSet::new(); // (thread_id, direction_id)
-    for d in repo::directions_for_repo(db, repo_id).await.map_err(e)? {
-        targets.insert((d.thread_id, d.id));
+async fn repo_ask_scope(db: &Db, repo_id: i32) -> R<WorkspaceAskScope> {
+    let mut scope = WorkspaceAskScope::default();
+    for direction in repo::directions_for_repo(db, repo_id).await.map_err(e)? {
+        scope
+            .direction_routes
+            .insert((direction.thread_id, direction.id.to_string()));
     }
-    for s in repo::sessions_for_repo(db, repo_id).await.map_err(e)? {
-        if let Some(d) = repo::get_direction(db, s.direction_id).await.map_err(e)? {
-            targets.insert((d.thread_id, d.id));
+    for session in repo::sessions_for_repo(db, repo_id).await.map_err(e)? {
+        if let Some(direction) = repo::get_direction(db, session.direction_id)
+            .await
+            .map_err(e)?
+        {
+            scope
+                .direction_routes
+                .insert((direction.thread_id, direction.id.to_string()));
         }
     }
-    for (thread, dir) in targets {
-        asks.purge_dir(thread, &dir.to_string());
-    }
-    // best-effort durable clear (revokes already reached the writer via emit)
-    let _ = crate::auth_persist::flush(asks).await;
-    Ok(())
+    Ok(scope)
 }
 
 /// Remove a repo from its workspace: delete Weft's reference, the repo's
@@ -780,33 +2254,51 @@ async fn purge_repo_ask_footprint(
 /// is NEVER deleted — only Weft's tracking of it.
 #[tauri::command]
 pub async fn delete_repo(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     asks: State<'_, crate::ask::AskRegistry>,
     repo_id: i32,
 ) -> R<()> {
-    // Capture the repo path before the cascade — the repo_ref row is gone after
-    // delete_repo_cascade, so we must resolve the git path first.
-    let repo = repo::get_repo(&db, repo_id)
-        .await
-        .map_err(e)?
-        .ok_or("repo not found")?;
-    // Purge the AskRegistry footprint (open asks + standing grants) of the directions
-    // this delete removes — the cascade bypasses delete_thread, so without this a
-    // stale card or a later reused direction id could inherit the deleted task's
-    // Full/Always access. Do it while the rows still exist to enumerate.
-    purge_repo_ask_footprint(&db, &asks, repo_id).await?;
-    // Forget before the cascade so any in-flight curator pass sees the deletion
-    // as early as possible and does not publish stale running/done state.
-    crate::curator::run_forget(repo_id);
+    repo::mark_repo_deleting(&db, repo_id).await.map_err(e)?;
+    let result = delete_repo_after_fence(app, &db, &asks, repo_id).await;
+    if result.is_err() {
+        let _ = repo::clear_repo_deleting(&db, repo_id).await;
+    }
+    result
+}
+
+async fn delete_repo_after_fence(
+    app: tauri::AppHandle,
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    repo_id: i32,
+) -> R<()> {
+    let feedback_locks = lock_repo_action_cleanups(
+        db,
+        repo::pending_repo_action_feedback_for_repo(db, repo_id)
+            .await
+            .map_err(e)?,
+    )
+    .await?;
+    let engine_state = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let engine_admission = engine_state.engine_admission_write().await;
+    // Snapshot engines while their session rows still exist. The repo deletion
+    // marker blocks reconstruction, and the snapshot is stopped only after the
+    // atomic cascade succeeds so rollback never interrupts a surviving turn.
+    let engine_keys = repo_engine_keys(db, repo_id).await?;
+    let bus = app.state::<crate::bus::BusRegistry>();
+    let scope = repo_ask_scope(db, repo_id).await?;
+    let lifecycle_guards = lock_thread_lifecycles(&bus, &scope.affected_thread_ids()).await;
     // issue #160 round-22 P1 (Codex computer_srv.rs:385) / round-24 P1
     // (computer_srv.rs:775): revoke computer routes for every direction this repo
     // owns BEFORE the cascade removes them. A repo delete leaves the parent
-    // threads (and their directions in OTHER repos) alive, so we revoke each
-    // removed direction PRECISELY — `dir = direction_id` — never the whole
+    // threads (and their directions in OTHER repos) alive, so each removed
+    // direction is revoked PRECISELY — `dir = direction_id` — never the whole
     // thread; a thread-level revoke would strand a multi-repo thread's surviving
-    // directions. The direction-precise flag is what the screenshot capture
-    // closure and `session_is_live` both consult.
-    let doomed_directions = repo::directions_for_repo(&db, repo_id).await.map_err(e)?;
+    // directions. round-24 P2 (commands.rs:803): snapshot prior revocation state
+    // so a failed cascade restores EXACTLY what was there. round-23 P1
+    // (computer_srv.rs:2608): clear the control lease if a doomed route holds it.
+    let doomed_directions = repo::directions_for_repo(db, repo_id).await.map_err(e)?;
     let doomed_routes: std::collections::HashSet<(i32, String)> = doomed_directions
         .iter()
         .map(|d| (d.thread_id, d.id.to_string()))
@@ -817,61 +2309,45 @@ pub async fn delete_repo(
         threads.dedup();
         threads
     };
-    // issue #160 round-24 P2 (Codex commands.rs:803): snapshot prior revocation
-    // state so a failed cascade restores EXACTLY what was there (a blanket
-    // un-revoke would drop a revocation an earlier repo delete already published
-    // for one of these surviving threads).
     let revocation_undo = crate::bus::computer_srv::snapshot_revocations(&doomed_threads);
     for direction in &doomed_directions {
-        crate::bus::computer_srv::revoke_computer_route_dir(direction.thread_id, direction.id.to_string());
+        crate::bus::computer_srv::revoke_computer_route_dir(
+            direction.thread_id,
+            direction.id.to_string(),
+        );
     }
     clear_control_if_route_doomed(&doomed_routes);
-    let removed = match repo::delete_repo_cascade(&db, repo_id).await {
-        Ok(removed) => removed,
+    let effects = match repo::delete_repo_cascade_with_human_cancellations(db, repo_id).await {
+        Ok(effects) => effects,
         Err(err) => {
             crate::bus::computer_srv::restore_revocations(revocation_undo);
             return Err(e(err));
         }
     };
+    stop_engines_by_key(&app, &engine_keys).await;
+    drop(engine_admission);
+    apply_committed_bus_delete_effects(
+        &bus,
+        &effects.cancelled_requests,
+        &[],
+        &effects.removed_directions,
+        &std::collections::BTreeMap::new(),
+    );
+    purge_committed_permission_effects(asks, &[], &effects.removed_directions).await?;
     // issue #160 round-24 P2 (Codex commands.rs:794): prune each removed
-    // direction's computer-output subtree. `session_root` can only resolve LIVE
-    // directions/worktrees and `remove_computer_output_for_thread` deletes whole
-    // threads, so a surviving thread's deleted-direction output
-    // (`<WEFT_HOME>/computer/<thread>/<dir>/…`) would otherwise never be pruned —
-    // repeated repo replacements in one long-lived thread would accumulate stale
-    // screenshots and audit logs.
+    // direction's computer-output subtree — `remove_computer_output_for_thread`
+    // deletes whole threads and the parent thread SURVIVES a repo delete, so a
+    // surviving thread's deleted-direction output would otherwise never be
+    // pruned. Best-effort, after the rows are gone.
     for (thread_id, dir) in &doomed_routes {
         crate::bus::computer_srv::remove_computer_output_for_direction(*thread_id, dir);
     }
-    // Gate worktree removal on created_checkout (a reused pre-existing path must
-    // survive) and branch deletion on created_branch (a pre-existing branch reused
-    // by the -b fallback survives repo deletion). cleanup_worktrees cannot be used
-    // here because delete_repo_cascade already deleted the repo_ref row (which
-    // cleanup_worktrees needs for the git path lookup); instead we use the
-    // pre-fetched path directly.
-    let repo_path = std::path::Path::new(&repo.local_git_path);
-    for (wt_id, _repo_id, path, branch, created_branch, created_checkout) in &removed {
-        // The worktree's code-checkpoint shadow repo goes with it (its rows
-        // were already deleted by the cascade).
-        crate::checkpoint::remove_shadow(*wt_id);
-        if *created_checkout {
-            if let Err(err) = crate::git::remove_worktree(repo_path, std::path::Path::new(path)) {
-                eprintln!("[weft] worktree remove failed for {path}: {err}");
-            }
-        } else {
-            // Reused (non-weft) checkout: keep it as a usable worktree, but LOCK it so the
-            // orphan GC skips it now that its DB row is gone (mirrors cleanup_worktrees).
-            // Locking via git metadata also means a later re-add of this repo can't
-            // re-orphan the checkout.
-            let _ = crate::git::lock_worktree(repo_path, std::path::Path::new(path));
-        }
-        if *created_branch {
-            if let Err(err) = crate::git::delete_branch(repo_path, branch) {
-                eprintln!("[weft] branch delete failed for {branch}: {err}");
-            }
-        }
-    }
-    Ok(())
+    drop(lifecycle_guards);
+    drop(feedback_locks);
+    crate::curator::run_forget(repo_id);
+    materialize::cleanup_removed_worktrees(&effects.removed_worktrees)
+        .await
+        .map_err(e)
 }
 
 #[tauri::command]
@@ -913,15 +2389,7 @@ pub async fn create_thread(
     let thread = repo::create_thread(&db, workspace_id, &title, &kind, &tool)
         .await
         .map_err(e)?;
-    crate::engine_routing::record_decision(
-        &db,
-        thread.id,
-        None,
-        None,
-        "new_thread",
-        &route,
-    )
-    .await;
+    crate::engine_routing::record_decision(&db, thread.id, None, None, "new_thread", &route).await;
     Ok(thread)
 }
 
@@ -1079,8 +2547,8 @@ pub async fn set_proposal_direction_base(
 /// Approving dispatch here IS the human's "I already trust this issue's
 /// worktree reads" decision (the issue's own motivating pain point — a worker
 /// started right after approval still asking `pwd`), so every dir under this
-/// thread — this call's new directions AND any spawned later (a re-dispatch, a
-/// subsequent write-trigger) — auto-allows a `RiskLevel::ReadOnly` ask from
+/// thread — this call's new directions AND any spawned later (for example a
+/// re-dispatch) — auto-allows a `RiskLevel::ReadOnly` ask from
 /// here on. Never widens beyond ReadOnly (see `AskRegistry::grant_read_only_issue`);
 /// in-memory only, so it does NOT survive a restart (contrast Full/Always) and
 /// is separately revocable (`revoke_read_only_grant`). Granted unconditionally
@@ -1136,15 +2604,18 @@ pub async fn confirm_proposal(
 ) -> R<Vec<i32>> {
     let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
     let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
-    confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sessions(
+    let ids = confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sessions(
         &db,
         &asks,
         thread_id,
         manual_tool.as_deref(),
         &is_session_live,
     )
-        .await
-        .map_err(e)
+    .await
+    .map_err(e)?;
+    use tauri::Emitter;
+    let _ = app.emit("needs-you://changed", thread_id);
+    Ok(ids)
 }
 
 /// The brief a worker for this direction would be dispatched with (§4.10).
@@ -1361,10 +2832,7 @@ pub struct WorktreeView {
 }
 
 #[tauri::command]
-pub async fn list_worktrees(
-    db: State<'_, Db>,
-    direction_id: Option<i32>,
-) -> R<Vec<WorktreeView>> {
+pub async fn list_worktrees(db: State<'_, Db>, direction_id: Option<i32>) -> R<Vec<WorktreeView>> {
     let rows = repo::list_worktrees(&db, direction_id).await.map_err(e)?;
     Ok(rows
         .into_iter()
@@ -1452,10 +2920,7 @@ fn read_dir_tree(
     if depth == 0 {
         // Reached the depth limit. If this directory has any entries, report
         // truncation so the UI doesn't show a non-empty folder as empty.
-        let has_entries = std::fs::read_dir(path)
-            .map_err(e)?
-            .next()
-            .is_some();
+        let has_entries = std::fs::read_dir(path).map_err(e)?.next().is_some();
         return Ok((Vec::new(), has_entries));
     }
 
@@ -1493,8 +2958,7 @@ fn read_dir_tree(
                 continue;
             }
             *counter += 1;
-            let (children, child_truncated) =
-                read_dir_tree(&entry_path, depth - 1, counter)?;
+            let (children, child_truncated) = read_dir_tree(&entry_path, depth - 1, counter)?;
             truncated = truncated || child_truncated;
             nodes.push(FileNode {
                 path: path_str,
@@ -1520,7 +2984,11 @@ fn read_dir_tree(
 #[tauri::command]
 pub fn list_worktree_files(cwd: String) -> R<FileTree> {
     let mut counter = 0;
-    let (nodes, truncated) = read_dir_tree(std::path::Path::new(&cwd), FILE_TREE_MAX_DEPTH, &mut counter)?;
+    let (nodes, truncated) = read_dir_tree(
+        std::path::Path::new(&cwd),
+        FILE_TREE_MAX_DEPTH,
+        &mut counter,
+    )?;
     Ok(FileTree {
         nodes,
         truncated,
@@ -1528,22 +2996,85 @@ pub fn list_worktree_files(cwd: String) -> R<FileTree> {
     })
 }
 
-
+async fn delete_thread_cascade_after_bus_fence(
+    db: &Db,
+    bus: &crate::bus::BusRegistry,
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+    action_cleanups: Vec<LockedRepoActionCleanup>,
+) -> R<Vec<repo::RemovedWorktree>> {
+    let lifecycle_gate = bus.thread_lifecycle_gate(thread_id);
+    let _lifecycle = lifecycle_gate.lock().await;
+    let action_cleanup_plans = repo_action_cleanup_plans(&action_cleanups);
+    // Install the reversible process-local fence before the DB await. A
+    // concurrently answered command can win OCC before durable cancellation,
+    // but its later delivery sees `closing` and cannot recreate the bus.
+    let (_, cancelled_asks) = bus.begin_thread_close(thread_id);
+    let (removed, durable_cancelled) =
+        match repo::delete_thread_cascade_with_human_cancellations_and_action_cleanups(
+            db,
+            thread_id,
+            &action_cleanup_plans,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                bus.rollback_thread_close(thread_id);
+                return Err(e(error));
+            }
+        };
+    // Only mutate the retained live bus and publish terminal card events after
+    // the atomic cancellation+cascade commit. A failed delete rolls back to an
+    // answerable request and an untouched bus.
+    bus.apply_thread_human_cancellation(thread_id);
+    let durable_ids = durable_cancelled
+        .iter()
+        .map(|request| request.request_id)
+        .collect::<Vec<_>>();
+    let event_ids = human_cancel_event_ids(cancelled_asks, &durable_ids);
+    bus.notify_cancelled_asks(thread_id, &event_ids);
+    bus.commit_thread_close(thread_id);
+    // The Ask Bridge registers under this SAME lifecycle gate. Purge before
+    // releasing it so every hook that linearized first is cancelled/revoked,
+    // while every hook that arrives later observes the durable delete marker
+    // or missing identity and cannot recreate an ask or grant after cleanup.
+    asks.purge_thread(thread_id);
+    cleanup_locked_repo_actions(db, &action_cleanups).await;
+    Ok(removed)
+}
 
 #[tauri::command]
-pub async fn delete_thread(
-    app: tauri::AppHandle,
-    db: State<'_, Db>,
-    thread_id: i32,
-) -> R<()> {
-    // Collect the engine keys FIRST (the cascade deletes the session rows that
-    // make workers discoverable), then cascade BEFORE stopping: once the rows are
-    // gone, a concurrent send or bus wake can no longer resolve the thread/session
-    // and revive an engine under a key this loop already processed — the revival
-    // paths all look those rows up. Stopping after the cascade leaves no orphans
-    // either: set_lead_status fences its meta-row insert on the thread still
-    // existing, and per-session status updates no-op on deleted rows.
+pub async fn delete_thread(app: tauri::AppHandle, db: State<'_, Db>, thread_id: i32) -> R<()> {
+    // Fence session/engine admission before snapshotting keys. Without this, a
+    // worker could open after the snapshot but before the cascade, leaving a
+    // live engine whose newly-created session row is then deleted.
+    repo::mark_thread_deleting(&db, thread_id)
+        .await
+        .map_err(e)?;
+    let result = delete_thread_after_fence(app, &db, thread_id).await;
+    if result.is_err() {
+        let _ = repo::clear_thread_deleting(&db, thread_id).await;
+    }
+    result
+}
+
+async fn delete_thread_after_fence(app: tauri::AppHandle, db: &Db, thread_id: i32) -> R<()> {
+    let action_cleanups = lock_repo_action_cleanups(
+        db,
+        repo::repo_action_executions_requiring_lock_for_thread(db, thread_id)
+            .await
+            .map_err(e)?,
+    )
+    .await?;
+    let engine_state = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let engine_admission = engine_state.engine_admission_write().await;
+    // Collect keys while the durable marker blocks every worker reconstruction,
+    // then stop only after the cascade commits. Failed deletion therefore keeps
+    // both rows and running turns intact.
     let keys = thread_engine_keys(&db, thread_id).await?;
+    let bus = app.state::<crate::bus::BusRegistry>();
+    let asks = app.state::<crate::ask::AskRegistry>();
     // issue #160 round-23 P1 (Codex commands.rs:756): revoke this thread's
     // computer routes BEFORE the destructive cascade (and the grant flush +
     // engine shutdown that follow it), not after. An in-flight computer call
@@ -1552,39 +3083,48 @@ pub async fn delete_thread(
     // `recheck_stop_and_lease_before_backend` — the thread isn't in the
     // revocation set until the revoke runs — and reach the desktop after its
     // rows are gone. Roll back if the cascade fails so a still-live session
-    // isn't fail-closed forever.
-    let revocation_undo = crate::bus::computer_srv::snapshot_revocations(std::slice::from_ref(&thread_id));
+    // isn't fail-closed forever. round-23 P1 (computer_srv.rs:2608): also clear
+    // the control lease if this doomed route holds it.
+    let revocation_undo =
+        crate::bus::computer_srv::snapshot_revocations(std::slice::from_ref(&thread_id));
     crate::bus::computer_srv::revoke_computer_routes(thread_id);
     clear_control_if_doomed(std::slice::from_ref(&thread_id));
-    let removed = match repo::delete_thread_cascade(&db, thread_id).await {
+    let removed = match delete_thread_cascade_after_bus_fence(
+        db,
+        &bus,
+        asks.inner(),
+        thread_id,
+        action_cleanups,
+    )
+    .await
+    {
         Ok(removed) => removed,
         Err(err) => {
             crate::bus::computer_srv::restore_revocations(revocation_undo);
-            return Err(e(err));
+            return Err(err);
         }
     };
-    // Purge the issue's WHOLE AskRegistry footprint: cancel its still-open asks
-    // (else a lingering card, answered Full/Always after the rows are gone, would
-    // persist a fresh grant for the deleted id) AND revoke its standing grants, so
-    // a future reused thread id can't inherit access. The revoke's emit reaches the
-    // writer; a best-effort awaited flush makes it durable without gating delete.
-    let asks = app.state::<crate::ask::AskRegistry>();
-    asks.purge_thread(thread_id);
+    // Purge already happened under the lifecycle gate. The revoke emit reaches
+    // the writer; this best-effort awaited flush makes it durable without
+    // widening the handler's gate across its one-hour human wait.
     let _ = crate::auth_persist::flush(&asks).await;
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
     for key in keys {
         if let Some(eng) = state.remove(key) {
-            crate::lead_chat::engine::stop(&app, &eng).await;
+            // The global write fence is still held; use the admitted stop
+            // core so this path never waits for a surface gate while holding
+            // the write lock.
+            crate::lead_chat::engine::stop_under_engine_admission(&app, &eng).await;
         }
     }
+    drop(engine_admission);
     // issue #160 round-18 P2 (Codex paths.rs:89): drop this thread's computer-
     // use output subtree (screenshots + rotated audit logs under
-    // `weft_home/computer/<thread>/`) as part of the delete cascade —
-    // otherwise that persistent per-thread tree outlives the thread with no
-    // retention path that could ever bound it. Best-effort, never gates the
-    // delete — see `computer_srv::remove_computer_output_for_thread`'s doc.
+    // `weft_home/computer/<thread>/`) as part of the delete — otherwise that
+    // persistent per-thread tree outlives the thread with no retention path
+    // that could ever bound it. Best-effort, never gates the delete.
     crate::bus::computer_srv::remove_computer_output_for_thread(thread_id);
-    materialize::cleanup_worktrees(&db, &removed)
+    materialize::cleanup_removed_worktrees(&removed)
         .await
         .map_err(e)
 }
@@ -1595,67 +3135,6 @@ pub fn thread_messages(
     thread_id: i32,
 ) -> R<Vec<crate::bus::Msg>> {
     Ok(bus.log(thread_id))
-}
-
-/// One thing waiting on the human, with enough context to act on it cold.
-#[derive(serde::Serialize)]
-pub struct NeedItem {
-    pub ask_id: u64,
-    pub thread_id: i32,
-    pub thread_title: String,
-    pub direction_id: i32,
-    pub direction_name: String,
-    pub text: String,
-    pub ts: u64,
-    /// See `bus::AskKind`. A `Question` shows an answer box; both NOTICE kinds
-    /// don't (answering is refused backend-side) — they differ in whether the
-    /// UI's generic "clears itself automatically" footer applies.
-    pub kind: crate::bus::AskKind,
-}
-
-/// Aggregate every open agent→human question across the workspace's threads.
-/// This is the data behind the "Needs-you" surface — a pure bus + structure
-/// projection, no TUI parsing.
-#[tauri::command]
-pub async fn needs_you(
-    db: State<'_, Db>,
-    bus: tauri::State<'_, crate::bus::BusRegistry>,
-    workspace_id: i32,
-) -> R<Vec<NeedItem>> {
-    let threads: Vec<_> = repo::list_threads(&db, workspace_id)
-        .await
-        .map_err(e)?
-        .into_iter()
-        .filter(|t| t.kind != "curator") // hidden curator-chat thread is not a board issue
-        .collect();
-    let mut items: Vec<NeedItem> = Vec::new();
-    for t in threads {
-        let asks = bus.open_asks(t.id);
-        if asks.is_empty() {
-            continue;
-        }
-        let dirs = repo::list_directions(&db, t.id).await.map_err(e)?;
-        for a in asks {
-            let dir_id = a.from.parse::<i32>().unwrap_or(-1);
-            let dir_name = dirs
-                .iter()
-                .find(|d| d.id == dir_id)
-                .map(|d| d.name.clone())
-                .unwrap_or_else(|| a.from.clone());
-            items.push(NeedItem {
-                ask_id: a.id,
-                thread_id: t.id,
-                thread_title: t.title.clone(),
-                direction_id: dir_id,
-                direction_name: dir_name,
-                text: a.text,
-                ts: a.ts,
-                kind: a.kind,
-            });
-        }
-    }
-    items.sort_by_key(|i| i.ts);
-    Ok(items)
 }
 
 /// The resolved default coding tool plus the user's explicit choice (if any).
@@ -1702,10 +3181,7 @@ pub async fn get_automatic_engine_routing_enabled(db: State<'_, Db>) -> R<bool> 
 }
 
 #[tauri::command]
-pub async fn set_automatic_engine_routing_enabled(
-    db: State<'_, Db>,
-    enabled: bool,
-) -> R<()> {
+pub async fn set_automatic_engine_routing_enabled(db: State<'_, Db>, enabled: bool) -> R<()> {
     repo::set_setting(
         &db,
         crate::engine_routing::K_AUTOMATIC_ROUTING_ENABLED,
@@ -1946,7 +3422,9 @@ pub async fn set_quota_failover_enabled(db: State<'_, Db>, enabled: bool) -> R<(
 /// merge.
 #[tauri::command]
 pub async fn get_pr_auto_merge_enabled(db: State<'_, Db>) -> R<bool> {
-    crate::host::automerge::try_auto_merge_enabled(&db).await.map_err(e)
+    crate::host::automerge::try_auto_merge_enabled(&db)
+        .await
+        .map_err(e)
 }
 
 #[tauri::command]
@@ -1963,9 +3441,7 @@ pub async fn set_pr_auto_merge_enabled(db: State<'_, Db>, enabled: bool) -> R<()
 /// The user-configured coding-agent command overrides ("aliases"): identity →
 /// command (e.g. `claude` → `cc-claude`). Empty map when none are set.
 #[tauri::command]
-pub async fn get_tool_commands(
-    db: State<'_, Db>,
-) -> R<std::collections::HashMap<String, String>> {
+pub async fn get_tool_commands(db: State<'_, Db>) -> R<std::collections::HashMap<String, String>> {
     repo::get_tool_commands(&db).await.map_err(e)
 }
 
@@ -2061,133 +3537,6 @@ pub async fn set_tool_command(
     Ok(())
 }
 
-/// One pending write declaration waiting on the human, with thread context.
-#[derive(serde::Serialize)]
-pub struct WriteTrigger {
-    pub thread_id: i32,
-    pub thread_title: String,
-    pub index: usize,
-    pub name: String,
-    pub repo_name: String,
-    pub reason: String,
-    pub base_branch: String,
-    pub hint: crate::engine_routing::RoutingHint,
-    pub route: Option<crate::engine_routing::RouteDecision>,
-    /// See `planner::PendingWrite::depends_on` — surfaced here so the per-lane Needs-you card
-    /// can show which producer gates this consumer's merge (Codex review, PR #159
-    /// planner.rs:109).
-    pub depends_on: String,
-}
-
-/// Every pending write declaration across the workspace's threads — the
-/// data behind the Needs-you "approve a write" cards.
-#[tauri::command]
-pub async fn write_triggers(
-    app: tauri::AppHandle,
-    db: State<'_, Db>,
-    workspace_id: i32,
-) -> R<Vec<WriteTrigger>> {
-    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
-    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
-    let threads: Vec<_> = repo::list_threads(&db, workspace_id)
-        .await
-        .map_err(e)?
-        .into_iter()
-        .filter(|t| t.kind != "curator") // hidden curator-chat thread is not a board issue
-        .collect();
-    let mut out = Vec::new();
-    for t in threads {
-        for p in crate::planner::pending_writes_with_live_sessions(
-            &db,
-            t.id,
-            &is_session_live,
-        )
-        .await
-        .map_err(e)? {
-            out.push(WriteTrigger {
-                thread_id: t.id,
-                thread_title: t.title.clone(),
-                index: p.index,
-                name: p.name,
-                repo_name: p.repo_name,
-                reason: p.reason,
-                base_branch: p.base_branch,
-                hint: p.hint,
-                route: p.route,
-                depends_on: p.depends_on,
-            });
-        }
-    }
-    Ok(out)
-}
-
-/// Approve a write declaration + propagate issue #103's read-only auto-allow to
-/// the whole issue. Extracted from the `#[tauri::command]` wrapper (mirrors
-/// `confirm_proposal_and_propagate_read_only`) so the propagation is directly
-/// testable without constructing a `tauri::State`.
-///
-/// Same trust decision as `confirm_proposal_and_propagate_read_only` (see its
-/// doc): approving ONE lane's dispatch outside the initial ScopeReview batch is
-/// still "the human approved this issue's dispatch to run", so it gets the
-/// identical grant. In-memory only, never widens beyond `RiskLevel::ReadOnly`,
-/// separately revocable (`revoke_read_only_grant`).
-async fn approve_write_trigger_and_propagate_read_only(
-    db: &Db,
-    asks: &crate::ask::AskRegistry,
-    thread_id: i32,
-    index: usize,
-    tool: &str,
-) -> anyhow::Result<i32> {
-    let id = crate::planner::approve_direction(db, thread_id, index, tool).await?;
-    asks.grant_read_only_issue(thread_id);
-    Ok(id)
-}
-
-/// Approve a write declaration: create its direction + materialize. Returns the
-/// new direction id so the caller can dispatch a worker. See
-/// `approve_write_trigger_and_propagate_read_only` for the read-only propagation.
-#[tauri::command]
-pub async fn approve_write_trigger(
-    app: tauri::AppHandle,
-    db: State<'_, Db>,
-    asks: tauri::State<'_, crate::ask::AskRegistry>,
-    thread_id: i32,
-    index: usize,
-    tool: Option<String>,
-) -> R<i32> {
-    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
-    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
-    let id = crate::planner::approve_direction_with_pin_and_live_sessions(
-        &db,
-        thread_id,
-        index,
-        tool.as_deref(),
-        &is_session_live,
-    )
-    .await
-    .map_err(e)?;
-    asks.grant_read_only_issue(thread_id);
-    Ok(id)
-}
-
-/// Deny a write declaration: mark denied + relay to the lead's bus inbox.
-#[tauri::command]
-pub async fn deny_write_trigger(
-    db: State<'_, Db>,
-    bus: tauri::State<'_, crate::bus::BusRegistry>,
-    thread_id: i32,
-    index: usize,
-) -> R<()> {
-    let (name, repo) = crate::planner::deny_direction(&db, thread_id, index)
-        .await
-        .map_err(e)?;
-    let msg = format!(
-        "The human DENIED the write declaration \"{name}\" (repo {repo}). Do not create it; revise the plan or ask why.",
-    );
-    bus.post(thread_id, crate::bus::HUMAN, "lead", &msg, "message");
-    Ok(())
-}
-
 /// Mark a lead action_card as resolved once its repo flow succeeded, persisting
 /// the settled state into the row so it survives reload (no re-click double-add).
 #[tauri::command]
@@ -2207,118 +3556,10 @@ pub async fn resolve_action_card(db: State<'_, Db>, message_id: i32, name: Strin
                     status: m.status,
                 },
             );
+            let _ = app.emit("needs-you://changed", m.thread_id);
         }
     }
     Ok(())
-}
-
-/// Answer an open ask; the reply lands in the asking direction's bus inbox. The
-/// durable settled-trail row is written by the `trail` consumer off the bus's
-/// resolution event, so every answer path (desktop / remote / IM) is covered.
-#[tauri::command]
-pub fn answer_ask(
-    bus: tauri::State<'_, crate::bus::BusRegistry>,
-    thread_id: i32,
-    ask_id: u64,
-    text: String,
-) -> R<()> {
-    if bus.answer_ask(thread_id, ask_id, &text) {
-        Ok(())
-    } else {
-        Err("that question was already answered or no longer exists".into())
-    }
-}
-
-/// Core of [`retry_pr_tracking`], taking `&Db` directly so it's unit-testable
-/// without a Tauri `State`/`AppHandle` (the `&Db`/store-seam pattern this
-/// codebase already uses for command logic that doesn't actually need the
-/// runtime). Re-registers every still-`open` PR/MR tracked under `direction_id`
-/// with ITS OWN already-stored fields — a plain upsert-by-natural-key
-/// (`repo::register_pull_request`), so it resets `probe_fail_count` to 0
-/// exactly the way a fresh agent `register_pr` call would (see that
-/// function's doc), without shelling out anywhere or needing the agent at
-/// all. Safe to call on a direction with no given-up row: a still-healthy row
-/// is simply reset to a zero streak, which the next probe overwrites anyway —
-/// so this is the desktop-side "retry" action for the ONE Needs-you notice
-/// that does not clear itself (`host::judge::give_up_text`), without having
-/// to first prove precisely which row triggered it.
-///
-/// ALSO clears `host::automerge`'s own, entirely separate per-(row, head_sha)
-/// merge-ATTEMPT backoff (`host::automerge::MergeBackoffState`) for every row
-/// this function touches. Before this, Retry only ever reached `probe_
-/// fail_count` (`host::monitor`'s "could not even CHECK this PR/MR" counter)
-/// — a row whose CHECKS were succeeding fine but whose `gh pr merge`
-/// attempts kept failing (branch protection, a repo that rejects squash
-/// merges, ...) had exhausted a counter this button never touched, so
-/// clicking it looked like it worked (the notice cleared, `probe_fail_count`
-/// really did reset) while the actual stuck condition silently remained.
-/// `MergeBackoffState::clear` has no rate limit of its own; see that
-/// method's doc for why an unlimited Retry is the deliberate choice here,
-/// not an oversight — briefly: every attempt Retry unlocks still has to
-/// clear the FULL live gate again (`gate::decide_auto_merge` against a FRESH
-/// read), so Retry can only let an already-ready-looking target keep trying,
-/// never bypass the actual authorization.
-async fn retry_pr_tracking_core(
-    db: &Db,
-    direction_id: i32,
-    merge_backoff: &crate::host::automerge::MergeBackoffState,
-) -> anyhow::Result<u32> {
-    let rows = repo::list_pull_requests_for_direction(db, direction_id).await?;
-    let mut reset = 0u32;
-    for row in rows.into_iter().filter(|r| r.lifecycle == "open") {
-        repo::register_pull_request(
-            db,
-            row.thread_id,
-            row.direction_id,
-            row.repo_id,
-            &row.host_kind,
-            &row.host_base,
-            &row.host_owner,
-            &row.host_repo,
-            row.number,
-            &row.url,
-            &row.title,
-        )
-        .await?;
-        merge_backoff.clear(row.id);
-        reset += 1;
-    }
-    Ok(reset)
-}
-
-/// The Needs-you "retry tracking" button's backend: see
-/// [`retry_pr_tracking_core`]. Returns how many rows were reset (0 is not an
-/// error — the notice may already have been superseded by a later sweep).
-#[tauri::command]
-pub async fn retry_pr_tracking(
-    db: State<'_, Db>,
-    merge_backoff: State<'_, crate::host::automerge::MergeBackoffState>,
-    direction_id: i32,
-) -> R<u32> {
-    retry_pr_tracking_core(&db, direction_id, &merge_backoff).await.map_err(e)
-}
-
-/// All pending permission Asks across the workspace (the Ask Bridge → Needs-you),
-/// enriched with the owning thread's title and the asking task's name so the card
-/// says which thread / which task is asking.
-#[tauri::command]
-pub async fn pending_asks(
-    db: State<'_, Db>,
-    asks: tauri::State<'_, crate::ask::AskRegistry>,
-) -> R<Vec<crate::ask::Ask>> {
-    let mut open = asks.open();
-    for a in &mut open {
-        if let Ok(Some(t)) = repo::get_thread(&db, a.thread).await {
-            a.thread_title = t.title;
-            a.workspace_id = Some(t.workspace_id);
-        }
-        if let Ok(id) = a.dir.parse::<i32>() {
-            if let Ok(Some(d)) = repo::get_direction(&db, id).await {
-                a.dir_name = d.name;
-            }
-        }
-    }
-    Ok(open)
 }
 
 /// Dangerous mode (global): every agent's tool asks auto-allow, no prompts.
@@ -2337,61 +3578,11 @@ pub fn set_keep_awake(power: tauri::State<'_, crate::power::PowerGuard>, on: boo
     Ok(())
 }
 
-/// Production default for the runaway-guard idle-kill cap: 30 min (1800s).
-/// Named (not an inline literal) so `lead_chat::engine`'s turn-freeze
-/// auto-recovery threshold — a DIFFERENT, faster-firing mechanism (issue #93)
-/// that must always fire well before this cap does, or it's silently
-/// shadowed/made dead code by this one — can cross-module sentinel-test
-/// against it (see `lead_chat::engine`'s
-/// `turn_freeze_threshold_stays_under_idle_watchdog_default` test). §7 跑飞护栏.
-pub(crate) const IDLE_WATCHDOG_DEFAULT_SECS: u64 = 1800;
-
-/// Runaway-guardrail caps (§7 跑飞护栏), enforced per busy turn by the chat
-/// engine's watchdog (lead_chat::engine::spawn_watchdog). Configurable at
-/// runtime from Settings; seeded from the WEFT_* env defaults so an env
-/// override still sets the initial value. 0 on either disables that cap.
-pub struct GuardrailState {
-    inner: std::sync::Mutex<(u64, u64)>, // (idle_secs, wall_secs)
-}
-
-impl Default for GuardrailState {
-    fn default() -> Self {
-        Self {
-            inner: std::sync::Mutex::new((
-                env_secs("WEFT_IDLE_WATCHDOG_SECS", IDLE_WATCHDOG_DEFAULT_SECS),
-                env_secs("WEFT_WALL_CAP_SECS", 7200), // 2 h
-            )),
-        }
-    }
-}
-
-impl GuardrailState {
-    pub fn set(&self, idle_secs: u64, wall_secs: u64) {
-        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = (idle_secs, wall_secs);
-    }
-    /// (idle_cap_secs, wall_cap_secs)
-    pub fn get(&self) -> (u64, u64) {
-        *self.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
 pub(crate) fn env_secs(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
-}
-
-/// Runaway guardrails (§7): idle + wall-clock caps in seconds; 0 disables that
-/// cap. See the GuardrailState note on enforcement.
-#[tauri::command]
-pub fn set_guardrails(
-    guard: tauri::State<'_, GuardrailState>,
-    idle_secs: u64,
-    wall_secs: u64,
-) -> R<()> {
-    guard.set(idle_secs, wall_secs);
-    Ok(())
 }
 
 /// Read-only snapshot backing the observe surface: the worktree to read
@@ -2446,42 +3637,41 @@ pub async fn session_for(
         .map_err(e)?;
     // 有活引擎(claude worker)就读它缓存的会话信息快照;否则给空(由 init/usage
     // event 在首条消息后补全)。
-    let (context_tokens, window, model, mcp_servers, tools) = match latest
-        .as_ref()
-        .map(|s| s.id)
-        .and_then(|sid| {
+    let (context_tokens, window, model, mcp_servers, tools) =
+        match latest.as_ref().map(|s| s.id).and_then(|sid| {
             app.state::<crate::lead_chat::engine::LeadChatState>()
                 .get(sid as i64)
         }) {
-        Some(eng) => {
-            let g = eng.lock().await;
-            (
-                g.last_context_tokens,
-                g.last_window,
-                g.last_model.clone(),
-                g.last_mcp_servers.clone(),
-                g.last_tools.clone(),
-            )
-        }
-        None => {
-            // No live engine (e.g. after an app relaunch): serve the persisted
-            // snapshot (session.meta) so the panel isn't blank until the next turn.
-            let snap = latest
-                .as_ref()
-                .filter(|s| !s.meta.is_empty())
-                .and_then(|s| {
-                    serde_json::from_str::<crate::lead_chat::engine::PersistedMeta>(&s.meta).ok()
-                })
-                .unwrap_or_default();
-            (
-                snap.context_tokens,
-                snap.window,
-                snap.model,
-                snap.mcp_servers,
-                snap.tools,
-            )
-        }
-    };
+            Some(eng) => {
+                let g = eng.lock().await;
+                (
+                    g.last_context_tokens,
+                    g.last_window,
+                    g.last_model.clone(),
+                    g.last_mcp_servers.clone(),
+                    g.last_tools.clone(),
+                )
+            }
+            None => {
+                // No live engine (e.g. after an app relaunch): serve the persisted
+                // snapshot (session.meta) so the panel isn't blank until the next turn.
+                let snap = latest
+                    .as_ref()
+                    .filter(|s| !s.meta.is_empty())
+                    .and_then(|s| {
+                        serde_json::from_str::<crate::lead_chat::engine::PersistedMeta>(&s.meta)
+                            .ok()
+                    })
+                    .unwrap_or_default();
+                (
+                    snap.context_tokens,
+                    snap.window,
+                    snap.model,
+                    snap.mcp_servers,
+                    snap.tools,
+                )
+            }
+        };
     let command = crate::tool_command::effective(
         latest.as_ref().and_then(|s| s.command.as_deref()),
         &dir.tool,
@@ -2695,57 +3885,6 @@ pub async fn workspace_skills(
         .map_err(e)
 }
 
-/// Pending "needs you" count per workspace (answerable agent questions + tool
-/// asks + pending write triggers — self-clearing NOTICEs excluded, see
-/// `open_answerable_ask_count`), so the workspace switcher can flag OTHER
-/// workspaces that want attention.
-#[tauri::command]
-pub async fn workspace_needs_counts(
-    db: State<'_, Db>,
-    bus: tauri::State<'_, crate::bus::BusRegistry>,
-    asks: tauri::State<'_, crate::ask::AskRegistry>,
-) -> R<Vec<(i32, u32)>> {
-    use std::collections::HashSet;
-    let open_asks = asks.open();
-    let mut out = Vec::new();
-    for w in repo::list_workspaces(&db).await.map_err(e)? {
-        let all_threads = repo::list_threads(&db, w.id)
-            .await
-            .map_err(e)?;
-        let workspace_tids: HashSet<i32> = all_threads.iter().map(|t| t.id).collect();
-        let threads: Vec<_> = all_threads
-            .into_iter()
-            .filter(|t| t.kind != "curator") // hidden curator chat isn't a board issue
-            .collect();
-        let mut count: u32 = 0;
-        for t in &threads {
-            // Questions still come from open_answerable_ask_count (issue #105).
-            // Action-required notices are not answerable, but they leave a durable
-            // Retry control in Needs-you, so the dock badge and workspace switcher
-            // should count them. Self-clearing notices stay out.
-            count += bus.open_answerable_ask_count(t.id) as u32;
-            count += bus
-                .open_asks(t.id)
-                .iter()
-                .filter(|a| a.kind == crate::bus::AskKind::NoticeActionRequired)
-                .count() as u32;
-            count += crate::planner::pending_writes(&db, t.id)
-                .await
-                .map_err(e)?
-                .len() as u32;
-        }
-        count += open_asks
-            .iter()
-            // Permission asks are global and the hidden curator thread is not
-            // part of `threads` above, but its asks still belong to this
-            // workspace and appear in Needs-you.
-            .filter(|a| workspace_tids.contains(&a.thread))
-            .count() as u32;
-        out.push((w.id, count));
-    }
-    Ok(out)
-}
-
 /// Answer a pending permission Ask. `answer` is allow | deny | always | full —
 /// always remembers this action for the task, full grants it full access.
 #[tauri::command]
@@ -2906,6 +4045,7 @@ pub fn bus_post_human(
 /// IM 设置视图：secret 只回是否已设置，不回明文（与 ImSettings::Debug 同纪律）。
 #[derive(serde::Serialize)]
 pub struct ImSettingsView {
+    pub provider: String,
     pub app_id: String,
     pub has_secret: bool,
     pub bound: bool,
@@ -2918,6 +4058,7 @@ pub struct ImSettingsView {
 pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
     let s = crate::im::ImSettings::load(&db).await.map_err(e)?;
     Ok(ImSettingsView {
+        provider: s.provider.as_str().to_string(),
         app_id: s.app_id,
         has_secret: !s.app_secret.is_empty(),
         bound: !s.allow_open_ids.is_empty(),
@@ -2926,33 +4067,133 @@ pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
     })
 }
 
-/// 写飞书凭证并重启桥。secret 空 = 保持原值(不覆盖已存密钥)。`enable=true` 时同时置
-/// `im.feishu.enabled`(扫码接入即启用);手填保存走 `enable=false`,enabled 仍由开关 /
-/// 默认决定。`owner_open_id=Some` 时把该 open_id 设为白名单——扫码创建的新机器人用它
-/// 让授权者立即可对话,并覆盖旧应用遗留的白名单(那些 open_id 属于旧 app、对新 bot 无效,
-/// 留着反而会让新 owner 被 `inbound::route` 忽略);手填路径传 `None`,不动既有白名单。
-/// 扫码注册成功路径与本函数共用,保证「落库 + 重连」单一实现。
-async fn apply_feishu_credentials(
-    app: &tauri::AppHandle,
+async fn persist_im_credentials(
     db: &Db,
+    provider: crate::im::ImProvider,
     app_id: &str,
     app_secret: &str,
     enable: bool,
-    owner_open_id: Option<&str>,
+    owner_id: Option<&str>,
+    select_provider: bool,
 ) -> anyhow::Result<()> {
-    repo::set_setting(db, crate::im::K_APP_ID, app_id.trim()).await?;
-    if !app_secret.is_empty() {
-        repo::set_setting(db, crate::im::K_APP_SECRET, app_secret.trim()).await?;
+    let app_id = app_id.trim();
+    let app_secret = app_secret.trim();
+    let owner_id = owner_id.map(str::trim).filter(|owner| !owner.is_empty());
+    let mut settings = Vec::with_capacity(5);
+    if select_provider {
+        settings.push((crate::im::K_PROVIDER, provider.as_str()));
     }
-    if let Some(oid) = owner_open_id {
-        let oid = oid.trim();
-        if !oid.is_empty() {
-            repo::set_setting(db, crate::im::K_ALLOW, oid).await?;
-        }
+    settings.push((provider.app_id_key(), app_id));
+    if !app_secret.is_empty() {
+        settings.push((provider.app_secret_key(), app_secret));
+    }
+    if let Some(owner_id) = owner_id {
+        settings.push((provider.allow_key(), owner_id));
     }
     if enable {
-        repo::set_setting(db, crate::im::K_ENABLED, "1").await?;
+        settings.push((provider.enabled_key(), "1"));
     }
+    repo::set_settings_atomic(db, &settings).await
+}
+
+async fn apply_im_credentials(
+    app: &tauri::AppHandle,
+    db: &Db,
+    provider: crate::im::ImProvider,
+    app_id: &str,
+    app_secret: &str,
+    enable: bool,
+    owner_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let bridge = app.state::<crate::im::ImBridge>();
+    let _authority = bridge.authority_write_lease().await;
+    persist_im_credentials(
+        db,
+        provider,
+        app_id,
+        app_secret,
+        enable,
+        owner_id,
+        true,
+    )
+    .await?;
+    crate::im::spawn(app.clone());
+    Ok(())
+}
+
+/// Persist a completed Feishu scan without selecting Feishu. A callback can
+/// finish after the user has switched to DingTalk; keeping `K_PROVIDER`
+/// untouched makes that newer choice authoritative while retaining the scanned
+/// credentials for a later switch back.
+async fn persist_feishu_scan_credentials(
+    db: &Db,
+    app_id: &str,
+    app_secret: &str,
+    owner_open_id: &str,
+) -> anyhow::Result<()> {
+    persist_im_credentials(
+        db,
+        crate::im::ImProvider::Feishu,
+        app_id,
+        app_secret,
+        true,
+        Some(owner_open_id),
+        false,
+    )
+    .await
+}
+
+async fn persist_im_enabled(
+    db: &Db,
+    provider: crate::im::ImProvider,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    repo::set_setting(db, provider.enabled_key(), if enabled { "1" } else { "0" }).await
+}
+
+async fn apply_im_enabled(
+    app: &tauri::AppHandle,
+    db: &Db,
+    provider: crate::im::ImProvider,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    let bridge = app.state::<crate::im::ImBridge>();
+    // A disable is an authority retirement. Keep the write lease through both
+    // persistence and generation bump so an in-flight lead enqueue is wholly
+    // before the disable or validates against the disabled state afterward.
+    let _authority = bridge.authority_write_lease().await;
+    persist_im_enabled(db, provider, enabled).await?;
+    crate::im::spawn(app.clone());
+    Ok(())
+}
+
+async fn reset_im_owner(
+    app: &tauri::AppHandle,
+    db: &Db,
+    provider: crate::im::ImProvider,
+) -> anyhow::Result<()> {
+    let bridge = app.state::<crate::im::ImBridge>();
+    let _authority = bridge.authority_write_lease().await;
+    let active_provider = crate::im::ImSettings::active_provider(db).await?;
+    crate::im::reset_owner(db, provider).await?;
+    if active_provider == provider {
+        crate::im::spawn(app.clone());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn im_set_provider(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    provider: String,
+) -> R<()> {
+    let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    let bridge = app.state::<crate::im::ImBridge>();
+    let _authority = bridge.authority_write_lease().await;
+    repo::set_setting(&db, crate::im::K_PROVIDER, provider.as_str())
+        .await
+        .map_err(e)?;
     crate::im::spawn(app.clone());
     Ok(())
 }
@@ -2963,23 +4204,67 @@ async fn apply_feishu_credentials(
 pub async fn im_set_settings(
     app: tauri::AppHandle,
     db: State<'_, Db>,
+    registration: State<'_, crate::im::feishu::registration::RegistrationService>,
+    provider: String,
     app_id: String,
     app_secret: String,
 ) -> R<()> {
-    apply_feishu_credentials(&app, &db, &app_id, &app_secret, false, None)
-        .await
-        .map_err(e)
+    let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    let apply = apply_im_credentials(&app, &db, provider, &app_id, &app_secret, false, None);
+    let result = if provider == crate::im::ImProvider::Feishu {
+        registration.supersede_with(apply).await
+    } else {
+        apply.await
+    };
+    result.map_err(e)
 }
 
 /// 开关桥：写 enabled 标志并重启。off = 断开但保留凭证；on = 凭证齐全则连接
 /// （缺凭证时置 disabled，等用户在已展开的表单里补齐再保存）。
 #[tauri::command]
-pub async fn im_set_enabled(app: tauri::AppHandle, db: State<'_, Db>, enabled: bool) -> R<()> {
-    repo::set_setting(&db, crate::im::K_ENABLED, if enabled { "1" } else { "0" })
-        .await
-        .map_err(e)?;
-    crate::im::spawn(app);
-    Ok(())
+pub async fn im_set_enabled(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    registration: State<'_, crate::im::feishu::registration::RegistrationService>,
+    provider: String,
+    enabled: bool,
+) -> R<()> {
+    let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    // Toggling a named provider must not select it. A delayed toggle can race a
+    // newer provider choice; keeping K_PROVIDER untouched makes that newer
+    // choice authoritative while still preserving this provider's enabled bit.
+    // Feishu's registration apply gate stays outermost, matching credentials,
+    // scan completion, and owner reset; this prevents lock-order inversion.
+    let apply = apply_im_enabled(&app, &db, provider, enabled);
+    if provider == crate::im::ImProvider::Feishu {
+        registration.supersede_with(apply).await
+    } else {
+        apply.await
+    }
+    .map_err(e)
+}
+
+/// Clear a provider's locally bound owner without deleting credentials. The
+/// active bridge is restarted so in-memory prompt-recipient/card mappings for
+/// the retired owner cannot suppress or leak status updates after rebind.
+#[tauri::command]
+pub async fn im_reset_owner(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    registration: State<'_, crate::im::feishu::registration::RegistrationService>,
+    provider: String,
+) -> R<()> {
+    let provider = crate::im::ImProvider::parse(&provider).map_err(e)?;
+    // Feishu keeps the registration apply gate outermost, matching manual and
+    // scan credential paths. The authority gate is acquired inside `reset` so
+    // concurrent registration callbacks cannot deadlock on inverted lock order.
+    let reset = reset_im_owner(&app, &db, provider);
+    if provider == crate::im::ImProvider::Feishu {
+        registration.supersede_with(reset).await
+    } else {
+        reset.await
+    }
+    .map_err(e)
 }
 
 /// 远程待命：桥启用期间持有「防空闲休眠」断言，保证飞书指令随时可达。
@@ -3007,6 +4292,36 @@ pub fn im_status(bridge: State<'_, crate::im::ImBridge>) -> R<String> {
     Ok(bridge.status())
 }
 
+fn dingtalk_copy_should_start_bridge(
+    update: crate::im::DingTalkCopyUpdate,
+    bridge_status: &str,
+) -> bool {
+    update == crate::im::DingTalkCopyUpdate::Initialized || bridge_status == "waiting_locale"
+}
+
+/// Synchronize DingTalk's fixed user-facing copy from the frontend i18n
+/// catalogs. Active channels share this memory-only bundle, so locale changes
+/// update rendering in place without retiring output subscribers. The first
+/// bundle still starts a selected DingTalk bridge that was waiting for copy.
+#[tauri::command]
+pub async fn im_set_dingtalk_copy(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    bridge: State<'_, crate::im::ImBridge>,
+    copy: crate::im::outbound::DingTalkCopy,
+) -> R<()> {
+    copy.validate().map_err(e)?;
+    let update = bridge.set_dingtalk_copy(copy);
+    if !dingtalk_copy_should_start_bridge(update, &bridge.status()) {
+        return Ok(());
+    }
+    let settings = crate::im::ImSettings::load(&db).await.map_err(e)?;
+    if settings.provider == crate::im::ImProvider::DingTalk {
+        crate::im::spawn(app);
+    }
+    Ok(())
+}
+
 // ───────────────────────── 飞书扫码接入(device-flow）─────────────────────────
 
 #[derive(serde::Serialize)]
@@ -3031,14 +4346,35 @@ pub async fn feishu_scan_begin(
 ) -> R<ScanBeginView> {
     use crate::im::feishu::registration::{OnSuccess, ReqwestTransport};
     let app_cb = app.clone();
-    let on_success: OnSuccess = std::sync::Arc::new(move |client_id, client_secret, open_id| {
-        let app = app_cb.clone();
-        Box::pin(async move {
-            let db = app.state::<Db>().inner().clone();
-            apply_feishu_credentials(&app, &db, &client_id, &client_secret, true, Some(&open_id))
-                .await
-        }) as futures::future::BoxFuture<'static, anyhow::Result<()>>
-    });
+    let registration_cb = svc.inner().clone();
+    let on_success: OnSuccess = std::sync::Arc::new(
+        move |generation, client_id, client_secret, open_id| {
+            let app = app_cb.clone();
+            let registration = registration_cb.clone();
+            Box::pin(async move {
+                registration
+                    .apply_if_live(generation, async move {
+                        let db = app.state::<Db>().inner().clone();
+                        let bridge = app.state::<crate::im::ImBridge>();
+                        let _authority = bridge.authority_write_lease().await;
+                        persist_feishu_scan_credentials(
+                            &db,
+                            &client_id,
+                            &client_secret,
+                            &open_id,
+                        )
+                        .await?;
+                        let selected = crate::im::ImSettings::active_provider(&db).await?;
+                        if selected == crate::im::ImProvider::Feishu {
+                            crate::im::spawn(app.clone());
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                Ok(())
+            }) as futures::future::BoxFuture<'static, anyhow::Result<()>>
+        },
+    );
     let transport = std::sync::Arc::new(ReqwestTransport::default());
     let begin = svc.begin(transport, on_success).await.map_err(e)?;
     Ok(ScanBeginView {
@@ -3069,10 +4405,10 @@ pub fn feishu_scan_status(
 
 /// 取消扫码(关闭 dialog / 卸载时调用),停止后台轮询。
 #[tauri::command]
-pub fn feishu_scan_cancel(
+pub async fn feishu_scan_cancel(
     svc: State<'_, crate::im::feishu::registration::RegistrationService>,
 ) -> R<()> {
-    svc.cancel();
+    svc.cancel().await;
     Ok(())
 }
 
@@ -3197,6 +4533,160 @@ pub async fn db_change_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn waiting_dingtalk_bridge_retries_after_copy_was_already_initialized() {
+        assert!(dingtalk_copy_should_start_bridge(
+            crate::im::DingTalkCopyUpdate::Unchanged,
+            "waiting_locale"
+        ));
+        assert!(dingtalk_copy_should_start_bridge(
+            crate::im::DingTalkCopyUpdate::Updated,
+            "waiting_locale"
+        ));
+        assert!(!dingtalk_copy_should_start_bridge(
+            crate::im::DingTalkCopyUpdate::Updated,
+            "online"
+        ));
+    }
+
+    #[tokio::test]
+    async fn toggling_named_im_provider_does_not_select_it() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+
+        persist_im_enabled(&db, crate::im::ImProvider::Feishu, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_PROVIDER)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("dingtalk")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_ENABLED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_feishu_scan_credentials_keep_newer_dingtalk_selection() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, crate::im::K_PROVIDER, "dingtalk")
+            .await
+            .unwrap();
+
+        persist_feishu_scan_credentials(&db, "cli_feishu", "sec_feishu", "ou_owner")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_PROVIDER)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("dingtalk")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_APP_ID)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cli_feishu")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_ALLOW)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ou_owner")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_ENABLED)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_scan_generation_cannot_overwrite_newer_manual_feishu_credentials() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let registration =
+            crate::im::feishu::registration::RegistrationService::default();
+
+        registration
+            .supersede_with(persist_im_credentials(
+                &db,
+                crate::im::ImProvider::Feishu,
+                "cli_manual",
+                "sec_manual",
+                false,
+                None,
+                true,
+            ))
+            .await
+            .unwrap();
+        let applied = registration
+            .apply_if_live(
+                0,
+                persist_feishu_scan_credentials(&db, "cli_scan", "sec_scan", "ou_scan"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!applied, "superseded scan callback must not write");
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_APP_ID)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cli_manual")
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::im::K_APP_SECRET)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("sec_manual")
+        );
+        assert!(repo::get_setting(&db, crate::im::K_ALLOW)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo::get_setting(&db, crate::im::K_ENABLED)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn fresh_profile_scan_uses_default_feishu_provider() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        persist_feishu_scan_credentials(&db, "cli_feishu", "sec_feishu", "ou_owner")
+            .await
+            .unwrap();
+
+        assert!(repo::get_setting(&db, crate::im::K_PROVIDER)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            crate::im::ImSettings::active_provider(&db).await.unwrap(),
+            crate::im::ImProvider::Feishu
+        );
+    }
 
     fn sh(dir: &std::path::Path, args: &[&str]) {
         let status = std::process::Command::new(args[0])
@@ -3218,6 +4708,1758 @@ mod tests {
         sh(&p, &["git", "add", "-A"]);
         sh(&p, &["git", "commit", "-q", "-m", "init"]);
         p
+    }
+
+    async fn repo_action_card(
+        db: &Db,
+        action_id: &str,
+        action_kind: &str,
+    ) -> (
+        entities::workspace::Model,
+        entities::thread::Model,
+        entities::lead_message::Model,
+    ) {
+        let workspace = repo::create_workspace(db, &format!("ws-{action_id}"))
+            .await
+            .unwrap();
+        let thread = repo::create_thread(db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let card = repo::insert_lead_message(
+            db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "action_card",
+            &serde_json::json!({
+                "title": "Add the repository",
+                "actions": [{"id": action_id, "kind": action_kind, "label": "Run"}],
+            })
+            .to_string(),
+            "complete",
+        )
+        .await
+        .unwrap();
+        (workspace, thread, card)
+    }
+
+    /// Make lock ownership handoff explicit before a test starts a phase that
+    /// reacquires the same execution token. The production lock remains
+    /// fail-fast; this probe only proves that the previous owner has dropped
+    /// its guard instead of relying on scheduler timing between awaits.
+    fn assert_repo_action_lock_handoff(execution_token: &str) {
+        let lock = acquire_repo_action_os_lock(execution_token).unwrap();
+        drop(lock);
+    }
+
+    async fn materialize_unregistered_repo_action(
+        db: &Db,
+        root: &std::path::Path,
+        action_id: &str,
+    ) -> (
+        entities::workspace::Model,
+        entities::thread::Model,
+        entities::lead_message::Model,
+        entities::repo_action_execution::Model,
+        std::path::PathBuf,
+    ) {
+        let destination = root.join(format!("{action_id}-dest"));
+        std::fs::create_dir_all(&destination).unwrap();
+        let destination = std::fs::canonicalize(destination).unwrap();
+        let target = destination.join("checkout");
+        let (workspace, thread, card) = repo_action_card(db, action_id, "new").await;
+        let fingerprint = repo_action_fingerprint(&["new", &target.to_string_lossy(), "checkout"]);
+        let mut admission = admit_repo_action(
+            db,
+            workspace.id,
+            Some(thread.id),
+            Some(card.id),
+            Some(action_id),
+            Some("new"),
+            "new",
+            &fingerprint,
+            &target,
+            Some(&destination),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        materialize_repo_action(db, &mut admission, crate::git::init_repo)
+            .await
+            .unwrap();
+        let execution = admission.execution.clone();
+        let execution_token = admission.execution.execution_token.clone();
+        drop(admission);
+        assert_repo_action_lock_handoff(&execution_token);
+        (workspace, thread, card, execution, target)
+    }
+
+    async fn registered_new_repo_action(
+        db: &Db,
+        root: &std::path::Path,
+        action_id: &str,
+    ) -> (
+        entities::workspace::Model,
+        entities::thread::Model,
+        entities::lead_message::Model,
+        RepoActionAdmission,
+        entities::repo_ref::Model,
+    ) {
+        let destination = root.join(format!("{action_id}-dest"));
+        std::fs::create_dir_all(&destination).unwrap();
+        let destination = std::fs::canonicalize(destination).unwrap();
+        let target = destination.join("checkout");
+        let workspace = repo::create_workspace(db, &format!("ws-{action_id}"))
+            .await
+            .unwrap();
+        let thread = repo::create_thread(db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        use sea_orm::{ActiveModelTrait, Set};
+        static NEXT_TEST_ACTION_MESSAGE_ID: std::sync::atomic::AtomicI32 =
+            std::sync::atomic::AtomicI32::new(900_000);
+        let card = entities::lead_message::ActiveModel {
+            id: Set(NEXT_TEST_ACTION_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)),
+            thread_id: Set(thread.id),
+            session_id: Set(None),
+            turn_id: Set(1),
+            role: Set("assistant".to_string()),
+            kind: Set("action_card".to_string()),
+            content: Set(serde_json::json!({
+                "title": "Add the repository",
+                "actions": [{"id": action_id, "kind": "new", "label": "Run"}],
+            }).to_string()),
+            status: Set("complete".to_string()),
+            created_at: Set(String::new()),
+            seq: Set(None),
+            native_anchor: Set(None),
+            consumed_at: Set(None),
+        }
+        .insert(&db.0)
+        .await
+        .unwrap();
+        let fingerprint = repo_action_fingerprint(&["new", &target.to_string_lossy(), "checkout"]);
+        let mut admission = admit_repo_action(
+            db,
+            workspace.id,
+            Some(thread.id),
+            Some(card.id),
+            Some(action_id),
+            Some("new"),
+            "new",
+            &fingerprint,
+            &target,
+            Some(&destination),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let materialized = materialize_repo_action(db, &mut admission, crate::git::init_repo)
+            .await
+            .unwrap();
+        let repo_ref = register_repo_without_schedule(
+            db,
+            workspace.id,
+            "checkout",
+            &materialized.to_string_lossy(),
+            Some(&admission._os_lock),
+        )
+        .await
+        .unwrap();
+        (workspace, thread, card, admission, repo_ref)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completion_outbox_linearizes_before_visible_phase_one() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (workspace, thread, card, mut admission, repo_ref) =
+            registered_new_repo_action(&db, root.path(), "completion-fifo").await;
+        let key = crate::lead_chat::commands::lead_key(thread.id);
+        let serial = crate::lead_chat::engine::admission_gate_for_key(key)
+            .lock_owned()
+            .await;
+
+        let (scan_tx, mut scan_rx) = tokio::sync::oneshot::channel();
+        let (phase_release_tx, phase_release_rx) = tokio::sync::oneshot::channel();
+        let visible_db = db.clone();
+        let visible = tokio::spawn(async move {
+            // This is the visible send's actual surface admission boundary:
+            // pending durable rows are scanned while the gate is held, then
+            // Phase 1 persists the user row before releasing the gate.
+            let _surface = crate::lead_chat::engine::admission_gate_for_key(key)
+                .lock_owned()
+                .await;
+            let pending = repo::list_pending_lead_hidden_deliveries(
+                &visible_db,
+                Some(thread.id),
+            )
+            .await
+            .unwrap();
+            let _ = scan_tx.send(pending);
+            phase_release_rx.await.unwrap();
+            repo::insert_lead_message(
+                &visible_db,
+                thread.id,
+                None,
+                2,
+                "user",
+                "text",
+                r#"{"text":"new user instruction"}"#,
+                "complete",
+            )
+            .await
+            .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(30),
+                &mut scan_rx,
+            )
+            .await
+            .is_err(),
+            "visible send must stop at the surface gate while completion owns it"
+        );
+
+        // Use the same completion body as production after its surface gate
+        // has been acquired. The visible task cannot scan until this commit
+        // releases the gate, so it must observe repo feedback first.
+        test_complete_admitted_repo_action_under_gate(&db, &mut admission, &repo_ref, serial)
+            .await
+            .unwrap();
+        let pending = scan_rx.await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source_kind, "repo_action");
+        assert_eq!(pending[0].source_id, admission.execution.id);
+        phase_release_tx.send(()).unwrap();
+        let user = visible.await.unwrap();
+        assert_eq!(user.turn_id, 2);
+        assert_eq!(user.role, "user");
+        assert!(
+            repo::get_lead_hidden_delivery_by_dedupe(
+                &db,
+                &format!("repo_action:{}", admission.execution.id),
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(
+            repo::get_repo_action_execution(&db, card.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .feedback_state,
+            repo::REPO_ACTION_FEEDBACK_PENDING
+        );
+        assert_eq!(workspace.id, admission.execution.workspace_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completion_gate_handoff_releases_action_gate_and_rechecks_delete_fence() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (_workspace, thread, card, mut admission, repo_ref) =
+            registered_new_repo_action(&db, root.path(), "completion-fence").await;
+        let key = crate::lead_chat::commands::lead_key(thread.id);
+        let serial = crate::lead_chat::engine::admission_gate_for_key(key)
+            .lock_owned()
+            .await;
+        let db_for_completion = db.clone();
+        let completion = tokio::spawn(async move {
+            complete_admitted_repo_action(&db_for_completion, &mut admission, &repo_ref).await
+        });
+
+        // The completion task must drop its long-lived repo-action guard before
+        // waiting on the occupied surface gate. Acquiring this probe guard is
+        // the deterministic handoff point; a task that kept `_gate` would
+        // deadlock here while the test holds `serial`.
+        let mut probe = None;
+        for _ in 0..20 {
+            if let Ok(guard) = tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                repo_action_gate(card.id).lock_owned(),
+            )
+            .await
+            {
+                probe = Some(guard);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            probe.is_some(),
+            "completion must release repo-action gate before waiting on surface admission"
+        );
+        drop(probe);
+
+        // A fresh delete marker is installed while completion waits. The
+        // completion transaction must re-read this fence after reacquiring
+        // surface -> lifecycle -> repo-action, rather than committing from the
+        // pre-materialize verdict.
+        repo::mark_thread_deleting(&db, thread.id).await.unwrap();
+        drop(serial);
+        let error = completion.await.unwrap().unwrap_err();
+        assert_eq!(error, "action_card_stale");
+        assert!(
+            repo::list_pending_lead_hidden_deliveries(&db, Some(thread.id))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let execution = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, repo::REPO_ACTION_MATERIALIZED);
+        assert_eq!(execution.feedback_state, repo::REPO_ACTION_FEEDBACK_NONE);
+        let content: serde_json::Value = serde_json::from_str(
+            &repo::get_lead_message(&db, card.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+        )
+        .unwrap();
+        assert!(content.get("resolved").is_none());
+    }
+
+    #[tokio::test]
+    async fn repo_action_wrong_identity_and_stale_card_are_rejected_before_mutation() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let local = init_main_repo(root.path(), "local");
+        let (workspace, thread, card) = repo_action_card(&db, "add", "add").await;
+
+        let wrong = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "local".to_string(),
+            local.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("other-action".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(wrong, "action_card_stale");
+        assert!(repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            2,
+            "assistant",
+            "text",
+            "Use a different repository instead",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let stale = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "local".to_string(),
+            local.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("add".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale, "action_card_stale");
+        assert!(
+            repo::list_repos(&db, workspace.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the stale action is rejected before any workspace mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_new_and_clone_cards_leave_no_target_or_staging_side_effect() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        let new_dest = root.path().join("new-dest");
+        std::fs::create_dir_all(&new_dest).unwrap();
+        let (new_workspace, new_thread, new_card) =
+            repo_action_card(&db, "stale-new", "new").await;
+        repo::insert_lead_message(
+            &db,
+            new_thread.id,
+            None,
+            2,
+            "assistant",
+            "text",
+            "A newer turn superseded the repository card",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let new_error = create_repo_inner(
+            &db,
+            new_workspace.id,
+            "checkout".to_string(),
+            new_dest.to_string_lossy().into_owned(),
+            Some(new_thread.id),
+            Some(new_card.id),
+            Some("stale-new".to_string()),
+            Some("new".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(new_error, "action_card_stale");
+        assert!(repo::get_repo_action_execution(&db, new_card.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo::list_repos(&db, new_workspace.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!new_dest.join("checkout").exists());
+        assert!(std::fs::read_dir(&new_dest)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("weft-repo-action")));
+
+        let source = init_main_repo(root.path(), "stale-clone-source");
+        let clone_dest = root.path().join("clone-dest");
+        std::fs::create_dir_all(&clone_dest).unwrap();
+        let (clone_workspace, clone_thread, clone_card) =
+            repo_action_card(&db, "stale-clone", "clone").await;
+        repo::insert_lead_message(
+            &db,
+            clone_thread.id,
+            None,
+            2,
+            "assistant",
+            "text",
+            "A newer turn superseded the clone card",
+            "complete",
+        )
+        .await
+        .unwrap();
+        let clone_error = clone_repo_inner(
+            &db,
+            clone_workspace.id,
+            source.to_string_lossy().into_owned(),
+            clone_dest.to_string_lossy().into_owned(),
+            "checkout".to_string(),
+            Some(clone_thread.id),
+            Some(clone_card.id),
+            Some("stale-clone".to_string()),
+            Some("clone".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(clone_error, "action_card_stale");
+        assert!(repo::get_repo_action_execution(&db, clone_card.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo::list_repos(&db, clone_workspace.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!clone_dest.join("checkout").exists());
+        assert!(std::fs::read_dir(&clone_dest)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("weft-repo-action")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_exact_repo_action_is_one_execution_mutation_resolution_and_feedback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let local = init_main_repo(root.path(), "concurrent-local");
+        let (workspace, thread, card) = repo_action_card(&db, "concurrent-add", "add").await;
+        let args = || {
+            (
+                workspace.id,
+                "concurrent-local".to_string(),
+                local.to_string_lossy().into_owned(),
+                Some(thread.id),
+                Some(card.id),
+                Some("concurrent-add".to_string()),
+                Some("add".to_string()),
+            )
+        };
+
+        let first_db = db.clone();
+        let (first_workspace, first_name, first_path, first_thread, first_message, first_id, first_kind) =
+            args();
+        let first = tokio::spawn(async move {
+            add_repo_ref_inner(
+                &first_db,
+                first_workspace,
+                first_name,
+                first_path,
+                first_thread,
+                first_message,
+                first_id,
+                first_kind,
+            )
+            .await
+        });
+        let second_db = db.clone();
+        let (second_workspace, second_name, second_path, second_thread, second_message, second_id, second_kind) =
+            args();
+        let second = tokio::spawn(async move {
+            add_repo_ref_inner(
+                &second_db,
+                second_workspace,
+                second_name,
+                second_path,
+                second_thread,
+                second_message,
+                second_id,
+                second_kind,
+            )
+            .await
+        });
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        let mut completed = Vec::with_capacity(2);
+        let mut saw_in_progress = false;
+        for result in [first, second] {
+            match result {
+                Ok(result) => completed.push(result),
+                Err(error) if error == "action_card_in_progress" => saw_in_progress = true,
+                Err(error) => panic!("concurrent exact action failed unexpectedly: {error}"),
+            }
+        }
+        // A loser that reaches the OS lock while the winner is still mutating
+        // is a valid in-progress response. Once both owner tasks have joined,
+        // retry the exact invocation and observe the durable replay outcome.
+        if saw_in_progress {
+            let (workspace_id, name, path, thread_id, message_id, action_id, action_kind) = args();
+            completed.push(
+                add_repo_ref_inner(
+                    &db,
+                    workspace_id,
+                    name,
+                    path,
+                    thread_id,
+                    message_id,
+                    action_id,
+                    action_kind,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        assert_eq!(completed.len(), 2);
+        let outcomes = completed
+            .iter()
+            .map(|result| result.outcome)
+            .collect::<Vec<_>>();
+        assert!(outcomes.contains(&RepoActionExecutionOutcome::FreshlyCompleted));
+        assert!(outcomes.contains(&RepoActionExecutionOutcome::Replayed));
+        assert_eq!(completed[0].repo.id, completed[1].repo.id);
+        assert_eq!(repo::list_repos(&db, workspace.id).await.unwrap().len(), 1);
+
+        let message = repo::get_lead_message(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let content: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+        assert_eq!(content["resolved"], "concurrent-local");
+        let execution = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, repo::REPO_ACTION_COMPLETED);
+        assert_eq!(execution.repo_id, completed[0].repo.id);
+        assert_eq!(execution.feedback_state, repo::REPO_ACTION_FEEDBACK_PENDING);
+
+        let deliveries = std::sync::Arc::new(AtomicUsize::new(0));
+        let first_deliveries = deliveries.clone();
+        let second_deliveries = deliveries.clone();
+        let execution_id = execution.id;
+        let expected_thread_id = thread.id;
+        let first_db = db.clone();
+        let first_drain = drain_repo_action_feedback_with(
+            &db,
+            execution_id,
+            move |delivered_thread_id, payload| async move {
+                assert_eq!(delivered_thread_id, expected_thread_id);
+                assert_eq!(payload["execution_id"], execution_id);
+                first_deliveries.fetch_add(1, Ordering::SeqCst);
+                let hidden = repo::enqueue_repo_action_feedback_from_journal(&first_db, execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(repo::consume_lead_hidden_delivery(&first_db, hidden.id)
+                    .await
+                    .unwrap()
+                    .is_some());
+                Ok(true)
+            },
+        );
+        let second_db = db.clone();
+        let second_drain = drain_repo_action_feedback_with(
+            &db,
+            execution_id,
+            move |_, _| async move {
+                second_deliveries.fetch_add(1, Ordering::SeqCst);
+                let hidden = repo::enqueue_repo_action_feedback_from_journal(&second_db, execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(repo::consume_lead_hidden_delivery(&second_db, hidden.id)
+                    .await
+                    .unwrap()
+                    .is_some());
+                Ok(true)
+            },
+        );
+        let (first_done, second_done) = tokio::join!(first_drain, second_drain);
+        assert!(first_done.unwrap() || second_done.unwrap());
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repo::get_repo_action_execution(&db, card.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .feedback_state,
+            repo::REPO_ACTION_FEEDBACK_DELIVERED
+        );
+    }
+
+    #[tokio::test]
+    async fn claimed_repo_action_owner_completes_after_newer_assistant_activity() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let local = init_main_repo(root.path(), "barrier-local");
+        let (workspace, thread, card) = repo_action_card(&db, "barrier-add", "add").await;
+        let local_text = local.to_string_lossy().into_owned();
+        let target = normalized_existing_repo_target(&local_text).unwrap();
+        let target_text = target.to_string_lossy().into_owned();
+        let fingerprint = repo_action_fingerprint(&["add", &target_text, "barrier-local"]);
+        let mut admission = admit_repo_action(
+            &db,
+            workspace.id,
+            Some(thread.id),
+            Some(card.id),
+            Some("barrier-add"),
+            Some("add"),
+            "add",
+            &fingerprint,
+            &target,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(admission.execution.status, repo::REPO_ACTION_PENDING);
+
+        // The claim is the write-first actionability linearization point. A
+        // newer assistant row after it must not revoke this owner completion;
+        // otherwise the already-authorized mutation could strand its repo.
+        repo::insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            2,
+            "assistant",
+            "text",
+            "A newer turn arrived after the action claim",
+            "complete",
+        )
+        .await
+        .unwrap();
+        admission.execution = repo::mark_repo_action_materialized(
+            &db,
+            admission.execution.id,
+            &admission.execution.execution_token,
+        )
+        .await
+        .unwrap();
+        let repo_ref = register_repo_without_schedule(
+            &db,
+            workspace.id,
+            "barrier-local",
+            &target_text,
+            Some(&admission._os_lock),
+        )
+        .await
+        .unwrap();
+        complete_admitted_repo_action(&db, &mut admission, &repo_ref)
+        .await
+        .unwrap();
+        cleanup_completed_action_target(&admission, &repo_ref).unwrap();
+        let execution_token = admission.execution.execution_token.clone();
+        drop(admission);
+        assert_repo_action_lock_handoff(&execution_token);
+
+        assert_eq!(repo::list_repos(&db, workspace.id).await.unwrap().len(), 1);
+        let message = repo::get_lead_message(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let content: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+        assert_eq!(content["resolved"], "barrier-local");
+        let execution = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, repo::REPO_ACTION_COMPLETED);
+        assert_eq!(execution.feedback_state, repo::REPO_ACTION_FEEDBACK_PENDING);
+
+        let deliveries = std::sync::Arc::new(AtomicUsize::new(0));
+        let first_deliveries = deliveries.clone();
+        let second_deliveries = deliveries.clone();
+        let first_db = db.clone();
+        let first = drain_repo_action_feedback_with(
+            &db,
+            execution.id,
+            move |_, payload| async move {
+                assert_eq!(payload["execution_id"], execution.id);
+                first_deliveries.fetch_add(1, Ordering::SeqCst);
+                let hidden = repo::enqueue_repo_action_feedback_from_journal(&first_db, execution.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(repo::consume_lead_hidden_delivery(&first_db, hidden.id)
+                    .await
+                    .unwrap()
+                    .is_some());
+                Ok(true)
+            },
+        );
+        let second_db = db.clone();
+        let second = drain_repo_action_feedback_with(
+            &db,
+            execution.id,
+            move |_, _| async move {
+                second_deliveries.fetch_add(1, Ordering::SeqCst);
+                let hidden = repo::enqueue_repo_action_feedback_from_journal(&second_db, execution.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(repo::consume_lead_hidden_delivery(&second_db, hidden.id)
+                    .await
+                    .unwrap()
+                    .is_some());
+                Ok(true)
+            },
+        );
+        let (first, second) = tokio::join!(first, second);
+        assert!(first.unwrap() || second.unwrap());
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repo::get_repo_action_execution(&db, card.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .feedback_state,
+            repo::REPO_ACTION_FEEDBACK_DELIVERED
+        );
+    }
+
+    #[test]
+    fn repo_action_os_lock_allows_only_one_execution_holder() {
+        let token = new_repo_action_token();
+        let first = acquire_repo_action_os_lock(&token).unwrap();
+        let second = acquire_repo_action_os_lock(&token).unwrap_err();
+        assert_eq!(second, "action_card_in_progress");
+        drop(first);
+        assert!(acquire_repo_action_os_lock(&token).is_ok());
+    }
+
+    #[tokio::test]
+    async fn materialize_promotion_never_replaces_a_foreign_empty_target() {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let destination = std::fs::canonicalize(root.path()).unwrap();
+        let target = destination.join("foreign-empty");
+        let (workspace, thread, card) = repo_action_card(&db, "noreplace", "new").await;
+        let fingerprint =
+            repo_action_fingerprint(&["new", &target.to_string_lossy(), "foreign-empty"]);
+        let mut admission = admit_repo_action(
+            &db,
+            workspace.id,
+            Some(thread.id),
+            Some(card.id),
+            Some("noreplace"),
+            Some("new"),
+            "new",
+            &fingerprint,
+            &target,
+            Some(&destination),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let staging = std::path::PathBuf::from(&admission.execution.staging_path);
+        #[cfg(unix)]
+        let foreign_inode = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(unix)]
+        let mutation_inode = foreign_inode.clone();
+        let foreign_target = target.clone();
+        let error = materialize_repo_action(&db, &mut admission, move |staging| {
+            crate::git::init_repo(staging)?;
+            // Deterministic promotion seam: this lands after the initial target
+            // preflight and before the no-replace rename.
+            std::fs::create_dir(&foreign_target)?;
+            #[cfg(unix)]
+            mutation_inode.store(
+                std::fs::symlink_metadata(&foreign_target)?.ino(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("cannot atomically install repository"));
+        assert!(target.is_dir());
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap().ino(),
+            foreign_inode.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(!target.join(".git").join(REPO_ACTION_TOKEN_MARKER).exists());
+        assert!(
+            !staging.exists(),
+            "owned staging is journaled and reclaimed"
+        );
+        assert!(repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn add_repo_action_completed_replay_is_idempotent_and_rejects_new_args() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let local = init_main_repo(root.path(), "local");
+        let (workspace, thread, card) = repo_action_card(&db, "add", "add").await;
+        let first = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "local".to_string(),
+            local.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("add".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap();
+        let replay = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "local".to_string(),
+            local.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("add".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.outcome, RepoActionExecutionOutcome::FreshlyCompleted);
+        assert_eq!(replay.outcome, RepoActionExecutionOutcome::Replayed);
+        assert_eq!(replay.repo.id, first.repo.id);
+        assert_eq!(repo::list_repos(&db, workspace.id).await.unwrap().len(), 1);
+        let execution = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, repo::REPO_ACTION_COMPLETED);
+        assert_eq!(execution.repo_id, first.repo.id);
+        assert_eq!(execution.feedback_state, repo::REPO_ACTION_FEEDBACK_PENDING);
+        let first_hidden = repo::get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{}", execution.id),
+        )
+        .await
+        .unwrap()
+        .expect("completion must atomically create the hidden outbox row");
+        let payload: serde_json::Value = serde_json::from_str(&execution.feedback_payload).unwrap();
+        assert_eq!(payload["execution_id"], execution.id);
+        assert_eq!(payload["action_id"], "add");
+        assert_eq!(payload["status"], "ok");
+        let replay_hidden = repo::get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{}", execution.id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(replay_hidden.id, first_hidden.id);
+
+        let deliveries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let execution_id = execution.id;
+        let expected_thread_id = thread.id;
+        let first_deliveries = deliveries.clone();
+        let second_deliveries = deliveries.clone();
+        let first_db = db.clone();
+        let first_drain = drain_repo_action_feedback_with(
+            &db,
+            execution_id,
+            move |delivered_thread_id, payload| async move {
+                assert_eq!(delivered_thread_id, expected_thread_id);
+                assert_eq!(payload["execution_id"], execution_id);
+                first_deliveries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                let hidden = repo::enqueue_repo_action_feedback_from_journal(&first_db, execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(repo::consume_lead_hidden_delivery(&first_db, hidden.id)
+                    .await
+                    .unwrap()
+                    .is_some());
+                Ok(true)
+            },
+        );
+        let second_db = db.clone();
+        let second_drain =
+            drain_repo_action_feedback_with(&db, execution_id, move |_, _| async move {
+                second_deliveries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let hidden = repo::enqueue_repo_action_feedback_from_journal(&second_db, execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(repo::consume_lead_hidden_delivery(&second_db, hidden.id)
+                    .await
+                    .unwrap()
+                    .is_some());
+                Ok(true)
+            });
+        let (first_done, second_done) = tokio::join!(first_drain, second_drain);
+        assert!(first_done.unwrap() || second_done.unwrap());
+        assert_eq!(deliveries.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let delivered = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            delivered.feedback_state,
+            repo::REPO_ACTION_FEEDBACK_DELIVERED
+        );
+
+        let replay_after_delivery = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "local".to_string(),
+            local.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("add".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay_after_delivery.outcome,
+            RepoActionExecutionOutcome::Replayed
+        );
+        let retained_hidden = repo::get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{}", execution.id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(retained_hidden.id, first_hidden.id);
+        assert_eq!(
+            retained_hidden.state,
+            repo::LEAD_HIDDEN_DELIVERY_CONSUMED
+        );
+
+        let wrong_args = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "renamed".to_string(),
+            local.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("add".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(wrong_args, "action_card_stale");
+    }
+
+    #[tokio::test]
+    async fn repo_action_feedback_drain_requires_hidden_receipt() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let local = init_main_repo(root.path(), "missing-receipt");
+        let (workspace, thread, card) = repo_action_card(&db, "missing-receipt", "add").await;
+        let completed = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "missing-receipt".to_string(),
+            local.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("missing-receipt".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap();
+        let execution_id = completed.execution_id.unwrap();
+        let execution = repo::get_repo_action_execution_by_id(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_repo_action_lock_handoff(&execution.execution_token);
+        let hidden = repo::get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{execution_id}"),
+        )
+        .await
+        .unwrap()
+        .expect("completion must atomically create the hidden outbox row");
+        repo::delete_lead_hidden_deliveries_for_thread(&db, thread.id)
+            .await
+            .unwrap();
+        assert!(
+            repo::get_lead_hidden_delivery(&db, hidden.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let callback_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let callback_count_for_drain = callback_count.clone();
+        assert!(!drain_repo_action_feedback_with(&db, execution_id, move |_, _| async move {
+            callback_count_for_drain.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        })
+        .await
+        .unwrap());
+        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repo::get_repo_action_execution_by_id(&db, execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .feedback_state,
+            repo::REPO_ACTION_FEEDBACK_PENDING
+        );
+        assert!(repo::get_lead_hidden_delivery_by_dedupe(
+            &db,
+            &format!("repo_action:{execution_id}")
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn journal_feedback_accepts_remote_dedup_path_repoint() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let existing_path = init_main_repo(root.path(), "existing-remote");
+        let requested_path = init_main_repo(root.path(), "requested-remote");
+        let remote = "https://example.com/weft/dedup.git";
+        sh(&existing_path, &["git", "remote", "add", "origin", remote]);
+        sh(&requested_path, &["git", "remote", "add", "origin", remote]);
+        let (workspace, thread, card) = repo_action_card(&db, "remote-dedup", "add").await;
+        let existing = register_repo(
+            &db,
+            workspace.id,
+            "existing-remote",
+            &existing_path.to_string_lossy(),
+        )
+        .await
+        .unwrap();
+        let result = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "requested-remote".to_string(),
+            requested_path.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("remote-dedup".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, RepoActionExecutionOutcome::FreshlyCompleted);
+        assert_eq!(result.repo.id, existing.id);
+        let execution_id = result.execution_id.unwrap();
+        let execution = repo::get_repo_action_execution_by_id(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(execution.target_path, result.repo.local_git_path);
+        let hidden = repo::enqueue_repo_action_feedback_from_journal(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&hidden.payload).unwrap();
+        assert_eq!(payload["local_git_path"], result.repo.local_git_path);
+        assert_eq!(hidden.thread_id, thread.id);
+    }
+
+    #[tokio::test]
+    async fn completed_feedback_survives_repo_delete_until_it_is_delivered_once() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let local = init_main_repo(root.path(), "delete-before-feedback");
+        let (workspace, thread, card) = repo_action_card(&db, "add-delete", "add").await;
+        let completed = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "delete-before-feedback".to_string(),
+            local.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("add-delete".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap();
+        let execution_id = completed.execution_id.unwrap();
+        let journal = repo::get_repo_action_execution_by_id(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let hidden = repo::enqueue_lead_hidden_delivery(
+            &db,
+            thread.id,
+            "repo_action",
+            execution_id,
+            &format!("repo_action:{execution_id}"),
+            &journal.feedback_payload,
+        )
+        .await
+        .unwrap();
+        let feedback_locks = lock_repo_action_cleanups(
+            &db,
+            repo::pending_repo_action_feedback_for_repo(&db, completed.repo.id)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        repo::delete_repo_cascade_with_human_cancellations(&db, completed.repo.id)
+            .await
+            .unwrap();
+        let retained = repo::get_repo_action_execution_by_id(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.feedback_state, repo::REPO_ACTION_FEEDBACK_PENDING);
+        assert_eq!(
+            repo::get_lead_hidden_delivery(&db, hidden.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            repo::LEAD_HIDDEN_DELIVERY_PENDING
+        );
+        assert!(repo::get_repo(&db, completed.repo.id)
+            .await
+            .unwrap()
+            .is_none());
+        drop(feedback_locks);
+
+        // A repo delete cannot discard a pending feedback journal or its
+        // hidden outbox row. The engine's first activity is the receipt: both
+        // durable states advance in one transaction, and a missing repo then
+        // permits the completed execution to be cleaned up atomically.
+        assert!(repo::consume_lead_hidden_delivery(&db, hidden.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(repo::get_repo_action_execution_by_id(&db, execution_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            repo::get_lead_hidden_delivery(&db, hidden.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            repo::LEAD_HIDDEN_DELIVERY_CONSUMED
+        );
+        assert!(repo::consume_lead_hidden_delivery(&db, hidden.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(local.exists(), "repo delete only removes Weft tracking");
+    }
+
+    #[tokio::test]
+    async fn clone_mutation_failure_releases_owned_claim_and_same_args_can_retry() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let (workspace, thread, card) = repo_action_card(&db, "clone", "clone").await;
+        let args = || {
+            (
+                source.to_string_lossy().into_owned(),
+                dest.to_string_lossy().into_owned(),
+                "checkout".to_string(),
+                Some(thread.id),
+                Some(card.id),
+                Some("clone".to_string()),
+                Some("clone".to_string()),
+            )
+        };
+        let (url, destination, name, thread_id, message_id, action_id, action_kind) = args();
+        assert!(clone_repo_inner(
+            &db,
+            workspace.id,
+            url,
+            destination,
+            name,
+            thread_id,
+            message_id,
+            action_id,
+            action_kind,
+        )
+        .await
+        .is_err());
+        assert!(repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!dest.join("checkout").exists());
+        assert!(std::fs::read_dir(&dest).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("weft-repo-action")));
+
+        sh(&source, &["git", "init", "-q"]);
+        sh(&source, &["git", "config", "user.email", "t@t.t"]);
+        sh(&source, &["git", "config", "user.name", "t"]);
+        std::fs::write(source.join("README.md"), "# source\n").unwrap();
+        sh(&source, &["git", "add", "-A"]);
+        sh(&source, &["git", "commit", "-q", "-m", "init"]);
+        let (url, destination, name, thread_id, message_id, action_id, action_kind) = args();
+        let repo_ref = clone_repo_inner(
+            &db,
+            workspace.id,
+            url,
+            destination,
+            name,
+            thread_id,
+            message_id,
+            action_id,
+            action_kind,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&repo_ref.repo.local_git_path).unwrap(),
+            std::fs::canonicalize(dest.join("checkout")).unwrap()
+        );
+        assert!(dest.join("checkout").join(".git").is_dir());
+        assert!(!dest
+            .join("checkout")
+            .join(".git")
+            .join(REPO_ACTION_TOKEN_MARKER)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn guarded_create_success_preserves_checkout_and_removes_only_token_marker() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("new-dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let (workspace, thread, card) = repo_action_card(&db, "new", "new").await;
+
+        let created = create_repo_inner(
+            &db,
+            workspace.id,
+            "created".to_string(),
+            dest.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("new".to_string()),
+            Some("new".to_string()),
+        )
+        .await
+        .unwrap();
+        let target = dest.join("created");
+        assert_eq!(
+            std::fs::canonicalize(&created.repo.local_git_path).unwrap(),
+            std::fs::canonicalize(&target).unwrap()
+        );
+        assert!(target.join(".git").is_dir());
+        assert!(!target.join(".git").join(REPO_ACTION_TOKEN_MARKER).exists());
+        let execution = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(execution.cleanup_preserve_target);
+        assert_eq!(execution.feedback_state, repo::REPO_ACTION_FEEDBACK_PENDING);
+    }
+
+    #[tokio::test]
+    async fn guarded_remote_duplicate_clone_still_removes_only_the_redundant_checkout() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let source = init_main_repo(root.path(), "dedup-source");
+        let existing = root.path().join("existing");
+        sh(
+            root.path(),
+            &[
+                "git",
+                "clone",
+                "-q",
+                source.to_str().unwrap(),
+                existing.to_str().unwrap(),
+            ],
+        );
+        let dest = root.path().join("dedup-dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let (workspace, thread, card) = repo_action_card(&db, "dedup-clone", "clone").await;
+        let existing_repo =
+            register_repo(&db, workspace.id, "existing", &existing.to_string_lossy())
+                .await
+                .unwrap();
+
+        let completed = clone_repo_inner(
+            &db,
+            workspace.id,
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+            "duplicate".to_string(),
+            Some(thread.id),
+            Some(card.id),
+            Some("dedup-clone".to_string()),
+            Some("clone".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let duplicate = dest.join("duplicate");
+        assert_eq!(completed.repo.id, existing_repo.id);
+        assert!(existing.join(".git").is_dir());
+        assert!(!duplicate.exists());
+        assert_eq!(repo::list_repos(&db, workspace.id).await.unwrap().len(), 1);
+        let execution = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!execution.cleanup_preserve_target);
+    }
+
+    #[tokio::test]
+    async fn clone_finalize_failure_resumes_marker_without_recloning() {
+        use sea_orm::ConnectionTrait;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let source = init_main_repo(root.path(), "source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let (workspace, thread, card) = repo_action_card(&db, "clone", "clone").await;
+        db.0.execute_unprepared(
+            "CREATE TRIGGER fail_repo_action_complete BEFORE UPDATE OF status \
+                 ON repo_action_execution WHEN NEW.status = 'completed' BEGIN \
+                 SELECT RAISE(ABORT, 'forced finalize failure'); END;",
+        )
+        .await
+        .unwrap();
+        let call = |url: String| {
+            clone_repo_inner(
+                &db,
+                workspace.id,
+                url,
+                dest.to_string_lossy().into_owned(),
+                "checkout".to_string(),
+                Some(thread.id),
+                Some(card.id),
+                Some("clone".to_string()),
+                Some("clone".to_string()),
+            )
+        };
+        let first_error = call(source.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        assert!(first_error.contains("forced finalize failure"));
+        let pending = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.status, repo::REPO_ACTION_MATERIALIZED);
+        let target = dest.join("checkout");
+        assert!(repo_action_target_has_token(
+            &target,
+            &pending.execution_token
+        ));
+        let first_repo = repo::list_repos(&db, workspace.id).await.unwrap();
+        assert_eq!(first_repo.len(), 1);
+
+        db.0.execute_unprepared("DROP TRIGGER fail_repo_action_complete")
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&source).unwrap();
+        let replay = call(source.to_string_lossy().into_owned()).await.unwrap();
+        assert_eq!(replay.repo.id, first_repo[0].id);
+        assert_eq!(repo::list_repos(&db, workspace.id).await.unwrap().len(), 1);
+        assert!(!target.join(".git").join(REPO_ACTION_TOKEN_MARKER).exists());
+    }
+
+    #[tokio::test]
+    async fn failed_thread_delete_rolls_back_action_cleanup_and_action_retries() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let source = init_main_repo(root.path(), "rollback-source");
+        let dest = root.path().join("rollback-dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let (workspace, thread, card) = repo_action_card(&db, "rollback-clone", "clone").await;
+        db.0.execute_unprepared(
+            "CREATE TRIGGER fail_action_finalize_for_delete BEFORE UPDATE OF status \
+                 ON repo_action_execution WHEN NEW.status = 'completed' BEGIN \
+                 SELECT RAISE(ABORT, 'forced finalize failure'); END;",
+        )
+        .await
+        .unwrap();
+        let call = || {
+            clone_repo_inner(
+                &db,
+                workspace.id,
+                source.to_string_lossy().into_owned(),
+                dest.to_string_lossy().into_owned(),
+                "checkout".to_string(),
+                Some(thread.id),
+                Some(card.id),
+                Some("rollback-clone".to_string()),
+                Some("clone".to_string()),
+            )
+        };
+        assert!(call()
+            .await
+            .unwrap_err()
+            .contains("forced finalize failure"));
+        db.0.execute_unprepared("DROP TRIGGER fail_action_finalize_for_delete")
+            .await
+            .unwrap();
+        let pending = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_repo_action_lock_handoff(&pending.execution_token);
+
+        let locked = lock_repo_action_cleanups(
+            &db,
+            repo::repo_action_executions_requiring_lock_for_thread(&db, thread.id)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let plans = repo_action_cleanup_plans(&locked);
+        db.0.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            format!(
+                "CREATE TRIGGER fail_thread_delete_with_action BEFORE DELETE ON thread \
+                     WHEN OLD.id = {} BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END",
+                thread.id
+            ),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            repo::delete_thread_cascade_with_human_cancellations_and_action_cleanups(
+                &db, thread.id, &plans,
+            )
+            .await
+            .is_err()
+        );
+        let execution = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, repo::REPO_ACTION_MATERIALIZED);
+        assert!(!execution.cleanup_preserve_target);
+        let target = dest.join("checkout");
+        assert!(repo_action_target_has_token(
+            &target,
+            &execution.execution_token
+        ));
+        assert!(repo::get_thread(&db, thread.id).await.unwrap().is_some());
+
+        db.0.execute_unprepared("DROP TRIGGER fail_thread_delete_with_action")
+            .await
+            .unwrap();
+        drop(locked);
+        let completed = call().await.unwrap();
+        assert_eq!(
+            completed.outcome,
+            RepoActionExecutionOutcome::FreshlyCompleted
+        );
+        assert!(target.exists());
+        assert!(!target.join(".git").join(REPO_ACTION_TOKEN_MARKER).exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_plan_false_is_upgraded_when_exact_target_is_registered_in_cascade_txn() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (workspace, thread, card, execution, target) =
+            materialize_unregistered_repo_action(&db, root.path(), "cleanup-adopt").await;
+
+        let locked = lock_repo_action_cleanups(&db, vec![execution])
+            .await
+            .unwrap();
+        let plans = repo_action_cleanup_plans(&locked);
+        assert_eq!(plans.len(), 1);
+        assert!(!plans[0].preserve_target);
+
+        // Deterministic plan→cascade seam. The typed held-lock path models the
+        // exact DB state a writer that linearized before cleanup would leave,
+        // without dropping cleanup ownership between plan and transaction.
+        let registered = register_repo_without_schedule(
+            &db,
+            workspace.id,
+            "adopted",
+            &target.to_string_lossy(),
+            Some(&locked[0]._lock),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&registered.local_git_path).unwrap(),
+            std::fs::canonicalize(&target).unwrap()
+        );
+
+        repo::delete_thread_cascade_with_human_cancellations_and_action_cleanups(
+            &db, thread.id, &plans,
+        )
+        .await
+        .unwrap();
+        let journal = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.status, repo::REPO_ACTION_CLEANUP_PENDING);
+        assert!(journal.cleanup_preserve_target);
+
+        cleanup_locked_repo_actions(&db, &locked).await;
+        assert!(repo::get_repo(&db, registered.id).await.unwrap().is_some());
+        assert!(target.join(".git").is_dir());
+        assert!(!target.join(".git").join(REPO_ACTION_TOKEN_MARKER).exists());
+        assert!(repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_lock_rejects_guardless_registration_between_commit_and_target_removal() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (workspace, thread, card, execution, target) =
+            materialize_unregistered_repo_action(&db, root.path(), "cleanup-linearize").await;
+        let existing = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "existing",
+            &root.path().join("existing").to_string_lossy(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+
+        let locked = lock_repo_action_cleanups(&db, vec![execution])
+            .await
+            .unwrap();
+        let plans = repo_action_cleanup_plans(&locked);
+        assert!(!plans[0].preserve_target);
+        repo::delete_thread_cascade_with_human_cancellations_and_action_cleanups(
+            &db, thread.id, &plans,
+        )
+        .await
+        .unwrap();
+        let journal = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!journal.cleanup_preserve_target);
+
+        let registration_error =
+            register_repo(&db, workspace.id, "too-late", &target.to_string_lossy())
+                .await
+                .unwrap_err();
+        assert_eq!(registration_error, "action_card_in_progress");
+        let repoint_error = repo::set_repo_path(&db, existing.id, &target.to_string_lossy())
+            .await
+            .unwrap_err();
+        assert_eq!(repoint_error.to_string(), "action_card_in_progress");
+        assert_ne!(
+            repo::get_repo(&db, existing.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .local_git_path,
+            target.to_string_lossy()
+        );
+
+        cleanup_locked_repo_actions(&db, &locked).await;
+        assert!(!target.exists());
+        assert!(repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn action_cleanup_failure_retains_journal_until_checked_retry_succeeds() {
+        use sea_orm::ConnectionTrait;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let source = init_main_repo(root.path(), "cleanup-source");
+        let dest = root.path().join("cleanup-dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let (workspace, thread, card) = repo_action_card(&db, "cleanup-clone", "clone").await;
+        db.0.execute_unprepared(
+            "CREATE TRIGGER fail_action_finalize_for_cleanup BEFORE UPDATE OF status \
+                 ON repo_action_execution WHEN NEW.status = 'completed' BEGIN \
+                 SELECT RAISE(ABORT, 'forced finalize failure'); END;",
+        )
+        .await
+        .unwrap();
+        assert!(clone_repo_inner(
+            &db,
+            workspace.id,
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+            "checkout".to_string(),
+            Some(thread.id),
+            Some(card.id),
+            Some("cleanup-clone".to_string()),
+            Some("clone".to_string()),
+        )
+        .await
+        .unwrap_err()
+        .contains("forced finalize failure"));
+        db.0.execute_unprepared("DROP TRIGGER fail_action_finalize_for_cleanup")
+            .await
+            .unwrap();
+
+        let locked = lock_repo_action_cleanups(
+            &db,
+            repo::repo_action_executions_requiring_lock_for_thread(&db, thread.id)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let plans = repo_action_cleanup_plans(&locked);
+        repo::delete_thread_cascade_with_human_cancellations_and_action_cleanups(
+            &db, thread.id, &plans,
+        )
+        .await
+        .unwrap();
+        let journal = repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.status, repo::REPO_ACTION_CLEANUP_PENDING);
+        assert!(journal.cleanup_preserve_target);
+        let target = dest.join("checkout");
+        assert!(target.exists());
+        assert!(repo_action_target_has_token(
+            &target,
+            &journal.execution_token
+        ));
+
+        let forced = cleanup_locked_repo_action_with(&db, &locked[0], |_, _| {
+            Err("forced remove failure".to_string())
+        })
+        .await;
+        assert_eq!(forced.unwrap_err(), "forced remove failure");
+        assert!(repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .is_some());
+        cleanup_locked_repo_actions(&db, &locked).await;
+        assert!(repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            target.exists(),
+            "a registered user repository is never deleted"
+        );
+        assert!(!target.join(".git").join(REPO_ACTION_TOKEN_MARKER).exists());
+    }
+
+    #[tokio::test]
+    async fn guarded_clone_preserves_foreign_occupied_target() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let source = init_main_repo(root.path(), "source");
+        let dest = root.path().join("dest");
+        let target = dest.join("checkout");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), "mine").unwrap();
+        let (workspace, thread, card) = repo_action_card(&db, "clone", "clone").await;
+        let error = clone_repo_inner(
+            &db,
+            workspace.id,
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+            "checkout".to_string(),
+            Some(thread.id),
+            Some(card.id),
+            Some("clone".to_string()),
+            Some("clone".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("not owned by this action"));
+        assert_eq!(
+            std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+            "mine"
+        );
+        assert!(repo::get_repo_action_execution(&db, card.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo::list_repos(&db, workspace.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3266,7 +6508,10 @@ mod tests {
         // (a) Standard repo with a real main/master integration branch → vetted default.
         let std_repo = init_main_repo(&root, "api");
         let def = crate::git::current_branch(&std_repo).unwrap();
-        assert!(def == "main" || def == "master", "precondition: init produced main/master");
+        assert!(
+            def == "main" || def == "master",
+            "precondition: init produced main/master"
+        );
         let r_std = register_repo(&db, ws.id, "api", std_repo.to_str().unwrap())
             .await
             .unwrap();
@@ -3274,7 +6519,10 @@ mod tests {
             r_std.base_ref_is_default,
             "R47-2: a real main/master default must be captured as is_default=true (unchanged)"
         );
-        assert_eq!(r_std.base_ref, def, "captured base is the vetted default branch");
+        assert_eq!(
+            r_std.base_ref, def,
+            "captured base is the vetted default branch"
+        );
 
         // (b) Nonstandard repo: rename the only branch to `trunk` (no main/master, no remote).
         let nonstd = init_main_repo(&root, "weird");
@@ -3344,7 +6592,10 @@ mod tests {
         let r = register_repo(&db, WS, "svc", repo_dir.to_str().unwrap())
             .await
             .unwrap();
-        assert_eq!(r.workspace_id, WS, "precondition: row landed on the sentinel workspace");
+        assert_eq!(
+            r.workspace_id, WS,
+            "precondition: row landed on the sentinel workspace"
+        );
 
         // Absence assert over a generous window — the buggy spawn reaches the
         // gate within milliseconds of register_repo returning.
@@ -3424,6 +6675,49 @@ mod tests {
         assert!(!keys.contains(&(keep_worker.id as i64)));
     }
 
+    #[tokio::test]
+    async fn thread_deletion_fence_blocks_session_creation_after_engine_snapshot() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, workspace.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "codex",
+            repo_ref.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+
+        repo::mark_thread_deleting(&db, thread.id).await.unwrap();
+        let keys = thread_engine_keys(&db, thread.id).await.unwrap();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([crate::lead_chat::commands::lead_key(thread.id)])
+        );
+        let error = repo::create_session(&db, direction.id, repo_ref.id, "codex", "/tmp/api-wt")
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(&format!("thread {} is being deleted", thread.id)));
+
+        repo::clear_thread_deleting(&db, thread.id).await.unwrap();
+        let session = repo::create_session(&db, direction.id, repo_ref.id, "codex", "/tmp/api-wt")
+            .await
+            .unwrap();
+        assert!(!keys.contains(&i64::from(session.id)));
+    }
+
     #[test]
     fn occupied_repo_target_allows_only_real_empty_dirs() {
         let root = std::env::temp_dir().join(format!("weft-target-{}", std::process::id()));
@@ -3475,12 +6769,26 @@ mod tests {
             .await
             .unwrap();
         let direction = repo::create_direction(
-            &db, thread.id, "web task", "claude", repo_ref.id, "change", "plan+impl", "",
+            &db,
+            thread.id,
+            "web task",
+            "claude",
+            repo_ref.id,
+            "change",
+            "plan+impl",
+            "",
         )
         .await
         .unwrap();
         let other_direction = repo::create_direction(
-            &db, other.id, "other task", "claude", repo_ref.id, "change", "plan+impl", "",
+            &db,
+            other.id,
+            "other task",
+            "claude",
+            repo_ref.id,
+            "change",
+            "plan+impl",
+            "",
         )
         .await
         .unwrap();
@@ -3507,43 +6815,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extend_removed_repo_paths_loads_external_repo_refs() {
-        let db = Db::connect("sqlite::memory:").await.unwrap();
-        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
-        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
-        let repo_ref = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
-            .await
-            .unwrap();
-        let external_repo =
-            repo::add_repo_ref(&db, keep_ws.id, "api", "/tmp/api", "main", "", true)
-                .await
-                .unwrap();
-        let mut repo_paths = std::collections::HashMap::from([(
-            repo_ref.id,
-            repo_ref.local_git_path.clone(),
-        )]);
-        let removed = vec![(
-            1,
-            external_repo.id,
-            "/tmp/api-wt".to_string(),
-            "feature/api".to_string(),
-            true,
-            true,
-        )];
-
-        extend_removed_repo_paths(&db, &mut repo_paths, &removed)
-            .await
-            .unwrap();
-
-        assert_eq!(repo_paths.get(&repo_ref.id).map(String::as_str), Some("/tmp/web"));
-        assert_eq!(
-            repo_paths.get(&external_repo.id).map(String::as_str),
-            Some("/tmp/api")
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_workspace_asks_only_clears_deleted_workspace_threads() {
+    async fn workspace_permission_effects_preserve_a_secondary_session_direction() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "delete me").await.unwrap();
         let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
@@ -3571,27 +6843,20 @@ mod tests {
         )
         .await
         .unwrap();
-        repo::create_session(
-            &db,
-            keep_direction.id,
-            repo_ref.id,
-            "claude",
-            "/tmp/orphan",
-        )
-        .await
-        .unwrap();
+        repo::create_session(&db, keep_direction.id, repo_ref.id, "claude", "/tmp/orphan")
+            .await
+            .unwrap();
         let asks = crate::ask::AskRegistry::new();
-        let (remove_id, remove_rx) =
-            asks.request(
-                thread.id,
-                "",
-                "claude",
-                "Run: rm",
-                "rm -rf tmp",
-                crate::ask::RiskLevel::Unknown,
-                "rm -rf tmp",
-            );
-        let (repo_scoped_id, repo_scoped_rx) = asks.request(
+        let (remove_id, remove_rx) = asks.request(
+            thread.id,
+            "",
+            "claude",
+            "Run: rm",
+            "rm -rf tmp",
+            crate::ask::RiskLevel::Unknown,
+            "rm -rf tmp",
+        );
+        let (repo_scoped_id, _repo_scoped_rx) = asks.request(
             keep_thread.id,
             &keep_direction.id.to_string(),
             "claude",
@@ -3600,27 +6865,27 @@ mod tests {
             crate::ask::RiskLevel::Unknown,
             "rm -rf tmp",
         );
-        let (keep_id, _keep_rx) =
-            asks.request(
-                keep_thread.id,
-                "20",
-                "claude",
-                "Run: test",
-                "pnpm test",
-                crate::ask::RiskLevel::Unknown,
-                "pnpm test",
-            );
+        let (keep_id, _keep_rx) = asks.request(
+            keep_thread.id,
+            "20",
+            "claude",
+            "Run: test",
+            "pnpm test",
+            crate::ask::RiskLevel::Unknown,
+            "pnpm test",
+        );
 
-        cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
+        purge_committed_permission_effects(&asks, &[thread.id], &[])
+            .await
+            .unwrap();
 
         assert!(remove_rx.await.is_err());
-        assert!(repo_scoped_rx.await.is_err());
         assert_eq!(
             asks.open().iter().map(|ask| ask.id).collect::<Vec<_>>(),
-            vec![keep_id]
+            vec![repo_scoped_id, keep_id]
         );
         assert!(!asks.open().iter().any(|ask| ask.id == remove_id));
-        assert!(!asks.open().iter().any(|ask| ask.id == repo_scoped_id));
+        assert!(asks.open().iter().any(|ask| ask.id == repo_scoped_id));
     }
 
     #[tokio::test]
@@ -3649,18 +6914,27 @@ mod tests {
             always: vec![],
         });
 
-        cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
+        purge_committed_permission_effects(&asks, &[thread.id], &[])
+            .await
+            .unwrap();
 
         // the deleted workspace's grant is gone; the other workspace's survives
-        assert!(asks.auto_decision(thread.id, "", crate::ask::RiskLevel::Unknown, "anything").is_none());
+        assert!(asks
+            .auto_decision(thread.id, "", crate::ask::RiskLevel::Unknown, "anything")
+            .is_none());
         assert_eq!(
-            asks.auto_decision(keep_thread.id, "", crate::ask::RiskLevel::Unknown, "anything"),
+            asks.auto_decision(
+                keep_thread.id,
+                "",
+                crate::ask::RiskLevel::Unknown,
+                "anything"
+            ),
             Some(crate::ask::Decision::Allow)
         );
     }
 
     #[tokio::test]
-    async fn cancel_workspace_asks_revokes_repo_routed_direction_grants() {
+    async fn workspace_permission_effects_preserve_secondary_session_grants() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "delete me").await.unwrap();
         let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
@@ -3709,22 +6983,25 @@ mod tests {
             Some(crate::ask::Decision::Allow)
         );
 
-        cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
+        purge_committed_permission_effects(&asks, &[], &[])
+            .await
+            .unwrap();
 
-        // deleting the workspace that owns the routed repo revokes the repo-routed
-        // direction's grant (which lives in another workspace's thread).
-        assert!(asks
-            .auto_decision(
+        // The direction survives; deleting only its secondary session must not
+        // revoke the permission footprint shared by its primary session.
+        assert_eq!(
+            asks.auto_decision(
                 keep_thread.id,
                 &routed.id.to_string(),
                 crate::ask::RiskLevel::Unknown,
                 "x"
-            )
-            .is_none());
+            ),
+            Some(crate::ask::Decision::Allow)
+        );
     }
 
     #[tokio::test]
-    async fn purge_repo_ask_footprint_covers_bound_and_routed_and_cancels_asks() {
+    async fn repo_permission_purge_preserves_a_surviving_secondary_session_direction() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let repo_a = repo::add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true)
@@ -3738,13 +7015,27 @@ mod tests {
             .unwrap();
         // dir_a is BOUND to repo_a (the deleted repo).
         let dir_a = repo::create_direction(
-            &db, thread.id, "a", "claude", repo_a.id, "why", "plan+impl", "",
+            &db,
+            thread.id,
+            "a",
+            "claude",
+            repo_a.id,
+            "why",
+            "plan+impl",
+            "",
         )
         .await
         .unwrap();
         // dir_routed is bound to repo_b but has a SESSION using repo_a → repo-routed.
         let dir_routed = repo::create_direction(
-            &db, thread.id, "routed", "claude", repo_b.id, "why", "plan+impl", "",
+            &db,
+            thread.id,
+            "routed",
+            "claude",
+            repo_b.id,
+            "why",
+            "plan+impl",
+            "",
         )
         .await
         .unwrap();
@@ -3753,7 +7044,14 @@ mod tests {
             .unwrap();
         // dir_b is bound to repo_b with no repo_a session → survives.
         let dir_b = repo::create_direction(
-            &db, thread.id, "b", "claude", repo_b.id, "why", "plan+impl", "",
+            &db,
+            thread.id,
+            "b",
+            "claude",
+            repo_b.id,
+            "why",
+            "plan+impl",
+            "",
         )
         .await
         .unwrap();
@@ -3775,33 +7073,33 @@ mod tests {
             ],
             always: vec![],
         });
-        // open asks for the two directions the repo delete removes
-        let (ask_a, _r1) =
-            asks.request(
-                thread.id,
-                &dir_a.id.to_string(),
-                "codex",
-                "Run: x",
-                "x",
-                crate::ask::RiskLevel::Unknown,
-                "x",
-            );
-        let (ask_routed, _r2) =
-            asks.request(
-                thread.id,
-                &dir_routed.id.to_string(),
-                "codex",
-                "Run: y",
-                "y",
-                crate::ask::RiskLevel::Unknown,
-                "y",
-            );
+        // Both directions currently have asks, but only dir_a is actually
+        // removed when repo_a is deleted.
+        let (ask_a, _r1) = asks.request(
+            thread.id,
+            &dir_a.id.to_string(),
+            "codex",
+            "Run: x",
+            "x",
+            crate::ask::RiskLevel::Unknown,
+            "x",
+        );
+        let (ask_routed, _r2) = asks.request(
+            thread.id,
+            &dir_routed.id.to_string(),
+            "codex",
+            "Run: y",
+            "y",
+            crate::ask::RiskLevel::Unknown,
+            "y",
+        );
 
-        purge_repo_ask_footprint(&db, &asks, repo_a.id)
+        purge_committed_permission_effects(&asks, &[], &[(thread.id, dir_a.id)])
             .await
             .unwrap();
 
-        // BOUND (dir_a) and REPO-ROUTED (dir_routed) grants revoked; dir_b survives.
+        // The bound direction is purged. A direction with only one secondary
+        // repo_a session survives with its other sessions, ask, and grant.
         assert!(asks
             .auto_decision(
                 thread.id,
@@ -3810,14 +7108,15 @@ mod tests {
                 "x"
             )
             .is_none());
-        assert!(asks
-            .auto_decision(
+        assert_eq!(
+            asks.auto_decision(
                 thread.id,
                 &dir_routed.id.to_string(),
                 crate::ask::RiskLevel::Unknown,
                 "x"
-            )
-            .is_none());
+            ),
+            Some(crate::ask::Decision::Allow)
+        );
         assert_eq!(
             asks.auto_decision(
                 thread.id,
@@ -3827,9 +7126,198 @@ mod tests {
             ),
             Some(crate::ask::Decision::Allow)
         );
-        // their open asks are cancelled — a post-delete answer can't re-grant them.
+        // Only the removed direction's ask is cancelled.
         let open: Vec<u64> = asks.open().iter().map(|a| a.id).collect();
-        assert!(!open.contains(&ask_a) && !open.contains(&ask_routed));
+        assert!(!open.contains(&ask_a));
+        assert!(open.contains(&ask_routed));
+    }
+
+    #[tokio::test]
+    async fn repo_delete_cancels_only_questions_from_removed_secondary_sessions() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let primary_repo = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "primary",
+            "/tmp/primary",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let secondary_repo = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "secondary",
+            "/tmp/secondary",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "codex",
+            primary_repo.id,
+            "why",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let primary_session = repo::create_session(
+            &db,
+            direction.id,
+            primary_repo.id,
+            "codex",
+            "/tmp/primary-wt",
+        )
+        .await
+        .unwrap();
+        let secondary_session = repo::create_session(
+            &db,
+            direction.id,
+            secondary_repo.id,
+            "codex",
+            "/tmp/secondary-wt",
+        )
+        .await
+        .unwrap();
+        let keep = repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            &direction.id.to_string(),
+            direction.id,
+            1,
+            0,
+            primary_session.id,
+            "Keep working in primary?",
+        )
+        .await
+        .unwrap();
+        let cancel = repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            &direction.id.to_string(),
+            direction.id,
+            1,
+            0,
+            secondary_session.id,
+            "Keep working in secondary?",
+        )
+        .await
+        .unwrap();
+        let unattributed = repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            &direction.id.to_string(),
+            direction.id,
+            1,
+            0,
+            0,
+            "Which session asked this?",
+        )
+        .await
+        .unwrap();
+        let bus = crate::bus::BusRegistry::new();
+        let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(bus.set_ask_notifier(events).is_empty());
+        for request in [&keep, &cancel, &unattributed] {
+            assert!(bus.restore_human_request(
+                thread.id,
+                &direction.id.to_string(),
+                &request.question,
+                u64::try_from(request.id).unwrap(),
+            ));
+        }
+        while event_rx.try_recv().is_ok() {}
+
+        let effects = repo::delete_repo_cascade_with_human_cancellations(&db, secondary_repo.id)
+            .await
+            .unwrap();
+        apply_committed_bus_delete_effects(
+            &bus,
+            &effects.cancelled_requests,
+            &[],
+            &effects.removed_directions,
+            &std::collections::BTreeMap::new(),
+        );
+        assert!(
+            effects.removed_directions.is_empty(),
+            "the direction is bound to the primary repo and survives"
+        );
+        assert_eq!(
+            repo::get_human_request(&db, keep.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            repo::HUMAN_REQUEST_OPEN
+        );
+        assert_eq!(
+            repo::get_human_request(&db, cancel.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            repo::HUMAN_REQUEST_CANCELLED
+        );
+        assert_eq!(
+            repo::get_human_request(&db, unattributed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            repo::HUMAN_REQUEST_OPEN,
+            "source_session_id=0 is not safely attributable to the deleted session"
+        );
+        assert_eq!(
+            bus.open_asks(thread.id)
+                .into_iter()
+                .map(|ask| ask.id)
+                .collect::<Vec<_>>(),
+            vec![
+                u64::try_from(keep.id).unwrap(),
+                u64::try_from(unattributed.id).unwrap(),
+            ]
+        );
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            crate::bus::state::HumanAskEvent::Cancelled { ask_id, .. }
+                if ask_id == u64::try_from(cancel.id).unwrap()
+        ));
+
+        assert!(repo::get_direction(&db, direction.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(repo::get_session(&db, primary_session.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(repo::get_session(&db, secondary_session.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            repo::get_human_request(&db, keep.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            repo::HUMAN_REQUEST_OPEN
+        );
     }
 
     #[tokio::test]
@@ -3870,7 +7358,10 @@ mod tests {
 
         let r = revoke_grant_durable(&asks, 7, Some("42"), None).await;
 
-        assert!(r.is_err(), "a failed durable write must surface as an error");
+        assert!(
+            r.is_err(),
+            "a failed durable write must surface as an error"
+        );
         // the revoked Full grant is restored (memory matches the unchanged store)...
         assert_eq!(
             asks.auto_decision(7, "42", crate::ask::RiskLevel::Unknown, "x"),
@@ -3920,7 +7411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_workspace_human_asks_only_clears_deleted_workspace_threads() {
+    async fn workspace_bus_effects_preserve_legacy_asks_on_surviving_directions() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "delete me").await.unwrap();
         let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
@@ -3948,31 +7439,1165 @@ mod tests {
         )
         .await
         .unwrap();
-        repo::create_session(
+        repo::create_session(&db, keep_direction.id, repo_ref.id, "claude", "/tmp/orphan")
+            .await
+            .unwrap();
+        let bus = crate::bus::BusRegistry::new();
+        let remove_id = bus.ask_human(thread.id, "lead", "delete?");
+        let repo_scoped_id = bus.ask_human(
+            keep_thread.id,
+            &keep_direction.id.to_string(),
+            "delete repo?",
+        );
+        let keep_id = bus.ask_human(keep_thread.id, "lead", "keep?");
+
+        repo::mark_workspace_deleting(&db, ws.id).await.unwrap();
+        let scope = workspace_ask_scope(&db, ws.id).await.unwrap();
+        let mut closing_asks = std::collections::BTreeMap::new();
+        for thread_id in &scope.thread_ids {
+            let (_, ask_ids) = bus.begin_thread_close(*thread_id);
+            closing_asks.insert(*thread_id, ask_ids);
+        }
+        let effects = repo::delete_workspace_cascade_with_human_cancellations(&db, ws.id)
+            .await
+            .unwrap();
+        apply_committed_bus_delete_effects(
+            &bus,
+            &effects.cancelled_requests,
+            &effects.removed_threads,
+            &effects.removed_directions,
+            &closing_asks,
+        );
+
+        assert!(bus.open_asks(thread.id).is_empty());
+        assert_eq!(
+            bus.open_asks(keep_thread.id)
+                .into_iter()
+                .map(|ask| ask.id)
+                .collect::<Vec<_>>(),
+            vec![repo_scoped_id, keep_id]
+        );
+        assert_ne!(remove_id, keep_id);
+        assert_ne!(repo_scoped_id, keep_id);
+    }
+
+    #[tokio::test]
+    async fn failed_repo_delete_rolls_back_durable_and_retains_process_local_state() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let deleted_repo = repo::add_repo_ref(
             &db,
-            keep_direction.id,
+            workspace.id,
+            "secondary",
+            "/tmp/secondary",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let primary_repo = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "primary",
+            "/tmp/primary",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "codex",
+            primary_repo.id,
+            "why",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = repo::create_session(
+            &db,
+            direction.id,
+            deleted_repo.id,
+            "codex",
+            "/tmp/secondary-wt",
+        )
+        .await
+        .unwrap();
+        let request = repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            &direction.id.to_string(),
+            direction.id,
+            1,
+            0,
+            session.id,
+            "Continue in secondary?",
+        )
+        .await
+        .unwrap();
+        let route = repo::HumanRequestImRoute {
+            channel: "feishu".to_string(),
+            account: "cli_test".to_string(),
+            owner: "ou_owner".to_string(),
+            message_id: "om_repo_rollback".to_string(),
+            terminal_revision: 0,
+        };
+        repo::record_human_request_im_route(&db, request.id, &route)
+            .await
+            .unwrap();
+
+        let bus = crate::bus::BusRegistry::new();
+        let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(bus.set_ask_notifier(events).is_empty());
+        assert!(bus.restore_human_request(
+            thread.id,
+            &direction.id.to_string(),
+            &request.question,
+            u64::try_from(request.id).unwrap(),
+        ));
+        let asks = crate::ask::AskRegistry::new();
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant {
+                thread: thread.id,
+                dir: direction.id.to_string(),
+            }],
+            always: vec![],
+        });
+        let (permission_id, _permission_rx) = asks.request(
+            thread.id,
+            &direction.id.to_string(),
+            "codex",
+            "Run: test",
+            "pnpm test",
+            crate::ask::RiskLevel::Unknown,
+            "pnpm test",
+        );
+        db.0.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            format!(
+                "CREATE TRIGGER fail_target_repo_delete BEFORE DELETE ON repo_ref \
+                     WHEN OLD.id = {} BEGIN SELECT RAISE(ABORT, 'forced repo delete failure'); END",
+                deleted_repo.id
+            ),
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            repo::delete_repo_cascade_with_human_cancellations(&db, deleted_repo.id)
+                .await
+                .is_err()
+        );
+
+        assert!(repo::get_repo(&db, deleted_repo.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(repo::get_session(&db, session.id).await.unwrap().is_some());
+        let persisted = repo::get_human_request(&db, request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, repo::HUMAN_REQUEST_OPEN);
+        assert_eq!(persisted.revision, request.revision);
+        assert!(repo::get_human_card_terminal_outbox_for_route(&db, &route)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            bus.open_asks(thread.id)
+                .into_iter()
+                .map(|ask| ask.id)
+                .collect::<Vec<_>>(),
+            vec![u64::try_from(request.id).unwrap()]
+        );
+        assert!(event_rx.try_recv().is_err());
+        assert!(asks.open().iter().any(|ask| ask.id == permission_id));
+        assert_eq!(
+            asks.auto_decision(
+                thread.id,
+                &direction.id.to_string(),
+                crate::ask::RiskLevel::Unknown,
+                "x",
+            ),
+            Some(crate::ask::Decision::Allow)
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_deleting_fence_freezes_direction_and_session_scope() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "ws").await.unwrap();
+        let target_repo =
+            repo::add_repo_ref(&db, workspace.id, "target", "/tmp/target", "main", "", true)
+                .await
+                .unwrap();
+        let primary_repo = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "primary",
+            "/tmp/primary",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let surviving_direction = repo::create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "codex",
+            primary_repo.id,
+            "why",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+
+        repo::mark_repo_deleting(&db, target_repo.id).await.unwrap();
+        let session_error = repo::create_session(
+            &db,
+            surviving_direction.id,
+            target_repo.id,
+            "codex",
+            "/tmp/target-wt",
+        )
+        .await
+        .unwrap_err();
+        assert!(session_error
+            .to_string()
+            .contains(&format!("repo {} is being deleted", target_repo.id)));
+        let direction_error = repo::create_direction(
+            &db,
+            thread.id,
+            "late",
+            "codex",
+            target_repo.id,
+            "why",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap_err();
+        assert!(direction_error
+            .to_string()
+            .contains("direction_write_fenced_or_stale"));
+        repo::clear_repo_deleting(&db, target_repo.id)
+            .await
+            .unwrap();
+        assert!(repo::create_session(
+            &db,
+            surviving_direction.id,
+            target_repo.id,
+            "codex",
+            "/tmp/target-wt",
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_workspace_delete_rolls_back_owned_and_secondary_questions() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_workspace = repo::create_workspace(&db, "keep me").await.unwrap();
+        let workspace_repo =
+            repo::add_repo_ref(&db, workspace.id, "web", "/tmp/web", "main", "", true)
+                .await
+                .unwrap();
+        let keep_repo =
+            repo::add_repo_ref(&db, keep_workspace.id, "api", "/tmp/api", "main", "", true)
+                .await
+                .unwrap();
+        let owned_thread = repo::create_thread(&db, workspace.id, "owned", "feature", "codex")
+            .await
+            .unwrap();
+        let external_thread =
+            repo::create_thread(&db, keep_workspace.id, "external", "feature", "codex")
+                .await
+                .unwrap();
+        let external_direction = repo::create_direction(
+            &db,
+            external_thread.id,
+            "implementation",
+            "codex",
+            keep_repo.id,
+            "why",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let secondary_session = repo::create_session(
+            &db,
+            external_direction.id,
+            workspace_repo.id,
+            "codex",
+            "/tmp/web-wt",
+        )
+        .await
+        .unwrap();
+        let owned_request = repo::create_human_request(
+            &db,
+            workspace.id,
+            owned_thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "Delete this workspace?",
+        )
+        .await
+        .unwrap();
+        let secondary_request = repo::create_human_request(
+            &db,
+            keep_workspace.id,
+            external_thread.id,
+            &external_direction.id.to_string(),
+            external_direction.id,
+            1,
+            0,
+            secondary_session.id,
+            "Continue in web?",
+        )
+        .await
+        .unwrap();
+        let route = repo::HumanRequestImRoute {
+            channel: "feishu".to_string(),
+            account: "cli_test".to_string(),
+            owner: "ou_owner".to_string(),
+            message_id: "om_workspace_rollback".to_string(),
+            terminal_revision: 0,
+        };
+        repo::record_human_request_im_route(&db, secondary_request.id, &route)
+            .await
+            .unwrap();
+        let bus = crate::bus::BusRegistry::new();
+        let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(bus.set_ask_notifier(events).is_empty());
+        for request in [&owned_request, &secondary_request] {
+            assert!(bus.restore_human_request(
+                request.thread_id,
+                &request.direction_scope,
+                &request.question,
+                u64::try_from(request.id).unwrap(),
+            ));
+        }
+        repo::mark_workspace_deleting(&db, workspace.id)
+            .await
+            .unwrap();
+        let (_, owned_ask_ids) = bus.begin_thread_close(owned_thread.id);
+        db.0
+            .execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                format!(
+                    "CREATE TRIGGER fail_target_workspace_delete BEFORE DELETE ON workspace \
+                     WHEN OLD.id = {} BEGIN SELECT RAISE(ABORT, 'forced workspace delete failure'); END",
+                    workspace.id
+                ),
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            repo::delete_workspace_cascade_with_human_cancellations(&db, workspace.id)
+                .await
+                .is_err()
+        );
+        bus.rollback_thread_close(owned_thread.id);
+
+        assert!(repo::list_workspaces(&db)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.id == workspace.id));
+        assert!(repo::get_session(&db, secondary_session.id)
+            .await
+            .unwrap()
+            .is_some());
+        for request in [&owned_request, &secondary_request] {
+            let persisted = repo::get_human_request(&db, request.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(persisted.status, repo::HUMAN_REQUEST_OPEN);
+            assert_eq!(persisted.revision, request.revision);
+        }
+        assert!(repo::get_human_card_terminal_outbox_for_route(&db, &route)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            bus.open_asks(owned_thread.id)
+                .into_iter()
+                .map(|ask| ask.id)
+                .collect::<Vec<_>>(),
+            owned_ask_ids
+        );
+        assert_eq!(
+            bus.open_asks(external_thread.id)
+                .into_iter()
+                .map(|ask| ask.id)
+                .collect::<Vec<_>>(),
+            vec![u64::try_from(secondary_request.id).unwrap()]
+        );
+        assert!(event_rx.try_recv().is_err());
+        repo::clear_workspace_deleting(&db, workspace.id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_thread_delete_waits_for_lifecycle_then_purges_hook_first_permission() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "delete permission").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "repo",
+            "/tmp/delete-permission",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let thread = repo::create_thread(
+            &db,
+            workspace.id,
+            "delete permission",
+            "feature",
+            "codex",
+        )
+        .await
+        .unwrap();
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "worker",
+            "codex",
             repo_ref.id,
-            "claude",
-            "/tmp/orphan",
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let scope = direction.id.to_string();
+        let asks = crate::ask::AskRegistry::new();
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant {
+                thread: thread.id,
+                dir: scope.clone(),
+            }],
+            always: vec![],
+        });
+        asks.grant_read_only_session(thread.id, &scope);
+        asks.grant_read_only_issue(thread.id);
+        let bus = crate::bus::BusRegistry::new();
+        // Model the exact hook-first seam: handle_ask owns lifecycle, then
+        // registers in AskRegistry before it drops that guard and starts its
+        // one-hour wait.
+        let held = bus.thread_lifecycle_gate(thread.id).lock_owned().await;
+        let (ask_id, receiver) = asks.request(
+            thread.id,
+            &scope,
+            "codex",
+            "Run: touch late",
+            "touch late",
+            crate::ask::RiskLevel::Write,
+            "touch late",
+        );
+        repo::mark_thread_deleting(&db, thread.id).await.unwrap();
+
+        let delete_db = db.clone();
+        let delete_bus = bus.clone();
+        let delete_asks = asks.clone();
+        let thread_id = thread.id;
+        let mut delete_task = tokio::spawn(async move {
+            delete_thread_cascade_after_bus_fence(
+                &delete_db,
+                &delete_bus,
+                &delete_asks,
+                thread_id,
+                Vec::new(),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut delete_task)
+                .await
+                .is_err(),
+            "delete must wait for the ask registration lifecycle owner"
+        );
+        assert_eq!(asks.open_in(thread.id).len(), 1);
+        drop(held);
+
+        delete_task.await.unwrap().unwrap();
+        assert!(repo::get_thread(&db, thread.id).await.unwrap().is_none());
+        assert!(asks.open_in(thread.id).is_empty());
+        assert!(asks.snapshot_grants().is_empty());
+        assert_eq!(
+            asks.read_only_grants(),
+            crate::ask::ReadOnlyGrants::default()
+        );
+        assert!(!asks.answer(ask_id, crate::ask::Answer::Full));
+        assert!(receiver.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_thread_delete_reopens_bus_and_rolls_back_question_cancellation() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "keep after failure")
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "still here", "feature", "codex")
+            .await
+            .unwrap();
+        let request = repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "Continue?",
+        )
+        .await
+        .unwrap();
+        let route = repo::HumanRequestImRoute {
+            channel: "feishu".to_string(),
+            account: "cli_test".to_string(),
+            owner: "ou_owner".to_string(),
+            message_id: "om_failed_delete".to_string(),
+            terminal_revision: 0,
+        };
+        repo::record_human_request_im_route(&db, request.id, &route)
+            .await
+            .unwrap();
+
+        let bus = crate::bus::BusRegistry::new();
+        let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(bus.set_ask_notifier(events).is_empty());
+        assert!(bus.restore_human_request(
+            thread.id,
+            "lead",
+            &request.question,
+            u64::try_from(request.id).unwrap(),
+        ));
+        db.0.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            format!(
+                "CREATE TRIGGER fail_target_thread_delete BEFORE DELETE ON thread \
+                     WHEN OLD.id = {} BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END",
+                thread.id
+            ),
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            delete_thread_cascade_after_bus_fence(
+                &db,
+                &bus,
+                &crate::ask::AskRegistry::new(),
+                thread.id,
+                Vec::new(),
+            )
+            .await
+            .is_err()
+        );
+
+        let persisted = repo::get_human_request(&db, request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, repo::HUMAN_REQUEST_OPEN);
+        assert_eq!(persisted.revision, request.revision);
+        assert!(repo::get_human_card_terminal_outbox_for_route(&db, &route)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            bus.open_asks(thread.id)
+                .into_iter()
+                .map(|ask| ask.id)
+                .collect::<Vec<_>>(),
+            vec![u64::try_from(request.id).unwrap()]
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a rolled-back delete emits no cancellation"
+        );
+        assert!(bus.answer_ask(thread.id, u64::try_from(request.id).unwrap(), "Yes",));
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            crate::bus::state::HumanAskEvent::Answered { ask_id, .. }
+                if ask_id == u64::try_from(request.id).unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_thread_delete_preserves_durable_state_and_retry_commits_once() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "retry delete").await.unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "retry me", "feature", "codex")
+            .await
+            .unwrap();
+        let open_request = repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "Open question",
+        )
+        .await
+        .unwrap();
+        let answered_request = repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            2,
+            0,
+            0,
+            "Answered question",
+        )
+        .await
+        .unwrap();
+        let answered_request = repo::answer_human_request(
+            &db,
+            workspace.id,
+            answered_request.id,
+            answered_request.revision,
+            "keep this answer",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let open_route = repo::HumanRequestImRoute {
+            channel: "feishu".to_string(),
+            account: "cli_test".to_string(),
+            owner: "ou_owner".to_string(),
+            message_id: "om_retry_open".to_string(),
+            terminal_revision: 0,
+        };
+        let answered_route = repo::HumanRequestImRoute {
+            channel: "feishu".to_string(),
+            account: "cli_test".to_string(),
+            owner: "ou_owner".to_string(),
+            message_id: "om_retry_answered".to_string(),
+            terminal_revision: 0,
+        };
+        repo::record_human_request_im_route(&db, open_request.id, &open_route)
+            .await
+            .unwrap();
+        repo::record_human_request_im_route(&db, answered_request.id, &answered_route)
+            .await
+            .unwrap();
+
+        let bus = crate::bus::BusRegistry::new();
+        let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(bus.set_ask_notifier(events).is_empty());
+        assert!(bus.restore_human_request(
+            thread.id,
+            "lead",
+            &open_request.question,
+            u64::try_from(open_request.id).unwrap(),
+        ));
+        assert!(bus.restore_durable_answer(
+            thread.id,
+            u64::try_from(answered_request.id).unwrap(),
+            "lead",
+            &answered_request.answer,
+        ));
+        bus.post(thread.id, "system", "lead", "ordinary bus history", "message");
+        let baseline_log = bus.log(thread.id);
+        let baseline_inbox = bus.inbox(thread.id, "lead");
+        assert!(baseline_inbox.iter().any(|message| {
+            message.request_id == Some(u64::try_from(answered_request.id).unwrap())
+        }));
+        assert!(baseline_inbox.iter().any(|message| message.request_id.is_none()));
+        bus.restore_inbox(thread.id, "lead", baseline_inbox.clone());
+
+        let open_before = repo::get_human_request(&db, open_request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let answered_before = repo::get_human_request(&db, answered_request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(open_before.status, repo::HUMAN_REQUEST_OPEN);
+        assert_eq!(answered_before.status, repo::HUMAN_REQUEST_ANSWERED);
+
+        db.0.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            format!(
+                "CREATE TRIGGER fail_retry_thread_delete BEFORE DELETE ON thread \
+                     WHEN OLD.id = {} BEGIN SELECT RAISE(ABORT, 'forced retry delete failure'); END",
+                thread.id
+            ),
+        ))
+        .await
+        .unwrap();
+        let failed = delete_thread_cascade_after_bus_fence(
+            &db,
+            &bus,
+            &crate::ask::AskRegistry::new(),
+            thread.id,
+            Vec::new(),
+        )
+        .await;
+        assert!(failed
+            .unwrap_err()
+            .contains("forced retry delete failure"));
+
+        let open_after_failure = repo::get_human_request(&db, open_request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let answered_after_failure = repo::get_human_request(&db, answered_request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(open_after_failure, open_before);
+        assert_eq!(answered_after_failure, answered_before);
+        assert!(repo::get_human_card_terminal_outbox_for_route(&db, &open_route)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo::get_human_card_terminal_outbox_for_route(&db, &answered_route)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            bus.open_asks(thread.id)
+                .into_iter()
+                .map(|ask| ask.id)
+                .collect::<Vec<_>>(),
+            vec![u64::try_from(open_request.id).unwrap()]
+        );
+        let inbox_after_failure = bus.inbox(thread.id, "lead");
+        assert_eq!(inbox_after_failure, baseline_inbox);
+        bus.restore_inbox(thread.id, "lead", inbox_after_failure);
+        assert_eq!(bus.log(thread.id), baseline_log);
+        assert!(event_rx.try_recv().is_err());
+
+        db.0.execute_unprepared("DROP TRIGGER fail_retry_thread_delete")
+            .await
+            .unwrap();
+        delete_thread_cascade_after_bus_fence(
+            &db,
+            &bus,
+            &crate::ask::AskRegistry::new(),
+            thread.id,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(repo::get_thread(&db, thread.id).await.unwrap().is_none());
+        assert!(bus.open_asks(thread.id).is_empty());
+        assert!(bus.inbox(thread.id, "lead").is_empty());
+        assert!(bus.log(thread.id).is_empty());
+
+        let mut cancelled_ids = Vec::new();
+        while let Ok(crate::bus::state::HumanAskEvent::Cancelled { ask_id, .. }) =
+            event_rx.try_recv()
+        {
+            cancelled_ids.push(ask_id);
+        }
+        cancelled_ids.sort_unstable();
+        assert_eq!(
+            cancelled_ids,
+            vec![
+                u64::try_from(open_request.id).unwrap(),
+                u64::try_from(answered_request.id).unwrap(),
+            ]
+        );
+        let open_outbox = repo::get_human_card_terminal_outbox_for_route(&db, &open_route)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(open_outbox.terminal_status, repo::HUMAN_REQUEST_CANCELLED);
+        assert_eq!(open_outbox.terminal_revision, open_before.revision + 1);
+        assert!(!open_outbox.delivered);
+        let answered_outbox =
+            repo::get_human_card_terminal_outbox_for_route(&db, &answered_route)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            answered_outbox.terminal_revision,
+            answered_before.revision + 1
+        );
+        assert!(!answered_outbox.delivered);
+
+        let retry_error = delete_thread_cascade_after_bus_fence(
+            &db,
+            &bus,
+            &crate::ask::AskRegistry::new(),
+            thread.id,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(retry_error.contains("thread") && retry_error.contains("not found"));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_thread_delete_releases_lifecycle_gate_before_answer_commits() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let workspace = repo::create_workspace(&db, "keep after failure")
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, workspace.id, "still here", "feature", "codex")
+            .await
+            .unwrap();
+        let request = repo::create_human_request(
+            &db,
+            workspace.id,
+            thread.id,
+            "lead",
+            0,
+            1,
+            0,
+            0,
+            "Continue?",
         )
         .await
         .unwrap();
         let bus = crate::bus::BusRegistry::new();
-        let remove_id = bus.ask_human(thread.id, "lead", "delete?");
-        let repo_scoped_id =
-            bus.ask_human(keep_thread.id, &keep_direction.id.to_string(), "delete repo?");
-        let keep_id = bus.ask_human(keep_thread.id, "lead", "keep?");
+        let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(bus.set_ask_notifier(events).is_empty());
+        assert!(bus.restore_human_request(
+            thread.id,
+            "lead",
+            &request.question,
+            u64::try_from(request.id).unwrap(),
+        ));
+        db.0.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            format!(
+                "CREATE TRIGGER fail_concurrent_thread_delete BEFORE DELETE ON thread \
+                     WHEN OLD.id = {} BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END",
+                thread.id
+            ),
+        ))
+        .await
+        .unwrap();
 
-        cancel_workspace_human_asks(&db, &bus, ws.id).await.unwrap();
+        let held_gate = bus.thread_lifecycle_gate(thread.id).lock_owned().await;
+        let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+        let delete_db = db.clone();
+        let delete_bus = bus.clone();
+        let delete_asks = crate::ask::AskRegistry::new();
+        let thread_id = thread.id;
+        let delete_task = tokio::spawn(async move {
+            let _ = delete_started_tx.send(());
+            delete_thread_cascade_after_bus_fence(
+                &delete_db,
+                &delete_bus,
+                &delete_asks,
+                thread_id,
+                Vec::new(),
+            )
+            .await
+        });
+        delete_started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        let answer_db = db.clone();
+        let answer_bus = bus.clone();
+        let answer_task = tokio::spawn(async move {
+            crate::attention::answer_durable_human_request(
+                &answer_db,
+                &answer_bus,
+                request.id,
+                Some(thread_id),
+                Some(workspace.id),
+                Some(request.revision),
+                "Yes",
+            )
+            .await
+        });
+        drop(held_gate);
 
+        assert!(delete_task.await.unwrap().is_err());
+        assert!(answer_task.await.unwrap().unwrap().is_some());
+        let persisted = repo::get_human_request(&db, request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, repo::HUMAN_REQUEST_ANSWERED);
         assert!(bus.open_asks(thread.id).is_empty());
-        assert_eq!(bus.open_asks(keep_thread.id)[0].id, keep_id);
-        assert!(!bus
-            .open_asks(keep_thread.id)
-            .iter()
-            .any(|ask| ask.id == repo_scoped_id));
-        assert_ne!(remove_id, keep_id);
-        assert_ne!(repo_scoped_id, keep_id);
+        let inbox = bus.inbox(thread.id, "lead");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].request_id, u64::try_from(request.id).ok());
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            crate::bus::state::HumanAskEvent::Answered { ask_id, .. }
+                if ask_id == u64::try_from(request.id).unwrap()
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the failed delete emitted no cancellation"
+        );
+    }
+
+    async fn rewind_repo_action_card(
+        db: &Db,
+        action_id: &str,
+        action_kind: &str,
+    ) -> (
+        entities::workspace::Model,
+        entities::thread::Model,
+        entities::lead_message::Model,
+        entities::lead_message::Model,
+    ) {
+        let workspace = repo::create_workspace(db, &format!("rewind-{action_id}"))
+            .await
+            .unwrap();
+        let thread = repo::create_thread(db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let target = repo::insert_lead_message(
+            db,
+            thread.id,
+            None,
+            1,
+            "user",
+            "text",
+            r#"{"text":"start over"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let card = repo::insert_lead_message(
+            db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "action_card",
+            &serde_json::json!({
+                "title": "Repository action",
+                "actions": [{"id": action_id, "kind": action_kind, "label": "Run"}],
+            })
+            .to_string(),
+            "complete",
+        )
+        .await
+        .unwrap();
+        (workspace, thread, target, card)
+    }
+
+    #[tokio::test]
+    async fn rewind_suppresses_completed_repo_action_feedback_before_drain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let local = init_main_repo(root.path(), "completed-target");
+        let (workspace, thread, target, card) =
+            rewind_repo_action_card(&db, "rewind-completed", "add").await;
+        let completed = add_repo_ref_inner(
+            &db,
+            workspace.id,
+            "completed-target".to_string(),
+            local.to_string_lossy().into_owned(),
+            Some(thread.id),
+            Some(card.id),
+            Some("rewind-completed".to_string()),
+            Some("add".to_string()),
+        )
+        .await
+        .unwrap();
+        let execution_id = completed.execution_id.unwrap();
+        let planned_ids = vec![target.id, card.id];
+        let locked = lock_repo_action_cleanups(
+            &db,
+            repo::repo_action_executions_requiring_lock_for_message_ids(
+                &db,
+                thread.id,
+                &planned_ids,
+            )
+            .await
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let cleanup_plans = repo_action_cleanup_plans(&locked);
+        let rewind_plans = repo_action_rewind_plans(&locked);
+        let (deleted, _) = repo::rewind_persist_with_repo_actions(
+            &db,
+            thread.id,
+            None,
+            target.id,
+            None,
+            None,
+            &cleanup_plans,
+            &rewind_plans,
+        )
+        .await
+        .unwrap();
+        cleanup_locked_repo_actions(&db, &locked).await;
+        drop(locked);
+
+        assert_eq!(deleted, planned_ids);
+        assert!(repo::get_repo(&db, completed.repo.id)
+            .await
+            .unwrap()
+            .is_some());
+        let sink_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let sink = sink_count.clone();
+        assert!(drain_repo_action_feedback_with(&db, execution_id, move |_, _| async move {
+            sink.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        })
+        .await
+        .unwrap());
+        assert_eq!(sink_count.load(Ordering::SeqCst), 0);
+        assert!(repo::get_repo_action_execution_by_id(&db, execution_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn rewind_materialized_repo_action_runs_checked_cleanup_and_preserves_registered_target()
+    {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let target_path = init_main_repo(root.path(), "materialized-target");
+        let (workspace, thread, target_message, card) =
+            rewind_repo_action_card(&db, "rewind-materialized", "clone").await;
+        let token = new_repo_action_token();
+        let staging_path = root
+            .path()
+            .join(format!(".weft-repo-action-{token}.staging"));
+        let target_text = target_path.to_string_lossy().into_owned();
+        let staging_text = staging_path.to_string_lossy().into_owned();
+        let request = repo::RepoActionClaimRequest {
+            workspace_id: workspace.id,
+            thread_id: thread.id,
+            message_id: card.id,
+            action_id: "rewind-materialized",
+            action_kind: "clone",
+            expected_action_kind: "clone",
+            invocation_fingerprint: "rewind-materialized-fingerprint",
+            execution_token: &token,
+            target_path: &target_text,
+            staging_path: &staging_text,
+        };
+        let execution = repo::claim_repo_action_execution(&db, &request)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(&staging_path).unwrap();
+        let owner = repo_action_owner_path(&staging_path, &token).unwrap();
+        write_token_file(&owner, &token, true).unwrap();
+        write_repo_action_target_marker(&target_path, &token).unwrap();
+        let execution = repo::mark_repo_action_materialized(&db, execution.id, &token)
+            .await
+            .unwrap();
+        // Hold the token lock explicitly across registration so the test's
+        // release→cleanup reacquisition has a visible owner boundary.
+        let registration_lock = acquire_repo_action_os_lock(&token).unwrap();
+        let registered = repo::add_repo_ref_with_action_lock(
+            &db,
+            workspace.id,
+            "materialized-target",
+            &target_text,
+            "main",
+            "",
+            true,
+            &registration_lock,
+        )
+        .await
+        .unwrap();
+        drop(registration_lock);
+        assert_repo_action_lock_handoff(&token);
+
+        let planned_ids = vec![target_message.id, card.id];
+        let locked = lock_repo_action_cleanups(
+            &db,
+            repo::repo_action_executions_requiring_lock_for_message_ids(
+                &db,
+                thread.id,
+                &planned_ids,
+            )
+            .await
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let cleanup_plans = repo_action_cleanup_plans(&locked);
+        let rewind_plans = repo_action_rewind_plans(&locked);
+        repo::rewind_persist_with_repo_actions(
+            &db,
+            thread.id,
+            None,
+            target_message.id,
+            None,
+            None,
+            &cleanup_plans,
+            &rewind_plans,
+        )
+        .await
+        .unwrap();
+        let journal = repo::get_repo_action_execution_by_id(&db, execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.status, repo::REPO_ACTION_CLEANUP_PENDING);
+        assert!(journal.cleanup_preserve_target);
+
+        cleanup_locked_repo_actions(&db, &locked).await;
+        drop(locked);
+        assert!(repo::get_repo_action_execution_by_id(&db, execution.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo::get_repo(&db, registered.id).await.unwrap().is_some());
+        assert!(target_path.exists());
+        assert!(!target_path
+            .join(".git")
+            .join(REPO_ACTION_TOKEN_MARKER)
+            .exists());
+        assert!(!staging_path.exists());
+        assert!(!owner.exists());
     }
 
     // ---- issue #103: read-only propagation wiring (the command-layer glue,
@@ -3986,7 +8611,9 @@ mod tests {
     /// confirm/materialize tests running in this same binary.
     #[tokio::test]
     async fn confirm_proposal_propagates_read_only_to_the_whole_issue_but_never_write() {
-        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tag = format!("weft-confirm-readonly-propagate-{}", std::process::id());
         let root = std::env::temp_dir().join(format!("{tag}-root"));
         let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
@@ -4023,7 +8650,9 @@ mod tests {
                 direction_id: 0,
             }],
         };
-        crate::planner::save_proposal(&db, t.id, &proposal).await.unwrap();
+        crate::planner::save_proposal(&db, t.id, &proposal)
+            .await
+            .unwrap();
 
         let asks = crate::ask::AskRegistry::new();
         let ids = confirm_proposal_and_propagate_read_only(&db, &asks, t.id)
@@ -4060,225 +8689,6 @@ mod tests {
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
-    }
-
-    /// Approving ONE write-trigger lane outside the initial ScopeReview batch
-    /// propagates the SAME issue-wide read-only grant — the identical trust
-    /// decision (see `approve_write_trigger_and_propagate_read_only`'s doc).
-    #[tokio::test]
-    async fn approve_write_trigger_propagates_read_only_to_the_whole_issue_but_never_write() {
-        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = format!("weft-approve-readonly-propagate-{}", std::process::id());
-        let root = std::env::temp_dir().join(format!("{tag}-root"));
-        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&weft_home);
-        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
-        init_main_repo(&root, "api");
-
-        let db = Db::connect("sqlite::memory:").await.unwrap();
-        let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        repo::add_repo_ref(
-            &db,
-            ws.id,
-            "api",
-            root.join("api").to_str().unwrap(),
-            "main",
-            "",
-            true,
-        )
-        .await
-        .unwrap();
-        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
-            .await
-            .unwrap();
-        let proposal = crate::planner::Proposal {
-            rationale: "r".into(),
-            directions: vec![crate::planner::ProposedDirection {
-                name: "B".into(),
-                repo: "api".into(),
-                reason: "r".into(),
-                mandate: "".into(),
-                base_branch: "".into(),
-                decision: "".into(),
-                direction_id: 0,
-            }],
-        };
-        crate::planner::save_proposal(&db, t.id, &proposal).await.unwrap();
-
-        let asks = crate::ask::AskRegistry::new();
-        let dir_id =
-            approve_write_trigger_and_propagate_read_only(&db, &asks, t.id, 0, "claude")
-                .await
-                .unwrap();
-        let dir = dir_id.to_string();
-
-        assert_eq!(
-            asks.auto_decision(t.id, &dir, crate::ask::RiskLevel::ReadOnly, "cat README.md"),
-            Some(crate::ask::Decision::Allow)
-        );
-        // issue-wide: covers a dir that didn't exist at approve time too.
-        assert_eq!(
-            asks.auto_decision(t.id, "999999", crate::ask::RiskLevel::ReadOnly, "pwd"),
-            Some(crate::ask::Decision::Allow)
-        );
-        assert!(asks
-            .auto_decision(t.id, &dir, crate::ask::RiskLevel::Write, "rm -rf x")
-            .is_none());
-        assert!(asks
-            .auto_decision(
-                t.id,
-                &dir,
-                crate::ask::RiskLevel::NetworkOrCredential,
-                "curl evil"
-            )
-            .is_none());
-
-        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
-        let _ = materialize::cleanup_worktrees(&db, &removed).await;
-        std::env::remove_var("WEFT_HOME");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&weft_home);
-    }
-
-    // --- retry_pr_tracking (Needs-you "retry" button for the give-up notice) --
-
-    async fn pr_retry_fixture(
-        db: &Db,
-    ) -> (entities::thread::Model, entities::direction::Model, entities::repo_ref::Model) {
-        let ws = repo::create_workspace(db, "ws").await.unwrap();
-        let repo_ref = repo::add_repo_ref(db, ws.id, "widgets", "/tmp/widgets", "main", "", true)
-            .await
-            .unwrap();
-        let thread = repo::create_thread(db, ws.id, "issue", "feature", "codex")
-            .await
-            .unwrap();
-        let direction = repo::create_direction(
-            db, thread.id, "ship it", "codex", repo_ref.id, "why", "impl-only", "",
-        )
-        .await
-        .unwrap();
-        (thread, direction, repo_ref)
-    }
-
-    #[tokio::test]
-    async fn retry_pr_tracking_resets_a_given_up_rows_probe_failure_streak() {
-        let db = Db::connect("sqlite::memory:").await.unwrap();
-        let (thread, dir, repo_ref) = pr_retry_fixture(&db).await;
-        let merge_backoff = crate::host::automerge::MergeBackoffState::default();
-        let pr = repo::register_pull_request(
-            &db, thread.id, dir.id, repo_ref.id, "github", "github.com", "acme", "widgets", 4,
-            "https://github.com/acme/widgets/pull/4", "fix things",
-        )
-        .await
-        .unwrap();
-        // Drive it past a small give-up threshold, mirroring
-        // `host::monitor::MAX_CONSECUTIVE_PROBE_FAILURES` — the exact state
-        // that backs the "action required" Needs-you notice this button
-        // targets: `list_open_pull_requests` would now exclude this row.
-        repo::mark_pull_request_probe_error(&db, pr.id, "still broken").await.unwrap();
-        repo::mark_pull_request_probe_error(&db, pr.id, "still broken").await.unwrap();
-        let before = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
-        assert!(before.probe_fail_count >= 2);
-        assert!(
-            repo::list_open_pull_requests(&db, 2).await.unwrap().is_empty(),
-            "precondition: the row must actually have fallen out of the sweep"
-        );
-
-        let reset_count = retry_pr_tracking_core(&db, dir.id, &merge_backoff).await.unwrap();
-        assert_eq!(reset_count, 1);
-
-        let after = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
-        assert_eq!(after.probe_fail_count, 0, "retry must reset the streak, same as a fresh register_pr");
-        assert_eq!(
-            repo::list_open_pull_requests(&db, 2).await.unwrap().len(),
-            1,
-            "the row must rejoin the sweep after a retry"
-        );
-    }
-
-    #[tokio::test]
-    async fn retry_pr_tracking_ignores_merged_rows_and_a_direction_with_nothing_tracked() {
-        let db = Db::connect("sqlite::memory:").await.unwrap();
-        let (thread, dir, repo_ref) = pr_retry_fixture(&db).await;
-        let merge_backoff = crate::host::automerge::MergeBackoffState::default();
-
-        // A direction with no tracked PR/MR at all: a harmless no-op, not an
-        // error — the button must not fail just because the notice it targets
-        // was already superseded by a later sweep.
-        assert_eq!(retry_pr_tracking_core(&db, dir.id, &merge_backoff).await.unwrap(), 0);
-
-        // A merged row must be left alone — resetting a closed chapter's
-        // streak would be pointless (it will never be swept again either way)
-        // and `register_pull_request` would otherwise silently resurrect
-        // stale `open`-shaped bookkeeping for it.
-        let pr = repo::register_pull_request(
-            &db, thread.id, dir.id, repo_ref.id, "github", "github.com", "acme", "widgets", 5, "", "",
-        )
-        .await
-        .unwrap();
-        use sea_orm::{ActiveModelTrait, Set};
-        let mut a: entities::pull_request::ActiveModel = pr.clone().into();
-        a.lifecycle = Set("merged".to_string());
-        a.probe_fail_count = Set(3);
-        a.update(&db.0).await.unwrap();
-        // Seed an EXHAUSTED merge-attempt backoff entry too, mirroring a row
-        // that finally merged after exactly using up its attempts — a merged
-        // row must not have EITHER of its counters touched by Retry.
-        for _ in 0..3 {
-            merge_backoff.record_failure(pr.id, &pr.head_sha);
-        }
-
-        assert_eq!(
-            retry_pr_tracking_core(&db, dir.id, &merge_backoff).await.unwrap(),
-            0,
-            "a merged row must not be touched"
-        );
-        let reloaded = repo::get_pull_request(&db, pr.id).await.unwrap().unwrap();
-        assert_eq!(reloaded.probe_fail_count, 3, "left exactly as it was");
-        assert!(
-            merge_backoff.is_exhausted(pr.id, &pr.head_sha),
-            "a merged row's merge-attempt backoff must be left exactly as it was too, not silently cleared"
-        );
-    }
-
-    #[tokio::test]
-    async fn retry_pr_tracking_also_clears_an_exhausted_merge_attempt_backoff() {
-        // Task B's exact repro: `host::monitor`'s `probe_fail_count` never
-        // moved (every CHECK succeeded) — the row is stuck purely because
-        // `host::automerge`'s OWN, separate merge-attempt backoff
-        // (`MergeBackoffState`) exhausted. Before this fix, `register_
-        // pull_request` alone (the old body of `retry_pr_tracking_core`)
-        // never reached that table at all, so a human clicking Retry saw
-        // the button "succeed" while the row stayed silently stuck.
-        let db = Db::connect("sqlite::memory:").await.unwrap();
-        let (thread, dir, repo_ref) = pr_retry_fixture(&db).await;
-        let merge_backoff = crate::host::automerge::MergeBackoffState::default();
-        let pr = repo::register_pull_request(
-            &db, thread.id, dir.id, repo_ref.id, "github", "github.com", "acme", "widgets", 6,
-            "https://github.com/acme/widgets/pull/6", "flaky merge",
-        )
-        .await
-        .unwrap();
-        for _ in 0..3 {
-            merge_backoff.record_failure(pr.id, &pr.head_sha);
-        }
-        assert!(
-            merge_backoff.is_exhausted(pr.id, &pr.head_sha),
-            "precondition: the row's merge-attempt backoff must actually be exhausted"
-        );
-        assert_eq!(
-            repo::get_pull_request(&db, pr.id).await.unwrap().unwrap().probe_fail_count,
-            0,
-            "precondition: host::monitor's OWN counter never moved — this is purely an automerge-side backoff"
-        );
-
-        retry_pr_tracking_core(&db, dir.id, &merge_backoff).await.unwrap();
-
-        assert!(
-            !merge_backoff.is_exhausted(pr.id, &pr.head_sha),
-            "Retry must also clear host::automerge's OWN merge-attempt backoff, not just host::monitor's probe_fail_count"
-        );
     }
 
     // —— issue #160 round-8 P1 #1: stale enable vs. a later Stop ——

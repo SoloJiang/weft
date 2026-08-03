@@ -8,10 +8,8 @@ export interface ThreadActivitySession {
 
 /** A canonical, exhaustive view of the activity owned by one thread. */
 export type ThreadActivityView =
-  | { kind: "idle"; running: 0; stalled: 0 }
-  | { kind: "running"; running: number; stalled: 0 }
-  | { kind: "stalled"; running: 0; stalled: number }
-  | { kind: "mixed"; running: number; stalled: number };
+  | { kind: "idle"; running: 0 }
+  | { kind: "running"; running: number };
 
 export interface ThreadActivityInput {
   workerSessions: Iterable<ThreadActivitySession>;
@@ -19,17 +17,9 @@ export interface ThreadActivityInput {
   leadState: TurnState | undefined;
 }
 
-function viewForCounts(running: number, stalled: number): ThreadActivityView {
-  if (running === 0 && stalled === 0) {
-    return { kind: "idle", running: 0, stalled: 0 };
-  }
-  if (stalled === 0) {
-    return { kind: "running", running, stalled: 0 };
-  }
-  if (running === 0) {
-    return { kind: "stalled", running: 0, stalled };
-  }
-  return { kind: "mixed", running, stalled };
+function viewForCount(running: number): ThreadActivityView {
+  if (running === 0) return { kind: "idle", running: 0 };
+  return { kind: "running", running };
 }
 
 /**
@@ -44,16 +34,12 @@ export function selectThreadActivity({
 }: ThreadActivityInput): ThreadActivityView {
   const threadDirections = new Set(directionIds);
   let running = 0;
-  let stalled = 0;
 
   for (const session of workerSessions) {
     if (!threadDirections.has(session.directionId)) continue;
     switch (session.status) {
       case "running":
         running += 1;
-        break;
-      case "stalled":
-        stalled += 1;
         break;
       case "idle":
       case "exited":
@@ -65,14 +51,11 @@ export function selectThreadActivity({
     case "busy":
       running += 1;
       break;
-    case "stalled":
-      stalled += 1;
-      break;
     case "idle":
     case "stopped":
     case undefined:
       break;
   }
 
-  return viewForCounts(running, stalled);
+  return viewForCount(running);
 }

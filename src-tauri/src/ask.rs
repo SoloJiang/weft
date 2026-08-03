@@ -1419,13 +1419,13 @@ pub struct Ask {
     /// re-derived by the frontend.
     pub risk: RiskLevel,
     pub ts: u64,
-    /// Human context, filled when listed (pending_asks): the owning thread's
+    /// Human context, filled when projected into the attention queue: the owning thread's
     /// title and the asking task's name. Empty for a lead/planning session.
     #[serde(default)]
     pub thread_title: String,
     #[serde(default)]
     pub dir_name: String,
-    /// Owning workspace id, filled when listed (pending_asks).
+    /// Owning workspace id, filled when projected into the attention queue.
     #[serde(default)]
     pub workspace_id: Option<i32>,
     /// The canonical, EXACT action identity (full command / full path set /

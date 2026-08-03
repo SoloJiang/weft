@@ -13,8 +13,7 @@ import {
   NOTIFY_CATEGORIES,
   notifyCopyKeys,
   planNotifyOpen,
-  snapshotOf,
-  type NotifyCategory,
+  snapshotOfAttentionSnapshots,
   type NotifyCategoryFlags,
   type NotifyRoute,
   type NotifySnapshot,
@@ -136,6 +135,7 @@ export interface OsNotifyOpenEvent {
   repoId?: number | null;
   sessionId?: number | null;
   askId?: number | null;
+  attentionId?: string | null;
   workspaceId?: number | null;
   openNeeds?: boolean | null;
   openCurator?: boolean | null;
@@ -149,6 +149,7 @@ function notifyOpenKey(payload: OsNotifyOpenEvent): string {
     payload.repoId ?? null,
     payload.sessionId ?? null,
     payload.askId ?? null,
+    payload.attentionId ?? null,
     payload.workspaceId ?? null,
     payload.openNeeds ?? null,
     payload.openCurator ?? null,
@@ -354,7 +355,8 @@ async function sendOsNotification(
     directionId: route.directionId ?? null,
     repoId: route.repoId ?? null,
     sessionId: route.sessionId ?? null,
-    askId: route.askId ?? null,
+    askId: null,
+    attentionId: route.attentionId ?? null,
     workspaceId: route.workspaceId ?? null,
     openNeeds: route.openNeeds ?? null,
     openCurator: route.openCurator ?? null,
@@ -371,22 +373,15 @@ async function sendOsNotification(
  */
 export function useSystemNotifications() {
   const {
-    needs,
-    asks,
-    writeTriggers,
+    attentionSnapshots,
     notificationOverview,
-    sessions,
-    leadTurn,
     processQuota,
     notificationHydration,
-    threads,
     notifyEnabled,
     notifyCategories,
     quietHours,
     activeWorkspaceId,
     needsByWorkspace,
-    threadWorkspaceById,
-    threadKindById,
     workspaceLoadSeq,
     workspaceLoading,
     workspaceRestoring,
@@ -404,57 +399,19 @@ export function useSystemNotifications() {
   const { t } = useTranslation();
   const prev = useRef<NotifySnapshot | null>(null);
   const baselineWs = useRef<number | null>(null);
-  const baselineReady = useRef<Set<NotifyCategory>>(new Set());
-  const sourceReadyPrevious = useRef<Record<NotifyCategory, boolean>>({
+  const sourceReadyPrevious = useRef<NotifyCategoryFlags>({
     needs: false,
     review: false,
-    stalled: false,
     quota: false,
   });
-  const liveWorkersReadyPrevious = useRef(false);
-  const asksReadyPrevious = useRef(false);
-  const workspaceNeedsReadyPrevious = useRef(false);
-  const globalBaselineReady = useRef({
-    asks: false,
+  const categoryEnabledPrevious = useRef<NotifyCategoryFlags>({
+    needs: false,
     review: false,
-    stalled: false,
     quota: false,
   });
-  const reviewNotificationsEnabledPrevious = useRef(
-    notifyEnabled && notifyCategories.review,
-  );
   const [permissionState, setPermissionState] = useState<NotifyPermission>("prompt");
   const [windowFocused, setWindowFocused] = useState<boolean | null>(null);
   const lastBadge = useRef<number | null>(null);
-
-  const threadsById = useRef<
-    Record<number, { title: string; workspaceId?: number; kind?: string }>
-  >({});
-  useEffect(() => {
-    const m: Record<
-      number,
-      { title: string; workspaceId?: number; kind?: string }
-    > = {
-      ...threadsById.current,
-    };
-    for (const [idStr, ws] of Object.entries(threadWorkspaceById)) {
-      const id = Number(idStr);
-      const prevMeta = m[id];
-      m[id] = {
-        title: prevMeta?.title ?? `#${id}`,
-        workspaceId: ws,
-        kind: threadKindById[id] ?? prevMeta?.kind,
-      };
-    }
-    for (const th of threads) {
-      m[th.id] = {
-        title: th.title,
-        workspaceId: th.workspace_id,
-        kind: th.kind,
-      };
-    }
-    threadsById.current = m;
-  }, [threads, threadWorkspaceById, threadKindById]);
 
   // OS permission, settled once per enable.
   useEffect(() => {
@@ -725,7 +682,7 @@ export function useSystemNotifications() {
       (intent) => intent.type === "direction" && intent.sessionId != null,
     );
     if (workerIntent && !liveWorkersHydrated) {
-      // A retained stalled-worker click must wait for adopted sessions before
+      // A retained legacy worker click must wait for adopted sessions before
       // resolving the exact session route; otherwise it falls back to lead.
       putPendingNav(pending);
       return;
@@ -774,9 +731,7 @@ export function useSystemNotifications() {
     pendingNavRetry,
   ]);
 
-  // Dock / taskbar badge tracks actionable Needs-you across all workspaces.
-  // needsByWorkspace already includes questions + asks + writeTriggers +
-  // action-required notices per workspace (self-clearing notices stay out).
+  // Dock / taskbar badge is the sum of canonical workspace snapshot counts.
   useEffect(() => {
     const count = Object.values(needsByWorkspace).reduce((a, b) => a + b, 0);
     if (lastBadge.current === count) return;
@@ -784,248 +739,78 @@ export function useSystemNotifications() {
     void setDockBadge(count);
   }, [needsByWorkspace]);
 
-  // Notification sources hydrate asynchronously after mount / workspace switch.
-  // The store marks each source only after its authoritative request completes;
-  // do not arm diffs from a fixed timeout while those requests are still empty.
-  // Each category keeps its own baseline so a ready source can accumulate real
-  // events while an unrelated source is still retrying.
+  // Each category arms only after its authoritative source hydrates. Startup,
+  // workspace switches and preference re-enables establish a silent baseline,
+  // so old work is never replayed as a new OS notification.
   useEffect(() => {
-    const sourceWorkspaceMatches =
-      notificationHydration.workspaceId === activeWorkspaceId;
-    const asksReady = sourceWorkspaceMatches && notificationHydration.asks;
-    const workspaceNeedsReady =
-      sourceWorkspaceMatches && notificationHydration.workspaceNeeds;
-    const liveWorkersReady =
-      sourceWorkspaceMatches && notificationHydration.liveWorkers;
-    const sessionRefs: Record<
-      number,
-      {
-        info: { session_id: number };
-        status: (typeof sessions)[number]["status"];
-        directionId: number;
-        repoId: number;
-        threadId: number;
-        eventDriven?: boolean;
-        workspaceId?: number;
-      }
-    > = {};
-    for (const [sid, s] of Object.entries(sessions)) {
-      if (!liveWorkersReady && !s.eventDriven) continue;
-      sessionRefs[Number(sid)] = {
-        info: { session_id: s.info.session_id },
-        status: s.status,
-        directionId: s.directionId,
-        repoId: s.repoId,
-        threadId: s.threadId,
-        eventDriven: s.eventDriven,
-        workspaceId: s.workspaceId,
-      };
-    }
-    const next = snapshotOf(
-      needs,
-      asks,
-      writeTriggers,
-      notificationOverview,
-      sessionRefs,
-      leadTurn,
-      processQuota,
-      threadsById.current,
-      activeWorkspaceId,
-    );
-    const reviewNotificationsEnabled = notifyEnabled && notifyCategories.review;
-    const reviewMuteBegan =
-      reviewNotificationsEnabledPrevious.current && !reviewNotificationsEnabled;
-    reviewNotificationsEnabledPrevious.current = reviewNotificationsEnabled;
-    if (reviewMuteBegan) {
-      // A muted review source must be rebaselined when it returns; transitions
-      // that happened while muted are not notification events.
-      globalBaselineReady.current.review = false;
-      baselineReady.current.delete("review");
-    }
-    // Do not advance any baseline while the current workspace selection is
-    // resetting. Global asks/stalls/quota/review transitions must survive until
-    // the settled snapshot can be compared.
     if (workspaceLoading) return;
-    const sourceReady: Record<NotifyCategory, boolean> = {
-      needs: asksReady || workspaceNeedsReady,
-      review:
-        reviewNotificationsEnabled &&
-        sourceWorkspaceMatches &&
-        notificationHydration.overview,
-      // Lead-turn pushes and locally observed sessions are authoritative even
-      // while the adopted-worker snapshot is retrying.
-      stalled: sourceWorkspaceMatches,
+    const workspaceMatches = notificationHydration.workspaceId === activeWorkspaceId;
+    const next = snapshotOfAttentionSnapshots(
+      attentionSnapshots,
+      notificationOverview,
+      processQuota,
+    );
+    const sourceReady: NotifyCategoryFlags = {
+      needs: notificationHydration.workspaceNeeds,
+      review: workspaceMatches && notificationHydration.overview,
       quota: notificationHydration.quota,
     };
-    const eventStalledKeys = new Set<string>();
-    for (const s of Object.values(sessionRefs)) {
-      if (s.eventDriven && s.status === "stalled") {
-        eventStalledKeys.add(`stall:worker:${s.info.session_id}`);
-      }
-    }
-    for (const [tidStr, turn] of Object.entries(leadTurn)) {
-      if (turn.state !== "stalled") continue;
-      const tid = Number(tidStr);
-      const kind = threadsById.current[tid]?.kind;
-      eventStalledKeys.add(
-        kind === "curator" ? `stall:curator:${tid}` : `stall:lead:${tid}`,
-      );
-    }
-    const sameWorkspace =
-      baselineWs.current === activeWorkspaceId && prev.current != null;
-    const needsSourceBecameUnready =
-      notifyCategories.needs &&
-      ((asksReadyPrevious.current && !asksReady) ||
-        (workspaceNeedsReadyPrevious.current && !workspaceNeedsReady));
-    const liveWorkersBecameReady =
-      liveWorkersReady && !liveWorkersReadyPrevious.current;
-    const sourceBecameUnready =
-      needsSourceBecameUnready ||
-      NOTIFY_CATEGORIES.some(
-        (kind) =>
-          notifyCategories[kind] &&
-          sourceReadyPrevious.current[kind] &&
-          !sourceReady[kind],
-      );
-    if (!sameWorkspace || sourceBecameUnready) {
+    const categoryEnabled: NotifyCategoryFlags = {
+      needs: notifyEnabled && notifyCategories.needs,
+      review: notifyEnabled && notifyCategories.review,
+      quota: notifyEnabled && notifyCategories.quota,
+    };
+
+    const workspaceChanged = baselineWs.current !== activeWorkspaceId;
+    if (prev.current == null || workspaceChanged) {
       const previous = prev.current;
-      const preserveGlobal = { ...globalBaselineReady.current };
+      prev.current = previous ?? emptyNotifySnapshot();
       baselineWs.current = activeWorkspaceId;
-      prev.current = emptyNotifySnapshot();
       if (previous) {
-        if (preserveGlobal.asks) {
-          prev.current.needs = new Map(
-            [...previous.needs].filter(([key]) => key.startsWith("ask:")),
-          );
-        }
-        if (preserveGlobal.stalled) {
-          prev.current.stalled = new Map(previous.stalled);
-        }
-        if (preserveGlobal.review) {
-          prev.current.review = new Map(previous.review);
-        }
-        if (preserveGlobal.quota) {
-          prev.current.quota = new Map(previous.quota);
-        }
+        // Needs and quota are global. A workspace switch must not reset their
+        // diff baseline or suppress an action created in another workspace
+        // during the switch. Review hydration is re-armed with the workspace
+        // overview load below.
+        sourceReadyPrevious.current.review = false;
+        categoryEnabledPrevious.current.review = false;
+      } else {
+        sourceReadyPrevious.current.needs = false;
+        sourceReadyPrevious.current.review = false;
+        sourceReadyPrevious.current.quota = false;
+        categoryEnabledPrevious.current.needs = false;
+        categoryEnabledPrevious.current.review = false;
+        categoryEnabledPrevious.current.quota = false;
       }
-      baselineReady.current.clear();
-      globalBaselineReady.current = preserveGlobal;
-      liveWorkersReadyPrevious.current = false;
-      asksReadyPrevious.current = false;
-      workspaceNeedsReadyPrevious.current = false;
     }
-    sourceReadyPrevious.current = sourceReady;
-    liveWorkersReadyPrevious.current = liveWorkersReady;
-    const asksBecameReady = asksReady && !asksReadyPrevious.current;
-    const workspaceNeedsBecameReady =
-      workspaceNeedsReady && !workspaceNeedsReadyPrevious.current;
-    asksReadyPrevious.current = asksReady;
-    workspaceNeedsReadyPrevious.current = workspaceNeedsReady;
-    const base = prev.current;
-    if (!base) return;
-    const isNeedsKeyReady = (key: string): boolean => {
-      if (key.startsWith("ask:")) return asksReady;
-      return workspaceNeedsReady;
-    };
+
+    const baseline = prev.current;
+    if (!baseline) return;
+    const events = [];
     for (const kind of NOTIFY_CATEGORIES) {
-      if (sourceReady[kind] && !baselineReady.current.has(kind)) {
-        if (kind === "quota" && notificationHydration.quotaPushPending) {
-          // A push arrived before the initial quota snapshot. Keep the empty
-          // (or preserved global) baseline so the first degraded transition is
-          // diffed instead of being mistaken for initial state.
-          globalBaselineReady.current.quota = true;
-          baselineReady.current.add(kind);
-          continue;
-        }
-        if (kind === "needs") {
-          const initialNeeds = [...next.needs].filter(([key]) => {
-            if (key.startsWith("ask:")) {
-              return asksReady && !globalBaselineReady.current.asks;
-            }
-            return workspaceNeedsReady;
-          });
-          base.needs = new Map([
-            ...base.needs,
-            ...initialNeeds,
-          ]);
-          if (asksReady) {
-            globalBaselineReady.current.asks = true;
-          }
-        } else if (kind === "review" && globalBaselineReady.current.review) {
-          // Keep the all-workspace review baseline across a workspace reset.
-        } else if (
-          kind === "stalled" && globalBaselineReady.current.stalled
-        ) {
-          // Keep the global stalled baseline across a workspace reset.
-        } else if (kind === "quota" && globalBaselineReady.current.quota) {
-          // Keep the global quota baseline across a workspace reset.
-        } else {
-          base[kind] = new Map(next[kind]);
-          if (kind === "stalled") {
-            globalBaselineReady.current.stalled = true;
-          }
-          if (kind === "review") {
-            globalBaselineReady.current.review = true;
-          }
-          if (kind === "quota") {
-            globalBaselineReady.current.quota = true;
-          }
-        }
-        baselineReady.current.add(kind);
+      const ready = sourceReady[kind];
+      const enabled = categoryEnabled[kind];
+      const becameReady = ready && !sourceReadyPrevious.current[kind];
+      const becameEnabled = enabled && !categoryEnabledPrevious.current[kind];
+      const firstQuotaPush =
+        kind === "quota" &&
+        becameReady &&
+        notificationHydration.quotaPushPending;
+      if (ready && enabled && ((!becameReady && !becameEnabled) || firstQuotaPush)) {
+        const onlyKind: NotifyCategoryFlags = {
+          needs: kind === "needs",
+          review: kind === "review",
+          quota: kind === "quota",
+        };
+        events.push(...diffForNotifications(baseline, next, onlyKind));
       }
-    }
-    if (asksBecameReady && !globalBaselineReady.current.asks) {
-      for (const [key, entry] of next.needs) {
-        if (key.startsWith("ask:")) base.needs.set(key, entry);
+      if (ready) {
+        baseline[kind] = new Map(next[kind]);
       }
-      globalBaselineReady.current.asks = true;
+      sourceReadyPrevious.current[kind] = ready;
+      categoryEnabledPrevious.current[kind] = enabled;
     }
-    if (workspaceNeedsBecameReady) {
-      for (const [key, entry] of next.needs) {
-        if (!key.startsWith("ask:")) base.needs.set(key, entry);
-      }
-    }
-    if (liveWorkersBecameReady) {
-      // Initial adopted-worker rows are not transitions. Keep lead/local event
-      // keys in the diff baseline so stalls observed before hydration survive.
-      for (const [key, entry] of next.stalled) {
-        if (!eventStalledKeys.has(key)) base.stalled.set(key, entry);
-      }
-    }
-    const nextForDiff = {
-      ...next,
-      needs: new Map(
-        [...next.needs].filter(([key]) => isNeedsKeyReady(key)),
-      ),
-    };
-    // Diff each authoritative source independently. A slow or failed overview
-    // request must not suppress Needs, stalled, or quota notifications whose
-    // sources are already ready. Unready categories keep their previous
-    // snapshot until their own source becomes authoritative.
-    const diffCategories: NotifyCategoryFlags = {
-      needs: notifyCategories.needs && sourceReady.needs,
-      review: notifyCategories.review && sourceReady.review,
-      stalled: notifyCategories.stalled && sourceReady.stalled,
-      quota: notifyCategories.quota && sourceReady.quota,
-    };
-    const events = diffForNotifications(base, nextForDiff, diffCategories);
-    // Advance ready categories before the foreground/quiet-hours gate,
-    // preserving the existing behavior that suppressed events are not replayed
-    // later while leaving unready categories untouched.
-    const baselineNeeds = new Map(
-      [...base.needs].filter(([key]) => !isNeedsKeyReady(key)),
-    );
-    for (const [key, entry] of next.needs) {
-      if (isNeedsKeyReady(key)) baselineNeeds.set(key, entry);
-    }
-    const advanced: NotifySnapshot = { ...base };
-    for (const kind of NOTIFY_CATEGORIES) {
-      if (!sourceReady[kind]) continue;
-      advanced[kind] = kind === "needs"
-        ? baselineNeeds
-        : new Map(next[kind]);
-    }
-    prev.current = advanced;
+    prev.current = baseline;
+
     if (!notifyEnabled || permissionState !== "granted") return;
     if (
       isAppInForeground({
@@ -1035,33 +820,29 @@ export function useSystemNotifications() {
     ) {
       return;
     }
-    if (isInQuietHours(quietHours)) return;
-
-    if (events.length === 0) return;
+    if (isInQuietHours(quietHours) || events.length === 0) return;
 
     void (async () => {
       let sent = false;
-      for (const ev of events) {
-        const keys = notifyCopyKeys(ev.kind);
+      for (const event of events) {
+        const keys = notifyCopyKeys(event.kind);
         const title = t(keys.title);
         const body =
-          ev.count === 1 ? ev.sample : t(keys.body, { count: ev.count });
+          event.count === 1
+            ? event.sample
+            : t(keys.body, { count: event.count });
         try {
-          await sendOsNotification(title, body, ev.route);
+          await sendOsNotification(title, body, event.route);
           sent = true;
         } catch {
-          /* never let a failed ping disturb the app */
+          /* notification delivery must never disturb the app */
         }
       }
       if (sent) void requestAttention();
     })();
   }, [
-    needs,
-    asks,
-    writeTriggers,
+    attentionSnapshots,
     notificationOverview,
-    sessions,
-    leadTurn,
     processQuota,
     notificationHydration,
     notifyEnabled,
@@ -1072,8 +853,5 @@ export function useSystemNotifications() {
     windowFocused,
     t,
     permissionState,
-    threads,
-    threadWorkspaceById,
-    threadKindById,
   ]);
 }

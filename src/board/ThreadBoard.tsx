@@ -19,7 +19,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { isPendingNeed, useStore } from "../state/store";
+import { attentionDirectionId, useStore } from "../state/store";
 import type { Direction, RepoChecks, SessionStatus, Worktree } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { Dialog, DialogPanel } from "../components/ui/Dialog";
@@ -67,8 +67,7 @@ export function ThreadBoard() {
     setReviewingProposal,
     threadTab,
     setThreadTab,
-    needs,
-    asks,
+    attentionItems,
     checksByDirection,
     renameDirection,
   } = useStore();
@@ -96,8 +95,7 @@ export function ThreadBoard() {
   };
 
   const urgent = (d: Direction): boolean =>
-    needs.some((n) => n.direction_id === d.id && isPendingNeed(n)) ||
-    asks.some((a) => a.dir === String(d.id)) ||
+    attentionItems.some((item) => attentionDirectionId(item) === d.id) ||
     (checksByDirection[d.id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail"));
 
   // One tab body, one obvious branch each (no nested ternary): the lead chat,
@@ -204,8 +202,7 @@ function DirectionCard({
   const {
     worktreesByDirection,
     viewDirection,
-    needs,
-    asks,
+    attentionItems,
     checksByDirection,
     requestSkillReview,
     openNeeds,
@@ -223,9 +220,7 @@ function DirectionCard({
   const allChecks = (checks ?? []).flatMap((rc) => rc.checks);
   const failed = allChecks.filter((c) => c.status === "fail").length;
   const passed = allChecks.filter((c) => c.status === "pass").length;
-  const hasNeed =
-    needs.some((n) => n.direction_id === direction.id && isPendingNeed(n)) ||
-    asks.some((a) => a.dir === String(direction.id));
+  const hasNeed = attentionItems.some((item) => attentionDirectionId(item) === direction.id);
   const firstWrite = liveWrites[0];
 
   const testsKind = deriveTestsKind(failed, passed, allChecks.length);
