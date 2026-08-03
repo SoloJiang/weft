@@ -1696,13 +1696,26 @@ async fn approve(
     // audit-log view have the identical "not the raw text, just its length"
     // requirement, so one function serves both. Every other action's detail
     // carries nothing this module considers secret (a coordinate, a window
-    // name, a key combo LABEL like "cmd+s" — never what was typed), so this
-    // is `None` for everything except `type`; `im::outbound::perm_card` falls
-    // back to the unredacted `detail` in that case (see its own doc). Passed
-    // to the ONLY production caller of `request_with_preview` — see that
-    // method's own doc on why it grew this parameter directly rather than a
-    // separate `_redacted` variant.
-    let detail_redacted = (action == "type").then(|| redact_audit_args(action, args).to_string());
+    // name, a key combo LABEL like "cmd+s" — never what was typed), so in
+    // practice this is `None` for everything except `type` (round-31 made the
+    // condition structural — "would the audit redaction change the args" —
+    // rather than a literal action match; see the comment at the binding
+    // below); `im::outbound::perm_card` falls back to the unredacted `detail`
+    // when `None` (see its own doc). Passed to the ONLY production caller of
+    // `request_with_preview` — see that method's own doc on why it grew this
+    // parameter directly rather than a separate `_redacted` variant.
+    // issue #160 round-31 P1 (Codex computer_srv.rs:2158): populated whenever
+    // the audit redaction would change the args AT ALL — not just for `type`.
+    // Structurally fail-closed: whatever `redact_audit_args` considers secret
+    // (bulk `type` text, a printable `key` chord, a `text` smuggled onto any
+    // other action — the last two are also rejected by `pure_validate` before
+    // a card ever opens, so this is defense in depth) can never go out raw on
+    // the outbound IM card either, and a future redaction rule extends to the
+    // IM view automatically instead of needing a second edit here.
+    let detail_redacted = {
+        let audit_view = redact_audit_args(action, args);
+        (&audit_view != args).then(|| audit_view.to_string())
+    };
 
     // issue #160 round-5 review P1 §1: GUI actions — observation AND input
     // alike — go through the GUI-only `auto_decision_gui`, NOT the ordinary
@@ -2154,9 +2167,6 @@ fn required_window(args: &Value) -> Result<&str, String> {
 /// becomes `{"text_redacted": true, "text_chars": N}` in place of the
 /// literal string; every other key (`action`, `window`, …) is untouched.
 fn redact_audit_args(action: &str, args: &Value) -> Value {
-    if action != "type" && action != "key" {
-        return args.clone();
-    }
     let mut redacted = args.clone();
     let Some(obj) = redacted.as_object_mut() else {
         return redacted;
@@ -2170,20 +2180,30 @@ fn redact_audit_args(action: &str, args: &Value) -> Value {
         return redacted;
     };
     // `type` always redacts (bulk keystrokes are content). issue #160 round-20
-    // (Codex computer_srv.rs:1475): `key` redacts a BARE single printable
-    // character — the sensitive char-by-char case `pure_validate`/
-    // `reject_unsafe_key_combo` reject; redacting it HERE too means even the
-    // rejected attempt's audit line never records the raw character. round-26
-    // P1 (Codex computer_srv.rs:2962): a SHIFT-ONLY printable chord
-    // (`shift+h` = `H`) is the same content case one shift away and is
-    // redacted identically. A real command combo (`cmd+s`, `ctrl+c`, `enter`)
-    // is NOT content and stays in the audit for forensics.
-    let redact = action == "type"
-        || matches!(
-            computer::parse_key_combo(text).as_deref(),
-            Ok([computer::KeyToken::Unicode(_)])
-                | Ok([computer::KeyToken::Shift, computer::KeyToken::Unicode(_)])
-        );
+    // (Codex computer_srv.rs:1475): `key` redacts a printable TEXT-entry
+    // chord — judged by [`is_printable_text_chord`] since round-31 P1 (Codex
+    // computer_srv.rs:3162), the same semantic predicate `reject_unsafe_key_
+    // combo` rejects on, so even the rejected attempt's audit line never
+    // records the raw character(s); an UNPARSEABLE `key` payload is redacted
+    // too (it is not a command chord the audit needs for forensics, and could
+    // be anything — a secret pasted into the wrong field included). A real
+    // command combo (`cmd+s`, `ctrl+c`, `enter`) is NOT content and stays in
+    // the audit for forensics.
+    //
+    // issue #160 round-31 P1 (Codex computer_srv.rs:2158): EVERY OTHER action
+    // redacts a present `text` unconditionally — no other action consumes the
+    // field at all (`pure_validate` now rejects it outright), but the audit
+    // logs rejected calls too, so a payload smuggled onto e.g. a `screenshot`
+    // would otherwise land verbatim in the durable log the `type` redaction
+    // exists to keep it out of.
+    let redact = match action {
+        "type" => true,
+        "key" => match computer::parse_key_combo(text).as_deref() {
+            Ok(tokens) => is_printable_text_chord(tokens),
+            Err(_) => true,
+        },
+        _ => true,
+    };
     if redact {
         let chars = text.chars().count();
         obj.insert("text".to_string(), json!({ "text_redacted": true, "text_chars": chars }));
@@ -3068,6 +3088,23 @@ fn pure_validate(action: &str, args: &Value) -> Result<(), String> {
     if !VALID_ACTIONS.iter().any(|a| *a == action) {
         return Err(unknown_action_error(action));
     }
+    // issue #160 round-31 P1 (Codex computer_srv.rs:2158): `text` is the ONE
+    // secret-classified argument this tool takes (literal keystrokes), and
+    // only `type` and `key` consume it — every other action REJECTS a present
+    // `text` outright, before any card is built. The shared tool schema
+    // accepts the field for every action, so a payload smuggled onto e.g. a
+    // `screenshot` used to ride through untouched: ignored by dispatch but
+    // carried VERBATIM on the approval card (`detail_redacted` only covered
+    // `type`) and into the durable audit (`redact_audit_args` likewise) —
+    // both now also redact defensively, but rejecting the malformed request
+    // here keeps a misleading card from ever opening at all, same as the
+    // round-30 `window` rule below.
+    if action != "type" && action != "key" && args.get("text").is_some() {
+        return Err(format!(
+            "'{action}' takes no 'text' argument — only `type` and `key` accept one; remove the \
+             argument and retry"
+        ));
+    }
     match action {
         "left_click" | "right_click" | "double_click" | "triple_click" | "mouse_move" => {
             required_window(args)?;
@@ -3150,20 +3187,21 @@ fn reject_unconsumed_window(action: &str, args: &Value) -> Result<(), String> {
 ///    it (round-20 P2, Codex ...:1189). A MODIFIED chord (e.g. `shift+escape`)
 ///    does not match the bare-Escape shortcut and is deliberately left alone.
 fn reject_unsafe_key_combo(tokens: &[computer::KeyToken]) -> Result<(), String> {
-    match tokens {
-        // issue #160 round-26 P1 (Codex computer_srv.rs:2962): a SHIFT-ONLY
-        // printable chord (`shift+h` → holds Shift, clicks `h` → enters `H`)
-        // is the same char-by-char TEXT entry as the bare case below — Shift
-        // merely selects the upper/shifted glyph, unlike ctrl/alt/meta chords
-        // which are commands, not content. Left unrejected it reopened the
-        // round-20 disclosure one shift away: uppercase or shifted sensitive
-        // text entered character by character through `key`, unredacted in
-        // both the outbound card and the durable audit.
-        [computer::KeyToken::Unicode(_)] | [computer::KeyToken::Shift, computer::KeyToken::Unicode(_)] => Err(
+    // issue #160 round-26 P1 (Codex computer_srv.rs:2962) + round-31 P1
+    // (Codex computer_srv.rs:3162): every SEMANTICALLY shift-only printable
+    // chord is the same char-by-char TEXT entry as a bare printable key —
+    // judged by [`is_printable_text_chord`], not by exact slice patterns,
+    // which kept missing shapes one variation away (round-26 caught
+    // `shift+h` after round-20's bare `h`; round-31 caught `shift+shift+h`
+    // after round-26). See that predicate's own doc.
+    if is_printable_text_chord(tokens) {
+        return Err(
             "send printable characters with the `type` action, not `key` — `key` is for \
              named keys and modifier shortcuts (e.g. `enter`, `tab`, `ctrl+c`)"
                 .to_string(),
-        ),
+        );
+    }
+    match tokens {
         [computer::KeyToken::Named(computer::NamedKey::Escape)] => Err(
             "`escape` can't be injected through the `key` action — a bare Escape collides with \
              weft's global emergency-stop shortcut and could trip the kill switch instead of \
@@ -3172,6 +3210,32 @@ fn reject_unsafe_key_combo(tokens: &[computer::KeyToken]) -> Result<(), String> 
         ),
         _ => Ok(()),
     }
+}
+
+/// issue #160 round-31 P1 (Codex computer_srv.rs:3162): the SEMANTIC
+/// "printable text entry" test the round-20/26/31 findings converge on. True
+/// when the chord consists of NOTHING but Shift modifiers and at least one
+/// printable `Unicode` token — `h`, `shift+h`, `shift+shift+h`, any
+/// duplicate/reordered variant: every shape whose OS effect is "hold (only)
+/// Shift, click printable keys", i.e. TEXT entry, which `type` (redacted
+/// end-to-end) exists for. A predicate over the token multiset cannot be
+/// dodged by repeating or reordering tokens the way the previous exact slice
+/// patterns could. Any non-Shift modifier (ctrl/alt/meta) or any named key
+/// makes the chord a COMMAND and exempts it — commands are not content, and
+/// keeping them readable in the audit is deliberate forensics (round-20).
+/// Shared verbatim by [`reject_unsafe_key_combo`] (the request-time reject)
+/// and [`redact_audit_args`] (the audit-time redaction), so the two
+/// boundaries can never disagree on what counts as text entry.
+fn is_printable_text_chord(tokens: &[computer::KeyToken]) -> bool {
+    let mut printable = 0usize;
+    for token in tokens {
+        match token {
+            computer::KeyToken::Shift => {}
+            computer::KeyToken::Unicode(_) => printable += 1,
+            _ => return false,
+        }
+    }
+    printable >= 1
 }
 
 fn now_ms() -> u64 {
@@ -4363,6 +4427,85 @@ mod tests {
         assert_eq!(redacted["text"]["text_redacted"], true);
         assert_eq!(redacted["text"]["text_chars"], 1);
         assert_eq!(redacted["window"], "notes", "non-text keys pass through");
+    }
+
+    /// issue #160 round-31 P1 (Codex computer_srv.rs:2158): only `type` and
+    /// `key` consume `text` — every other action rejects a present one
+    /// outright, before any card is built, so typing content can't ride an
+    /// action whose card and dispatch never mention it.
+    #[test]
+    fn pure_validate_rejects_a_text_argument_on_non_typing_actions() {
+        let cases = [
+            ("screenshot", json!({"action": "screenshot", "window": "notes", "text": "secret"})),
+            (
+                "left_click",
+                json!({"action": "left_click", "window": "notes", "coordinate": [1, 2], "text": "secret"}),
+            ),
+            ("wait", json!({"action": "wait", "duration_ms": 5, "text": "secret"})),
+            ("list_windows", json!({"action": "list_windows", "text": "secret"})),
+        ];
+        for (action, args) in cases {
+            let err = pure_validate(action, &args)
+                .expect_err("a non-typing action must reject a smuggled text argument");
+            assert!(err.contains("takes no 'text'"), "{action}: {err}");
+        }
+        // The two consumers still accept it.
+        assert!(pure_validate("type", &json!({"action": "type", "window": "n", "text": "hi"})).is_ok());
+        assert!(pure_validate("key", &json!({"action": "key", "window": "n", "text": "ctrl+c"})).is_ok());
+    }
+
+    /// issue #160 round-31 P1 (Codex computer_srv.rs:2158): the audit line
+    /// redacts a present `text` on EVERY action — the request is rejected
+    /// (see the pure_validate test above), but rejected calls are audited
+    /// too, and the smuggled payload must not land verbatim in the durable
+    /// log. An UNPARSEABLE `key` payload is redacted for the same reason: it
+    /// is not a command chord forensics needs, and could be anything.
+    #[test]
+    fn redact_audit_args_redacts_smuggled_text_on_any_action() {
+        let args = json!({"action": "screenshot", "window": "notes", "text": "hunter2"});
+        let redacted = redact_audit_args("screenshot", &args);
+        assert_eq!(redacted["text"]["text_redacted"], true);
+        assert_eq!(redacted["text"]["text_chars"], 7);
+        assert_eq!(redacted["window"], "notes", "non-text keys pass through");
+        assert!(
+            !redacted.to_string().contains("hunter2"),
+            "the raw smuggled text must never reach the audit: {redacted}"
+        );
+
+        let bad_key = json!({"action": "key", "window": "notes", "text": "hunter2"});
+        let redacted = redact_audit_args("key", &bad_key);
+        assert_eq!(
+            redacted["text"]["text_redacted"], true,
+            "an unparseable key payload is redacted, never kept raw: {redacted}"
+        );
+    }
+
+    /// issue #160 round-31 P1 (Codex computer_srv.rs:3162): duplicate-shift
+    /// printable chords (`shift+shift+h`) are the same text entry as
+    /// `shift+h` — the semantic [`is_printable_text_chord`] predicate rejects
+    /// AND redacts them regardless of how many Shift tokens pad the chord,
+    /// while shift+NAMED-key and any chord carrying a non-shift modifier stay
+    /// accepted commands.
+    #[test]
+    fn duplicate_shift_printable_chords_are_rejected_and_redacted() {
+        let key = |text: &str| json!({"action": "key", "window": "notes", "text": text});
+        for chord in ["shift+shift+h", "shift+shift+shift+h"] {
+            assert!(
+                pure_validate("key", &key(chord)).is_err(),
+                "{chord} is printable text entry padded with duplicate shifts — must be rejected"
+            );
+            let redacted = redact_audit_args("key", &key(chord));
+            assert_eq!(
+                redacted["text"]["text_redacted"], true,
+                "{chord} must be redacted in the audit line too: {redacted}"
+            );
+        }
+        // Duplicate shifts on a NAMED key, and any non-shift modifier, are
+        // still command chords — accepted and kept readable for forensics.
+        assert!(pure_validate("key", &key("shift+shift+tab")).is_ok());
+        assert!(pure_validate("key", &key("ctrl+shift+shift+t")).is_ok());
+        let combo = redact_audit_args("key", &key("ctrl+shift+shift+t"));
+        assert_eq!(combo["text"], "ctrl+shift+shift+t");
     }
 
     /// issue #160 round-20 (Codex computer_srv.rs:1189 + :1475): the `key`
