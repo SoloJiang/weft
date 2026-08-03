@@ -1419,6 +1419,18 @@ struct ControlHolderState {
     /// the Settings banner reads — that UI only cares who holds the lease,
     /// not this in-between bookkeeping state.
     escape_ready: bool,
+    /// Set when a clear/release arrives while an injection is IN FLIGHT
+    /// ([`input_in_flight`]) instead of removing the holder outright. A doomed
+    /// holder authorizes NOTHING further — [`lease_check_for_injection`]
+    /// refuses it and [`acquire_control`] never renews it — but it stays
+    /// VISIBLE (to [`control_state`], and through [`holder_is_live`] to
+    /// [`sync_shortcut_state`]) so the Settings banner and the OS-level
+    /// Escape registration survive until the one uninterruptible backend call
+    /// already past its final recheck actually returns; removing the holder
+    /// immediately would blank both Stop surfaces at the exact moment a human
+    /// is most likely to want them. [`InputFlightGuard`]'s `Drop` removes a
+    /// doomed holder the instant the injection lands.
+    doomed: bool,
 }
 
 /// A snapshot of who currently holds the computer-use control lease, for
@@ -1634,13 +1646,23 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
                     });
                 }
                 if is_live && is_same_holder {
-                    // issue #160 round-15 P1: this exact holder's own
-                    // registration round-trip has not confirmed the kill
-                    // switch yet — refuse the renewal outright rather than
-                    // let a racing-in second call from the SAME session
-                    // inherit an unconfirmed lease. Nothing is mutated on
-                    // this path: the original still-registering acquire is
-                    // left untouched.
+                    // A doomed holder (torn down mid-injection — see
+                    // `ControlHolderState::doomed`) must never be renewed
+                    // back to life by its own session racing in: it is only
+                    // still visible for the Stop surfaces, and it is removed
+                    // the instant its in-flight injection ends.
+                    if holder.doomed {
+                        return Err(ComputerError::Busy {
+                            thread: holder.thread,
+                            dir: holder.dir.clone(),
+                        });
+                    }
+                    // This exact holder's own registration round-trip has not
+                    // confirmed the kill switch yet — refuse the renewal
+                    // outright rather than let a racing-in second call from
+                    // the SAME session inherit an unconfirmed lease. Nothing
+                    // is mutated on this path: the original
+                    // still-registering acquire is left untouched.
                     if !holder.escape_ready {
                         return Err(ComputerError::EscapeRegistrationPending);
                     }
@@ -1674,6 +1696,7 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
                 expires_at: lease_deadline(now),
                 expires_at_ms: now_ms().saturating_add(CONTROL_LEASE_MS),
                 escape_ready: false,
+                doomed: false,
             });
         } else if let Some(holder) = guard.as_mut() {
             holder.expires_at = lease_deadline(now);
@@ -1749,34 +1772,81 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
     Ok(())
 }
 
+/// The single lease judgment the final pre-backend recheck needs, read in
+/// ONE `control_mutex` acquisition (see `bus::computer_srv`'s
+/// `recheck_stop_and_lease_before_backend`, its only consumer) — so
+/// "does the holder authorize this exact session" and "is that holder
+/// doomed" can never be answered from two different instants.
+pub enum LeaseCheckOutcome {
+    /// The exact `(thread, dir, wt)` triple holds a live, un-doomed lease.
+    Authorized,
+    /// A live lease is held by a DIFFERENT session.
+    Busy { thread: i32, dir: String },
+    /// No lease, an expired lease, or a DOOMED one — a holder marked by a
+    /// clear/release that landed mid-injection still shows on the Stop
+    /// surfaces (see [`ControlHolderState::doomed`]) but authorizes no
+    /// further backend call, its own included: the injection already past
+    /// this check runs to completion, everything behind it fails closed.
+    Lost,
+}
+
+/// See [`LeaseCheckOutcome`]. Lock-only and synchronous (no `.await`, no db)
+/// so it can run at the last possible instant on the same blocking thread as
+/// the backend call. Reads liveness through [`holder_is_live`] like every
+/// other judgment, but does NOT lazily remove an expired holder — that stays
+/// [`control_state`]'s job.
+pub fn lease_check_for_injection(thread: i32, dir: &str, wt: Option<i32>) -> LeaseCheckOutcome {
+    let guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    match guard.as_ref() {
+        Some(h) if !holder_is_live(h.expires_at, now) => LeaseCheckOutcome::Lost,
+        Some(h) if h.doomed => LeaseCheckOutcome::Lost,
+        Some(h) if h.thread == thread && h.dir == dir && h.wt == wt => {
+            LeaseCheckOutcome::Authorized
+        }
+        Some(h) => LeaseCheckOutcome::Busy { thread: h.thread, dir: h.dir.clone() },
+        None => LeaseCheckOutcome::Lost,
+    }
+}
+
 /// Release the lease early — a no-op unless `(thread, dir, wt)` is the CURRENT
 /// holder (an already-expired/released lease, or one some other session
 /// since took over, is left alone rather than clobbered). Used by
-/// `commands::clear_control_if_session_doomed` (round-32) to drop exactly one
-/// doomed session's lease during a repo delete; also available to any caller
+/// `commands::clear_control_if_session_doomed` to drop exactly one doomed
+/// session's lease during a repo delete; also available to any caller
 /// that knows it's done and wants the next session unblocked sooner than the
 /// full 30s lease.
 ///
-/// issue #160 round-33 P2 (Codex mod.rs:1746): a successful release also
-/// syncs the OS-level global Escape shortcut — OUTSIDE the lock, the same
-/// decide-unlock-act shape as [`clear_control`] and [`control_state`]'s
-/// lazy-expiry path (see [`sync_shortcut_state`]'s own doc for the race that
-/// shape closes). Without it, releasing the last holder left bare Escape
-/// globally intercepted indefinitely: `control_state` thereafter sees `None`
-/// (not an expired holder), so its own repair path never fires, the banner
-/// disappears, and pressing Escape could still trip Emergency Stop with no
-/// active controller.
+/// A successful release also syncs the OS-level global Escape shortcut —
+/// OUTSIDE the lock, the same decide-unlock-act shape as [`clear_control`]
+/// and [`control_state`]'s lazy-expiry path (see [`sync_shortcut_state`]'s
+/// own doc for the race that shape closes). Without it, releasing the last
+/// holder left bare Escape globally intercepted indefinitely:
+/// `control_state` thereafter sees `None` (not an expired holder), so its
+/// own repair path never fires, the banner disappears, and pressing Escape
+/// could still trip Emergency Stop with no active controller.
+///
+/// While an injection is in flight, a matching release marks the holder
+/// doomed instead of removing it — see [`ControlHolderState::doomed`] for
+/// the full contract (Stop surfaces stay alive, nothing further authorized,
+/// removed the instant the injection lands).
 pub fn release_control(thread: i32, dir: &str, wt: Option<i32>) {
-    let released;
-    {
+    let cleared = {
         let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-        released =
-            matches!(guard.as_ref(), Some(h) if h.thread == thread && h.dir == dir && h.wt == wt);
-        if released {
-            *guard = None;
+        match guard.as_mut() {
+            Some(h) if h.thread == thread && h.dir == dir && h.wt == wt => {
+                if input_in_flight() {
+                    h.doomed = true;
+                    false
+                } else {
+                    *guard = None;
+                    true
+                }
+            }
+            _ => false,
         }
-    }
-    if released {
+    };
+    if cleared {
         sync_shortcut_state();
     }
 }
@@ -1838,14 +1908,32 @@ pub fn control_state() -> Option<ControlHolder> {
 /// this via `emergency_stop`), so it goes through the SAME serialized
 /// [`sync_shortcut_state`] rather than a bare `unregister_global_escape()`
 /// call, for the identical race-closing reason.
+///
+/// While an injection is in flight, the holder is marked doomed instead of
+/// removed — see [`ControlHolderState::doomed`]. This covers the
+/// emergency-stop path too, deliberately: the stop LATCH (already tripped by
+/// [`trip_stop_latch`] before it calls here) is what refuses every
+/// subsequent action, while the holder staying visible keeps the Escape
+/// registration and the banner alive until the one uninterruptible backend
+/// call already past its own final recheck actually returns — the same
+/// "Stop surfaces must outlive an in-flight injection" invariant
+/// [`holder_is_live`] enforces, honored on the teardown side as well.
 pub fn clear_control() {
-    let had_holder = {
+    let cleared = {
         let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-        let had_holder = guard.is_some();
-        *guard = None;
-        had_holder
+        match guard.as_mut() {
+            None => false,
+            Some(h) if input_in_flight() => {
+                h.doomed = true;
+                false
+            }
+            Some(_) => {
+                *guard = None;
+                true
+            }
+        }
     };
-    if had_holder {
+    if cleared {
         sync_shortcut_state();
     }
 }
@@ -1854,6 +1942,11 @@ pub fn clear_control() {
 /// [`enabled`] call fails closed) AND clear the control lease (in case a
 /// call is already mid-flight against the old value), THEN best-effort
 /// persist `computer_use_enabled = false` to the DB for next launch.
+/// When an injection is in flight, the lease-clear half marks the holder
+/// doomed rather than removing it (the latch half never waits — it is what
+/// refuses everything from this instant on); see [`clear_control`]'s own doc
+/// for why the kill-switch surfaces must outlive the one uninterruptible
+/// backend call.
 ///
 /// issue #160 review R1 #1: latch first, persist second — the latch flip and
 /// the lease clear below happen BEFORE the DB write, and [`enabled`] only
@@ -2379,6 +2472,28 @@ pub struct InputFlightGuard {
 impl Drop for InputFlightGuard {
     fn drop(&mut self) {
         INPUT_IN_FLIGHT.store(false, Ordering::SeqCst);
+        // Remove a holder a mid-injection clear/release marked doomed (see
+        // `ControlHolderState::doomed`) — the Stop surfaces it was kept
+        // visible for have nothing left to guard once the injection lands.
+        // Runs BEFORE `_inner` (the flight mutex guard) is dropped, so the
+        // next queued input call cannot even acquire the guard until the
+        // removal has landed. The doomed flag lives inside `control_mutex`,
+        // and the clear paths only ever mark it after reading
+        // `INPUT_IN_FLIGHT == true` under that same lock — so every mark is
+        // either ordered before this cleanup (removed here) or ordered after
+        // the `store(false)` above (its own path removes immediately); no
+        // interleaving strands a doomed holder.
+        let removed = {
+            let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            let doomed = matches!(guard.as_ref(), Some(h) if h.doomed);
+            if doomed {
+                *guard = None;
+            }
+            doomed
+        };
+        if removed {
+            sync_shortcut_state();
+        }
     }
 }
 
@@ -2515,8 +2630,19 @@ fn key_token(part: &str) -> Result<KeyToken, ComputerError> {
             let mut chars = part.chars();
             match (chars.next(), chars.next()) {
                 (Some(c), None) => Ok(KeyToken::Unicode(c)),
+                // The token is caller-chosen free text, and this message
+                // flows verbatim into the MCP error result AND the PERSISTED
+                // audit line's `outcome` field (`call_computer` stores the
+                // raw error string) — `redact_audit_args` redacts an
+                // unparseable `key`'s ARGS precisely because they can carry
+                // smuggled secrets, so echoing the same content back through
+                // the OUTCOME string would reopen the exact leak that
+                // redaction closes. Name only the token's length, never its
+                // content.
                 _ => Err(ComputerError::Unsupported(format!(
-                    "unrecognized key \"{part}\" in combo"
+                    "a {}-character key-combo token is not a recognized modifier, named key, or \
+                     single printable character",
+                    part.chars().count()
                 ))),
             }
         }
@@ -3983,6 +4109,91 @@ mod tests {
         );
     }
 
+    /// A `clear_control` that lands while an injection is in flight (a
+    /// delete tearing down the holder's route, or Emergency Stop itself)
+    /// must NOT drop the holder — and with it the Escape registration and
+    /// the banner's data source — while the uninterruptible backend call is
+    /// still running. The holder is marked doomed instead: still VISIBLE
+    /// (both Stop surfaces read it), authorizing NOTHING (the pre-backend
+    /// lease check refuses it, its own session cannot renew it), and removed
+    /// the instant the flight guard drops.
+    #[tokio::test]
+    async fn clear_control_dooms_an_in_flight_holder_and_removes_it_at_flight_end() {
+        let _lock = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_control();
+
+        acquire_control(31, "310", None).unwrap();
+        let flight = input_flight_guard().await;
+
+        clear_control();
+        assert!(
+            control_state().is_some(),
+            "the holder (and both kill-switch surfaces keyed off it) must survive while the \
+             injection is in flight"
+        );
+        assert!(
+            matches!(lease_check_for_injection(31, "310", None), LeaseCheckOutcome::Lost),
+            "a doomed holder must authorize no further backend call, its own session included"
+        );
+        assert!(
+            matches!(acquire_control(31, "310", None), Err(ComputerError::Busy { .. })),
+            "a doomed holder must not be renewable back to life"
+        );
+
+        drop(flight);
+        assert!(
+            control_state().is_none(),
+            "the doomed holder must be removed the instant the injection finishes"
+        );
+    }
+
+    /// The `release_control` half: an exact-triple release during flight
+    /// dooms the holder just like `clear_control`, while a NON-matching
+    /// release stays the same no-op it always was — it must not doom the
+    /// real holder.
+    #[tokio::test]
+    async fn release_control_dooms_only_the_exact_holder_during_flight() {
+        let _lock = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_control();
+
+        acquire_control(32, "320", Some(1)).unwrap();
+        let flight = input_flight_guard().await;
+
+        // A sibling's (wrong-wt) release during flight: no-op, dooms nothing.
+        release_control(32, "320", Some(2));
+        assert!(
+            matches!(lease_check_for_injection(32, "320", Some(1)), LeaseCheckOutcome::Authorized),
+            "a non-matching release must leave the holder fully authorized"
+        );
+        // The holder's own release during flight: doomed, not yet removed.
+        release_control(32, "320", Some(1));
+        assert!(
+            control_state().is_some(),
+            "an exact release during flight must keep the holder visible, not drop it mid-injection"
+        );
+        assert!(
+            matches!(lease_check_for_injection(32, "320", Some(1)), LeaseCheckOutcome::Lost),
+            "the doomed holder must stop authorizing its own backend calls immediately"
+        );
+
+        drop(flight);
+        assert!(
+            control_state().is_none(),
+            "the doomed holder must be removed at flight end"
+        );
+
+        // A FRESH hold after the cycle starts clean — nothing from the doomed
+        // round can leak into it.
+        acquire_control(32, "320", Some(2)).unwrap();
+        let flight = input_flight_guard().await;
+        drop(flight);
+        assert!(
+            control_state().is_some(),
+            "a fresh, un-doomed holder must survive an uneventful flight cycle"
+        );
+        clear_control();
+    }
+
     /// issue #160 round-12 P1 #4: the property this round exists for — while
     /// `input_flight_guard`'s guard is held, a control lease whose own timer
     /// already lapsed must keep reporting as live (both to `control_state`'s
@@ -4144,6 +4355,7 @@ mod tests {
                 expires_at: lease_deadline(std::time::Instant::now()),
                 expires_at_ms: now_ms().saturating_add(CONTROL_LEASE_MS),
                 escape_ready: false,
+                doomed: false,
             });
         }
 
@@ -4266,6 +4478,28 @@ mod tests {
     fn parse_key_combo_rejects_empty_and_unrecognized_tokens() {
         assert!(parse_key_combo("cmd+").is_err());
         assert!(parse_key_combo("bogus_key").is_err());
+    }
+
+    /// The unrecognized-token error must never echo the token itself — the
+    /// string flows into the MCP error result and the persisted audit line's
+    /// `outcome`, so a smuggled secret in a malformed `key` arg would
+    /// otherwise ride the error text past `redact_audit_args`' own args
+    /// redaction.
+    #[test]
+    fn parse_key_combo_never_echoes_an_unrecognized_token_into_the_error() {
+        let smuggled = "hunter2-super-secret";
+        let err = match parse_key_combo(smuggled) {
+            Err(e) => e.to_string(),
+            Ok(_) => unreachable!("a multi-character unrecognized token must be rejected"),
+        };
+        assert!(
+            !err.contains(smuggled) && !err.contains("hunter2"),
+            "the error text must not carry the token's content: {err}"
+        );
+        assert!(
+            err.contains(&smuggled.chars().count().to_string()),
+            "the error should still name the token's length so a benign typo is debuggable: {err}"
+        );
     }
 
     /// issue #160 round-8 P2 #6: a combo whose non-final token is NOT a

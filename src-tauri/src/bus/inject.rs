@@ -10,18 +10,97 @@ use std::path::Path;
 pub struct Injection {
     pub args: Vec<String>,
     /// Environment variables the spawn site must set on the tool's OWN child
-    /// process. Two producers today:
-    ///  - the codex computer-use injection (issue #160 round-15 P1, Codex
-    ///    inject.rs:364): the per-session bearer must not ride in `-c` argv
-    ///    (world-readable via process listings on Linux) — the `-c` flag names
-    ///    only the VARIABLE, and the secret rides here instead (a child's
-    ///    environment is readable only by its own uid);
+    /// process. Three producers today:
+    ///  - the codex computer-use injection: the per-session bearer must not
+    ///    ride in `-c` argv (world-readable via process listings on Linux) —
+    ///    the `-c` flag names only the VARIABLE, and the secret rides here
+    ///    instead (a child's environment is readable only by its own uid);
     ///  - OpenCode's documented OPENCODE_CONFIG_CONTENT (per-session bus
     ///    injection, see `inject_opencode_session_bus`), so concurrent
     ///    sessions in one worktree never overwrite a shared opencode.json bus
-    ///    URL.
+    ///    URL;
+    ///  - the OpenCode computer-use injection (see the `"opencode"` arm of
+    ///    [`inject_computer`]), which carries its per-session bearer through
+    ///    the SAME OPENCODE_CONFIG_CONTENT variable instead of the worktree's
+    ///    `opencode.json` file.
     /// Every other injection leaves this empty.
+    ///
+    /// Because TWO producers can both emit an `OPENCODE_CONFIG_CONTENT` entry
+    /// for one spawn (the session bus and the computer server), a spawn site
+    /// that accumulates several injections' `env` lists MUST pass the result
+    /// through [`coalesce_env`] before handing it to the child —
+    /// `Command::envs` applies duplicate keys last-wins, which would silently
+    /// drop the earlier server's config.
     pub env: Vec<(String, String)>,
+}
+
+/// The one environment variable two different injections can both target —
+/// OpenCode's documented inline-config channel, read additively on top of
+/// any file-based config.
+const OPENCODE_CONFIG_CONTENT_VAR: &str = "OPENCODE_CONFIG_CONTENT";
+
+/// Deep-merge `overlay` into `base`: objects merge key-by-key recursively,
+/// anything else is replaced by the overlay's value. Only used by
+/// [`coalesce_env`] on OPENCODE_CONFIG_CONTENT payloads, where the two
+/// producers' configs are disjoint except for the shared `"mcp"` object that
+/// must UNION (`weft_bus` + `weft_computer`), not clobber.
+fn deep_merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(overlay_map)) => {
+            for (key, value) in overlay_map {
+                match base_map.get_mut(&key) {
+                    Some(slot) => deep_merge_json(slot, value),
+                    None => {
+                        base_map.insert(key, value);
+                    }
+                }
+            }
+        }
+        (slot, value) => *slot = value,
+    }
+}
+
+/// Collapse duplicate `OPENCODE_CONFIG_CONTENT` entries in an accumulated
+/// injection-env list into ONE deep-merged entry — see [`Injection`]'s `env`
+/// doc for why every spawn site must call this.
+/// Later entries merge ON TOP of earlier ones, preserving the same
+/// precedence `Command::envs`' last-wins would give whole values. If any
+/// entry is not a JSON object (nothing this module produces — defensive
+/// only), merging is impossible and the list falls back to plain last-wins
+/// for that variable. Every other variable passes through untouched, in
+/// order.
+pub fn coalesce_env(env: Vec<(String, String)>) -> Vec<(String, String)> {
+    let (mut out, opencode): (Vec<_>, Vec<_>) =
+        env.into_iter().partition(|(key, _)| key != OPENCODE_CONFIG_CONTENT_VAR);
+    if opencode.len() <= 1 {
+        out.extend(opencode);
+        return out;
+    }
+    let mut parsed = Vec::with_capacity(opencode.len());
+    for (_, value) in &opencode {
+        let object = serde_json::from_str::<serde_json::Value>(value)
+            .ok()
+            .filter(serde_json::Value::is_object);
+        match object {
+            Some(object) => parsed.push(object),
+            None => {
+                // Unmergeable payload: keep plain env semantics (last wins).
+                if let Some(last) = opencode.into_iter().next_back() {
+                    out.push(last);
+                }
+                return out;
+            }
+        }
+    }
+    let mut iter = parsed.into_iter();
+    let Some(mut merged) = iter.next() else {
+        return out;
+    };
+    for overlay in iter {
+        deep_merge_json(&mut merged, overlay);
+    }
+    out.push((OPENCODE_CONFIG_CONTENT_VAR.to_string(), merged.to_string()));
+    out
 }
 
 impl Injection {
@@ -383,7 +462,19 @@ pub fn inject(
 }
 
 fn inject_opencode_session_bus(url: &str) -> Injection {
-    let mut root = std::env::var("OPENCODE_CONFIG_CONTENT")
+    opencode_env_config_injection("weft_bus", url)
+}
+
+/// Register one HTTP MCP `server` for an OpenCode session via the
+/// OPENCODE_CONFIG_CONTENT environment channel — the shared builder behind
+/// [`inject_opencode_session_bus`] and the `"opencode"` arm of
+/// [`inject_computer`]. Layers on top of any
+/// OPENCODE_CONFIG_CONTENT already present in WEFT's OWN process
+/// environment (a user-provided base config is preserved, not clobbered);
+/// when several injections for ONE spawn each produce an entry, the spawn
+/// site's [`coalesce_env`] pass deep-merges them into one.
+fn opencode_env_config_injection(server: &str, url: &str) -> Injection {
+    let mut root = std::env::var(OPENCODE_CONFIG_CONTENT_VAR)
         .ok()
         .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
         .filter(serde_json::Value::is_object)
@@ -402,13 +493,13 @@ fn inject_opencode_session_bus(url: &str) -> Injection {
     }
     if let Some(mcp_obj) = mcp.as_object_mut() {
         mcp_obj.insert(
-            "weft_bus".to_string(),
+            server.to_string(),
             serde_json::json!({ "type": "remote", "url": url, "enabled": true }),
         );
     }
     Injection {
         args: vec![],
-        env: vec![("OPENCODE_CONFIG_CONTENT".to_string(), root.to_string())],
+        env: vec![(OPENCODE_CONFIG_CONTENT_VAR.to_string(), root.to_string())],
     }
 }
 
@@ -444,11 +535,12 @@ pub fn inject_curator(base: &str, thread: i32, tool: &str, cwd: &Path) -> Inject
 /// generic [`inject_mcp`] the others use — that helper writes claude's
 /// config INSIDE the worktree and opencode's merge into the worktree's own
 /// (possibly git-tracked) `opencode.json`, neither of which this endpoint's
-/// token can safely land in. See [`inject_computer_claude`] and
-/// [`inject_computer_opencode`]'s own doc comments for each tool's
-/// dedicated, token-safe path. Codex needs neither: its own injection is
-/// already a bare `-c` CLI flag with no file at all (unchanged, same as
-/// every other codex injection in this module).
+/// token can safely land in. See [`inject_computer_claude`]'s own doc for
+/// Claude's dedicated, token-safe file path; OpenCode's arm below routes the
+/// token through the OPENCODE_CONFIG_CONTENT environment channel instead of
+/// ANY file (see that arm's own comment). Codex needs neither: its own
+/// injection is already a bare `-c` CLI flag with no file at all (unchanged,
+/// same as every other codex injection in this module).
 ///
 /// Callers MUST gate this on `crate::computer::enabled(db)` themselves — this
 /// function injects unconditionally. issue #160 round-12 P2 #7: as of this
@@ -463,7 +555,13 @@ pub fn inject_curator(base: &str, thread: i32, tool: &str, cwd: &Path) -> Inject
 /// own materialized worktree row is already in scope where it calls this
 /// function); the lead call site always passes `None` (a lead has no
 /// worktree — it runs out of its own scratch cwd).
-pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path, wt: Option<i32>) -> Injection {
+///
+/// No `cwd` parameter — dropped deliberately, not incidentally: no arm of
+/// this function touches the session's checkout at all (claude's token file
+/// lives under Weft's own state dir, codex and opencode ride argv/env), and
+/// the signature enforces that a future arm can't quietly reintroduce a
+/// worktree write.
+pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, wt: Option<i32>) -> Injection {
     if crate::acp::backend_for(tool).is_some() {
         // MCP is supplied on session/new|resume, not via launch flags/files —
         // same rule `inject_mcp` applies for every other server.
@@ -504,10 +602,21 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
                 )],
             }
         }
-        "opencode" => {
-            inject_computer_opencode(cwd, &url);
-            Injection::none()
-        }
+        // The bearer-carrying URL rides the OPENCODE_CONFIG_CONTENT
+        // environment channel — the SAME mechanism the per-session bus
+        // already uses — and never touches `opencode.json` at all. A file
+        // merge would leave the token in an UNIGNORED worktree file whenever
+        // the cwd is a LINKED worktree (`merge_opencode_config` rightly
+        // skips `git_exclude` there — a linked worktree's exclude file is
+        // the CANONICAL repo's), where any broad `git add` sweep would
+        // commit — and potentially publish — a live credential. The env
+        // channel closes that entirely (nothing on disk to sweep), and with
+        // it the tracked-`opencode.json` hazard — so OpenCode sessions whose
+        // tracked status cannot be proven (a lead's non-repo scratch cwd, a
+        // checkout where git can't run) get the computer tool instead of a
+        // silent withhold. Same accepted same-uid residual as every
+        // env-carried secret (`Injection::env`'s codex bearer note).
+        "opencode" => opencode_env_config_injection("weft_computer", &url),
         _ => Injection::none(),
     }
 }
@@ -526,10 +635,10 @@ pub const COMPUTER_TOKEN_ENV_VAR: &str = "WEFT_COMPUTER_MCP_TOKEN";
 /// call — any other local account that can reach the path in that gap (the
 /// exact shared/traversable-machine threat model [`inject_computer_claude`]'s
 /// own doc already targets) can read a bearer token straight off disk before
-/// the chmod ever lands. Both token-bearing config writes in this module
-/// ([`inject_computer_claude`]'s Claude `.mcp.json`, and
-/// [`inject_computer_opencode`]'s merged `opencode.json`) go through this
-/// instead of write-then-chmod.
+/// the chmod ever lands. The one token-bearing config write in this module
+/// ([`inject_computer_claude`]'s Claude `.mcp.json`) goes through this
+/// instead of write-then-chmod (OpenCode's token never touches disk at all —
+/// see [`opencode_env_config_injection`]).
 ///
 /// `#[cfg(unix)]`: writes to a fresh temp SIBLING opened with `create_new`
 /// (O_EXCL) + `O_NOFOLLOW` + mode `0o600` in ONE syscall — never observably
@@ -873,93 +982,6 @@ fn sanitize_filename_component(s: &str) -> String {
         .collect()
 }
 
-/// Whether `cwd`'s `opencode.json` is a git-TRACKED file — issue #160
-/// round-12 P1 #6 (Codex round-11 finding). `merge_opencode_config`'s own
-/// `git_exclude` call only ever hides an UNTRACKED file from `git status`;
-/// it can never un-track a file the sub-repo already committed. Merging the
-/// computer server's session-scoped bearer token into an ALREADY-TRACKED
-/// `opencode.json` would persist Weft's own credential wiring straight into
-/// the user's repo history the next time they commit — a hard CLAUDE.md
-/// violation ("never write cross-repo wiring into canonical repositories"),
-/// not merely a same-machine readability concern the way an untracked file
-/// with lax permissions is. `git ls-files --error-unmatch` is the standard
-/// "is this path tracked" check; any error (not a git repo at all, the
-/// binary is missing, some other git failure) reads as "not tracked" — the
-/// SAME fail-open-to-"attempt the merge" default `merge_opencode_config`
-/// already has for every other failure mode on this path (best-effort
-/// throughout this module), rather than a NEW way for this one check to
-/// refuse computer-use injection outright.
-fn opencode_json_is_tracked(cwd: &Path) -> bool {
-    // issue #160 round-16 P1 (Codex inject.rs:602): fail CLOSED on an
-    // indeterminate answer. This used to map ANY failure — git missing from
-    // PATH, a `safe.directory` refusal, a corrupt checkout — to "not tracked",
-    // which let the bearer-carrying merge proceed against a file that may very
-    // well be tracked: exactly the "session wiring + credential lands in the
-    // canonical repository's history" outcome the tracked check exists to
-    // prevent, silently re-opened by every environment where the check itself
-    // couldn't run. `git ls-files --error-unmatch` has exactly one exit code
-    // that POSITIVELY proves "untracked" (1, with git having run at all);
-    // only that proof may unlock the merge. Exit 0 is tracked; anything else
-    // (spawn failure, 128, a killed process with no code) is indeterminate and
-    // reads as tracked — the caller then withholds injection, degrading
-    // gracefully to "opencode gets no computer server this session" rather
-    // than gambling with the user's repo history. This deliberately diverges
-    // from this module's usual best-effort fail-open posture (see
-    // `merge_opencode_config`) because the downside here is not a missing
-    // feature but a committed credential — CLAUDE.md's "never write cross-repo
-    // wiring into canonical repositories" is a hard constraint, not a
-    // best-effort one.
-    match std::process::Command::new("git")
-        .args(["ls-files", "--error-unmatch", "opencode.json"])
-        .current_dir(cwd)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-    {
-        Ok(s) if s.success() => true,
-        Ok(s) if s.code() == Some(1) => false,
-        _ => true,
-    }
-}
-
-/// OpenCode's computer-use MCP merge, issue #160 round-12 P1 #6 (Codex
-/// round-11 finding): a SEPARATE path from `inject_mcp`'s generic
-/// `merge_opencode_config` (used by `weft_bus`/`weft_planner`/
-/// `weft_curator`/`weft_global`, none of which carry a secret) precisely
-/// because `url` here embeds a per-session bearer token. Two protections
-/// the generic merge doesn't need:
-///
-/// 1. NEVER merges into an ALREADY-TRACKED `opencode.json`
-///    ([`opencode_json_is_tracked`]) — the computer-use tool simply isn't
-///    offered to this OpenCode worker in that one case, rather than risking
-///    Weft's own credential wiring landing in the user's next commit. This
-///    is the ONE tool this round is willing to withhold to hold the "never
-///    write cross-repo wiring into a canonical repo" line; every other MCP
-///    server keeps `merge_opencode_config`'s pre-existing accepted
-///    limitation (it still merges into a tracked file — harmless, since none
-///    of them carry a secret).
-/// 2. The merged file is written ATOMICALLY owner-only on unix (issue #160
-///    round-12 P1 #D — see [`write_owner_only_atomic`]'s own doc) — the
-///    bearer token must not be left world/group-readable on a shared or
-///    traversable checkout, mirroring the SAME protection
-///    [`inject_computer_claude`] applies to Claude's own config. Before
-///    round-12, this narrowed the file to `0600` via a SEPARATE
-///    `set_permissions` call right after `merge_opencode_config`'s own
-///    plain `std::fs::write` landed — a default-umask-readable window
-///    between the two, same shape as [`inject_computer_claude`]'s own
-///    pre-round-12 gap.
-///
-/// KNOWN, ACCEPTED residual (documented here, and in the round's own report):
-/// same-uid processes can still read this file/env regardless (existing §9
-/// residual) — what this closes is the token landing in a TRACKED repo file,
-/// not same-machine, same-account visibility.
-fn inject_computer_opencode(cwd: &Path, url: &str) {
-    if opencode_json_is_tracked(cwd) {
-        return;
-    }
-    merge_opencode_config(cwd, "weft_computer", url, true);
-}
-
 /// Build the global-MCP injection for the Concierge engine (M3-2). Not
 /// per-thread — the URL has no thread/dir in path; identity is "the global
 /// helper running in IM single-chat". Same additive shape as planner.
@@ -994,12 +1016,9 @@ fn inject_mcp(server: &str, stem: &str, url: &str, tool: &str, cwd: &Path) -> In
             format!("mcp_servers.{server}.url={url}"),
         ]),
         "opencode" => {
-            // `secret: false` — none of `weft_bus`/`weft_planner`/
-            // `weft_curator`/`weft_global` carry a bearer token, so the
-            // plain (non-atomic, non-owner-only) write is unchanged from
-            // before round-12 P1 #D. Only `inject_computer_opencode`'s
-            // `weft_computer` merge passes `true`.
-            merge_opencode_config(cwd, server, url, false);
+            // None of `weft_bus`/`weft_planner`/`weft_curator`/`weft_global`
+            // carry a bearer token — see `merge_opencode_config`'s doc.
+            merge_opencode_config(cwd, server, url);
             Injection::none()
         }
         _ => Injection::none(),
@@ -1009,17 +1028,16 @@ fn inject_mcp(server: &str, stem: &str, url: &str, tool: &str, cwd: &Path) -> In
 /// Deep-merge `mcp.<server> = {type:remote, url, enabled:true}` into the cwd's
 /// opencode.json, preserving any existing config the sub-repo shipped.
 ///
-/// `secret` (issue #160 round-12 P1 #D): when `true` ([`inject_computer_opencode`]'s
-/// ONE caller — `url` embeds a per-session bearer token), the merged file is
-/// written via [`write_owner_only_atomic`] instead of a plain `std::fs::write`
-/// — see that function's own doc for the write-then-chmod window this
-/// closes. `false` (every other caller, via `inject_mcp`'s generic
-/// `"opencode"` branch) keeps the pre-existing plain write: none of
+/// Reached only via `inject_mcp`'s generic `"opencode"` branch — none of
 /// `weft_bus`/`weft_planner`/`weft_curator`/`weft_global` carry a secret, so
-/// there is nothing here for owner-only atomicity to protect, and forcing it
-/// anyway would needlessly tighten a config file the sub-repo may expect to
-/// read/write with its own tooling.
-fn merge_opencode_config(cwd: &Path, server: &str, url: &str, secret: bool) {
+/// the plain (non-atomic, non-owner-only) write is fine, and tightening the
+/// file anyway would needlessly restrict a config the sub-repo may expect to
+/// read/write with its own tooling. The one server whose URL embeds a bearer
+/// token (`weft_computer`) never writes ANY file — it rides the
+/// OPENCODE_CONFIG_CONTENT environment channel instead (see
+/// [`opencode_env_config_injection`]), which is what keeps this merge
+/// no-secrets-only.
+fn merge_opencode_config(cwd: &Path, server: &str, url: &str) {
     let path = cwd.join("opencode.json");
     let mut root: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
@@ -1045,11 +1063,7 @@ fn merge_opencode_config(cwd: &Path, server: &str, url: &str, secret: bool) {
         );
     }
     let bytes = serde_json::to_vec_pretty(&root).unwrap_or_default();
-    if secret {
-        let _ = write_owner_only_atomic(&path, &bytes);
-    } else {
-        let _ = std::fs::write(&path, &bytes);
-    }
+    let _ = std::fs::write(&path, &bytes);
     // Best-effort: only hides opencode.json from git when the sub-repo does NOT
     // track it. If the repo ships a tracked opencode.json, the merge still shows
     // as a modification — an accepted limitation of the worktree-local merge.
@@ -1155,7 +1169,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", &dir, None);
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", None);
         assert_eq!(inj.args[0], "--mcp-config");
         let cfg_path = std::path::PathBuf::from(&inj.args[1]);
         assert!(
@@ -1211,14 +1225,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-reinject-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
-        let first = inject_computer("http://127.0.0.1:9", 5, "50", "claude", &dir, Some(7));
+        let first = inject_computer("http://127.0.0.1:9", 5, "50", "claude", Some(7));
         let cfg_path = std::path::PathBuf::from(&first.args[1]);
         assert!(cfg_path.exists(), "the first injection must write the config");
 
         // A second injection for the SAME (thread, dir, wt) but a DIFFERENT
         // base URL — standing in for a resumed/rerun session hitting the SAME
         // predictable path; the newer content must win.
-        let second = inject_computer("http://127.0.0.1:8", 5, "50", "claude", &dir, Some(7));
+        let second = inject_computer("http://127.0.0.1:8", 5, "50", "claude", Some(7));
         assert_eq!(
             std::path::PathBuf::from(&second.args[1]),
             cfg_path,
@@ -1252,13 +1266,13 @@ mod tests {
         // SAME (thread, dir) is a DIFFERENT config file — two workers of one
         // multi-repo direction must never clobber each other's config — and the
         // absent-wt case is distinct from any explicit wt too.
-        let other_wt = inject_computer("http://127.0.0.1:9", 5, "50", "claude", &dir, Some(8));
+        let other_wt = inject_computer("http://127.0.0.1:9", 5, "50", "claude", Some(8));
         assert_ne!(
             std::path::PathBuf::from(&other_wt.args[1]),
             cfg_path,
             "a different wt must produce a different config path"
         );
-        let absent_wt = inject_computer("http://127.0.0.1:9", 5, "50", "claude", &dir, None);
+        let absent_wt = inject_computer("http://127.0.0.1:9", 5, "50", "claude", None);
         assert_ne!(
             std::path::PathBuf::from(&absent_wt.args[1]),
             cfg_path,
@@ -1313,7 +1327,7 @@ mod tests {
     #[test]
     fn computer_codex_uses_config_override_with_the_bearer_in_env_not_argv() {
         let token = crate::bus::computer_srv::computer_session_token(1, "10", None);
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Path::new("/tmp"), None);
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", None);
         assert_eq!(
             inj.args,
             vec![
@@ -1347,7 +1361,7 @@ mod tests {
         let key = crate::bus::computer_srv::computer_session_token(1, "10", Some(42));
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-wt-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", &dir, Some(42));
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", Some(42));
         assert_eq!(inj.args[0], "--mcp-config");
         let cfg_path = std::path::PathBuf::from(&inj.args[1]);
         assert!(!cfg_path.starts_with(&dir), "must live outside the worktree, got {cfg_path:?}");
@@ -1362,7 +1376,7 @@ mod tests {
         // codex (issue #160 round-15 P1): the `?wt=` pin stays in the argv URL
         // (a worktree id is not a secret) but the bearer rides env, minted for
         // this EXACT `wt`.
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Path::new("/tmp"), Some(42));
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Some(42));
         assert_eq!(
             inj.args,
             vec![
@@ -1892,106 +1906,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // —— issue #160 round-12 P1 #6: computer-use token never lands in a tracked opencode.json ——
+    // —— the OpenCode computer bearer rides the OPENCODE_CONFIG_CONTENT env
+    // channel, never a file ——
 
-    /// The untracked/common case: a real git checkout (a worker's cwd always
-    /// is one) with no pre-existing `opencode.json` at all (or one the
-    /// sub-repo never committed) — the computer server's merge proceeds
-    /// exactly like `inject_mcp`'s generic merge does for `weft_bus`, PLUS
-    /// narrows the file to `0600` on unix (the token-bearing difference
-    /// `inject_computer_opencode` adds on top). issue #160 round-16 P1: the
-    /// fixture MUST be a genuine git repo now — `opencode_json_is_tracked`
-    /// fails CLOSED on an indeterminate answer (a non-repo dir), so only a
-    /// positive `git ls-files` "untracked" proof unlocks the merge (the
-    /// non-repo case has its own dedicated withhold test below).
+    /// The base property: the computer injection for OpenCode produces ONLY
+    /// an env-carried inline config (bearer URL included) and touches no
+    /// file at all — a plain directory (not even a git repo, the case the
+    /// old file merge WITHHELD as tracked-indeterminate) now both stays
+    /// clean on disk AND actually gets the tool.
     #[test]
-    fn computer_opencode_merges_and_narrows_permissions_when_untracked() {
-        let dir = std::env::temp_dir().join(format!("weft-inj-comp-oc-untracked-{}", std::process::id()));
+    fn computer_opencode_rides_the_env_channel_and_writes_no_file() {
+        let dir = std::env::temp_dir().join(format!("weft-inj-comp-oc-env-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&dir)
-            .status()
-            .unwrap()
-            .success());
 
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "opencode", &dir, None);
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "opencode", None);
         assert!(inj.args.is_empty(), "opencode has no launch-flag injection");
-        let cfg_path = dir.join("opencode.json");
-        let cfg = std::fs::read_to_string(&cfg_path).unwrap();
-        assert!(cfg.contains("weft_computer") && cfg.contains("/computer/1/10/mcp"), "{cfg}");
+        assert_eq!(inj.env.len(), 1);
+        assert_eq!(inj.env[0].0, "OPENCODE_CONFIG_CONTENT");
+        let inline: serde_json::Value = serde_json::from_str(&inj.env[0].1).unwrap();
+        let url = inline["mcp"]["weft_computer"]["url"].as_str().unwrap();
+        assert!(url.contains("/computer/1/10/mcp"), "{url}");
         assert!(
-            cfg.contains(&format!("key={}", crate::bus::computer_srv::computer_session_token(1, "10", None))),
-            "{cfg}"
+            url.contains(&format!(
+                "key={}",
+                crate::bus::computer_srv::computer_session_token(1, "10", None)
+            )),
+            "the per-session bearer must ride the env-carried URL: {url}"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "the bearer-token-bearing opencode.json must be 0600, got {mode:o}");
-        }
+        assert!(
+            !dir.join("opencode.json").exists(),
+            "the computer injection must write NO opencode.json — the bearer never touches disk"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// issue #160 round-12 P1 #D: re-merging the SAME `opencode.json` again
-    /// (a second spawn/resume for the same worktree) must go through
-    /// `write_owner_only_atomic`'s remove-then-`create_new` path and land at
-    /// exactly `0600` again — never fall back to a wider mode because the
-    /// file already exists — and the merge itself must still preserve
-    /// whatever the FIRST merge already wrote (the deep-merge semantics
-    /// `merge_opencode_config` reads-then-rewrites are unaffected by which
-    /// write path lands the bytes).
+    /// A sub-repo that ships (and committed) its own `opencode.json`: the
+    /// file stays byte-for-byte untouched — no token can ever land in the
+    /// repo's history — while the env channel still delivers the tool (a
+    /// file merge would have to WITHHOLD it here; the env channel doesn't).
     #[test]
-    fn computer_opencode_reinjection_stays_owner_only_and_preserves_the_merge() {
-        let dir = std::env::temp_dir().join(format!("weft-inj-comp-oc-reinject-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // issue #160 round-16 P1: a genuine git repo, like every worker cwd —
-        // the fail-closed tracked check withholds the merge everywhere else.
-        assert!(std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&dir)
-            .status()
-            .unwrap()
-            .success());
-        let cfg_path = dir.join("opencode.json");
-
-        let _ = inject_computer("http://127.0.0.1:9", 2, "20", "opencode", &dir, None);
-        assert!(cfg_path.exists(), "the first merge must write the config");
-
-        // A second merge, standing in for a resumed/rerun session's own
-        // spawn-time injection landing on the SAME worktree.
-        let _ = inject_computer("http://127.0.0.1:9", 2, "20", "opencode", &dir, Some(9));
-        let cfg = std::fs::read_to_string(&cfg_path).unwrap();
-        assert!(cfg.contains("wt=9"), "the SECOND merge's URL must win: {cfg}");
-        assert!(cfg.contains("weft_computer"), "{cfg}");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(
-                mode, 0o600,
-                "re-merging must remain exactly 0600, never a wider mode surviving from a stale \
-                 create, got {mode:o}"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The protected case: the sub-repo ships (and has COMMITTED) its own
-    /// `opencode.json` — merging the computer server's per-session bearer
-    /// token into it would persist Weft's own credential wiring straight into
-    /// the user's repo history the next time they commit. This must refuse
-    /// the merge outright (the tool simply isn't offered to this worker),
-    /// never write the token into that tracked file. `weft_bus`'s OWN merge
-    /// (via `inject`, unaffected by this round) is exercised alongside to
-    /// confirm this restriction is scoped to the computer server alone — the
-    /// other servers keep their pre-existing "still merges into a tracked
-    /// file, accepted limitation" behavior since they carry no secret.
-    #[test]
-    fn computer_opencode_never_merges_into_an_already_tracked_opencode_json() {
+    fn computer_opencode_leaves_a_tracked_opencode_json_untouched_and_still_injects() {
         use std::process::Command;
         let root = std::env::temp_dir().join(format!("weft-inj-comp-oc-tracked-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -2007,66 +1962,132 @@ mod tests {
         sh(&root, &["git", "init", "-q"]);
         sh(&root, &["git", "config", "user.email", "t@t.t"]);
         sh(&root, &["git", "config", "user.name", "t"]);
-        std::fs::write(
-            root.join("opencode.json"),
-            r#"{"mcp":{"repo_own":{"type":"local","command":["x"]}}}"#,
-        )
-        .unwrap();
+        let shipped = r#"{"mcp":{"repo_own":{"type":"local","command":["x"]}}}"#;
+        std::fs::write(root.join("opencode.json"), shipped).unwrap();
         sh(&root, &["git", "add", "-A"]);
         sh(&root, &["git", "commit", "-q", "-m", "init"]);
 
         let token = crate::bus::computer_srv::computer_session_token(1, "10", None);
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "opencode", &root, None);
-        assert!(inj.args.is_empty());
+        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "opencode", None);
         let cfg = std::fs::read_to_string(root.join("opencode.json")).unwrap();
+        assert_eq!(cfg, shipped, "a tracked opencode.json must stay byte-for-byte untouched");
+        assert!(!cfg.contains(&token));
+        let inline: serde_json::Value = serde_json::from_str(&inj.env[0].1).unwrap();
         assert!(
-            !cfg.contains("weft_computer") && !cfg.contains(&token),
-            "a TRACKED opencode.json must never gain the computer server or its token: {cfg}"
+            inline["mcp"]["weft_computer"].is_object(),
+            "the tool is delivered via env despite the tracked file: {inline}"
         );
-        // The repo's own pre-existing content is untouched.
-        assert!(cfg.contains("repo_own"));
-
-        // Sanity: `weft_bus` (no secret) still merges into this SAME tracked
-        // file — confirming the refusal above is specific to the computer
-        // server, not a blanket "never touch a tracked opencode.json" that
-        // would also silently break the bus.
-        let _ = inject("http://127.0.0.1:9", 1, "10", None, "opencode", &root);
-        let cfg_after_bus = std::fs::read_to_string(root.join("opencode.json")).unwrap();
-        assert!(cfg_after_bus.contains("weft_bus"), "{cfg_after_bus}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// issue #160 round-16 P1 (Codex inject.rs:602): when the tracked check
-    /// cannot POSITIVELY prove `opencode.json` is untracked — here, a
-    /// directory that is not a git repository at all, so `git ls-files` exits
-    /// 128 rather than the one exit code (1) that proves "untracked" — the
-    /// bearer-carrying merge is WITHHELD entirely. Indeterminate must never
-    /// read as "safe to write a credential into".
+    /// The hazard the env channel exists for: in a LINKED worktree (`.git`
+    /// is a gitfile), `git_exclude` is rightly skipped (the exclude file is
+    /// the canonical repo's), so a file-carried bearer would sit UNIGNORED —
+    /// one broad `git add` away from a committed, pushable credential. The
+    /// env channel must leave the worktree's `git status` completely clean.
     #[test]
-    fn computer_opencode_withholds_when_tracked_detection_is_indeterminate() {
-        let root =
-            std::env::temp_dir().join(format!("weft-inj-comp-oc-indet-{}", std::process::id()));
+    fn computer_opencode_writes_nothing_into_a_linked_worktree() {
+        use std::process::Command;
+        let root = std::env::temp_dir().join(format!("weft-inj-comp-oc-linked-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        // NOT a git repo — and a pre-existing opencode.json whose tracked
-        // status therefore cannot be determined.
-        std::fs::write(
-            root.join("opencode.json"),
-            r#"{"mcp":{"repo_own":{"type":"local","command":["x"]}}}"#,
-        )
-        .unwrap();
+        let repo = root.join("repo");
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let sh = |dir: &Path, args: &[&str]| {
+            assert!(Command::new(args[0])
+                .args(&args[1..])
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success());
+        };
+        sh(&repo, &["git", "init", "-q"]);
+        sh(&repo, &["git", "config", "user.email", "t@t.t"]);
+        sh(&repo, &["git", "config", "user.name", "t"]);
+        std::fs::write(repo.join("README.md"), "x\n").unwrap();
+        sh(&repo, &["git", "add", "-A"]);
+        sh(&repo, &["git", "commit", "-q", "-m", "init"]);
+        sh(&repo, &["git", "worktree", "add", "-q", wt.to_str().unwrap()]);
 
-        let token = crate::bus::computer_srv::computer_session_token(1, "10", None);
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "opencode", &root, None);
-        assert!(inj.args.is_empty());
-        let cfg = std::fs::read_to_string(root.join("opencode.json")).unwrap();
+        let inj = inject_computer("http://127.0.0.1:9", 5, "50", "opencode", Some(7));
         assert!(
-            !cfg.contains("weft_computer") && !cfg.contains(&token),
-            "an INDETERMINATE tracked status must withhold the computer merge: {cfg}"
+            !wt.join("opencode.json").exists(),
+            "no opencode.json may be created in a linked worktree — it would be UNIGNORED there"
         );
-        assert!(cfg.contains("repo_own"), "pre-existing content untouched");
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&status.stdout);
+        assert!(s.trim().is_empty(), "the worktree must stay clean — nothing sweepable: {s}");
+        let inline: serde_json::Value = serde_json::from_str(&inj.env[0].1).unwrap();
+        let url = inline["mcp"]["weft_computer"]["url"].as_str().unwrap();
+        assert!(url.contains("wt=7") && url.contains("key="), "{url}");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An opencode WORKER's session bus and computer server BOTH produce an
+    /// OPENCODE_CONFIG_CONTENT entry — `coalesce_env` must deep-merge them
+    /// into one entry carrying BOTH mcp servers (a raw `Command::envs` pass
+    /// would keep only the later one, silently dropping the bus), while
+    /// unrelated variables pass through.
+    #[test]
+    fn coalesce_env_deep_merges_the_bus_and_computer_opencode_entries() {
+        let dir = std::env::temp_dir().join(format!("weft-inj-coalesce-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bus = inject("http://127.0.0.1:9", 7, "19", Some(63), "opencode", &dir);
+        let comp = inject_computer("http://127.0.0.1:9", 7, "19", "opencode", Some(4));
+        let mut env = vec![("OTHER_VAR".to_string(), "kept".to_string())];
+        env.extend(bus.env);
+        env.extend(comp.env);
+
+        let coalesced = coalesce_env(env);
+        let opencode: Vec<_> =
+            coalesced.iter().filter(|(k, _)| k == "OPENCODE_CONFIG_CONTENT").collect();
+        assert_eq!(opencode.len(), 1, "exactly one merged entry: {coalesced:?}");
+        let inline: serde_json::Value = serde_json::from_str(&opencode[0].1).unwrap();
+        assert_eq!(
+            inline["mcp"]["weft_bus"]["url"],
+            "http://127.0.0.1:9/bus/7/19/mcp?session_id=63",
+            "the bus half must survive the merge: {inline}"
+        );
+        let comp_url = inline["mcp"]["weft_computer"]["url"].as_str().unwrap();
+        assert!(comp_url.contains("/computer/7/19/mcp?wt=4&key="), "{comp_url}");
+        assert!(
+            coalesced.iter().any(|(k, v)| k == "OTHER_VAR" && v == "kept"),
+            "unrelated variables pass through untouched: {coalesced:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `coalesce_env` edge shapes: a single entry passes through verbatim,
+    /// and an unmergeable (non-object) payload falls back to plain last-wins
+    /// rather than corrupting either value.
+    #[test]
+    fn coalesce_env_passes_singletons_and_falls_back_to_last_wins_when_unmergeable() {
+        let single = coalesce_env(vec![(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            r#"{"mcp":{}}"#.to_string(),
+        )]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].1, r#"{"mcp":{}}"#, "a singleton must pass through byte-identical");
+
+        let fallback = coalesce_env(vec![
+            ("OPENCODE_CONFIG_CONTENT".to_string(), "not-json".to_string()),
+            ("OPENCODE_CONFIG_CONTENT".to_string(), r#"{"mcp":{"a":{}}}"#.to_string()),
+        ]);
+        let opencode: Vec<_> =
+            fallback.iter().filter(|(k, _)| k == "OPENCODE_CONFIG_CONTENT").collect();
+        assert_eq!(opencode.len(), 1);
+        assert_eq!(
+            opencode[0].1, r#"{"mcp":{"a":{}}}"#,
+            "unmergeable input keeps plain env last-wins semantics"
+        );
     }
 }

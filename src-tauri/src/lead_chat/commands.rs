@@ -323,7 +323,6 @@ pub async fn lead_engine(
             thread_id,
             crate::bus::LEAD,
             &t.lead_tool,
-            &cwd,
             // issue #160 round-2 P2 §5: the lead lane has no
             // worktree at all (it runs out of its own scratch cwd),
             // so it never has a `wt` to pin — always `None`.
@@ -332,6 +331,11 @@ pub async fn lead_engine(
         extra.extend(comp.args);
         extra_env.extend(comp.env);
     }
+    // Deep-merge any duplicate OPENCODE_CONFIG_CONTENT entries the
+    // accumulated injections produced — `Command::envs` is last-wins per
+    // key, which would silently drop an earlier server's config (see
+    // `bus::inject::coalesce_env`).
+    let extra_env = crate::bus::inject::coalesce_env(extra_env);
     push_model_arg(&mut extra, t.lead_model.as_deref());
     let system_prompt = if is_concierge {
         concierge_prompt(lang)
@@ -1642,7 +1646,6 @@ pub(crate) async fn chat_open_worker_impl(
         dir.thread_id,
         &direction_id.to_string(),
         &session_tool,
-        &cwd,
         // issue #160 round-2 P2 §5: this worker's OWN worktree
         // (`wt`, resolved above for this EXACT direction+repo pair)
         // — not "the first worktree of this direction" a
@@ -1651,6 +1654,11 @@ pub(crate) async fn chat_open_worker_impl(
     );
     extra.extend(comp.args);
     extra_env.extend(comp.env);
+    // An opencode worker's session bus AND computer server BOTH ride
+    // OPENCODE_CONFIG_CONTENT — deep-merge the duplicate entries or
+    // `Command::envs`' last-wins drops the bus (see
+    // `bus::inject::coalesce_env`).
+    let extra_env = crate::bus::inject::coalesce_env(extra_env);
     push_model_arg(&mut extra, sess.model.as_deref());
 
     let key = sess.id as i64;
@@ -1841,7 +1849,6 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
                 dir.thread_id,
                 &sess.direction_id.to_string(),
                 &sess.tool,
-                &cwd,
                 worktree_id,
             );
             (comp.args, comp.env)
@@ -1850,6 +1857,10 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     };
     extra.extend(comp_args);
     extra_env.extend(comp_env);
+    // Same as the spawn path above — deep-merge the bus's and the computer
+    // server's OPENCODE_CONFIG_CONTENT entries (see
+    // `bus::inject::coalesce_env`).
+    let extra_env = crate::bus::inject::coalesce_env(extra_env);
     push_model_arg(&mut extra, sess.model.as_deref());
     let mut inner = engine::EngineInner {
         thread_id: dir.thread_id,

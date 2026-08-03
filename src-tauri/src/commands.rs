@@ -115,6 +115,16 @@ pub async fn delete_workspace(
 /// one holder, so this refuses only the torn-down route; a surviving sibling
 /// direction that merely happens to hold it re-acquires on its next action
 /// (entry-gated — a deleted route cannot re-acquire).
+///
+/// When the doomed holder's own injection is IN FLIGHT at this instant, the
+/// clear (all three helpers here — this one, [`clear_control_if_route_doomed`],
+/// and [`clear_control_if_session_doomed`]'s per-triple releases) marks the
+/// holder doomed instead of yanking the OS-level Escape registration and the
+/// banner out from under a still-running, uninterruptible backend call — see
+/// `computer::clear_control`'s doc. The stalled-call protection is intact: a
+/// doomed holder authorizes no further backend call (the pre-backend lease
+/// check refuses it immediately), and it is removed the instant the in-flight
+/// injection lands.
 fn clear_control_if_doomed(doomed_threads: &[i32]) {
     let Some(holder) = crate::computer::control_state() else {
         return;

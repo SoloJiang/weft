@@ -1524,7 +1524,11 @@ const MAX_OPEN_OBSERVE_ASKS: usize = 3;
 /// once its own approval step couldn't even pin down a window identity.
 /// [`run_action`] threads the `Some(w)` through to its own later, FRESH
 /// `resolve_window` call for that same action and refuses to inject if the
-/// two disagree — see [`verify_approved_target`].
+/// two disagree — see [`verify_approved_target`]. That resolution-failure
+/// `Err` is NOT returned before authorization — it is deferred behind the
+/// same grant/card decision as everything else, so a grant-less caller can't
+/// use it as a window-existence oracle; see the `resolution_failure` binding
+/// below.
 ///
 /// issue #160 round-10 P1 #A: the resolve above USED TO happen only once
 /// authorization already landed (`bind_approved_window`, round-8's own
@@ -1592,7 +1596,28 @@ async fn approve(
     // window and a later capture would land on a DIFFERENT one.
     // `list_windows`/`cursor_position` (no specific window target at all)
     // are unaffected: `window_query` is always blank for them.
-    let resolved = if !window_query.trim().is_empty()
+    // The resolve below captures its OUTCOME instead of returning a failure
+    // early. Returning a resolution failure (WindowNotFound, an ambiguous
+    // query) straight to the agent from here — before `auto_decision_gui`
+    // was consulted or any card opened — would make this authorization-time
+    // resolve a grant-less window-EXISTENCE oracle: probe a query and an
+    // instant error vs. an approval wait tells the agent whether such a
+    // window is on the human's desktop, reconstructable one probe at a time
+    // into exactly the enumeration the `list_windows` card gates (the
+    // AmbiguousWindow redaction below strips the candidate LIST on this same
+    // path; the exists/doesn't-exist BIT would survive it). A failed resolve
+    // therefore rides the SAME approval flow as everything else: `resolved`
+    // stays `None`, `action_key` falls back to its query-only shape below, a
+    // card opens for the probe itself (no preview — there is no window to
+    // show), and the resolution error reaches the agent only AFTER an Allow
+    // (auto-grant or human alike; a Deny is byte-identical to any other
+    // deny). The in-closure gate errors (stop latch, route revocation) still
+    // return immediately — they carry no window-existence information. A
+    // query-only Always grant a human mints on such a card only ever
+    // fast-paths future FAILING resolves of that same query: any successful
+    // resolution builds the id/app/title-bearing key instead, which never
+    // matches it.
+    let (resolved, resolution_failure) = if !window_query.trim().is_empty()
         && (risk == crate::ask::RiskLevel::Write || action == "screenshot")
     {
         // issue #160 round-18 P1 (Codex computer_srv.rs:1343): this
@@ -1637,19 +1662,23 @@ async fn approve(
         // the eventually-scheduled closure would still enumerate the desktop
         // under an authority that no longer exists.
         let dir_recheck = dir.to_string();
-        let window = {
+        // Nested `Result`: the OUTER layer is the gate errors
+        // (stop/revocation/pool failure — returned immediately via `??`), the
+        // INNER layer is the resolution outcome itself, deferred behind the
+        // approval decision below.
+        let resolution = {
             let _observe_permit = screenshot_semaphore()
                 .acquire()
                 .await
                 .map_err(|e| e.to_string())?;
-            match on_blocking(move || {
+            on_blocking(move || {
                 if computer::stop_latched() {
                     return Err(ComputerError::Disabled.to_string());
                 }
                 if route_revoked_sync(thread, &dir_recheck, wt) {
                     return Err(SESSION_GONE_MSG.to_string());
                 }
-                computer::resolve_window(b.as_ref(), &wq).map_err(|e| match e {
+                Ok(computer::resolve_window(b.as_ref(), &wq).map_err(|e| match e {
                     // issue #160 round-23 P1: redacted — see the comment above
                     // this block for why the candidate list must not reach the
                     // agent from this authorization-time resolve.
@@ -1659,17 +1688,16 @@ async fn approve(
                             .to_string()
                     }
                     other => other.to_string(),
-                })
+                }))
             })
-            .await?
-            {
-                Ok(w) => w,
-                Err(message) => return Err(message),
-            }
+            .await??
         };
-        Some(window)
+        match resolution {
+            Ok(w) => (Some(w), None),
+            Err(message) => (None, Some(message)),
+        }
     } else {
-        None
+        (None, None)
     };
     // Granularity tradeoff (documented, not a behavior bug): folding
     // `app`+`title` into an input action's key makes a standing Always grant
@@ -1792,7 +1820,17 @@ async fn approve(
         // it) — reused directly here rather than resolved a second time, so
         // there is no "resolve once for the key, resolve again to bind" gap
         // left for a window swap to land in.
-        Some(Decision::Allow) => return Ok(resolved.map(ApprovedWindow::from)),
+        // A deferred resolution failure surfaces HERE, once authorization
+        // has actually landed — as an `Err`, never `Ok(None)`, which would
+        // let a windowed input arm proceed UNBOUND ("approval couldn't pin
+        // down a window identity ⇒ the action must not run", this function's
+        // fail-closed rule).
+        Some(Decision::Allow) => {
+            return match resolution_failure {
+                Some(message) => Err(message),
+                None => Ok(resolved.map(ApprovedWindow::from)),
+            }
+        }
         // `auto_decision_exact` never actually returns `Deny` today (only
         // Allow-only standing grants exist) — this arm keeps the gate
         // correct regardless, mirroring `handle_ask`'s own defensive shape,
@@ -1891,7 +1929,13 @@ async fn approve(
         // P1 #B, run both before AND after activation) is what actually
         // guards the approve→dispatch gap a long human wait can open, not
         // this return value.
-        Ok(Ok(Decision::Allow)) => Ok(resolved.map(ApprovedWindow::from)),
+        // The human answered Allow on the probe's own card — only now may
+        // the deferred resolution error reach the agent (see the
+        // `resolution_failure` binding's doc above).
+        Ok(Ok(Decision::Allow)) => match resolution_failure {
+            Some(message) => Err(message),
+            None => Ok(resolved.map(ApprovedWindow::from)),
+        },
         Ok(Ok(Decision::Deny)) => Err("denied in weft".to_string()),
         // Timed out, or the sender was dropped (`AskRegistry::cancel`/
         // `cancel_for` — e.g. an engine/model switch tearing this session
@@ -2968,21 +3012,30 @@ fn recheck_stop_and_lease_before_backend(thread: i32, dir: &str, wt: Option<i32>
     if computer::stop_latched() {
         return Err(ComputerError::Disabled.to_string());
     }
-    // issue #160 round-23 P1 (Codex computer_srv.rs:2608): the "session deleted
-    // after recheck_after_guard, while the final resolve/injection was queued"
-    // gap is closed at ITS ROOT rather than here — the delete paths now CLEAR
-    // the control lease for any route they tear down (see `commands`'
-    // `clear_control_if_doomed`), so the lease check below already fails closed
-    // for a deleted route. A blanket revocation check HERE would be wrong: this
-    // helper is `dir`-blind at the thread level, and `delete_repo` revokes a
-    // SURVIVING thread (only one of its directions is gone), so a thread-level
-    // refuse would permanently break computer-use for that thread's OTHER
-    // directions. Lease-clearing is direction-precise (the lease names exactly
-    // one `(thread, dir)`), so it refuses only the torn-down route.
-    match computer::control_state() {
-        Some(holder) if holder.thread == thread && holder.dir == dir && holder.wt == wt => Ok(()),
-        Some(holder) => Err(ComputerError::Busy { thread: holder.thread, dir: holder.dir }.to_string()),
-        None => Err(
+    // The "session deleted after recheck_after_guard, while the final
+    // resolve/injection was queued" gap is closed at ITS ROOT rather than
+    // here — the delete paths CLEAR the control lease for any route they
+    // tear down (see `commands`' `clear_control_if_doomed`), so the lease
+    // check below already fails closed for a deleted route. A blanket
+    // revocation check HERE would be wrong: this helper is `dir`-blind at
+    // the thread level, and `delete_repo` revokes a SURVIVING thread (only
+    // one of its directions is gone), so a thread-level refuse would
+    // permanently break computer-use for that thread's OTHER directions.
+    // Lease-clearing is direction-precise (the lease names exactly one
+    // `(thread, dir)`), so it refuses only the torn-down route.
+    //
+    // `lease_check_for_injection` (not `control_state`): a clear that lands
+    // while an injection is in flight leaves the holder VISIBLE for the Stop
+    // surfaces but marks it doomed — `control_state` still reports it, and
+    // matching on that snapshot would wave a torn-down route straight into
+    // the backend. The dedicated check reads holder + doomed under one lock
+    // and refuses a doomed holder as Lost.
+    match computer::lease_check_for_injection(thread, dir, wt) {
+        computer::LeaseCheckOutcome::Authorized => Ok(()),
+        computer::LeaseCheckOutcome::Busy { thread, dir } => {
+            Err(ComputerError::Busy { thread, dir }.to_string())
+        }
+        computer::LeaseCheckOutcome::Lost => Err(
             "the control lease was lost just before injection (it may have expired, or been \
              cleared by a kill switch) — retry"
                 .to_string(),
@@ -8695,6 +8748,153 @@ mod tests {
 
         mock.windows_sequence.lock().unwrap_or_else(|e| e.into_inner()).clear();
         computer::clear_emergency_stop(computer::stop_generation());
+    }
+
+    /// A grant-less call whose window query resolves to NOTHING must not
+    /// learn that before authorization — an immediate `WindowNotFound`
+    /// return would be a window-existence oracle (instant error vs. approval
+    /// wait = one bit of desktop enumeration per probe, no human involved).
+    /// The failure opens a query-only card (no preview) and the error text
+    /// reaches the agent only AFTER the human answers Allow.
+    #[tokio::test]
+    async fn a_failed_window_resolve_defers_behind_a_card_and_surfaces_only_after_allow() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // An EMPTY desktop: any query fails to resolve.
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![]);
+        computer::clear_emergency_stop(computer::stop_generation());
+        let asks = AskRegistry::new(); // no grant
+        let thread = 904_601;
+        let dir = "lead";
+        let args = json!({"action": "left_click", "window": "ghost", "coordinate": [1, 1]});
+        let digest = args_digest(&args);
+
+        let asks_bg = asks.clone();
+        let args_bg = args.clone();
+        let handle = tokio::spawn(async move {
+            approve(&asks_bg, thread, dir, None, "left_click", &args_bg).await
+        });
+
+        let mut card = None;
+        for _ in 0..200 {
+            if let Some(a) = asks.open().into_iter().find(|a| a.thread == thread && a.dir == dir) {
+                card = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let card = card.expect(
+            "a failed resolve must open a card for the probe itself, never return the error \
+             straight to the grant-less agent",
+        );
+        assert!(
+            !handle.is_finished(),
+            "the call must be WAITING on the card — an early return is the existence oracle"
+        );
+        assert_eq!(
+            card.action_key,
+            crate::ask::action_key(&["gui", "left_click", "ghost", &digest]),
+            "an unresolved window keys the card by the QUERY alone — there is no identity to bind"
+        );
+        assert!(card.preview.is_none(), "no window resolved, so there is nothing to preview");
+
+        assert!(asks.answer(card.id, crate::ask::Answer::Allow));
+        let err = handle.await.unwrap().expect_err(
+            "even after Allow the action must fail — approval could not pin down a window identity",
+        );
+        assert!(err.contains("no visible window matched"), "{err}");
+
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The Deny half of the existence-oracle gate: denying the probe's card
+    /// returns the exact same "denied in weft" every other deny returns —
+    /// leaking nothing about whether the window existed.
+    #[tokio::test]
+    async fn a_failed_window_resolve_denied_card_returns_the_ordinary_deny() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![]);
+        computer::clear_emergency_stop(computer::stop_generation());
+        let asks = AskRegistry::new();
+        let thread = 904_602;
+        let dir = "lead";
+        let args = json!({"action": "left_click", "window": "ghost", "coordinate": [1, 1]});
+
+        let asks_bg = asks.clone();
+        let args_bg = args.clone();
+        let handle = tokio::spawn(async move {
+            approve(&asks_bg, thread, dir, None, "left_click", &args_bg).await
+        });
+
+        let mut card = None;
+        for _ in 0..200 {
+            if let Some(a) = asks.open().into_iter().find(|a| a.thread == thread && a.dir == dir) {
+                card = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let card = card.expect("the failed resolve must card, same as the Allow test");
+
+        assert!(asks.answer(card.id, crate::ask::Answer::Deny));
+        let err = handle.await.unwrap().expect_err("a denied card must deny the call");
+        assert_eq!(err, "denied in weft", "a deny must be byte-identical to any other deny");
+        assert!(
+            !err.contains("window"),
+            "the deny must not carry any window-existence information"
+        );
+
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// A query-only Always grant (mintable ONLY from a resolution-failure
+    /// card a human already approved) fast-paths future failing resolves of
+    /// that same query: the error returns without a fresh card. Successful
+    /// resolves can never match it — their keys carry id/app/title — so the
+    /// grant authorizes exactly the disclosure the human already made, and
+    /// nothing else.
+    #[tokio::test]
+    async fn a_query_only_always_grant_returns_the_resolve_failure_without_a_new_card() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![]);
+        computer::clear_emergency_stop(computer::stop_generation());
+        let asks = AskRegistry::new();
+        let thread = 904_603;
+        let dir = "lead";
+        let args = json!({"action": "left_click", "window": "ghost", "coordinate": [1, 1]});
+        let digest = args_digest(&args);
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: Vec::new(),
+            always: vec![crate::ask::AlwaysGrant {
+                thread,
+                dir: dir.to_string(),
+                action_key: crate::ask::action_key(&["gui", "left_click", "ghost", &digest]),
+            }],
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            approve(&asks, thread, dir, None, "left_click", &args),
+        )
+        .await
+        .expect("a standing grant must decide without blocking on any card");
+
+        let err = result.expect_err("the deferred resolve failure surfaces under the grant");
+        assert!(err.contains("no visible window matched"), "{err}");
+        assert!(asks.open().is_empty(), "the grant path must mint no card: {:?}", asks.open());
+
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// issue #160 round-29 P2 (Codex computer_srv.rs:2871): `activate_and_
