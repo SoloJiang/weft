@@ -624,7 +624,7 @@ async fn run_action(
     // `verify_approved_target`, right before it activates/injects — see that
     // function's own doc for the "approve one window, dispatch to a
     // different one" gap this closes.
-    let approved = approve(asks, thread, dir, action, args).await?;
+    let approved = approve(asks, thread, dir, wt, action, args).await?;
     // issue #160 round-2 P1 §1: re-check the kill switch AFTER the approval
     // await returns — NOT just once, up top, before that (potentially very
     // long, up to `bus::server::ASK_WAIT`) wait began. A human can hit Stop
@@ -954,7 +954,7 @@ async fn run_action(
                     // reuses it rather than re-resolving. See
                     // [`VerifiedWindowIdentity`] for the id-reuse hazard this
                     // closes.
-                    store_screenshot_preview(thread, &dir_owned, preview, VerifiedWindowIdentity::from_window(&w));
+                    store_screenshot_preview(thread, &dir_owned, wt, preview, VerifiedWindowIdentity::from_window(&w));
                 }
                 // issue #160 round-11 P1 #D: record THIS capture's own saved
                 // dimensions for (thread, dir, shot.window_id) — every
@@ -1479,6 +1479,7 @@ async fn approve(
     asks: &AskRegistry,
     thread: i32,
     dir: &str,
+    wt: Option<i32>,
     action: &str,
     args: &Value,
 ) -> Result<Option<ApprovedWindow>, String> {
@@ -1551,21 +1552,44 @@ async fn approve(
         // pool. The permit is scoped to this block alone — dropped the moment
         // the resolve returns, NEVER held across the human approval wait
         // below (which can last up to the full ask timeout).
+        // issue #160 round-28 P2 (Codex computer_srv.rs:1559): re-check the
+        // synchronous stop latch AND the direction-precise route revocation
+        // INSIDE the closure, after the semaphore/blocking-pool queue waits —
+        // exactly like the list_windows/screenshot/cursor closures. Round-27's
+        // permit bounds concurrency, but bounding IS queueing: a call can now
+        // sit parked on the semaphore (or the blocking pool) while a human
+        // hits Stop or a delete revokes the route, and without this recheck
+        // the eventually-scheduled closure would still enumerate the desktop
+        // under an authority that no longer exists.
+        let dir_recheck = dir.to_string();
         let window = {
             let _observe_permit = screenshot_semaphore()
                 .acquire()
                 .await
                 .map_err(|e| e.to_string())?;
-            match on_blocking(move || computer::resolve_window(b.as_ref(), &wq)).await? {
-                Ok(w) => w,
-                Err(ComputerError::AmbiguousWindow { .. }) => {
-                    return Err(
+            match on_blocking(move || {
+                if computer::stop_latched() {
+                    return Err(ComputerError::Disabled.to_string());
+                }
+                if route_revoked_sync(thread, &dir_recheck) {
+                    return Err(SESSION_GONE_MSG.to_string());
+                }
+                computer::resolve_window(b.as_ref(), &wq).map_err(|e| match e {
+                    // issue #160 round-23 P1: redacted — see the comment above
+                    // this block for why the candidate list must not reach the
+                    // agent from this authorization-time resolve.
+                    ComputerError::AmbiguousWindow { .. } => {
                         "the window query matched more than one window — narrow it to a unique \
                          application name or window title"
-                            .to_string(),
-                    );
-                }
-                Err(other) => return Err(other.to_string()),
+                            .to_string()
+                    }
+                    other => other.to_string(),
+                })
+            })
+            .await?
+            {
+                Ok(w) => w,
+                Err(message) => return Err(message),
             }
         };
         Some(window)
@@ -1689,7 +1713,7 @@ async fn approve(
         None => {}
     }
 
-    let preview = preview_for_action(thread, dir, risk, resolved.as_ref());
+    let preview = preview_for_action(thread, dir, wt, risk, resolved.as_ref());
     // issue #160 round-14 P1 (Codex computer_srv.rs:515): for an input (Write)
     // action, open the card ATOMICALLY with the "no other ask is already open
     // for this (thread, dir)" check — `check_suspended` above and this insert
@@ -2039,6 +2063,7 @@ pub fn args_digest(args: &Value) -> String {
 fn preview_for_action(
     thread: i32,
     dir: &str,
+    wt: Option<i32>,
     risk: crate::ask::RiskLevel,
     resolved: Option<&computer::WindowInfo>,
 ) -> Option<String> {
@@ -2057,7 +2082,7 @@ fn preview_for_action(
     // not the numeric id alone — see [`VerifiedWindowIdentity`]'s own doc for
     // the id-reuse hazard an id-only comparison left open.
     let target = VerifiedWindowIdentity::from_window(resolved?);
-    let (data_uri, stored) = last_screenshot_preview(thread, dir)?;
+    let (data_uri, stored) = last_screenshot_preview(thread, dir, wt)?;
     (stored == target).then_some(data_uri)
 }
 
@@ -2482,9 +2507,19 @@ impl VerifiedWindowIdentity {
     }
 }
 
-fn screenshot_previews() -> &'static Mutex<HashMap<(i32, String), (String, VerifiedWindowIdentity, u64)>> {
-    static PREVIEWS: OnceLock<Mutex<HashMap<(i32, String), (String, VerifiedWindowIdentity, u64)>>> =
-        OnceLock::new();
+/// Keyed by `(thread, dir, wt)` — the worktree id included since issue #160
+/// round-28 P2 (Codex computer_srv.rs:2488): sibling workers of ONE direction
+/// share `(thread, dir)` but are distinct sessions (distinct bearer tokens,
+/// distinct lease holders — see `computer::ControlHolder.wt`), so a
+/// `(thread, dir)`-keyed entry let worker A's freshly-captured preview attach
+/// to worker B's input approval card whenever their resolved windows matched —
+/// cross-session context the card's human should never be shown. Same widening
+/// `computer::record_shot_dims` got in round-26 (N3), for the same reason.
+fn screenshot_previews(
+) -> &'static Mutex<HashMap<(i32, String, Option<i32>), (String, VerifiedWindowIdentity, u64)>> {
+    static PREVIEWS: OnceLock<
+        Mutex<HashMap<(i32, String, Option<i32>), (String, VerifiedWindowIdentity, u64)>>,
+    > = OnceLock::new();
     PREVIEWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -2506,7 +2541,9 @@ const MAX_PREVIEWS: usize = 32;
 /// about to be written already exists (an UPDATE never grows the map, so it
 /// never needs to evict anything to make room for itself) — see this
 /// function's one caller for that guard.
-fn evict_oldest_if_full(map: &mut HashMap<(i32, String), (String, VerifiedWindowIdentity, u64)>) {
+fn evict_oldest_if_full(
+    map: &mut HashMap<(i32, String, Option<i32>), (String, VerifiedWindowIdentity, u64)>,
+) {
     if map.len() < MAX_PREVIEWS {
         return;
     }
@@ -2519,11 +2556,17 @@ fn evict_oldest_if_full(map: &mut HashMap<(i32, String), (String, VerifiedWindow
     }
 }
 
-fn store_screenshot_preview(thread: i32, dir: &str, preview: String, identity: VerifiedWindowIdentity) {
+fn store_screenshot_preview(
+    thread: i32,
+    dir: &str,
+    wt: Option<i32>,
+    preview: String,
+    identity: VerifiedWindowIdentity,
+) {
     let mut g = screenshot_previews().lock().unwrap_or_else(|e| e.into_inner());
-    let key = (thread, dir.to_string());
+    let key = (thread, dir.to_string(), wt);
     // Only evict to make room for a genuinely NEW key — refreshing an
-    // EXISTING (thread, dir)'s preview (the common case: a session that
+    // EXISTING (thread, dir, wt)'s preview (the common case: a session that
     // screenshots repeatedly) must not count against capacity or trigger an
     // eviction of some unrelated session's entry.
     if !g.contains_key(&key) {
@@ -2533,13 +2576,17 @@ fn store_screenshot_preview(thread: i32, dir: &str, preview: String, identity: V
 }
 
 /// The most recent screenshot preview (and the window id it came from) for
-/// `(thread, dir)`, if any — see [`screenshot_previews`]'s doc. Read only
+/// `(thread, dir, wt)`, if any — see [`screenshot_previews`]'s doc. Read only
 /// from [`preview_for_action`] within this same module now (the round-2 P1
 /// server-side gate owns preview attachment; `bus::server::handle_ask` no
 /// longer does — see this module's own top doc comment).
-fn last_screenshot_preview(thread: i32, dir: &str) -> Option<(String, VerifiedWindowIdentity)> {
+fn last_screenshot_preview(
+    thread: i32,
+    dir: &str,
+    wt: Option<i32>,
+) -> Option<(String, VerifiedWindowIdentity)> {
     let g = screenshot_previews().lock().unwrap_or_else(|e| e.into_inner());
-    g.get(&(thread, dir.to_string()))
+    g.get(&(thread, dir.to_string(), wt))
         .map(|(preview, identity, _ts)| (preview.clone(), identity.clone()))
 }
 
@@ -3099,6 +3146,21 @@ async fn append_audit(db: &Db, thread: i32, dir: &str, wt: Option<i32>, entry: &
     // reaches this check after deletion began is refused here; the lead lane
     // is covered too (`RouteRevocation::Whole` matches every lane). Best-effort
     // like the rest of this function — a refused line just goes unlogged.
+    //
+    // issue #160 round-28 P2 (Codex computer_srv.rs:3106): that recheck alone
+    // was still check-then-act across `.await`s — a delete could publish its
+    // revocation AND run `remove_computer_output_*` entirely BETWEEN this
+    // check passing and the write below landing, recreating the subtree for
+    // the deleted session anyway. Hold [`revocation_txn_lock`] across the
+    // whole check → create_dir_all → write sequence: every delete flow holds
+    // that same lock from BEFORE it publishes revocation until AFTER its
+    // output removal (see `commands::delete_*_after_fence`), so either this
+    // append finishes first (and the delete's later removal sweeps the line
+    // away) or the delete finishes first (and the check here sees the
+    // revocation and refuses). Lock order is `revocation_txn_lock` →
+    // `audit_write_lock` (inside `write_audit_line_locked`), and the delete
+    // flows never take `audit_write_lock` at all, so no cycle exists.
+    let _revocation_txn = revocation_txn_lock().lock().await;
     if route_revoked_sync(thread, dir) {
         return;
     }
@@ -4256,7 +4318,7 @@ mod tests {
         let args = json!({"action": "type", "window": "notes", "text": "hunter2"});
 
         let asks_bg = asks.clone();
-        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "type", &args).await });
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, None, "type", &args).await });
 
         let mut card = None;
         for _ in 0..200 {
@@ -4314,7 +4376,7 @@ mod tests {
         let args = json!({"action": "left_click", "window": "notes", "coordinate": [1, 1]});
 
         let asks_bg = asks.clone();
-        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "left_click", &args).await });
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, None, "left_click", &args).await });
 
         let mut card = None;
         for _ in 0..200 {
@@ -4374,7 +4436,7 @@ mod tests {
 
         let args = json!({"action": "screenshot", "window": "notes"});
         let asks_bg = asks.clone();
-        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "screenshot", &args).await });
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, None, "screenshot", &args).await });
 
         let mut card = None;
         for _ in 0..200 {
@@ -4406,7 +4468,7 @@ mod tests {
 
         let args = json!({"action": "list_windows"});
         let asks_bg = asks.clone();
-        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "list_windows", &args).await });
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, None, "list_windows", &args).await });
 
         let mut card = None;
         for _ in 0..200 {
@@ -4477,7 +4539,7 @@ mod tests {
         // No card ever appears — this must resolve on its own, promptly.
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            approve(&asks, thread, dir, "screenshot", &args),
+            approve(&asks, thread, dir, None, "screenshot", &args),
         )
         .await
         .expect("an exact Always grant must auto-approve without ever needing a human answer");
@@ -5284,7 +5346,7 @@ mod tests {
             always: vec![crate::ask::AlwaysGrant { thread, dir: dir.to_string(), action_key }],
         });
 
-        let approved = tokio::time::timeout(std::time::Duration::from_secs(5), approve(&asks, thread, dir, "left_click", &args))
+        let approved = tokio::time::timeout(std::time::Duration::from_secs(5), approve(&asks, thread, dir, None, "left_click", &args))
             .await
             .expect("must resolve without ever needing a human answer")
             .expect("an exact identity match must auto-approve");
@@ -5354,7 +5416,7 @@ mod tests {
 
         let asks_bg = asks.clone();
         let args_bg = args.clone();
-        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "left_click", &args_bg).await });
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, None, "left_click", &args_bg).await });
 
         let mut card = None;
         for _ in 0..200 {
@@ -5436,7 +5498,7 @@ mod tests {
 
         let asks_bg = asks.clone();
         let args_bg = args.clone();
-        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "left_click", &args_bg).await });
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, None, "left_click", &args_bg).await });
 
         let mut card = None;
         for _ in 0..200 {
@@ -5502,7 +5564,7 @@ mod tests {
             always: vec![crate::ask::AlwaysGrant { thread, dir: dir.to_string(), action_key }],
         });
 
-        let approved = tokio::time::timeout(std::time::Duration::from_secs(5), approve(&asks, thread, dir, "left_click", &args))
+        let approved = tokio::time::timeout(std::time::Duration::from_secs(5), approve(&asks, thread, dir, None, "left_click", &args))
             .await
             .expect("must resolve without ever needing a human answer")
             .expect("an exact id+app+title match must auto-approve");
@@ -5534,11 +5596,11 @@ mod tests {
         });
 
         let list_windows_args = json!({"action": "list_windows"});
-        let approved_lw = approve(&asks, thread, dir, "list_windows", &list_windows_args).await.unwrap();
+        let approved_lw = approve(&asks, thread, dir, None, "list_windows", &list_windows_args).await.unwrap();
         assert!(approved_lw.is_none());
 
         let wait_args = json!({"action": "wait", "duration_ms": 1});
-        let approved_wait = approve(&asks, thread, dir, "wait", &wait_args).await.unwrap();
+        let approved_wait = approve(&asks, thread, dir, None, "wait", &wait_args).await.unwrap();
         assert!(
             approved_wait.is_none(),
             "wait is Write-classified but has no window argument to bind: {approved_wait:?}"
@@ -5579,7 +5641,7 @@ mod tests {
         });
 
         let screenshot_args = json!({"action": "screenshot", "window": "anything"});
-        let approved = approve(&asks, thread, dir, "screenshot", &screenshot_args).await.unwrap();
+        let approved = approve(&asks, thread, dir, None, "screenshot", &screenshot_args).await.unwrap();
         assert_eq!(
             approved,
             Some(ApprovedWindow { id: 907_602, app: "Anything".into(), title: "anything window".into() }),
@@ -5618,7 +5680,7 @@ mod tests {
         });
 
         let screenshot_args = json!({"action": "screenshot", "window": "nonexistent-window-query"});
-        let err = approve(&asks, thread, dir, "screenshot", &screenshot_args).await.unwrap_err();
+        let err = approve(&asks, thread, dir, None, "screenshot", &screenshot_args).await.unwrap_err();
         assert!(err.to_lowercase().contains("no visible window"), "{err}");
     }
 
@@ -5775,7 +5837,7 @@ mod tests {
 
         let asks_bg = asks.clone();
         let args_bg = args.clone();
-        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, "screenshot", &args_bg).await });
+        let handle = tokio::spawn(async move { approve(&asks_bg, thread, dir, None, "screenshot", &args_bg).await });
 
         let mut card = None;
         for _ in 0..200 {
@@ -7637,7 +7699,7 @@ mod tests {
         computer::trip_stop_latch();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            approve(&asks, thread, dir, "wait", &json!({"duration_ms": 5})),
+            approve(&asks, thread, dir, None, "wait", &json!({"duration_ms": 5})),
         )
         .await
         .expect("the post-insert latch check must fail fast, never block on the card");
@@ -7650,6 +7712,65 @@ mod tests {
             asks.open()
         );
 
+        computer::clear_emergency_stop(computer::stop_generation());
+    }
+
+    /// issue #160 round-28 P2 (Codex computer_srv.rs:1559): the authorization-
+    /// time window resolve rechecks the stop latch (and route revocation)
+    /// INSIDE its blocking closure — a windowed request that was parked on the
+    /// screenshot semaphore or the blocking-pool queue when a human hit Stop
+    /// must fail closed WITHOUT enumerating the desktop and without minting a
+    /// card. Proven by seeding `windows_sequence` with one entry: had the
+    /// closure reached `resolve_window`, `list_windows` would have popped it.
+    #[tokio::test]
+    async fn approve_authorization_resolve_fails_closed_after_stop_without_enumerating() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        {
+            let mut seq = mock.windows_sequence.lock().unwrap_or_else(|e| e.into_inner());
+            seq.clear();
+            seq.push_back(vec![computer::WindowInfo {
+                id: 904_501,
+                app: "Notes".into(),
+                title: "notes".into(),
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            }]);
+        }
+        computer::clear_emergency_stop(computer::stop_generation());
+        let asks = AskRegistry::new();
+
+        computer::trip_stop_latch();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            approve(
+                &asks,
+                904_501,
+                "lead",
+                None,
+                "screenshot",
+                &json!({"action": "screenshot", "window": "notes"}),
+            ),
+        )
+        .await
+        .expect("the in-closure latch recheck must fail fast, never block on a card");
+
+        let err = result.expect_err("a tripped stop latch must fail the resolve closed");
+        assert!(err.contains("disabled"), "expected the disabled rejection, got: {err}");
+        assert!(asks.open().is_empty(), "no card may be minted after Stop: {:?}", asks.open());
+        assert_eq!(
+            mock.windows_sequence.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "the closure must refuse BEFORE resolve_window ever enumerates (nothing popped)"
+        );
+
+        mock.windows_sequence.lock().unwrap_or_else(|e| e.into_inner()).clear();
         computer::clear_emergency_stop(computer::stop_generation());
     }
 
@@ -7672,7 +7793,7 @@ mod tests {
         for _ in 0..MAX_OPEN_OBSERVE_ASKS {
             let a = asks.clone();
             parked.push(tokio::spawn(async move {
-                let _ = approve(&a, thread, dir, "list_windows", &json!({})).await;
+                let _ = approve(&a, thread, dir, None, "list_windows", &json!({})).await;
             }));
         }
         // Wait (bounded) until all under-cap cards are actually open.
@@ -7687,7 +7808,7 @@ mod tests {
         // The one-over call must reject immediately — no fourth card.
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            approve(&asks, thread, dir, "list_windows", &json!({})),
+            approve(&asks, thread, dir, None, "list_windows", &json!({})),
         )
         .await
         .expect("an over-cap observe call must fail fast, never open another card");
@@ -7822,27 +7943,28 @@ mod tests {
 
     #[test]
     fn evict_oldest_if_full_removes_only_the_single_oldest_entry_at_capacity() {
-        let mut map: HashMap<(i32, String), (String, VerifiedWindowIdentity, u64)> = HashMap::new();
+        let mut map: HashMap<(i32, String, Option<i32>), (String, VerifiedWindowIdentity, u64)> =
+            HashMap::new();
         for i in 0..MAX_PREVIEWS as i32 {
-            map.insert((i, "d".to_string()), (format!("p{i}"), pid(i as u32), i as u64));
+            map.insert((i, "d".to_string(), None), (format!("p{i}"), pid(i as u32), i as u64));
         }
         assert_eq!(map.len(), MAX_PREVIEWS);
 
         // Simulate the (MAX_PREVIEWS + 1)th write: evict, then insert.
         evict_oldest_if_full(&mut map);
         map.insert(
-            (MAX_PREVIEWS as i32, "d".to_string()),
+            (MAX_PREVIEWS as i32, "d".to_string(), None),
             (format!("p{MAX_PREVIEWS}"), pid(MAX_PREVIEWS as u32), MAX_PREVIEWS as u64),
         );
 
         assert_eq!(map.len(), MAX_PREVIEWS, "capacity must stay bounded");
         assert!(
-            !map.contains_key(&(0, "d".to_string())),
+            !map.contains_key(&(0, "d".to_string(), None)),
             "the OLDEST entry (ts=0) must be evicted"
         );
         for i in 1..=MAX_PREVIEWS as i32 {
             assert!(
-                map.contains_key(&(i, "d".to_string())),
+                map.contains_key(&(i, "d".to_string(), None)),
                 "every entry newer than the evicted one must remain: missing {i}"
             );
         }
@@ -7850,8 +7972,9 @@ mod tests {
 
     #[test]
     fn evict_oldest_if_full_is_a_no_op_below_capacity() {
-        let mut map: HashMap<(i32, String), (String, VerifiedWindowIdentity, u64)> = HashMap::new();
-        map.insert((1, "d".to_string()), ("p".to_string(), pid(1), 100));
+        let mut map: HashMap<(i32, String, Option<i32>), (String, VerifiedWindowIdentity, u64)> =
+            HashMap::new();
+        map.insert((1, "d".to_string(), None), ("p".to_string(), pid(1), 100));
         evict_oldest_if_full(&mut map);
         assert_eq!(map.len(), 1, "must not evict anything below capacity");
     }
@@ -7862,9 +7985,9 @@ mod tests {
         // FIRST one again (same key) — this must never trigger an eviction,
         // since it doesn't grow the map.
         for i in 0..MAX_PREVIEWS as i32 {
-            store_screenshot_preview(910_000 + i, "lead", format!("p{i}"), pid(i as u32));
+            store_screenshot_preview(910_000 + i, "lead", None, format!("p{i}"), pid(i as u32));
         }
-        store_screenshot_preview(910_000, "lead", "refreshed".to_string(), pid(999));
+        store_screenshot_preview(910_000, "lead", None, "refreshed".to_string(), pid(999));
 
         let g = screenshot_previews().lock().unwrap();
         assert!(
@@ -7873,7 +7996,7 @@ mod tests {
             g.len()
         );
         assert_eq!(
-            g.get(&(910_000, "lead".to_string())).map(|(p, ..)| p.clone()),
+            g.get(&(910_000, "lead".to_string(), None)).map(|(p, ..)| p.clone()),
             Some("refreshed".to_string()),
             "the refreshed value must actually be stored"
         );
@@ -7893,15 +8016,38 @@ mod tests {
             "the SAME numeric id with a different app/title must NOT compare equal"
         );
 
-        // Unique (thread, dir) key — no process-wide lock needed (see
+        // Unique (thread, dir, wt) key — no process-wide lock needed (see
         // `process_state_test_lock`'s doc on keyed vs unkeyed state).
-        store_screenshot_preview(920_001, "lead", "PREVIEW".to_string(), captured.clone());
-        let (data, stored) = last_screenshot_preview(920_001, "lead").unwrap();
+        store_screenshot_preview(920_001, "lead", None, "PREVIEW".to_string(), captured.clone());
+        let (data, stored) = last_screenshot_preview(920_001, "lead", None).unwrap();
         assert_eq!(data, "PREVIEW", "the preview data URI round-trips");
         assert_eq!(stored, captured, "the FULL identity round-trips, not just the id");
         assert_ne!(
             stored, id_reused,
             "a later window that merely reused the numeric id won't match the stored preview"
         );
+    }
+
+    /// issue #160 round-28 P2 (Codex computer_srv.rs:2488): sibling workers of
+    /// ONE direction share `(thread, dir)` but are distinct sessions keyed by
+    /// `wt` — one sibling's preview must never be readable under (or attach to
+    /// a card for) another's key, the same isolation `computer::shot_dims_for`
+    /// got in round-26.
+    #[test]
+    fn screenshot_previews_are_isolated_per_worktree_for_sibling_workers() {
+        let identity = pid(42);
+        store_screenshot_preview(930_001, "0", Some(1), "SIBLING-A".to_string(), identity.clone());
+
+        assert!(
+            last_screenshot_preview(930_001, "0", Some(2)).is_none(),
+            "a sibling worker differing only by wt must not see another's preview"
+        );
+        assert!(
+            last_screenshot_preview(930_001, "0", None).is_none(),
+            "the lead lane (wt=None) must not see a worker's preview either"
+        );
+        let (data, stored) = last_screenshot_preview(930_001, "0", Some(1)).unwrap();
+        assert_eq!(data, "SIBLING-A", "the owning (thread, dir, wt) still reads its own entry");
+        assert_eq!(stored, identity);
     }
 }

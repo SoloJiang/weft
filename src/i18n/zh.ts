@@ -839,6 +839,13 @@ export const zh = {
     computerUseTitle: "允许 computer use",
     computerUseHint:
       "允许 agent 查看并操控本机其他应用窗口：枚举窗口、对指定应用窗口截图，并在你批准后向其注入点击、滚动、拖拽、文本输入与键盘快捷键。默认关闭。截图会排除 Weft 自身窗口与已知的终端应用窗口(尽力而为的清单，并非穷尽)。每次调用会先在「待你处理」中征求批准，但你在卡片上给出的 Always／Full 授权会自动放行后续同类调用；开启或关闭立即生效，对已在运行的会话也一样——下一次工具调用就会按当前设置校验，无需重启。",
+    // 由 macOS（而非 webview）渲染：Automation（Apple Events）授权弹窗的用途
+    // 说明。目录仍是唯一权威（CLAUDE.md：用户可见文案只经 en.ts/zh.ts）；
+    // 生成器把这个 key 镜像进打包携带的本地化 InfoPlist.strings——修改后运行
+    // `node --experimental-strip-types scripts/gen-infoplist-strings.mjs`，
+    // 漂移会被 tests/frontend/infoPlistStrings.test.ts 直接判失败。
+    computerUseMacosAutomationPrompt:
+      "Weft 会在点击或输入前，通过 System Events 把你批准的 computer use 操作所指向的窗口调到最前。仅当你在设置中启用了 computer use、且批准了对应操作时才会执行。",
     computerControlActive:
       "有 agent 正在控制桌面（任务 {{dir}}，线程 {{thread}}）。按 Esc 或点击「立即停止」即可中断。",
     computerControlStop: "立即停止",

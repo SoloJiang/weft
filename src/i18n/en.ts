@@ -869,6 +869,16 @@ export const en = {
     computerUseTitle: "Allow computer use",
     computerUseHint:
       "Lets an agent see and control other application windows on this computer: enumerate windows, screenshot a named window, and — with your approval — click, scroll, drag, type text, and send keyboard shortcuts into it. Off by default. Screenshots exclude Weft's own window and known terminal-emulator windows (a best-effort list, not an exhaustive one). Each call asks in Needs you first, but an Always or Full grant you give there auto-approves matching later calls. Turning this on or off takes effect immediately, even for sessions already running — the very next tool call is checked against the current setting, with no restart needed.",
+    // Rendered by macOS, not the webview: the Automation (Apple Events)
+    // consent prompt's usage description. The catalogs stay authoritative
+    // (CLAUDE.md: user-facing strings only through en.ts/zh.ts); a generator
+    // mirrors this key into the localized InfoPlist.strings resources the
+    // bundle ships — run `node --experimental-strip-types
+    // scripts/gen-infoplist-strings.mjs` after editing, and keep
+    // src-tauri/Info.plist's own fallback string equal to the English copy
+    // (tests/frontend/infoPlistStrings.test.ts fails on any drift).
+    computerUseMacosAutomationPrompt:
+      "Weft brings the window an approved computer-use action targets to the front (via System Events) before it clicks or types. This runs only for actions you approve while Computer Use is enabled in Settings.",
     computerControlActive:
       "An agent is controlling the desktop (task {{dir}} in thread {{thread}}). Press Esc or click Stop to cut it off.",
     computerControlStop: "Stop",

@@ -771,6 +771,41 @@ function AutomationSettings() {
   // no other consumer.
   const [computerUse, setComputerUseState] = useState(false);
   const [computerUseLoaded, setComputerUseLoaded] = useState(false);
+  // issue #160 round-28 P2 (Codex SettingsDialog.tsx:796): true while a
+  // toggle's own optimistic set + backend call is in flight, so the refresh
+  // poll below never clobbers it with a stale pre-toggle read racing back.
+  const computerUseToggleInFlightRef = useRef(false);
+
+  // issue #160 round-28 P2 (Codex SettingsDialog.tsx:796): Emergency Stop
+  // (the banner's Stop button or the global Esc shortcut) flips
+  // computer_use_enabled off in the BACKEND while this pane can already be
+  // mounted — a mount-time read alone leaves the toggle showing ON until the
+  // dialog is reopened, telling the human computer use is still armed right
+  // after they killed it. Re-poll while mounted, on the same 3s cadence
+  // `ComputerControlBanner` uses for the same state; a rejected poll keeps
+  // the last known value (never flips the toggle on a transient IPC failure),
+  // and an in-flight toggle wins over any concurrently-resolving poll. The
+  // OTHER toggles in this pane deliberately stay mount-time reads: nothing in
+  // the backend flips them out from under an open dialog the way Emergency
+  // Stop flips this one.
+  useEffect(() => {
+    let alive = true;
+    const h = setInterval(() => {
+      if (computerUseToggleInFlightRef.current) return;
+      api.getComputerUseEnabled().then(
+        (enabled) => {
+          if (!alive || computerUseToggleInFlightRef.current) return;
+          setComputerUseState(enabled);
+          setComputerUseLoaded(true);
+        },
+        () => {},
+      );
+    }, 3000);
+    return () => {
+      alive = false;
+      clearInterval(h);
+    };
+  }, []);
 
   useEffect(() => {
     void api.imGetSettings().then((s) => {
@@ -854,6 +889,7 @@ function AutomationSettings() {
 
   async function toggleComputerUse(on: boolean) {
     const prev = computerUse;
+    computerUseToggleInFlightRef.current = true;
     setComputerUseState(on);
     try {
       await api.setComputerUseEnabled(on);
@@ -871,6 +907,8 @@ function AutomationSettings() {
         setComputerUseState(prev);
       }
       throw err;
+    } finally {
+      computerUseToggleInFlightRef.current = false;
     }
   }
 
