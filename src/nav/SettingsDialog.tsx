@@ -752,7 +752,7 @@ function AutomationSettings() {
   } = useStore();
   const [remoteStandby, setRemoteStandby] = useState(false);
   const [remoteStandbyLoaded, setRemoteStandbyLoaded] = useState(false);
-  // issue #97: auto fail-over to the fallback engine when the current one
+  // auto fail-over to the fallback engine when the current one
   // reports its usage limit exceeded. Own local+effect pair (mirrors
   // remoteStandby just below) rather than the global store — this is a
   // narrow, rarely-touched preference with no other consumer.
@@ -765,17 +765,17 @@ function AutomationSettings() {
   // above) — a narrow, rarely-touched preference with no other consumer.
   const [autoMerge, setAutoMergeState] = useState(false);
   const [autoMergeLoaded, setAutoMergeLoaded] = useState(false);
-  // issue #160 M1: OS-level computer use (window enumeration + screenshot of a
+  // OS-level computer use (window enumeration + screenshot of a
   // named app window) for visual verification. Own local+effect pair (mirrors
   // automaticRouting just above) — a narrow, rarely-touched preference with
   // no other consumer.
   const [computerUse, setComputerUseState] = useState(false);
   const [computerUseLoaded, setComputerUseLoaded] = useState(false);
-  // issue #160 round-28 P2 (Codex SettingsDialog.tsx:796): true while a
+  // true while a
   // toggle's own optimistic set + backend call is in flight, so the refresh
   // poll below never clobbers it with a stale pre-toggle read racing back.
   const computerUseToggleInFlightRef = useRef(false);
-  // issue #160 round-33 P2 (Codex SettingsDialog.tsx:798): generation counter
+  // generation counter
   // bumped every time a toggle STARTS. The in-flight flag alone left a
   // gap: a poll's read could be issued before the toggle began, and by the
   // time it resolved the toggle had already finished and cleared the flag —
@@ -786,7 +786,7 @@ function AutomationSettings() {
   // started since — the same generational guard `ComputerControlBanner`'s
   // `tickSeqRef` uses for its own reordering hazard.
   const computerUseGenRef = useRef(0);
-  // issue #160 round-35 P2 (Codex SettingsDialog.tsx:809): single-flight for
+  // single-flight for
   // the poll itself — the generation guard only orders polls around LOCAL
   // toggles, so two overlapping polls straddling an EXTERNAL Emergency Stop
   // could still apply out of order (the older `true` overwriting the newer
@@ -795,7 +795,7 @@ function AutomationSettings() {
   // `ComputerControlBanner`'s `tickInFlightRef`.
   const computerUsePollInFlightRef = useRef(false);
 
-  // issue #160 round-28 P2 (Codex SettingsDialog.tsx:796): Emergency Stop
+  // Emergency Stop
   // (the banner's Stop button or the global Esc shortcut) flips
   // computer_use_enabled off in the BACKEND while this pane can already be
   // mounted — a mount-time read alone leaves the toggle showing ON until the
@@ -811,11 +811,11 @@ function AutomationSettings() {
     let alive = true;
     const h = setInterval(() => {
       if (computerUseToggleInFlightRef.current) return;
-      // round-35 P2: single-flight — skip the tick if the previous poll
+      // Single-flight — skip the tick if the previous poll
       // hasn't resolved; see `computerUsePollInFlightRef`'s doc.
       if (computerUsePollInFlightRef.current) return;
       computerUsePollInFlightRef.current = true;
-      // round-33 P2: capture the toggle generation BEFORE issuing the read —
+      // Capture the toggle generation BEFORE issuing the read —
       // see `computerUseGenRef`'s doc for the stale-overwrite this closes.
       const gen = computerUseGenRef.current;
       api.getComputerUseEnabled().then(
@@ -919,7 +919,7 @@ function AutomationSettings() {
 
   async function toggleComputerUse(on: boolean) {
     const prev = computerUse;
-    // round-33 P2: invalidate every poll read issued BEFORE this toggle —
+    // Invalidate every poll read issued BEFORE this toggle —
     // their results are stale the instant the user acts.
     computerUseGenRef.current += 1;
     computerUseToggleInFlightRef.current = true;
@@ -927,7 +927,7 @@ function AutomationSettings() {
     try {
       await api.setComputerUseEnabled(on);
     } catch (err) {
-      // issue #160 round-21 P2 (Codex SettingsDialog.tsx:863): a FAILED disable
+      // a FAILED disable
       // still trips the backend's in-memory stop latch, so Computer Use stays
       // disabled even though persistence failed — the requested/`prev` state is
       // NOT authoritative (restoring `true` would show an "on" toggle that

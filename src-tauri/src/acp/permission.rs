@@ -120,8 +120,8 @@ pub enum PermissionIntent {
     /// `weft_computer`'s MCP path (`bus::server::summarize`) uses, so a
     /// `left_click` reads as the same tier from either route.
     Gui { action: String },
-    /// A call to weft's OWN injected `weft_computer` MCP tool (issue #160
-    /// round-29 P1, Codex permission.rs:173) — recognized by the unambiguous
+    /// A call to weft's OWN injected `weft_computer` MCP tool
+    /// — recognized by the unambiguous
     /// server-qualified tool-name forms in the title (see
     /// [`is_weft_computer_mcp_call`]) and pulled out BEFORE the native-GUI
     /// classification, which would otherwise match the same
@@ -151,7 +151,7 @@ pub enum PermissionIntent {
 ///  2. its structured `rawInput.action` names a RECOGNIZED GUI action (the
 ///     same closed word list `ask::classify_gui_action` tiers).
 ///
-/// issue #160 round-25 P1 (Codex permission.rs:145): title alone is NOT an
+/// title alone is NOT an
 /// authoritative, immutable tool identity — the only evidence that a native
 /// GUI toolCall arrives titled exactly `computer`/`browser` is the
 /// `available_commands_update` SLASH-COMMAND listing in
@@ -187,7 +187,7 @@ fn is_gui_tool_call(tc: &Value) -> bool {
 }
 
 /// Whether this toolCall is weft's OWN injected `weft_computer` MCP tool
-/// (issue #160 round-29 P1, Codex permission.rs:173). The round-27 broadening
+/// . the earlier broadening
 /// of [`is_gui_tool_call`] (any `rawInput.action` naming a known GUI verb)
 /// also matches the injected MCP tool's OWN argument shape — its `rawInput`
 /// IS `{"action": "left_click", ...}` — so without this carve-out, an agent
@@ -292,7 +292,7 @@ pub fn intent_from_params(params: &Value) -> PermissionIntent {
     {
         return PermissionIntent::Command(cmd.to_string());
     }
-    // issue #160 round-29 P1: weft's own injected `weft_computer` MCP tool,
+    // weft's own injected `weft_computer` MCP tool,
     // pulled out BEFORE the native-GUI branch below (its rawInput carries the
     // same `action` shape that branch matches — see
     // `is_weft_computer_mcp_call`'s doc). AFTER the command check above,
@@ -329,7 +329,7 @@ pub fn intent_from_params(params: &Value) -> PermissionIntent {
     }
 }
 
-/// The canonical, EXACT action identity for an Always grant (issue #89).
+/// The canonical, EXACT action identity for an Always grant.
 ///
 /// The stringified `rawInput` alone is NOT it. ACP lets a request carry its
 /// target only in `toolCall.locations` — which is exactly where
@@ -378,7 +378,7 @@ pub fn intent_key_from_params(params: &Value) -> String {
         .and_then(|k| k.as_str())
         .unwrap_or("tool");
     let raw = tc.get("rawInput").cloned().unwrap_or(Value::Null);
-    // Mirrors `intent_from_params`'s round-29 carve-out, INCLUDING its
+    // Mirrors `intent_from_params`'s carve-out, INCLUDING its
     // command-first precedence (the `command` guard here — a weft-titled
     // payload carrying `rawInput.command` classifies as the shell command it
     // would run, so it must key as one too). Defensive only: the ACP consumer
@@ -930,7 +930,7 @@ mod tests {
         );
     }
 
-    /// issue #160 round-25 P1 (Codex permission.rs:145): a native GUI toolCall
+    /// a native GUI toolCall
     /// whose display title is NOT the bare `computer`/`browser` string —
     /// action-specific, localized, or otherwise renamed — is STILL recognized
     /// as GUI from its structured `rawInput.action`, so it can never slip down
@@ -972,10 +972,10 @@ mod tests {
         );
     }
 
-    /// issue #160 round-29 P1 (Codex permission.rs:173): a permission request
+    /// a permission request
     /// for weft's OWN injected `weft_computer` MCP tool — recognized by its
     /// server-qualified tool-name title — is NOT a native GUI intent, even
-    /// though its `rawInput` carries the exact `action` shape the round-25
+    /// though its `rawInput` carries the exact `action` shape the earlier
     /// broadening matches. It classifies as `WeftComputerMcp` (auto-allowed by
     /// the ACP consumer; the server-side gate chain owns the real approval)
     /// instead of being rejected before weft's own server ever sees the call.
@@ -1002,7 +1002,7 @@ mod tests {
         }
     }
 
-    /// The round-29 carve-out keeps `intent_from_params`'s command-first
+    /// the earlier carve-out keeps `intent_from_params`'s command-first
     /// precedence: a weft-computer-titled payload smuggling a
     /// `rawInput.command` classifies (and keys) as the shell command it would
     /// run — carded as one, never auto-allowed as an MCP computer call.

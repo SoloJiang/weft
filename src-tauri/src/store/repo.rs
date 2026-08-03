@@ -1966,8 +1966,8 @@ pub async fn list_threads(db: &Db, workspace_id: i32) -> Result<Vec<thread::Mode
         .await?)
 }
 
-/// Deduped thread ids that own at least one direction in `repo_id` — issue #160
-/// round-22 P1 (Codex computer_srv.rs:385). `delete_repo` removes those
+/// Deduped thread ids that own at least one direction in `repo_id`
+/// `delete_repo` removes those
 /// directions (the threads themselves survive), so its caller revokes these
 /// threads' computer routes; `session_is_live` then refuses the removed
 /// directions while still allowing each thread's surviving ones.
@@ -6282,7 +6282,7 @@ pub async fn list_lead_messages(db: &Db, thread_id: i32) -> Result<Vec<lead_mess
 /// Only the tool rows of ONE session that can possibly carry an inline-image
 /// collection (`content` mentions `"images"`), oldest-first — the narrow
 /// candidate set `lead_chat::engine::enforce_durable_inline_image_cap_db`
-/// prunes over. issue #160 round-26 P2 (Codex engine.rs:1162): that function
+/// prunes over. that function
 /// used to load the thread's ENTIRE message history on every image-bearing
 /// tool result and filter in memory — a screenshot-heavy session repeatedly
 /// re-scanned all historical content (other sessions included), quadratic as

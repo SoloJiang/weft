@@ -194,7 +194,7 @@ function formatDetail(detail: string): { text: string; omittedChars: number } {
 
 /** A GUI-input-style ask's latest screenshot (issue: tool row / ask preview
  *  images) — rendered above the raw-detail area, same "visible by default,
- *  not opt-in" stance as `DetailPreview` (round-2 review, issue #101):
+ *  not opt-in" stance as `DetailPreview`:
  *  whether or not the raw JSON detail also expands is orthogonal to whether
  *  there's a screenshot to show. `object-contain` (not `cover`, unlike the
  *  cropped `Attachment` thumbnail) — a GUI screenshot's aspect ratio and full

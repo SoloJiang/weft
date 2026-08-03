@@ -162,7 +162,7 @@ pub fn perm_card(ask: &crate::ask::Ask, lang: &str) -> Value {
         // 实际命令不忠实是欺骗面（且 lark_md 不支持 ``` 代码块——那是
         // markdown 组件独有），原样直出才可信。
         //
-        // issue #160 round-4 P1 §1: 出站到 IM 的这一处必须优先读
+        // 出站到 IM 的这一处必须优先读
         // `detail_redacted`（本地桌面卡才用完整 `ask.detail`）——否则
         // `weft_computer` 的 `type` 原文键入内容在人审批之前就随这张卡
         // 发到了第三方（Lark）。`unwrap_or(&ask.detail)` 兜底：没有脱敏版
@@ -537,7 +537,7 @@ mod tests {
         );
     }
 
-    /// issue #160 round-4 P1 §1: when `detail_redacted` is set, the outbound
+    /// when `detail_redacted` is set, the outbound
     /// IM card must render THAT, never the raw `detail` — this is the exact
     /// leak the fix closes (a `weft_computer` `type` action's literal
     /// keystrokes must never reach the Lark bridge, even though the LOCAL

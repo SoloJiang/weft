@@ -1026,7 +1026,7 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
         &program,
         &read_only,
         // The curator never receives the computer-use injection, so it has no
-        // env to carry (issue #160 round-15 P1 — see `Injection::env`).
+        // env to carry.
         &[],
         cwd,
         crate::proc_registry::Owner::curator(),

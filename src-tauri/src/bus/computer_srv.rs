@@ -1,4 +1,4 @@
-//! `weft_computer` MCP server (issue #160). M1 shipped observation only
+//! `weft_computer` MCP server. M1 shipped observation only
 //! (window enumeration + screenshot); M2 adds input injection — click/type/
 //! key/scroll/drag/move — gated behind the SAME `computer_use_enabled` app
 //! setting (default OFF, fails closed — see `computer::enabled`), PLUS a
@@ -15,7 +15,7 @@
 //!
 //! Every `computer` call result comes back as plain text.
 //!
-//! Issue #160 round-2 P1 (architecture fix): `/computer/:thread/:dir/mcp`'s
+//! Architecture: `/computer/:thread/:dir/mcp`'s
 //! identity comes from the URL path alone (same guarantee `bus::server::
 //! handle` relies on) — but unlike the OTHER bus MCP servers, this one used
 //! to have NO approval gate of its own at all: authorization lived entirely
@@ -48,11 +48,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-// —— issue #160 round-16 P1 (Codex computer_srv.rs:605): move every synchronous OS/encode step off the async runtime ——
+// —— move every synchronous OS/encode step off the async runtime ——
 
-/// issue #160 round-16 P1 (Codex 605): run one synchronous OS/encode step on
+/// run one synchronous OS/encode step on
 /// tokio's blocking pool instead of directly on the async worker that called
-/// it. Before this round, EVERY OS-touching call this module makes —
+/// it. Before this change, EVERY OS-touching call this module makes —
 /// `computer::visible_windows`/`resolve_window` (xcap window enumeration),
 /// `screenshot_window` (capture + PNG encode), `encode_jpeg_data_uri` (JPEG
 /// re-encode, preview and MCP image alike), `activate_target` (a shell-out
@@ -85,7 +85,7 @@ fn text_result(s: String) -> Value {
 }
 
 /// A FAILED `tools/call`'s result — the same text content, plus the MCP
-/// `isError: true` flag (issue #160 round-35 P2, Codex computer_srv.rs:551).
+/// `isError: true` flag.
 /// Without it, a denied permission / disabled setting / lost lease / backend
 /// failure came back as an ordinary content-only result: MCP clients report
 /// the call as successful and the tool-result pipeline persists/renders a
@@ -101,7 +101,7 @@ fn error_result(s: String) -> Value {
 /// `image_b64` is the screenshot re-encoded as JPEG (no `data:` prefix — raw
 /// base64, the shape the MCP `image` content type wants) via
 /// [`computer::encode_jpeg_data_uri`]. The text path is NEVER dropped even
-/// when the image is attached (issue #160 M3-B spec): every engine, image-
+/// when the image is attached: every engine, image-
 /// capable or not, still gets the file path as a fallback for its own
 /// image-viewing tool.
 fn text_and_image_result(s: String, image_b64: String) -> Value {
@@ -121,16 +121,16 @@ fn sse(value: Value) -> Response {
         .into_response()
 }
 
-/// The `?wt=` query param's three distinguishable states (issue #160
-/// round-10 P2 #2, Codex 107) — CLAUDE.md: derive ONE discriminated value,
+/// The `?wt=` query param's three distinguishable states
+/// — CLAUDE.md: derive ONE discriminated value,
 /// map it exhaustively, rather than re-deriving "is this absent, valid, or
 /// garbage" ad hoc. Before this type existed, `q.get("wt").and_then(|s|
 /// s.parse::<i32>().ok())` collapsed BOTH "no `?wt=` at all" and "a `?wt=`
 /// present but not a number" onto the identical `None` — so a malformed/
 /// forged non-numeric `wt` on a multi-repo direction took the SAME "first
 /// worktree" fallback an honestly-absent one gets, silently misdirecting a
-/// worker's screenshots/audit into a DIFFERENT repo's checkout. Round-8 P2 #7
-/// already closed this for an explicit NUMERIC id that doesn't resolve to a
+/// worker's screenshots/audit into a DIFFERENT repo's checkout. Resolution
+/// already closes this for an explicit NUMERIC id that doesn't resolve to a
 /// worktree of this direction (fail closed, never fall back to first); this
 /// closes the identical gap one parse step earlier, for a `wt` that isn't
 /// even numeric to begin with.
@@ -140,14 +140,14 @@ enum WtParam {
     Absent,
     /// `?wt=<n>` parsed to a valid i32 — may still fail closed later, in
     /// `session_root`, if `n` doesn't name a worktree of THIS direction
-    /// (round-8 P2 #7); this variant only proves the STRING was numeric.
+    /// ; this variant only proves the STRING was numeric.
     Explicit(i32),
     /// `?wt=<garbage>` present but NOT a valid i32 — an EXPLICIT pin that is
     /// simply malformed. Must reject the call outright, never fall back to
     /// "first worktree": whatever worktree the caller meant to pin, a
     /// non-numeric value manifestly isn't "no preference at all", so
     /// silently guessing on its behalf reopens the exact misdirection
-    /// round-8 P2 #7 already refuses for a well-formed-but-wrong id.
+    /// the explicit-pin validation already refuses for a well-formed-but-wrong id.
     Invalid,
 }
 
@@ -163,7 +163,7 @@ impl WtParam {
     }
 
     /// Collapse to what `session_root` already knows how to resolve
-    /// (`Ok(Option<i32>)`, honoring round-8 P2 #7's own closed-set fail-
+    /// (`Ok(Option<i32>)`, honoring the explicit pin's closed-set fail-
     /// closed rule), or a fixed rejection for `Invalid` — the exhaustive map
     /// CLAUDE.md asks for, kept in ONE place rather than an `if` scattered at
     /// the call site.
@@ -180,7 +180,7 @@ impl WtParam {
     }
 }
 
-// —— issue #160 round-11 P1 #A: per-session bearer for this ONE privileged
+// —— per-session bearer for this ONE privileged
 // endpoint ——
 //
 // Every OTHER bus MCP endpoint (`/bus/:thread/:dir/mcp`, `/planner/:thread/
@@ -211,7 +211,7 @@ impl WtParam {
 // needs nothing more than recomputing the SAME HMAC from the SAME path values
 // — no lookup table to keep in sync, no secret to ever write to disk.
 //
-// KNOWN, ACCEPTED residual (not eliminated this round): a SAME-UID local
+// KNOWN, ACCEPTED residual (not eliminated this change): a SAME-UID local
 // process can still read a legitimate worker's own MCP config file / process
 // environment / launch args and recover this SAME token from there — this
 // closes "any local process, any uid, can forge the path or guess a URL",
@@ -220,7 +220,7 @@ impl WtParam {
 // live with (nothing here is weaker than the rest of the process's own trust
 // boundary) — full closure needs OS-level uid/sandbox isolation between
 // weft and the tool processes it launches, tracked (like the other real-
-// machine residuals in this file) as issue #160 §9 follow-up work, not
+// machine residuals in this file) as follow-up work, not
 // something a single-process HMAC can fix on its own.
 
 /// The process-wide HMAC key, generated ONCE per process from a CSPRNG
@@ -258,7 +258,7 @@ fn computer_token_mac(
     wt: Option<i32>,
 ) -> Result<HmacSha256, hmac::digest::InvalidLength> {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(computer_endpoint_secret())?;
-    // issue #160 round-13/14 P1 (Codex computer_srv.rs:214 + inject.rs:483): the
+    // the
     // MAC binds the EXACT worktree this URL carries, not just `(thread, dir)`.
     // Sibling worker sessions of one multi-repo direction share a single
     // `(thread, dir)` but differ only by `wt`; binding just `(thread, dir)`
@@ -268,8 +268,8 @@ fn computer_token_mac(
     // grants. Folding `wt` into the MAC means a swapped `?wt=` no longer matches
     // the token the worker was actually issued. The `none` marker for the
     // absent/lead case (no worktree at all) is a DISTINCT representation that
-    // can never collide with any explicit `wt<id>` — the separate lead/absent
-    // encoding Codex's finding calls for.
+    // can never collide with any explicit `wt<id>` — a separate lead/absent
+    // encoding, never a collapsible one.
     let wt_repr = match wt {
         Some(id) => format!("wt{id}"),
         None => "none".to_string(),
@@ -279,7 +279,7 @@ fn computer_token_mac(
 }
 
 /// The per-session token [`inject::computer_url`] appends as `&key=<token>`
-/// (issue #160 round-11 P1 #A) — hex(HMAC-SHA256(process secret,
+///  — hex(HMAC-SHA256(process secret,
 /// "{thread}/{dir}")). Deterministic for the SAME `(thread, dir)` (so a
 /// worker's own injected URL keeps working for the life of the process — this
 /// is never re-minted per-call), but unforgeable without either the process
@@ -309,7 +309,7 @@ pub fn computer_session_token(thread: i32, dir: &str, wt: Option<i32>) -> String
 
 /// Constant-time verification of a caller-supplied `key` against the token
 /// [`computer_session_token`] would mint for THIS EXACT path `(thread, dir)`
-/// (issue #160 round-11 P1 #A) — used by [`handle_computer`] before anything
+///  — used by [`handle_computer`] before anything
 /// else runs. Goes through `hmac`'s own `Mac::verify_slice` (backed by
 /// `subtle`'s constant-time equality) rather than decoding+comparing hex
 /// strings with `==`, which would short-circuit on the first mismatching
@@ -330,12 +330,12 @@ fn verify_computer_token(thread: i32, dir: &str, wt: Option<i32>, supplied: &str
 // `thread`/`dir` come from the URL path (same identity-can't-be-spoofed
 // guarantee `bus::server::handle` relies on for `/bus/:thread/:dir/mcp`).
 //
-// `?wt=<worktree_id>` (issue #160 round-2 P2 §5): an OPTIONAL query param a
+// `?wt=<worktree_id>`: an OPTIONAL query param a
 // caller can attach when it already knows the EXACT worktree its own worker
 // session materialized into — see `inject::computer_url`'s doc for who sets
 // it and why. Without it, the pre-existing "first worktree for this
 // direction" fallback is unchanged — a bare `?wt=`-less URL behaves exactly
-// as it always did. A malformed/non-numeric `wt` (issue #160 round-10 P2 #2)
+// as it always did. A malformed/non-numeric `wt`
 // is now REJECTED outright — see [`WtParam`] — rather than silently taking
 // that same fallback.
 pub async fn handle_computer(
@@ -346,7 +346,7 @@ pub async fn handle_computer(
     headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> Response {
-    // issue #160 round-11 P1 #A: reject BEFORE the request's `method`/`id`
+    // reject BEFORE the request's `method`/`id`
     // are even inspected, and before ANY authorization logic (`approve`'s own
     // gate included) ever runs — see this module's own top-of-section doc
     // comment for the full rationale. A caller with no `key=`, an empty one,
@@ -354,7 +354,7 @@ pub async fn handle_computer(
     // 401 — no JSON-RPC envelope, no hint about method/id/tool shape, nothing
     // that would help a guessing caller narrow down the real token.
     //
-    // issue #160 round-15 P1 (Codex inject.rs:364): the SAME token is now also
+    // the SAME token is now also
     // accepted as `Authorization: Bearer <token>` — codex carries its MCP
     // config on argv (`-c` flags), where a `?key=` URL would be world-readable
     // through process listings, so its injection names an env var instead and
@@ -373,7 +373,7 @@ pub async fn handle_computer(
         Some(k) if !k.is_empty() => k,
         _ => bearer,
     };
-    // issue #160 round-13/14 P1 (Codex computer_srv.rs:214 + inject.rs:483): the
+    // the
     // per-session bearer is bound to the EXACT worktree this URL carries, not
     // just `(thread, dir)` — see [`computer_token_mac`]'s own doc for the
     // sibling-worktree hijack this closes. Resolve `?wt=` FIRST: a malformed one
@@ -388,7 +388,7 @@ pub async fn handle_computer(
     if !verify_computer_token(thread, &dir, wt, supplied_key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    // issue #160 round-19 P1 (Codex computer_srv.rs:403): a still-valid token is
+    // a still-valid token is
     // refused once its owning thread has been deleted — `delete_thread` revokes
     // the route. Fast path is a lock-only set lookup (live sessions and the
     // synthetic-identity tests pay nothing); only a revoked thread pays one
@@ -450,8 +450,8 @@ const VALID_ACTIONS: &[&str] = &[
 
 /// The ONE rendering of the "unknown action" rejection, shared by BOTH
 /// [`pure_validate`] (which now rejects an unrecognized action FIRST, before
-/// the approval gate — issue #160 round-13 P1) and [`run_action`]'s own
-/// fail-closed `_` arm. issue #160 round-13 follow-up: these two used to
+/// the approval gate) and [`run_action`]'s own
+/// fail-closed `_` arm. These two used to
 /// format the message independently — `pure_validate` emitted a bare
 /// `unknown action: <a>` while `run_action` listed the valid ones — so once
 /// `pure_validate` began winning the race, the caller (and the
@@ -506,7 +506,7 @@ async fn call_computer(
     let mut window_id: Option<u32> = None;
     // Set ONLY by the "screenshot" arm of `run_action`, and ONLY when the
     // engine driving `(thread, dir)` is one `engine_accepts_mcp_image` allows
-    // — see that function's doc table (issue #160 M3-B).
+    // — see that function's doc table.
     let mut screenshot_image_b64: Option<String> = None;
 
     let outcome = run_action(
@@ -530,7 +530,7 @@ async fn call_computer(
     // The DURABLE audit line's own args payload — NOT the same `args` the
     // approval card in `approve` showed the human — see `redact_audit_args`'s
     // doc for why `action == "type"`'s literal keystrokes are redacted here
-    // (issue #160 round-2 P2) but never on the card the human approved BEFORE
+    //  but never on the card the human approved BEFORE
     // this call ran.
     let audit_args = redact_audit_args(&action, args);
 
@@ -560,15 +560,15 @@ async fn call_computer(
     match (outcome.is_ok(), screenshot_image_b64) {
         (true, Some(image_b64)) => text_and_image_result(outcome_text, image_b64),
         (true, None) => text_result(outcome_text),
-        // issue #160 round-35 P2 (Codex computer_srv.rs:551): a failed call
+        // a failed call
         // carries `isError: true` — see [`error_result`]'s doc.
         (false, _) => error_result(outcome_text),
     }
 }
 
 /// Every action's dispatch, `Ok(confirmation text)` or `Err(error text)` —
-/// the text reaches the calling agent either way, but since issue #160
-/// round-35 P2 an `Err` is marked with the MCP `isError: true` flag (see
+/// the text reaches the calling agent either way; an `Err` is additionally
+/// marked with the MCP `isError: true` flag (see
 /// [`error_result`]); the `Result` split also lets [`call_computer`] report
 /// an honest `"ok"`-or-not outcome to the audit log without re-deriving it
 /// from the text.
@@ -594,7 +594,7 @@ async fn run_action(
     if name != "computer" {
         return Err(format!("unknown tool: {name}"));
     }
-    // issue #160 round-13 P1 (Codex computer_srv.rs:515): run ALL pure,
+    // run ALL pure,
     // side-effect-free schema validation for THIS action BEFORE the approval
     // gate below ever opens a card. A malformed call (e.g. `left_click` with no
     // `coordinate`) must be rejected outright — never after a human already
@@ -603,14 +603,14 @@ async fn run_action(
     // below still re-parse (idempotent) and still do the LIVE checks (window
     // resolution, focus freshness, control lease) that can only run post-approval.
     pure_validate(action, args)?;
-    // The server-side approval gate (issue #160 round-2 P1) — see this
+    // The server-side approval gate — see this
     // module's own doc comment and `approve`'s. Runs for EVERY action,
     // observation or input, before any action-specific argument is even
     // looked at: a standing grant decides silently, otherwise this blocks on
     // a Needs-you card exactly like `bus::server::handle_ask` does for every
     // other tool call in this crate.
     //
-    // issue #160 round-10 P2 #5 (Codex 296): for a Write (input) action,
+    // for a Write (input) action,
     // refuse to even OPEN a new approval card when this EXACT (thread, dir)
     // already has a DIFFERENT one open and unanswered — checked BEFORE
     // `approve` below, not just in each input arm's own later call (which
@@ -631,7 +631,7 @@ async fn run_action(
     if crate::ask::classify_gui_action(action) == crate::ask::RiskLevel::Write {
         check_suspended(asks, thread, dir)?;
     }
-    // issue #160 round-8 P1 #4: `approved` is the window identity `approve`
+    // `approved` is the window identity `approve`
     // itself resolved AUTHORITATIVELY at the moment it authorized this call,
     // for a Write (input) action with a window argument — `None` for every
     // observe action and for `wait`. Every input arm below threads this
@@ -640,7 +640,7 @@ async fn run_action(
     // function's own doc for the "approve one window, dispatch to a
     // different one" gap this closes.
     let approved = approve(asks, thread, dir, wt, action, args).await?;
-    // issue #160 round-2 P1 §1: re-check the kill switch AFTER the approval
+    // re-check the kill switch AFTER the approval
     // await returns — NOT just once, up top, before that (potentially very
     // long, up to `bus::server::ASK_WAIT`) wait began. A human can hit Stop
     // (disabling the setting, or tripping the emergency-stop latch —  both
@@ -650,16 +650,16 @@ async fn run_action(
     // and would never see the disable. Without this second check, that Allow
     // would sail straight through to dispatch below as if the kill switch had
     // never fired. Cheap (one more `enabled` read) and correct: this is the
-    // exact race the round-2 review flagged, not a hypothetical.
+    // exact race described above, not a hypothetical.
     if !computer::enabled(db).await {
         return Err(ComputerError::Disabled.to_string());
     }
     match action {
         "list_windows" => {
-            // issue #160 round-16 P1 (Codex 605): acquire the SAME semaphore
+            // acquire the SAME semaphore
             // `screenshot` holds during capture (`screenshot_semaphore` — see
             // its own doc, capacity 2) before this call's own OS enumeration
-            // — round-15 P2's `MAX_OPEN_OBSERVE_ASKS` only bounds how many
+            // — `MAX_OPEN_OBSERVE_ASKS` only bounds how many
             // observe Ask CARDS may sit open waiting on a human; a session
             // already holding a standing Full/Always grant skips that gate
             // entirely and previously had NO cap at all on how many
@@ -668,18 +668,18 @@ async fn run_action(
             // budget gives the already-authorized path the same hard
             // concurrency ceiling, rather than inventing a second one.
             let _observe_permit = screenshot_semaphore().acquire().await.map_err(|e| e.to_string())?;
-            // issue #160 round-17 P1 (Codex computer_srv.rs:647): recheck the
+            // recheck the
             // kill switch AFTER the permit queue — with both permits held, a
             // standing-granted caller can sit in `acquire().await` across a
             // Stop/disable, and the only `enabled` read it ever passed was
             // `run_action`'s top gate, long before the queue. Same shape as
-            // the screenshot arm's own post-semaphore recheck (round-14 P1);
+            // the screenshot arm's own post-semaphore recheck;
             // this is the arm's LAST await before the enumeration is
             // scheduled.
             if !computer::enabled(db).await {
                 return Err(ComputerError::Disabled.to_string());
             }
-            // issue #160 round-22 P1 (Codex computer_srv.rs:664): re-check the
+            // re-check the
             // session's liveness after the observe queue too. A thread deleted
             // while this `list_windows` sat waiting for a permit records a route
             // revocation but does NOT flip `enabled`, so without this a
@@ -693,18 +693,18 @@ async fn run_action(
             }
             let b = backend::backend();
             let dir_owned = dir.to_string();
-            // issue #160 round-16 P1 (Codex 605): the enumeration itself
+            // the enumeration itself
             // moves onto tokio's blocking pool — see `on_blocking`'s own doc
             // for why every OS-touching call here now does.
             on_blocking(move || {
-                // issue #160 round-23 P2 (Codex computer_srv.rs:684): final
+                // final
                 // synchronous Stop-latch check on the blocking-pool thread, as
                 // the first statement immediately before the OS enumeration — a
                 // Stop landing while THIS closure sat QUEUED for a blocking
                 // thread must fail closed here, exactly as the screenshot/input
                 // closures already do via `recheck_stop_and_lease_before_backend`.
                 // `list_windows` holds no control lease, so no lease re-verify —
-                // but the stop latch AND (round-27 P2, Codex computer_srv.rs:695)
+                // but the stop latch AND
                 // the direction-precise route revocation both apply: a thread/
                 // direction deleted while this closure sat queued does not trip
                 // the global latch, and a standing-granted `list_windows` would
@@ -724,13 +724,13 @@ async fn run_action(
         }
         "screenshot" => {
             let window_query = required_window(args)?;
-            // issue #160 round-11 P1 #C: verify the window `approve` bound at
+            // verify the window `approve` bound at
             // authorization time (screenshot now binds one too — see that
             // function's own `resolved`/doc comment) is STILL the window
             // about to be captured — fail-closed otherwise, never silently
             // capturing whatever the query happens to resolve to NOW. The
             // read-only twin of every input arm's own
-            // `resolve_and_verify_target` gate (issue #160 round-8 P1 #4),
+            // `resolve_and_verify_target` gate,
             // applied here to an OBSERVE action for the first time: a card
             // can sit open for a long time (up to `bus::server::ASK_WAIT`)
             // before a human answers it, during which the ORIGINAL window
@@ -745,23 +745,23 @@ async fn run_action(
             // ever awaiting `screenshot_out_dir`/the capture semaphore below
             // for a call that was always going to be rejected anyway. Its
             // OWN `WindowInfo` is intentionally unused past this point —
-            // issue #160 round-12 P1 #I re-resolves and re-verifies a SECOND
+            // the capture path re-resolves and re-verifies a SECOND
             // time, right before the capture, and THAT result is what gets
             // used for the actual capture/record below.
-            // issue #160 round-18 P1 (Codex computer_srv.rs:1343): this first
+            // this first
             // (fail-fast) resolve now runs on the blocking pool too — one
             // single, argument-gated enumeration, but still a synchronous
             // `xcap` call that must never run inline on an async worker where
             // concurrent captures could collectively starve the Stop/Escape
-            // kill-switch tasks (round-16 P1 kept it inline as "just one
-            // enumeration"; round-18 closes that residual runtime-occupancy
+            // kill-switch tasks ("just one enumeration" inline is still a
+            // residual runtime-occupancy
             // gap — the same reason `approve`'s own authorization-time resolve
             // moved off the runtime). The SECOND resolve below, sitting
             // immediately next to the actual capture, already runs inside this
             // arm's single capture `on_blocking` closure.
             let _ = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let out_dir = screenshot_out_dir(db, thread, dir, wt).await?;
-            // issue #160 round-12 P1 #5: acquire the process-wide capture
+            // acquire the process-wide capture
             // semaphore BEFORE the synchronous capture below — see
             // `screenshot_semaphore`'s own doc for why (a Full/Always-granted
             // worker could otherwise fire arbitrarily many concurrent
@@ -771,7 +771,7 @@ async fn run_action(
             // this call does; dropped when this arm's block ends (including
             // on an early `?` return from the capture itself).
             let _capture_permit = screenshot_semaphore().acquire().await.map_err(|e| e.to_string())?;
-            // issue #160 round-16 P1 (Codex 605): whether this call's owning
+            // whether this call's owning
             // engine accepts an inline MCP image is looked up now, on the
             // runtime — `engine_accepts_mcp_image` awaits the db, but
             // everything past the recheck below (the second resolve through
@@ -780,17 +780,16 @@ async fn run_action(
             // itself `.await` anything. The bool crosses that boundary as a
             // plain owned value instead of the lookup itself moving in.
             //
-            // issue #160 round-17 P1 (Codex computer_srv.rs:730): this lookup
-            // sits BEFORE the enabled recheck below, not after it — round-16's
+            // this lookup
+            // sits BEFORE the enabled recheck below, not after it — the earlier
             // refactor briefly had it after, which re-opened the exact gap the
             // recheck exists to close: a Stop landing while THIS db await was
             // in flight went unseen, and the capture was scheduled anyway. The
             // recheck must be the arm's genuinely LAST await.
             let want_mcp_image = engine_accepts_mcp_image(db, thread, dir).await;
-            // issue #160 round-23 P1 (Codex computer_srv.rs:766): recheck session
-            // liveness after the capture queue too. The list_windows arm gained
-            // this in round-22, but this screenshot arm still only rechecked
-            // `enabled` below. A thread deleted while this call waited for a
+            // recheck session
+            // liveness after the capture queue too. The list_windows arm runs
+            // the same recheck; `enabled` alone below is not enough. A thread deleted while this call waited for a
             // capture permit records a route revocation but does NOT flip
             // `enabled`, so without this a standing-granted caller would capture
             // pixels after its session is gone — and `screenshot_window` writing
@@ -800,7 +799,7 @@ async fn run_action(
             if computer_routes_revoked(thread) && !session_is_live(db, thread, dir, wt).await {
                 return Err(SESSION_GONE_MSG.to_string());
             }
-            // issue #160 round-14 P1 (Codex computer_srv.rs:583): recheck the
+            // recheck the
             // kill switch AFTER every await this arm took since the last
             // `enabled` check up top — `screenshot_out_dir`, the capture
             // semaphore's own `acquire().await` (which can queue arbitrarily
@@ -809,13 +808,13 @@ async fn run_action(
             // hitting Stop / disabling Computer Use while this call sat queued
             // would still capture once a permit freed — a Full/Always-granted
             // caller could leave many captures queued to fire AFTER Stop.
-            // This is the arm's LAST `.await` (round-17 P1 re-established
-            // that invariant — see the lookup's comment above): nothing runs
+            // This is the arm's LAST `.await` (see the lookup's comment
+            // above for that invariant): nothing runs
             // between it and scheduling the blocking capture below.
             if !computer::enabled(db).await {
                 return Err(ComputerError::Disabled.to_string());
             }
-            // issue #160 round-12 P1 #I: re-resolve + re-verify identity
+            // re-resolve + re-verify identity
             // AGAIN, after EVERY await this arm takes since the first check
             // above (`screenshot_out_dir`, the capture semaphore itself, then
             // the engine lookup just above) — with BOTH `SCREENSHOT_
@@ -827,11 +826,11 @@ async fn run_action(
             // during that queueing gap and a same-query REPLACEMENT window
             // take its place, and `screenshot_window`'s internal re-resolve
             // would then silently capture the REPLACEMENT's pixels under an
-            // approval that was only ever shown for the original — this is
-            // exactly the round-11 P1 #C gap, reopened by round-12 P1 #5's OWN
-            // semaphore queue.
+            // approval that was only ever shown for the original — the exact
+            // gap this re-verify exists to close, which the capture semaphore's
+            // own queueing would otherwise reopen.
             //
-            // issue #160 round-16 P1 (Codex 605): this resolve, the capture,
+            // this resolve, the capture,
             // and every encode/record below now all run INSIDE one
             // `on_blocking` closure — moved off the async runtime for the
             // same reason `on_blocking`'s own doc gives (a slow/queued OS
@@ -842,8 +841,8 @@ async fn run_action(
             // (a plain sync closure — `spawn_blocking` requires that), and
             // the resolve inside it runs immediately before the capture, on
             // the SAME blocking-pool thread, with nothing else able to run in
-            // between — so the "just verified" identity guarantee (round-12
-            // P1 #I) is preserved exactly, just now separated from this check
+            // between — so the "just verified" identity guarantee
+            // is preserved exactly, just now separated from this check
             // by a `spawn_blocking` scheduling boundary instead of sitting in
             // the same async stack frame. `resolve_and_verify_target` takes
             // `window_id_out` as `&mut Option<u32>` — a reference into THIS
@@ -857,7 +856,7 @@ async fn run_action(
             let window_query_owned = window_query.to_string();
             let approved_for_capture = approved.clone();
             let dir_owned = dir.to_string();
-            // Kept for the round-30 post-write recheck below — `out_dir`
+            // Kept for the earlier post-write recheck below — `out_dir`
             // itself moves into the capture closure.
             let out_dir_cleanup = out_dir.clone();
             let b = backend::backend();
@@ -871,7 +870,7 @@ async fn run_action(
                     Ok(w) => w,
                     Err(e) => return (resolved_id, Err(e)),
                 };
-                // issue #160 round-17 P1 (Codex computer_srv.rs:793): capture
+                // capture
                 // the EXACT window `w` just verified — `computer::screenshot_
                 // resolved` takes the already-resolved `WindowInfo` instead of
                 // the raw query, so there is NO third enumeration left for a
@@ -881,7 +880,7 @@ async fn run_action(
                 // are still two). If `w` closed in the instant since the
                 // verify above, `capture_window(w.id)` fails closed rather
                 // than ever falling back to a lookalike.
-                // issue #160 round-20 P1 (Codex computer_srv.rs:813): recheck
+                // recheck
                 // the stop latch on THIS blocking thread, immediately before
                 // the capture. The arm's last `enabled` recheck ran BEFORE this
                 // closure was scheduled; a Stop landing while the closure sat
@@ -894,7 +893,7 @@ async fn run_action(
                 if computer::stop_latched() {
                     return (resolved_id, Err(ComputerError::Disabled.to_string()));
                 }
-                // issue #160 round-24 P1 (Codex computer_srv.rs:775): the async
+                // the async
                 // liveness recheck ran BEFORE this closure was scheduled — and
                 // before the `enabled` await and the blocking-pool queue wait
                 // that follow it. A delete landing in that window can't be seen
@@ -912,7 +911,7 @@ async fn run_action(
                     Ok(s) => s,
                     Err(e) => return (resolved_id, Err(e.to_string())),
                 };
-                // issue #160 round-10 P2 #H: this confirmation text is shared
+                // this confirmation text is shared
                 // by BOTH the plain-text-only result and `text_and_image_
                 // result`'s own text block (see that function's doc) —
                 // worded so it holds for either: a capable client (Claude,
@@ -930,8 +929,8 @@ async fn run_action(
                 );
                 // Both the preview registry and the MCP image block need the
                 // raw pixels — read straight off `shot.pixels`, the SAME
-                // in-memory RGBA `screenshot_window` itself scaled and saved
-                // (issue #160 round-7 P1), never re-opened from `shot.path`.
+                // in-memory RGBA `screenshot_window` itself scaled and saved —
+                // never re-opened from `shot.path`.
                 // This used to re-read the just-saved PNG back off disk
                 // (`read_captured_image`, now deleted): a worker-writable
                 // `out_dir` is repository-controlled content, and the gap
@@ -952,7 +951,7 @@ async fn run_action(
                 //
                 // Keyed to `shot.window_id` — the id `computer::
                 // screenshot_window` ITSELF already resolved and captured
-                // against (issue #160 round-6 review P2 #4) — rather than
+                // against — rather than
                 // re-resolving `window_query` a second time here: a second
                 // resolution can land on a DIFFERENT window than the one
                 // actually captured if it closed, was renamed, or its id got
@@ -964,8 +963,7 @@ async fn run_action(
                 if let Ok(preview) =
                     computer::encode_jpeg_data_uri(&shot.pixels, PREVIEW_LONG_EDGE, PREVIEW_QUALITY)
                 {
-                    // issue #160 round-14 P1 (Codex computer_srv.rs:1466):
-                    // store the FULL window identity (id + app + title) this
+                    // Store the FULL window identity (id + app + title) this
                     // capture came from, not the numeric id alone — `w` is
                     // the already-resolved, just-verified target (its `id`
                     // equals `shot.window_id` by that verification), so this
@@ -974,7 +972,7 @@ async fn run_action(
                     // closes.
                     store_screenshot_preview(thread, &dir_owned, wt, preview, VerifiedWindowIdentity::from_window(&w));
                 }
-                // issue #160 round-11 P1 #D: record THIS capture's own saved
+                // record THIS capture's own saved
                 // dimensions for (thread, dir, shot.window_id) — every
                 // coordinate-taking input arm below maps against whatever is
                 // on file here (see `computer::map_screenshot_coord`'s own
@@ -986,7 +984,7 @@ async fn run_action(
                 // The MCP `image` content block is engine-gated — see
                 // `engine_accepts_mcp_image`'s doc table; `want_mcp_image`
                 // was already decided on the runtime, above, before this
-                // closure started (see that round-16 P1 comment).
+                // closure started (see that change-16 P1 comment).
                 let image_b64 = if want_mcp_image {
                     computer::encode_jpeg_data_uri(&shot.pixels, MCP_IMAGE_LONG_EDGE, MCP_IMAGE_QUALITY)
                         .ok()
@@ -998,15 +996,15 @@ async fn run_action(
             })
             .await?;
             *window_id_out = resolved_id;
-            // issue #160 round-30 P2 (Codex computer_srv.rs:893): re-check the
+            // re-check the
             // route revocation AFTER the capture/save, under the SAME
             // [`revocation_txn_lock`] the delete flows hold from before they
             // publish revocation until after their output removal — the
             // closure's own pre-capture check is check-then-act across the
             // whole blocking capture, so a delete could interleave and the
             // save's `create_dir_all(out_dir)` would recreate the deleted
-            // session's subtree (exactly the append_audit gap round-28
-            // closed, on the screenshot write path). Two outcomes only:
+            // session's subtree (the same gap `append_audit` closes, here on
+            // the screenshot write path). Two outcomes only:
             // either this check (which waits out any in-flight delete
             // transaction) sees the revocation — then THIS call's own
             // recreated output is removed and the call fails with the same
@@ -1032,12 +1030,12 @@ async fn run_action(
             Ok(text)
         }
         "left_click" | "right_click" | "double_click" | "triple_click" => {
-            // issue #160 round-2 P2 §4: every PURELY-argument-shaped check
+            // every PURELY-argument-shaped check
             // for this action (the window argument being non-empty, the
             // coordinate's shape) runs BEFORE the control lease/throttle are
             // touched — see this section's own "input gates" doc comment
-            // further down for the full ordering rationale. issue #160
-            // round-6 review P1 #2+#3: the window's actual RESOLUTION and
+            // further down for the full ordering rationale. The
+            // window's actual RESOLUTION and
             // the coordinate's mapping against it are NOT purely-argument
             // checks (they depend on the live desktop's current state) and
             // now run AFTER `input_flight_guard`/the first
@@ -1056,11 +1054,10 @@ async fn run_action(
             // cross-module contract on `computer::input_flight_guard`'s own
             // doc — a second `tools/call` for the SAME (thread, dir) racing
             // in concurrently must serialize here rather than interleave its
-            // own click on the human's real desktop (issue #160 review R1
-            // P2).
+            // own click on the human's real desktop.
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir, wt).await?;
-            // issue #160 round-6 review P1 #3: resolve the window AND map
+            // resolve the window AND map
             // the coordinate FRESH here, after the flight guard — not
             // before it, as this used to. A call that queued on the guard
             // behind another session's in-flight action could sit there for
@@ -1071,13 +1068,13 @@ async fn run_action(
             // (now stale) coordinates were computed against — or on an
             // entirely different window that reused the same id.
             //
-            // issue #160 round-8 P1 #4: this window must still be the EXACT
+            // this window must still be the EXACT
             // one `approve` bound at authorization time — see
             // `verify_approved_target`'s own doc. Checked BEFORE this window
             // is ever activated or clicked (`resolve_and_verify_target`
             // does both: resolve, record `window_id_out`, verify).
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            // issue #160 round-33 P2 (Codex computer_srv.rs:1074): PREFLIGHT
+            // PREFLIGHT
             // the coordinate mapping against the pre-activation window — a
             // call whose prerequisite is already missing (no recorded
             // screenshot for this window, or an out-of-bounds coordinate)
@@ -1087,7 +1084,7 @@ async fn run_action(
             // against the post-activation `w2` below, unchanged (freshness —
             // the window can move/resize during the blocking activation).
             let _ = map_input_coord(thread, dir, wt, &w, cx, cy)?;
-            // issue #160 round-4 P1 §2 (broadened round-5 review P1 §6): reclaim
+            // Reclaim
             // the foreground BEFORE this click reaches the OS, not after — see
             // `activate_target`'s own doc for why even the click family (not
             // just type/key) needs this, UNCONDITIONALLY (Auto approvals
@@ -1097,7 +1094,7 @@ async fn run_action(
             // and an Auto approval offers no guarantee the target still holds
             // the real OS foreground either.
             activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
-            // issue #160 round-10 P1 #B: `activate_target` (inside the call
+            // `activate_target` (inside the call
             // above) shells out to a potentially slow, blocking OS call
             // (osascript/wmctrl/`xdotool --sync`) — the window can move,
             // resize, close, or have its id reused by an unrelated window
@@ -1106,7 +1103,7 @@ async fn run_action(
             // pre-activation `w`, which may already be stale by now.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let (px, py) = map_input_coord(thread, dir, wt, &w2, cx, cy)?;
-            // issue #160 round-16 P1 (Codex 605): the injection itself moves
+            // the injection itself moves
             // onto tokio's blocking pool too (`enigo` is a synchronous OS
             // call — see `on_blocking`'s own doc). No extra concurrency cap
             // is needed here the way `list_windows`/`screenshot` needed one:
@@ -1114,7 +1111,7 @@ async fn run_action(
             // ENTIRE process to one in-flight input action at a time — every
             // OTHER input arm below shares this same reasoning without
             // repeating it.
-            // issue #160 round-18 P1 (Codex computer_srv.rs:967): the final
+            // the final
             // stop/lease recheck runs INSIDE the closure, on the blocking
             // thread, right before the backend call — see
             // `recheck_stop_and_lease_before_backend`'s own doc for the gap
@@ -1122,7 +1119,7 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
-                // issue #160 round-26 P2 (Codex computer_srv.rs:1006): pace the
+                // pace the
                 // ACTUAL dispatch — admission throttling alone lets calls that
                 // queued behind a slow flight-guard holder burst back-to-back
                 // once it releases. Sleep out the remaining gap FIRST, then run
@@ -1151,27 +1148,26 @@ async fn run_action(
             acquire_and_throttle(thread, dir, wt)?;
             // See the click-family arm above for why this guard is held
             // across the backend call itself, and why window resolution/
-            // coordinate mapping now happen AFTER it (issue #160 round-6
-            // review P1 #3), TWICE — once before activation, once after
-            // (issue #160 round-10 P1 #B).
+            // coordinate mapping now happen AFTER it, TWICE — once before
+            // activation, once after.
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir, wt).await?;
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            // issue #160 round-33 P2: preflight before activation — see the
+            // preflight before activation — see the
             // click-family arm above.
             let _ = map_input_coord(thread, dir, wt, &w, cx, cy)?;
             activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
-            // issue #160 round-10 P1 #B: see the click-family arm above.
+            // see the click-family arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let (px, py) = map_input_coord(thread, dir, wt, &w2, cx, cy)?;
-            // issue #160 round-16 P1 (Codex 605): see the click-family arm
+            // see the click-family arm
             // above.
-            // issue #160 round-18 P1: final in-closure stop/lease recheck —
+            // final in-closure stop/lease recheck —
             // see the click-family arm above.
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
-                // issue #160 round-26 P2 (Codex computer_srv.rs:1006): pace the
+                // pace the
                 // ACTUAL dispatch — admission throttling alone lets calls that
                 // queued behind a slow flight-guard holder burst back-to-back
                 // once it releases. Sleep out the remaining gap FIRST, then run
@@ -1195,14 +1191,14 @@ async fn run_action(
             acquire_and_throttle(thread, dir, wt)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir, wt).await?;
-            // issue #160 round-6 review P1 #3: BOTH endpoints are remapped
+            // BOTH endpoints are remapped
             // against the SAME freshly-resolved window — a drag has two
-            // coordinates, but only one window to go stale. issue #160
-            // round-10 P1 #B: that resolve now happens TWICE, before and
+            // coordinates, but only one window to go stale. That resolve
+            // happens TWICE, before and
             // after activation — see the click-family arm above — and BOTH
             // endpoints are mapped against the SECOND (post-activation) `w2`.
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            // issue #160 round-33 P2: preflight BOTH endpoints before
+            // preflight BOTH endpoints before
             // activation — see the click-family arm above.
             let _ = map_input_coord(thread, dir, wt, &w, sx, sy)?;
             let _ = map_input_coord(thread, dir, wt, &w, ex, ey)?;
@@ -1210,14 +1206,14 @@ async fn run_action(
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let from = map_input_coord(thread, dir, wt, &w2, sx, sy)?;
             let to = map_input_coord(thread, dir, wt, &w2, ex, ey)?;
-            // issue #160 round-16 P1 (Codex 605): see the click-family arm
+            // see the click-family arm
             // above.
-            // issue #160 round-18 P1: final in-closure stop/lease recheck —
+            // final in-closure stop/lease recheck —
             // see the click-family arm above.
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
-                // issue #160 round-26 P2 (Codex computer_srv.rs:1006): pace the
+                // pace the
                 // ACTUAL dispatch — admission throttling alone lets calls that
                 // queued behind a slow flight-guard holder burst back-to-back
                 // once it releases. Sleep out the remaining gap FIRST, then run
@@ -1242,21 +1238,21 @@ async fn run_action(
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir, wt).await?;
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            // issue #160 round-33 P2: preflight before activation — see the
+            // preflight before activation — see the
             // click-family arm above.
             let _ = map_input_coord(thread, dir, wt, &w, cx, cy)?;
             activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
-            // issue #160 round-10 P1 #B: see the click-family arm above.
+            // see the click-family arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let (px, py) = map_input_coord(thread, dir, wt, &w2, cx, cy)?;
-            // issue #160 round-16 P1 (Codex 605): see the click-family arm
+            // see the click-family arm
             // above.
-            // issue #160 round-18 P1: final in-closure stop/lease recheck —
+            // final in-closure stop/lease recheck —
             // see the click-family arm above.
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
-                // issue #160 round-26 P2 (Codex computer_srv.rs:1006): pace the
+                // pace the
                 // ACTUAL dispatch — admission throttling alone lets calls that
                 // queued behind a slow flight-guard holder burst back-to-back
                 // once it releases. Sleep out the remaining gap FIRST, then run
@@ -1275,7 +1271,7 @@ async fn run_action(
         "type" => {
             let window_query = required_window(args)?;
             let text = required_text(args)?;
-            // issue #160 round-5 review P2 §3: a hard length ceiling, checked
+            // a hard length ceiling, checked
             // right after `required_text` and well before any lease/throttle
             // is touched — see `check_type_length`'s own doc for why.
             check_type_length(text)?;
@@ -1283,17 +1279,17 @@ async fn run_action(
             acquire_and_throttle(thread, dir, wt)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir, wt).await?;
-            // issue #160 round-6 review P1 #2+#3: resolve the window (and,
+            // Resolve the window (and,
             // right below, check focus-freshness against it) AFTER the
             // flight guard now too — a queued `type` used to resolve the
             // window BEFORE the guard, so a stale id from a closed/reused
             // window could reach `require_recent_focus`/`activate_target`
-            // for the wrong target. Focus-freshness gate itself (issue #160
-            // round-2 P1 addendum) is unchanged in SPIRIT — see
+            // for the wrong target. Focus-freshness gate itself
+            // is unchanged in SPIRIT — see
             // `require_recent_focus`'s doc — just now checked against a
             // freshly-resolved id rather than a possibly-stale one.
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            // issue #160 round-33 P2 (Codex computer_srv.rs:1074): PREFLIGHT
+            // PREFLIGHT
             // the focus-freshness prerequisite against the pre-activation
             // window — a `type` with no recent click on this window is doomed
             // anyway, so it must fail BEFORE activation raises and focuses
@@ -1301,7 +1297,7 @@ async fn run_action(
             // against the post-activation `w2` below is unchanged.
             require_recent_focus(thread, dir, wt, &w)?;
             activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
-            // issue #160 round-10 P1 #B: re-resolve/re-verify AFTER
+            // re-resolve/re-verify AFTER
             // activation, same as every other input arm — and check focus-
             // freshness against THIS fresh id (`w2.id`), not the
             // pre-activation one: the window `require_recent_focus` guards
@@ -1310,15 +1306,15 @@ async fn run_action(
             require_recent_focus(thread, dir, wt, &w2)?;
             let char_count = text.chars().count();
             let text_owned = text.to_string();
-            // issue #160 round-16 P1 (Codex 605): see the click-family arm
+            // see the click-family arm
             // above — `text_owned` crosses into the blocking closure since
             // `text` itself is borrowed from `args`, not `'static`.
-            // issue #160 round-18 P1: final in-closure stop/lease recheck —
+            // final in-closure stop/lease recheck —
             // see the click-family arm above.
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
-                // issue #160 round-26 P2 (Codex computer_srv.rs:1006): pace the
+                // pace the
                 // ACTUAL dispatch — admission throttling alone lets calls that
                 // queued behind a slow flight-guard holder burst back-to-back
                 // once it releases. Sleep out the remaining gap FIRST, then run
@@ -1337,10 +1333,10 @@ async fn run_action(
         "key" => {
             let window_query = required_window(args)?;
             let combo = required_text(args)?;
-            // issue #160 round-10 P2 #4 (Codex 580): validate the combo's
+            // validate the combo's
             // SHAPE — a pure, argument-only check, no lease/throttle/backend
             // touched — before `check_suspended`/`acquire_and_throttle`
-            // below, mirroring round-2 P2 §4's "purely-argument checks run
+            // below, mirroring the "purely-argument checks run
             // first" discipline every other input arm already follows (see
             // this section's own "input gates" doc comment further down).
             // Before this, a malformed combo (e.g. "ctrl+a+b") wasn't
@@ -1351,7 +1347,7 @@ async fn run_action(
             // going to fail. The parsed tokens are discarded here (`let _`)
             // — this exists ONLY to reject a malformed shape early; the
             // combo's ACTUAL injection still goes through `b.key(combo)`
-            // below (issue #160 round-16 P1: now via `on_blocking` — see
+            // below (now via `on_blocking` — see
             // that helper's own doc — but still the SAME backend call,
             // unchanged; os.rs itself is not touched here).
             let _ = computer::parse_key_combo(combo).map_err(|e| e.to_string())?;
@@ -1361,22 +1357,22 @@ async fn run_action(
             recheck_after_guard(db, asks, thread, dir, wt).await?;
             // See the matching comment in the "type" arm above.
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            // issue #160 round-33 P2: preflight the focus prerequisite before
+            // preflight the focus prerequisite before
             // activation — see the "type" arm above.
             require_recent_focus(thread, dir, wt, &w)?;
             activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
-            // issue #160 round-10 P1 #B: see the "type" arm above.
+            // see the "type" arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             require_recent_focus(thread, dir, wt, &w2)?;
             let combo_owned = combo.to_string();
-            // issue #160 round-16 P1 (Codex 605): see the click-family arm
+            // see the click-family arm
             // above.
-            // issue #160 round-18 P1: final in-closure stop/lease recheck —
+            // final in-closure stop/lease recheck —
             // see the click-family arm above.
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
-                // issue #160 round-26 P2 (Codex computer_srv.rs:1006): pace the
+                // pace the
                 // ACTUAL dispatch — admission throttling alone lets calls that
                 // queued behind a slow flight-guard holder burst back-to-back
                 // once it releases. Sleep out the remaining gap FIRST, then run
@@ -1395,7 +1391,7 @@ async fn run_action(
         // No window, no control lock, no throttle — this reads the cursor's
         // current position without touching input devices.
         "cursor_position" => {
-            // issue #160 round-16 P1 (Codex 605): even this near-instant OS
+            // even this near-instant OS
             // call moves onto tokio's blocking pool (see `on_blocking`'s own
             // doc) so it never risks parking an async worker Stop/Escape
             // needs — cheap enough that it doesn't need `screenshot_
@@ -1405,7 +1401,7 @@ async fn run_action(
             let b = backend::backend();
             let dir_owned = dir.to_string();
             on_blocking(move || {
-                // issue #160 round-24 P2 (Codex computer_srv.rs:1265): recheck
+                // recheck
                 // the Stop latch on THIS blocking thread, immediately before the
                 // OS read. The post-approval `enabled` check ran BEFORE this
                 // closure was scheduled; a Stop landing while it sat queued would
@@ -1413,7 +1409,7 @@ async fn run_action(
                 if computer::stop_latched() {
                     return Err(ComputerError::Disabled.to_string());
                 }
-                // issue #160 round-26 P2 (Codex computer_srv.rs:1290): ALSO
+                // ALSO
                 // recheck the direction-precise route revocation here, exactly
                 // like the screenshot capture closure — a thread/direction
                 // deleted while this closure sat queued does NOT trip the
@@ -1437,16 +1433,16 @@ async fn run_action(
         // Fail-closed, not fail-open: an unrecognized/missing action is
         // rejected with the valid list, never silently treated as one of
         // the known ones. In practice [`pure_validate`] already rejected an
-        // unknown action before dispatch ever reached here (issue #160
-        // round-13 P1) — this arm stays as defense-in-depth, sharing the
+        // unknown action before dispatch ever reached here
+        // — this arm stays as defense-in-depth, sharing the
         // SAME [`unknown_action_error`] rendering so the two can't diverge.
         _ => Err(unknown_action_error(action)),
     }
 }
 
-// —— server-side approval gate (issue #160 round-2 P1) ——
+// —— server-side approval gate ——
 
-/// issue #160 round-15 P2 (Codex computer_srv.rs:1288): how many OBSERVE-class
+/// how many OBSERVE-class
 /// (`RiskLevel::ReadOnly`) computer-use Ask cards may sit open at once for one
 /// `(thread, dir)` before further grant-less observe calls fail closed instead
 /// of opening more — see `approve`'s observe branch. Small on purpose: a human
@@ -1460,15 +1456,14 @@ const MAX_OPEN_OBSERVE_ASKS: usize = 3;
 /// Gate EVERY `tools/call` here, server-side, before [`run_action`]'s dispatch
 /// looks at any action-specific argument — see this module's own top doc
 /// comment for the full architecture rationale (this closes the "any local
-/// process can just POST past the engine's hook" gap the round-1 review
-/// found).
+/// process can just POST past the engine's hook" gap).
 ///
 /// Mirrors `bus::server::handle_ask`'s own shape closely on purpose, so the
 /// two Ask-bridge entry points behave identically wherever they overlap:
 ///  1. Classify (`risk` via [`crate::ask::classify_gui_action`]), build the
 ///     display `summary` and the canonical `action_key` — `["gui", action,
-///     window, args_digest]` (issue #160 round-2 P2 §2 added the trailing
-///     digest — see [`args_digest`]'s own doc for why), a namespace of its
+///     window, args_digest]` (the trailing
+///     digest is deliberate — see [`args_digest`]'s own doc), a namespace of its
 ///     own (distinct from `bus::server::summarize`'s `["mcp", tool_name,
 ///     args]` for the SAME tool, since this is a different, more precise
 ///     identity: it never depends on which engine-specific tool-name shape
@@ -1478,9 +1473,9 @@ const MAX_OPEN_OBSERVE_ASKS: usize = 3;
 ///     (`redact_audit_args`) is.
 ///  2. A standing grant (`dangerous` mode / Full / Always for this EXACT
 ///     `action_key`) decides silently via [`crate::ask::AskRegistry::
-///     auto_decision_exact`] — issue #160 round-5 review P1 §1: unlike
+///     auto_decision_exact`] — unlike
 ///     `handle_ask`'s own `auto_decision` call, a GUI action is deliberately
-///     NEVER swept in by issue #103's coarse read-only batch-or-issue grant
+///     NEVER swept in by the coarse read-only batch-or-issue grant
 ///     — see that method's own doc for why a `screenshot`/`list_windows`
 ///     call (always `RiskLevel::ReadOnly`, regardless of which window it
 ///     targets) cannot be treated the same as an ordinary read-only tool
@@ -1495,23 +1490,23 @@ const MAX_OPEN_OBSERVE_ASKS: usize = 3;
 /// [`run_action`] only proceeds to `has_open`/the control lease/the throttle
 /// — checks for a DIFFERENT, unrelated open ask, or for someone else driving
 /// the desktop right now — AFTER this gate returns `Ok`; those are a
-/// completely separate concern (issue #160 M2) from "is this call
+/// completely separate concern from "is this call
 /// authorized at all".
 ///
 /// Used to return `()` alone, not a distinction between how the `Ok` was
-/// reached: issue #160 round-4 P1 §2 originally returned an
-/// `Approval::{Auto,Interactive}` value here so every input arm of
+/// reached: this originally returned an
+/// `Approval::{Auto,Interactive}` value so every input arm of
 /// [`run_action`] could call `activate_target` ONLY for an Interactive
 /// approval (a card that actually rendered — a human clicking Weft's own UI
-/// to answer it takes the foreground away from the target). Round-5 review
-/// P1 §6 (issue #160 #3) removed that distinction: `activate_target` is now
+/// to answer it takes the foreground away from the target). That
+/// distinction was removed: `activate_target` is now
 /// called UNCONDITIONALLY by every input arm regardless of how this call
 /// approved — see that function's own doc for why an Auto approval needs the
 /// SAME reactivation an Interactive one does. With no caller left that
 /// needed to tell the two apart, the `Approval` enum this used to return was
 /// deleted entirely rather than kept as unused plumbing.
 ///
-/// issue #160 round-8 P1 #4: now returns `Result<Option<ApprovedWindow>,
+/// now returns `Result<Option<ApprovedWindow>,
 /// String>` instead — see [`ApprovedWindow`]'s own doc for the identity-
 /// binding problem this closes. `Ok(None)` for every OBSERVE action
 /// (`screenshot`/`list_windows`/`cursor_position`) and for any Write action
@@ -1530,8 +1525,8 @@ const MAX_OPEN_OBSERVE_ASKS: usize = 3;
 /// use it as a window-existence oracle; see the `resolution_failure` binding
 /// below.
 ///
-/// issue #160 round-10 P1 #A: the resolve above USED TO happen only once
-/// authorization already landed (`bind_approved_window`, round-8's own
+/// the resolve above USED TO happen only once
+/// authorization already landed (`bind_approved_window`, the earlier
 /// helper, now folded directly into this function — see the `resolved`
 /// binding below). That left a gap `bind_approved_window` alone could never
 /// close: a standing Always grant is looked up by `action_key` ALONE, and
@@ -1540,7 +1535,7 @@ const MAX_OPEN_OBSERVE_ASKS: usize = 3;
 /// approved one `type`-into-"notes" call as Always, that SAME key kept
 /// auto-approving every FUTURE `type` into whatever window "notes" happens
 /// to resolve to later, including an entirely different app/title that
-/// closed the original and took its place (round-8's own approve→dispatch
+/// closed the original and took its place (the earlier approve→dispatch
 /// binding only ever caught that drift AFTER approval, never at the
 /// grant-lookup step itself). The fix: for a Write action with a non-blank
 /// window argument, resolve `window_query` AUTHORITATIVELY right here,
@@ -1570,7 +1565,7 @@ async fn approve(
         format!("computer: {action} @ {window_query}")
     };
     let digest = args_digest(args);
-    // issue #160 round-10 P1 #A: resolve the window's identity FIRST, before
+    // resolve the window's identity FIRST, before
     // `action_key` is even built — see this function's own doc comment above
     // for the standing-grant identity gap this closes. Every Write-classified
     // action with a non-blank window argument gets this (mirrors the OLD
@@ -1578,8 +1573,8 @@ async fn approve(
     // `cursor_position` and `wait` (Write-classified but windowless) have
     // nothing to bind and keep the OLD, resolve-free key shape below.
     //
-    // issue #160 round-11 P1 #C: `screenshot` now ALSO resolves here, even
-    // though it's `RiskLevel::ReadOnly` — before this round, ONLY Write
+    // `screenshot` now ALSO resolves here, even
+    // though it's `RiskLevel::ReadOnly` — before this change, ONLY Write
     // actions bound a window at all, so a screenshot's approval card/standing
     // grant was scoped to the bare QUERY STRING alone, never the window it
     // actually resolved to. That let a card opened (or an Always grant
@@ -1588,7 +1583,7 @@ async fn approve(
     // DIFFERENT window that closed the original and took its place while the
     // card sat open, or after the grant was earned. Folding the resolved
     // identity into a screenshot's own key too closes that the same way
-    // round-10 P1 #A already closed it for input actions: a standing grant
+    // the input actions' keys already do: a standing grant
     // only ever matches the EXACT window it was granted against, and this
     // same `resolved` value is what the screenshot arm below verifies the
     // window it's ABOUT TO CAPTURE against (see `verify_approved_target`'s
@@ -1620,7 +1615,7 @@ async fn approve(
     let (resolved, resolution_failure) = if !window_query.trim().is_empty()
         && (risk == crate::ask::RiskLevel::Write || action == "screenshot")
     {
-        // issue #160 round-18 P1 (Codex computer_srv.rs:1343): this
+        // this
         // authorization-time window resolution is a synchronous `xcap`
         // enumeration that runs for EVERY windowed Write action and every
         // `screenshot`, BEFORE the observe-ask bound or the capture
@@ -1634,7 +1629,7 @@ async fn approve(
         // inline.
         let b = backend::backend();
         let wq = window_query.to_string();
-        // issue #160 round-23 P1 (Codex computer_srv.rs:1428): this resolve runs
+        // this resolve runs
         // at AUTHORIZATION time — before `auto_decision_exact` and before any
         // permission card. `ComputerError::AmbiguousWindow`'s Display lists every
         // matching app name, window title, and id; returning it here would hand
@@ -1644,7 +1639,7 @@ async fn approve(
         // narrow-your-query message. Other resolution errors (e.g. WindowNotFound)
         // disclose nothing about OTHER windows and pass through unchanged; the
         // full candidate list still reaches the human on the approval card.
-        // issue #160 round-27 P2 (Codex computer_srv.rs:1536): bound THIS
+        // bound THIS
         // authorization-time enumeration too. It runs BEFORE the screenshot
         // semaphore or the open-approval cap is ever acquired, so a burst of
         // concurrent requests (standing grant or not) could otherwise fan out
@@ -1652,10 +1647,10 @@ async fn approve(
         // pool. The permit is scoped to this block alone — dropped the moment
         // the resolve returns, NEVER held across the human approval wait
         // below (which can last up to the full ask timeout).
-        // issue #160 round-28 P2 (Codex computer_srv.rs:1559): re-check the
+        // re-check the
         // synchronous stop latch AND the direction-precise route revocation
         // INSIDE the closure, after the semaphore/blocking-pool queue waits —
-        // exactly like the list_windows/screenshot/cursor closures. Round-27's
+        // exactly like the list_windows/screenshot/cursor closures. The
         // permit bounds concurrency, but bounding IS queueing: a call can now
         // sit parked on the semaphore (or the blocking pool) while a human
         // hits Stop or a delete revokes the route, and without this recheck
@@ -1679,7 +1674,7 @@ async fn approve(
                     return Err(SESSION_GONE_MSG.to_string());
                 }
                 Ok(computer::resolve_window(b.as_ref(), &wq).map_err(|e| match e {
-                    // issue #160 round-23 P1: redacted — see the comment above
+                    // redacted — see the comment above
                     // this block for why the candidate list must not reach the
                     // agent from this authorization-time resolve.
                     ComputerError::AmbiguousWindow { .. } => {
@@ -1704,12 +1699,12 @@ async fn approve(
     // scoped to that EXACT window TITLE, not just the app — a title change
     // (a browser tab navigating, a document renaming itself in its title
     // bar) mints a new key and re-cards even though a human would likely
-    // consider it "the same window". That is the safe default this round
+    // consider it "the same window". That is the safe default this change
     // ships; loosening it to app-only scoping is a legitimate, separately-
-    // discussable product tradeoff for later, not something this round
+    // discussable product tradeoff for later, not something this change
     // changes.
     //
-    // issue #160 round-11 P1 #B: the resolved window's own `id` is now ALSO
+    // the resolved window's own `id` is now ALSO
     // folded in — right after `window_query`, before `app`/`title` — for
     // every action this branch covers (both Write actions with a window, and
     // now `screenshot`). Before this, the key carried `app`+`title` but NOT
@@ -1730,7 +1725,7 @@ async fn approve(
     // the a `type` Always-grant's own note on this same shape).
     // `always_key_is_persistable` (ask.rs) decides whether a GUI grant is safe to
     // persist from `parts[0]` (`"gui"`) and `parts[2]` (the window query — a
-    // window-bound grant is never persisted, round-24 P2). Inserting `id` at
+    // window-bound grant is never persisted). Inserting `id` at
     // position 3 (0-indexed) leaves both untouched, so that gate is unaffected by
     // this shape change.
     let action_key = match &resolved {
@@ -1755,7 +1750,7 @@ async fn approve(
     // see `detail_redacted`'s doc comment immediately below for the DIFFERENT,
     // EARLIER leak this alone does not close.
     let detail = args.to_string();
-    // issue #160 round-4 P1 §1: `AskEvent::Opened` (fired inside
+    // `AskEvent::Opened` (fired inside
     // `request_with_preview` below) hands this ENTIRE `Ask` — `detail`
     // included — straight to the IM bridge, which renders it into an
     // outbound Lark card BEFORE the human ever answers anything (see
@@ -1770,14 +1765,14 @@ async fn approve(
     // requirement, so one function serves both. Every other action's detail
     // carries nothing this module considers secret (a coordinate, a window
     // name, a key combo LABEL like "cmd+s" — never what was typed), so in
-    // practice this is `None` for everything except `type` (round-31 made the
-    // condition structural — "would the audit redaction change the args" —
+    // practice this is `None` for everything except `type` (the condition is
+    // structural — "would the audit redaction change the args" —
     // rather than a literal action match; see the comment at the binding
     // below); `im::outbound::perm_card` falls back to the unredacted `detail`
     // when `None` (see its own doc). Passed to the ONLY production caller of
     // `request_with_preview` — see that method's own doc on why it grew this
     // parameter directly rather than a separate `_redacted` variant.
-    // issue #160 round-31 P1 (Codex computer_srv.rs:2158): populated whenever
+    // populated whenever
     // the audit redaction would change the args AT ALL — not just for `type`.
     // Structurally fail-closed: whatever `redact_audit_args` considers secret
     // (bulk `type` text, a printable `key` chord, a `text` smuggled onto any
@@ -1790,10 +1785,10 @@ async fn approve(
         (&audit_view != args).then(|| audit_view.to_string())
     };
 
-    // issue #160 round-5 review P1 §1: GUI actions — observation AND input
+    // GUI actions — observation AND input
     // alike — go through the GUI-only `auto_decision_gui`, NOT the ordinary
     // `auto_decision` every other tool's ask-creation path uses. The
-    // difference is deliberate: `auto_decision` also honors issue #103's
+    // difference is deliberate: `auto_decision` also honors the
     // coarse "release all read-only" batch/issue grant for any
     // `RiskLevel::ReadOnly` ask, but `screenshot`/`list_windows` are
     // `ReadOnly` by `classify_gui_action`'s own construction REGARDLESS OF
@@ -1803,9 +1798,9 @@ async fn approve(
     // password manager, …) with no computer-specific card and no chance for
     // the human to see WHICH window before the pixels are captured. That is
     // a materially larger disclosure than the coarse grant was ever built to
-    // cover (issue #103's own "skip the card for `git status`" scope).
+    // cover.
     //
-    // issue #160 round-25 P1 (Codex ask.rs:2095): `auto_decision_gui` also
+    // `auto_decision_gui` also
     // drops the GLOBAL `dangerous`-mode shortcut that `auto_decision_exact`
     // keeps — Dangerous mode's user-facing promise is worktree-scoped ("act
     // freely inside their worktrees", `i18n` `dangerDesc`), so it must not
@@ -1815,7 +1810,7 @@ async fn approve(
     // grant and exact Always match behave exactly as before, Dangerous mode no
     // longer sweeps GUI in. See `AskRegistry::auto_decision_gui`'s own doc.
     match asks.auto_decision_gui(thread, dir, &action_key) {
-        // issue #160 round-10 P1 #A: `resolved` was already computed above,
+        // `resolved` was already computed above,
         // BEFORE this grant was even looked up (the key itself depends on
         // it) — reused directly here rather than resolved a second time, so
         // there is no "resolve once for the key, resolve again to bind" gap
@@ -1840,7 +1835,7 @@ async fn approve(
     }
 
     let preview = preview_for_action(thread, dir, wt, risk, resolved.as_ref());
-    // issue #160 round-14 P1 (Codex computer_srv.rs:515): for an input (Write)
+    // for an input (Write)
     // action, open the card ATOMICALLY with the "no other ask is already open
     // for this (thread, dir)" check — `check_suspended` above and this insert
     // were two SEPARATE lock acquisitions, so two concurrent Write calls for
@@ -1859,7 +1854,7 @@ async fn approve(
             None => return Err(ComputerError::SuspendedPendingAsk.to_string()),
         }
     } else {
-        // issue #160 round-15 P2 (Codex computer_srv.rs:1288): observe actions
+        // observe actions
         // (`screenshot`/`list_windows`/`cursor_position`) are deliberately NOT
         // suspended by an unrelated open card the way Write actions are — but
         // that must not mean UNBOUNDED: without a cap, a worker looping
@@ -1884,13 +1879,13 @@ async fn approve(
         }
     };
 
-    // issue #160 round-15 P1 (Codex commands.rs:1619): re-check the SYNCHRONOUS
+    // re-check the SYNCHRONOUS
     // stop latch immediately AFTER publishing the card, and self-cancel it if a
     // stop/disable landed. `run_action`'s top `computer::enabled` gate can be
     // passed by a call that then straddles the disable transition — window
     // resolution above is a real OS call, so the gap between "enabled read
     // true" and "card inserted" is unbounded. Both disable paths (Emergency
-    // Stop AND, as of round-15, the Settings toggle) run trip_stop_latch →
+    // Stop AND, the Settings toggle) run trip_stop_latch →
     // cancel_gui_asks: a card inserted BEFORE the sweep is killed by the sweep;
     // one inserted AFTER it is exactly this straddler — the sweep missed it,
     // but the latch was already visible when we get here (this check is after
@@ -1902,13 +1897,13 @@ async fn approve(
         asks.cancel(id);
         return Err(ComputerError::Disabled.to_string());
     }
-    // issue #160 round-34 P2 (Codex computer_srv.rs:1848): the SAME straddler
+    // the SAME straddler
     // shape, for route revocation — a thread/repo delete whose `asks` purge
     // ran between this call's entry check and the insert above misses THIS
     // card, which would otherwise sit answerable for the full ask timeout
     // after its session's rows are gone (an Always/Full answer minting a
     // grant for a deleted identity). The delete publishes its revocation
-    // BEFORE its purge (round-23), so program order guarantees one side sees
+    // BEFORE its purge, so program order guarantees one side sees
     // the other: either the purge ran after our insert (and swept the card),
     // or this check — after the insert — sees the already-published
     // revocation and cancels our own card. `route_revoked_sync` is lock-only
@@ -1919,14 +1914,14 @@ async fn approve(
     }
 
     match tokio::time::timeout(crate::bus::server::ASK_WAIT, rx).await {
-        // issue #160 round-10 P1 #A: same `resolved` value, reused here too —
-        // see this function's own top doc comment for why this round
+        // same `resolved` value, reused here too —
+        // see this function's own top doc comment for why this change
         // deliberately no longer re-resolves a second time at the moment the
-        // human's card answers Allow (round-8's own `bind_approved_window`
+        // human's card answers Allow (the earlier `bind_approved_window`
         // used to): a standing Always grant this call might mint is keyed
         // off THIS identity regardless, and `run_action`'s own later, fresh
-        // `resolve_window`/`verify_approved_target` pair (issue #160 round-10
-        // P1 #B, run both before AND after activation) is what actually
+        // `resolve_window`/`verify_approved_target` pair
+        // is what actually
         // guards the approve→dispatch gap a long human wait can open, not
         // this return value.
         // The human answered Allow on the probe's own card — only now may
@@ -1949,8 +1944,8 @@ async fn approve(
 }
 
 /// The window identity [`approve`] itself resolved AUTHORITATIVELY, at the
-/// instant it authorized ONE particular input (Write-classified) action —
-/// issue #160 round-8 P1 #4. Threaded through to [`run_action`]'s own later,
+/// instant it authorized ONE particular input (Write-classified) action.
+/// Threaded through to [`run_action`]'s own later,
 /// FRESH `resolve_window` call for that SAME action (via
 /// [`verify_approved_target`]) so a window that closed, was renamed, or got
 /// its id reused by ANOTHER window in the gap between approval and dispatch
@@ -1963,7 +1958,7 @@ async fn approve(
 /// alone is not sufficient to prove "this is still the window that was
 /// approved" — `app`+`title` must also still match.
 ///
-/// issue #160 round-10 P1 #A: this is now ALSO the exact identity folded
+/// this is now ALSO the exact identity folded
 /// into the input action's own `action_key` (see `approve`'s `resolved`
 /// binding) — the same three fields serve both jobs (scoping a standing
 /// Always grant to one window, and verifying dispatch lands on that same
@@ -1976,13 +1971,13 @@ struct ApprovedWindow {
     title: String,
 }
 
-/// issue #160 round-10 P1 #A: `approve` resolves a Write action's window
+/// `approve` resolves a Write action's window
 /// EXACTLY ONCE (see its own `resolved` binding) and reuses that SAME
 /// `WindowInfo` both to build `action_key` and — via this trivial,
 /// infallible conversion — to construct the `ApprovedWindow` it returns.
-/// Replaces round-8's own `bind_approved_window`, which used to re-resolve
+/// Replaces the earlier `bind_approved_window`, which used to re-resolve
 /// `window_query` a SECOND time at the moment authorization landed; folding
-/// window identity into the key itself (this round's fix) means that second
+/// window identity into the key itself (this change's fix) means that second
 /// resolve no longer serves any purpose a plain field-copy can't.
 impl From<computer::WindowInfo> for ApprovedWindow {
     fn from(w: computer::WindowInfo) -> Self {
@@ -1990,7 +1985,7 @@ impl From<computer::WindowInfo> for ApprovedWindow {
     }
 }
 
-/// issue #160 round-8 P1 #4: the execution-time check every input arm of
+/// the execution-time check every input arm of
 /// [`run_action`] runs right after its OWN fresh `resolve_window` (and right
 /// BEFORE `activate_and_recheck`/the actual backend injection) — the target
 /// this call is about to drive must be BYTE-FOR-BYTE the same window
@@ -2019,7 +2014,7 @@ fn verify_approved_target(
     Ok(())
 }
 
-/// issue #160 round-10 P1 #B: resolve `window_query` fresh against the
+/// resolve `window_query` fresh against the
 /// process-wide backend, record its id into `window_id_out` — done even when
 /// the very next [`verify_approved_target`] check fails, so the audit log
 /// still names which window was TARGETED, not only ones that actually
@@ -2051,7 +2046,7 @@ fn resolve_and_verify_target(
     Ok(w)
 }
 
-/// issue #160 round-16 P1 (Codex 605): the on-blocking-pool wrapper every
+/// the on-blocking-pool wrapper every
 /// input arm of [`run_action`] calls (instead of [`resolve_and_verify_
 /// target`] directly) both times it resolves a target window — window
 /// enumeration (`computer::resolve_window`, inside the wrapped call) is a
@@ -2085,8 +2080,8 @@ async fn resolve_and_verify_target_blocking(
 /// Map an agent-given screenshot-space coordinate for `w` — the FRESHLY
 /// resolved (post-activation) window every coordinate-taking input arm
 /// already has on hand — to a physical on-screen point, using `(thread,
-/// dir, w.id)`'s most recently recorded screenshot dimensions (issue #160
-/// round-11 P1 #D) rather than re-deriving a scale from `w`'s CURRENT size —
+/// dir, w.id)`'s most recently recorded screenshot dimensions
+/// rather than re-deriving a scale from `w`'s CURRENT size —
 /// see `computer::map_screenshot_coord`'s own doc for the resize-drift bug
 /// this replaces `computer::map_to_physical` to close.
 ///
@@ -2096,10 +2091,10 @@ async fn resolve_and_verify_target_blocking(
 /// last screenshot fell out of `computer::MAX_SHOT_DIMS`'s bound) has no
 /// screenshot-space coordinate system to interpret its own `coordinate`
 /// against at all — this ALSO happens to enforce "screenshot before you
-/// click", a good practice this round is happy to require outright rather
+/// click", a good practice this change is happy to require outright rather
 /// than merely encourage.
 fn map_input_coord(thread: i32, dir: &str, wt: Option<i32>, w: &computer::WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), String> {
-    // issue #160 round-12 P1 #2: `shot_dims_for` (not the old id-only
+    // `shot_dims_for` (not the old id-only
     // `shot_dims`) also verifies `w`'s CURRENT app+title against whatever was
     // recorded at capture time — an id the OS reused for a different window
     // since that screenshot now reads as no record at all, the same
@@ -2116,7 +2111,7 @@ fn map_input_coord(thread: i32, dir: &str, wt: Option<i32>, w: &computer::Window
 }
 
 /// Fixed key order for the "consequential parameters" digest folded into the
-/// Always-grant `action_key` (issue #160 round-2 P2 §2) — every argument
+/// Always-grant `action_key` — every argument
 /// across every action this server implements that actually determines WHAT
 /// an action does to the human's screen. `text` carries `type`/`key`'s own
 /// content; the rest are the coordinate/scroll/duration shapes the other
@@ -2132,8 +2127,8 @@ const DIGEST_PARAM_KEYS: &[&str] = &[
     "duration_ms",
 ];
 
-/// A stable sha256 hex digest of `args`'s consequential parameters (issue
-/// #160 round-2 P2 §2), folded as the trailing element of the Always-grant
+/// A stable sha256 hex digest of `args`'s consequential parameters,
+/// folded as the trailing element of the Always-grant
 /// `action_key` so a standing grant is scoped to the EXACT parameters it was
 /// granted for — not just `action` + `window`. Before this, `action_key =
 /// ["gui", action, window]` meant a SINGLE Always answer to one `type` call
@@ -2191,7 +2186,7 @@ pub fn args_digest(args: &Value) -> String {
 }
 
 /// The screenshot preview to attach to a NEW Ask card for `action` targeting
-/// `window_query`, if any (issue #160 round-2 P1 §2). Observe-only actions
+/// `window_query`, if any. Observe-only actions
 /// (`risk != Write`) never attach one, unchanged from the M3-B rule this
 /// replaces (relocated here from `bus::server::handle_ask` — see this
 /// module's own doc comment): the agent that just took a screenshot already
@@ -2217,15 +2212,15 @@ fn preview_for_action(
     if risk != crate::ask::RiskLevel::Write {
         return None;
     }
-    // issue #160 round-20 P1 (Codex computer_srv.rs:1889): REUSE the identity
+    // REUSE the identity
     // `approve` already resolved once (on the blocking pool — see its
     // `resolved` binding) instead of enumerating windows a SECOND time inline
     // on the async runtime. Under several concurrent grant-less input requests
     // that extra synchronous `xcap` enumeration could occupy every tokio worker
     // before the first card was even admitted, starving the Stop/Escape tasks;
     // reusing the already-resolved window removes it (and closes the last
-    // "resolve twice, window swapped in between" gap for the preview). issue
-    // #160 round-14 P1: match on the FULL window identity (id + app + title),
+    // "resolve twice, window swapped in between" gap for the preview). Match
+    // on the FULL window identity (id + app + title),
     // not the numeric id alone — see [`VerifiedWindowIdentity`]'s own doc for
     // the id-reuse hazard an id-only comparison left open.
     let target = VerifiedWindowIdentity::from_window(resolved?);
@@ -2234,7 +2229,7 @@ fn preview_for_action(
 }
 
 /// A window-scoped action's `window` argument, validated BEFORE it ever
-/// reaches [`computer::resolve_window`] (issue #160 round-2 P2): missing,
+/// reaches [`computer::resolve_window`]: missing,
 /// non-string, empty, or all-whitespace all fail here with an explicit
 /// missing-argument error instead of falling through to resolution. Without
 /// this check, an empty string would still reach `resolve_window`'s
@@ -2258,7 +2253,7 @@ fn required_window(args: &Value) -> Result<&str, String> {
 
 /// The audit log's OWN args payload for this call — identical to the raw
 /// call args for every action except `type`, whose literal keystrokes must
-/// NEVER be written to `.weft/computer-audit.jsonl` (issue #160 round-2 P2):
+/// NEVER be written to `.weft/computer-audit.jsonl`:
 /// that file persists on disk indefinitely and is readable by anyone with
 /// filesystem access to the worktree, unlike the Ask card's `detail` (built
 /// in [`approve`], from this SAME raw `args`) — which is ephemeral, shown
@@ -2275,7 +2270,7 @@ fn redact_audit_args(action: &str, args: &Value) -> Value {
     let Some(obj) = redacted.as_object_mut() else {
         return redacted;
     };
-    // issue #160 round-33 P1 (Codex computer_srv.rs:3090): strip every key
+    // strip every key
     // outside the action's [`allowed_args`] allowlist WHOLESALE — both the
     // key name and its value are request-author-chosen and can carry smuggled
     // content, so neither may persist. `reject_unknown_args` already refuses
@@ -2301,9 +2296,9 @@ fn redact_audit_args(action: &str, args: &Value) -> Value {
     let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
         return redacted;
     };
-    // `type` always redacts (bulk keystrokes are content). issue #160 round-20
-    // (Codex computer_srv.rs:1475): `key` redacts a printable TEXT-entry
-    // chord — judged by [`is_printable_text_chord`] since round-31 P1 (Codex
+    // `type` always redacts (bulk keystrokes are content). `key` redacts a
+    // printable TEXT-entry
+    // chord — judged by [`is_printable_text_chord`] (a chord like
     // computer_srv.rs:3162), the same semantic predicate `reject_unsafe_key_
     // combo` rejects on, so even the rejected attempt's audit line never
     // records the raw character(s); an UNPARSEABLE `key` payload is redacted
@@ -2312,7 +2307,7 @@ fn redact_audit_args(action: &str, args: &Value) -> Value {
     // command combo (`cmd+s`, `ctrl+c`, `enter`) is NOT content and stays in
     // the audit for forensics.
     //
-    // issue #160 round-31 P1 (Codex computer_srv.rs:2158): EVERY OTHER action
+    // EVERY OTHER action
     // redacts a present `text` unconditionally — no other action consumes the
     // field at all (`pure_validate` now rejects it outright), but the audit
     // logs rejected calls too, so a payload smuggled onto e.g. a `screenshot`
@@ -2333,11 +2328,11 @@ fn redact_audit_args(action: &str, args: &Value) -> Value {
     redacted
 }
 
-// —— type/key focus-freshness gate (issue #160 round-2 P1 addendum) ——
+// —— type/key focus-freshness gate ——
 //
 // Neither backend this module drives exposes a real "which window currently
 // holds OS keyboard focus" query (`xcap` has none; a genuine focus API is a
-// real-machine follow-up, issue #160 §9), so `type`/`key` cannot verify focus
+// real-machine follow-up), so `type`/`key` cannot verify focus
 // directly. Without SOME check here, they would blindly inject keystrokes
 // into whatever happens to be focused — which could be a credential prompt,
 // or any other window the agent never intended, if it never actually clicked
@@ -2353,10 +2348,10 @@ fn redact_audit_args(action: &str, args: &Value) -> Value {
 // but it closes the main accident surface: typing into a target window that
 // was never clicked at all, this session, ever.
 //
-// issue #160 round-3 P1 §1 previously patched a SECOND hole here — an
+// A previous design patched a SECOND hole here — an
 // Interactive approval card dragging OS focus to Weft between the click and
 // the keystrokes — by replaying the exact last-click coordinate right before
-// `type`/`key`. Round-4 P1 §2 REMOVES that replay hack: it only ever helped
+// `type`/`key`. The activation design REMOVES that replay hack: it only ever helped
 // `type`/`key` (a `left_click`/`scroll`/`drag`/`mouse_move` itself was still
 // exposed — an absolute-coordinate action can land on Weft's own card if the
 // card now covers the target window's on-screen position, not just a stale
@@ -2366,7 +2361,7 @@ fn redact_audit_args(action: &str, args: &Value) -> Value {
 // `activate_target`'s own doc, right below this section, for the actual fix:
 // reactivating the TARGET window through `backend::ComputerBackend::
 // activate_window` before ANY input action reaches the OS, not just
-// `type`/`key` — and, since round-5 review P1 §6, before an AUTO-approved
+// `type`/`key` — and, review P1 §6, before an AUTO-approved
 // input action too, not only one that actually surfaced an Interactive card.
 
 /// How long a click on a window is trusted to still hold that window's OS
@@ -2376,13 +2371,13 @@ const FOCUS_FRESHNESS_SECS: u64 = FOCUS_FRESHNESS_MS / 1000;
 
 /// Process-level "last window this `(thread, dir)` actually clicked, and
 /// when" registry — see this section's own doc comment.
-/// issue #160 round-4 P1 §2: no longer carries the click's physical
-/// `(px, py)` — that existed ONLY to feed the round-3 P1 §1 replay-click
-/// hack this round removes (see this section's own top doc comment); the
+/// no longer carries the click's physical
+/// `(px, py)` — that existed ONLY to feed the replay-click
+/// hack this section's own top doc comment describes removing; the
 /// window id + timestamp pair is all [`require_recent_focus`] itself has
 /// ever needed.
 ///
-/// issue #160 round-15 P2 (Codex computer_srv.rs:1707): the timestamp is a
+/// the timestamp is a
 /// monotonic [`std::time::Instant`] now, NOT wall-clock `now_ms()`. This used
 /// to reason "a system clock adjustment mid-session is not a hazard this
 /// heuristic needs to defend against" — wrong for a PERMISSION-adjacent gate:
@@ -2393,15 +2388,15 @@ const FOCUS_FRESHNESS_SECS: u64 = FOCUS_FRESHNESS_MS / 1000;
 /// process-local and monotonic, which is exactly what this check is: a
 /// process-local freshness heuristic. (The audit log's `ts_ms` stays wall
 /// clock — that's a human-readable record, not a gate.)
-/// issue #160 round-17 P2 (Codex computer_srv.rs:1943): the value carries the
+/// the value carries the
 /// clicked window's FULL [`VerifiedWindowIdentity`] now, not its bare id — an
 /// id reused within the 15s freshness window used to let the REPLACEMENT
 /// window read as "recently clicked", and under a Full grant a `type`/`key`
 /// would then activate and inject into it with neither a card nor a genuine
 /// click. Identity comparison fails that closed, same as the preview and
 /// shot-dims registries already do.
-/// Keyed by `(thread, dir, wt)` — the worktree id included since issue #160
-/// round-34 P2 (Codex computer_srv.rs:2329): sibling workers of ONE
+/// Keyed by `(thread, dir, wt)` — the worktree id is part of the key because
+/// sibling workers of ONE
 /// multi-repo direction share `(thread, dir)` but are distinct sessions, so
 /// worker A's successful click must never satisfy worker B's `type`/`key`
 /// focus prerequisite — under a shared Full grant that meant silently
@@ -2440,9 +2435,9 @@ fn require_recent_focus(
 ) -> Result<(), String> {
     let g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
     let target = VerifiedWindowIdentity::from_window(w);
-    // issue #160 round-15 P2: `Instant::elapsed` is monotonic — a wall-clock
-    // rollback can no longer stretch one click's freshness window. issue #160
-    // round-17 P2: the FULL identity must match, not just the id (see
+    // `Instant::elapsed` is monotonic — a wall-clock
+    // rollback can no longer stretch one click's freshness window. The FULL
+    // identity must match, not just the id (see
     // [`recent_clicks`]'s own doc for the id-reuse hazard).
     let fresh = matches!(
         g.get(&(thread, dir.to_string(), wt)),
@@ -2459,28 +2454,28 @@ fn require_recent_focus(
     ))
 }
 
-// —— reclaiming the foreground before every input action (issue #160 round-4 P1 §2, broadened round-5 review P1 §6) ——
+// —— reclaiming the foreground before every input action ——
 
 /// Reactivates the target window before the backend ever touches the OS —
 /// click family, `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`
-/// (issue #160 round-4 P1 §2, replacing round-3 P1 §1's own click-replay
+/// (replacing the click-replay
 /// hack — see the focus-freshness section's own doc comment above for why
 /// that hack was unsafe and insufficient). Called via [`activate_and_recheck`]
 /// — NOT this function directly — from every input arm of [`run_action`]:
 /// AFTER the FIRST [`recheck_after_guard`] (right after acquiring
-/// `input_flight_guard`) and the arm's own fresh window resolution (issue
-/// #160 round-6 review P1 #2+#3), and immediately followed by a SECOND
+/// `input_flight_guard`) and the arm's own fresh window resolution,
+/// and immediately followed by a SECOND
 /// `recheck_after_guard` call before the action-specific backend call
 /// itself — see [`activate_and_recheck`]'s own doc for why THIS call, being
 /// a potentially slow, blocking OS call (`osascript`/`wmctrl`/`xdotool`),
 /// needed its own dedicated recheck rather than trusting the one already
 /// taken before it started.
 ///
-/// Round-4 P1 §2 shipped this ONLY for an Interactive approval (a card that
+/// An earlier shape ran this ONLY for an Interactive approval (a card that
 /// actually rendered, so a human clicking Weft's own UI to answer it just
-/// took the foreground away from the target). Round-5 review P1 §6 (issue
-/// #160 #3) broadens it to EVERY input action, Auto-approved ones included:
-/// Codex's own finding was that a standing grant deciding silently does NOT
+/// took the foreground away from the target). It covers EVERY input
+/// action, Auto-approved ones included:
+/// a standing grant deciding silently does NOT
 /// mean the target window still holds the real OS foreground/focus at the
 /// moment this call finally runs — a human sitting at the machine can switch
 /// windows, alt-tab, or bring some OTHER app forward between an agent's calls
@@ -2501,8 +2496,8 @@ fn require_recent_focus(
 /// around it: answer/grant from weft's own desktop UI, where the foreground
 /// never has anywhere else to go.
 ///
-/// KNOWN, ACCEPTED residual (recorded here and in issue #160 §9, not
-/// eliminated this round): even after this call succeeds, there is no
+/// KNOWN, ACCEPTED residual (recorded here, not
+/// eliminated this change): even after this call succeeds, there is no
 /// cross-platform primitive this module can call to VERIFY the target window
 /// is truly frontmost at the exact instant the backend call right after this
 /// one actually injects — neither `xcap` nor `enigo` exposes a "is this
@@ -2516,10 +2511,9 @@ fn require_recent_focus(
 /// heuristic it complements. This residual is scoped to third-party focus
 /// theft specifically — a human hitting Stop DURING this call is a
 /// DIFFERENT, now-closed hazard: see [`activate_and_recheck`]'s own doc for
-/// the second `recheck_after_guard` that closes it (issue #160 round-6
-/// review P1 #2).
+/// the second `recheck_after_guard` that closes it.
 fn activate_target(target: &computer::WindowInfo) -> Result<(), String> {
-    // issue #160 round-34 P2 (Codex computer_srv.rs:2986): the FULL verified
+    // the FULL verified
     // identity crosses this boundary now, not the bare id — the backend
     // re-verifies app/title as close to the raise as the platform allows
     // (see `ComputerBackend::activate_window`'s doc), so an id reused while
@@ -2534,7 +2528,7 @@ fn activate_target(target: &computer::WindowInfo) -> Result<(), String> {
     })
 }
 
-// —— screenshot → MCP image content + Ask-card preview registry (issue #160 M3-B) ——
+// —— screenshot → MCP image content + Ask-card preview registry ——
 
 /// Long edge / JPEG quality for the MCP `image` content block a `screenshot`
 /// result gets, for the engines [`engine_accepts_mcp_image`] allows — a full
@@ -2553,12 +2547,12 @@ const MCP_IMAGE_QUALITY: u8 = 75;
 const PREVIEW_LONG_EDGE: u32 = 640;
 const PREVIEW_QUALITY: u8 = 60;
 
-/// issue #160 round-12 P1 #5: process-wide cap on CONCURRENT screenshot
+/// process-wide cap on CONCURRENT screenshot
 /// capture+encode. A `screenshot` call synchronously captures a full RGBA
 /// frame, PNG-encodes it to disk, then may ALSO JPEG-encode it up to twice
 /// more (the preview thumbnail above, and — engine-gated — the MCP inline
 /// image) — with no throttle/semaphore/flight-guard anywhere on this path
-/// before this round. Full access or a matching Always grant lets a worker
+/// before this change. Full access or a matching Always grant lets a worker
 /// fire arbitrarily many concurrent `screenshot` calls, each one holding its
 /// own full-resolution RGBA buffer (tens of MB for a 4K display) plus
 /// PNG/JPEG encode buffers, all resident in memory at once — a
@@ -2580,13 +2574,13 @@ const SCREENSHOT_CONCURRENCY: usize = 2;
 /// capture — Rust drops the permit as part of normal scope unwinding, no
 /// manual guard-drop needed).
 ///
-/// issue #160 round-16 P1 (Codex 605): the `list_windows` arm of `run_action`
+/// the `list_windows` arm of `run_action`
 /// now ALSO acquires this same semaphore, before its own enumeration —
 /// deliberately sharing this one "OS observation" budget rather than minting
-/// a second, separate one. Round-15 P2's `MAX_OPEN_OBSERVE_ASKS` only bounds
+/// a second, separate one. `MAX_OPEN_OBSERVE_ASKS` only bounds
 /// how many observe Ask CARDS may sit open waiting on a human; a session
 /// already holding a standing Full/Always grant skips card-opening entirely,
-/// and until this round had NO concurrency cap at all on the OS calls that
+/// and until this change had NO concurrency cap at all on the OS calls that
 /// path could fire. This is the hard ceiling for that already-authorized
 /// case — `MAX_OPEN_OBSERVE_ASKS` and this semaphore guard two different
 /// stages of the same lifecycle (before a grant exists, and after one does).
@@ -2627,7 +2621,7 @@ async fn session_tool(db: &Db, thread: i32, dir: &str) -> Option<String> {
 }
 
 /// Which weft_computer callers get a screenshot's pixels as an inline MCP
-/// `image` content block (issue #160 M3-B), on top of the text confirmation
+/// `image` content block, on top of the text confirmation
 /// EVERY caller always gets regardless (this module's own doc comment: the
 /// agent's own image-viewing tool is the universal fallback):
 ///
@@ -2647,8 +2641,8 @@ async fn engine_accepts_mcp_image(db: &Db, thread: i32, dir: &str) -> bool {
     }
 }
 
-/// Process-level "most recent screenshot" registry (issue #160 M3-B, value
-/// shape extended in round-2 P1 §2): one small preview thumbnail PLUS the
+/// Process-level "most recent screenshot" registry
+/// : one small preview thumbnail PLUS the
 /// window id it actually came from, per (thread, dir), refreshed on EVERY
 /// successful `screenshot` action regardless of which engine is asking
 /// (unlike the MCP image content block above, which is engine-gated) —
@@ -2659,12 +2653,12 @@ async fn engine_accepts_mcp_image(db: &Db, thread: i32, dir: &str) -> bool {
 /// key/etc without opening the saved PNG themselves. A process-wide
 /// `OnceLock`, not per-request state, so it survives across the many
 /// separate MCP calls a session makes — mirrors `computer::control_mutex`'s
-/// own process-level-static shape for the same reason (issue #160 M2).
+/// own process-level-static shape for the same reason.
 /// In-memory only: a stale/missing preview is harmless (the Ask card just
 /// renders without one), so a restart starting empty is fine — no
 /// durability needed.
 ///
-/// issue #160 round-2 P2 §7: this used to grow UNBOUNDED for the life of the
+/// this used to grow UNBOUNDED for the life of the
 /// process — one entry per (thread, dir) that ever screenshotted, never
 /// evicted. [`MAX_PREVIEWS`] caps it; the value's third element is the
 /// insertion timestamp [`store_screenshot_preview`] needs to find (and evict)
@@ -2677,11 +2671,9 @@ async fn engine_accepts_mcp_image(db: &Db, thread: i32, dir: &str) -> bool {
 /// `app`+`title` alongside `id` fails such a match closed instead — the SAME
 /// id-reuse defense `computer::shot_dims_for` applies to recorded screenshot
 /// geometry. Two registries key off this:
-///  - the Ask-card preview registry (issue #160 round-14 P1, Codex
-///    computer_srv.rs:1466) — so a stale preview can't be attached to a card
+///  - the Ask-card preview registry — so a stale preview can't be attached to a card
 ///    for a window that merely reused the captured window's number;
-///  - the click-focus registry (issue #160 round-17 P2, Codex
-///    computer_srv.rs:1943) — so a `type`/`key` within the freshness window
+///  - the click-focus registry — so a `type`/`key` within the freshness window
 ///    can't ride a click recorded against a window that closed and had its
 ///    id reused (under a Full grant that would have meant injecting
 ///    keystrokes into the replacement with neither a card nor a real click
@@ -2699,14 +2691,14 @@ impl VerifiedWindowIdentity {
     }
 }
 
-/// Keyed by `(thread, dir, wt)` — the worktree id included since issue #160
-/// round-28 P2 (Codex computer_srv.rs:2488): sibling workers of ONE direction
+/// Keyed by `(thread, dir, wt)` — the worktree id is part of the key because
+/// sibling workers of ONE direction
 /// share `(thread, dir)` but are distinct sessions (distinct bearer tokens,
 /// distinct lease holders — see `computer::ControlHolder.wt`), so a
 /// `(thread, dir)`-keyed entry let worker A's freshly-captured preview attach
 /// to worker B's input approval card whenever their resolved windows matched —
 /// cross-session context the card's human should never be shown. Same widening
-/// `computer::record_shot_dims` got in round-26 (N3), for the same reason.
+/// `computer::record_shot_dims` has, for the same reason.
 fn screenshot_previews(
 ) -> &'static Mutex<HashMap<(i32, String, Option<i32>), (String, VerifiedWindowIdentity, u64)>> {
     static PREVIEWS: OnceLock<
@@ -2715,7 +2707,7 @@ fn screenshot_previews(
     PREVIEWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The registry's capacity (issue #160 round-2 P2 §7). Chosen generously
+/// The registry's capacity. Chosen generously
 /// above any realistic number of SIMULTANEOUSLY ACTIVE computer-use sessions
 /// this process would ever host at once (each entry is one small JPEG
 /// thumbnail, refreshed per-session on its own next screenshot — this is not
@@ -2769,7 +2761,7 @@ fn store_screenshot_preview(
 
 /// The most recent screenshot preview (and the window id it came from) for
 /// `(thread, dir, wt)`, if any — see [`screenshot_previews`]'s doc. Read only
-/// from [`preview_for_action`] within this same module now (the round-2 P1
+/// from [`preview_for_action`] within this same module (the
 /// server-side gate owns preview attachment; `bus::server::handle_ask` no
 /// longer does — see this module's own top doc comment).
 fn last_screenshot_preview(
@@ -2795,11 +2787,11 @@ fn window_arg(args: &Value) -> String {
 /// 2. are we going faster than the global input throttle allows —
 ///    [`ComputerError::RateLimited`] — see [`acquire_and_throttle`];
 /// 3. does someone else hold the control lease — [`ComputerError::Busy`] —
-///    also [`acquire_and_throttle`], checked AFTER the throttle (issue #160
-///    round-12 P2 #G — see that function's own doc for why the order
+///    also [`acquire_and_throttle`], checked AFTER the throttle (see that
+///    function's own doc for why the order
 ///    flipped from the reverse it used to be).
 ///
-/// issue #160 round-2 P2 §4 split this single gate in two and moved the
+/// This single gate is split in two, with the
 /// MUTATING half ([`acquire_and_throttle`] — it actually takes the 30s
 /// control lease and consumes a throttle slot) to run AFTER every
 /// action-specific, purely-argument-shaped check for that action (the window
@@ -2814,7 +2806,7 @@ fn window_arg(args: &Value) -> String {
 /// permission UI while it's up), and doesn't itself acquire or consume
 /// anything, so there's no cost to checking it before argument parsing.
 ///
-/// issue #160 round-6 review P1 #2+#3: the window's actual RESOLUTION (and,
+/// The window's actual RESOLUTION (and,
 /// for the mouse family, the coordinate's mapping against it; for `type`/
 /// `key`, the focus-freshness check against it) are NOT purely-argument
 /// checks — they depend on the live desktop's current state, which can have
@@ -2837,14 +2829,14 @@ fn check_suspended(asks: &AskRegistry, thread: i32, dir: &str) -> Result<(), Str
 }
 
 /// The MUTATING half of the input gate — see [`check_suspended`]'s doc
-/// comment for the full round-2 P2 §4 ordering rationale. Called ONLY once
+/// comment for the full ordering rationale. Called ONLY once
 /// every fallible, non-mutating check for this specific action has already
 /// passed, immediately before the backend call itself: a call that was
 /// always going to be rejected for a bad argument never reaches this, so it
 /// never occupies the control lease or a throttle slot.
 ///
-/// issue #160 round-12 P2 #G: throttle is now checked BEFORE the control
-/// lease is (re)acquired — the reverse of this function's own pre-round-12
+/// throttle is now checked BEFORE the control
+/// lease is (re)acquired — the reverse of this function's own earlier
 /// order. Before this, a same-session input call faster than
 /// `computer::THROTTLE_MS` apart still ran `acquire_control` FIRST, which
 /// unconditionally RENEWS the 30s sliding-window lease (a live same-holder
@@ -2860,7 +2852,7 @@ fn check_suspended(asks: &AskRegistry, thread: i32, dir: &str) -> Result<(), Str
 /// passes, and means a rejected, rate-limited call no longer touches
 /// `acquire_control`/the lease at all.
 fn acquire_and_throttle(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), String> {
-    // issue #160 round-13 P2 (Codex computer_srv.rs:1955): a call that is about
+    // a call that is about
     // to be rejected as `Busy` (a DIFFERENT, still-live session holds the
     // control lease) must NOT consume a throttle slot on the way out. The
     // throttle is process-wide and single-slotted; `throttle_input` records
@@ -2870,7 +2862,7 @@ fn acquire_and_throttle(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), S
     // ACTUAL holder's own paced calls into `RateLimited` even though they are
     // ≥ `THROTTLE_MS` apart. Peek the holder first: only a free lease or one
     // this SAME `(thread, dir)` already holds proceeds to the throttle. This
-    // keeps round-12 P2 #G intact — a same-holder call that is itself rate-
+    // keeps the throttle-first order intact — a same-holder call that is itself rate-
     // limited still rejects at `throttle_input` WITHOUT renewing its lease,
     // because `acquire_control` only runs after the throttle passes.
     //
@@ -2882,7 +2874,7 @@ fn acquire_and_throttle(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), S
     // the new foreign holder and bails before the throttle), so it can never
     // become the repeatable starvation the peek closes.
     if let Some(holder) = computer::control_state() {
-        // issue #160 round-25 P1 (Codex mod.rs:1552): `wt` is part of the
+        // `wt` is part of the
         // holder identity, so a SIBLING worker (same `(thread, dir)`, different
         // worktree) peeks as a foreign holder and bails with `Busy` here
         // instead of sliding through as the same holder.
@@ -2895,8 +2887,8 @@ fn acquire_and_throttle(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), S
     Ok(())
 }
 
-/// A gate every input branch of [`run_action`] clears TWICE now (issue #160
-/// round-6 review P1 #2): once immediately after acquiring
+/// A gate every input branch of [`run_action`] clears TWICE now
+/// : once immediately after acquiring
 /// `computer::input_flight_guard()` (before that branch's own fresh window
 /// resolution/coordinate mapping/focus check), and again via
 /// [`activate_and_recheck`] right after `activate_target` — see that
@@ -2913,7 +2905,7 @@ fn acquire_and_throttle(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), S
 /// disabling the setting and clearing the control lease
 /// (`computer::emergency_stop`) — or, once the lease self-heals on expiry, a
 /// completely different `(thread, dir)` could acquire it first. Neither
-/// `approve`'s own post-await recheck (issue #160 round-2 P1 §1, which only
+/// `approve`'s own post-await recheck (which only
 /// re-runs once, right after the approval gate, long before the guard is
 /// even requested) nor `acquire_and_throttle`'s own `acquire_control` call
 /// (which already ran, successfully, before this caller ever started
@@ -2921,16 +2913,15 @@ fn acquire_and_throttle(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), S
 /// AFTER the queue itself, so a call that waited behind someone else's long
 /// hold sees the world as it is NOW, not as it was when it first queued.
 ///
-/// `Ok` requires ALL THREE: no OTHER ask now open for this `(thread, dir)`
-/// (issue #160 round-5 review P1 §2 — see the paragraph below),
+/// `Ok` requires ALL THREE: no OTHER ask now open for this `(thread, dir)`,
 /// [`computer::enabled`] still true, AND [`computer::control_state`] naming
 /// this EXACT `(thread, dir)` as the current holder — a DIFFERENT holder, or
 /// no holder at all (an expired or force-cleared lease), both fail closed
 /// rather than let a call that no longer holds the lease it thinks it does
 /// reach the backend anyway.
 ///
-/// issue #160 round-5 review P1 §2: this used to check only enabled+lease —
-/// Codex's finding was that a call queued on `input_flight_guard` can have a
+/// this used to check only enabled+lease — but a
+/// call queued on `input_flight_guard` can have a
 /// BRAND-NEW ask open for its SAME `(thread, dir)` while it waits (a
 /// completely unrelated permission request from the same engine, racing in
 /// through its own hook), and once such a call finally acquires the guard it
@@ -2953,14 +2944,14 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
     if !computer::enabled(db).await {
         return Err(ComputerError::Disabled.to_string());
     }
-    // issue #160 round-19 P1 (Codex computer_srv.rs:403): revalidate the session
+    // revalidate the session
     // at this post-queue checkpoint, immediately before injection — a thread
     // deleted WHILE this call sat queued on `input_flight_guard` (behind another
     // session's in-flight action) must be caught here, not only at the
     // `handle_computer` entry gate. Gated on the revocation set: a thread that
     // was never deleted (every synthetic-identity test, and normal operation)
     // pays only the lock-only lookup, never the `session_is_live` DB check.
-    // issue #160 round-34 P1 (Codex computer_srv.rs:2869): the request's OWN
+    // the request's OWN
     // `wt` is passed through — this used to hardcode `None`, which
     // `session_is_live` reads as "no worktree pinned, direction row is
     // enough": a SESSION-ONLY worker whose worktree a repo delete removed
@@ -2971,7 +2962,7 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
     if computer_routes_revoked(thread) && !session_is_live(db, thread, dir, wt).await {
         return Err(SESSION_GONE_MSG.to_string());
     }
-    // issue #160 round-25 P1 (Codex mod.rs:1552): compare `wt` too, so a
+    // compare `wt` too, so a
     // SIBLING worker (same `(thread, dir)`) that legitimately took the lease
     // after THIS call's own lease expired while it sat queued is recognized as
     // a different holder here — not mistaken for "I still hold it" and waved
@@ -2987,7 +2978,7 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
     }
 }
 
-/// issue #160 round-18 P1 (Codex computer_srv.rs:967): the FINAL, purely
+/// the FINAL, purely
 /// SYNCHRONOUS kill-switch + control-lease recheck, run INSIDE an input arm's
 /// [`on_blocking`] closure — on the very blocking-pool thread that is about to
 /// call the OS injection backend, as its first statement immediately before
@@ -3047,7 +3038,7 @@ fn recheck_stop_and_lease_before_backend(thread: i32, dir: &str, wt: Option<i32>
 /// time" tail every input branch of [`run_action`] runs, immediately after
 /// its own branch-specific fresh window resolution (and, for the mouse
 /// family, coordinate remap / for `type`/`key`, focus-freshness check) and
-/// right before the actual backend call (issue #160 round-6 review P1 #2).
+/// right before the actual backend call.
 ///
 /// `activate_target` shells out to a blocking OS call (`osascript`/
 /// `wmctrl`/`xdotool` — see its own doc) that can itself take a real amount
@@ -3062,7 +3053,7 @@ fn recheck_stop_and_lease_before_backend(thread: i32, dir: &str, wt: Option<i32>
 /// backend ever sees the injection — the caller must `?` this and never
 /// fall through to its own backend call on an `Err` here.
 ///
-/// issue #160 round-16 P1 (Codex 605): `activate_target` — the blocking
+/// `activate_target` — the blocking
 /// shell-out this function's own doc above describes — now runs via
 /// [`on_blocking`] rather than directly on the async worker (see that
 /// helper's own doc for why: a slow/wedged activation call must never risk
@@ -3077,14 +3068,14 @@ async fn activate_and_recheck(
     wt: Option<i32>,
     target: &computer::WindowInfo,
 ) -> Result<(), String> {
-    // issue #160 round-29 P2 (Codex computer_srv.rs:2871): run the SAME
+    // run the SAME
     // synchronous latch/lease recheck the final injection closures run,
     // INSIDE this closure, immediately before the activation call. Activation
     // is itself a desktop-control side effect — it raises and FOCUSES the
     // target application — and the only checks before it (the caller's
     // `recheck_after_guard` after acquiring `input_flight_guard`) ran before
     // this closure was scheduled: an Emergency Stop, route deletion (which
-    // clears the lease — round-23), or lease expiry landing while the
+    // clears the lease), or lease expiry landing while the
     // preceding resolution or THIS closure sat queued on the blocking pool
     // would otherwise still let a stopped/deleted session steal foreground
     // focus, with only the LATER post-activation recheck stopping the
@@ -3101,7 +3092,7 @@ async fn activate_and_recheck(
     recheck_after_guard(db, asks, thread, dir, wt).await
 }
 
-/// `arr[0]`/`arr[1]` must each fit `u32` — issue #160 round-3 P2 §3: this
+/// `arr[0]`/`arr[1]` must each fit `u32` — this
 /// used to read each as `i64` then cast `as u32`, which silently WRAPS an
 /// in-range-for-i64-but->u32::MAX value (e.g. `4294967296` — `2^32` — casts
 /// straight to `0`), letting an absurd JSON integer sail past the "must be
@@ -3132,8 +3123,8 @@ fn required_text(args: &Value) -> Result<&str, String> {
         .ok_or_else(|| "missing required 'text'".to_string())
 }
 
-/// Hard ceiling on `type`'s payload length (issue #160 round-5 review P2
-/// §3): a single approved `type` call is meant to be a bounded UI
+/// Hard ceiling on `type`'s payload length
+/// : a single approved `type` call is meant to be a bounded UI
 /// interaction — a form field, a search box, a short reply — not an
 /// HTTP-body-sized blob. Under a Full/Always grant, `enigo.type_text` runs
 /// completely SYNCHRONOUSLY inside [`computer::input_flight_guard`] — held
@@ -3150,7 +3141,7 @@ fn required_text(args: &Value) -> Result<&str, String> {
 /// long `type` into multiple shorter injections with a lease renewal between
 /// chunks (so the FIRST chunk's own cancellation window would actually cover
 /// the rest) is the more complete answer, but it needs a change at the
-/// `enigo` layer this round doesn't touch (there is no partial/cancellable
+/// `enigo` layer this change doesn't touch (there is no partial/cancellable
 /// `type_text` this module could call into today) — tracked as a follow-up,
 /// not required to close the bound this ceiling already provides
 /// unconditionally. `5000` chars is generous for any single interactive
@@ -3188,7 +3179,7 @@ fn check_type_length(text: &str) -> Result<(), String> {
 /// `(dx, dy)` delta `backend::ComputerBackend::scroll` understands.
 fn parse_scroll(args: &Value) -> Result<(i32, i32), String> {
     let direction = args.get("scroll_direction").and_then(|v| v.as_str()).unwrap_or("");
-    // issue #160 round-14 P2 (Codex computer_srv.rs:2147): distinguish an
+    // distinguish an
     // ABSENT `scroll_amount` (→ the documented default of 3) from one that is
     // PRESENT but not representable as an `i64` (a JSON string like `"30"`, or a
     // number outside `i64`'s range). The old `.and_then(as_i64).unwrap_or(3)`
@@ -3234,8 +3225,7 @@ fn parse_duration_ms(args: &Value) -> Result<u64, String> {
 
 /// Every pure, side-effect-free schema check for `action`'s arguments,
 /// factored out so [`run_action`] can run them ALL before the approval gate
-/// (`approve`) ever opens a Needs-you card (issue #160 round-13 P1, Codex
-/// computer_srv.rs:515). A malformed call is rejected here, up front — never
+/// (`approve`) ever opens a Needs-you card. A malformed call is rejected here, up front — never
 /// after a human answered a card for it, which would mint a standing
 /// Always/Full grant for a request that then fails its own arm's parse and
 /// never executes. This mirrors, EXACTLY, the pure checks each arm in
@@ -3248,10 +3238,10 @@ fn pure_validate(action: &str, args: &Value) -> Result<(), String> {
     if !VALID_ACTIONS.iter().any(|a| *a == action) {
         return Err(unknown_action_error(action));
     }
-    // issue #160 round-33 P1 (Codex computer_srv.rs:3090): reject EVERY
+    // reject EVERY
     // argument outside the action's closed allowlist — see
-    // [`reject_unknown_args`]. Generalizes (and replaces) the round-30
-    // windowless-`window` and round-31 non-typing-`text` one-offs: those
+    // [`reject_unknown_args`]. Generalizes (and replaces) the earlier
+    // windowless-`window` and non-typing-`text` one-offs: those
     // closed two named fields, but the tool schema permits additional
     // properties, so ANY unrecognized key (`password`, …) could still ride a
     // schema-valid request onto the approval card and into the durable audit
@@ -3294,8 +3284,7 @@ fn pure_validate(action: &str, args: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// The closed per-action argument allowlist (issue #160 round-33 P1, Codex
-/// computer_srv.rs:3090) — exactly the keys each dispatch arm actually
+/// The closed per-action argument allowlist — exactly the keys each dispatch arm actually
 /// consumes, plus the discriminant `action` itself. One table serving BOTH
 /// [`reject_unknown_args`] (request-time rejection) and
 /// [`redact_audit_args`] (audit-time stripping), so the two boundaries can
@@ -3315,13 +3304,13 @@ fn allowed_args(action: &str) -> &'static [&'static str] {
     }
 }
 
-/// issue #160 round-33 P1 (Codex computer_srv.rs:3090): reject any argument
+/// reject any argument
 /// outside [`allowed_args`], BEFORE a card is built or anything is logged.
 /// The tool schema permits additional properties, so a schema-valid request
 /// could smuggle arbitrary content under an unrecognized key (`password`,
 /// …) — ignored by dispatch, but carried verbatim onto the approval card and
-/// into the durable audit. Generalizes the round-30 windowless-`window` and
-/// round-31 non-typing-`text` rules: unconsumed fields are rejected as a
+/// into the durable audit. Generalizes the earlier windowless-`window` and
+/// non-typing-`text` rules: unconsumed fields are rejected as a
 /// class, not one named field at a time.
 ///
 /// The offending KEY is deliberately NOT echoed in the error: the error
@@ -3344,7 +3333,7 @@ fn reject_unknown_args(action: &str, args: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// issue #160 round-20 (Codex computer_srv.rs:1189 + :1475): reject two `key`
+/// reject two `key`
 /// payloads outright, from [`pure_validate`] — BEFORE the approval card is ever
 /// built (so neither reaches the IM bridge) and before any backend work:
 ///
@@ -3353,21 +3342,20 @@ fn reject_unknown_args(action: &str, args: &Value) -> Result<(), String> {
 ///    `type`, a `key` payload is NOT redacted on the outbound Lark card or in
 ///    the durable audit, so routing sensitive text through `key` one character
 ///    at a time would disclose each character; forcing it onto `type` (which
-///    redacts) closes that (round-20 P1, Codex ...:1475).
+///    redacts) closes that.
 ///  - a BARE `Escape` (no modifier): the process-wide global Escape shortcut is
 ///    the kill switch's OS-level layer whenever a control lease is held, so an
 ///    injected bare Escape can be swallowed as Emergency Stop instead of
 ///    reaching the target window — disabling Computer Use rather than acting on
-///    it (round-20 P2, Codex ...:1189). A MODIFIED chord (e.g. `shift+escape`)
+///    it. A MODIFIED chord (e.g. `shift+escape`)
 ///    does not match the bare-Escape shortcut and is deliberately left alone.
 fn reject_unsafe_key_combo(tokens: &[computer::KeyToken]) -> Result<(), String> {
-    // issue #160 round-26 P1 (Codex computer_srv.rs:2962) + round-31 P1
-    // (Codex computer_srv.rs:3162): every SEMANTICALLY shift-only printable
+    // Every SEMANTICALLY shift-only printable
     // chord is the same char-by-char TEXT entry as a bare printable key —
     // judged by [`is_printable_text_chord`], not by exact slice patterns,
-    // which kept missing shapes one variation away (round-26 caught
-    // `shift+h` after round-20's bare `h`; round-31 caught `shift+shift+h`
-    // after round-26). See that predicate's own doc.
+    // which kept missing shapes one variation away (`shift+h` slipped past a
+    // bare-`h` pattern, then `shift+shift+h` slipped past the `shift+h`
+    // pattern). See that predicate's own doc.
     if is_printable_text_chord(tokens) {
         return Err(
             "send printable characters with the `type` action, not `key` — `key` is for \
@@ -3375,11 +3363,10 @@ fn reject_unsafe_key_combo(tokens: &[computer::KeyToken]) -> Result<(), String> 
                 .to_string(),
         );
     }
-    // issue #160 round-20 P2 (Codex computer_srv.rs:1189) + round-32 P2
-    // (Codex mod.rs:2037): reject any chord that would inject an UNMODIFIED
+    // Reject any chord that would inject an UNMODIFIED
     // Escape press — judged semantically by [`chord_injects_bare_escape`],
     // not by the exact bare-`escape` slice, which the same duplicate-token
-    // dodge round-31 closed for printable chords slipped past
+    // dodge closed for printable chords slipped past
     // (`escape+escape` pressed-and-held a bare Escape while missing
     // `[Named(Escape)]`).
     if chord_injects_bare_escape(tokens) {
@@ -3394,7 +3381,7 @@ fn reject_unsafe_key_combo(tokens: &[computer::KeyToken]) -> Result<(), String> 
     Ok(())
 }
 
-/// issue #160 round-32 P2 (Codex mod.rs:2037): would executing this chord
+/// would executing this chord
 /// press Escape with NO real modifier held — the exact event the OS-level
 /// global emergency-stop shortcut is registered for? On global-hotkey
 /// backends that observe synthesized input, such an injected press is
@@ -3434,8 +3421,8 @@ fn chord_injects_bare_escape(tokens: &[computer::KeyToken]) -> bool {
     is_escape(last) && !held.iter().any(is_real_modifier)
 }
 
-/// issue #160 round-31 P1 (Codex computer_srv.rs:3162): the SEMANTIC
-/// "printable text entry" test the round-20/26/31 findings converge on. True
+/// the SEMANTIC
+/// "printable text entry" test the earlier/31 findings converge on. True
 /// when the chord consists of NOTHING but Shift modifiers and at least one
 /// printable `Unicode` token — `h`, `shift+h`, `shift+shift+h`, any
 /// duplicate/reordered variant: every shape whose OS effect is "hold (only)
@@ -3444,7 +3431,7 @@ fn chord_injects_bare_escape(tokens: &[computer::KeyToken]) -> bool {
 /// dodged by repeating or reordering tokens the way the previous exact slice
 /// patterns could. Any non-Shift modifier (ctrl/alt/meta) or any named key
 /// makes the chord a COMMAND and exempts it — commands are not content, and
-/// keeping them readable in the audit is deliberate forensics (round-20).
+/// keeping them readable in the audit is deliberate forensics.
 /// Shared verbatim by [`reject_unsafe_key_combo`] (the request-time reject)
 /// and [`redact_audit_args`] (the audit-time redaction), so the two
 /// boundaries can never disagree on what counts as text entry.
@@ -3500,18 +3487,18 @@ async fn append_audit(db: &Db, thread: i32, dir: &str, wt: Option<i32>, entry: &
     let Some(path) = audit_log_path(db, thread, dir, wt).await else {
         return;
     };
-    // issue #160 round-27 P2 (Codex computer_srv.rs:3069): recheck the
+    // recheck the
     // direction-precise route revocation immediately before creating/writing
     // the path. `audit_log_path` can resolve while the session's rows still
     // exist, a concurrent delete can then remove the whole computer-output
     // subtree, and the `create_dir_all` below would RECREATE it for a deleted
     // session — output regained after cleanup. The delete paths publish their
-    // revocation BEFORE the destructive cascade (round-23), so an append that
+    // revocation BEFORE the destructive cascade, so an append that
     // reaches this check after deletion began is refused here; the lead lane
     // is covered too (`RouteRevocation::Whole` matches every lane). Best-effort
     // like the rest of this function — a refused line just goes unlogged.
     //
-    // issue #160 round-28 P2 (Codex computer_srv.rs:3106): that recheck alone
+    // that recheck alone
     // was still check-then-act across `.await`s — a delete could publish its
     // revocation AND run `remove_computer_output_*` entirely BETWEEN this
     // check passing and the write below landing, recreating the subtree for
@@ -3536,7 +3523,7 @@ async fn append_audit(db: &Db, thread: i32, dir: &str, wt: Option<i32>, entry: &
     write_audit_line_locked(&path, &line).await;
 }
 
-/// issue #160 round-12 P1 #E: process-wide async lock serializing every
+/// process-wide async lock serializing every
 /// "check size → (maybe) rotate → open → append" sequence
 /// [`write_audit_line_locked`] performs — the concurrent-writer race this
 /// closes: two `tools/call`s finishing at nearly the same moment each
@@ -3566,8 +3553,8 @@ fn audit_write_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// The actual critical section [`append_audit`] serializes on (issue #160
-/// round-12 P1 #E) — split out from `append_audit` so a test can drive
+/// The actual critical section [`append_audit`] serializes on
+/// — split out from `append_audit` so a test can drive
 /// genuine concurrent calls against a raw path directly, without needing a
 /// `Db`/workspace resolution just to reach the race this closes. Holds
 /// [`audit_write_lock`] across the WHOLE size-check → rotate → open →
@@ -3580,7 +3567,7 @@ fn audit_write_lock() -> &'static tokio::sync::Mutex<()> {
 async fn write_audit_line_locked(path: &std::path::Path, line: &str) {
     use tokio::io::AsyncWriteExt;
     let _guard = audit_write_lock().lock().await;
-    // issue #160 round-10 P1 #F: rotate BEFORE opening for append — see
+    // rotate BEFORE opening for append — see
     // `rotate_audit_if_needed`'s own doc for the unbounded-growth hazard
     // this closes (a Full/exact-Always-granted agent looping
     // `cursor_position`/`list_windows` with no throttle of its own would
@@ -3603,8 +3590,8 @@ async fn write_audit_line_locked(path: &std::path::Path, line: &str) {
     }
 }
 
-/// Single-file rotation cap for `computer-audit.jsonl` (issue #160 round-10
-/// P1 #F): unlike screenshots ([`prune_old_screenshots`]/
+/// Single-file rotation cap for `computer-audit.jsonl`
+/// : unlike screenshots ([`prune_old_screenshots`]/
 /// [`MAX_RETAINED_SCREENSHOTS`] equivalents live in `computer` — see
 /// `computer::screenshot_window`'s own retention cap), the audit log had NO
 /// rotation/quota/cleanup at all — every `tools/call`, Full/exact-Always
@@ -3620,14 +3607,14 @@ const MAX_AUDIT_BYTES: u64 = 5 * 1024 * 1024;
 /// [`MAX_AUDIT_BYTES`], via [`rotate_audit_at_size`]. Total on-disk usage for
 /// this one file stays bounded to roughly `2 * MAX_AUDIT_BYTES`: the live
 /// file plus, at most, one rotated `.1`. A more elaborate multi-generation
-/// rotation, or a per-session quota, is a follow-up — this round ships the
+/// rotation, or a per-session quota, is a follow-up — this change ships the
 /// simplest scheme that actually bounds growth.
 fn rotate_audit_if_needed(path: &std::path::Path) {
     rotate_audit_at_size(path, MAX_AUDIT_BYTES);
 }
 
-/// The actual rotation logic, parameterized on `max_bytes` (issue #160
-/// round-10 P1 #F) so a test can drive it against a real, small file without
+/// The actual rotation logic, parameterized on `max_bytes`
+/// so a test can drive it against a real, small file without
 /// having to write out multiple real megabytes just to exercise the
 /// threshold — [`rotate_audit_if_needed`] is the one production caller,
 /// always with [`MAX_AUDIT_BYTES`].
@@ -3663,7 +3650,7 @@ fn rotate_audit_at_size(path: &std::path::Path, max_bytes: u64) {
         if rotated_meta.file_type().is_symlink() {
             return; // never rename onto a symlinked destination
         }
-        // issue #160 round-16 P2 (Codex computer_srv.rs:2631): remove the
+        // remove the
         // previous generation EXPLICITLY before the rename. On unix, `rename`
         // replaces an existing destination atomically — but on Windows it
         // FAILS instead, and since rotation is best-effort (the error was
@@ -3682,7 +3669,7 @@ fn rotate_audit_at_size(path: &std::path::Path, max_bytes: u64) {
 }
 
 /// The actual `open(2)` call [`append_audit`] makes — factored out so its own
-/// `O_NOFOLLOW` defense (issue #160 round-4 P2 §3) is unit-testable in
+/// `O_NOFOLLOW` defense is unit-testable in
 /// isolation from [`refuse_symlinks`]'s EARLIER, per-component check.
 ///
 /// [`refuse_symlinks`] (via [`audit_log_path`]) already refuses a symlink
@@ -3711,7 +3698,7 @@ fn rotate_audit_at_size(path: &std::path::Path, max_bytes: u64) {
 /// `FILE_FLAG_OPEN_REPARSE_POINT` at each step) is a follow-up, not required
 /// to close THIS specific leaf race, which is what this flag targets.
 ///
-/// issue #160 round-10 P2 #3 (Codex 1868): `#[cfg(unix)]` also sets the
+/// `#[cfg(unix)]` also sets the
 /// create mode to `0o600` (owner read/write only). Before this, a fresh
 /// `computer-audit.jsonl` was created with whatever `open(2)`'s own default
 /// (`0o666`) survives the process umask — `0o644` under the common `022`
@@ -3721,7 +3708,7 @@ fn rotate_audit_at_size(path: &std::path::Path, max_bytes: u64) {
 /// `computer::screenshot_window`); this brings the audit log to the SAME
 /// owner-only bar. Mode is only consulted by `open(2)` when it actually
 /// CREATES a new file (`O_CREAT` with no existing inode) — appending to an
-/// already-existing, already-lenient file from before this round keeps
+/// already-existing, already-lenient file from before this change keeps
 /// whatever mode it already had; only fresh files (and rotated-away originals
 /// — see `rotate_if_full`) get the tightened default.
 async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
@@ -3731,7 +3718,7 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
     options.custom_flags(libc::O_NOFOLLOW);
     #[cfg(unix)]
     options.mode(0o600);
-    // issue #160 round-21 P2 (Codex computer_srv.rs:3052): on Windows, a freshly
+    // on Windows, a freshly
     // CREATED audit file (the first append, or the new live file after each
     // rotation) must get the same owner-only protection unix gets from `0o600`
     // above — otherwise it inherits a permissive `WEFT_HOME` directory ACL and
@@ -3745,7 +3732,7 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
     #[cfg(windows)]
     if is_new {
         use std::os::windows::io::AsRawHandle;
-        // issue #160 round-27 P2 (Codex computer_srv.rs:3288): fail CLOSED
+        // fail CLOSED
         // when the owner-only ACL cannot be applied — matching the screenshot
         // and secret-config writers, and superseding the earlier best-effort
         // stance. The audit records window titles, actions, coordinates and
@@ -3774,8 +3761,8 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
 ///
 ///  - worker lane (`dir` a direction id): `<weft_home>/computer/<thread>/
 ///    <dir>/wt-<id>`, `id` being the RESOLVED worktree id (see `wt`'s own doc
-///    below for exactly which one). issue #160 round-10 P1 #1 (Codex 1992 +
-///    672) moved this OFF the worktree entirely and into Weft's own managed
+///    below for exactly which one). This lives OFF the worktree entirely, in
+///    Weft's own managed
 ///    storage — see [`crate::paths::computer_output_root`]'s doc for why: in
 ///    a LINKED worktree, `git rev-parse --git-path info/exclude` resolves to
 ///    the CANONICAL repo's own SHARED `.git/info/exclude` (worktrees share
@@ -3788,12 +3775,12 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
 ///    `git_exclude` call is gone too (see [`screenshot_out_dir`]/
 ///    [`audit_log_path`]) — there is no longer anything to exclude FROM. The
 ///    `wt-<id>` suffix keeps the SAME per-worktree isolation the old
-///    worktree-rooted path got for free (round-2 P2 §5): two worktrees of the
+///    worktree-rooted path got for free: two worktrees of the
 ///    same multi-repo direction still never share an output directory,
 ///    whether `id` came from an EXPLICIT pin or the first-worktree fallback
 ///    below.
 ///  - lead lane (`dir == bus::LEAD`): `<weft_home>/computer/<thread>/lead` —
-///    issue #160 round-16 P1 (Codex computer_srv.rs:2812). This used to be
+///    NOT
 ///    the lead's own scratch cwd (`<weft_home>/leads/<thread>`), but that
 ///    directory is a real working dir the LEAD AGENT ITSELF writes into: an
 ///    agent (or any background process with the same access) could swap the
@@ -3807,13 +3794,13 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
 ///    SAME Weft-managed root the worker lane already uses — a tree Weft
 ///    creates for itself and never hands to any agent as a working
 ///    directory — which removes the agent-writable-parent premise of the
-///    race by construction (the same reasoning round-10 P1 #1 used to move
+///    race by construction (the same reasoning that moved
 ///    the WORKER lane off the worktree). `refuse_symlinks` stays as defense
 ///    in depth on both lanes. Old audit/screenshot files left in the scratch
-///    cwd from before this round are simply orphaned (best-effort logs; never
+///    cwd from before this change are simply orphaned (best-effort logs; never
 ///    read back).
 ///
-/// `wt` (issue #160 round-2 P2 §5): the CALLER's own worktree id, when it
+/// `wt`: the CALLER's own worktree id, when it
 /// could resolve one — see `inject::computer_url`'s doc for who sets this
 /// and why (a multi-repo direction has MORE THAN ONE worktree row, and
 /// without this every worker sharing that direction fell back to whichever
@@ -3824,7 +3811,7 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
 /// THIS thread, below) — a forged/foreign worktree id can never redirect
 /// output into another direction's (or another thread's) namespace.
 ///
-/// issue #160 round-8 P2 #7: an EXPLICIT `wt` that fails that check is now
+/// an EXPLICIT `wt` that fails that check is now
 /// FAIL-CLOSED — `None` — rather than silently falling back to "the first
 /// worktree of this direction" as it used to. That old fallback was fine for
 /// an ABSENT `wt` (there was never a specific worktree pinned to begin with),
@@ -3837,19 +3824,19 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
 /// activity to the wrong worker. Only a genuinely ABSENT `wt` (`None`) still
 /// falls back to "first worktree for this direction"; an explicit id that
 /// doesn't resolve now fails the whole call closed instead of picking a
-/// different worktree on its own. issue #160 round-10 P2 #2 ([`WtParam`])
+/// different worktree on its own. [`WtParam`]
 /// extends the SAME fail-closed rule one parse step earlier, for a `?wt=`
 /// that isn't even numeric — that rejection happens in `handle_computer`,
 /// before this function (or any of its callers) is ever reached.
 ///
 /// `None` on any failure (DB error, unresolvable path, no worktree at all
 /// for this direction, a numeric `dir` that doesn't resolve to a direction
-/// belonging to THIS thread, or — per round-8 P2 #7 above — an EXPLICIT `wt`
+/// belonging to THIS thread, or — per the explicit-pin rule above — an EXPLICIT `wt`
 /// that doesn't name a worktree of this direction) — callers turn that into
 /// their own soft-failure text rather than a 500.
 async fn session_root(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Option<std::path::PathBuf> {
     if dir == crate::bus::LEAD {
-        // issue #160 round-16 P1: Weft-managed, never agent-writable — see
+        // Weft-managed, never agent-writable — see
         // this function's own lead-lane doc above.
         let root = crate::paths::computer_output_root()
             .ok()?
@@ -3863,7 +3850,7 @@ async fn session_root(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Optio
         _ => return None,
     }
     let worktrees = repo::list_worktrees(db, Some(direction_id)).await.ok()?;
-    // round-8 P2 #7: an EXPLICIT pin must hit an actual worktree of THIS
+    // An EXPLICIT pin must hit an actual worktree of THIS
     // direction, or the whole call fails closed — silently falling back to
     // the first worktree would write this session's screenshots/audit into a
     // DIFFERENT repo's namespace in a multi-repo direction. An ABSENT `wt`
@@ -3880,7 +3867,7 @@ async fn session_root(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Optio
     Some(root)
 }
 
-/// issue #160 round-18 P2 (Codex paths.rs:89): remove a thread's ENTIRE
+/// remove a thread's ENTIRE
 /// computer-use output subtree — `<weft_home>/computer/<thread>/`, which holds
 /// every lead/worker session's screenshots and rotated audit logs (see
 /// [`session_root`] for the layout underneath it) — as part of deleting the
@@ -3896,7 +3883,7 @@ async fn session_root(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Optio
 /// plain integer with no path-separator/`..` component, so there is nothing to
 /// escape [`crate::paths::computer_output_root`] with.
 pub(crate) fn remove_computer_output_for_thread(thread: i32) {
-    // issue #160 round-26 P1 (Codex computer_srv.rs:3366): walk every
+    // walk every
     // component from `weft_home` down WITHOUT following symlinks before the
     // recursive delete — `computer_output_root`'s own `create_dir_all` happily
     // follows a pre-planted symlink at `computer/`, and `remove_dir_all`
@@ -3915,7 +3902,7 @@ pub(crate) fn remove_computer_output_for_thread(thread: i32) {
     }
 }
 
-/// issue #160 round-24 P2 (Codex commands.rs:794): remove ONE worker direction's
+/// remove ONE worker direction's
 /// computer-output subtree — `<weft_home>/computer/<thread>/<direction_id>/`,
 /// holding that direction's per-worktree screenshots and rotated audit logs (see
 /// [`session_root`]'s worker layout). `commands::delete_repo` removes a repo's
@@ -3933,7 +3920,7 @@ pub(crate) fn remove_computer_output_for_direction(thread: i32, dir: &str) {
     if dir.parse::<i32>().is_err() {
         return;
     }
-    // issue #160 round-26 P1 (Codex computer_srv.rs:3366): same no-follow
+    // same no-follow
     // ancestor walk as [`remove_computer_output_for_thread`] — a symlinked
     // `computer/` or `<thread>/` ancestor must never be traversed into a
     // recursive delete outside Weft-managed storage.
@@ -3948,7 +3935,7 @@ pub(crate) fn remove_computer_output_for_direction(thread: i32, dir: &str) {
     }
 }
 
-/// issue #160 round-32 P2 (Codex commands.rs:2354): remove ONE session-only
+/// remove ONE session-only
 /// worker's output subtree — `<weft_home>/computer/<thread>/<dir>/wt-<wt>/`
 /// (see [`session_root`]'s worker layout) — for `commands::delete_repo`
 /// removing a worktree whose direction is OWNED BY ANOTHER repo and survives.
@@ -3956,7 +3943,7 @@ pub(crate) fn remove_computer_output_for_direction(thread: i32, dir: &str) {
 /// direction's OTHER worktrees; this prunes only the deleted worktree's own
 /// namespace, which [`session_root`] can never resolve again once the worktree
 /// row is gone. Same bounds and no-follow ancestor walk as the other removers
-/// (round-26): `dir` must be a plain direction id, `wt` is a plain integer,
+/// : `dir` must be a plain direction id, `wt` is a plain integer,
 /// and a refused/symlinked chain just skips the best-effort cleanup.
 pub(crate) fn remove_computer_output_for_worktree(thread: i32, dir: &str, wt: i32) {
     if dir.parse::<i32>().is_err() {
@@ -3974,7 +3961,7 @@ pub(crate) fn remove_computer_output_for_worktree(thread: i32, dir: &str, wt: i3
     }
 }
 
-/// issue #160 round-30 P2 (Codex computer_srv.rs:893): undo THIS call's own
+/// undo THIS call's own
 /// screenshot write after the post-capture revocation recheck found the route
 /// revoked — the capture closure's `create_dir_all(out_dir)` + PNG save can
 /// RECREATE a session subtree a concurrent delete already removed (the
@@ -3986,7 +3973,7 @@ pub(crate) fn remove_computer_output_for_worktree(thread: i32, dir: &str, wt: i3
 /// `std::fs::remove_dir`, which fails on a non-empty directory and ends the
 /// walk, so a surviving sibling session's tree can never be swept.
 ///
-/// Symlink containment (round-26 doctrine): the path is re-walked from
+/// Symlink containment: the path is re-walked from
 /// `weft_home` with the same no-follow [`refuse_symlinks`] verification the
 /// delete-side removers use, re-checked HERE (not trusted from resolution
 /// time) because a component could have been swapped for a symlink since —
@@ -4033,7 +4020,7 @@ fn remove_recreated_screenshot_output(out_dir: &std::path::Path) {
     }
 }
 
-/// issue #160 round-19 P1 (Codex computer_srv.rs:403): does `(thread, dir, wt)`
+/// does `(thread, dir, wt)`
 /// STILL denote a live session? The per-session bearer stays valid for the
 /// whole process lifetime and each Axum request is independent of the engine,
 /// so a thread/direction deleted AFTER the token was minted — `delete_thread_
@@ -4048,13 +4035,12 @@ fn remove_recreated_screenshot_output(out_dir: &std::path::Path) {
 /// the thread row still exists. Fail-CLOSED — any DB error resolves to `false`
 /// (not live), so a transient store hiccup can never fail OPEN into driving a
 /// desktop whose owning session may already be gone.
-/// The one rendering of the "session deleted" refusal (issue #160 round-19 P1),
+/// The one rendering of the "session deleted" refusal,
 /// used by the [`recheck_after_guard`] post-queue revalidation.
 const SESSION_GONE_MSG: &str =
     "this computer-use session no longer exists (its issue or direction was deleted) — refused";
 
-/// Per-thread computer-use route revocation state (issue #160 round-19 P1, Codex
-/// computer_srv.rs:403; refined round-24 P1, Codex computer_srv.rs:775). A whole-
+/// Per-thread computer-use route revocation state. A whole-
 /// thread delete revokes EVERY route; a repo delete revokes only the specific
 /// worker directions it removes, leaving the thread's surviving directions (and
 /// its lead lane) live — so the state has to distinguish the two, or a repo
@@ -4081,7 +4067,7 @@ enum RouteRevocation {
     ///  - `dirs` — worker directions the deleted repo OWNED, keyed by the route
     ///    `dir` string (`direction_id.to_string()`); every lane/worktree of such
     ///    a direction is revoked.
-    ///  - `worktrees` — issue #160 round-32 P1 (Codex commands.rs:2315):
+    ///  - `worktrees`:
     ///    `(dir, wt)` pairs for SESSION-ONLY workers — a worktree/session the
     ///    deleted repo contributed to a direction OWNED BY ANOTHER repo. The
     ///    direction (and its other repos' sibling worktrees) survive, so a
@@ -4136,8 +4122,8 @@ pub(crate) fn revoke_computer_route_dir(thread: i32, dir: String) {
     }
 }
 
-/// Revoke ONE session-only worker `(thread, dir, wt)` — issue #160 round-32 P1
-/// (Codex commands.rs:2315): `commands::delete_repo` removing a worktree whose
+/// Revoke ONE session-only worker `(thread, dir, wt)`
+/// : `commands::delete_repo` removing a worktree whose
 /// direction is OWNED BY ANOTHER repo and survives. Adds to (never downgrades)
 /// the thread's entry, exactly like [`revoke_computer_route_dir`]. Recording
 /// the entry also flips [`computer_routes_revoked`] for the thread, so the
@@ -4165,14 +4151,14 @@ pub(crate) fn revoke_computer_route_session(thread: i32, dir: String, wt: i32) {
 }
 
 /// Prior revocation state for a set of threads, captured BEFORE a delete revokes
-/// them so a FAILED cascade can restore EXACTLY what was there — issue #160
-/// round-24 P2 (Codex commands.rs:803). A blanket un-revoke would drop a
+/// them so a FAILED cascade can restore EXACTLY what was there.
+/// A blanket un-revoke would drop a
 /// revocation that an EARLIER successful delete already published for the same
 /// thread, re-opening that stale route's bearer.
 pub(crate) struct RevocationSnapshot(Vec<(i32, Option<RouteRevocation>)>);
 
 /// Serializes every delete flow's revocation TRANSACTION — snapshot → publish →
-/// cascade → restore-or-commit — issue #160 round-26 P1 (Codex commands.rs:832).
+/// cascade → restore-or-commit.
 /// Without it, two overlapping deletes touching routes of the SAME thread can
 /// both snapshot the prior map before either publishes; if one cascade succeeds
 /// and the other later fails, the failing operation's restore replaces the
@@ -4225,8 +4211,8 @@ fn computer_routes_revoked(thread: i32) -> bool {
 /// Sync + route-precise: is THIS exact `(thread, dir, wt)` route revoked? Used
 /// inside a blocking-pool closure (the screenshot capture) where an async
 /// [`session_is_live`] can't run but a coarse thread-level refuse would be wrong
-/// — `delete_repo` leaves the thread's sibling directions live. `wt` joined the
-/// key in round-32 P1 (Codex commands.rs:2315): a SESSION-ONLY worker deletion
+/// — `delete_repo` leaves the thread's sibling directions live. `wt` is part
+/// of the key: a SESSION-ONLY worker deletion
 /// revokes one exact `(dir, wt)` while the direction's surviving sibling
 /// worktrees (and its `wt`-less lead-style resolution) stay live, so the check
 /// has to be worktree-precise where a worktree identity exists at all.
@@ -4266,17 +4252,17 @@ async fn session_is_live(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> bo
 }
 
 /// Build `base/components[0]/components[1]/...`, refusing if ANY existing
-/// path component along the way is a symlink (issue #160 round-2 P2 §3).
+/// path component along the way is a symlink.
 /// Originally guarded a worktree's own `.weft` subtree (repository-controlled
 /// content a sandboxed agent's own approved writes could tamper with);
-/// round-10 P1 #1 moved the worker lane's own `base` off the worktree
-/// entirely and into a Weft-owned directory under `weft_home` (see
+/// the worker lane's own `base` lives off the worktree
+/// entirely, in a Weft-owned directory under `weft_home` (see
 /// [`session_root`]'s own doc) — that directory is created by Weft itself,
 /// never handed to a sandboxed agent to write into directly, so the
 /// worktree-tampering scenario this originally guarded against is largely
 /// closed by construction now. Kept anyway as defense in depth (a SEPARATE,
 /// same-uid process on the human's own machine could still reach into
-/// `weft_home` — a residual risk noted here, not fixed by this round) and
+/// `weft_home` — a residual risk noted here, not fixed by this change) and
 /// because the lead lane's `base` (`<weft_home>/leads/<thread>`) is still a
 /// real, git-init'd working directory other tooling can touch.
 ///
@@ -4308,7 +4294,7 @@ fn refuse_symlinks(base: &std::path::Path, components: &[&str]) -> Result<std::p
 /// Resolve `<root>/<leaf>` for a computer-use output write (the screenshots
 /// directory or the audit log), refusing if ANY path component from
 /// `weft_home` down — `computer/`, `<thread>/`, `<dir>/`, `wt-<id>/`, AND the
-/// final `<leaf>` — is a symlink. issue #160 round-25 P1 (Codex paths.rs:90).
+/// final `<leaf>` — is a symlink.
 ///
 /// [`refuse_symlinks`] alone only walks the components appended AFTER its
 /// `base`; both output resolvers passed the already-joined [`session_root`] as
@@ -4370,22 +4356,22 @@ fn refuse_symlinked_output(
 
 /// Resolve the screenshot output directory for `(thread, dir[, wt])`:
 ///  - worker lane: `<session_root>/screenshots` — a dedicated, Weft-managed
-///    directory (see [`session_root`]'s own doc for the round-10 P1 #1 move
+///    directory (see [`session_root`]'s own doc for the move
 ///    off the worktree). No `git::git_exclude` call anymore: this directory
 ///    was never inside a git-tracked worktree to begin with, so there is
 ///    nothing left to exclude FROM (and nothing left that could leak a
 ///    `.weft/` entry into a canonical repo's `info/exclude`).
-///  - lead lane: `<session_root>/screenshots` too — issue #160 round-15 P2
-///    (Codex computer_srv.rs:2759) first gave leads a dedicated subdirectory
+///  - lead lane: `<session_root>/screenshots` too
+///    first gave leads a dedicated subdirectory
 ///    (so retention pruning never operates over unrelated files), and
-///    round-16 P1 (Codex computer_srv.rs:2812) then moved the lead's WHOLE
-///    session root under Weft-managed storage (see [`session_root`]'s
+///    the lead's WHOLE
+///    session root moved under Weft-managed storage (see [`session_root`]'s
 ///    lead-lane doc for the agent-writable-parent race that closed) — at
 ///    which point the lead lane needs no special `.weft/` layer anymore and
 ///    both lanes share ONE shape.
 ///
 /// `Err` (not silently `None`) on a resolution failure OR a refused symlink
-/// (issue #160 round-2 P2 §3, via [`refuse_symlinks`]) — callers surface the
+///  — callers surface the
 /// SPECIFIC reason (missing worktree vs. a compromised output path) to the
 /// calling agent rather than one flattened "no worktree" text for both.
 async fn screenshot_out_dir(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Result<std::path::PathBuf, String> {
@@ -4398,19 +4384,19 @@ async fn screenshot_out_dir(db: &Db, thread: i32, dir: &str, wt: Option<i32>) ->
 /// Resolve the audit log path for `(thread, dir[, wt])`:
 ///  - worker lane: `<session_root>/computer-audit.jsonl` — directly under the
 ///    dedicated per-(thread, dir, wt) directory [`session_root`] resolves
-///    (issue #160 round-10 P1 #1); no `.weft/` layer needed since the whole
+///  ; no `.weft/` layer needed since the whole
 ///    directory is already private to this one session, and no
 ///    `git::git_exclude` call anymore for the SAME reason [`screenshot_out_dir`]
 ///    no longer needs one.
-///  - lead lane: `<session_root>/computer-audit.jsonl` too — issue #160
-///    round-16 P1 (Codex computer_srv.rs:2812) moved the lead's session root
+///  - lead lane: `<session_root>/computer-audit.jsonl` too —
+///    the lead's session root lives
 ///    under Weft-managed storage (see [`session_root`]'s lead-lane doc), so
 ///    the `.weft/` layer its scratch-cwd audit log used to hide behind is no
 ///    longer needed: the whole directory is private to this one session, same
 ///    as the worker lane, and both lanes share ONE shape.
 ///
 /// `None` (best-effort, per [`append_audit`]'s own doc) on a resolution
-/// failure OR a refused symlink (issue #160 round-2 P2 §3, via
+/// failure OR a refused symlink (via
 /// [`refuse_symlinks`]) — a compromised output path just means this one call
 /// goes unlogged, same as any other audit-write failure.
 async fn audit_log_path(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Option<std::path::PathBuf> {
@@ -4422,10 +4408,10 @@ async fn audit_log_path(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Opt
 mod tests {
     use super::*;
 
-    // —— issue #160 round-12 P2 #7: always-inject + server-side disabled gate ——
+    // —— always-inject + server-side disabled gate ——
 
     /// The static tool description must itself say this needs enabling in
-    /// Settings — since round-12 P2 #7 makes injection unconditional
+    /// Settings — makes injection unconditional
     /// (`weft_computer` is now handed to every issue-lead/worker engine
     /// regardless of the setting), an agent must not have to guess why every
     /// call comes back `disabled` the first time it tries.
@@ -4439,7 +4425,7 @@ mod tests {
         );
     }
 
-    // —— issue #160 round-10 P2 #2: `?wt=` three-state parsing ——
+    // —— `?wt=` three-state parsing ——
 
     #[test]
     fn wt_param_parse_distinguishes_absent_explicit_and_invalid() {
@@ -4470,8 +4456,7 @@ mod tests {
         assert!(WtParam::Invalid.resolve().is_err());
     }
 
-    /// issue #160 round-13/14 P1 (Codex computer_srv.rs:214 + inject.rs:483):
-    /// the bearer binds the EXACT worktree, not just `(thread, dir)`. A token
+    /// The bearer binds the EXACT worktree, not just `(thread, dir)`. A token
     /// minted for one `wt` must NOT verify for a sibling `wt` (the hijack), for
     /// the absent case, or for a different `(thread, dir)`; the absent token is
     /// symmetric — it must not verify for any explicit `wt`.
@@ -4560,7 +4545,7 @@ mod tests {
         assert!(parse_scroll(&json!({})).is_err());
     }
 
-    /// issue #160 round-14 P2 (Codex computer_srv.rs:2147): an ABSENT
+    /// an ABSENT
     /// `scroll_amount` defaults to 3, but a PRESENT-but-invalid one (a JSON
     /// string, or a number outside `i64`) is REJECTED — never silently
     /// substituted with 3, which would let the approval card and the actual
@@ -4588,7 +4573,7 @@ mod tests {
         assert_eq!(parse_scroll(&json!({"scroll_direction": "down", "scroll_amount": 5})).unwrap(), (0, 5));
     }
 
-    /// issue #160 round-13 P2 (Codex computer_srv.rs:1955): a call rejected as
+    /// a call rejected as
     /// `Busy` by a DIFFERENT live holder must NOT consume a throttle slot on
     /// the way out — otherwise a foreign session polling every `THROTTLE_MS`
     /// keeps bumping the global throttle and starves the real holder.
@@ -4639,7 +4624,7 @@ mod tests {
         assert!(parse_coordinate(&json!({"coordinate": [-1, 20]}), "coordinate").is_err());
     }
 
-    /// issue #160 round-3 P2 §3: a JSON integer that fits `i64` but overflows
+    /// a JSON integer that fits `i64` but overflows
     /// `u32` (here `2^32` exactly) used to wrap `as u32` straight to `0` —
     /// silently passing the "non-negative" check and landing on a real,
     /// in-bounds-looking coordinate instead of being rejected. Covers both
@@ -4662,7 +4647,7 @@ mod tests {
         );
     }
 
-    // —— issue #160 round-2 P2: `required_window` ——
+    // —— `required_window` ——
 
     #[test]
     fn required_window_accepts_a_non_blank_string() {
@@ -4681,7 +4666,7 @@ mod tests {
         assert!(required_window(&json!({"window": null})).is_err(), "null");
     }
 
-    // —— issue #160 round-2 P3 (audit redaction) ——
+    // —— audit redaction ——
 
     #[test]
     fn redact_audit_args_replaces_type_text_with_a_char_count_only() {
@@ -4709,7 +4694,7 @@ mod tests {
     #[test]
     fn redact_audit_args_leaves_key_combos_and_other_actions_untouched() {
         // A real `key` COMBO is a shortcut, not content — it stays in the audit
-        // for forensics (issue #160 round-20 only redacts a BARE printable key).
+        // for forensics.
         let combo = json!({"action": "key", "window": "notes", "text": "cmd+s"});
         assert_eq!(redact_audit_args("key", &combo), combo, "a key combo is not redacted");
         // A non-type/non-key action is passed through wholesale.
@@ -4717,7 +4702,7 @@ mod tests {
         assert_eq!(redact_audit_args("left_click", &click), click, "other actions untouched");
     }
 
-    /// issue #160 round-20 (Codex computer_srv.rs:1475): a BARE printable `key`
+    /// a BARE printable `key`
     /// payload (the char-by-char text-entry case `pure_validate` rejects) is
     /// redacted in the durable audit too, so even the rejected attempt records
     /// no raw character.
@@ -4730,7 +4715,7 @@ mod tests {
         assert_eq!(redacted["window"], "notes", "non-text keys pass through");
     }
 
-    /// issue #160 round-31 P1 (Codex computer_srv.rs:2158): only `type` and
+    /// only `type` and
     /// `key` consume `text` — every other action rejects a present one
     /// outright, before any card is built, so typing content can't ride an
     /// action whose card and dispatch never mention it.
@@ -4755,13 +4740,13 @@ mod tests {
         assert!(pure_validate("key", &json!({"action": "key", "window": "n", "text": "ctrl+c"})).is_ok());
     }
 
-    /// issue #160 round-31 P1 (Codex computer_srv.rs:2158): a `text` smuggled
+    /// a `text` smuggled
     /// onto a non-typing action never reaches the durable log — the request
     /// is rejected (see the pure_validate test above), but rejected calls are
-    /// audited too. Since round-33 P1 the allowlist strips the pair WHOLESALE
+    /// audited too. The allowlist strips the pair WHOLESALE
     /// (it is an unrecognized argument for that action — stronger than the
     /// original char-count redaction). An UNPARSEABLE `key` payload — where
-    /// `text` IS the consumed field — keeps the round-31 char-count
+    /// `text` IS the consumed field — keeps the earlier char-count
     /// redaction: it is not a command chord forensics needs.
     #[test]
     fn redact_audit_args_redacts_smuggled_text_on_any_action() {
@@ -4769,7 +4754,7 @@ mod tests {
         let redacted = redact_audit_args("screenshot", &args);
         assert!(
             redacted.get("text").is_none(),
-            "an unconsumed text is stripped wholesale since round-33: {redacted}"
+            "an unconsumed text must be stripped wholesale: {redacted}"
         );
         assert_eq!(redacted["unrecognized_args_redacted"], 1);
         assert_eq!(redacted["window"], "notes", "allowlisted keys pass through");
@@ -4786,7 +4771,7 @@ mod tests {
         );
     }
 
-    /// issue #160 round-31 P1 (Codex computer_srv.rs:3162): duplicate-shift
+    /// duplicate-shift
     /// printable chords (`shift+shift+h`) are the same text entry as
     /// `shift+h` — the semantic [`is_printable_text_chord`] predicate rejects
     /// AND redacts them regardless of how many Shift tokens pad the chord,
@@ -4814,10 +4799,10 @@ mod tests {
         assert_eq!(combo["text"], "ctrl+shift+shift+t");
     }
 
-    /// issue #160 round-20 (Codex computer_srv.rs:1189 + :1475): the `key`
+    /// the `key`
     /// action rejects a bare printable character (use `type`) and a bare Escape
     /// (kill-switch collision), but still accepts named keys and modifier chords.
-    /// issue #160 round-30 P2 (Codex computer_srv.rs:1491): windowless actions
+    /// windowless actions
     /// reject a smuggled `window` argument BEFORE any card is built — an
     /// accepted-but-ignored one let the card summary read as scoped
     /// (`computer: list_windows @ Calculator`) while dispatch enumerated the
@@ -4836,7 +4821,7 @@ mod tests {
         assert!(pure_validate("wait", &json!({"action": "wait", "duration_ms": 5})).is_ok());
     }
 
-    /// issue #160 round-33 P1 (Codex computer_srv.rs:3090): EVERY argument
+    /// EVERY argument
     /// outside the action's closed allowlist is rejected before any card, the
     /// error never echoes the smuggled key or value (it becomes the audited
     /// outcome), and the rejected attempt's own audit line strips the pair
@@ -4879,12 +4864,12 @@ mod tests {
         assert!(pure_validate("key", &key("shift+escape")).is_ok());
     }
 
-    /// issue #160 round-32 P2 (Codex mod.rs:2037): any chord that would press
+    /// any chord that would press
     /// Escape UNMODIFIED is rejected semantically — a held Escape
     /// (`escape+escape`, `escape+a`) or an Escape clicked with only
     /// non-modifier keys held (`tab+escape`) collides with the global
-    /// emergency-stop shortcut exactly like the bare `escape` round-20
-    /// rejected, while genuinely modified chords stay accepted.
+    /// emergency-stop shortcut exactly like a bare `escape` press,
+    /// while genuinely modified chords stay accepted.
     #[test]
     fn unmodified_escape_chords_are_rejected_semantically() {
         let key = |text: &str| json!({"action": "key", "window": "notes", "text": text});
@@ -4899,7 +4884,7 @@ mod tests {
         assert!(pure_validate("key", &key("ctrl+escape")).is_ok());
     }
 
-    /// issue #160 round-26 P1 (Codex computer_srv.rs:2962): a SHIFT-ONLY
+    /// a SHIFT-ONLY
     /// printable chord (`shift+h` = `H`) is char-by-char TEXT entry one shift
     /// away from the bare case above — rejected (use `type`) AND redacted in
     /// the audit line, while command chords (`ctrl+h`, `shift+tab`,
@@ -4937,7 +4922,7 @@ mod tests {
         assert!(redacted.get("text").is_none());
     }
 
-    // —— issue #160 round-4 P1 §1: detail_redacted (the IM-bridge leak) ——
+    // —— detail_redacted (the IM-bridge leak) ——
 
     /// The end-to-end property the fix exists for: a `type` action's Ask
     /// keeps the RAW text in `detail` (the LOCAL desktop card still needs it
@@ -4947,7 +4932,7 @@ mod tests {
     /// durable audit line.
     #[tokio::test]
     async fn approve_sets_detail_redacted_for_type_but_keeps_the_local_detail_raw() {
-        // issue #160 round-10 P1 #A note: `approve` now resolves a Write
+        // Note: `approve` resolves a Write
         // action's window AUTHORITATIVELY before it even checks a standing
         // grant (so it can fold the identity into `action_key`) — this needs
         // a resolvable "notes" window (`shared_mock`, under
@@ -5007,7 +4992,7 @@ mod tests {
     /// harmless) full `detail` for these.
     #[tokio::test]
     async fn approve_leaves_detail_redacted_none_for_a_non_type_action() {
-        // issue #160 round-10 P1 #A note: see the matching comment in
+        // Note: see the matching comment in
         // `approve_sets_detail_redacted_for_type_but_keeps_the_local_detail_raw`
         // above — `left_click` is Write-classified too, so it needs the same
         // resolvable-window setup for `approve`'s own early resolve.
@@ -5049,11 +5034,11 @@ mod tests {
         let _ = handle.await.unwrap();
     }
 
-    // —— issue #160 round-5 review P1 §1: GUI actions never sweep in the
+    // —— GUI actions never sweep in the
     // generic read-only batch/issue grant ——
 
     /// The end-to-end property the fix exists for: a session already holding
-    /// issue #103's "release all read-only for this session" grant — the
+    /// the "release all read-only for this session" grant — the
     /// GENERIC, cross-tool batch grant, not anything computer-specific — must
     /// still see a real Needs-you card for a `screenshot`/`list_windows`
     /// call, because those are `RiskLevel::ReadOnly` by `classify_gui_action`'s
@@ -5064,7 +5049,7 @@ mod tests {
     /// Always ever granted.
     #[tokio::test]
     async fn screenshot_still_cards_despite_a_read_only_session_grant_with_no_exact_always() {
-        // issue #160 round-11 P1 #C note: `approve` now resolves a
+        // Note: `approve` resolves a
         // `screenshot`'s window authoritatively too (not just Write actions),
         // even on the path to opening a card — this needs a resolvable
         // "notes" window (`shared_mock`, under `process_state_test_lock`) so
@@ -5113,8 +5098,8 @@ mod tests {
         assert!(err.contains("denied"), "{err}");
     }
 
-    /// Same property for the ISSUE-wide read-only grant (issue #103's
-    /// dispatch-approval propagation) — `list_windows` must still card too.
+    /// Same property for the ISSUE-wide read-only grant
+    /// — `list_windows` must still card too.
     #[tokio::test]
     async fn list_windows_still_cards_despite_a_read_only_issue_grant() {
         let asks = AskRegistry::new();
@@ -5149,13 +5134,13 @@ mod tests {
     /// `screenshot @ notes` call is still auto-approved without a card —
     /// `auto_decision_gui` keeps honoring Full/Always exactly like
     /// `auto_decision` does, it just drops the read-only batch/issue fallback
-    /// (and, round-25, the global `dangerous` shortcut). Proves the fix is a
+    /// (and the global `dangerous` shortcut). Proves the fix is a
     /// narrowing, not a blanket "GUI actions never auto-approve".
     #[tokio::test]
     async fn screenshot_auto_approves_with_an_exact_always_grant_and_no_read_only_batch() {
-        // issue #160 round-11 P1 #C: `screenshot` now resolves its window
+        // `screenshot` now resolves its window
         // authoritatively too, folding `id`/`app`/`title` into the key
-        // (issue #160 round-11 P1 #B) exactly like a Write action's key —
+        //  exactly like a Write action's key —
         // this pre-seeded Always grant must be built the SAME way `approve`
         // itself now would, or it silently misses and this call hangs
         // waiting on a card nobody is spawned to answer.
@@ -5203,14 +5188,14 @@ mod tests {
         assert!(asks.open().is_empty(), "an auto-approved call must never surface a card");
     }
 
-    // —— issue #160 round-2 P1 addendum: type/key focus-freshness gate ——
+    // —— type/key focus-freshness gate ——
     //
     // Each test below uses a UNIQUE synthetic thread id so they can run in
     // parallel (the default for `cargo test`) without racing each other on
     // the shared process-level `recent_clicks()` registry.
 
-    /// A minimal window fixture for the focus tests — round-17 P2 made the
-    /// registry identity-keyed, so the tests pass full `WindowInfo`s now.
+    /// A minimal window fixture for the focus tests — the
+    /// registry is identity-keyed, so the tests pass full `WindowInfo`s.
     fn focus_win(id: u32) -> computer::WindowInfo {
         computer::WindowInfo {
             id,
@@ -5246,7 +5231,7 @@ mod tests {
         assert!(err.contains("8"), "error should name the window that lacks focus: {err}");
     }
 
-    /// issue #160 round-17 P2 (Codex computer_srv.rs:1943): a REUSED numeric
+    /// a REUSED numeric
     /// id must not satisfy the freshness check — the clicked window closed
     /// and a different app/title took its number within the 15s window.
     #[test]
@@ -5275,7 +5260,7 @@ mod tests {
         assert!(require_recent_focus(thread_a, "10", None, &focus_win(7)).is_err());
     }
 
-    /// issue #160 round-34 P2 (Codex computer_srv.rs:2329): sibling workers of
+    /// sibling workers of
     /// one multi-repo direction share `(thread, dir)` but are distinct
     /// sessions keyed by `wt` — worker A's click must never satisfy worker
     /// B's `type`/`key` focus prerequisite, nor the lead-style `None`
@@ -5301,8 +5286,8 @@ mod tests {
         // Seed a click stamped older than `FOCUS_FRESHNESS_MS` directly,
         // rather than sleeping 15s in a test — same "no fake clock needed"
         // approach the coordinator's spec calls for, just expressed as a
-        // pre-expired `Instant` (round-15 P2: the registry is monotonic
-        // Instant-based now) instead of a real-time wait. `checked_sub` can
+        // pre-expired `Instant` (the registry is monotonic
+        // Instant-based) instead of a real-time wait. `checked_sub` can
         // only return `None` if the process somehow started less than ~15s
         // after the Instant epoch — skip (vacuously pass) rather than panic
         // in that unreachable-in-practice case.
@@ -5321,7 +5306,7 @@ mod tests {
         assert!(require_recent_focus(thread, "lead", None, &focus_win(7)).is_err());
     }
 
-    // —— issue #160 round-4 P1 §2, broadened round-5 review P1 §6: activate_target ——
+    // —— activate_target ——
 
     /// The ONE shared `MockBackend` every test in this module that needs to
     /// drive `run_action` through the process-wide `backend::backend()`
@@ -5347,12 +5332,11 @@ mod tests {
         .clone()
     }
 
-    /// The end-to-end property this fix exists for, post round-5 review P1
-    /// §6: `activate_target` reactivates the target window
+    /// The end-to-end property this fix exists for:
+    /// `activate_target` reactivates the target window
     /// (`backend.activate_window`) UNCONDITIONALLY, every time it's called —
     /// there is no longer an Auto/Interactive distinction to skip it for (see
-    /// this function's own doc for why Codex's round-5 finding removed that
-    /// distinction). Also covers the fail-closed path: when activation itself
+    /// this function's own doc for why that distinction was removed). Also covers the fail-closed path: when activation itself
     /// is broken (`Unsupported`), this must propagate an `Err` naming the
     /// window, never fall through and let the real action reach the OS
     /// anyway.
@@ -5363,7 +5347,7 @@ mod tests {
         mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
         *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
         mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        // issue #160 round-34 P2: activation verifies the FULL identity
+        // activation verifies the FULL identity
         // against the currently visible set, so the target must be visible.
         let target = computer::WindowInfo {
             id: 7,
@@ -5390,7 +5374,7 @@ mod tests {
         assert!(activate_target(&target).is_ok());
         assert_eq!(mock.actions.lock().unwrap().len(), 2);
 
-        // issue #160 round-34 P2 (Codex computer_srv.rs:2986): the SAME
+        // the SAME
         // numeric id now belonging to a DIFFERENT application (id reuse while
         // the activation closure sat queued) is refused BEFORE any raise —
         // no new action recorded.
@@ -5431,9 +5415,9 @@ mod tests {
         mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
-    // —— issue #160 round-6 review P1 #2+#3: input branches re-resolve/re-activate AFTER the flight guard ——
+    // —— input branches re-resolve/re-activate AFTER the flight guard ——
 
-    /// issue #160 round-6 review P1 #3: a `left_click` that queues on
+    /// a `left_click` that queues on
     /// `computer::input_flight_guard` behind another in-flight action must
     /// use the window's geometry AS IT IS once it actually gets to inject —
     /// not whatever `resolve_window`/`map_to_physical` would have computed
@@ -5471,7 +5455,7 @@ mod tests {
             full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
             always: Vec::new(),
         });
-        // issue #160 round-11 P1 #D: an input action now maps its coordinate
+        // an input action now maps its coordinate
         // against a RECORDED screenshot's own dimensions (fail-closed with
         // none on file) rather than the window's current size — seed the
         // record directly (standing in for "this session already
@@ -5554,7 +5538,7 @@ mod tests {
         computer::clear_control();
     }
 
-    /// issue #160 round-6 review P1 #2: `activate_target` shells out to a
+    /// `activate_target` shells out to a
     /// (potentially slow, blocking) OS call. A Stop that lands WHILE that
     /// call is running must still be honored: the SECOND
     /// `recheck_after_guard` (run via `activate_and_recheck`, right after
@@ -5645,7 +5629,7 @@ mod tests {
         computer::clear_control();
     }
 
-    // —— issue #160 round-10 P1 #B: re-resolve/re-verify AFTER activation ——
+    // —— re-resolve/re-verify AFTER activation ——
 
     /// The end-to-end property this fix exists for: while `activate_window`
     /// runs (standing in for a real, slow OS activation call), the window
@@ -5654,7 +5638,7 @@ mod tests {
     /// window's geometry AS OF AFTER activation, never the stale
     /// pre-activation origin.
     ///
-    /// issue #160 round-12 P1 #C note: this origin change is also exactly
+    /// Note: this origin change is also exactly
     /// why `computer::shot_dims_for` does NOT gate on geometry — see that
     /// function's own doc, which names this test by function name as one of
     /// the two reasons.
@@ -5685,7 +5669,7 @@ mod tests {
             full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
             always: Vec::new(),
         });
-        // issue #160 round-11 P1 #D: seed this window's own recorded
+        // seed this window's own recorded
         // screenshot dims (its size never changes in this scenario, only its
         // origin does — see the hook below) so the click's coordinate mapping
         // doesn't fail closed for want of a screenshot on file.
@@ -5838,7 +5822,7 @@ mod tests {
         computer::clear_control();
     }
 
-    // —— issue #160 round-8 P1 #4: approval bound to the resolved window identity ——
+    // —— approval bound to the resolved window identity ——
 
     /// The end-to-end property this fix exists for: `approve` resolves the
     /// target window (query "shifty", matching by title substring) and binds
@@ -5941,7 +5925,7 @@ mod tests {
 
     /// The mirror image: the query resolves to the SAME window both at
     /// approval time and at dispatch time (the common, no-race case) — the
-    /// action must still succeed exactly as it did before round-8 P1 #4.
+    /// action must still succeed exactly as it did without the binding.
     #[tokio::test]
     async fn input_action_succeeds_when_the_approved_window_is_unchanged() {
         let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -5970,7 +5954,7 @@ mod tests {
             full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
             always: Vec::new(),
         });
-        // issue #160 round-11 P1 #D: seed this window's recorded screenshot
+        // seed this window's recorded screenshot
         // dims (unchanged for this scenario) so the click's coordinate
         // mapping doesn't fail closed for want of a screenshot on file.
         computer::record_shot_dims(
@@ -6017,7 +6001,7 @@ mod tests {
         computer::clear_control();
     }
 
-    // —— issue #160 round-10 P1 #A: standing Always grant scoped to the
+    // —— standing Always grant scoped to the
     // approved window's own identity, not just the query string ——
 
     /// The end-to-end property this fix exists for: an Always grant seeded
@@ -6076,7 +6060,7 @@ mod tests {
     /// seeded for the OLD identity must MISS (a different `action_key`,
     /// since `app`+`title` are folded into it), falling through to a fresh
     /// Needs-you card rather than silently auto-approving the replacement
-    /// window. Before issue #160 round-10 P1 #A, the key never captured
+    /// window. Without identity in the key, it never captured
     /// WHICH window was approved (only the query string), so this exact
     /// scenario would have auto-approved silently.
     #[tokio::test]
@@ -6148,13 +6132,13 @@ mod tests {
         assert!(err.contains("denied"), "{err}");
     }
 
-    // —— issue #160 round-11 P1 #B: Always key now also binds the window INSTANCE (id) ——
+    // —— Always key now also binds the window INSTANCE (id) ——
 
-    /// The exact gap round-11 P1 #B closes, isolated from round-10 P1 #A's
-    /// own (broader) "different window entirely" scenario above: the ORIGINAL
+    /// The id-in-the-key gap, isolated from the
+    /// (broader) "different window entirely" scenario above: the ORIGINAL
     /// window closes and a NEW one opens with the EXACT SAME `app`+`title` —
     /// a relaunched app, a reopened document with an identical name — but a
-    /// DIFFERENT `id`. Before this round, the key carried `app`+`title` but
+    /// DIFFERENT `id`. Before this change, the key carried `app`+`title` but
     /// NOT `id`, so this replacement window's key was IDENTICAL to the
     /// original's — the standing Always grant would have silently kept
     /// authorizing input into the REPLACEMENT instance. With `id` folded in,
@@ -6291,7 +6275,7 @@ mod tests {
     /// for `verify_approved_target` to ever check against, and their
     /// `action_key` keeps the OLD, resolve-free four-part shape.
     ///
-    /// issue #160 round-11 P1 #C note: this test USED TO also cover
+    /// Note: this test USED TO also cover
     /// `screenshot` here (asserting it never binds a window either) — that is
     /// no longer true: `screenshot` now resolves and binds a window exactly
     /// like a Write action does (see `approve`'s own `resolved` doc comment)
@@ -6320,7 +6304,7 @@ mod tests {
         );
     }
 
-    // —— issue #160 round-11 P1 #C: screenshot ALSO binds its resolved window ——
+    // —— screenshot ALSO binds its resolved window ——
 
     /// The end-to-end property the fix exists for: a `screenshot` with a
     /// non-blank, resolvable `window` argument now binds that window's
@@ -6365,7 +6349,7 @@ mod tests {
     /// The fail-closed half: a `screenshot` whose `window` argument does NOT
     /// resolve to any visible window must reject the WHOLE call — never
     /// silently proceed with `Ok(None)` the way an unresolvable query used to
-    /// before this round (when screenshot never attempted a resolve at all).
+    /// before this change (when screenshot never attempted a resolve at all).
     #[tokio::test]
     async fn screenshot_fails_closed_when_its_window_arg_cannot_resolve() {
         let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -6398,7 +6382,7 @@ mod tests {
     }
 
     /// The end-to-end property `screenshot`'s NEW capture-time identity check
-    /// exists for (issue #160 round-11 P1 #C): a card is opened for
+    /// exists for: a card is opened for
     /// `screenshot @ shifty`, binding window X's identity the instant it
     /// opens; while the human sits on that still-open card, the ORIGINAL
     /// window closes and a DIFFERENT one — same title substring, so the SAME
@@ -6570,7 +6554,7 @@ mod tests {
         assert!(err.contains("denied"), "{err}");
     }
 
-    /// issue #160 round-18 P1 (Codex computer_srv.rs:967): the FINAL,
+    /// the FINAL,
     /// SYNCHRONOUS stop/lease recheck each input arm runs INSIDE its
     /// `on_blocking` closure right before the backend call. Touches the SAME
     /// process-wide stop-latch/control-lease statics as every other lease test
@@ -6614,7 +6598,7 @@ mod tests {
         computer::clear_control();
     }
 
-    /// issue #160 round-25 P1 (Codex mod.rs:1552): the final recheck compares
+    /// the final recheck compares
     /// `wt` too, so a SIBLING worker (SAME `(thread, dir)`, different worktree)
     /// holding the lease is NOT mistaken for "I still hold it". Worker wt=1's
     /// recheck must fail while sibling wt=2 holds the lease, even though thread
@@ -6645,7 +6629,7 @@ mod tests {
         computer::clear_control();
     }
 
-    /// issue #160 round-34 P1 (Codex computer_srv.rs:2869): the post-queue
+    /// the post-queue
     /// liveness recheck validates the request's OWN `wt` — a session-only
     /// worker whose worktree a repo delete removed (direction SURVIVING) must
     /// be refused here even though it holds a freshly-acquired lease, while
@@ -6676,7 +6660,7 @@ mod tests {
                 .await
                 .unwrap();
         // Repo B's worktree was deleted — no row exists for this id, and the
-        // round-32 fence published a session-only revocation for it.
+        // delete fence published a session-only revocation for it.
         let wt_b_id = wt_a.id + 991;
         let dir_s = direction.id.to_string();
         let restore = snapshot_revocations(&[thread.id]);
@@ -6702,7 +6686,7 @@ mod tests {
         restore_revocations(restore);
     }
 
-    /// issue #160 round-18 P2 (Codex paths.rs:89): deleting a thread removes
+    /// deleting a thread removes
     /// ITS computer-output subtree only, never a sibling thread's.
     #[test]
     fn remove_computer_output_for_thread_drops_only_that_threads_subtree() {
@@ -6733,7 +6717,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// issue #160 round-26 P1 (Codex computer_srv.rs:3366): the recursive
+    /// the recursive
     /// cleanup helpers must never delete THROUGH a symlinked ancestor — a
     /// pre-planted symlink at `computer/` would otherwise redirect
     /// `remove_dir_all` into `<target>/<thread>` OUTSIDE Weft-managed storage.
@@ -6776,7 +6760,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
-    /// issue #160 round-30 P2 (Codex computer_srv.rs:893): the post-capture
+    /// the post-capture
     /// cleanup removes exactly what THIS call's save recreated — the
     /// screenshots subtree plus any now-empty ancestors — while a surviving
     /// sibling direction's tree stops the ancestor pruning (non-recursive
@@ -6821,7 +6805,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// Same round-26 symlink doctrine for the round-30 cleanup: a symlinked
+    /// Same symlink doctrine for the earlier cleanup: a symlinked
     /// `computer/` ancestor refuses the removal outright (the target
     /// survives), and an `out_dir` outside `<weft_home>` is never touched.
     #[cfg(unix)]
@@ -6862,7 +6846,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
-    /// issue #160 round-24 P2 (Codex commands.rs:794): a repo delete prunes ONLY
+    /// a repo delete prunes ONLY
     /// the removed direction's output subtree — a sibling direction and the lead
     /// lane under the SAME surviving thread are untouched, and a non-integer dir
     /// never touches the filesystem.
@@ -6900,7 +6884,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// issue #160 round-32 P2 (Codex commands.rs:2354): deleting a SESSION-ONLY
+    /// deleting a SESSION-ONLY
     /// worker (a secondary repo's worktree under a SURVIVING direction) prunes
     /// exactly `computer/<thread>/<dir>/wt-<id>` — the direction's sibling
     /// worktree, its own other content, and the lead lane are untouched, and a
@@ -6945,7 +6929,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// issue #160 round-19 P1 (Codex computer_srv.rs:403): a request under a
+    /// a request under a
     /// deleted thread/direction is refused — `session_is_live` is the admission
     /// gate that revokes the route once the delete cascade runs.
     #[tokio::test]
@@ -6985,7 +6969,7 @@ mod tests {
         assert!(!session_is_live(&db, thread.id, &dir_s, Some(wt.id)).await);
     }
 
-    /// issue #160 round-19 P1 (Codex computer_srv.rs:403) + round-24 P1: the
+    /// The
     /// revocation map is empty until a delete (so no live session — nor any
     /// synthetic-identity test — ever pays the `session_is_live` DB check), and
     /// it distinguishes a WHOLE-thread delete from a per-DIRECTION (repo) delete
@@ -7020,7 +7004,7 @@ mod tests {
         assert!(!computer_routes_revoked(repo_thread));
     }
 
-    /// issue #160 round-32 P1 (Codex commands.rs:2315): a SESSION-ONLY worker
+    /// a SESSION-ONLY worker
     /// revocation — repo B's worktree deleted while the direction (owned by
     /// repo A) survives — refuses exactly `(dir, wt_b)`: the coarse gate fires
     /// (so `session_is_live` runs for every request of the thread), the doomed
@@ -7055,7 +7039,7 @@ mod tests {
         assert!(!computer_routes_revoked(thread));
     }
 
-    /// issue #160 round-24 P2 (Codex commands.rs:803): a failed cascade's
+    /// a failed cascade's
     /// rollback must restore EXACTLY the prior revocation state — never drop a
     /// revocation that an earlier successful delete already published.
     #[test]
@@ -7080,7 +7064,7 @@ mod tests {
         assert!(!computer_routes_revoked(thread));
     }
 
-    // —— issue #160 round-3 P1 §2 (extended round-5 review P1 §2): recheck_after_guard ——
+    // —— recheck_after_guard ——
 
     /// One test exercises `recheck_after_guard`'s whole matrix sequentially,
     /// mirroring `computer::tests::control_lock_busy_expiry_release_and_clear`'s
@@ -7088,7 +7072,7 @@ mod tests {
     /// static as every other `computer::acquire_control`-touching test in
     /// this binary, so splitting these scenarios across separate `#[test]`s
     /// would let `cargo test`'s default parallel threads race each other's
-    /// lease state. issue #160 round-5 review P1 §2's own `has_open` scenario
+    /// lease state. The `has_open` scenario
     /// lives HERE too, for the exact same reason — a separate `#[tokio::test]`
     /// that also calls `computer::acquire_control` raced this one and the
     /// OTHER lease-touching tests in this file/binary under `cargo test`'s
@@ -7129,7 +7113,7 @@ mod tests {
         computer::acquire_control(thread, dir, None).unwrap();
         assert!(recheck_after_guard(&db, &asks, thread, dir, None).await.is_ok());
 
-        // issue #160 round-5 review P1 §2: a brand-new, unrelated ask opening
+        // a brand-new, unrelated ask opening
         // for this EXACT (thread, dir) — simulating one that opened WHILE this
         // call sat queued on `input_flight_guard` — must now deny with the
         // SAME `SuspendedPendingAsk` text `check_suspended`'s own up-front
@@ -7155,16 +7139,15 @@ mod tests {
         computer::clear_control();
     }
 
-    // —— issue #160 round-2 P1 §1: re-check the kill switch AFTER approval ——
+    // —— re-check the kill switch AFTER approval ——
 
     /// The human hits Stop (disabling the setting) WHILE a card is still
     /// open; a stale Allow answers that SAME card anyway (e.g. a click that
     /// raced the Stop). The re-check inside `run_action`, right after
     /// `approve` returns, must still deny — and never reach dispatch.
     ///
-    /// issue #160 round-8 P1 #4 note: `approve` itself now resolves the
-    /// target window authoritatively as soon as the human's Allow lands (see
-    /// `bind_approved_window`) — this needs a resolvable "notes" window
+    /// Note: `approve` itself resolves the
+    /// target window authoritatively as soon as the human's Allow lands — this needs a resolvable "notes" window
     /// (`shared_mock`, under `process_state_test_lock`) so that resolve
     /// itself succeeds and control actually reaches the kill-switch re-check
     /// this test exists to exercise, rather than failing earlier on an
@@ -7233,14 +7216,14 @@ mod tests {
         );
     }
 
-    // —— issue #160 round-11 P1 #D: coordinate mapping by SAVED screenshot geometry ——
+    // —— coordinate mapping by SAVED screenshot geometry ——
 
     /// The fail-closed half, end-to-end through `run_action`'s own "left_click"
     /// arm (Full-granted, so `approve` decides silently): a window that
     /// resolves fine but was NEVER screenshotted for this exact (thread, dir)
     /// has no screenshot-space coordinate system to map against at all —
     /// the click must be rejected, never silently fall back to mapping
-    /// against the window's CURRENT size (the exact bug this round closes).
+    /// against the window's CURRENT size (the exact bug this change closes).
     #[tokio::test]
     async fn left_click_fails_closed_when_no_screenshot_is_on_file_for_the_window() {
         let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -7288,7 +7271,7 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_lowercase().contains("screenshot"), "{err}");
-        // issue #160 round-33 P2 (Codex computer_srv.rs:1074): the missing
+        // the missing
         // prerequisite is now PREFLIGHTED before activation, so the doomed
         // call must not have raised/focused the target window either — not
         // just skipped the click.
@@ -7309,7 +7292,7 @@ mod tests {
     /// the SAVED screenshot must map to the SAME proportional position on the
     /// window's CURRENT rectangle — never a position derived from treating
     /// the screenshot as if it were sized to match the window's PRESENT
-    /// dimensions (`map_to_physical`'s old bug this round replaces).
+    /// dimensions (`map_to_physical`'s old bug this change replaces).
     #[tokio::test]
     async fn left_click_maps_the_screenshot_coordinate_proportionally_after_a_resize() {
         let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -7341,7 +7324,7 @@ mod tests {
         });
         // The screenshot this agent is reading coordinates off of was saved
         // at 1280x800 — BEFORE the window resized down to 1000x600 above.
-        // issue #160 round-12 P1 #C: geometry is now ALSO recorded here
+        // geometry is now ALSO recorded here
         // (the window's own pre-resize rect), but `shot_dims_for` does not
         // gate on it — see that function's own doc for why this exact
         // resize-tolerance property (`left_click_maps_the_screenshot_
@@ -7391,7 +7374,7 @@ mod tests {
         computer::clear_control();
     }
 
-    // —— issue #160 round-12 P1 #5: screenshot capture/encode concurrency cap ——
+    // —— screenshot capture/encode concurrency cap ——
 
     /// The mechanism itself: `SCREENSHOT_CONCURRENCY` permits total, so
     /// draining that many exhausts the semaphore and a further acquire must
@@ -7442,18 +7425,18 @@ mod tests {
             .expect("the queued capture must complete once a permit frees up");
     }
 
-    /// issue #160 round-12 P1 #I: the identity re-verification round-12 P1 #5's
-    /// OWN capture semaphore reopened. The ORIGINAL window can close and a
+    /// the identity re-verification the
+    /// capture semaphore's own queueing reopened. The ORIGINAL window can close and a
     /// same-query REPLACEMENT take its place while a call sits queued on the
     /// capture semaphore — `approve` and the arm's own FIRST
     /// `resolve_and_verify_target` only ever saw the ORIGINAL window. A Full
-    /// grant (not a fresh card) isolates this from round-11 P1 #C's own
-    /// pre-approval gap. Without the round-12 P1 #I re-check,
+    /// grant (not a fresh card) isolates this from the
+    /// pre-approval resolution gap. Without the post-queue re-check,
     /// `screenshot_window`'s own internal re-resolve would silently capture
     /// the REPLACEMENT the instant a permit frees up.
     ///
-    /// round-27 P2 gave `approve`'s OWN resolve a semaphore permit too, so a
-    /// drained semaphore now parks the call at APPROVE — before any
+    /// `approve`'s OWN resolve holds a semaphore permit too, so a
+    /// drained semaphore parks the call at APPROVE — before any
     /// resolution — and a wall-clock "swap while queued" would land before
     /// the FIRST resolve (where capturing the replacement would be CORRECT:
     /// authorization would have bound it). The swap is therefore sequenced
@@ -7522,7 +7505,7 @@ mod tests {
             .await
         });
 
-        // The call queues on the drained semaphore (round-27: at `approve`'s
+        // The call queues on the drained semaphore (at `approve`'s
         // own authorization-time resolve, the FIRST permit acquisition on the
         // path). The window "swap" itself needs no timing at all — the mock's
         // `windows_sequence` (seeded above) hands the original to resolves #1
@@ -7561,12 +7544,12 @@ mod tests {
         drop(held);
     }
 
-    // —— issue #160 round-16 P1: list_windows shares the observe semaphore ——
+    // —— list_windows shares the observe semaphore ——
 
-    /// issue #160 round-16 P1 (Codex computer_srv.rs:605): `list_windows` now
+    /// `list_windows` now
     /// acquires the SAME `screenshot_semaphore` a `screenshot` capture does —
     /// closing the "no cap at all on an already-authorized session's
-    /// concurrent enumeration" gap this round exists for. `MockBackend` (see
+    /// concurrent enumeration" gap this change exists for. `MockBackend` (see
     /// its own doc comment) has no delay-injection hook for `list_windows`
     /// itself, so a genuine concurrent race can't be forced through
     /// `run_action` the way `screenshot_re_verifies_after_the_capture_
@@ -7651,7 +7634,7 @@ mod tests {
         drop(held);
     }
 
-    // —— issue #160 round-12 P2 #G: throttle checked BEFORE the control lease
+    // —— throttle checked BEFORE the control lease
     // is (re)acquired ——
 
     /// The end-to-end property this fix exists for: a same-session input
@@ -7696,7 +7679,7 @@ mod tests {
         computer::clear_control();
     }
 
-    // —— issue #160 round-2 P2 §2: args_digest / Always-grant action_key ——
+    // —— args_digest / Always-grant action_key ——
 
     #[test]
     fn args_digest_is_order_independent_and_stable() {
@@ -7732,7 +7715,7 @@ mod tests {
         assert_eq!(args_digest(&a), args_digest(&b));
     }
 
-    /// The end-to-end property the round-2 P2 §2 fix exists for: the SAME
+    /// The end-to-end property the earlier P2 §2 fix exists for: the SAME
     /// action+window+params produce the SAME `action_key` (so an Always
     /// grant is reused); a CHANGED consequential param (here, `text`) mints a
     /// DIFFERENT key (so it must re-card); and the key itself never contains
@@ -7753,7 +7736,7 @@ mod tests {
         assert!(!key3.contains("goodbye"), "{key3}");
     }
 
-    // —— issue #160 round-2 P2 §3: refuse_symlinks ——
+    // —— refuse_symlinks ——
 
     #[test]
     fn refuse_symlinks_accepts_an_ordinary_directory() {
@@ -7806,7 +7789,7 @@ mod tests {
         let _ = std::fs::remove_file(&secret);
     }
 
-    // —— issue #160 round-25 P1 (Codex paths.rs:90): refuse_symlinked_output
+    // —— refuse_symlinked_output
     // walks EVERY ancestor from weft_home down, not just the appended leaf ——
 
     /// The ordinary case: an all-real ancestor chain resolves to
@@ -7894,7 +7877,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
-    // —— issue #160 round-4 P2 §3: O_NOFOLLOW closes the leaf open TOCTOU ——
+    // —— O_NOFOLLOW closes the leaf open TOCTOU ——
 
     /// Proves the NEW defense in isolation from `refuse_symlinks`'s own,
     /// EARLIER check: the leaf path is ALREADY a symlink to an outside file
@@ -7944,7 +7927,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// issue #160 round-10 P2 #3 (Codex 1868): a freshly-created audit file
+    /// a freshly-created audit file
     /// must be owner-only `0600`, never the umask-`022`-survivable `0644` a
     /// bare `open(2)` with no explicit mode would leave it at. Checked via
     /// `symlink_metadata` (not `metadata`) purely out of habit-consistency
@@ -7971,7 +7954,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // —— issue #160 round-10 P1 #F: bounded audit-log rotation ——
+    // —— bounded audit-log rotation ——
 
     /// The core property: a file already AT (or over) the threshold gets
     /// renamed to `<path>.1`, and the original path is free again for a
@@ -8122,7 +8105,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// issue #160 round-12 P1 #E: the concurrent-writer race `audit_write_lock`
+    /// the concurrent-writer race `audit_write_lock`
     /// closes, exercised through genuine concurrency (a multi-threaded
     /// runtime, so the check/rotate/open/write sequence really can interleave
     /// across OS threads without the lock) rather than sequential calls.
@@ -8179,8 +8162,8 @@ mod tests {
 
     /// End-to-end through the async path a real worker's `screenshot`/audit
     /// call takes (`session_root` → `screenshot_out_dir`/`audit_log_path`).
-    /// issue #160 round-10 P1 #1 moved the worker lane's output OFF the
-    /// worktree entirely and into a dedicated directory under `weft_home` —
+    /// The worker lane's output lives OFF the
+    /// worktree entirely, in a dedicated directory under `weft_home` —
     /// so this test's hazard is no longer "a worktree-writable `.weft`"
     /// (there is no `.weft` in the worktree for this path anymore at all —
     /// asserted below) but the residual one `refuse_symlinks`'s own doc now
@@ -8225,7 +8208,7 @@ mod tests {
         let dir_s = direction.id.to_string();
         // Plant the symlinks at the Weft-managed output directory THIS
         // session resolves to — deliberately NOT inside the worktree, which
-        // this round moves output off of entirely.
+        // this change moves output off of entirely.
         let session_dir = crate::paths::computer_output_root()
             .unwrap()
             .join(thread.id.to_string())
@@ -8244,7 +8227,7 @@ mod tests {
             "must never write through the symlink"
         );
 
-        // issue #160 round-10 P1 #1: the worker lane must never touch the
+        // the worker lane must never touch the
         // worktree's own `.weft` at all anymore — there is nothing left to
         // `git_exclude` there either (that call is gone).
         assert!(
@@ -8258,15 +8241,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    // —— issue #160 round-2 P2 §4: parameter validation before the lease ——
+    // —— parameter validation before the lease ——
 
     /// A `left_click` missing `coordinate`, already Full-granted (so `approve`
     /// decides silently), must be rejected on the missing argument WITHOUT
     /// ever touching the control lease.
     ///
-    /// issue #160 round-8 P1 #4 note: `approve` itself now resolves the
-    /// target window authoritatively as part of authorizing this call (see
-    /// `bind_approved_window`), independent of whether `coordinate` is even
+    /// Note: `approve` itself resolves the
+    /// target window authoritatively as part of authorizing this call,
+    /// independent of whether `coordinate` is even
     /// present — so this test installs `shared_mock` with a resolvable
     /// "notes" window (under `process_state_test_lock`) to keep that
     /// resolve itself from being the thing that fails, so the assertion
@@ -8290,7 +8273,7 @@ mod tests {
         // `computer::mod`'s own tests' notes on the same hazard) — cleared
         // immediately before and after so this test's own assertion isn't
         // muddied by a lease some other test happened to leave behind.
-        // issue #160 round-5 review: that comment previously described the
+        // that comment previously described the
         // hazard without actually preventing it — `process_state_test_lock`
         // does, by serializing this against every other test that touches
         // the same family of globals.
@@ -8331,7 +8314,7 @@ mod tests {
         computer::clear_control();
     }
 
-    // —— issue #160 round-5 review P2 §3: MAX_TYPE_CHARS ——
+    // —— MAX_TYPE_CHARS ——
 
     #[test]
     fn check_type_length_accepts_up_to_the_cap_and_rejects_over_it() {
@@ -8358,15 +8341,15 @@ mod tests {
     /// records `window_id_out` and would go on to touch the focus-freshness
     /// gate, the control lease, and the backend call itself.
     ///
-    /// issue #160 round-8 P1 #4 note: `approve` itself now ALSO resolves the
+    /// Note: `approve` itself ALSO resolves the
     /// window authoritatively, unconditionally, for any Write action with a
     /// non-blank window argument — including THIS one — to bind an
     /// `ApprovedWindow` before this call ever reaches its own arm (see
     /// `bind_approved_window`'s doc). That resolve happens regardless of
     /// whether the LATER, action-specific arguments (like this call's
-    /// over-limit `text`) turn out to be invalid — so this test now installs
-    /// `shared_mock` with a resolvable "notes" window (unlike before round-8,
-    /// when this test deliberately used NO backend at all and relied on the
+    /// over-limit `text`) turn out to be invalid — so this test installs
+    /// `shared_mock` with a resolvable "notes" window (a variant without any
+    /// backend at all would rely on the
     /// guaranteed-`Unsupported` `StubBackend` to prove ordering). What this
     /// test still proves: `check_type_length` rejects before the ARM's own
     /// resolve/backend call — `window_id_out` stays `None` and no INPUT
@@ -8425,7 +8408,7 @@ mod tests {
         );
     }
 
-    // —— issue #160 round-10 P2 #4: key combo validated before the lease ——
+    // —— key combo validated before the lease ——
 
     /// End-to-end through `run_action`'s own "key" arm (Full-granted, so
     /// `approve` decides silently): a malformed combo (`ctrl+a+b` — a
@@ -8487,7 +8470,7 @@ mod tests {
         computer::clear_control();
     }
 
-    // —— issue #160 round-10 P2 #5: check_suspended before opening a NEW card ——
+    // —— check_suspended before opening a NEW card ——
 
     /// The property this fix exists for: a session with an ALREADY-open,
     /// unanswered permission card must reject a Write action BEFORE `approve`
@@ -8565,7 +8548,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_action_rejects_a_malformed_action_before_opening_any_card() {
-        // issue #160 round-13 P1 (Codex computer_srv.rs:515): a malformed call
+        // a malformed call
         // (here `left_click` with no `coordinate`) must be rejected by pure
         // schema validation BEFORE `approve` — so NO permission card is ever
         // opened for it, even with no standing grant. If validation regressed
@@ -8622,7 +8605,7 @@ mod tests {
         computer::clear_control();
     }
 
-    /// issue #160 round-15 P1 (Codex commands.rs:1619): a card published by a
+    /// a card published by a
     /// caller that straddled the disable transition (passed `run_action`'s
     /// `enabled` gate BEFORE the latch tripped, inserted its card AFTER
     /// `cancel_gui_asks`'s sweep) self-cancels via `approve`'s post-insert
@@ -8659,7 +8642,7 @@ mod tests {
         computer::clear_emergency_stop(computer::stop_generation());
     }
 
-    /// issue #160 round-34 P2 (Codex computer_srv.rs:1848): the SAME straddler
+    /// the SAME straddler
     /// property for route revocation — a card inserted AFTER a delete's asks
     /// purge already swept must be self-cancelled by the post-insert
     /// revocation recheck, never left answerable (Always/Full into a deleted
@@ -8691,7 +8674,7 @@ mod tests {
         restore_revocations(restore);
     }
 
-    /// issue #160 round-28 P2 (Codex computer_srv.rs:1559): the authorization-
+    /// the authorization-
     /// time window resolve rechecks the stop latch (and route revocation)
     /// INSIDE its blocking closure — a windowed request that was parked on the
     /// screenshot semaphore or the blocking-pool queue when a human hit Stop
@@ -8897,7 +8880,7 @@ mod tests {
         *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
-    /// issue #160 round-29 P2 (Codex computer_srv.rs:2871): `activate_and_
+    /// `activate_and_
     /// recheck` re-runs the synchronous stop/lease recheck INSIDE its blocking
     /// closure, immediately before the activation call — a Stop that lands
     /// while the closure sits queued must prevent the target window from ever
@@ -8935,7 +8918,7 @@ mod tests {
         computer::clear_emergency_stop(computer::stop_generation());
     }
 
-    /// issue #160 round-15 P2 (Codex computer_srv.rs:1288): grant-less OBSERVE
+    /// grant-less OBSERVE
     /// calls stop opening cards once [`MAX_OPEN_OBSERVE_ASKS`] are already
     /// open for this (thread, dir) — the one-over call fails closed with the
     /// backlog error instead of minting an unbounded Ask + waiter per call.
@@ -8986,9 +8969,9 @@ mod tests {
         }
     }
 
-    // —— issue #160 round-2 P2 §5: multi-worktree `wt` routing ——
+    // —— multi-worktree `wt` routing ——
 
-    /// issue #160 round-10 P1 #1: `session_root` no longer returns the
+    /// `session_root` no longer returns the
     /// worktree's OWN path for the worker lane — it returns a dedicated
     /// namespace under `weft_home/computer/<thread>/<dir>/wt-<id>` (see that
     /// function's own doc). This test now needs an ISOLATED `WEFT_HOME` to
@@ -9020,7 +9003,7 @@ mod tests {
         .unwrap();
 
         // Two worktrees for the SAME (multi-repo) direction — the exact
-        // shape issue #160 round-2 P2 §5 fixes: `.next()` alone would always
+        // shape the `wt` pin exists for: `.next()` alone would always
         // resolve to whichever of these was inserted first, regardless of
         // which worker session actually asked.
         let wt_a =
@@ -9048,7 +9031,7 @@ mod tests {
         // No `wt` at all: unchanged pre-existing "first worktree" fallback —
         // still resolves to wt_a's OWN namespace, keeping the SAME
         // per-worktree isolation the old worktree-rooted path got for free
-        // (round-2 P2 §5): two worktrees of the same multi-repo direction
+        // : two worktrees of the same multi-repo direction
         // never share an output namespace, whether `wt` came from an
         // explicit pin or this fallback.
         let no_wt = session_root(&db, thread.id, &dir_s, None).await.unwrap();
@@ -9059,7 +9042,7 @@ mod tests {
         );
 
         // A `wt` naming a worktree of a DIFFERENT direction is rejected
-        // (closed-set validation) — round-8 P2 #7: this must now FAIL CLOSED
+        // (closed-set validation) — this must FAIL CLOSED
         // (`None`), never silently fall back to "first worktree of THIS
         // direction" as it used to. A worker session that explicitly pinned a
         // worktree that's since become invalid must never have its
@@ -9092,12 +9075,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    // —— issue #160 round-2 P2 §7: bounded preview registry ——
+    // —— bounded preview registry ——
 
     /// A throwaway [`VerifiedWindowIdentity`] for tests that only exercise the
     /// registry's capacity/timestamp behavior, where the window identity itself
-    /// is irrelevant (issue #160 round-14 P1 changed the stored value to carry
-    /// the full identity).
+    /// is irrelevant
+    /// .
     fn pid(id: u32) -> VerifiedWindowIdentity {
         VerifiedWindowIdentity { id, app: String::new(), title: String::new() }
     }
@@ -9163,7 +9146,7 @@ mod tests {
         );
     }
 
-    /// issue #160 round-14 P1 (Codex computer_srv.rs:1466): the preview registry
+    /// the preview registry
     /// stores and matches the FULL window identity (id + app + title), so a
     /// reused numeric id belonging to a DIFFERENT window (different app/title)
     /// no longer matches a stale preview — the id-reuse hazard an id-only
@@ -9189,11 +9172,11 @@ mod tests {
         );
     }
 
-    /// issue #160 round-28 P2 (Codex computer_srv.rs:2488): sibling workers of
+    /// sibling workers of
     /// ONE direction share `(thread, dir)` but are distinct sessions keyed by
     /// `wt` — one sibling's preview must never be readable under (or attach to
     /// a card for) another's key, the same isolation `computer::shot_dims_for`
-    /// got in round-26.
+    /// has.
     #[test]
     fn screenshot_previews_are_isolated_per_worktree_for_sibling_workers() {
         let identity = pid(42);

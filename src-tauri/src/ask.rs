@@ -100,7 +100,7 @@ pub fn action_key(parts: &[&str]) -> String {
 }
 
 /// Whether an `action_key` (see [`action_key`]'s own doc) names a GUI/
-/// computer-use action, from the serialized key alone — issue #160 round-12
+/// computer-use action, from the serialized key alone
 /// P1 #B, generalizing [`AskRegistry::cancel_gui_asks`] beyond the ONE
 /// tool-name shape (`tool == "computer"`) `weft_computer`'s own MCP path
 /// happens to use.
@@ -118,8 +118,8 @@ pub fn action_key(parts: &[&str]) -> String {
 ///    "gui:<action>", grant_id]` (`intent_key_from_params`'s own `Gui`
 ///    carve-out folds the action into `intent_key` as `gui:<action>` before
 ///    `lead_chat::engine`'s ACP `Permission` arm builds the actual key) — so
-///    the serialized key always STARTS WITH `["Acp","gui:`. Round-12 P1 #A
-///    now rejects every ACP-native GUI intent outright before any card (and
+///    the serialized key always STARTS WITH `["Acp","gui:`. The engine
+///    rejects every ACP-native GUI intent outright before any card (and
 ///    so any `action_key`) is ever built for it, but this check stays
 ///    general on purpose — see `cancel_gui_asks`'s own doc — so a future
 ///    route is covered by construction, not by enumeration.
@@ -1295,7 +1295,7 @@ const GUI_WRITE_ACTIONS: &[&str] = &[
 /// (`GUI_READ_ONLY_ACTIONS`) is `ReadOnly`; anything that injects input
 /// (`GUI_WRITE_ACTIONS`) is `Write`; an unrecognized action is `Unknown` —
 /// the same honest-default rule `classify_risk` follows everywhere else in
-/// this file, never guessed low (issue #101).
+/// this file, never guessed low.
 ///
 /// `GUI_READ_ONLY_ACTIONS`/`GUI_WRITE_ACTIONS` and `computer_srv`'s own
 /// action enum are two INDEPENDENT closed sets — the MCP tool's dispatch on
@@ -1324,7 +1324,7 @@ pub(crate) fn classify_gui_action(action: &str) -> RiskLevel {
 /// `Unknown`). `acp::permission::is_gui_tool_call` uses this to recognize a
 /// native omp GUI toolCall from its structured `rawInput.action` even when its
 /// display title is not the bare `computer`/`browser` string it happens to
-/// carry today (issue #160 round-25 P1, Codex permission.rs:145) — the action a
+/// carry today — the action a
 /// tool will actually perform is a stronger identity signal than a mutable,
 /// possibly-localized display title.
 pub(crate) fn is_known_gui_action(action: &str) -> bool {
@@ -1394,7 +1394,7 @@ pub struct Ask {
     /// the raw action detail (command / file path / full input).
     pub detail: String,
     /// A REDACTED stand-in for `detail`, for the remote/IM presentation
-    /// surface ONLY (issue #160 round-4 P1 §1) — `None` for every ask whose
+    /// surface ONLY — `None` for every ask whose
     /// `detail` carries nothing that needs redacting (everything except a
     /// `weft_computer` `type` action today; see `bus::computer_srv::approve`,
     /// the only production setter). The LOCAL desktop Needs-you card always
@@ -1437,7 +1437,7 @@ pub struct Ask {
     #[serde(skip_serializing)]
     pub action_key: String,
     /// A small `data:image/jpeg;base64,...` thumbnail of this session's most
-    /// recent `weft_computer` screenshot (issue #160 M3-B) — GUI-ask-only
+    /// recent `weft_computer` screenshot — GUI-ask-only
     /// context so the human can see roughly what's on screen before
     /// allowing/denying an input action, without opening a file. `None` for
     /// every non-GUI ask, and for a GUI ask with no prior screenshot in this
@@ -1502,21 +1502,21 @@ impl GrantSnapshot {
     }
 }
 
-/// issue #160 round-8 P2 #5 / round-24 P2 (Codex ask.rs:1520): whether an
+/// Whether an
 /// Always-grant's `action_key` is safe to WRITE TO DISK across a restart.
 /// `bus::computer_srv::approve` mints a GUI action's `action_key` as
 /// `["gui", action, window, digest]` (see that function's own doc for the full
 /// shape). Two independent reasons make a GUI key unsafe to persist, and BOTH
 /// reduce to "the key binds a specific WINDOW" (`parts[2]` non-empty):
 ///
-/// 1. **Window-id reuse (round-24).** A window-bound key names its target only
+/// 1. **Window-id reuse.** A window-bound key names its target only
 ///    by OS window id / app / title. Window ids are reusable, so a grant
 ///    re-seeded at boot could have `auto_decision_exact` silently authorize a
 ///    screenshot / click / key against a same-app/same-title REPLACEMENT window
 ///    that inherited the id — `approve` re-binds whatever the query resolves to
 ///    NOW onto the persisted tuple. Input against an unapproved window is a
 ///    permission-boundary break, so no window-bound GUI grant may persist.
-/// 2. **Typed-secret digest (round-8).** `type`'s `digest = sha256(text)`, so a
+/// 2. **Typed-secret digest.** `type`'s `digest = sha256(text)`, so a
 ///    persisted `["gui", "type", …]` key carries that hash in the clear in the
 ///    default-plaintext `auth_grants` row, dictionary-attackable at leisure.
 ///    `type` is always window-bound, so rule 1 already covers it.
@@ -1676,7 +1676,7 @@ impl Inner {
         GrantSnapshot { full, always }
     }
 
-    /// issue #160 round-8 P2 #5 / round-24 P2: the snapshot actually handed to a
+    /// The snapshot actually handed to a
     /// [`PersistMsg`] — [`Self::grant_snapshot`] with every WINDOW-BOUND GUI
     /// Always-grant key dropped (see [`always_key_is_persistable`]'s own doc for
     /// exactly which shape and why: window-id reuse plus the `type` digest). This
@@ -1860,7 +1860,7 @@ impl AskRegistry {
     ///
     /// Thin `preview: None` wrapper over [`Self::request_with_preview`] — kept
     /// as its OWN method (not folded into one signature with an added
-    /// parameter) so issue #160 M3-B's GUI-ask screenshot preview didn't have
+    /// parameter) so the GUI-ask screenshot preview didn't have
     /// to touch every one of this method's many call sites across the crate
     /// (`lead_chat::engine`, `commands.rs`, `bus::global`, `auth_persist.rs`,
     /// …) just to pass `None` — see `Self::request_with_preview`'s own doc for
@@ -1889,7 +1889,7 @@ impl AskRegistry {
     /// (thread, dir) — see that function's attach rule); every other call site
     /// goes through the plain [`Self::request`] wrapper instead.
     ///
-    /// `detail_redacted` (issue #160 round-4 P1 §1): see `Ask::detail_redacted`'s
+    /// `detail_redacted`: see `Ask::detail_redacted`'s
     /// own doc for the full rationale. Added as a parameter here (rather than a
     /// new `request_with_preview_redacted` variant) since this method has
     /// exactly ONE production call site today (`bus::computer_srv::approve` —
@@ -1962,7 +1962,7 @@ impl AskRegistry {
         id
     }
 
-    /// issue #160 round-14 P1 (Codex computer_srv.rs:515): like
+    /// like
     /// [`Self::request_with_preview`], but the "is another ask already open for
     /// this (thread, dir)" check and the insert of THIS ask happen under ONE
     /// lock acquisition. Returns `None` — inserting NOTHING — when any ask is
@@ -2008,7 +2008,7 @@ impl AskRegistry {
         Some((id, rx))
     }
 
-    /// issue #160 round-15 P2 (Codex computer_srv.rs:1288): the OBSERVE-side
+    /// the OBSERVE-side
     /// counterpart to [`Self::request_with_preview_unless_open`] — an atomic
     /// "count open GUI asks for (thread, dir), insert only under the cap"
     /// under ONE lock acquisition. Returns `None` (inserting nothing) once
@@ -2079,19 +2079,19 @@ impl AskRegistry {
     /// The STRICT half of [`auto_decision`] — `dangerous` mode, a Full grant
     /// for this (thread, dir), or an Always grant matching this EXACT
     /// `action_key` — with NO read-only batch/issue fallback. Factored out as
-    /// its own method (issue #160 round-5 review P1 §1) for
+    /// its own method for
     /// `bus::computer_srv::approve`'s GUI actions: a `screenshot`/
     /// `list_windows` call is `RiskLevel::ReadOnly` by `classify_gui_action`'s
     /// own construction REGARDLESS OF WHICH WINDOW it targets, so if this
     /// gate accepted the same read-only batch/issue grant `auto_decision`
-    /// does, a session that once released "all read-only" (issue #103) would
+    /// does, a session that once released "all read-only" would
     /// silently auto-approve screenshotting/enumerating ANY window on the
     /// human's desktop — including an unrelated app (mail, a browser tab, a
     /// password manager) — with no computer-specific card and no chance for
     /// the human to see WHICH window before the pixels are captured. That is
     /// a materially different disclosure than "skip the card for `git
     /// status`", which is what the read-only batch grant was actually built
-    /// to cover (issue #103's own scope). A GUI action — observation or
+    /// to cover. A GUI action — observation or
     /// input alike — may therefore ONLY be auto-approved by a standing rule
     /// precise enough to name (via `action_key`) the EXACT action, never a
     /// coarse content-classified risk tier.
@@ -2126,8 +2126,8 @@ impl AskRegistry {
 
     /// GUI/computer-use counterpart of [`auto_decision_exact`]: honors a Full
     /// grant for this `(thread, dir)` or an exact Always grant for this action,
-    /// but NEVER the global `dangerous` shortcut. issue #160 round-25 P1 (Codex
-    /// ask.rs:2095): Dangerous mode's user-facing promise is that agents may act
+    /// but NEVER the global `dangerous` shortcut:
+    /// Dangerous mode's user-facing promise is that agents may act
     /// freely only "inside their worktrees" (`i18n` `settings.dangerDesc`) — so
     /// it must NOT silently auto-approve DESKTOP-WIDE GUI control (screenshotting
     /// unrelated windows, clicking/typing into other apps) the way it does for
@@ -2155,8 +2155,8 @@ impl AskRegistry {
     /// NetworkOrCredential/Unknown ask falls through to `None` (surfaces)
     /// exactly as it would if no read-only grant existed at all.
     ///
-    /// Built ON TOP OF [`auto_decision_exact`] (issue #160 round-5 review P1
-    /// §1): the exact-match checks (`dangerous`/`full`/`always`) are IDENTICAL
+    /// Built ON TOP OF [`auto_decision_exact`]:
+    /// the exact-match checks (`dangerous`/`full`/`always`) are IDENTICAL
     /// between the two, factored out so `bus::computer_srv::approve`'s GUI
     /// gate can reuse them WITHOUT ALSO inheriting the read-only batch/issue
     /// fallback below — see that method's own doc comment for why a GUI
@@ -2178,7 +2178,7 @@ impl AskRegistry {
         // dispatch-approval time (`read_only_issue`) auto-allows a ReadOnly-tier
         // ask — never anything else, by construction (the `risk ==` check gates
         // the whole branch, not just a sub-case).
-        // issue #160 round-19 P1 (Codex computer_srv.rs:1543): the coarse
+        // the coarse
         // read-only grants NEVER cover a native GUI observe action — only an
         // exact GUI grant (checked above via `auto_decision_exact`) may. Excluding
         // GUI action keys here is the forward-looking half of the same fix the
@@ -2201,7 +2201,7 @@ impl AskRegistry {
         let Some(ask) = g.open.iter().find(|a| a.id == id).cloned() else {
             return false;
         };
-        // issue #160 round-16 P1 (Codex computer_srv.rs:1357): a GUI ask
+        // a GUI ask
         // answered while the computer-use stop latch is tripped is forced to
         // Deny — decided HERE, under the registry lock, atomically with the
         // grant recording below. The disable paths (Emergency Stop and the
@@ -2212,10 +2212,10 @@ impl AskRegistry {
         // answer landing in the instant between them could still have minted
         // an Always/Full grant for a world that was already stopped.
         //
-        // issue #160 round-17 P1 (Codex ask.rs:2174): the latch is now read
+        // the latch is now read
         // through a guard HELD UNTIL THIS METHOD RETURNS (see the explicit
         // `drop` before the final `true`), not a one-shot `stop_latched()`
-        // read — the round-16 shape released the stop mutex before the grant
+        // read — the earlier shape released the stop mutex before the grant
         // was inserted, so a Stop tripping in that gap (then blocking on the
         // registry lock in `cancel_gui_asks`) still let this answer record a
         // grant "concurrently with" the stop. With the guard held through
@@ -2296,7 +2296,7 @@ impl AskRegistry {
         if granted {
             g.emit_persist();
         }
-        // issue #160 round-17 P1: released only now — after the grant (and its
+        // released only now — after the grant (and its
         // persist emit) have fully landed — so a concurrently-tripping Stop
         // orders strictly after this whole answer. See the guard's own comment
         // at the top of this method.
@@ -2343,8 +2343,8 @@ impl AskRegistry {
         }
     }
 
-    /// Cancel every open GUI/computer-use ask (issue #160 round-12 P1 #B,
-    /// generalizing round-12 P1 #1's own `cancel_computer_asks`):
+    /// Cancel every open GUI/computer-use ask (generalizing the older
+    /// `cancel_computer_asks`):
     /// emergency-stop's own kill switch (`computer::emergency_stop`) only
     /// ever tears down the control lease and disables the setting — it does
     /// NOT touch any GUI approval card already sitting in Needs-you. Without
@@ -2368,14 +2368,14 @@ impl AskRegistry {
     /// treats as a fail-closed deny — so a stop-in-flight card reads to the
     /// calling agent exactly like a timed-out one, never a silent no-op.
     ///
-    /// Renamed from the round-12 P1 #1 `cancel_computer_asks` and
+    /// Renamed from the earlier P1 #1 `cancel_computer_asks` and
     /// generalized from a bare `tool == "computer"` filter to
-    /// [`action_key_is_gui`] (round-12 review): the old filter only ever
+    /// [`action_key_is_gui`]: the old filter only ever
     /// matched a GUI ask built through `weft_computer`'s own MCP path (which
     /// always sets `tool = "computer"`) and silently missed a GUI ask an
     /// ACP-native `computer`/`browser` request would build under the
     /// ENGINE's own tool name instead (`"claude"`/`"codex"`/…) — see
-    /// `lead_chat::engine`'s ACP `Permission` arm, which round-12 P1 #A now
+    /// `lead_chat::engine`'s ACP `Permission` arm, which
     /// rejects those outright before any such card is ever built, but this
     /// filter stays action-key-based (not tool-name-based) so ANY future
     /// GUI-ask route is still reachable by an emergency stop by
@@ -2400,7 +2400,7 @@ impl AskRegistry {
     }
 
     /// [`Self::cancel_gui_asks`] scoped to ONE `(thread, dir)` route — issue
-    /// #160 round-35 P1 (Codex commands.rs:2389): `delete_repo` removing a
+    /// `delete_repo` removing a
     /// SESSION-ONLY worker (a worktree contributed to a direction OWNED BY
     /// ANOTHER repo) deletes no direction, so the direction-keyed permission
     /// purge leaves that worker's already-open computer card answerable —
@@ -2503,7 +2503,7 @@ impl AskRegistry {
         let hit: Vec<Ask> = g
             .open
             .iter()
-            // issue #160 round-19 P1 (Codex computer_srv.rs:1543): a native
+            // a native
             // GUI observe ask (screenshot / list_windows / cursor_position) is
             // `RiskLevel::ReadOnly` too, but the coarse "release read-only"
             // grant must NEVER auto-allow it — `auto_decision_exact`
@@ -2535,7 +2535,7 @@ impl AskRegistry {
         let hit: Vec<Ask> = g
             .open
             .iter()
-            // issue #160 round-19 P1 (Codex computer_srv.rs:1543): GUI observe
+            // GUI observe
             // asks are excluded from this coarse read-only sweep too — see the
             // matching filter in `grant_read_only_session`.
             .filter(|a| {
@@ -2814,7 +2814,7 @@ mod tests {
         assert_eq!(action_key(&["cmd", "X", "foo"]), action_key(&["cmd", "X", "foo"]));
     }
 
-    // ---- action_key_is_gui (issue #160 round-12 P1 #B) -------------------------
+    // ---- action_key_is_gui -------------------------
 
     #[test]
     fn action_key_is_gui_recognizes_the_weft_computer_mcp_shape() {
@@ -2883,7 +2883,7 @@ mod tests {
         }
     }
 
-    /// Issue #101: an unrecognized GUI action is never waved through as
+    /// An unrecognized GUI action is never waved through as
     /// read-only — same honest-default rule as every other `classify_*`.
     #[test]
     fn gui_unrecognized_action_is_unknown_never_read_only() {
@@ -4598,16 +4598,16 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_gui_asks_cancels_only_gui_asks_and_blocks_a_stale_always_answer() {
-        // issue #160 round-12 P1 #1/#B: emergency-stop must cancel any open
+        // emergency-stop must cancel any open
         // GUI card BEFORE a human can answer it Always/Full and silently mint
         // a standing grant that outlives the stop — this is the
         // registry-level half of that fix (the two emergency-stop entry
         // points that call it live in `commands.rs`/`computer::mod.rs`).
-        // Generalized (round-12 P1 #B) from a bare `tool == "computer"`
+        // Generalized from a bare `tool == "computer"`
         // filter to `action_key_is_gui`: covers BOTH the `weft_computer` MCP
         // shape (`["gui", ...]`, `tool == "computer"`) and the ACP-native
         // shape (`["Acp","gui:...", ...]`, `tool` = the ENGINE's own name) —
-        // the round-12 P1 #A fix rejects the latter outright before a card
+        // the earlier P1 #A fix rejects the latter outright before a card
         // is ever built, but this test still proves the cancel filter itself
         // would catch it if one somehow existed.
         let r = AskRegistry::new();
@@ -4772,7 +4772,7 @@ mod tests {
         assert!(!r.has_open(1, "10"));
     }
 
-    /// issue #160 round-14 P1 (Codex computer_srv.rs:515): the atomic
+    /// the atomic
     /// check-and-insert. It inserts only when NO ask is already open for this
     /// (thread, dir); a second concurrent call for the same session sees the
     /// first's card and gets `None` (inserting nothing), while a different
@@ -4805,7 +4805,7 @@ mod tests {
         assert_eq!(r.open().len(), 2);
     }
 
-    /// issue #160 round-15 P2 (Codex computer_srv.rs:1288): the atomic
+    /// the atomic
     /// count-and-insert for observe-class GUI asks — inserts under the cap,
     /// refuses over it, and counts ONLY GUI-keyed asks (a non-GUI bash card
     /// neither consumes nor is blocked by the GUI budget).
@@ -4842,7 +4842,7 @@ mod tests {
         assert!(other.is_some(), "the cap is per-(thread, dir), not global");
     }
 
-    /// issue #160 round-16 P1 (Codex computer_srv.rs:1357): while the
+    /// while the
     /// computer-use stop latch is tripped, answering a GUI ask `Always` is
     /// forced to Deny under the registry lock — no grant is recorded, the
     /// waiter sees Deny — while a non-GUI ask answered in the same window
@@ -5113,7 +5113,7 @@ mod tests {
         );
     }
 
-    // —— issue #160 round-8 P2 #5 / round-24 P2: window-bound GUI Always-grants
+    // —— window-bound GUI Always-grants
     // never reach persistence (window-id reuse could authorize a replacement) ——
 
     #[test]
@@ -5124,7 +5124,7 @@ mod tests {
         );
         assert!(
             !always_key_is_persistable(&action_key(&["gui", "left_click", "notes", "deadbeef"])),
-            "a window-bound input GUI key must not be persistable (round-24: window-id reuse)"
+            "a window-bound input GUI key must not be persistable (window ids are reused)"
         );
         assert!(
             !always_key_is_persistable(&action_key(&["gui", "screenshot", "notes", "deadbeef"])),
@@ -5148,10 +5148,10 @@ mod tests {
         );
     }
 
-    /// issue #160 round-11 P1 #B: `bus::computer_srv::approve` folds the resolved
+    /// `bus::computer_srv::approve` folds the resolved
     /// window's own `id` into a GUI action's key too (right after the query
     /// string, before `app`/`title`) — a real window-bound key is 7 elements,
-    /// not 4. round-24 P2: persistence is judged on `parts[2]` (the window query)
+    /// not 4. Persistence is judged on `parts[2]` (the window query)
     /// being non-empty, so every window-bound GUI action — `type`, `left_click`,
     /// `screenshot` alike — is non-persistable in this longer shape too.
     #[test]
@@ -5166,8 +5166,8 @@ mod tests {
         }
     }
 
-    /// The end-to-end property this fix exists for (issue #160 round-8 P2 #5 +
-    /// round-24 P2): seed a window-bound `type` GUI grant, a window-bound
+    /// The end-to-end property this fix exists
+    /// for: seed a window-bound `type` GUI grant, a window-bound
     /// `left_click` GUI grant, a WINDOWLESS `list_windows` GUI grant, and an
     /// ordinary tool grant, all in the SAME (thread, dir) — the snapshot shipped
     /// to the persistence writer must drop BOTH window-bound GUI keys (window-id
@@ -5221,7 +5221,7 @@ mod tests {
         );
         assert!(
             !persisted_keys.contains(&click_key),
-            "a window-bound click grant must NEVER reach the writer (round-24): {persisted_keys:?}"
+            "a window-bound click grant must NEVER reach the writer: {persisted_keys:?}"
         );
         assert!(persisted_keys.contains(&list_key), "a windowless GUI grant must still persist");
         assert!(persisted_keys.contains(&tool_key), "an ordinary tool grant must still persist");
@@ -5594,11 +5594,11 @@ mod tests {
         assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "mystery_tool").is_none());
     }
 
-    // ---- issue #160 round-5 review P1 §1: `auto_decision_exact` never honors
+    // ---- `auto_decision_exact` never honors
     // the read-only batch/issue grant (GUI actions must not be swept by it) ----
 
     /// The property `bus::computer_srv::approve` depends on: a session/issue
-    /// holding the coarse "release all read-only" grant (issue #103) still
+    /// holding the coarse "release all read-only" grant still
     /// gets `None` (surfaces a card) from `auto_decision_exact` — the strict
     /// entry point GUI actions use — even for an action_key `classify_risk`
     /// would call `ReadOnly`. The ordinary `auto_decision` entry point, used
@@ -5621,7 +5621,7 @@ mod tests {
         );
     }
 
-    /// Same property for the ISSUE-wide grant (issue #103's dispatch-approval
+    /// Same property for the ISSUE-wide grant (the dispatch-approval
     /// propagation) — `auto_decision_exact` must not honor it either.
     #[test]
     fn auto_decision_exact_ignores_the_read_only_issue_grant() {
@@ -5657,7 +5657,7 @@ mod tests {
         assert!(r.auto_decision_exact(3, "30", "different").is_none());
     }
 
-    /// issue #160 round-25 P1 (Codex ask.rs:2095): the GUI entry point
+    /// the GUI entry point
     /// `auto_decision_gui` DROPS the global `dangerous` shortcut that
     /// `auto_decision_exact` keeps — Dangerous mode's promise is worktree-scoped
     /// so it must never auto-approve desktop-wide GUI control — while STILL
@@ -5785,7 +5785,7 @@ mod tests {
         assert!(open.contains(&unknown_id));
     }
 
-    /// issue #160 round-19 P1 (Codex computer_srv.rs:1543): a native GUI observe
+    /// a native GUI observe
     /// ask is `RiskLevel::ReadOnly`, but the coarse "release read-only" grant
     /// must NEVER sweep it (nor auto-allow a future one) — only an exact GUI
     /// grant may. An ordinary read-only ask alongside it is still swept.

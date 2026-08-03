@@ -30,7 +30,7 @@ fn ensure_lead_cwd(thread_id: i32) -> anyhow::Result<std::path::PathBuf> {
     Ok(cwd)
 }
 
-/// Append a `--model <value>` override (issue #98) onto an engine's spawn args
+/// Append a `--model <value>` override onto an engine's spawn args
 /// — the ONE place this flag gets built, called from all three `EngineInner`
 /// construction sites (`lead_engine`, `chat_open_worker_impl`, `worker_engine`)
 /// so the shape can't drift between them. claude and codex's per-turn argv
@@ -265,7 +265,7 @@ pub async fn lead_engine(
     );
     crate::skills::inject_for(db, t.workspace_id, &cwd).await;
     let mut extra = ask.args;
-    // issue #160 round-15 P1: env pairs the injections ask the spawn to set on
+    // env pairs the injections ask the spawn to set on
     // the tool child (today: only the codex computer-use bearer) — see
     // `bus::inject::Injection::env` / `engine::EngineInner::extra_env`.
     let mut extra_env: Vec<(String, String)> = vec![];
@@ -307,7 +307,7 @@ pub async fn lead_engine(
             )
             .args,
         );
-        // issue #160 round-12 P2 #7: computer-use MCP is now injected
+        // computer-use MCP is now injected
         // UNCONDITIONALLY for the issue lead (never concierge/curator) —
         // the setting/kill-switch is enforced dynamically, server-side, on
         // every call by `bus::computer_srv::run_action`'s own
@@ -315,7 +315,7 @@ pub async fn lead_engine(
         // setting on/off from Settings takes effect immediately, without
         // needing to rebuild this already-running engine — see
         // `bus::inject::inject_computer`'s own doc.
-        // issue #160 round-15 P1: keep BOTH halves of the computer injection —
+        // keep BOTH halves of the computer injection —
         // args on argv, the codex bearer via the child's env (see
         // `bus::inject::Injection::env`).
         let comp = crate::bus::inject::inject_computer(
@@ -323,7 +323,7 @@ pub async fn lead_engine(
             thread_id,
             crate::bus::LEAD,
             &t.lead_tool,
-            // issue #160 round-2 P2 §5: the lead lane has no
+            // the lead lane has no
             // worktree at all (it runs out of its own scratch cwd),
             // so it never has a `wt` to pin — always `None`.
             None,
@@ -1634,11 +1634,11 @@ pub(crate) async fn chat_open_worker_impl(
     extra.extend(inj.args);
     let mut extra_env = ask.env;
     extra_env.extend(inj.env);
-    // issue #160 round-12 P2 #7: computer-use MCP is now injected
+    // computer-use MCP is now injected
     // UNCONDITIONALLY for workers too, same as the lead branch above — the
     // setting/kill-switch is enforced dynamically, server-side, on every
     // call (see that branch's own doc for why).
-    // issue #160 round-15 P1: keep BOTH halves of the computer injection —
+    // keep BOTH halves of the computer injection —
     // args on argv, the codex bearer via the child's env (see
     // `bus::inject::Injection::env`).
     let comp = crate::bus::inject::inject_computer(
@@ -1646,7 +1646,7 @@ pub(crate) async fn chat_open_worker_impl(
         dir.thread_id,
         &direction_id.to_string(),
         &session_tool,
-        // issue #160 round-2 P2 §5: this worker's OWN worktree
+        // this worker's OWN worktree
         // (`wt`, resolved above for this EXACT direction+repo pair)
         // — not "the first worktree of this direction" a
         // multi-repo direction would otherwise fall back to.
@@ -1815,7 +1815,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     extra.extend(inj.args);
     let mut extra_env = ask.env;
     extra_env.extend(inj.env);
-    // This worker's OWN worktree (issue #160 round-2 P2 §5) — resolved ONCE
+    // This worker's OWN worktree — resolved ONCE
     // here and reused both for `inject_computer`'s `wt` pin below and for
     // `EngineInner::worktree_id` further down, instead of two separate DB
     // lookups for the same (direction, repo) pair.
@@ -1824,13 +1824,13 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         .ok()
         .flatten()
         .map(|w| w.id);
-    // issue #160 round-12 P2 #7: computer-use MCP is injected on this worker
+    // computer-use MCP is injected on this worker
     // resume/rebuild path too (the setting/kill-switch is enforced
-    // dynamically, server-side, on every call), and round-15 P1 keeps BOTH
+    // dynamically, server-side, on every call), keeping BOTH
     // halves — args on argv, the codex bearer via the child's env (see
     // `bus::inject::Injection::env`).
     //
-    // issue #160 round-17 P2 (Codex commands.rs:1679): but ONLY with a
+    // but ONLY with a
     // POSITIVELY resolved worktree. A worker session always has exactly one
     // worktree; `worktree_for` collapsing a DB error or a missing row to
     // `None` used to flow straight into `inject_computer` as the absent-`wt`
@@ -2090,7 +2090,7 @@ fn normalize_model(model: Option<String>) -> Option<String> {
 }
 
 /// Result of switching a lead/worker's engine identity and/or model override
-/// (issue #96/#98). Both success and failure must be honestly visible to the
+/// . Both success and failure must be honestly visible to the
 /// user (not a bare boolean) — the frontend renders the concrete before/after
 /// (e.g. "claude → codex", "no override → gpt-5.5-high").
 #[derive(serde::Serialize, Clone)]
@@ -2259,7 +2259,7 @@ pub async fn switch_lead_tool(
 
 /// The body of [`switch_lead_tool`], taking plain refs instead of Tauri's
 /// `State` extractor so non-IPC backend code can call it too — currently the
-/// only other caller is [`maybe_failover_on_quota`] (issue #97: auto fail-over
+/// only other caller is [`maybe_failover_on_quota`] (auto fail-over
 /// on a quota-exceeded turn reuses this EXACT sequence, not a hand-rolled
 /// partial update). See `switch_lead_tool`'s original doc for the full
 /// six-step rationale; this split is purely mechanical (no behavior change).
@@ -2323,8 +2323,8 @@ async fn switch_lead_tool_inner(
         asks.cancel_for(thread_id, "lead");
     }
 
-    // ONE transaction: the new tool/model and native-id clear (issue #96
-    // pitfall 1). No activity timestamp or recovery marker participates in
+    // ONE transaction: the new tool/model and native-id clear
+    // . No activity timestamp or recovery marker participates in
     // engine switching.
     let pinned = reason.is_none();
     // A fail-over keeps its committing flag in the old engine until the durable
@@ -2553,7 +2553,7 @@ async fn switch_worker_tool_inner(
     Ok(outcome)
 }
 
-// ───────────────────────── issue #97: quota fail-over ─────────────────────────
+// ───────────────────────── quota fail-over ─────────────────────────
 
 /// app_setting key gating auto fail-over on a quota-exceeded turn (see
 /// [`maybe_failover_on_quota`]). Unset/anything else = DISABLED — this is
@@ -2605,7 +2605,7 @@ fn quota_failover_cooldown_active(key: QuotaFailoverKey) -> bool {
 
 /// Claims the fail-over slot for `key` (thread_id, session_id) iff it hasn't
 /// already fired within [`QUOTA_FAILOVER_COOLDOWN_SECS`] — a one-shot gate,
-/// not a queue: a call that returns `false` should just skip this round
+/// not a queue: a call that returns `false` should just skip this change
 /// entirely, not retry.
 fn claim_quota_failover_slot(key: QuotaFailoverKey) -> bool {
     let mut cooldowns = quota_failover_cooldowns()
@@ -2662,7 +2662,7 @@ enum QuotaFailoverClaimGate {
     /// This call won the race: the slot is now ours for
     /// [`QUOTA_FAILOVER_COOLDOWN_SECS`].
     Claimed,
-    /// Another call already holds the slot for this key — skip this round
+    /// Another call already holds the slot for this key — skip this change
     /// entirely rather than retry (see [`claim_quota_failover_slot`]'s doc).
     Lost,
 }
@@ -2804,7 +2804,7 @@ async fn quota_failover_still_unpinned(db: &Db, thread_id: i32, session_id: Opti
 }
 
 /// Fire-and-forget entry point: engine.rs's two TurnEnd sites (codex_consumer,
-/// spawn_reader) call this right after a turn ends in error (issue #97).
+/// spawn_reader) call this right after a turn ends in error.
 /// Spawns its OWN task so it can safely re-lock the engine —
 /// `switch_lead_tool_inner`/`switch_worker_tool_inner` tear down and
 /// reconstruct it — without deadlocking the CALLER, which may still be
@@ -2825,7 +2825,7 @@ pub fn spawn_quota_failover_check(
     });
 }
 
-/// issue #97: auto-switch a thread/session away from `tool` using the shared
+/// auto-switch a thread/session away from `tool` using the shared
 /// engine-routing resolver. Thin wiring only — resolve the impure inputs
 /// (setting, installed tools, structured quota readings, cooldown peek),
 /// delegate the judgment call to the shared function (gates 1-5), then a
@@ -2834,7 +2834,7 @@ pub fn spawn_quota_failover_check(
 /// [`switch_lead_tool_inner`]/[`switch_worker_tool_inner`] VERBATIM — the
 /// exact six-step teardown/persist/reconstruct sequence #139 shipped and
 /// reviewed, never a hand-rolled partial tool/model update. Every failure is
-/// logged AND left as a durable, visible marker (issue #97 review P2) —
+/// logged AND left as a durable, visible marker —
 /// best-effort throughout, since nothing is waiting on this fire-and-forget
 /// check.
 async fn maybe_failover_on_quota(
@@ -2955,7 +2955,7 @@ async fn maybe_failover_on_quota(
     }
 }
 
-/// issue #97 review P2: a failed auto fail-over attempt used to leave only an
+/// a failed auto fail-over attempt used to leave only an
 /// `eprintln!` behind — indistinguishable, from the user's seat, from the
 /// feature not existing at all. Durable, visible marker mirroring
 /// `insert_switch_marker`'s "system-owned, always part of the record"

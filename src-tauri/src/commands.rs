@@ -105,7 +105,7 @@ pub async fn delete_workspace(
     result
 }
 
-/// issue #160 round-23 P1 (Codex computer_srv.rs:2608): if the process-wide
+/// if the process-wide
 /// computer control lease is held by a route this delete is tearing down, clear
 /// it. Otherwise an input call that already cleared `recheck_after_guard` and is
 /// stalled at its final resolve/injection would find the lease STILL naming its
@@ -148,8 +148,8 @@ fn clear_control_if_route_doomed(doomed_routes: &std::collections::HashSet<(i32,
     }
 }
 
-/// Worktree-precise counterpart of [`clear_control_if_route_doomed`] — issue
-/// #160 round-32 P1 (Codex commands.rs:2315): a `delete_repo` that removes a
+/// Worktree-precise counterpart of [`clear_control_if_route_doomed`]:
+/// a `delete_repo` that removes a
 /// SESSION-ONLY worker (a worktree contributed to a direction OWNED BY ANOTHER
 /// repo) dooms exactly `(thread, dir, wt)`; the direction — and any sibling
 /// worktree's lease — survives, so the route-level clear above must not fire.
@@ -192,18 +192,17 @@ async fn delete_workspace_after_fence(app: tauri::AppHandle, db: &Db, workspace_
         let (_, ask_ids) = bus.begin_thread_close(*thread_id);
         closing_asks.insert(*thread_id, ask_ids);
     }
-    // issue #160 round-22/23 P1 (Codex computer_srv.rs:385 + commands.rs:756):
-    // publish computer-route revocations for every thread this bulk delete
+    // Publish computer-route revocations for every thread this bulk delete
     // removes BEFORE the destructive cascade — an in-flight computer call whose
     // thread is deleted mid-cascade would otherwise slip past both
     // `recheck_after_guard` and the final `recheck_stop_and_lease_before_backend`
     // (its thread isn't in the revocation set yet) and reach the desktop after
-    // its rows are gone. round-24 P2 (commands.rs:803): snapshot the prior state
+    // its rows are gone. Snapshot the prior state
     // so a failed cascade restores EXACTLY what was there — a blanket un-revoke
     // would drop a revocation an earlier successful delete already published.
-    // round-23 P1 (computer_srv.rs:2608): also clear the control lease if a
+    // Also clear the control lease if a
     // doomed route holds it, so the final lease recheck fails closed.
-    // issue #160 round-26 P1 (Codex commands.rs:832): serialize the whole
+    // serialize the whole
     // revocation transaction (snapshot -> publish -> cascade -> restore-or-
     // commit) against every other delete flow — see `computer_srv::
     // revocation_txn_lock`'s doc for the overlapping-deletes rollback hazard.
@@ -245,7 +244,7 @@ async fn delete_workspace_after_fence(app: tauri::AppHandle, db: &Db, workspace_
         &effects.removed_directions,
     )
     .await?;
-    // issue #160 round-22: drop each removed thread's computer-use output
+    // drop each removed thread's computer-use output
     // subtree (`WEFT_HOME/computer/<thread>/`) — only after the rows are
     // actually gone; best-effort, never gates the delete.
     for thread_id in &effects.removed_threads {
@@ -2317,16 +2316,15 @@ async fn delete_repo_after_fence(
     let bus = app.state::<crate::bus::BusRegistry>();
     let scope = repo_ask_scope(db, repo_id).await?;
     let lifecycle_guards = lock_thread_lifecycles(&bus, &scope.affected_thread_ids()).await;
-    // issue #160 round-22 P1 (Codex computer_srv.rs:385) / round-24 P1
-    // (computer_srv.rs:775): revoke computer routes for every direction this repo
+    // Revoke computer routes for every direction this repo
     // owns BEFORE the cascade removes them. A repo delete leaves the parent
     // threads (and their directions in OTHER repos) alive, so each removed
     // direction is revoked PRECISELY — `dir = direction_id` — never the whole
     // thread; a thread-level revoke would strand a multi-repo thread's surviving
-    // directions. round-24 P2 (commands.rs:803): snapshot prior revocation state
-    // so a failed cascade restores EXACTLY what was there. round-23 P1
-    // (computer_srv.rs:2608): clear the control lease if a doomed route holds it.
-    // issue #160 round-26 P1 (Codex commands.rs:832): serialize the whole
+    // directions. Snapshot prior revocation state
+    // so a failed cascade restores EXACTLY what was there.
+    // Clear the control lease if a doomed route holds it.
+    // serialize the whole
     // revocation transaction (snapshot -> publish -> cascade -> restore-or-
     // commit) against every other delete flow — see `computer_srv::
     // revocation_txn_lock`'s doc for the overlapping-deletes rollback hazard.
@@ -2336,7 +2334,7 @@ async fn delete_repo_after_fence(
         .iter()
         .map(|d| (d.thread_id, d.id.to_string()))
         .collect();
-    // issue #160 round-32 P1 (Codex commands.rs:2315): this repo can ALSO have
+    // this repo can ALSO have
     // contributed worktrees/sessions to directions OWNED BY OTHER repos (a
     // multi-repo direction's secondary checkout). The cascade below deletes
     // those worktree+session rows while the DIRECTION survives, so the
@@ -2397,7 +2395,7 @@ async fn delete_repo_after_fence(
         &std::collections::BTreeMap::new(),
     );
     purge_committed_permission_effects(asks, &[], &effects.removed_directions).await?;
-    // issue #160 round-24 P2 (Codex commands.rs:794): prune each removed
+    // prune each removed
     // direction's computer-output subtree — `remove_computer_output_for_thread`
     // deletes whole threads and the parent thread SURVIVES a repo delete, so a
     // surviving thread's deleted-direction output would otherwise never be
@@ -2405,13 +2403,13 @@ async fn delete_repo_after_fence(
     for (thread_id, dir) in &doomed_routes {
         crate::bus::computer_srv::remove_computer_output_for_direction(*thread_id, dir);
     }
-    // issue #160 round-32 P2 (Codex commands.rs:2354): a SESSION-ONLY worker's
+    // a SESSION-ONLY worker's
     // output lives under a SURVIVING direction — the per-direction loop above
     // never touches it, so without this it would sit under
     // `computer/<thread>/<dir>/wt-<id>` until the whole thread is deleted.
     // Worktree-precise, so the direction's surviving sibling worktrees keep
     // their own subtrees.
-    // issue #160 round-35 P1 (Codex commands.rs:2389): ALSO cancel the doomed
+    // ALSO cancel the doomed
     // sessions' open GUI cards — the direction-keyed purge above only covers
     // removed directions, and a card left answerable after this delete could
     // be answered Full/Always into a standing grant at the SHARED
@@ -2624,7 +2622,7 @@ pub async fn set_proposal_direction_base(
     .map_err(e)
 }
 
-/// Confirm the stored proposal + propagate issue #103's read-only auto-allow
+/// Confirm the stored proposal + propagate the read-only auto-allow
 /// to the whole issue. Extracted from the `#[tauri::command]` wrapper (mirrors
 /// `revoke_grant_durable`) so the propagation itself is directly testable
 /// without constructing a `tauri::State`.
@@ -3160,7 +3158,7 @@ async fn delete_thread_after_fence(app: tauri::AppHandle, db: &Db, thread_id: i3
     let keys = thread_engine_keys(&db, thread_id).await?;
     let bus = app.state::<crate::bus::BusRegistry>();
     let asks = app.state::<crate::ask::AskRegistry>();
-    // issue #160 round-23 P1 (Codex commands.rs:756): revoke this thread's
+    // revoke this thread's
     // computer routes BEFORE the destructive cascade (and the grant flush +
     // engine shutdown that follow it), not after. An in-flight computer call
     // whose thread is deleted during any of those steps would otherwise slip
@@ -3168,9 +3166,9 @@ async fn delete_thread_after_fence(app: tauri::AppHandle, db: &Db, thread_id: i3
     // `recheck_stop_and_lease_before_backend` — the thread isn't in the
     // revocation set until the revoke runs — and reach the desktop after its
     // rows are gone. Roll back if the cascade fails so a still-live session
-    // isn't fail-closed forever. round-23 P1 (computer_srv.rs:2608): also clear
+    // isn't fail-closed forever. Also clear
     // the control lease if this doomed route holds it.
-    // issue #160 round-26 P1 (Codex commands.rs:832): serialize the whole
+    // serialize the whole
     // revocation transaction (snapshot -> publish -> cascade -> restore-or-
     // commit) against every other delete flow — see `computer_srv::
     // revocation_txn_lock`'s doc for the overlapping-deletes rollback hazard.
@@ -3208,7 +3206,7 @@ async fn delete_thread_after_fence(app: tauri::AppHandle, db: &Db, thread_id: i3
         }
     }
     drop(engine_admission);
-    // issue #160 round-18 P2 (Codex paths.rs:89): drop this thread's computer-
+    // drop this thread's computer-
     // use output subtree (screenshots + rotated audit logs under
     // `weft_home/computer/<thread>/`) as part of the delete — otherwise that
     // persistent per-thread tree outlives the thread with no retention path
@@ -3281,14 +3279,14 @@ pub async fn set_automatic_engine_routing_enabled(db: State<'_, Db>, enabled: bo
     .map_err(e)
 }
 
-/// issue #160 M1: whether OS-level computer use (window enumeration +
+/// whether OS-level computer use (window enumeration +
 /// screenshot) is turned on. Fails closed — see `crate::computer::enabled`.
 #[tauri::command]
 pub async fn get_computer_use_enabled(db: State<'_, Db>) -> R<bool> {
     Ok(crate::computer::enabled(&db).await)
 }
 
-/// issue #160 round-6 review P1 #1: an `enabled == true` request reads the
+/// an `enabled == true` request reads the
 /// current stop-generation via `computer::stop_generation` BEFORE its own
 /// `set_setting` write starts — see `computer::clear_emergency_stop`'s own
 /// doc for why this is required. Without it, a Stop landing WHILE this
@@ -3305,11 +3303,10 @@ pub async fn set_computer_use_enabled_inner(
     asks: &crate::ask::AskRegistry,
     enabled: bool,
 ) -> R<()> {
-    // issue #160 round-13 P1 (Codex commands.rs:1676) + round-15 P1 (Codex
-    // commands.rs:1619): the OFF transition is now the EXACT trip → cancel →
+    // The OFF transition is the EXACT trip → cancel →
     // persist sequence `computer_emergency_stop` runs — a Settings-disable IS
     // a (softer-intentioned) stop, and giving it a weaker sequence left a
-    // window Codex demonstrated twice. Round-13's fix cancelled open GUI asks
+    // window that resurfaced twice. An earlier fix cancelled open GUI asks
     // but only BEFORE the first await; while this function then queued on the
     // serialize mutex (or its `set_setting` write ran), `computer::enabled`
     // still read `true`, so a NEW GUI request arriving in that gap sailed
@@ -3321,11 +3318,11 @@ pub async fn set_computer_use_enabled_inner(
     // reads `false`, so no new call can pass `run_action`'s gate no matter
     // how long the persisted write takes. `cancel_gui_asks` then sweeps the
     // cards that were already open, and `bus::computer_srv::approve`'s own
-    // post-insert `stop_latched` self-check (round-15's other half — see that
+    // post-insert `stop_latched` self-check (the earlier other half — see that
     // call site) catches the one remaining straddler: a call that passed the
     // enabled gate BEFORE the trip and inserted its card AFTER this sweep.
     // `persist_stop` (not a bare `set_setting`) finishes the job: it shares
-    // `enable_serialize_mutex` (round-12 P2 #F call-order guarantee), and a
+    // `enable_serialize_mutex`, and a
     // failed write sets the sticky `STOP_PERSIST_FAILED` flag so the banner
     // warns that a restart may silently re-enable — the same
     // half-persisted-stop honesty the Emergency Stop button already has.
@@ -3337,13 +3334,13 @@ pub async fn set_computer_use_enabled_inner(
         asks.cancel_gui_asks();
         return crate::computer::persist_stop(db, my_gen).await;
     }
-    // issue #160 round-10 P2 #D: held for this ENTIRE function — read gen,
+    // held for this ENTIRE function — read gen,
     // write the setting, reconcile — so a second overlapping enable request
     // can never interleave with this one's own (possibly compensating)
     // write. See `computer::enable_serialize_mutex`'s own doc for the
     // enable-vs-enable race this originally closed.
     //
-    // issue #160 round-12 P2 #F: this is now the SAME lock
+    // this is now the SAME lock
     // `computer::persist_stop` also holds across ITS OWN write — before this
     // round, Stop's persisted write ran completely outside this queue, so a
     // slower Stop write could still land AFTER a newer, explicit enable's
@@ -3360,14 +3357,14 @@ pub async fn set_computer_use_enabled_inner(
     repo::set_setting(db, crate::computer::K_COMPUTER_USE_ENABLED, "true")
         .await
         .map_err(e)?;
-    // issue #160 review R1 #1: this is the ONLY place that clears the
+    // this is the ONLY place that clears the
     // emergency-stop latch — a human explicitly re-enabling computer use
-    // from Settings after a kill switch trip (which, as of round-15, every
+    // from Settings after a kill switch trip (which, every
     // Settings-disable also trips — see the early-return branch above). See
     // `computer::clear_emergency_stop`'s doc comment for why nothing else
     // may call it.
     //
-    // issue #160 round-6 review P1 #1: this now passes the generation read
+    // this now passes the generation read
     // ABOVE, before the write — `clear_emergency_stop` refuses to clear the
     // latch if a `emergency_stop` ran in between (the generation moved on),
     // leaving THIS request's own "enable" silently overridden by the more
@@ -3376,7 +3373,7 @@ pub async fn set_computer_use_enabled_inner(
     Ok(())
 }
 
-/// issue #160 round-8 P1 #1: `clear_emergency_stop` returning `false` means a
+/// `clear_emergency_stop` returning `false` means a
 /// LATER `emergency_stop` raced in while `set_computer_use_enabled_inner`'s
 /// own write (above) was still in flight — the in-memory latch (correctly)
 /// stays tripped, but the DB row this function's caller just wrote is now
@@ -3412,7 +3409,7 @@ pub async fn set_computer_use_enabled(
     set_computer_use_enabled_inner(&db, &asks, enabled).await
 }
 
-/// issue #160 M2: the current computer-use control holder, if any — the
+/// the current computer-use control holder, if any — the
 /// single mutex a computer-use tool call takes out while it's driving the
 /// desktop. `None` means no agent currently has control.
 #[tauri::command]
@@ -3420,26 +3417,26 @@ pub async fn get_computer_control_state() -> R<Option<crate::computer::ControlHo
     Ok(crate::computer::control_state())
 }
 
-/// issue #160 M2: kill switch for computer use — turns the
+/// kill switch for computer use — turns the
 /// `computer_use_enabled` setting off and clears the control mutex, so every
 /// subsequent computer tool call fails closed. Recovery is manual: a human
 /// has to go back into Settings and turn computer use on again.
 ///
-/// issue #160 review R1 #1: the in-memory latch `computer::trip_stop_latch`
+/// the in-memory latch `computer::trip_stop_latch`
 /// flips is set BEFORE anything attempts to persist the setting, so this
 /// stays fail-closed even when the DB write below fails — but that write
 /// error is still surfaced to the frontend (not swallowed) so a human sees
 /// the half-persisted state instead of believing the kill switch fully
 /// landed.
 ///
-/// issue #160 round-12 P1 #1 / round-12 P1 #B: also cancels every open GUI
+/// Also cancels every open GUI
 /// ask (`AskRegistry::cancel_gui_asks`) — see that method's own doc for the
 /// stale-card race this closes (a human answering an already-open GUI card
 /// `Always`/`Full` right after Stop would otherwise still record a standing
 /// grant, since `answer()` records it before the calling endpoint's own
 /// post-await kill-switch recheck ever runs).
 ///
-/// issue #160 round-12 P1 #B: reordered from the combined
+/// reordered from the combined
 /// `computer::emergency_stop(db).await` this used to call — cancellation now
 /// runs BEFORE the awaited persisted write, not after. Before this, an
 /// Always/Full answer landing on a still-open GUI card WHILE the DB write
@@ -3448,7 +3445,7 @@ pub async fn get_computer_control_state() -> R<Option<crate::computer::ControlHo
 /// in-memory latch immediately; `cancel_gui_asks()` (also synchronous) runs
 /// right after it, before anything here ever awaits; ONLY THEN does
 /// `computer::persist_stop` await the DB write (now ALSO serialized on
-/// `computer::enable_serialize_mutex` — round-12 P2 #F, see that function's
+/// `computer::enable_serialize_mutex` — see that function's
 /// own doc). `computer::emergency_stop(db)` itself is unchanged (still
 /// `trip_stop_latch` + `persist_stop` combined) and keeps its existing
 /// signature for its other, non-command caller (`tests`, and anything else
@@ -3463,7 +3460,7 @@ pub async fn computer_emergency_stop(db: State<'_, Db>, asks: State<'_, crate::a
     crate::computer::persist_stop(&db, my_gen).await
 }
 
-/// issue #160 round-6 review P2 #6: whether the MOST RECENT emergency stop
+/// whether the MOST RECENT emergency stop
 /// (button/dialog OR the OS-level global Escape shortcut — both funnel
 /// through `computer::emergency_stop`) failed to persist
 /// `computer_use_enabled = false` to disk. The in-memory kill switch is
@@ -3478,7 +3475,7 @@ pub async fn get_computer_stop_persist_failed() -> R<bool> {
     Ok(crate::computer::stop_persist_failed())
 }
 
-/// issue #97: whether Weft should auto-switch a thread/session to its
+/// whether Weft should auto-switch a thread/session to its
 /// fallback engine when the current one reports its usage limit as exceeded
 /// (`crate::lead_chat::commands::maybe_failover_on_quota`). Opt-in, default
 /// off — see `K_QUOTA_FAILOVER_ENABLED`'s doc for why.
@@ -3697,7 +3694,7 @@ pub struct ObserveRef {
     /// claude `mcp__<server>__<tool>` 名(分组成每个 server 的 tool 列表);重挂后
     /// 即便 init 已不再重放也能展开 tool。
     pub tools: Vec<String>,
-    /// This worker's `--model` override (issue #98), if one was set via
+    /// This worker's `--model` override, if one was set via
     /// `switch_worker_tool` — distinct from `model` above (the LIVE probed/
     /// reported model): the override is what the user asked for, `model` is
     /// what the engine actually reported running. Prefills the switch dialog.
@@ -3987,7 +3984,7 @@ pub async fn answer_permission(
     if !asks.answer(ask_id, a) {
         return Err("that request was already answered or has expired".into());
     }
-    // Both Full and Always now create a durable standing grant (issue #89: Always
+    // Both Full and Always now create a durable standing grant (Always
     // is keyed by the exact action_key, not the lossy display summary, so it's
     // safe to persist too). Persist it durably — routed through the single
     // ordered writer, awaited — before reporting success, so an immediate
@@ -4060,7 +4057,7 @@ pub async fn revoke_auth_grant(
     revoke_grant_durable(&asks, thread, dir.as_deref(), action_key.as_deref()).await
 }
 
-/// Current read-only auto-allow scopes (issue #103) — in-memory only, NEVER
+/// Current read-only auto-allow scopes — in-memory only, NEVER
 /// persisted (see `ask::Inner::read_only_session`'s doc), so this is a live
 /// snapshot, not something restored at boot. Backs the frontend's "read-only
 /// trusted" indicators (session + issue-wide) and their revoke entry points.
@@ -4071,7 +4068,7 @@ pub fn read_only_grants(
     Ok(asks.read_only_grants())
 }
 
-/// "Release all read-only for this session" (issue #103's core batch action):
+/// "Release all read-only for this session":
 /// resolves every currently open `RiskLevel::ReadOnly` ask in (thread, dir) to
 /// Allow and installs a forward-looking session-scoped rule so a later
 /// ReadOnly ask in the same session doesn't re-prompt either. A Write/
@@ -4089,7 +4086,7 @@ pub fn release_session_read_only(
     Ok(asks.grant_read_only_session(thread, &dir))
 }
 
-/// Revoke a read-only auto-allow grant (issue #103), at the granularity the
+/// Revoke a read-only auto-allow grant, at the granularity the
 /// caller passes: `dir == None` revokes the WHOLE issue's propagation
 /// (`grant_read_only_issue`'s counterpart); `dir == Some` revokes just that one
 /// session's batch grant. In-memory only — there is no durable write to roll
@@ -7435,7 +7432,7 @@ mod tests {
                     dir: "99".into(),
                 },
             ],
-            // Always is durable now (issue #89) — the rollback must restore it
+            // Always is durable now — the rollback must restore it
             // too, not just Full. `removed.always` is no longer unconditionally
             // empty (see ask::tests::revoke_returns_exactly_what_it_removed), so
             // a task-level revoke's rollback must cover both.
@@ -8690,7 +8687,7 @@ mod tests {
         assert!(!owner.exists());
     }
 
-    // ---- issue #103: read-only propagation wiring (the command-layer glue,
+    // ---- read-only propagation wiring (the command-layer glue,
     // not `AskRegistry::grant_read_only_issue`'s own boundary — that's covered
     // exhaustively in ask.rs's unit tests) ---------------------------------
 
@@ -8758,7 +8755,7 @@ mod tests {
         );
         // ...AND a direction that didn't exist at confirm time — the whole point of
         // ISSUE-wide (not just per-dir) propagation: a worker spawned later still
-        // inherits it (issue #103's motivating pain point).
+        // inherits it.
         assert_eq!(
             asks.auto_decision(t.id, "999999", crate::ask::RiskLevel::ReadOnly, "pwd"),
             Some(crate::ask::Decision::Allow)
@@ -8781,7 +8778,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    // —— issue #160 round-8 P1 #1: stale enable vs. a later Stop ——
+    // —— stale enable vs. a later Stop ——
 
     /// The no-race baseline: `set_computer_use_enabled_inner(true)` persists
     /// `"true"` and clears the latch when nothing else touched the
@@ -8806,7 +8803,7 @@ mod tests {
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
     }
 
-    /// issue #160 round-8 P1 #1: reproduces the exact race the compensating
+    /// reproduces the exact race the compensating
     /// write exists to close. `set_computer_use_enabled_inner` reads the
     /// stop-generation BEFORE its own `set_setting` write starts — here,
     /// `stale_gen` stands in for that read. A real `emergency_stop` then
@@ -8814,8 +8811,8 @@ mod tests {
     /// `"false"` and bumping the generation; the enable's own write then
     /// finishes and overwrites the row back to `"true"`. When the enable
     /// request now tries to reconcile with its (now stale) generation,
-    /// `clear_emergency_stop` must refuse (the later Stop wins) — and per
-    /// round-8 P1 #1, `reconcile_enable_after_write` must compensate by
+    /// `clear_emergency_stop` must refuse (the later Stop wins) — and
+    /// `reconcile_enable_after_write` must compensate by
     /// writing `"false"` back, so a restart (which resets the in-memory
     /// latch) doesn't read the stale `"true"` and silently revive computer
     /// use, undoing the more recent, explicit Stop.
@@ -8860,7 +8857,7 @@ mod tests {
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
     }
 
-    // —— issue #160 round-10 P2 #D: enable-vs-enable serialization ——
+    // —— enable-vs-enable serialization ——
 
     /// The composed end-to-end property `enable_serialize_mutex` exists to
     /// guarantee: once A's own compensating write has FULLY landed (the exact
@@ -8870,7 +8867,7 @@ mod tests {
     /// generation, persisting `"true"`, and clearing the latch, with nothing
     /// left over from A to clobber it. Genuine concurrent interleaving isn't
     /// reliably reproducible against an in-memory sqlite connection (see the
-    /// round-8 test's own doc comment) — this instead proves the two calls
+    /// generation test's own doc comment) — this instead proves the two calls
     /// compose correctly SEQUENTIALLY, which is exactly what
     /// `enable_serialize_mutex` forces two genuinely-racing calls into: A
     /// must run to full completion (through its own compensating write)
@@ -8947,7 +8944,7 @@ mod tests {
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
     }
 
-    // —— issue #160 round-12 P2 #F: Stop's own persisted write joins the SAME
+    // —— Stop's own persisted write joins the SAME
     // enable-vs-enable serialization lock ——
 
     /// The structural half: `computer::persist_stop`'s own write must
@@ -8996,9 +8993,9 @@ mod tests {
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
     }
 
-    /// The end-to-end property this round exists for: Stop's own persisted
+    /// The end-to-end property this change exists for: Stop's own persisted
     /// write, and a LATER explicit re-enable, must land on disk in CALL
-    /// order — never completion order. Before round-12 P2 #F, Stop's write
+    /// order — never completion order. Without the shared lock, Stop's write
     /// ran completely outside the enable-vs-enable lock, so a slow Stop
     /// write could still land AFTER a faster, later, LOCKED enable write and
     /// silently revert it. Reproduced here by holding the shared lock
@@ -9051,7 +9048,7 @@ mod tests {
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
     }
 
-    /// issue #160 round-13 P1 (Codex commands.rs:1676): turning Computer Use
+    /// turning Computer Use
     /// OFF from Settings cancels every open GUI ask (so a still-open card can't
     /// be answered `Always`/`Full` into a standing grant AFTER access was
     /// disabled), and cancels ONLY those — a concurrent non-GUI card is left
@@ -9088,7 +9085,7 @@ mod tests {
             open[0].tool, "bash",
             "only the GUI card is cancelled — an unrelated non-GUI card is left alone"
         );
-        // issue #160 round-15 P1 (Codex commands.rs:1619): the OFF transition
+        // the OFF transition
         // trips the in-memory latch BEFORE any await, so the gate is closed for
         // the entire (possibly slow) persist — both the latch and the persisted
         // setting must agree.

@@ -260,7 +260,7 @@ pub fn is_elicitation_request(method: &str) -> bool {
 /// `item/started` and its result on `item/completed`; agent text streams via
 /// deltas; `thread/tokenUsage/updated` carries the current-context usage.
 ///
-/// Every notification's `threadId` (issue #99) is read here and carried RAW into
+/// Every notification's `threadId` is read here and carried RAW into
 /// `ChatEvent::agent_thread` — the conversation/agent that produced this event,
 /// main narration and every collab sub-agent's own activity alike (app-server
 /// forwards a spawned sub-agent's events over this SAME connection, per-thread
@@ -412,7 +412,7 @@ pub fn turn_reports_quota_exceeded(params: &Value) -> bool {
 
 /// A codex app-server `RateLimitSnapshot` (the `rateLimits` field of an
 /// `account/rateLimits/updated` notification, or of an `account/rateLimits/read`
-/// response) → an [`crate::engine_quota::QuotaSnapshot`] for "codex" (issue #97).
+/// response) → an [`crate::engine_quota::QuotaSnapshot`] for "codex".
 ///
 /// Ground truth: openai/codex `codex-rs/app-server-protocol/src/protocol/v2/account.rs`.
 /// `primary`/`secondary` are independent rolling windows (`usedPercent`: 0-100
@@ -475,7 +475,7 @@ fn appserver_tool_call(item: &Value) -> crate::lead_chat::proto::ToolCall {
     }
 }
 
-/// A `collabAgentToolCall` item's known sub-agent thread ids (issue #99):
+/// A `collabAgentToolCall` item's known sub-agent thread ids:
 /// `receiverThreadIds` — "the newly spawned agent" for a spawn call, or the
 /// existing target agent for a send/wait call. Empty for a spawn's own
 /// `item/started` (the child doesn't exist yet) and for every non-collab item —
@@ -812,7 +812,7 @@ impl Client {
         // Resolve nvm/fnm/volta CLIs from a GUI launch's minimal PATH without
         // mutating the global env (see detect::tool_path).
         command.env("PATH", crate::detect::tool_path());
-        // issue #160 round-15 P1 (Codex inject.rs:364): injection-supplied env —
+        // injection-supplied env —
         // the codex computer-use bearer rides the child's environment (readable
         // only by its own uid), never `-c` argv (world-readable via ps). See
         // `bus::inject::Injection::env`.
@@ -916,7 +916,7 @@ impl Client {
         Ok(())
     }
 
-    /// Best-effort `account/rateLimits/read` → the engine_quota hub (issue #97).
+    /// Best-effort `account/rateLimits/read` → the engine_quota hub.
     /// Errors (older codex without this endpoint, a transient hiccup) are
     /// swallowed: this is a proactive nice-to-have, never load-bearing for the
     /// connection or a turn — the notification path (`read_loop`'s
@@ -958,7 +958,7 @@ impl Client {
                                             item: None,
                                             // A sub-agent's OWN turn can fail too — tag
                                             // it like any other event on this thread
-                                            // (issue #99) so the error lands in its
+                                            //  so the error lands in its
                                             // branch, not as spurious mainline text.
                                             agent_thread: tid.clone(),
                                         },
@@ -1426,7 +1426,7 @@ mod tests {
                 // Deltas carry their item id: parallel streams (collab sub-agents)
                 // key their own rows instead of interleaving into one bubble.
                 assert_eq!(item.as_deref(), Some("i"));
-                // The envelope's threadId (issue #99) rides along RAW — the engine,
+                // The envelope's threadId rides along RAW — the engine,
                 // not this mapper, decides mainline vs a sub-agent branch.
                 assert_eq!(agent_thread.as_deref(), Some("t"));
             }
@@ -1821,7 +1821,7 @@ mod tests {
 
     #[test]
     fn collab_tool_call_carries_receiver_thread_ids() {
-        // issue #99: `receiverThreadIds` is the minimal backend signal the
+        // `receiverThreadIds` is the minimal backend signal the
         // frontend groups on — verified against the real `CollabAgentToolCall`
         // ThreadItem shape (codex-rs app-server-protocol/src/protocol/v2/item.rs).
         // A spawn's item/started has no receiver yet (the child doesn't exist).

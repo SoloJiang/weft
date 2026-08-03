@@ -151,7 +151,7 @@ fn ask_url(
     }
 }
 
-/// `wt` (issue #160 round-2 P2 §5): the caller's own worktree id, when it
+/// `wt`: the caller's own worktree id, when it
 /// could resolve one — appended as `?wt=<id>` so `bus::computer_srv::
 /// handle_computer` can pin screenshots/audit to THIS EXACT worktree instead
 /// of falling back to "the first worktree of this direction" on a multi-repo
@@ -162,10 +162,10 @@ fn ask_url(
 /// (the lead lane, which has no worktree at all; an ACP branch that hasn't
 /// wired one through yet) is unaffected.
 ///
-/// `&key=<token>` (issue #160 round-11 P1 #A): EVERY `weft_computer` URL now
+/// `&key=<token>`: EVERY `weft_computer` URL now
 /// also carries this session-scoped bearer — `bus::computer_srv::
 /// computer_session_token(thread, dir, wt)`, an HMAC of the path's own
-/// identity AND the exact worktree it carries (issue #160 round-13/14 P1),
+/// identity AND the exact worktree it carries,
 /// under a process-lifetime secret that never leaves memory (see that
 /// function's own doc for the full rationale). This is the ONLY bus MCP URL
 /// that gets one: `mcp_url`/`planner_url`/`curator_url`/`global_url` above are
@@ -176,7 +176,7 @@ fn ask_url(
 /// `&` when `?wt=` is already present, `?` otherwise — still exactly ONE
 /// query string, never two separately-prefixed ones.
 fn computer_url(base: &str, thread: i32, dir: &str, wt: Option<i32>) -> String {
-    // issue #160 round-13/14 P1: the bearer is minted for the EXACT `wt` this
+    // the bearer is minted for the EXACT `wt` this
     // URL embeds (see `computer_srv::computer_token_mac`), so a worker that
     // later swaps its own `?wt=` to a sibling's id presents a token that no
     // longer matches and is rejected server-side.
@@ -192,7 +192,7 @@ fn computer_url(base: &str, thread: i32, dir: &str, wt: Option<i32>) -> String {
 /// lead also gets planner when `dir` is the lead lane; concierge/global callers
 /// pass `include_global`.
 ///
-/// `computer_wt` (issue #160 round-2 P2 §5): the worker's own worktree id,
+/// `computer_wt`: the worker's own worktree id,
 /// forwarded into [`computer_url`] when `include_computer` is set — see that
 /// function's own doc. Ignored (harmlessly) when `include_computer` is
 /// `false`. `None` for the lead lane (a lead has no worktree at all) and for
@@ -526,8 +526,8 @@ pub fn inject_curator(base: &str, thread: i32, tool: &str, cwd: &Path) -> Inject
     )
 }
 
-/// Build the computer-use MCP injection (issue #160) for a session, per
-/// thread/direction. Round-12 P1 #6 (Codex round-11 finding): unlike every
+/// Build the computer-use MCP injection for a session, per
+/// thread/direction. Unlike every
 /// OTHER injected server (`weft_bus`/`weft_planner`/`weft_curator`/
 /// `weft_global`, all unauthenticated by design — see their own URL
 /// builders' doc comments), this URL embeds a per-session bearer
@@ -543,14 +543,14 @@ pub fn inject_curator(base: &str, thread: i32, tool: &str, cwd: &Path) -> Inject
 /// same as every other codex injection in this module).
 ///
 /// Callers MUST gate this on `crate::computer::enabled(db)` themselves — this
-/// function injects unconditionally. issue #160 round-12 P2 #7: as of this
+/// function injects unconditionally. as of this
 /// round every production call site injects UNCONDITIONALLY instead
 /// (concierge/curator excluded) — the setting is enforced server-side, on
 /// every call, by `bus::computer_srv::run_action`'s own `computer::enabled`
 /// gate; this function's own behavior (inject regardless) hasn't changed,
 /// only who calls it.
 ///
-/// `wt` (issue #160 round-2 P2 §5): the calling worker's own worktree id —
+/// `wt`: the calling worker's own worktree id —
 /// see [`computer_url`]'s doc. Every worker call site can resolve this (its
 /// own materialized worktree row is already in scope where it calls this
 /// function); the lead call site always passes `None` (a lead has no
@@ -570,7 +570,7 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, wt: Optio
     let url = computer_url(base, thread, dir, wt);
     match tool {
         "claude" => inject_computer_claude(thread, dir, wt, &url),
-        // issue #160 round-15 P1 (Codex inject.rs:364): codex is the ONE tool
+        // codex is the ONE tool
         // whose injection rides argv (`-c` flags), and argv is world-readable
         // through process listings on Linux — so the bearer must NOT be part
         // of the URL here the way it is for every file-carried config above.
@@ -622,14 +622,14 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, wt: Optio
 }
 
 /// The environment variable name the codex computer-use injection routes the
-/// per-session bearer through (issue #160 round-15 P1) — see the codex arm of
+/// per-session bearer through — see the codex arm of
 /// [`inject_computer`]. `#[doc(hidden)] pub` for the same cross-crate-test
 /// reason as `computer_srv::computer_session_token`.
 #[doc(hidden)]
 pub const COMPUTER_TOKEN_ENV_VAR: &str = "WEFT_COMPUTER_MCP_TOKEN";
 
-/// Write `bytes` to `path` as an ATOMICALLY-created, owner-only file (issue
-/// #160 round-12 P1 #D, Codex round-11 finding): a bare `std::fs::write`
+/// Write `bytes` to `path` as an ATOMICALLY-created, owner-only file:
+/// a bare `std::fs::write`
 /// under the common `022` umask creates the file `0644` FIRST, and only
 /// narrows it to `0600` a moment later via a SEPARATE `set_permissions`
 /// call — any other local account that can reach the path in that gap (the
@@ -649,7 +649,7 @@ pub const COMPUTER_TOKEN_ENV_VAR: &str = "WEFT_COMPUTER_MCP_TOKEN";
 /// at any wider mode, ever" guarantee, and adds crash/failure atomicity on
 /// top.
 ///
-/// issue #160 round-13 P1: the previous version unlinked `path` FIRST and then
+/// the previous version unlinked `path` FIRST and then
 /// `create_new`+wrote in place, so a write that failed partway (full disk,
 /// quota, I/O error) left the caller's ORIGINAL config permanently destroyed
 /// — catastrophic for `merge_opencode_config`, which merges the USER's
@@ -663,7 +663,7 @@ pub const COMPUTER_TOKEN_ENV_VAR: &str = "WEFT_COMPUTER_MCP_TOKEN";
 /// directory entry at `path` (never writes THROUGH a symlink sitting there),
 /// so the no-follow guarantee holds for the final path too.
 ///
-/// issue #160 round-18 P1 (Codex inject.rs:500): Windows gets an owner-only
+/// Windows gets an owner-only
 /// path too now — [`set_owner_only_windows`] creates the temp file, stamps it
 /// with a PROTECTED DACL that grants ONLY the current user's SID (breaking
 /// ACL inheritance from the — possibly world-traversable — checkout directory)
@@ -683,7 +683,7 @@ fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> bool {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             return false;
         };
-        // issue #160 round-23 P2 (Codex inject.rs:486): a PID-only temp name is
+        // a PID-only temp name is
         // NOT unique WITHIN one process. Two concurrent constructors injecting
         // the same session's config would derive the identical temp path, and
         // the best-effort `remove_file` below would let the second writer unlink
@@ -726,8 +726,8 @@ fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> bool {
     }
 }
 
-/// Windows owner-only atomic write (issue #160 round-18 P1, Codex
-/// inject.rs:500) — the `#[cfg(windows)]` counterpart of the unix
+/// Windows owner-only atomic write
+/// — the `#[cfg(windows)]` counterpart of the unix
 /// `create_new(0o600)` path in [`write_owner_only_atomic`]. Writes to a
 /// pid-stamped temp beside `path`, applies an owner-only PROTECTED DACL to the
 /// open handle BEFORE any secret bytes land, writes+flushes, then atomically
@@ -743,7 +743,7 @@ fn set_owner_only_windows(path: &Path, bytes: &[u8]) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    // issue #160 round-23 P2 (Codex inject.rs:486): distinct temp name per write
+    // distinct temp name per write
     // — a PID-only name collides between two concurrent same-process writers for
     // one destination (see the unix branch's own note for the unlink/rename
     // race this closes).
@@ -772,7 +772,7 @@ fn set_owner_only_windows(path: &Path, bytes: &[u8]) -> bool {
     }
     drop(w);
     // Replace `path` with the owner-locked temp only after it holds the
-    // complete, flushed bytes. issue #160 round-19 P1 (Codex inject.rs:553):
+    // complete, flushed bytes.
     // `std::fs::rename` FAILS on Windows when the destination already exists —
     // and OpenCode's generic MCP injection (and Claude reinjection) can write a
     // config at this exact path FIRST, so a plain rename would fail on the very
@@ -788,8 +788,8 @@ fn set_owner_only_windows(path: &Path, bytes: &[u8]) -> bool {
 }
 
 /// Atomically replace `to` with `from` on Windows via `MoveFileExW`
-/// (`MOVEFILE_REPLACE_EXISTING`), preserving `from`'s ACL — issue #160
-/// round-19 P1 (Codex inject.rs:553). Unlike `std::fs::rename`, this succeeds
+/// (`MOVEFILE_REPLACE_EXISTING`), preserving `from`'s
+/// ACL. Unlike `std::fs::rename`, this succeeds
 /// when `to` already exists (the common case: a prior generic-MCP or reinject
 /// write). Returns whether the replace succeeded.
 #[cfg(windows)]
@@ -809,7 +809,7 @@ fn windows_replace_existing(from: &Path, to: &Path) -> bool {
 }
 
 /// Stamp an open file HANDLE with a PROTECTED DACL granting full control to
-/// ONLY the current process user's SID (issue #160 round-18 P1). The
+/// ONLY the current process user's SID. The
 /// `PROTECTED_DACL_SECURITY_INFORMATION` flag also strips inherited ACEs, so a
 /// permissive parent-directory ACL on a shared checkout can't leave the file
 /// readable by other accounts. Returns `false` on ANY failure — the caller
@@ -817,9 +817,9 @@ fn windows_replace_existing(from: &Path, to: &Path) -> bool {
 ///
 /// `pub(crate)` because it is the ONE Windows owner-only-file primitive shared
 /// across every place unix uses a `0o600` create: the secret-config writer
-/// here, plus the screenshot save (`computer::screenshot_resolved`, issue #160
-/// round-20 P2) and the audit log (`bus::computer_srv::open_audit_file_for_
-/// append`, issue #160 round-21 P2).
+/// here, plus the screenshot save (`computer::screenshot_resolved`)
+/// and the audit log (`bus::computer_srv::open_audit_file_for_
+/// append`).
 #[cfg(windows)]
 pub(crate) fn restrict_handle_to_owner(handle: std::os::windows::io::RawHandle) -> bool {
     use windows::core::PWSTR;
@@ -908,8 +908,8 @@ pub(crate) fn restrict_handle_to_owner(handle: std::os::windows::io::RawHandle) 
     }
 }
 
-/// Claude's computer-use MCP config, issue #160 round-12 P1 #6 (Codex
-/// round-11 finding): `inject_mcp`'s generic claude branch writes
+/// Claude's computer-use MCP config.
+/// `inject_mcp`'s generic claude branch writes
 /// `.weft-<stem>.mcp.json` INSIDE the worktree (`cwd`), relying on
 /// `git::git_exclude` to keep it out of `git status`/commits — fine for
 /// `weft_bus`/`weft_planner`/`weft_curator`/`weft_global`, none of which
@@ -925,7 +925,7 @@ pub(crate) fn restrict_handle_to_owner(handle: std::os::windows::io::RawHandle) 
 ///
 /// This writes the config to a Weft-managed, OUT-OF-REPO location instead —
 /// under `paths::weft_home()`, never inside `cwd` — created ATOMICALLY
-/// owner-only on unix (issue #160 round-12 P1 #D — see
+/// owner-only on unix (see
 /// [`write_owner_only_atomic`]'s own doc for why write-then-chmod left a
 /// readable window this closes) so only this user's own account can read
 /// the bearer even on a shared machine, and named per `(thread, dir)` so
@@ -945,7 +945,7 @@ fn inject_computer_claude(thread: i32, dir: &str, wt: Option<i32>, url: &str) ->
     if std::fs::create_dir_all(&mcp_dir).is_err() {
         return Injection::none();
     }
-    // issue #160 round-14 P1 (Codex inject.rs:483): the config filename includes
+    // the config filename includes
     // the worktree `wt`, with a DISTINCT representation for the absent/lead
     // case. Two Claude workers of one multi-repo direction share a single
     // `(thread, dir)` but differ by `wt`; naming the file by `(thread, dir)`
@@ -1068,12 +1068,12 @@ fn merge_opencode_config(cwd: &Path, server: &str, url: &str) {
     // track it. If the repo ships a tracked opencode.json, the merge still shows
     // as a modification — an accepted limitation of the worktree-local merge.
     //
-    // issue #160 round-27 P1 (Codex inject.rs:960): but NEVER from a LINKED
+    // but NEVER from a LINKED
     // worktree (`.git` is a gitfile, not a directory). A linked worktree's
     // `git rev-parse --git-path info/exclude` resolves to the CANONICAL
     // repository's shared `.git/info/exclude` (worktrees share one gitdir's
     // `info/` directory — the exact mechanism `paths::computer_output_root`'s
-    // round-10 doc records for the identical `.weft/` leak), so excluding here
+    // own doc records for the identical `.weft/` leak), so excluding here
     // would permanently hide `opencode.json` in the user's REAL checkout and
     // every sibling worktree — a hard violation of "never write cross-repo
     // wiring into canonical repositories" (CLAUDE.md). The cost of skipping is
@@ -1153,7 +1153,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// issue #160 round-12 P1 #6: Claude's computer-use config now lives
+    /// Claude's computer-use config now lives
     /// OUT OF the worktree entirely, under a Weft-managed `weft_home()`
     /// subdirectory, narrowed to `0600` on unix — see
     /// `inject_computer_claude`'s own doc for why. Needs an ISOLATED
@@ -1182,7 +1182,7 @@ mod tests {
         );
         let cfg = std::fs::read_to_string(&cfg_path).unwrap();
         assert!(cfg.contains("weft_computer") && cfg.contains("/computer/1/10/mcp"));
-        // issue #160 round-11 P1 #A: the injected URL still carries the
+        // the injected URL still carries the
         // EXACT per-session bearer `computer_session_token` would mint for
         // this same (thread, dir).
         assert!(
@@ -1201,15 +1201,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// issue #160 round-12 P1 #D + round-13 P1: re-injection (the SAME
+    /// Re-injection (the SAME
     /// `(thread, dir, wt)` writing this SAME path again — a resumed/rerun
     /// session) must land via [`write_owner_only_atomic`]'s temp-then-`rename`
     /// path, not silently fall back to a wider-mode write because the file
     /// already exists. Runs the injection TWICE for the identical
     /// `(thread, dir, wt)` and asserts the SECOND write is still exactly
-    /// `0600`, the content reflects the newer URL, and — round-13 P1 — no
+    /// `0600`, the content reflects the newer URL, and no
     /// `.weft-tmp` sibling is left behind (the atomic rename consumes it on
-    /// success). issue #160 round-14 P1 (Codex inject.rs:483): the config
+    /// success). the config
     /// filename now includes `wt`, so a re-injection with a DIFFERENT `wt` is a
     /// DIFFERENT file by design — this test therefore holds `wt` fixed and
     /// varies the base URL to prove the same-path rewrite; the distinct-`wt`
@@ -1252,7 +1252,7 @@ mod tests {
             );
         }
 
-        // round-13 P1: the atomic rename consumes the temp on success — no
+        // The atomic rename consumes the temp on success — no
         // `.weft-tmp` sibling may linger next to the real config.
         let mcp_dir = cfg_path.parent().unwrap();
         let leftover: Vec<_> = std::fs::read_dir(mcp_dir)
@@ -1262,7 +1262,7 @@ mod tests {
             .collect();
         assert!(leftover.is_empty(), "no temp file may be left behind: {leftover:?}");
 
-        // issue #160 round-14 P1 (Codex inject.rs:483): a DIFFERENT wt for the
+        // a DIFFERENT wt for the
         // SAME (thread, dir) is a DIFFERENT config file — two workers of one
         // multi-repo direction must never clobber each other's config — and the
         // absent-wt case is distinct from any explicit wt too.
@@ -1284,7 +1284,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// issue #160 round-13 P1: `write_owner_only_atomic` must replace an
+    /// `write_owner_only_atomic` must replace an
     /// existing file's contents WHOLESALE (never append/partial) at exactly
     /// 0600, and leave no temp sibling — the temp-then-rename path. (The
     /// data-preservation-on-failure guarantee — the original survives a failed
@@ -1320,7 +1320,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// issue #160 round-15 P1 (Codex inject.rs:364): codex's argv carries NO
+    /// codex's argv carries NO
     /// bearer — the URL is key-less, a second `-c` names the env VARIABLE, and
     /// the token itself rides `Injection::env` for the spawn site to set on
     /// the codex child alone.
@@ -1345,10 +1345,10 @@ mod tests {
         );
     }
 
-    /// issue #160 round-2 P2 §5: a resolved `wt` appends `?wt=<id>` to the
+    /// a resolved `wt` appends `?wt=<id>` to the
     /// injected URL, for both the claude file-based injection and codex's
     /// config-override flag. Needs an ISOLATED `WEFT_HOME` for the claude half
-    /// (round-12 P1 #6 moved that config out of the worktree) — see
+    ///  — see
     /// `paths::ENV_LOCK`'s own doc.
     #[test]
     fn computer_wt_appends_the_query_param_for_claude_and_codex() {
@@ -1373,7 +1373,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&weft_home);
 
-        // codex (issue #160 round-15 P1): the `?wt=` pin stays in the argv URL
+        // codex: the `?wt=` pin stays in the argv URL
         // (a worktree id is not a secret) but the bearer rides env, minted for
         // this EXACT `wt`.
         let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Some(42));
@@ -1390,7 +1390,7 @@ mod tests {
         assert!(inj.args.iter().all(|a| !a.contains(&key)), "{:?}", inj.args);
     }
 
-    // —— issue #160 round-11 P1 #A: computer_url mints a per-session `&key=` ——
+    // —— computer_url mints a per-session `&key=` ——
 
     /// `computer_url` itself, directly: the token it appends is EXACTLY
     /// `computer_session_token(thread, dir, wt)` for that same path's own
@@ -1460,7 +1460,7 @@ mod tests {
         assert!(!without_computer.iter().any(|s| s.name == "weft_computer"));
     }
 
-    /// issue #160 round-2 P2 §5: `computer_wt` forwards into the injected
+    /// `computer_wt` forwards into the injected
     /// `weft_computer` URL's `?wt=` query param for an ACP worker.
     #[test]
     fn acp_mcp_servers_computer_wt_pins_the_worktree_query_param() {

@@ -70,7 +70,7 @@ pub fn skills_home() -> std::io::Result<PathBuf> {
 
 /// ~/.weft/computer — Weft-managed computer-use session output (screenshots
 /// + the audit log), keyed by `(thread, dir[, worktree])` by each caller —
-/// see `bus::computer_srv::session_root`'s own doc. issue #160 round-10 P1 #1:
+/// see `bus::computer_srv::session_root`'s own doc.
 /// this REPLACES writing a worker-lane session's output straight into
 /// `<worktree>/.weft/...`. A LINKED worktree's `git rev-parse --git-path
 /// info/exclude` resolves to the CANONICAL repo's own SHARED

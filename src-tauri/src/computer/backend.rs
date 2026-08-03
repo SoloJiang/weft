@@ -10,7 +10,7 @@
 use super::{CapturedImage, ComputerError, WindowInfo};
 use std::sync::{Arc, OnceLock};
 
-/// Which physical mouse button a click/drag drives (issue #160 M2). Only the
+/// Which physical mouse button a click/drag drives. Only the
 /// two buttons the MCP surface exposes (`left_click`/`right_click`) — not a
 /// stand-in for every button `enigo::Button` knows about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,15 +23,15 @@ pub enum MouseButton {
 /// platform-independent logic in `computer/mod.rs` (matching, scaling,
 /// coordinate mapping, file I/O) never touches a real OS API directly and
 /// can be driven by [`super::mock::MockBackend`] in tests. The input methods
-/// (issue #160 M2) all take PHYSICAL screen coordinates — a caller maps an
+///  all take PHYSICAL screen coordinates — a caller maps an
 /// agent-given, screenshot-space coordinate through
 /// [`super::map_to_physical`] BEFORE calling any of them; the backend itself
 /// never rescales.
 pub trait ComputerBackend: Send + Sync {
     fn list_windows(&self) -> Result<Vec<WindowInfo>, ComputerError>;
     /// Capture `target`, verifying its FULL identity — `id` AND `app`/`title`
-    /// — on the exact window about to be captured (issue #160 round-32 P1,
-    /// Codex os.rs:30). This method performs its own enumeration to find the
+    /// — on the exact window about to be captured
+    /// . This method performs its own enumeration to find the
     /// window handle, and an OS window id is reusable: selecting by `id`
     /// alone let a window that closed after the caller's own
     /// resolve-and-verify be silently replaced by whatever unrelated (or
@@ -63,14 +63,14 @@ pub trait ComputerBackend: Send + Sync {
     fn cursor_position(&self) -> Result<(i32, i32), ComputerError>;
     /// Raise/focus `target`, verifying its FULL identity — `id` AND
     /// `app`/`title` — as close to the raise as the platform allows (issue
-    /// #160 round-34 P2, Codex computer_srv.rs:2986): activation addresses
+    /// the capture-side verification): activation addresses
     /// the window by its reusable numeric id, so an id-only boundary could
     /// raise and focus whatever unrelated application inherited the number
     /// after the caller's own resolve-and-verify — a foreground-steal side
     /// effect the caller's post-activation re-resolve only catches AFTER it
     /// happened. Same discipline as [`Self::capture_window`].
     /// Bring window `id` to the foreground and give it OS keyboard/mouse
-    /// focus (issue #160 round-4 P1 §2) — the ONLY mechanism
+    /// focus — the ONLY mechanism
     /// `bus::computer_srv::activate_if_interactive` uses to hand focus back
     /// to a target window after a Needs-you approval card took the
     /// foreground away from it. Replaces the earlier "replay the last click"

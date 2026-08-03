@@ -14,7 +14,7 @@ use std::sync::Mutex;
 pub struct MockBackend {
     pub windows: Vec<WindowInfo>,
     /// When `Some`, `list_windows` returns THIS instead of `windows` (issue
-    /// #160 round-6 review P1 #2+#3) — a test-controlled way to simulate a
+    /// flight guard) — a test-controlled way to simulate a
     /// window's geometry (or the whole visible set) changing BETWEEN two
     /// resolutions of the SAME query, e.g. while a call sits queued on
     /// `computer::input_flight_guard`. Write it directly (`*mock.
@@ -25,9 +25,9 @@ pub struct MockBackend {
     pub windows_override: Mutex<Option<Vec<WindowInfo>>>,
     /// When non-empty, each `list_windows` call POPS AND RETURNS the front
     /// entry, falling back to `windows_override`/`windows` once drained
-    /// (issue #160 round-27) — a call-count-deterministic way to make "the
+    ///  — a call-count-deterministic way to make "the
     /// Nth resolution of this query sees a DIFFERENT window set" without any
-    /// sleep/timing choreography. Needed once round-27 P2 gave `approve`'s
+    /// sleep/timing choreography. Needed because `approve`'s
     /// own authorization-time resolve a screenshot-semaphore permit: a test
     /// that drains the semaphore now parks the call at APPROVE (before any
     /// resolution), so a wall-clock "swap while queued" lands before the
@@ -36,7 +36,7 @@ pub struct MockBackend {
     /// regardless of where the queueing happens.
     pub windows_sequence: Mutex<std::collections::VecDeque<Vec<WindowInfo>>>,
     pub image: Option<CapturedImage>,
-    /// One line per input method call (issue #160 M2), in call order — e.g.
+    /// One line per input method call, in call order — e.g.
     /// `"click 100,200 Left x1"`. Lets a test assert an action actually
     /// reached the backend without a real OS input device. `Mutex` (not
     /// `RefCell`) because `ComputerBackend` requires `Send + Sync` and this
@@ -48,7 +48,7 @@ pub struct MockBackend {
     /// cursor would move.
     pub cursor: Mutex<(i32, i32)>,
     /// When `true`, `activate_window` fails with `Unsupported` instead of
-    /// recording an `"activate {id}"` action (issue #160 round-4 P1 §2) — a
+    /// recording an `"activate {id}"` action — a
     /// test-controlled switch simulating a real backend that couldn't find
     /// any window-activation API at all (`StubBackend`'s own permanent
     /// case), so a test can exercise `bus::computer_srv::
@@ -57,8 +57,8 @@ pub struct MockBackend {
     /// like every other successful mock action.
     pub fail_activate: AtomicBool,
     /// Run synchronously, once, from INSIDE `activate_window` right before it
-    /// records its own action and returns `Ok` (issue #160 round-6 review P1
-    /// #2) — lets a test simulate "a human hit Stop WHILE the (real,
+    /// records its own action and returns `Ok`
+    /// — lets a test simulate "a human hit Stop WHILE the (real,
     /// blocking) activation call was in flight" deterministically, without
     /// needing genuine OS-thread concurrency: the closure runs on the SAME
     /// task that called `activate_window`, so whatever it does (e.g.
@@ -97,8 +97,8 @@ impl ComputerBackend for MockBackend {
     }
 
     /// Returns the one canned `image` — after mirroring the REAL backend's
-    /// capture-time identity verification (issue #160 round-32 P1, Codex
-    /// os.rs:30): `target` must still be present, with matching id AND
+    /// capture-time identity verification
+    /// : `target` must still be present, with matching id AND
     /// app/title, in the CURRENTLY visible set. `windows_sequence` is
     /// deliberately NOT popped here — its entries feed `list_windows` calls
     /// by index (see its doc), and consuming one from a capture would
@@ -161,7 +161,7 @@ impl ComputerBackend for MockBackend {
     }
 
     fn activate_window(&self, target: &WindowInfo) -> Result<(), ComputerError> {
-        // issue #160 round-34 P2 (Codex computer_srv.rs:2986): mirror the real
+        // mirror the real
         // backend's raise-time identity verification — `target` must still be
         // present, with matching id AND app/title, in the CURRENTLY visible
         // set (same source rules as `capture_window` above; the sequence is

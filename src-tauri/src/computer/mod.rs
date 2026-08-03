@@ -1,4 +1,4 @@
-//! OS-level "computer use" core (issue #160). M1 shipped observation only
+//! OS-level "computer use" core. M1 shipped observation only
 //! (window enumeration + screenshot); M2 adds input injection — click/type/
 //! key/scroll/drag/move — behind the SAME setting gate, plus a process-wide
 //! control lock, an input throttle, and a coordinate-mapping layer so an
@@ -41,7 +41,7 @@ pub const K_COMPUTER_USE_ENABLED: &str = "computer_use_enabled";
 /// row, or any value other than the literal "true" all read as disabled —
 /// this gate gets no benefit of the doubt, unlike most weft settings.
 ///
-/// issue #160 review R1 #1: the emergency-stop latch ([`stop_state`]'s
+/// the emergency-stop latch ([`stop_state`]'s
 /// `stopped` field) is checked FIRST, before the DB is even touched — once
 /// tripped, this returns `false` unconditionally, so a `set_setting` write
 /// failure inside [`emergency_stop`] (which the latch does NOT depend on —
@@ -58,8 +58,8 @@ pub async fn enabled(db: &crate::store::Db) -> bool {
 }
 
 /// Process-level emergency-stop latch state, PLUS the generation counter
-/// [`clear_emergency_stop`] needs to detect a stale caller (issue #160
-/// round-6 review P1 #1) — kept together behind ONE mutex rather than
+/// [`clear_emergency_stop`] needs to detect a stale caller
+/// — kept together behind ONE mutex rather than
 /// `stopped` as a lone `AtomicBool` and `generation` as a separate
 /// `AtomicU64`: [`clear_emergency_stop`]'s whole job is a check-THEN-act
 /// ("is the generation still what the caller expects; if so, clear
@@ -80,8 +80,8 @@ pub async fn enabled(db: &crate::store::Db) -> bool {
 /// computer use from Settings.
 struct StopState {
     stopped: bool,
-    /// Bumped by every [`emergency_stop`] call (issue #160 round-6 review P1
-    /// #1). `commands::set_computer_use_enabled(true)` reads this via
+    /// Bumped by every [`emergency_stop`] call
+    /// . `commands::set_computer_use_enabled(true)` reads this via
     /// [`stop_generation`] BEFORE its own (possibly slow) `set_setting`
     /// write, then only actually clears the latch (via
     /// [`clear_emergency_stop`]) if the generation it read is STILL current
@@ -97,15 +97,15 @@ fn stop_state() -> &'static Mutex<StopState> {
     STATE.get_or_init(|| Mutex::new(StopState { stopped: false, generation: 0 }))
 }
 
-/// The current stop-generation (issue #160 round-6 review P1 #1) — see
+/// The current stop-generation — see
 /// [`StopState::generation`]'s own doc for the full read-before-write,
 /// clear-only-if-still-current contract this exists for.
 pub fn stop_generation() -> u64 {
     stop_state().lock().unwrap_or_else(|e| e.into_inner()).generation
 }
 
-/// SYNCHRONOUS read of the in-memory stop latch alone (issue #160 round-15
-/// P1, Codex commands.rs:1619) — `true` the instant [`trip_stop_latch`] runs,
+/// SYNCHRONOUS read of the in-memory stop latch alone
+/// — `true` the instant [`trip_stop_latch`] runs,
 /// with no DB read and no `.await`. [`enabled`] already consults this latch
 /// first, but is `async` (it falls through to the persisted setting);
 /// `bus::computer_srv::approve` needs a latch-only check it can run INSIDE a
@@ -118,7 +118,7 @@ pub fn stop_latched() -> bool {
     stop_state().lock().unwrap_or_else(|e| e.into_inner()).stopped
 }
 
-/// A held lock on the stop state (issue #160 round-17 P1, Codex ask.rs:2174)
+/// A held lock on the stop state
 /// — for the ONE caller that must make "observe the latch, then act on that
 /// observation" ATOMIC against a concurrently-tripping Stop:
 /// `AskRegistry::answer`'s grant recording. [`stop_latched`] releases the
@@ -147,8 +147,8 @@ pub fn hold_stop_state() -> StopLatchGuard {
     StopLatchGuard(stop_state().lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Clear the emergency-stop latch (issue #160 review R1 #1; generation check
-/// added round-6 review P1 #1 — see [`StopState`]'s own doc for why a lone
+/// Clear the emergency-stop latch (generation-checked — see [`StopState`]'s
+/// own doc for why a lone
 /// `AtomicBool`/`AtomicU64` pair could not make this fully race-safe). The
 /// ONLY legitimate caller is `commands::set_computer_use_enabled` when
 /// `enabled == true` — a human explicitly turning computer use back on from
@@ -163,9 +163,9 @@ pub fn hold_stop_state() -> StopLatchGuard {
 /// in between (the generation has since moved on), this returns `false` and
 /// leaves the latch tripped: an explicit, LATER Stop must never be silently
 /// undone by an EARLIER enable request that only just now finished its own
-/// DB write (issue #160 round-6 review P1 #1 — this is the exact bug this
+/// DB write (the exact bug this
 /// generation check exists to close). Also resets [`STOP_PERSIST_FAILED`] on
-/// an actual clear (issue #160 round-6 review P2 #6): a human explicitly
+/// an actual clear: a human explicitly
 /// re-enabling computer use from Settings is the closest thing this feature
 /// has to an acknowledgment that any earlier persist failure has been dealt
 /// with.
@@ -180,7 +180,7 @@ pub fn clear_emergency_stop(expected_gen: u64) -> bool {
     true
 }
 
-/// Set (issue #160 round-6 review P2 #6) whenever the MOST RECENT
+/// Set whenever the MOST RECENT
 /// [`emergency_stop`] call's own `set_setting` write failed — covering BOTH
 /// paths that call it (`commands::computer_emergency_stop`, the Stop button/
 /// dialog, AND the OS-level global Escape shortcut's own spawned call — see
@@ -189,8 +189,8 @@ pub fn clear_emergency_stop(expected_gen: u64) -> bool {
 /// `true` on disk for the next launch".
 ///
 /// Cleared two ways: a SUCCESSFUL [`clear_emergency_stop`] (a human
-/// explicitly re-enabling computer use from Settings), OR — issue #160
-/// round-8 P2 #3 — a SUCCESSFUL, still-most-recent [`emergency_stop`] retry
+/// explicitly re-enabling computer use from Settings), OR
+/// a SUCCESSFUL, still-most-recent [`emergency_stop`] retry
 /// (a human clicking Stop again after an earlier attempt's persist failed,
 /// this time landing). Either way this always reflects the MOST RECENT
 /// call's own outcome, by generation — never an older, slower call's stale
@@ -232,26 +232,26 @@ pub enum ComputerError {
     /// Reading/writing the screenshot file itself failed.
     Io(String),
     /// An input action's coordinate falls outside the most recent
-    /// screenshot's range for this window (issue #160 M2) — see
+    /// screenshot's range for this window — see
     /// [`map_to_physical`]. `max_x`/`max_y` are the LAST valid coordinate
     /// (inclusive) — the valid range is `0..=max_x` / `0..=max_y`, NOT the
-    /// screenshot's width/height (issue #160 review R1 #2: the upper bound
+    /// screenshot's width/height (the upper bound
     /// is exclusive, so `x == width` is one past the last real pixel column
     /// and is itself out of bounds).
     OutOfBounds { x: u32, y: u32, max_x: u32, max_y: u32 },
-    /// Someone else's session currently holds the control lease (issue #160
-    /// M2) — see [`acquire_control`].
+    /// Someone else's session currently holds the control lease
+    /// — see [`acquire_control`].
     Busy { thread: i32, dir: String },
-    /// The global input throttle rejected this call (issue #160 M2) — see
+    /// The global input throttle rejected this call — see
     /// [`throttle_input`].
     RateLimited { wait_ms: u64 },
     /// An open permission Ask is blocking this (thread, dir) from driving
-    /// the desktop (issue #160 M2) — checked in `bus::computer_srv` before
+    /// the desktop — checked in `bus::computer_srv` before
     /// any input action runs.
     SuspendedPendingAsk,
     /// The OS-level global Escape shortcut — the kill switch's redundant
     /// layer for while a CONTROLLED app (not weft's own WebView) holds real
-    /// OS focus — could not be registered (issue #160 round-10 P1 #7): some
+    /// OS focus — could not be registered: some
     /// other app already claimed it, or the desktop/platform doesn't support
     /// it. Fail-closed: [`acquire_control`] refuses to grant control at all
     /// rather than let input proceed with no way for a human to Escape out
@@ -261,8 +261,8 @@ pub enum ComputerError {
     /// distinction.
     EscapeUnavailable,
     /// A control lease exists for this exact `(thread, dir)` but its
-    /// kill-switch registration has not yet been CONFIRMED live (issue #160
-    /// round-15 P1, Codex mod.rs:1395) — see [`acquire_control`]'s own doc
+    /// kill-switch registration has not yet been CONFIRMED live
+    /// — see [`acquire_control`]'s own doc
     /// for the pending-registration race this closes. Distinct from
     /// [`EscapeUnavailable`](ComputerError::EscapeUnavailable): registration
     /// has not necessarily FAILED here, it just has not finished yet (or, in
@@ -363,8 +363,8 @@ pub struct Screenshot {
     /// something authoritative to read instead of re-deriving it.
     pub scale: f64,
     /// The id of the window this screenshot ACTUALLY captured — [`screenshot_window`]'s
-    /// own `matched.id`, from the SAME resolution it captured against (issue
-    /// #160 round-6 review P2 #4). Exists so a caller that needs to key
+    /// own `matched.id`, from the SAME resolution it captured against.
+    /// Exists so a caller that needs to key
     /// something off "the window this screenshot came from" (the Ask-card
     /// preview registry in `bus::computer_srv`) never has to re-resolve
     /// `query` a second time — a second resolution can land on a DIFFERENT
@@ -373,7 +373,7 @@ pub struct Screenshot {
     /// mis-keying the preview to the wrong window.
     pub window_id: u32,
     /// The SAVED image's own pixels, RGBA, kept in memory for the life of this
-    /// `Screenshot` value (round-7 P1) — the SAME `width`x`height`, already-
+    /// `Screenshot` value — the SAME `width`x`height`, already-
     /// scaled bytes `screenshot_window` wrote to `path`, captured right around
     /// its own `image.save` call rather than derived separately. Exists so a
     /// caller building a preview/MCP-image payload (`bus::computer_srv`) never
@@ -407,14 +407,14 @@ pub struct Screenshot {
 /// must not accidentally match nothing here, and "iTerm2 Preferences" is a
 /// different app from "iTerm2").
 ///
-/// issue #160 round-5 review P2 §5: this is a BEST-EFFORT list of terminal
+/// this is a BEST-EFFORT list of terminal
 /// emulators known at the time this list was last updated, NOT an exhaustive
 /// catalog of every terminal emulator that exists or will ever exist — a
 /// brand-new or simply-not-yet-added one is still screenshottable until this
 /// list is extended to cover it. `computerUseHint` (`src/i18n/en.ts`/`zh.ts`)
 /// is worded to match that reality ("known terminal-emulator windows", not
 /// "any terminal window") rather than promising a guarantee this table
-/// cannot keep. Round-5 added: Ghostty, foot, Tilix, Rio, st (suckless
+/// cannot keep. Also covered: Ghostty, foot, Tilix, Rio, st (suckless
 /// simple terminal), urxvt/rxvt, Terminator, Guake, Yakuake, xfce4-terminal,
 /// LXTerminal, QTerminal, Deepin Terminal, Tabby, Contour, WaveTerm, Cool
 /// Retro Term, Eterm, Sakura, Termite, and `kgx` (GNOME Console's own binary
@@ -542,12 +542,12 @@ pub fn resolve_window(backend: &dyn backend::ComputerBackend, query: &str) -> Re
 /// [`map_to_physical`] recomputes the SAME formula from the SAME window
 /// fields — the exact factor an agent-given coordinate against that
 /// screenshot must be divided by to recover a real screen position. Pulled
-/// out as its own function (issue #160 M2) specifically so those two call
+/// out as its own function specifically so those two call
 /// sites can never drift onto two different formulas: long edge > 1280px
 /// gets scaled down to fit (matching [`scale_capture`]'s pre-M2 rule
 /// exactly), everything else is 1:1.
 ///
-/// A thin wrapper over [`display_scale_for_dims`] (round-7 P2) — same
+/// A thin wrapper over [`display_scale_for_dims`] — same
 /// formula, just reading its two inputs off a [`WindowInfo`] instead of bare
 /// dimensions, for the two callers (`map_to_physical`'s live re-resolve, and
 /// any caller that only has a `WindowInfo` on hand) that want it that way.
@@ -557,7 +557,7 @@ pub fn display_scale(w: &WindowInfo) -> f64 {
 }
 
 /// The core of [`display_scale`], taking bare dimensions instead of a
-/// [`WindowInfo`] (round-7 P2) — so [`screenshot_window`] can derive the
+/// [`WindowInfo`] — so [`screenshot_window`] can derive the
 /// scale it records from the CAPTURED frame's own dimensions, not from a
 /// window resolved earlier and possibly already stale. See
 /// [`screenshot_window`]'s own doc comment for the resize-in-the-gap race
@@ -606,7 +606,7 @@ pub fn map_to_physical(w: &WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), C
     let scale = display_scale(w);
     let scaled_w = (f64::from(w.width) * scale).round() as u32;
     let scaled_h = (f64::from(w.height) * scale).round() as u32;
-    // Exclusive upper bound (issue #160 review R1 #2): a screenshot saved at
+    // Exclusive upper bound: a screenshot saved at
     // `scaled_w` x `scaled_h` px has valid pixel columns/rows `0..=scaled_w-1`
     // / `0..=scaled_h-1` — `cx == scaled_w` is one past the last real pixel,
     // not a valid click target, and must be rejected exactly like any larger
@@ -624,7 +624,7 @@ pub fn map_to_physical(w: &WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), C
     Ok((px, py))
 }
 
-// —— issue #160 round-11 P1 #D: map by SAVED screenshot geometry, not the
+// —— map by SAVED screenshot geometry, not the
 // window's CURRENT size ——
 //
 // [`map_to_physical`] above recomputes `display_scale` from `w`'s CURRENT
@@ -633,7 +633,7 @@ pub fn map_to_physical(w: &WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), C
 // one that RESIZED: a coordinate read off a screenshot taken at, say,
 // 1280px wide is expressed in THAT image's own pixel grid, not "whatever
 // grid a FRESH scale computed from the window's current (possibly now
-// different) width would produce". Example the round-11 review named: a
+// different) width would produce". Example: a
 // 2000px window captured at scale 0.64 (1280px saved), then resized down to
 // 1000px BEFORE the next click — `map_to_physical`'s old math would treat
 // screenshot-space `x=640` as if it were still "0.64 of the window's
@@ -673,7 +673,7 @@ pub fn map_screenshot_coord(
             max_y: shot_h.saturating_sub(1),
         });
     }
-    // issue #160 round-23 P2 (Codex computer/mod.rs:677): clamp each mapped
+    // clamp each mapped
     // offset to `width-1`/`height-1`. `cx`/`cy` are bounds-checked only against
     // the SCREENSHOT's own space (`cx < shot_w`), so a far-edge coordinate on a
     // window that SHRANK since the capture can round UP to exactly `width` —
@@ -690,7 +690,7 @@ pub fn map_screenshot_coord(
 }
 
 /// Process-level "most recent screenshot's OWN saved dimensions, per window"
-/// registry (issue #160 round-11 P1 #D) — keyed by the FULL `(thread, dir,
+/// registry — keyed by the FULL `(thread, dir,
 /// window_id)` triple (not just `(thread, dir)`, unlike [`screenshot_previews`]
 /// above): an agent may screenshot more than one window for the same
 /// session, and a later input action against a DIFFERENT window than the
@@ -704,19 +704,19 @@ pub fn map_screenshot_coord(
 /// CLOSED (never silently falls back to the window's current size) when
 /// nothing is on file — see [`map_screenshot_coord`]'s own doc for why
 /// reusing "current size" as a stand-in for "the screenshot's size" is
-/// exactly the bug this round closes, so falling back to it here would
+/// exactly the bug this change closes, so falling back to it here would
 /// silently reopen it. In-memory only, like every other per-session
 /// registry in this module (`recent_clicks`, `screenshot_previews`) — a
 /// restart starting empty just means the FIRST input action after restart
 /// needs a fresh screenshot first, which is the correct, safe default
 /// anyway.
-/// issue #160 round-12 P1 #2: the stored value now ALSO carries the window's
+/// the stored value now ALSO carries the window's
 /// own `app`+`title` at capture time (`(width, height, app, title, ts)`), not
 /// just its dimensions — see [`shot_dims_for`]'s own doc for why a bare
 /// `window_id` key is not enough on its own to answer "is this still the
 /// window that screenshot was taken of".
 ///
-/// issue #160 round-12 P1 #C: the stored value now ALSO carries the window's
+/// the stored value now ALSO carries the window's
 /// own `(x, y, width, height)` geometry AT CAPTURE TIME (see
 /// [`ShotDimsEntry`]) — the strongest per-instance identity signal this
 /// module has access to on top of `app`+`title`, given `xcap` (the backend
@@ -730,9 +730,9 @@ fn recent_shot_dims() -> &'static Mutex<std::collections::HashMap<(i32, String, 
 }
 
 /// One [`recent_shot_dims`] entry: the saved screenshot's own pixel
-/// dimensions, the window's identity (`app`/`title`) at capture time (issue
-/// #160 round-12 P1 #2), its full `(x, y, width, height)` GEOMETRY at that
-/// same instant (round-12 P1 #C — see [`record_shot_dims`]'s own doc), and
+/// dimensions, the window's identity (`app`/`title`) at capture time,
+/// its full `(x, y, width, height)` GEOMETRY at that
+/// same instant, and
 /// the insertion timestamp [`evict_oldest_shot_dims_if_full`] evicts by.
 #[derive(Debug, Clone)]
 struct ShotDimsEntry {
@@ -772,18 +772,17 @@ fn evict_oldest_shot_dims_if_full(map: &mut std::collections::HashMap<(i32, Stri
 
 /// Record a SAVED screenshot's own dimensions AND the window identity +
 /// geometry it was captured against, for `(thread, dir, wt, window_id)`,
-/// refreshing whatever was on file for that exact key. `wt` (issue #160
-/// round-26 P2, Codex mod.rs:797) isolates SIBLING worker sessions of one
+/// refreshing whatever was on file for that exact key. `wt`
+/// isolates SIBLING worker sessions of one
 /// multi-repo direction — same `(thread, dir)`, different worktree — so one
 /// sibling's fresh screenshot can never overwrite the dimensions another
 /// sibling's approved input is about to map coordinates against (a
 /// wrong-geometry click on a resized window), matching the wt-precise
-/// bearer and control lease (issue #160
-/// round-11 P1 #D; `app`/`title` added round-12 P1 #2, geometry added
-/// round-12 P1 #C — see [`shot_dims_for`]'s own doc for both). `w` is the
+/// bearer and control lease (see
+/// [`shot_dims_for`]'s own doc for the identity and geometry fields). `w` is the
 /// window `screenshot_window` actually captured against, resolved as close
 /// to the capture as this call site can manage (see `bus::computer_srv`'s
-/// screenshot arm, round-12 P1 #I) — its `app`/`title`/`x`/`y`/`width`/
+/// screenshot arm) — its `app`/`title`/`x`/`y`/`width`/
 /// `height` are what get stored; `shot_width`/`shot_height` are the SAVED
 /// IMAGE's own (possibly display-scaled) pixel dimensions, a SEPARATE number
 /// from `w`'s own on-screen geometry. Called ONLY from `bus::computer_srv`'s
@@ -822,8 +821,8 @@ pub fn record_shot_dims(thread: i32, dir: &str, wt: Option<i32>, window_id: u32,
 
 /// The most recently recorded screenshot dimensions for `w` under `(thread,
 /// dir, w.id)`, if any AND if the recorded capture's own `app`+`title` still
-/// match `w`'s CURRENT identity — issue #160 round-12 P1 #2 (Codex 1298):
-/// before this, the registry was keyed by `(thread, dir, window_id)` alone,
+/// match `w`'s CURRENT identity —
+/// keyed by `(thread, dir, window_id)` alone, the registry meant that
 /// so once a window closed and the OS/window manager reused its numeric id
 /// for an entirely unrelated window, a coordinate-taking input arm would
 /// silently look up (and map against) the OLD window's saved dimensions —
@@ -843,21 +842,21 @@ pub fn record_shot_dims(thread: i32, dir: &str, wt: Option<i32>, window_id: u32,
 /// behavior change for the common case (see [`map_screenshot_coord`]'s own
 /// doc).
 ///
-/// issue #160 round-12 P1 #C — geometry is recorded (see
+/// Geometry is recorded (see
 /// [`ShotDimsEntry`]/[`record_shot_dims`]) but DELIBERATELY NOT compared
 /// here, even though an id+app+title match with DIFFERENT geometry is
 /// exactly the "same id, coincidentally same app/title, actually a
-/// different window" case this round set out to narrow. Gating on it would
+/// different window" case this change set out to narrow. Gating on it would
 /// regress TWO already-shipped, deliberately tested properties this same
 /// module relies on, both driven through this exact function:
-///  - round-10 P1 #B (`bus::computer_srv::
+///  - activation movement (`bus::computer_srv::
 ///    left_click_uses_the_windows_geometry_as_of_after_activation_not_before`):
 ///    activation legitimately moves a window (a window manager
 ///    un-minimizing/refocusing it) — the ORIGIN changes — and the click
 ///    must still land correctly against its NEW position.
-///  - round-11 P1 #D (`bus::computer_srv::
+///  - proportional remapping (`bus::computer_srv::
 ///    left_click_maps_the_screenshot_coordinate_proportionally_after_a_resize`,
-///    "the end-to-end property this whole round exists for"): the window is
+///    "the end-to-end property the remap exists for"): the window is
 ///    legitimately RESIZED between an earlier screenshot and this click —
 ///    the SIZE changes — and the click must still map proportionally
 ///    against the new rectangle.
@@ -866,12 +865,12 @@ pub fn record_shot_dims(thread: i32, dir: &str, wt: Option<i32>, window_id: u32,
 /// is no subset of geometry this function could gate on without breaking
 /// one of the two. Closing the remaining gap for real needs a stable
 /// per-window instance identity `xcap` does not expose across separate
-/// calls (see this module's own top-of-file doc and issue #160 §9) — a
+/// calls (see this module's own top-of-file doc) — a
 /// protocol-level "screenshot token" the agent round-trips, or an OS-level
 /// window handle, either of which is a larger change than this function's
 /// signature. This residual — an id the OS reuses for a genuinely different
 /// window, with a coincidentally identical app+title AND a query that
-/// resolves to it — is unchanged from round-12 P1 #2's own accepted
+/// resolves to it — is an accepted
 /// residual; recording geometry here keeps it available for a future,
 /// protocol-aware fix (or for audit/forensic use) without regressing either
 /// tested tolerance today.
@@ -889,13 +888,13 @@ pub fn shot_dims_for(thread: i32, dir: &str, wt: Option<i32>, w: &WindowInfo) ->
 /// The window geometry [`record_shot_dims`] saved for `(thread, dir, w.id)`
 /// at capture time, if any AND if `app`+`title` still match — the SAME
 /// identity gate [`shot_dims_for`] itself applies, exposed as its own
-/// accessor (issue #160 round-12 P1 #C) so a caller that wants to REASON
+/// accessor so a caller that wants to REASON
 /// about geometry drift (audit/forensics, or a future stricter check once a
 /// real per-window instance token exists — see [`shot_dims_for`]'s own doc
-/// for why that check does not live in this round's hot path) can do so
+/// for why that check does not live in this change's hot path) can do so
 /// without duplicating the lookup. Not consumed by any production caller
 /// yet — see [`shot_dims_for`]'s own doc for the two shipped, tested
-/// tolerances (round-10 P1 #B, round-11 P1 #D) that keep this deliberately
+/// tolerances that keep this deliberately
 /// unwired from the coordinate-mapping path today.
 #[doc(hidden)]
 pub fn shot_geometry_for(thread: i32, dir: &str, wt: Option<i32>, w: &WindowInfo) -> Option<(i32, i32, u32, u32)> {
@@ -908,8 +907,8 @@ pub fn shot_geometry_for(thread: i32, dir: &str, wt: Option<i32>, w: &WindowInfo
     }
 }
 
-/// Process-level nonce appended to every screenshot's filename (issue #160
-/// round-3 P2 §4): two `screenshot` calls for the SAME window landing in the
+/// Process-level nonce appended to every screenshot's filename
+/// : two `screenshot` calls for the SAME window landing in the
 /// SAME millisecond used to compute the IDENTICAL `<unix_ms>-<window_id>.png`
 /// path and race each other's `image::save` — whichever call's write lands
 /// second silently overwrites the first call's own PNG at that exact path,
@@ -924,14 +923,14 @@ static SHOT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// downscale it (see [`scale_capture`]/[`display_scale_for_dims`]), and write
 /// it to `out_dir/<unix_ms>-<id>-<seq>.png` (`out_dir` is created if missing)
 /// — the trailing `<seq>` is [`SHOT_SEQ`]'s own collision-proofing nonce
-/// (issue #160 round-3 P2 §4), not derived from anything about the capture
+/// , not derived from anything about the capture
 /// itself. The returned [`Screenshot`] carries the saved image's pixels
-/// in-memory (`Screenshot::pixels`, round-7 P1) precisely so `bus::
+/// in-memory (`Screenshot::pixels`) precisely so `bus::
 /// computer_srv` never has to re-open `path` off disk to build a preview/MCP-
 /// image payload — see that field's own doc for the reopen-after-save
 /// symlink/TOCTOU race this closes.
 ///
-/// round-7 P2: the recorded `scale` (and the saved pixel dimensions) are
+/// The recorded `scale` (and the saved pixel dimensions) are
 /// derived from `captured` — the frame actually returned by THIS call's own
 /// `capture_window`, taken AFTER `matched` was resolved — rather than from
 /// `matched`'s own (pre-capture) `width`/`height`. If the window resized in
@@ -949,15 +948,15 @@ static SHOT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// re-resolves a FRESH `WindowInfo` and recomputes the scale from ITS current
 /// dimensions on every call, with an out-of-range coordinate rejected rather
 /// than silently mismapped — real-machine HiDPI device-pixel-ratio
-/// calibration beyond that remains issue #160 §9.
+/// calibration beyond that remains follow-up work.
 ///
-/// round-7 P1: every successful save also best-effort prunes this
+/// Every successful save also best-effort prunes this
 /// `out_dir` down to [`MAX_RETAINED_SCREENSHOTS`] via
 /// [`prune_old_screenshots`] — an unbounded, always-growing set of on-disk
 /// PNGs per session directory is its own resource-exhaustion hazard once
 /// `screenshot` is Always/Full-granted and no longer needs a card per call.
 ///
-/// issue #160 round-5 review P2 §4: `bus::computer_srv::screenshot_out_dir`
+/// `bus::computer_srv::screenshot_out_dir`
 /// already walks every path component up through `out_dir` via
 /// `refuse_symlinks` BEFORE ever calling this function — but a worktree is
 /// repository-controlled content, so the window between THAT check and the
@@ -972,9 +971,9 @@ static SHOT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// this recheck would silently follow it) and BEFORE `image.save` ever
 /// touches the filesystem. This narrows, but does not fully close, the race:
 /// a swap landing in the still-open window between THIS check and the actual
-/// write remains a residual — see below (round-8 P2 #8 closes THAT leaf).
+/// write remains a residual — see below.
 ///
-/// issue #160 round-8 P2 #8: the actual on-disk write is no longer a bare
+/// the actual on-disk write is no longer a bare
 /// `image.save(&path)`. On unix, the PNG is now encoded straight into a file
 /// handle opened with `create_new` (O_EXCL) + `O_NOFOLLOW` + mode `0o600` —
 /// closing TWO gaps `image.save` alone left open:
@@ -995,12 +994,12 @@ static SHOT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Non-unix keeps the pre-existing `image.save(&path)` (no owner-only concept
 /// there this crate can portably act on).
 ///
-/// issue #160 round-14 P2: `create_new` above only guarantees the leaf didn't
+/// `create_new` above only guarantees the leaf didn't
 /// exist a moment ago — it says nothing about what happens if the
 /// SUBSEQUENT `write_to`/`flush` (or, on non-unix, `image.save`, which
 /// creates AND writes in one call) then fails. A full disk or a hit quota
 /// can trip well after the file itself was successfully created, and until
-/// this round that left an empty or truncated PNG sitting on disk under a
+/// this change that left an empty or truncated PNG sitting on disk under a
 /// name [`SHOT_SEQ`] guarantees this process never reuses — so nothing ever
 /// cleaned it up again: not a retry (the next call picks a brand-new name),
 /// and not [`prune_old_screenshots`] (it doesn't even run on this error
@@ -1022,8 +1021,8 @@ pub fn screenshot_window(
     screenshot_resolved(backend, &matched, out_dir)
 }
 
-/// Capture an ALREADY-RESOLVED window — issue #160 round-17 P1 (Codex
-/// computer_srv.rs:793). [`screenshot_window`] above resolves its query
+/// Capture an ALREADY-RESOLVED window.
+/// [`screenshot_window`] above resolves its query
 /// itself, which was one resolution too many for `bus::computer_srv`'s
 /// screenshot arm: that caller had ALREADY resolved and identity-verified its
 /// target (`resolve_and_verify_target`) an instant earlier, and handing this
@@ -1033,8 +1032,8 @@ pub fn screenshot_window(
 /// original. Taking the verified [`WindowInfo`] instead pins the capture to
 /// the exact identity the caller verified: there is no re-resolution left to
 /// drift, and if that window is gone — or its numeric id was REUSED by a
-/// different window (issue #160 round-32 P1, Codex os.rs:30: the backend's
-/// own capture-time enumeration now re-verifies `app`/`title` on the exact
+/// different window (the backend's
+/// own capture-time enumeration re-verifies `app`/`title` on the exact
 /// handle it is about to capture, not the id alone) — by capture time,
 /// `backend.capture_window(matched)` fails closed rather than falling back
 /// to a lookalike.
@@ -1044,7 +1043,7 @@ pub fn screenshot_resolved(
     out_dir: &Path,
 ) -> Result<Screenshot, ComputerError> {
     let captured = backend.capture_window(matched)?;
-    // round-7 P2: derive the recorded scale from THIS frame (`captured`), not
+    // Derive the recorded scale from THIS frame (`captured`), not
     // from `matched`'s own pre-capture geometry — see this function's own doc
     // comment for the resize-in-the-gap race this closes.
     let scale = display_scale_for_dims(captured.width, captured.height);
@@ -1067,7 +1066,7 @@ pub fn screenshot_resolved(
     let path = out_dir.join(format!("{unix_ms}-{}-{seq}.png", matched.id));
     let width = image.width();
     let height = image.height();
-    // round-8 P2 #8: owner-only, no-follow, exclusive-create write — see this
+    // Owner-only, no-follow, exclusive-create write — see this
     // function's own doc comment above for exactly which two gaps this closes
     // over the plain `image.save(&path)` this replaces.
     #[cfg(unix)]
@@ -1077,7 +1076,7 @@ pub fn screenshot_resolved(
         opt.write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
         let file = opt.open(&path).map_err(|e| ComputerError::Io(e.to_string()))?;
         let mut w = std::io::BufWriter::new(file);
-        // round-14 P2: from this point on, `path` definitely exists on disk
+        // From this point on, `path` definitely exists on disk
         // (just created by `create_new` above) — `cleanup_on_err` wraps the
         // write+flush so any failure below best-effort deletes that
         // now-incomplete file before this function's `?` returns the
@@ -1086,7 +1085,7 @@ pub fn screenshot_resolved(
             image
                 .write_to(&mut w, image::ImageFormat::Png)
                 .map_err(|e| ComputerError::Io(e.to_string()))?;
-            // issue #160 round-10 P2 #G: `write_to` only writes through the
+            // `write_to` only writes through the
             // `BufWriter` — it does NOT itself guarantee the final buffered
             // bytes reach the underlying file, and `BufWriter::drop` (which would
             // otherwise run implicitly at the end of this block) SILENTLY
@@ -1104,7 +1103,7 @@ pub fn screenshot_resolved(
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
-        // issue #160 round-20 P2 (Codex computer/mod.rs:1089): create the PNG
+        // create the PNG
         // with an owner-only DACL BEFORE any pixels are written — the Windows
         // analog of the unix `0o600` create above. Otherwise `image.save`
         // creates it under the (possibly permissive) inherited directory ACL,
@@ -1141,15 +1140,15 @@ pub fn screenshot_resolved(
         // `cleanup_on_err` guarantee as the branches above.
         cleanup_on_err(&path, || image.save(&path).map_err(|e| ComputerError::Io(e.to_string())))?;
     }
-    // round-7 P1: keep the just-saved pixels in memory instead of ever having
+    // Keep the just-saved pixels in memory instead of ever having
     // a caller re-open `path` to get them back — see `Screenshot::pixels`'s
     // own doc for the symlink/TOCTOU race that reopen would risk. `into_raw`
     // consumes `image`, so this runs only after the write above (which only
     // borrows it) has already finished.
     let pixels = CapturedImage { rgba: image.into_raw(), width, height };
 
-    // round-7 P1: best-effort retention cap — never fails a screenshot that
-    // already saved successfully just because pruning stumbled. round-13 P2:
+    // Best-effort retention cap — never fails a screenshot that
+    // already saved successfully just because pruning stumbled;
     // pass `&path` as `just_written` so THIS call's own file is exempt from
     // pruning no matter how it sorts — see `prune_old_screenshots`'s own doc.
     prune_old_screenshots(out_dir, MAX_RETAINED_SCREENSHOTS, Some(&path));
@@ -1165,7 +1164,7 @@ pub fn screenshot_resolved(
 }
 
 /// Best-effort corrupt-file cleanup wrapper for [`screenshot_window`]'s
-/// on-disk PNG write (issue #160 round-14 P2). `write` performs the actual
+/// on-disk PNG write. `write` performs the actual
 /// platform write (unix: `write_to` + `flush` into an already-`create_new`'d
 /// file handle; non-unix: `image.save`, which creates and writes in one
 /// call) and may fail AFTER it has already put bytes — or an empty file — on
@@ -1183,7 +1182,7 @@ fn cleanup_on_err<T>(path: &Path, write: impl FnOnce() -> Result<T, ComputerErro
     })
 }
 
-/// Per-session-directory screenshot retention cap (round-7 P1). An agent
+/// Per-session-directory screenshot retention cap. An agent
 /// needs recent visual context, not an unbounded history — once `screenshot`
 /// is Always/Full-granted it no longer surfaces a card per call, so nothing
 /// else in this module limits how many PNGs a looping agent can accumulate in
@@ -1193,7 +1192,7 @@ fn cleanup_on_err<T>(path: &Path, write: impl FnOnce() -> Result<T, ComputerErro
 const MAX_RETAINED_SCREENSHOTS: usize = 20;
 
 /// Delete this module's OWN screenshots in `out_dir` beyond the most recent
-/// `keep` (round-7 P1) — best-effort: any I/O error along the way is
+/// `keep` — best-effort: any I/O error along the way is
 /// silently skipped, since a cleanup failure must never turn an
 /// already-successful screenshot save into a call failure. Only touches
 /// files [`is_own_screenshot_filename`] recognizes as this module's own
@@ -1212,7 +1211,7 @@ const MAX_RETAINED_SCREENSHOTS: usize = 20;
 /// matter where it lands in the sort below — a caller holding this call's
 /// own `Screenshot::path` is guaranteed a file still exists there afterward.
 ///
-/// issue #160 round-13 P2: sorting used to be mtime-descending ONLY. On a
+/// sorting used to be mtime-descending ONLY. On a
 /// filesystem with coarse mtime resolution (some FAT-family/network
 /// filesystems round to whole seconds or worse), or simply several
 /// screenshots landing in the same tick, multiple entries can compare
@@ -1260,11 +1259,11 @@ fn prune_old_screenshots(out_dir: &Path, keep: usize, just_written: Option<&Path
     if shots.len() <= keep {
         return;
     }
-    // newest first: mtime descending, then round-13 P2's seq tiebreak.
+    // newest first: mtime descending, then the seq tiebreak.
     shots.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     for (_, _, path) in shots.into_iter().skip(keep) {
         if just_written.is_some_and(|p| p == path) {
-            // round-13 P2: this is the file THIS call's own caller just
+            // This is the file THIS call's own caller just
             // wrote — never delete it, even though it sorted past `keep`.
             continue;
         }
@@ -1275,7 +1274,7 @@ fn prune_old_screenshots(out_dir: &Path, keep: usize, just_written: Option<&Path
 /// Parse the trailing `<seq>` component out of a filename already confirmed
 /// by [`is_own_screenshot_filename`] to be this module's own
 /// `<unix_ms>-<window_id>-<seq>.png` naming — [`prune_old_screenshots`]'s
-/// round-13 P2 mtime-tie tiebreak; see that function's own doc. Never
+/// mtime-tie tiebreak; see that function's own doc. Never
 /// panics: a parse failure (shouldn't happen, since the caller only reaches
 /// this after `is_own_screenshot_filename` already confirmed all three
 /// components are non-empty and all-digit) falls back to `0` — worst case,
@@ -1291,7 +1290,7 @@ fn own_screenshot_seq(path: &Path) -> u64 {
 
 /// Whether `path`'s file name matches this module's OWN screenshot naming —
 /// `<unix_ms>-<window_id>-<seq>.png`, three all-digit, non-empty dash-
-/// separated components with a `.png` extension (round-7 P1). Only a file
+/// separated components with a `.png` extension. Only a file
 /// matching this is ever a candidate for [`prune_old_screenshots`] to delete
 /// — anything else living in the same directory (today: nothing; in
 /// principle, a `.weft` subdirectory or some unrelated file a human or
@@ -1311,7 +1310,7 @@ fn is_own_screenshot_filename(path: &Path) -> bool {
 /// Downscale `captured` to at most `max_long_edge` px on its long edge (the
 /// SAME triangle-filter rule [`scale_capture`] uses for the on-disk PNG, but
 /// parameterized so a caller can target a DIFFERENT size than the
-/// screenshot's own display scale — issue #160 M3-B's MCP `image` content
+/// screenshot's own display scale — the MCP `image` content
 /// block wants 1280px, the Ask-card thumbnail registry wants a smaller
 /// 640px), drop the alpha channel (JPEG has none — `to_rgb8` does this),
 /// encode at `quality` (1-100, [`image::codecs::jpeg::JpegEncoder`]'s own
@@ -1362,7 +1361,7 @@ pub fn encode_jpeg_data_uri(
     Ok(format!("data:image/jpeg;base64,{b64}"))
 }
 
-// —— control lock / input throttle / emergency stop (issue #160 M2) ——
+// —— control lock / input throttle / emergency stop ——
 //
 // Process-level, not per-thread/dir: the whole point is that exactly ONE
 // session drives the ONE real mouse/keyboard weft has access to, so both the
@@ -1376,8 +1375,8 @@ pub fn encode_jpeg_data_uri(
 struct ControlHolderState {
     thread: i32,
     dir: String,
-    /// The exact worktree this holder's session materialized into (issue #160
-    /// round-25 P1, Codex mod.rs:1552) — `None` for the lead lane (no
+    /// The exact worktree this holder's session materialized into
+    /// — `None` for the lead lane (no
     /// worktree). Two SIBLING worker sessions of one multi-repo direction share
     /// a single `(thread, dir)` and differ ONLY by `wt`; without it in the
     /// holder identity the second sibling read as the SAME holder and RENEWED
@@ -1386,10 +1385,10 @@ struct ControlHolderState {
     /// lease. Folded into every identity check ([`acquire_control`],
     /// [`release_control`], and `bus::computer_srv`'s post-queue rechecks) so a
     /// sibling is a DIFFERENT holder — the same `(thread, dir, wt)` triple the
-    /// per-session bearer already binds (round-13/14).
+    /// per-session bearer already binds.
     wt: Option<i32>,
-    /// The AUTHORITATIVE lease deadline, on the monotonic clock (issue #160
-    /// round-29 P2, Codex mod.rs:1625). This used to be the epoch-ms value
+    /// The AUTHORITATIVE lease deadline, on the monotonic clock
+    /// . This used to be the epoch-ms value
     /// below: a wall-clock correction BACKWARD after acquisition (NTP step, a
     /// manual change, resume-time correction) then kept the nominal 30s lease
     /// live for the whole rollback — the old session could keep renewing while
@@ -1404,8 +1403,8 @@ struct ControlHolderState {
     /// consulted for liveness — see `expires_at` above.
     expires_at_ms: u64,
     /// Whether THIS hold's OS-level global Escape shortcut registration has
-    /// actually finished and passed [`escape_guard_permits_control`] (issue
-    /// #160 round-15 P1, Codex mod.rs:1395) — `false` from the instant a
+    /// actually finished and passed [`escape_guard_permits_control`] —
+    /// `false` from the instant a
     /// FRESH hold is written in [`acquire_control`]'s locked section until
     /// its later, unlocked `sync_shortcut_state`/`escape_guard_permits_
     /// control` round-trip confirms the kill switch is actually live, then
@@ -1439,8 +1438,8 @@ struct ControlHolderState {
 pub struct ControlHolder {
     pub thread: i32,
     pub dir: String,
-    /// The exact worktree the holder's session materialized into (issue #160
-    /// round-25 P1) — `None` for the lead lane. Carried so the Settings banner
+    /// The exact worktree the holder's session materialized into
+    /// — `None` for the lead lane. Carried so the Settings banner
     /// and the post-queue lease rechecks in `bus::computer_srv` identify the
     /// holder by the SAME `(thread, dir, wt)` triple [`acquire_control`] keys
     /// on, and a sibling worker (same `(thread, dir)`, different `wt`) is never
@@ -1457,8 +1456,8 @@ pub struct ControlHolder {
 const CONTROL_LEASE_MS: u64 = 30_000;
 
 /// True while [`input_flight_guard`]'s returned guard is held — i.e. an input
-/// action is ACTIVELY injecting via the real backend right now (issue #160
-/// round-12 P1 #4). A bare `AtomicBool`, not a counter: `input_flight_guard`
+/// action is ACTIVELY injecting via the real backend right now
+/// . A bare `AtomicBool`, not a counter: `input_flight_guard`
 /// is backed by a single global `tokio::sync::Mutex<()>`, so at most one
 /// caller can ever hold it at a time — there is no multi-holder overlap to
 /// count.
@@ -1473,8 +1472,8 @@ fn input_in_flight() -> bool {
 }
 
 /// Whether a control-lease holder with monotonic deadline `expires_at` should
-/// still be treated as live at `now` — issue #160 round-12 P1 #4 (Codex 1198);
-/// both instants come from the monotonic clock since round-29 P2 (see
+/// still be treated as live at `now`;
+/// both instants come from the monotonic clock (see
 /// [`ControlHolderState::expires_at`]'s doc for the backward-correction hazard
 /// the epoch-ms comparison had).
 /// Normally just "hasn't hit its `CONTROL_LEASE_MS` sliding-window expiry
@@ -1482,7 +1481,7 @@ fn input_in_flight() -> bool {
 /// [`input_in_flight`] is true: a synchronous injection (a long `type`, or a
 /// blocking OS backend call) can legitimately run past `CONTROL_LEASE_MS`
 /// while still actively driving the desktop, and treating that as "expired"
-/// mid-injection is exactly the bug this round closes — the lease would read
+/// mid-injection is exactly the bug this change closes — the lease would read
 /// as abandoned, [`sync_shortcut_state`] would unregister the OS-level Escape
 /// kill switch, and the Settings banner (which polls [`control_state`]) would
 /// read "no holder" — BOTH Stop surfaces vanishing while an action is still
@@ -1501,7 +1500,7 @@ fn input_in_flight() -> bool {
 /// "Stop's own UI vanishes and the lease looks abandoned while that's
 /// happening", not "make an in-progress `type` stoppable mid-keystroke" —
 /// that would need the backend's own input calls broken into cancellable
-/// chunks, a larger change tracked separately (see round-5's own notes on
+/// chunks, a larger change tracked separately (see the earlier notes on
 /// this).
 fn holder_is_live(expires_at: std::time::Instant, now: std::time::Instant) -> bool {
     expires_at > now || input_in_flight()
@@ -1523,8 +1522,8 @@ fn control_mutex() -> &'static Mutex<Option<ControlHolderState>> {
     CONTROL.get_or_init(|| Mutex::new(None))
 }
 
-/// Test-only synchronization (issue #160 round-5 review — flake found while
-/// verifying this round's own test suite, not a NEW hazard this round
+/// Test-only synchronization (a real flake found while
+/// verifying this module's own test suite, not a NEW hazard the code
 /// introduces): every test — in THIS module's own `#[cfg(test)] mod tests`,
 /// or in `bus::computer_srv`'s separate one — that touches ANY process-wide,
 /// un-keyed static this module owns ([`control_mutex`], [`throttle_mutex`],
@@ -1580,13 +1579,13 @@ fn now_ms() -> u64 {
 /// forever. Callers are not required to pair this with
 /// [`release_control`].
 ///
-/// issue #160 review R1 #5: the FIRST successful hold of an otherwise-unheld
+/// the FIRST successful hold of an otherwise-unheld
 /// lease (nobody held it, or the previous lease had expired) — as opposed to
 /// a LIVE same-holder renewal — syncs the OS-level global Escape shortcut
 /// (see [`sync_shortcut_state`]), so it exists only while a lease is
 /// genuinely live.
 ///
-/// issue #160 round-15 P1 (Codex mod.rs:1395): a control-lease acquire and
+/// a control-lease acquire and
 /// the OS-level Escape registration it triggers were not serialized against
 /// EACH OTHER — a fresh hold writes the new `ControlHolderState` and releases
 /// the lock BEFORE its own `sync_shortcut_state`/`escape_guard_permits_
@@ -1614,7 +1613,7 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
     let sync_needed;
     {
         let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-        // issue #160 round-34 P2 (Codex computer_srv.rs:2800): refuse any
+        // refuse any
         // acquisition — fresh hold or renewal — while the stop latch is set,
         // checked INSIDE this lock so it is atomic against
         // [`trip_stop_latch`]'s own set-latch-then-`clear_control` sequence:
@@ -1632,7 +1631,7 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
         }
         match guard.as_ref() {
             Some(holder) => {
-                // issue #160 round-25 P1 (Codex mod.rs:1552): `wt` is part of
+                // `wt` is part of
                 // the holder identity, so a SIBLING worker session (same
                 // `(thread, dir)`, different worktree) is a DIFFERENT holder and
                 // gets `Busy` below rather than silently renewing this lease.
@@ -1683,9 +1682,9 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
         }
         // Apply the decision made above. A renewal (`sync_needed == false`)
         // only advances the sliding window IN PLACE, preserving `escape_
-        // ready: true` — rewriting the whole struct here (as this used to,
-        // pre-round-15) would silently reset it to `false` on every single
-        // renewal, permanently reopening the exact race this round closes.
+        // ready: true` — rewriting the whole struct here
+        // would silently reset it to `false` on every single
+        // renewal, permanently reopening the exact race this change closes.
         // Every other reachable path is a fresh hold and always starts
         // `escape_ready: false`.
         if sync_needed {
@@ -1703,23 +1702,23 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
             holder.expires_at_ms = now_ms().saturating_add(CONTROL_LEASE_MS);
         }
     }
-    // Synced OUTSIDE the mutex guard (issue #160 review R1 #5): the Escape
+    // Synced OUTSIDE the mutex guard: the Escape
     // callback spawns a task that eventually calls `clear_control`, which
     // takes this SAME mutex — acting while still holding the lock here would
     // risk a reentrant deadlock if that path ever collapsed onto this call
-    // synchronously. issue #160 round-4 P2 §4: this is why the DECISION
+    // synchronously. this is why the DECISION
     // ("does the shortcut need to change") is taken inside the lock above,
     // but the ACTUAL register/unregister call is [`sync_shortcut_state`] —
     // see that function's own doc for how it closes the race a bare
     // `register_global_escape()` call here would reopen.
     if sync_needed {
         sync_shortcut_state();
-        // issue #160 round-10 P1 #7 (Codex 1220): fail CLOSED if THIS fresh
+        // fail CLOSED if THIS fresh
         // hold needed a real Escape registration and it didn't actually
         // succeed — see `escape_guard_permits_control`'s own doc for the (no
         // subsystem vs. subsystem-but-rejected) distinction it encodes. A
         // renewal (`sync_needed == false`) skips this: it never attempted a
-        // NEW registration to begin with, and round-4 P2 §4's own design
+        // NEW registration to begin with, and the shortcut-sync design
         // already assumes an already-registered shortcut stays registered
         // for the life of a live lease.
         let permitted = escape_guard_permits_control(
@@ -1737,7 +1736,7 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
             }
             return Err(ComputerError::EscapeUnavailable);
         }
-        // issue #160 round-15 P1: registration for THIS fresh hold is now
+        // registration for THIS fresh hold is now
         // CONFIRMED — flip `escape_ready` so a same-holder renewal (any that
         // raced in earlier were refused with `EscapeRegistrationPending`
         // above and must simply retry) can proceed normally from here on.
@@ -1855,7 +1854,7 @@ pub fn release_control(thread: i32, dir: &str, wt: Option<i32>) {
 /// split out purely so a unit test can drive it and [`sync_shortcut_state`]
 /// as two SEPARATE steps with another caller's own full acquire/sync cycle
 /// injected in between — deterministically reproducing the exact
-/// interleaving issue #160 round-4 P2 §4 fixes (see this section's own top
+/// interleaving the decide-unlock-act shape fixes (see this section's own top
 /// doc comment) without depending on real thread scheduling. Not `pub`:
 /// [`control_state`] is still the only production entry point.
 fn control_state_detect_and_clear_if_expired() -> (Option<ControlHolder>, bool) {
@@ -1881,14 +1880,14 @@ fn control_state_detect_and_clear_if_expired() -> (Option<ControlHolder>, bool) 
 
 /// The current holder, or `None` when nobody holds it OR the lease expired.
 /// An expired lease is cleaned up right here (lazily, on read) rather than
-/// left for the next [`acquire_control`] to notice — issue #160 review R1
+/// left for the next [`acquire_control`] to notice
 /// #5: that lazy cleanup is also this module's other sync trigger for the
 /// OS-level global Escape shortcut (see [`sync_shortcut_state`]), since an
 /// expired lease means nobody is actually driving the desktop anymore.
 pub fn control_state() -> Option<ControlHolder> {
     let (result, expired) = control_state_detect_and_clear_if_expired();
     // Synced OUTSIDE the mutex guard — same reentrancy concern as
-    // `acquire_control`'s own sync call. issue #160 round-4 P2 §4: this is
+    // `acquire_control`'s own sync call. this is
     // the exact call site the race lived in — see [`sync_shortcut_state`]'s
     // own doc for how re-reading `control_mutex` fresh, right here, closes it.
     if expired {
@@ -1899,10 +1898,10 @@ pub fn control_state() -> Option<ControlHolder> {
 
 /// Unconditionally drop the lease, regardless of who (if anyone) holds it —
 /// the emergency-stop escape hatch (see [`emergency_stop`]), which must win
-/// even over a session that still believes it's mid-lease. issue #160 review
-/// R1 #5: also syncs the OS-level global Escape shortcut when there WAS a
+/// even over a session that still believes it's mid-lease. Also
+/// syncs the OS-level global Escape shortcut when there WAS a
 /// holder to clear (a no-op call when there wasn't one is skipped rather than
-/// attempted and swallowed) — issue #160 round-4 P2 §4: this call site has
+/// attempted and swallowed) — this call site has
 /// the EXACT SAME "decide, unlock, then act" shape `control_state`'s own
 /// lazy-expiry path does (and the OS-level Escape callback itself reaches
 /// this via `emergency_stop`), so it goes through the SAME serialized
@@ -1938,7 +1937,7 @@ pub fn clear_control() {
     }
 }
 
-/// issue #160 M2 kill switch: trip the in-memory latch (so every subsequent
+/// The kill switch: trip the in-memory latch (so every subsequent
 /// [`enabled`] call fails closed) AND clear the control lease (in case a
 /// call is already mid-flight against the old value), THEN best-effort
 /// persist `computer_use_enabled = false` to the DB for next launch.
@@ -1948,7 +1947,7 @@ pub fn clear_control() {
 /// for why the kill-switch surfaces must outlive the one uninterruptible
 /// backend call.
 ///
-/// issue #160 review R1 #1: latch first, persist second — the latch flip and
+/// latch first, persist second — the latch flip and
 /// the lease clear below happen BEFORE the DB write, and [`enabled`] only
 /// ever consults the latch first, so a `set_setting` failure (disk full, DB
 /// locked, ...) can never leave the kill switch fail-open for the rest of
@@ -1958,20 +1957,20 @@ pub fn clear_control() {
 /// the setting persisted when it didn't is its own kind of foot-gun — it is
 /// just not the FAIL-CLOSED mechanism itself anymore.
 ///
-/// issue #160 round-6 review P1 #1: the generation bump happens in the SAME
+/// the generation bump happens in the SAME
 /// locked critical section as the `stopped` flip (see [`StopState`]'s own
 /// doc) — so a `set_computer_use_enabled(true)` request that read
 /// [`stop_generation`] before this call started is guaranteed to see a
 /// DIFFERENT generation afterward, and its own later
 /// [`clear_emergency_stop`] call is refused rather than undoing THIS stop.
 ///
-/// issue #160 round-6 review P2 #6: on a persist failure, this also sets
+/// on a persist failure, this also sets
 /// [`STOP_PERSIST_FAILED`] — covering both callers (the Settings/command
-/// path AND the OS-level global Escape shortcut's own spawned call below),
-/// since round-4 only wired the frontend's error state to the command path's
-/// own local `.catch`, leaving the Escape path's failures silently dropped.
+/// path AND the OS-level global Escape shortcut's own spawned call below) —
+/// wiring only the frontend's error state to the command path's
+/// own local `.catch` left the Escape path's failures silently dropped.
 ///
-/// issue #160 round-8 P2 #3: also CLEARS [`STOP_PERSIST_FAILED`] on a
+/// also CLEARS [`STOP_PERSIST_FAILED`] on a
 /// successful persist — not just on an explicit [`clear_emergency_stop`], as
 /// before. Without this, a first `emergency_stop` call whose write failed
 /// (disk full, DB locked, …) would set the flag, and a human clicking Stop
@@ -1984,7 +1983,7 @@ pub fn clear_control() {
 /// still-failing `emergency_stop`'s `true` — only the MOST RECENT call, by
 /// generation, is allowed to record the flag's final value.
 ///
-/// issue #160 round-12 P1 #B/#F: split into [`trip_stop_latch`] (synchronous,
+/// split into [`trip_stop_latch`] (synchronous,
 /// no lock held across an `.await`, no DB touched at all — flips `stopped`,
 /// bumps the generation, clears the control lease) and [`persist_stop`] (the
 /// awaited DB write, now serialized on the SAME [`enable_serialize_mutex`] a
@@ -1995,14 +1994,14 @@ pub fn clear_control() {
 ///    cancel_gui_asks` to run strictly BEFORE the awaited DB write below —
 ///    see that method's own doc for the stale-card-then-Always race left
 ///    open when cancellation only ran AFTER this whole function returned
-///    (round-12 P1 #B). Both now call `trip_stop_latch` (latch flips
+///  . Both now call `trip_stop_latch` (latch flips
 ///    immediately, no await), then `cancel_gui_asks` (also immediate), then
 ///    `persist_stop` (the awaited write) — never this combined function.
-///  - `persist_stop` joining `enable_serialize_mutex` (round-12 P2 #F) is
+///  - `persist_stop` joining `enable_serialize_mutex` is
 ///    what makes the LAST call's own write win the DB row regardless of
 ///    which call's write happens to finish I/O first — see
 ///    `enable_serialize_mutex`'s own doc for the compensating-write race
-///    this closes on the Stop side (before this round, Stop's write ran
+///    this closes on the Stop side (before this change, Stop's write ran
 ///    OUTSIDE that lock entirely, so a slower Stop write could still land
 ///    AFTER a newer, explicit enable's write and silently revert it).
 ///
@@ -2010,14 +2009,14 @@ pub fn clear_control() {
 /// OTHER caller (tests driving the kill switch end to end; any future
 /// caller that has no `AskRegistry` to cancel against) — it is simply
 /// `trip_stop_latch` immediately followed by an awaited `persist_stop`, with
-/// no behavior change from before this round for a caller that never
+/// no behavior change from before this change for a caller that never
 /// observed the gap between the two.
 pub async fn emergency_stop(db: &crate::store::Db) -> Result<(), String> {
     let my_gen = trip_stop_latch();
     persist_stop(db, my_gen).await
 }
 
-/// The synchronous half of [`emergency_stop`] (issue #160 round-12 P1 #B/#F)
+/// The synchronous half of [`emergency_stop`]
 /// — flips the in-memory `stopped` latch, bumps the stop-generation, and
 /// clears the control lease, all WITHOUT touching the DB or crossing an
 /// `.await` point. Returns the NEW generation, to be threaded into
@@ -2037,11 +2036,11 @@ pub fn trip_stop_latch() -> u64 {
     my_gen
 }
 
-/// The awaited half of [`emergency_stop`] (issue #160 round-12 P1 #B/#F):
+/// The awaited half of [`emergency_stop`]:
 /// best-effort persists `computer_use_enabled = false` for `my_gen` (the
 /// generation [`trip_stop_latch`] just minted) and records
 /// [`STOP_PERSIST_FAILED`] under the SAME generation guard `emergency_stop`
-/// always used. Round-12 P2 #F: now serialized on [`enable_serialize_mutex`]
+/// always used. Serialized on [`enable_serialize_mutex`]
 /// — the SAME lock `commands::set_computer_use_enabled_inner` holds across
 /// its own read-generation/write/reconcile sequence — so Stop's own
 /// persisted write and an overlapping explicit enable's persisted write can
@@ -2049,11 +2048,11 @@ pub fn trip_stop_latch() -> u64 {
 /// [`trip_stop_latch`], before this ever acquires the lock), so `enabled()`
 /// fails closed for the ENTIRE time this sits queued behind an in-flight
 /// enable — queuing the PERSISTED write behind that lock never reopens the
-/// fail-open window round-6/round-8's own fixes closed, it only decides
+/// fail-open window the earlier fixes closed, it only decides
 /// which value the DISK ends up with once both writes land.
 pub async fn persist_stop(db: &crate::store::Db, my_gen: u64) -> Result<(), String> {
     let _serialize = enable_serialize_mutex().lock().await;
-    // issue #160 round-22 P2 (Codex computer/mod.rs:1849): only persist "false"
+    // only persist "false"
     // if THIS Stop is STILL the current truth. `enable_serialize_mutex` orders
     // lock ATTEMPTS, not the user-visible calls that preceded them — so a later
     // Settings re-enable that reached the lock FIRST has already written "true"
@@ -2071,7 +2070,7 @@ pub async fn persist_stop(db: &crate::store::Db, my_gen: u64) -> Result<(), Stri
     let result = crate::store::repo::set_setting(db, K_COMPUTER_USE_ENABLED, "false")
         .await
         .map_err(|e| e.to_string());
-    // round-8 P2 #3: only record THIS call's outcome if no NEWER
+    // Only record THIS call's outcome if no NEWER
     // `emergency_stop`/`trip_stop_latch` has since bumped the generation
     // again — otherwise that newer call owns writing the flag for its own
     // outcome, and a slow success here must never clear a newer failure it
@@ -2085,12 +2084,12 @@ pub async fn persist_stop(db: &crate::store::Db, my_gen: u64) -> Result<(), Stri
     result
 }
 
-/// issue #160 round-10 P2 #D / round-12 P2 #F: serializes every
+/// Serializes every
 /// `commands::set_computer_use_enabled_inner` call AND every [`persist_stop`]
 /// call — see `set_computer_use_enabled_inner`'s own doc for the enable-vs-
 /// enable compensating-write race this originally existed for, and
 /// [`persist_stop`]'s own doc for why Stop's persisted write joined this same
-/// queue (round-12 P2 #F): without it, Stop's write ran OUTSIDE this lock
+/// queue: without it, Stop's write ran OUTSIDE this lock
 /// entirely, so an enable request already past its own read-generation step
 /// could still have its `"true"` write land AFTER a slower Stop's `"false"`
 /// write, silently reverting an explicit, more recent Stop. Held across
@@ -2109,7 +2108,7 @@ pub fn enable_serialize_mutex() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-// —— OS-level global Escape (issue #160 review R1 #5) ——
+// —— OS-level global Escape ——
 //
 // The WebView's own keydown Esc handler only fires while WEFT ITSELF has
 // keyboard focus — but the normal shape of a computer-use session is that
@@ -2123,7 +2122,7 @@ pub fn enable_serialize_mutex() -> &'static tokio::sync::Mutex<()> {
 // for the whole app lifetime — so it doesn't permanently steal the system
 // Escape key from every other app on the human's desktop.
 //
-// issue #160 round-4 P2 §4: `control_state`'s lazy-expiry cleanup used to
+// `control_state`'s lazy-expiry cleanup used to
 // decide "expired, nobody holds it anymore" INSIDE the `control_mutex`
 // guard, then call `unregister_global_escape()` AFTER releasing it. Between
 // that release and the unregister call actually running, a brand-new
@@ -2175,8 +2174,8 @@ fn escape_shortcut() -> tauri_plugin_global_shortcut::Shortcut {
 /// no subsystem here at all to have failed, so [`sync_shortcut_state`]/
 /// [`acquire_control`] treat that as "nothing to fail on" — see
 /// [`escape_guard_permits_control`]'s own doc for the full (no subsystem vs.
-/// subsystem-but-rejected) split this feeds. `Err` (issue #160 round-10 P1
-/// #7, Codex 1220) ONLY when an app handle IS installed and the OS itself
+/// subsystem-but-rejected) split this feeds. `Err`
+/// ONLY when an app handle IS installed and the OS itself
 /// refused the registration (already grabbed by another app, unsupported
 /// platform/desktop environment, ...) — logged here (same as before this
 /// round) AND now propagated so [`acquire_control`] can fail CLOSED instead
@@ -2184,7 +2183,7 @@ fn escape_shortcut() -> tauri_plugin_global_shortcut::Shortcut {
 fn register_global_escape() -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
     let Some(app) = APP_HANDLE.get() else { return Ok(()) };
-    // issue #160 round-22 P1 (Codex computer/mod.rs:2081): clear any prior
+    // clear any prior
     // bare-Escape registration FIRST. A control lease that EXPIRED between the
     // banner's cleanup polls leaves the OLD shortcut still registered at the OS;
     // registering the same accelerator again then fails ("already registered"),
@@ -2205,7 +2204,7 @@ fn register_global_escape() -> Result<(), String> {
         tauri::async_runtime::spawn(async move {
             use tauri::Manager as _;
             let db = app.state::<crate::store::Db>().inner().clone();
-            // issue #160 round-12 P1 #B: `trip_stop_latch` (immediate, no
+            // `trip_stop_latch` (immediate, no
             // await) THEN `cancel_gui_asks` (also immediate) THEN
             // `persist_stop` (the awaited DB write) — never the combined
             // `emergency_stop` wrapper. Before this split, cancellation ran
@@ -2248,7 +2247,7 @@ fn unregister_global_escape() {
 }
 
 /// Serializes EVERY register/unregister decision+call for the OS-level
-/// global Escape shortcut (issue #160 round-4 P2 §4 — see this section's own
+/// global Escape shortcut (see this section's own
 /// top doc comment for the race this closes). A mutex of its OWN, SEPARATE
 /// from `control_mutex` — never held at the same time as it (only ever
 /// locked from inside [`sync_shortcut_state`], which takes and releases
@@ -2264,7 +2263,7 @@ fn shortcut_mutex() -> &'static Mutex<()> {
 }
 
 /// Test-only observability for [`sync_shortcut_state`]'s own decisions
-/// (issue #160 round-4 P2 §4) — `register_global_escape`/
+///  — `register_global_escape`/
 /// `unregister_global_escape` both silently no-op without a
 /// `tauri::AppHandle` (see their own doc comments), which `cargo test --lib`
 /// never installs, so a test can't observe the real OS-level call directly.
@@ -2278,8 +2277,8 @@ static SHORTCUT_REGISTER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static SHORTCUT_UNREGISTER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the LAST time [`sync_shortcut_state`] attempted a registration
-/// (i.e. found a live holder), that attempt actually succeeded — issue #160
-/// round-10 P1 #7. `true` is also the resting/default value for the
+/// (i.e. found a live holder), that attempt actually succeeded.
+/// `true` is also the resting/default value for the
 /// no-live-holder case (`sync_shortcut_state`'s `unregister` branch resets it
 /// there): with no lease held, there is nothing for a NEXT `acquire_control`
 /// to have inherited a stale failure from — that next acquire runs its OWN
@@ -2291,7 +2290,7 @@ static SHORTCUT_UNREGISTER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static ESCAPE_REGISTER_OK: AtomicBool = AtomicBool::new(true);
 
 /// Bring the OS-level global Escape shortcut's registration in line with the
-/// control lease's CURRENT truth (issue #160 round-4 P2 §4) — the ONE choke
+/// control lease's CURRENT truth — the ONE choke
 /// point [`acquire_control`], [`control_state`], and [`clear_control`] all
 /// go through instead of calling `register_global_escape`/
 /// `unregister_global_escape` directly. [`shortcut_mutex`] ensures at most
@@ -2313,7 +2312,7 @@ fn sync_shortcut_state() {
         #[cfg(test)]
         SHORTCUT_REGISTER_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
         let result = register_global_escape();
-        // issue #160 round-10 P1 #7: recorded regardless of whether THIS
+        // recorded regardless of whether THIS
         // particular sync came from `acquire_control` — `control_state`'s
         // lazy-expiry path and `clear_control` only ever call this when
         // `holder_live` is false (their own holder just went away), so the
@@ -2335,8 +2334,8 @@ fn sync_shortcut_state() {
 /// Whether an acquire that just (re)synced the OS-level Escape shortcut may
 /// proceed granting control, given (a) whether a real `tauri::AppHandle`
 /// subsystem is even installed and (b) — only when it is — whether the
-/// actual registration attempt succeeded. issue #160 round-10 P1 #7 (Codex
-/// 1220). Pure/synchronous so this exact fail-closed judgment call is
+/// actual registration attempt succeeded.
+/// Pure/synchronous so this exact fail-closed judgment call is
 /// unit-testable without a real `tauri::AppHandle`/global-shortcut backend
 /// (`cargo test --lib` never has one — see [`register_global_escape`]'s own
 /// doc) — `acquire_control` composes it with `APP_HANDLE.get().is_some()` and
@@ -2395,15 +2394,15 @@ pub fn throttle_input() -> Result<(), ComputerError> {
 
 /// The instant the last input action was actually DISPATCHED to the OS
 /// backend — a separate clock from [`throttle_mutex`], which records
-/// ADMISSION time (issue #160 round-26 P2, Codex computer_srv.rs:1006).
+/// ADMISSION time.
 fn dispatch_pace_mutex() -> &'static Mutex<Option<Instant>> {
     static PACE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
     PACE.get_or_init(|| Mutex::new(None))
 }
 
 /// Enforce the [`THROTTLE_MS`] gap at DISPATCH time, on the blocking thread
-/// that is about to call the OS backend (issue #160 round-26 P2, Codex
-/// computer_srv.rs:1006). The admission throttle ([`throttle_input`]) alone
+/// that is about to call the OS backend.
+/// The admission throttle ([`throttle_input`]) alone
 /// cannot hold the advertised ~2-actions/second promise: while one slow
 /// action holds the flight guard, later calls can be ADMITTED ≥500ms apart,
 /// queue on the mutex, and then — once the slow holder releases — execute
@@ -2433,7 +2432,7 @@ pub fn pace_backend_dispatch() {
 }
 
 /// Process-wide input mutex serializing input-action calls END TO END
-/// (issue #160 review R1 #3). [`acquire_control`] only blocks a DIFFERENT
+/// . [`acquire_control`] only blocks a DIFFERENT
 /// `(thread, dir)` from taking over the lease — it does nothing to stop the
 /// SAME session from issuing two concurrent `tools/call`s, which would
 /// otherwise race each other straight into the OS backend and interleave
@@ -2450,7 +2449,7 @@ pub fn pace_backend_dispatch() {
 pub async fn input_flight_guard() -> InputFlightGuard {
     static FLIGHT: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     let inner = FLIGHT.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
-    // issue #160 round-12 P1 #4: flip the in-flight latch the INSTANT this
+    // flip the in-flight latch the INSTANT this
     // guard is actually acquired (not merely requested) — see
     // `holder_is_live`'s own doc for what this keeps alive while true.
     INPUT_IN_FLIGHT.store(true, Ordering::SeqCst);
@@ -2459,7 +2458,7 @@ pub async fn input_flight_guard() -> InputFlightGuard {
 
 /// The guard [`input_flight_guard`] returns — wraps the underlying
 /// `tokio::sync::MutexGuard` purely so `Drop` can clear [`INPUT_IN_FLIGHT`]
-/// the instant the caller's injection finishes (issue #160 round-12 P1 #4),
+/// the instant the caller's injection finishes,
 /// symmetric with the `store(true, ..)` in `input_flight_guard` itself. Every
 /// existing caller (`bus::computer_srv`'s input arms, this module's own
 /// tests) only ever binds this to a `let _guard = ...` / `let held = ...`
@@ -2497,7 +2496,7 @@ impl Drop for InputFlightGuard {
     }
 }
 
-// —— key combo grammar (issue #160 M2) ——
+// —— key combo grammar ——
 
 /// One token out of a `"cmd+s"`-shaped key combo string, parsed by
 /// [`parse_key_combo`]. Kept as its own pure enum/function — no `enigo`
@@ -2522,7 +2521,7 @@ pub enum KeyToken {
 }
 
 /// The closed set of named (non-modifier, non-printable) keys this module
-/// recognizes in a combo string — exactly the keys issue #160 M2's spec
+/// recognizes in a combo string — exactly the keys the computer-use spec
 /// calls out, not an attempt to cover every key `enigo` itself knows about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamedKey {
@@ -2561,7 +2560,7 @@ pub enum NamedKey {
 /// multi-character word (`"bogus_key"`) is [`ComputerError::Unsupported`]
 /// with a reason, never silently dropped.
 ///
-/// issue #160 round-8 P2 #6: every token EXCEPT THE LAST must itself be a
+/// every token EXCEPT THE LAST must itself be a
 /// modifier (`KeyToken::Meta`/`Control`/`Alt`/`Shift`) — `"a+b"` or
 /// `"ctrl+a+b"` used to pass this check (each individual token is a valid
 /// `KeyToken` on its own), but `os.rs`'s own `key()` then blindly treats
@@ -2654,7 +2653,7 @@ mod tests {
     use super::*;
     use crate::store::Db;
 
-    /// A monotonic deadline strictly in the past — the round-29 replacement
+    /// A monotonic deadline strictly in the past — the earlier replacement
     /// for the old `now_ms().saturating_sub(1)` expiry-forcing writes. The
     /// `checked_sub` fallback (`now` itself) still reads as expired:
     /// [`holder_is_live`] requires `expires_at > now`, and the clock can only
@@ -2712,7 +2711,7 @@ mod tests {
         assert!(!is_excluded("Safari"));
     }
 
-    /// issue #160 round-5 review P2 §5: the newly-added terminal emulators
+    /// the newly-added terminal emulators
     /// are excluded, case-insensitively, exactly like the pre-existing
     /// entries — and an unrelated app is still not swept in by the expansion.
     #[test]
@@ -2841,14 +2840,14 @@ mod tests {
         assert_eq!(shot.width, 1280);
         assert_eq!(shot.height, 720);
         assert_eq!(shot.scale, 0.5);
-        // issue #160 round-6 review P2 #4: the id of the window actually
+        // the id of the window actually
         // captured, not something a caller must re-resolve `query` to get.
         assert_eq!(shot.window_id, 9);
         let opened = image::open(&shot.path).unwrap();
         assert_eq!((opened.width(), opened.height()), (1280, 720));
     }
 
-    /// issue #160 round-8 P2 #8: the saved PNG must be owner-only (`0600`),
+    /// the saved PNG must be owner-only (`0600`),
     /// never the `image.save` default (`0644`, world/group-readable modulo
     /// umask) — a worktree in a shared/traversable directory must not leave
     /// screenshots (which can carry mail/browser/password-manager pixels)
@@ -2874,7 +2873,7 @@ mod tests {
         );
     }
 
-    /// issue #160 round-3 P2 §4: two `screenshot_window` calls for the SAME
+    /// two `screenshot_window` calls for the SAME
     /// window with the SAME args (so a naive `<unix_ms>-<id>.png` filename
     /// scheme could genuinely collide if both land in the same millisecond)
     /// must never overwrite each other — each gets its own path, and both
@@ -2897,13 +2896,13 @@ mod tests {
         assert!(shot2.path.exists());
     }
 
-    /// issue #160 round-5 review P2 §4: `out_dir` itself is ALREADY a symlink
+    /// `out_dir` itself is ALREADY a symlink
     /// to an outside directory by the time `screenshot_window` runs — standing
     /// in for the TOCTOU window between `bus::computer_srv::screenshot_out_dir`'s
     /// own EARLIER `refuse_symlinks` check and this function's own write.
     /// `create_dir_all` is a no-op here (the symlink already resolves to a
     /// real, existing directory) and does NOT itself error — so only the
-    /// dedicated `symlink_metadata` recheck this round adds can catch it. Must
+    /// dedicated `symlink_metadata` recheck this change adds can catch it. Must
     /// refuse with `ComputerError::Io`, and must never write the PNG through
     /// the symlink into the outside directory.
     #[cfg(unix)]
@@ -2938,7 +2937,7 @@ mod tests {
         let _ = std::fs::remove_file(&base);
     }
 
-    // —— Screenshot::pixels stay in memory (issue #160 round-7 P1) ——
+    // —— Screenshot::pixels stay in memory ——
 
     #[test]
     fn screenshot_window_pixels_are_the_in_memory_scaled_image_not_a_disk_reread() {
@@ -2971,7 +2970,7 @@ mod tests {
         );
     }
 
-    // —— recorded scale comes from the captured frame (issue #160 round-7 P2) ——
+    // —— recorded scale comes from the captured frame ——
 
     #[test]
     fn screenshot_window_derives_scale_from_the_captured_frame_not_a_stale_resolve() {
@@ -2999,7 +2998,7 @@ mod tests {
         assert_eq!(shot.pixels.height, expected.height());
     }
 
-    // —— cleanup_on_err (issue #160 round-14 P2) ——
+    // —— cleanup_on_err ——
 
     #[test]
     fn cleanup_on_err_removes_a_file_left_behind_by_a_failed_write() {
@@ -3054,7 +3053,7 @@ mod tests {
         assert!(path.exists(), "cleanup must never touch a file after a successful write");
     }
 
-    // —— prune_old_screenshots (issue #160 round-7 P1) ——
+    // —— prune_old_screenshots ——
 
     #[cfg(unix)]
     fn set_mtime(path: &Path, seconds_from_epoch: u64) {
@@ -3143,8 +3142,8 @@ mod tests {
 
         // Four own-named files, all given the EXACT same mtime — standing in
         // for a coarse-mtime filesystem, or several screenshots landing in
-        // the same tick, where mtime alone can't order them (issue #160
-        // round-13 P2). `seq` (the filename's third component) is the only
+        // the same tick, where mtime alone can't order them
+        // . `seq` (the filename's third component) is the only
         // thing that still tells them apart, and higher `seq` is newer.
         let mut paths = Vec::new();
         for seq in 0..4u64 {
@@ -3223,7 +3222,7 @@ mod tests {
         assert_eq!(own_screenshot_seq(Path::new("1-2.png")), 0);
     }
 
-    // —— encode_jpeg_data_uri (issue #160 M3-B) ——
+    // —— encode_jpeg_data_uri ——
 
     #[test]
     fn encode_jpeg_data_uri_produces_a_decodable_jpeg_with_the_right_prefix() {
@@ -3262,7 +3261,7 @@ mod tests {
         assert!(matches!(err, ComputerError::CaptureFailed(_)));
     }
 
-    // —— map_to_physical (issue #160 M2) ——
+    // —— map_to_physical ——
 
     #[test]
     fn map_to_physical_scales_and_offsets_a_screenshot_coordinate() {
@@ -3305,7 +3304,7 @@ mod tests {
 
     #[test]
     fn map_to_physical_rejects_the_exclusive_upper_bound_and_accepts_the_last_valid_coordinate() {
-        // issue #160 review R1 #2: `cx == scaled_w` (here 1280) must be
+        // `cx == scaled_w` (here 1280) must be
         // rejected — it's one past the last real pixel column — while
         // `cx == scaled_w - 1` (1279), the actual last valid column, is
         // accepted.
@@ -3348,7 +3347,7 @@ mod tests {
         assert_eq!((px, py), (110, 70));
     }
 
-    // —— map_screenshot_coord / recent_shot_dims (issue #160 round-11 P1 #D) ——
+    // —— map_screenshot_coord / recent_shot_dims ——
 
     /// The end-to-end property this fix exists for: a screenshot taken at
     /// 1280x800, the window later resized DOWN to 1000x600 (only the SIZE
@@ -3423,7 +3422,7 @@ mod tests {
 
     #[test]
     fn map_screenshot_coord_clamps_the_far_edge_inside_a_shrunk_window() {
-        // issue #160 round-23 P2 (Codex computer/mod.rs:677): a window that
+        // a window that
         // SHRANK to 100x100 since a 1280x800 screenshot. The far in-bounds
         // screenshot corner (1279, 799) proportionally rounds UP to the window's
         // EXCLUSIVE edge (offset 100 on a 100-wide window) — clamping holds it at
@@ -3450,8 +3449,8 @@ mod tests {
 
     /// A `WindowInfo` for `shot_dims_for`/`record_shot_dims` identity tests.
     /// `id`/`app`/`title` decide `shot_dims_for`'s own hit/miss gate;
-    /// geometry (`x`/`y`/`width`/`height`) is recorded alongside them (issue
-    /// #160 round-12 P1 #C) and readable via `shot_geometry_for`, but is
+    /// geometry (`x`/`y`/`width`/`height`) is recorded alongside them
+    /// and readable via `shot_geometry_for`, but is
     /// NOT part of `shot_dims_for`'s own gate — see that function's own doc
     /// for why. Defaults to `(0, 0, 0, 0)`; tests that care about geometry
     /// pass their own explicit values instead of this helper.
@@ -3480,7 +3479,7 @@ mod tests {
         );
     }
 
-    /// issue #160 round-26 P2 (Codex mod.rs:797): SIBLING worker sessions of
+    /// SIBLING worker sessions of
     /// one multi-repo direction — same `(thread, dir)`, different `wt` — keep
     /// SEPARATE dimension records for the same window. Worker A screenshotting
     /// after a resize must never overwrite the dims worker B's approved input
@@ -3514,7 +3513,7 @@ mod tests {
         );
     }
 
-    /// issue #160 round-12 P1 #2: the exact property this round closes — an
+    /// the exact property this change closes — an
     /// id REUSED by a different window (same numeric id, different app/title)
     /// must read as no record at all, fail-closed, never a stale hit against
     /// the OLD window's saved geometry.
@@ -3536,10 +3535,10 @@ mod tests {
         );
     }
 
-    // —— issue #160 round-12 P1 #C: capture-time geometry is recorded and
+    // —— capture-time geometry is recorded and
     // readable, deliberately NOT folded into `shot_dims_for`'s own gate ——
 
-    /// The data-layer half of round-12 P1 #C: `record_shot_dims` now ALSO
+    /// The data-layer half of geometry recording: `record_shot_dims` ALSO
     /// captures `w`'s own `(x, y, width, height)` at capture time, and
     /// `shot_geometry_for` returns EXACTLY that — round-tripped, not derived
     /// or approximated.
@@ -3583,10 +3582,10 @@ mod tests {
     }
 
     /// The exact residual `shot_dims_for`'s own doc calls out BY DESIGN: an
-    /// id+app+title match with DIFFERENT geometry (the narrow slice round-12
-    /// P1 #C set out to close) still returns `Some` — deliberately, because
-    /// this exact shape is ALSO what a legitimate resize (round-11 P1 #D) or
-    /// activation-driven reposition (round-10 P1 #B) produces, and neither
+    /// id+app+title match with DIFFERENT geometry
+    /// still returns `Some` — deliberately, because
+    /// this exact shape is ALSO what a legitimate resize or
+    /// activation-driven reposition produces, and neither
     /// of those may regress. `shot_geometry_for`, called alongside, proves
     /// the drift is at least OBSERVABLE (not silently lost) even though
     /// `shot_dims_for` does not act on it — seeded to make this
@@ -3621,7 +3620,7 @@ mod tests {
         assert_eq!(
             shot_dims_for(921_003, "lead", None, &moved),
             Some((1280, 800)),
-            "id+app+title still match — shot_dims_for must not regress round-10/round-11's \
+            "id+app+title still match — shot_dims_for must not regress the \
              resize/move tolerance"
         );
         // But the geometry drift itself is NOT hidden — a caller that wants
@@ -3634,7 +3633,7 @@ mod tests {
         );
     }
 
-    // —— control lock (issue #160 M2) ——
+    // —— control lock ——
 
     #[test]
     fn control_lock_busy_expiry_release_and_clear() {
@@ -3642,7 +3641,7 @@ mod tests {
         // (`control_mutex`), so this one test exercises the whole lifecycle
         // sequentially rather than each phase getting its own `#[test]` —
         // splitting them would let `cargo test`'s parallel test threads
-        // stomp on each other's lock state. issue #160 round-5 review:
+        // stomp on each other's lock state.
         // `process_state_test_lock` ALSO serializes this against every OTHER
         // test (in this file or `bus::computer_srv`'s) that touches the same
         // family of un-keyed globals — see that function's own doc for why
@@ -3690,7 +3689,7 @@ mod tests {
         assert!(control_state().is_none());
     }
 
-    /// issue #160 round-25 P1 (Codex mod.rs:1552): two SIBLING worker sessions
+    /// two SIBLING worker sessions
     /// of one multi-repo direction share a single `(thread, dir)` and differ
     /// ONLY by `wt`. The second sibling must be a DIFFERENT holder — it gets
     /// `Busy` while the first holds the lease, never a silent renewal that
@@ -3734,7 +3733,7 @@ mod tests {
         clear_control();
     }
 
-    // —— issue #160 round-4 P2 §4: the Escape-shortcut unregister race ——
+    // —— the Escape-shortcut unregister race ——
     //
     // Shares the SAME process-wide `control_mutex`/`shortcut_mutex` statics
     // as every other control-lock test in this file — kept as its own
@@ -3754,7 +3753,7 @@ mod tests {
     /// trusting the stale `expired = true` it was handed.
     #[test]
     fn escape_shortcut_sync_survives_a_new_acquire_racing_in_before_a_belated_cleanup_runs() {
-        // issue #160 round-5 review: see `process_state_test_lock`'s own doc —
+        // see `process_state_test_lock`'s own doc —
         // this test's own `SHORTCUT_*_ATTEMPTS` counter assertions are exact
         // counts, so it's especially sensitive to another test's `acquire_control`/
         // `clear_control` call incrementing them concurrently.
@@ -3817,7 +3816,7 @@ mod tests {
 
     #[tokio::test]
     async fn emergency_stop_disables_the_setting_and_clears_control() {
-        // issue #160 round-5 review: see `process_state_test_lock`'s own doc.
+        // see `process_state_test_lock`'s own doc.
         let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let db = Db::connect("sqlite::memory:").await.unwrap();
         crate::store::repo::set_setting(&db, K_COMPUTER_USE_ENABLED, "true")
@@ -3837,7 +3836,7 @@ mod tests {
         clear_emergency_stop(stop_generation());
     }
 
-    // —— emergency-stop latch (issue #160 review R1 #1) ——
+    // —— emergency-stop latch ——
 
     #[tokio::test]
     async fn emergency_stop_latch_wins_over_a_true_setting_until_explicitly_cleared() {
@@ -3847,8 +3846,8 @@ mod tests {
         // latch lifecycle sequentially, ending with the latch cleared again,
         // rather than splitting it across tests that could interleave with
         // each other (or with `enabled_reads_true_false_and_missing` below)
-        // under `cargo test`'s default parallel test threads. issue #160
-        // round-5 review: that risk was previously only DOCUMENTED, not
+        // under `cargo test`'s default parallel test threads. That risk
+        // was previously only DOCUMENTED, not
         // actually enforced — `process_state_test_lock` closes it for real.
         let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let db = Db::connect("sqlite::memory:").await.unwrap();
@@ -3874,7 +3873,7 @@ mod tests {
         clear_emergency_stop(stop_generation());
     }
 
-    /// issue #160 round-6 review P1 #1: reproduces the exact race the
+    /// reproduces the exact race the
     /// generation check exists to close — a `set_computer_use_enabled(true)`
     /// request reads the stop-generation, then (while its own DB write is
     /// still "in flight" here, simulated by simply not having called
@@ -3926,7 +3925,7 @@ mod tests {
         clear_emergency_stop(stop_generation());
     }
 
-    /// issue #160 round-6 review P2 #6: a persist failure inside
+    /// a persist failure inside
     /// `emergency_stop` (here: a read-only sqlite connection, standing in for
     /// a real disk-full/read-only-filesystem `set_setting` failure) must set
     /// `STOP_PERSIST_FAILED` — and a SUCCESSFUL `clear_emergency_stop` must
@@ -3964,7 +3963,7 @@ mod tests {
         clear_emergency_stop(stop_generation());
     }
 
-    /// issue #160 round-8 P2 #3: a successful RETRY of `emergency_stop` (a
+    /// a successful RETRY of `emergency_stop` (a
     /// human clicking Stop again after an earlier attempt's own persist
     /// failed) must clear `STOP_PERSIST_FAILED` on its own — the horizontal
     /// case `clear_emergency_stop`'s own reset does NOT cover, since nothing
@@ -3991,7 +3990,7 @@ mod tests {
         assert!(second.is_ok(), "the retry's own write must succeed against a writable connection");
         assert!(
             !stop_persist_failed(),
-            "round-8 P2 #3: a successful retry must clear the flag on its own — the human's \
+            "a successful retry must clear the flag on its own — the human's \
              \"try again\" action must be able to make the warning go away without a SEPARATE \
              re-enable-from-Settings round trip"
         );
@@ -3999,7 +3998,7 @@ mod tests {
         clear_emergency_stop(stop_generation());
     }
 
-    /// issue #160 round-8 P2 #3: the generation guard around recording
+    /// the generation guard around recording
     /// `STOP_PERSIST_FAILED` — an OLDER, slower `emergency_stop` call finishing
     /// AFTER a NEWER one already landed and recorded its own outcome must
     /// never overwrite that newer outcome. Reproduced by hand (real
@@ -4053,7 +4052,7 @@ mod tests {
         clear_emergency_stop(stop_generation());
     }
 
-    // —— input throttle (issue #160 M2) ——
+    // —— input throttle ——
 
     #[test]
     fn throttle_input_rejects_a_second_call_inside_the_window() {
@@ -4065,7 +4064,7 @@ mod tests {
         assert!(matches!(err, ComputerError::RateLimited { wait_ms } if wait_ms > 0 && wait_ms <= THROTTLE_MS));
     }
 
-    // —— input flight guard (issue #160 review R1 #3) ——
+    // —— input flight guard ——
 
     #[tokio::test]
     async fn input_flight_guard_serializes_concurrent_acquires() {
@@ -4194,7 +4193,7 @@ mod tests {
         clear_control();
     }
 
-    /// issue #160 round-12 P1 #4: the property this round exists for — while
+    /// the property this change exists for — while
     /// `input_flight_guard`'s guard is held, a control lease whose own timer
     /// already lapsed must keep reporting as live (both to `control_state`'s
     /// own poll, the Settings banner's source, AND to the OS-level Escape
@@ -4230,7 +4229,7 @@ mod tests {
         // `sync_shortcut_state`'s own attempt counters (no real `AppHandle`
         // in `cargo test --lib`, so the underlying OS call itself always
         // no-ops regardless — see `register_global_escape`'s own doc — but
-        // the DECISION of which branch to take is exactly what this round
+        // the DECISION of which branch to take is exactly what this change
         // changed).
         let unregister_before = SHORTCUT_UNREGISTER_ATTEMPTS.load(Ordering::SeqCst);
         sync_shortcut_state();
@@ -4257,7 +4256,7 @@ mod tests {
         clear_control();
     }
 
-    // —— OS-level global Escape (issue #160 review R1 #5) ——
+    // —— OS-level global Escape ——
 
     #[test]
     fn register_and_unregister_global_escape_noop_without_an_app_handle() {
@@ -4266,7 +4265,7 @@ mod tests {
         // stays `None` for the whole process — both calls must silently
         // no-op rather than panic (there is no live runtime-behavior test
         // possible here; see the task's own verification-scope note).
-        // issue #160 round-10 P1 #7: `register_global_escape` now returns a
+        // `register_global_escape` now returns a
         // `Result` — the no-`APP_HANDLE` case must still be `Ok`, never an
         // `Err` that would fail-close every single-threaded test in this
         // crate closed (see `escape_guard_permits_control`'s own doc).
@@ -4274,7 +4273,7 @@ mod tests {
         unregister_global_escape();
     }
 
-    // —— issue #160 round-10 P1 #7: fail-closed Escape registration ——
+    // —— fail-closed Escape registration ——
 
     #[test]
     fn escape_guard_permits_control_only_fails_closed_when_a_real_subsystem_rejected_it() {
@@ -4310,7 +4309,7 @@ mod tests {
         clear_control();
     }
 
-    // —— issue #160 round-15 P1: registration-pending leases (Codex mod.rs:1395) ——
+    // —— registration-pending leases ——
 
     /// A fresh hold in THIS test binary (no `APP_HANDLE`, so
     /// `escape_guard_permits_control(false, _)` always permits — see
@@ -4334,7 +4333,7 @@ mod tests {
         clear_control();
     }
 
-    /// The end-to-end property round-15 exists for: a holder whose OWN
+    /// The end-to-end property the escape_ready flag exists for: a holder whose OWN
     /// registration is still in flight (`escape_ready: false`) must not be
     /// inherited by ANY later `acquire_control` call — not a same-holder
     /// renewal (would race straight past the flight guard with no confirmed
@@ -4401,7 +4400,7 @@ mod tests {
         clear_control();
     }
 
-    /// issue #160 round-34 P2 (Codex computer_srv.rs:2800): no lease can be
+    /// no lease can be
     /// installed while the stop latch is set — a stale already-approved
     /// request racing Emergency Stop must not resurrect the control banner
     /// and global Escape interception after a successful Stop. Normal
@@ -4424,7 +4423,7 @@ mod tests {
         clear_control();
     }
 
-    /// issue #160 round-29 P2 (Codex mod.rs:1625): lease liveness is judged on
+    /// lease liveness is judged on
     /// the MONOTONIC deadline alone — the serialized wall-clock estimate is
     /// display-only. Simulated backward clock correction: the wall-clock
     /// mirror claims the lease has practically forever left while the
@@ -4458,7 +4457,7 @@ mod tests {
         clear_control();
     }
 
-    // —— key combo parsing (issue #160 M2) ——
+    // —— key combo parsing ——
 
     #[test]
     fn parse_key_combo_recognizes_modifiers_named_keys_and_single_chars() {
@@ -4502,7 +4501,7 @@ mod tests {
         );
     }
 
-    /// issue #160 round-8 P2 #6: a combo whose non-final token is NOT a
+    /// a combo whose non-final token is NOT a
     /// modifier must be rejected outright, rather than reaching `os.rs`'s
     /// `key()`, which would otherwise press-and-hold that token as though it
     /// were a modifier before pressing the final one.

@@ -7,7 +7,7 @@
 //!
 //! `/computer/:thread/:dir/mcp` (routed below, handled entirely by
 //! `bus::computer_srv::handle_computer`) is the ONE exception to that
-//! tradeoff (issue #160 round-11 P1 #A): it can capture the human's real
+//! tradeoff: it can capture the human's real
 //! screen and inject real input, so a forged path alone is no longer
 //! sufficient — the handler additionally requires a per-session `?key=`
 //! bearer token (HMAC-bound to the path's own `(thread, dir)`, minted by
@@ -87,7 +87,7 @@ pub fn router(bus: BusRegistry, db: Db, asks: AskRegistry) -> Router {
 // rather than time out into the tool's own hidden TUI prompt. Falls back only if
 // truly abandoned. Kept just under the hook/curl ceilings in inject.rs.
 //
-// `pub(crate)` (issue #160 round-2 P1): `bus::computer_srv`'s own server-side
+// `pub(crate)`: `bus::computer_srv`'s own server-side
 // approval gate reuses this SAME constant for its own `tokio::time::timeout`,
 // so the two independent Ask-bridge entry points (this hook endpoint, and the
 // `weft_computer` MCP tool call itself) can never silently drift onto two
@@ -267,7 +267,7 @@ async fn handle_ask(
 /// flow), so a per-call prompt for them is pure interruption.
 ///
 /// `weft_computer`'s `computer` entry is a DIFFERENT rationale from every
-/// other row here (issue #160 round-2 P1): it is not weft-governed the way a
+/// other row here: it is not weft-governed the way a
 /// bus post or a board status is — it drives the human's real mouse/keyboard.
 /// It is included because that call is no longer approved by this hook path
 /// AT ALL: `bus::computer_srv::run_action` gates every `tools/call` itself,
@@ -332,7 +332,7 @@ const AUTO_APPROVED_INTERNAL_TOOLS: &[(&str, &str)] = &[
 /// (fail-safe). Auto-approving opencode internals would need an unambiguous
 /// server-identity signal, which the flat tool name alone doesn't carry.
 ///
-/// ONE named exception (issue #160 round-2 P1): the literal string
+/// ONE named exception: the literal string
 /// `weft_computer_computer` — opencode's flattened form of `weft_computer`'s
 /// `computer` tool — IS recognized, unlike every other opencode-flattened
 /// name. This is safe specifically because it is unambiguous: there is no
@@ -373,7 +373,7 @@ fn is_weft_internal_tool(tool_name: &str) -> bool {
 ///   curator   → weft_curator + weft_bus
 ///   per-issue lead (any other kind) → weft_planner + weft_bus + weft_computer
 ///
-/// issue #160: a per-issue lead ALSO gets `weft_computer` (hard-coded OFF for
+/// a per-issue lead ALSO gets `weft_computer` (hard-coded OFF for
 /// concierge/curator at every real injection site — `lead_chat::commands::
 /// lead_engine` / `lead_chat::engine::spawn_acp_turn`), so it is listed here for
 /// the lead lane exactly and only where it is actually injected.
@@ -386,12 +386,12 @@ fn session_servers_for_kind(kind: &str) -> &'static [&'static str] {
 }
 
 /// Whether weft injected `server` for the already-admitted exact identity. A
-/// worker lane injects the bus AND `weft_computer` (issue #160); the lead family
+/// worker lane injects the bus AND `weft_computer`; the lead family
 /// keys off the thread kind (see [`session_servers_for_kind`], which lists
 /// `weft_computer` for a per-issue lead but not concierge/curator) and fails
 /// closed if that row can no longer be resolved.
 ///
-/// issue #160 round-2 P2 §6 / round-17 P1: `weft_computer` is auto-approved at
+/// `weft_computer` is auto-approved at
 /// THIS hook layer purely to avoid a redundant second card — the ONE real
 /// authorization for a `weft_computer` call is `bus::computer_srv::approve`'s
 /// server-side gate, which re-derives identity from the `/computer/:thread/:dir/
@@ -519,7 +519,7 @@ fn hook_decision(decision: &str, reason: &str) -> Response {
 /// name for the same tool — shape not confirmed from this repo's own code —
 /// is NOT recognized here and falls through to the generic MCP branch below,
 /// surfacing as `Unknown` risk rather than the GUI-specific tier. In
-/// practice this branch rarely fires at all post-issue-#160-round-2: the
+/// practice this branch rarely fires at all anymore: the
 /// server-side gate in `bus::computer_srv` now owns real approval for every
 /// `weft_computer` call, and `AUTO_APPROVED_INTERNAL_TOOLS` short-circuits
 /// this endpoint before `summarize` is even called for the two recognized
@@ -3223,7 +3223,7 @@ mod tests {
     /// M2-B: `weft_computer`'s single `computer` MCP tool routes through its
     /// own `RiskSignal::Gui` branch, not the generic MCP fallback — an
     /// observe-only action reads as `ReadOnly`, an input-injecting one as
-    /// `Write` (issue #101: never guessed low), and the summary names the
+    /// `Write`, and the summary names the
     /// window when one was given.
     #[test]
     fn summarize_recognizes_weft_computer_screenshot_as_read_only() {
@@ -3268,7 +3268,7 @@ mod tests {
         assert_ne!(summary, "computer: left_click");
     }
 
-    /// Issue #160 round-2 P1: `weft_computer_computer` (opencode's flattened
+    /// `weft_computer_computer` (opencode's flattened
     /// form) is the ONE opencode-shaped name `split_internal_tool` special-
     /// cases as unambiguous — so `summarize`'s Gui branch, which delegates to
     /// it, now recognizes this literal too, not just the claude-style name.
@@ -3284,7 +3284,7 @@ mod tests {
     fn session_servers_mirror_injection_policy() {
         // Lead family keys off the thread kind (worker lanes are handled in
         // session_injected — bus + computer — and a failed lookup fails closed
-        // there). issue #160: a per-issue lead also gets weft_computer;
+        // there). a per-issue lead also gets weft_computer;
         // concierge/curator never do (hard-coded off at every injection site).
         assert_eq!(session_servers_for_kind("concierge"), &["weft_global"]);
         assert_eq!(
@@ -3329,7 +3329,7 @@ mod tests {
         assert!(is_weft_internal_tool("mcp__weft_global__list_workspaces"));
     }
 
-    /// Issue #160 round-2 P1: both name shapes `split_internal_tool`
+    /// Both name shapes `split_internal_tool`
     /// recognizes for `weft_computer` — claude's `mcp__<server>__<tool>` and
     /// the one opencode-flattened literal — auto-approve at this hook layer
     /// (see `AUTO_APPROVED_INTERNAL_TOOLS`'s doc: the server-side gate owns
@@ -3685,13 +3685,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Issue #160 round-2 P1: while computer_use is enabled, a `weft_computer`
+    /// While computer_use is enabled, a `weft_computer`
     /// PreToolUse hook ask (the SAME shape `mcp__weft_computer__computer`
     /// carries) auto-approves at this endpoint WITHOUT ever surfacing a
     /// card — the server-side gate in `bus::computer_srv` is the one that
     /// actually approved (or will approve) this call; a second card here
-    /// would double-ask the human for nothing. Round-2 P2 §6: the lead lane
-    /// now needs an actual thread row of a QUALIFYING kind (an issue lead,
+    /// would double-ask the human for nothing. The lead lane
+    /// needs an actual thread row of a QUALIFYING kind (an issue lead,
     /// "feature" here — see `session_injected`'s own doc) since the fix no
     /// longer auto-approves off the setting alone.
     #[tokio::test]
@@ -3734,7 +3734,7 @@ mod tests {
         );
     }
 
-    /// Issue #160 round-2 P2 §6: a WORKER dir auto-approves the internal
+    /// A WORKER dir auto-approves the internal
     /// `weft_computer` hook ask (workers always have the server injected).
     /// Post-merge with main's durable-identity admission, the worker identity
     /// must be PROVEN first — real thread/direction/session rows and the exact
@@ -3809,7 +3809,7 @@ mod tests {
         assert!(asks.open().is_empty(), "must never ALSO surface a card here: {out}");
     }
 
-    /// Issue #160 round-2 P2 §6: the actual bug this fix closes — a
+    /// The actual bug this fix closes — a
     /// concierge (or curator) lead thread NEVER gets `weft_computer` injected
     /// (see `session_servers_for_kind`), so this hook path must NOT
     /// auto-approve a `weft_computer` ask for one even while the setting is
@@ -3854,7 +3854,7 @@ mod tests {
         );
     }
 
-    /// issue #160 round-17 P1 (Codex server.rs:435): while computer_use is
+    /// while computer_use is
     /// OFF, the hook layer STILL auto-approves a `weft_computer` ask for a
     /// qualifying lane — opening NO card — because the server-side gate both
     /// owns the setting (the MCP call just gets the disabled text) and runs

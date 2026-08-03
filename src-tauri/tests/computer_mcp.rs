@@ -1,8 +1,8 @@
 //! Drives the `weft_computer` MCP HTTP handler exactly like a CLI client
-//! would, mirroring `bus_http.rs`'s server-spinup style. Issue #160: M1
-//! shipped observation only (window listing + screenshot); M2 adds input
+//! would, mirroring `bus_http.rs`'s server-spinup style. Covers
+//! observation (window listing + screenshot) and input
 //! injection (click/type/key/scroll/drag/move), the control lock, the input
-//! throttle, and the audit log; round-2 P1 adds a server-side approval gate
+//! throttle, and the audit log; plus the server-side approval gate
 //! in front of every `tools/call` — see `bus::computer_srv::approve`'s doc.
 //!
 //! ONE tool named `computer`, dispatched by an `action` argument — see
@@ -15,7 +15,7 @@ use weft::bus::{computer_srv, server, BusRegistry};
 use weft::computer::{self, backend, mock::MockBackend, CapturedImage, WindowInfo};
 use weft::store::{repo, Db};
 
-/// issue #160 round-11 P1 #A: every real call into `/computer/:thread/:dir/
+/// every real call into `/computer/:thread/:dir/
 /// mcp` now needs `?key=<per-session token>` — built the SAME way
 /// `bus::inject::computer_url` itself would (`computer_srv::
 /// computer_session_token`, `#[doc(hidden)] pub` for exactly this reason).
@@ -24,7 +24,7 @@ use weft::store::{repo, Db};
 /// their own URL (the `?wt=` scenarios below) attach it explicitly.
 fn key_query(thread: i32, dir: &str) -> String {
     // No `?wt=` in the URL → the bearer is bound to the absent-worktree case
-    // (issue #160 round-13/14 P1). The handful of `?wt=` scenarios below mint
+    // . The handful of `?wt=` scenarios below mint
     // their own key for the exact `Some(wt)` their URL carries.
     format!("key={}", computer_srv::computer_session_token(thread, dir, None))
 }
@@ -34,7 +34,7 @@ async fn rpc(base: &str, thread: i32, dir: &str, body: serde_json::Value) -> Str
     rpc_url(&url, body).await
 }
 
-/// Same POST as [`rpc`], against a caller-built URL — lets the round-2 P2 §5
+/// Same POST as [`rpc`], against a caller-built URL — lets the earlier P2 §5
 /// `?wt=` query-param tests below attach a worktree id without `rpc`'s own
 /// `dir`-only URL shape getting in the way.
 async fn rpc_url(url: &str, body: serde_json::Value) -> String {
@@ -79,7 +79,7 @@ async fn wait_for_card(asks: &AskRegistry, what: &str) -> weft::ask::Ask {
 }
 
 /// Spawn a `tools/call` POST to the `weft_computer` MCP endpoint in the
-/// background and return its `JoinHandle` — issue #160 round-2 P1's
+/// background and return its `JoinHandle` — the
 /// server-side approval gate blocks the handler until a card is answered
 /// (or a standing grant auto-decides it), so the caller spawns this,
 /// `wait_for_card`s, inspects/answers the card, then `.await`s the handle
@@ -95,7 +95,7 @@ fn spawn_computer_call(
 ) -> tokio::task::JoinHandle<String> {
     let base = base.to_string();
     tokio::spawn(async move {
-        // issue #160 round-33 P1: `coordinate` only rides actions that consume
+        // `coordinate` only rides actions that consume
         // it — `pure_validate`'s per-action allowlist now rejects unrecognized
         // arguments outright, before any card.
         let arguments = if action == "screenshot" {
@@ -135,7 +135,7 @@ async fn tools_list_exposes_exactly_one_computer_tool() {
     assert_eq!(tools[0]["name"], "computer");
 }
 
-// —— issue #160 round-11 P1 #A: per-session bearer on `/computer/:thread/:dir/mcp` ——
+// —— per-session bearer on `/computer/:thread/:dir/mcp` ——
 
 /// The correct-key happy path, in isolation from every OTHER test in this
 /// file (which all get it for free via [`rpc`]/[`key_query`]): a request
@@ -242,7 +242,7 @@ async fn endpoint_auth_rejects_a_key_minted_for_a_different_thread_dir() {
     );
 }
 
-/// issue #160 round-15 P1 (Codex inject.rs:364): the SAME per-session token is
+/// the SAME per-session token is
 /// accepted as `Authorization: Bearer <token>` with NO `?key=` at all — the
 /// channel codex uses via `bearer_token_env_var`, so its argv never carries the
 /// secret. A wrong bearer is a bare 401 exactly like a wrong `?key=`.
@@ -312,7 +312,7 @@ async fn endpoint_auth_with_the_correct_key_still_reaches_the_real_approval_gate
     assert!(out.contains("denied"), "{out}");
 }
 
-/// issue #160 M1: the setting gate blocks BEFORE any backend call, so this
+/// the setting gate blocks BEFORE any backend call, so this
 /// must pass with no backend override installed at all — a real backend call
 /// here (there isn't one, by construction) would either panic in a headless
 /// test environment or hang, either of which would fail this test.
@@ -338,7 +338,7 @@ async fn disabled_setting_returns_disabled_text_without_touching_backend() {
     assert!(out.contains("Settings"), "expected disabled text: {out}");
 }
 
-/// issue #160 M1 (screenshot) + M2 (input actions, control lock, throttle,
+/// Screenshot + input actions (control lock, throttle,
 /// suspended-ask gate, audit log) end-to-end through the MCP HTTP handler,
 /// ALL in one test function, on purpose:
 ///
@@ -377,7 +377,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // against the SAME db `server::serve` is reading from.
     let db_handle = db.clone();
 
-    // issue #160 round-2 P1: EVERY `tools/call` now passes through a
+    // EVERY `tools/call` now passes through a
     // server-side approval gate (`bus::computer_srv::approve`) before it can
     // reach the backend — including every M1/M2 scenario below, which
     // predate that gate and were never written to answer a card. A Full
@@ -397,7 +397,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // A 1:1 (scale 1.0) window keeps the M2 section's physical-coordinate
     // math trivial to assert on: screenshot-space (100, 50) maps straight
     // through to physical (100, 50) since the window's own origin is (0, 0).
-    // A second window ("Other", id 2) exists purely for the round-2 P1 §2
+    // A second window ("Other", id 2) exists purely for the earlier P1 §2
     // window-match preview scenario further down — nothing in M1/M2 ever
     // targets it, so its presence doesn't change any existing assertion.
     let (width, height) = (640u32, 480u32);
@@ -452,9 +452,9 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert!(out.contains("screenshot saved"), "{out}");
     assert!(out.contains(".png"), "{out}");
 
-    // issue #160 round-15 P2 (Codex computer_srv.rs:2759) gave lead
-    // screenshots a dedicated subdirectory; round-16 P1 (Codex
-    // computer_srv.rs:2812) then moved the lead's WHOLE output root under
+    // Lead
+    // screenshots get a dedicated subdirectory, and the lead's WHOLE output
+    // root lives under
     // Weft-managed storage (`<weft_home>/computer/<thread>/lead`, same shape
     // as the worker lane's `wt-<id>` roots) — the agent-writable lead scratch
     // cwd receives NOTHING computer-related at all anymore.
@@ -496,8 +496,8 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     // 1. left_click succeeds: the mock backend records the click, the
-    // response confirms it, and an audit line is appended. issue #160
-    // round-5 review P1 §6: this session is Full-granted (an Auto approval,
+    // response confirms it, and an audit line is appended.
+    // This session is Full-granted (an Auto approval,
     // no card), and `activate_target` now runs UNCONDITIONALLY — so this
     // records TWO backend actions (`activate`, then `click`), not one.
     let out = rpc(
@@ -546,7 +546,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     let lines_after_2 = std::fs::read_to_string(&audit_path).unwrap().lines().count();
     assert_eq!(lines_after_2, 3);
 
-    // 2b. issue #160 round-5 review P2 §3: a `type` payload over
+    // 2b. a `type` payload over
     // `MAX_TYPE_CHARS` is rejected before ever reaching the backend — no new
     // mock action, and the rejection is itself still audited.
     let over_limit_text = "a".repeat(weft::bus::computer_srv::MAX_TYPE_CHARS + 1);
@@ -628,7 +628,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // registry starts empty each time.
     assert!(asks_handle.answer(ask_id, Answer::Deny));
 
-    // —— M3-B: engine-gated MCP image content + Ask-card preview (issue #160) ——
+    // —— M3-B: engine-gated MCP image content + Ask-card preview ——
     //
     // Reuses the SAME MockBackend/"Notes" window as M1/M2 above — a NEW
     // `MockBackend` would silently no-op (`backend::_set_backend_override` is
@@ -708,7 +708,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         }
     }
 
-    // issue #160 round-2 P1: `screenshot` now passes through the same
+    // `screenshot` now passes through the same
     // approval gate as every other action, so `assert_screenshot_content`
     // below (which awaits its RPC call synchronously, with nobody spawned to
     // answer a card) needs a standing grant for the EXACT `screenshot @
@@ -718,7 +718,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // exercise a REAL card for a DIFFERENT action (a click) or a DIFFERENT
     // window (`screenshot @ other`) on these SAME sessions.
     //
-    // issue #160 round-2 P2 §2: `action_key` grew a trailing `args_digest`
+    // `action_key` grew a trailing `args_digest`
     // element (a sha256 over the call's consequential params — see that
     // function's own doc), so this pre-seeded key must be built the EXACT
     // same way `approve` itself would for `{"action":"screenshot","window":
@@ -726,7 +726,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // `#[doc(hidden)] pub` for exactly this) — or this grant would silently
     // stop matching and every `assert_screenshot_content` call below would
     // hang for up to an hour waiting on a card nobody is spawned to answer.
-    // issue #160 round-11 P1 #B/#C: `screenshot` now ALSO resolves its window
+    // `screenshot` now ALSO resolves its window
     // and folds `id`/`app`/`title` into the key, exactly like a Write action
     // (see `approve`'s own doc) — "notes" resolves to id 1 / app "Notes" /
     // title "Untitled" per the `mock` window list above.
@@ -772,8 +772,8 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert_screenshot_content(&base, codex_lead.id, "lead", 24, false, "codex lead").await;
 
     // 9. Ask-card preview attach rule, now owned by the server-side gate
-    // itself (`bus::computer_srv::preview_for_action`, issue #160 round-2
-    // P1 §2 — relocated from `bus::server::handle_ask`, which no longer
+    // itself (`bus::computer_srv::preview_for_action`
+    // — relocated from `bus::server::handle_ask`, which no longer
     // attaches previews at all): a GUI INPUT ask targeting the SAME window
     // id as the most recent screenshot for this (thread, dir) carries
     // `Ask::preview`; the SAME (thread, dir) targeting a DIFFERENT window
@@ -781,7 +781,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // never carries one regardless; a (thread, dir) that never screenshotted
     // gets no preview either (isolation). Drives the REAL `tools/call`
     // endpoint directly (not a simulated hook POST) — this behavior is no
-    // longer reachable through the hook path at all post-round-2.
+    // longer reachable through the hook path at all.
     //
     // 9a. left_click on "notes" (id 1) — the SAME window `claude_thread`
     // just screenshotted in scenario 7 above — carries the preview.
@@ -830,13 +830,13 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert!(asks_handle.answer(card.id, Answer::Deny));
     call.await.unwrap();
 
-    // —— round-2 P1: the server-side approval gate itself ——
+    // —— the server-side approval gate itself ——
     //
     // Everything above exercised OTHER behavior (screenshot pipeline, input
     // gates, engine-gated images, preview attach) against sessions the gate
     // was made to stay out of the way of (a Full or narrow Always grant).
     // These scenarios exercise the GATE'S OWN behavior instead: standing
-    // grants, Always-grant reuse across two calls, and the round-2 P2
+    // grants, Always-grant reuse across two calls, and the earlier P2
     // window-argument validation — on sessions that start UNGRANTED.
     //
     // The control lease is a SINGLE process-wide slot, not one per (thread,
@@ -850,7 +850,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // answer skips the card entirely and reaches the backend directly.
     let (gate_thread, gate_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
     let gate_dir_s = gate_dir.to_string();
-    // issue #160 round-11 P1 #D: an input action now maps its coordinate
+    // an input action now maps its coordinate
     // against a RECORDED screenshot's own dimensions (fail-closed with none
     // on file) — this session never screenshotted "notes" (id 1) itself, so
     // seed the record directly rather than driving a real `screenshot` call
@@ -871,7 +871,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     let card = wait_for_card(&asks_handle, "left_click with no standing grant").await;
     assert_eq!(card.tool, "computer", "the gate's own card must self-identify as \"computer\", not an engine name");
     assert_eq!(card.summary, "computer: left_click @ notes");
-    // issue #160 round-4 P1 §1: only `action == "type"` ever carries a
+    // only `action == "type"` ever carries a
     // `detail_redacted` — a `left_click`'s detail (a coordinate) has nothing
     // this module considers secret, so the IM bridge falls back to the full
     // `detail` unchanged.
@@ -894,7 +894,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert!(out.contains("left_click") && out.contains("done"), "{out}");
     assert_eq!(
         mock.actions.lock().unwrap().len(),
-        // issue #160 round-4 P1 §2: this Allow is an Interactive approval (a
+        // this Allow is an Interactive approval (a
         // real card just appeared) — the click family now activates the
         // target window first, so this call records TWO backend actions
         // (`activate`, then `click`), not one.
@@ -908,7 +908,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // The THIRD, identical action_key (same action + same window) must skip
     // the card entirely now — the Always grant from the previous answer
     // auto-decides it, mirroring `bus::server::handle_ask`'s own Always
-    // semantics for every other tool. issue #160 round-5 review P1 §6: an
+    // semantics for every other tool. an
     // Auto approval now activates the target window too, exactly like an
     // Interactive one — so this STILL adds TWO more actions (`activate`,
     // then the click), not just one.
@@ -926,7 +926,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         mock.actions.lock().unwrap().len(),
         clicks_before + 4,
         "the Always-covered call must still reach the backend, WITH an activate call too \
-         (round-5 review P1 §6: Auto approvals activate too now): {:?}",
+         (Auto approvals activate too): {:?}",
         mock.actions.lock().unwrap()
     );
 
@@ -976,7 +976,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         "a rejected missing-window call must never reach the backend"
     );
 
-    // 12. Focus-freshness gate (issue #160 round-2 P1 addendum): `type`
+    // 12. Focus-freshness gate: `type`
     // rejects with no prior click on the target window; succeeds within 15s
     // of a click on that SAME window; rejects again for a DIFFERENT window
     // even with a fresh click on file (for the OTHER one). A brand-new
@@ -988,7 +988,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         full: vec![FullGrant { thread: focus_thread, dir: focus_dir_s.clone() }],
         always: Vec::new(),
     });
-    // issue #160 round-11 P1 #D: 12b's `left_click` below reaches the real
+    // 12b's `left_click` below reaches the real
     // backend (Full-granted) — seed this session's "notes" (id 1) shot dims
     // directly, same reasoning as section 10 above.
     computer::record_shot_dims(
@@ -1057,7 +1057,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     .await;
     assert!(out.to_lowercase().contains("focus"), "{out}");
 
-    // —— round-4 P1 §2 (broadened round-5 review P1 §6): reactivating the target window ——
+    // —— reactivating the target window ——
     //
     // The real hazard: click target window (foreground -> target) -> `approve`
     // cards the FOLLOWING input action -> a human answers it by clicking
@@ -1067,7 +1067,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // the click and the first `type` each surface a REAL card (an
     // `Interactive` approval); a THIRD call pre-seeds an Always grant so
     // `auto_decision` decides it silently (an `Auto` approval, no card) —
-    // issue #160 round-5 review P1 §6: `activate_target` is now called
+    // `activate_target` is now called
     // UNCONDITIONALLY, so this Auto path activates too, exactly like the
     // Interactive ones above it; a FOURTH simulates the backend having no
     // activation API at all (`Unsupported`) and must fail closed, never
@@ -1079,7 +1079,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
 
     let (refocus_thread, refocus_dir) = worker_dir(&db_handle, ws.id, r.id, "claude").await;
     let refocus_dir_s = refocus_dir.to_string();
-    // issue #160 round-11 P1 #D: every click/type below in this section
+    // every click/type below in this section
     // reaches the real backend for "notes" (id 1) — seed this session's shot
     // dims once, up front, same reasoning as sections 10/12 above (13b/13c's
     // `type` calls don't need this — only coordinate-taking actions do — but
@@ -1099,7 +1099,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // 13a. left_click on "notes" — no standing grant, so a real card
     // appears; a plain Allow (not Always) is an ordinary Interactive
     // approval, exactly like any other first-time click. The click family
-    // itself is now activate-gated too (issue #160 round-4 P1 §2: an
+    // itself is now activate-gated too (an
     // absolute-coordinate click can land on Weft's own card if it now covers
     // the target's on-screen position), so `activate 1` must appear
     // immediately before the click.
@@ -1140,7 +1140,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         })
     };
     let card = wait_for_card(&asks_handle, "activate scenario: type").await;
-    // issue #160 round-4 P1 §1: the LOCAL card still carries the raw typed
+    // the LOCAL card still carries the raw typed
     // text (the human deciding must see it), but its `detail_redacted` must
     // never carry it — this is the exact leak the fix closes, since this
     // very `Ask` is what an IM bridge (if one were installed) would render
@@ -1174,15 +1174,15 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
 
     // 13c. Auto path: pre-seed an Always grant for a SECOND `type` call (a
     // DIFFERENT `text`, hence a DIFFERENT action_key from 13b's) so
-    // `auto_decision` decides Allow WITHOUT a card ever appearing. issue #160
-    // round-5 review P1 §6: unlike the ORIGINAL round-4 fix (which only
-    // activated on an Interactive approval), `activate_target` now runs
+    // `auto_decision` decides Allow WITHOUT a card ever appearing.
+    // Unlike a design that only
+    // activated on an Interactive approval, `activate_target` runs
     // UNCONDITIONALLY — an Auto approval offers no guarantee the target
     // window still holds the real OS foreground at call time either — so
     // this path STILL records an `activate` call, immediately before the
     // `type`.
     //
-    // issue #160 round-10 P1 #A: `type` is Write-classified with a non-blank
+    // `type` is Write-classified with a non-blank
     // `window` argument, so `approve` now folds the resolved window's own
     // `app`+`title` into the key too (scoping a standing Always grant to
     // that EXACT window identity, not just the query string) — this pre-seed
@@ -1190,7 +1190,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // id 1 carries (see this test's own `mock` setup above), matching
     // EXACTLY what `approve` itself would resolve for `window: "notes"`, or
     // this grant silently stops matching and the call below hangs waiting on
-    // a card nobody is spawned to answer. issue #160 round-11 P1 #B: the
+    // a card nobody is spawned to answer. the
     // resolved window's own `id` ("1") is now ALSO folded in, right after the
     // query string.
     let text_auto = "auto-no-refocus".to_string();
@@ -1239,7 +1239,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         assert_eq!(
             actions.len(),
             baseline_auto + 2,
-            "round-5 review P1 §6: an Auto approval must ALSO activate the window now — expected \
+            "an Auto approval must ALSO activate the window — expected \
              [..., activate, type]: {actions:?}"
         );
         assert_eq!(actions[baseline_auto], "activate 1", "{actions:?}");
@@ -1271,7 +1271,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     );
     mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
 
-    // —— round-3 P1 §2: recheck_after_guard ——
+    // —— recheck_after_guard ——
     //
     // A second input call that queues on `computer::input_flight_guard`
     // behind a long-held first call must re-check BOTH the kill switch and
@@ -1318,7 +1318,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
         .unwrap();
     computer::clear_control();
 
-    // —— issue #160 round-5 review P1 §2: recheck_after_guard also re-checks has_open ——
+    // —— recheck_after_guard also re-checks has_open ——
     //
     // The invariant `check_suspended` establishes UP FRONT — an open
     // permission card suspends this session's input — must still hold for a
@@ -1377,7 +1377,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert!(asks_handle.answer(new_ask_id, Answer::Deny));
     computer::clear_control();
 
-    // 14. issue #160 round-10 P1 #1 + P2 #2: multi-repo `wt` routing now
+    // 14. Multi-repo `wt` routing
     // resolves into a WEFT-MANAGED namespace under `weft_home/computer/
     // <thread>/<dir>/wt-<id>` (no longer the worktree's own `.weft/`), and an
     // EXPLICIT-but-non-numeric `wt` fails the WHOLE call closed rather than
@@ -1444,7 +1444,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     // 14a. An explicit `?wt=` naming worktree B lands its audit line in B's
     // OWN weft-managed namespace, NOT A's — and never touches wt_14b_path
     // (the actual worktree CHECKOUT) at all: output no longer lives there.
-    // issue #160 round-13/14 P1: the bearer is bound to the EXACT `wt` the URL
+    // the bearer is bound to the EXACT `wt` the URL
     // carries, so a `?wt=B` URL must present the key minted for `Some(B)`.
     let url = format!(
         "{base}/computer/{}/{}/mcp?wt={}&key={}",
@@ -1482,7 +1482,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     assert!(audit_14a.exists(), "an absent wt must fall back to the first worktree's OWN namespace");
 
     // 14c. A forged `wt` naming a worktree of a DIFFERENT direction must
-    // FAIL CLOSED (round-8 P2 #7) — never silently fall back to A's
+    // FAIL CLOSED — never silently fall back to A's
     // namespace, and never write into the foreign direction's own namespace
     // either.
     let other_direction_14 = repo::create_direction(
@@ -1501,9 +1501,9 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     .unwrap();
     let lines_before_14c = std::fs::read_to_string(&audit_14a).unwrap().lines().count();
     // Mint the key for THIS foreign `wt` so the request clears the bearer check
-    // (issue #160 round-13/14 P1) and actually reaches `session_root` — the
+    //  and actually reaches `session_root` — the
     // point of 14c is that even a token-matching foreign-DIRECTION worktree is
-    // rejected there (round-8 P2 #7), independently of the token layer. The
+    // rejected there, independently of the token layer. The
     // sibling-worktree hijack the token binding itself blocks is covered
     // separately by `computer_token_binds_to_the_worktree_not_just_thread_dir`.
     let url = format!(
@@ -1521,16 +1521,16 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     let lines_after_14c = std::fs::read_to_string(&audit_14a).unwrap().lines().count();
     assert_eq!(
         lines_after_14c, lines_before_14c,
-        "round-8 P2 #7: a forged wt from a different direction must NOT fall back to A's namespace"
+        "a forged wt from a different direction must NOT fall back to A's namespace"
     );
     assert!(
         !session_dir_for(foreign_14.id).join("computer-audit.jsonl").exists(),
         "must never write into the foreign direction's own namespace either"
     );
 
-    // 14d. issue #160 round-10 P2 #2: an EXPLICIT but non-numeric `wt` must
+    // 14d. an EXPLICIT but non-numeric `wt` must
     // ALSO fail the WHOLE call closed — never silently fall back to "first
-    // worktree" the way an ABSENT `wt` does. issue #160 round-13/14 P1: it now
+    // worktree" the way an ABSENT `wt` does. it now
     // fails even earlier, at the bearer check — a malformed `wt` can match no
     // minted token, so `handle_computer` rejects it with a 401 before dispatch.
     let lines_before_14d = std::fs::read_to_string(&audit_14a).unwrap().lines().count();
@@ -1559,7 +1559,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     let _ = std::fs::remove_dir_all(&foreign_path_14);
 }
 
-/// issue #160 round-2 P1: with no standing grant, an input action surfaces a
+/// with no standing grant, an input action surfaces a
 /// Needs-you card via the server-side gate — a Deny rejects the call, and
 /// (unlike the giant test above, which routes every scenario through a
 /// MockBackend) this never even reaches far enough to need one: `approve`
@@ -1587,7 +1587,7 @@ async fn gate_denies_an_input_action_with_no_standing_grant() {
 
 /// The fail-closed twin of the test above: the ask's sender is dropped
 /// instead of answered (`AskRegistry::cancel_for` — the SAME mechanism an
-/// engine/model switch uses to tear down a stale ask, issue #96, and the
+/// engine/model switch uses to tear down a stale ask, and the
 /// SAME simulation `tests/bus_http.rs::ask_bridge_cancel_returns_explicit_
 /// deny` uses for the hook endpoint's own timeout/cancel path). The gate
 /// must return an EXPLICIT deny — never hang, and never silently allow.
@@ -1618,7 +1618,7 @@ async fn gate_denies_when_the_ask_is_cancelled_instead_of_answered() {
 /// `#[ignore]`d — run it by hand locally, e.g.
 /// `cargo test --test computer_mcp --features computer-os -- --ignored`.
 ///
-/// Issue #160 round-2 §6: turned from a shape-only smoke check (did the text
+/// Turned from a shape-only smoke check (did the text
 /// merely contain `"id"` anywhere — which an ERROR string could too, e.g.
 /// `ComputerError::Unsupported`'s message doesn't, but nothing enforced
 /// that) into real assertions: the window list must actually be non-empty

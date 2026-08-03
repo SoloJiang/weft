@@ -167,9 +167,9 @@ fn tool_call_update(update: &Value) -> UpdateOut {
     if id.is_empty() {
         return UpdateOut::Ignore;
     }
-    // issue #160 round-10 P2 #6 (Codex 281): the count/size cap is applied
+    // the count/size cap is applied
     // WHILE `extract_tool_images` scans the source array now, not afterward.
-    // issue #160 round-13 P2 (Codex Rea): that streaming cap
+    // that streaming cap
     // (`cap_and_dedup_images`, now `lead_chat::proto`) is the SAME function
     // the claude dialect calls too — see its own doc for why the OLD "format
     // everything, dedup everything, cap afterward" order let an
@@ -242,14 +242,14 @@ fn extract_tool_output(update: &Value) -> String {
 /// candidate this omitted for being oversized or in excess of the count cap
 /// (see [`cap_and_dedup_images`]'s own doc); the caller (`tool_call_update`)
 /// turns that into the SAME "(N image(s) omitted)" note the claude dialect
-/// produces — both dialects share this ONE capper as of issue #160 round-13
-/// P2 (Codex Rea).
+/// produces — both dialects share this ONE capper
+/// P2.
 ///
 /// This closes a real gap: before this function existed, an omp screenshot
 /// tool's image block was silently dropped — `extract_tool_output` only ever
 /// read the text half of a `tool_call_update`'s content.
 ///
-/// Issue #160 round-2 §5: this used to scan BOTH sources and concatenate
+/// This used to scan BOTH sources and concatenate
 /// whatever each one found — but a single tool result that mirrors the same
 /// image into both `rawOutput.content` AND `content[]` (a real shape at
 /// least one ACP backend produces) would then carry it TWICE, doubling the
@@ -257,17 +257,17 @@ fn extract_tool_output(update: &Value) -> String {
 /// `extract_tool_output`'s own text extraction: `rawOutput.content` wins
 /// outright when it carries at least one image (kept OR dropped — a source
 /// that carried nothing BUT oversized images still "carried an image" for
-/// this priority decision, exactly like the pre-round-10 behavior); `content[]`
+/// this priority decision, exactly like the pre-capper behavior); `content[]`
 /// is only consulted as a fallback when `rawOutput.content` carried none at
 /// all — never merged.
 ///
-/// issue #160 round-10 P2 #6 (Codex 281): the size/count cap used to apply
+/// the size/count cap used to apply
 /// AFTER this function had already formatted EVERY block into a full data
 /// URI string and cloned each distinct one into a `HashSet` for dedup — a
 /// malicious/broken ACP result with hundreds of near-2MB image blocks would
 /// allocate/copy hundreds of MB before a single one was ever dropped. The cap
 /// now applies WHILE scanning, via [`cap_and_dedup_images`] — see its own doc
-/// (moved to `lead_chat::proto` in issue #160 round-13 P2 so the claude
+/// (moved to `lead_chat::proto` so the claude
 /// dialect can share this exact implementation instead of keeping its own
 /// copy; `image_block_fields` below is still ACP's own resolve fn, passed
 /// into the shared capper same as before) for how it bounds both the count
@@ -293,7 +293,7 @@ fn extract_tool_images(update: &Value) -> (Vec<String>, usize) {
 /// the recognize-and-extract half of what used to be [`image_block_data_uri`]
 /// (now just the format step below), split out so [`cap_and_dedup_images`]
 /// can dedup/size-check BEFORE ever formatting/allocating the eventual owned
-/// data URI string (issue #160 round-10 P2 #6).
+/// data URI string.
 fn image_block_fields(block: &Value) -> Option<(&str, &str)> {
     if block.get("type").and_then(|t| t.as_str()) != Some("image") {
         return None;
@@ -539,7 +539,7 @@ mod tests {
         // A failed call with more than 4 images: only the first 4 survive and
         // the rest are announced as omitted in the output text
         // (cap_and_dedup_images, literally shared with the claude dialect
-        // since issue #160 round-13 P2).
+        // shared with the claude dialect).
         let overflow_images: Vec<Value> = (0..5)
             .map(|i| json!({ "type": "image", "data": format!("img{i}"), "mimeType": "image/png" }))
             .collect();
@@ -559,7 +559,7 @@ mod tests {
         }
     }
 
-    /// Issue #160 round-2 §5: a tool result that mirrors the SAME image into
+    /// A tool result that mirrors the SAME image into
     /// BOTH `rawOutput.content` and `content[]` (a real shape at least one
     /// ACP backend produces) must land ONE image, not two — `rawOutput.
     /// content` wins outright (mirroring `extract_tool_output`'s own text
@@ -626,7 +626,7 @@ mod tests {
         }
     }
 
-    /// issue #160 round-10 P2 #6 (Codex 281): a source carrying MORE than the
+    /// a source carrying MORE than the
     /// 4-image cap, where a 5th VALID (not oversized, not a duplicate) image
     /// sits right after the cap already filled, must still cap at 4 — proving
     /// the count cap is enforced by COUNT alone, not merely as a side effect
@@ -668,9 +668,9 @@ mod tests {
         }
     }
 
-    /// issue #160 round-10 P2 #6 (Codex 281) proved [`cap_and_dedup_images`]
+    /// A prior flaw in [`cap_and_dedup_images`] proved it
     /// never even `.next()`-ed the source once the count cap was full — round-
-    /// 13 P2 (Codex Red) deliberately gives that property up FOR THE COUNTING
+    /// 13 P2 deliberately gives that property up FOR THE COUNTING
     /// PHASE ONLY: the old `dropped += blocks.len()` counted every leftover
     /// block, images or not, as an omitted image (see the trailing-text tests
     /// below), so the remainder must now be visited via `resolve` to tell an
@@ -700,7 +700,7 @@ mod tests {
         assert_eq!(
             counter.get(),
             55,
-            "round-13 P2: the remainder IS now visited (via `resolve` only, never `format!`) so \
+            "the remainder IS visited (via `resolve` only, never `format!`) so \
              `dropped` can tell a real image from plain text or a duplicate — 4 calls to fill \
              `kept`, then 50 more `Some` calls for the remainder, plus the final `None` call that \
              ends the `for` loop"
@@ -708,9 +708,9 @@ mod tests {
         assert_eq!(dropped, 50, "all 50 are distinct, non-duplicate images, so every one counts");
     }
 
-    /// issue #160 round-13 P2 (Codex Red): once the 4-image cap is already
+    /// once the 4-image cap is already
     /// full, trailing TEXT blocks are not images and must not inflate
-    /// `dropped` — the bug this round fixes: the old code counted
+    /// `dropped` — the bug this change fixes: the old code counted
     /// `blocks.len()`, which conflated every leftover block (image or not)
     /// with an omitted image.
     #[test]
@@ -728,7 +728,7 @@ mod tests {
     /// The counterpart to the text-only case above: a genuine 5th (valid,
     /// distinct) image sitting right after the 4-image cap already filled,
     /// followed by a trailing text block, must still be counted as one
-    /// omitted image — round-13 fixes the false positive on text without
+    /// omitted image — this fixes the false positive on text without
     /// introducing a false negative on a real excess image.
     #[test]
     fn cap_and_dedup_images_still_counts_a_genuine_excess_image_before_trailing_text() {
@@ -744,8 +744,8 @@ mod tests {
     /// Two IDENTICAL excess images (repeating each other, not merely
     /// repeating a kept one) collapse to a single `dropped` — mirrors the
     /// "a duplicate silently collapses, never counted twice" rule the scan
-    /// already applies to the first 4 survivors. Chosen deliberately: Codex's
-    /// note says "remaining distinct image candidates", and collapsing
+    /// already applies to the first 4 survivors. Chosen deliberately: the
+    /// contract is "remaining distinct image candidates", and collapsing
     /// duplicates in the remainder is what keeps that word meaningful.
     #[test]
     fn cap_and_dedup_images_counts_duplicate_excess_images_once() {

@@ -18,7 +18,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-notification = "2"
-# OS-level Escape (issue #160 review R1 #5): computer use's control lease can
+# OS-level Escape: computer use's control lease can
 # put keyboard focus on the CONTROLLED app, not weft's own WebView, so the
 # WebView-only Esc keydown handler never sees it — this plugin's global
 # shortcut fires regardless of which app has focus. Registered only while a
@@ -86,28 +86,28 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tempfile = "3"
 # computer/mod.rs 的截图缩放 + PNG 落盘用它;MockBackend 测试路径也吃这个,故是常规
 # 依赖(不随 computer-os feature 门控)。xcap 本身也依赖 image,复用编译成本。
-# `jpeg`(issue #160 M3-B):`encode_jpeg_data_uri` 把截图编码成 MCP image content /
+# `jpeg`:`encode_jpeg_data_uri` 把截图编码成 MCP image content /
 # Ask 卡预览的 `data:image/jpeg;base64,...`——PNG 对照片级截图偏大,JPEG 在这个
 # 用途(有损、丢给模型/人眼看,不是存档)上明显更省 token/带宽。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-# OS 级窗口枚举 + 截图(issue #160 M1)。本机(Linux 容器)编译不过:xcap 传递依赖
+# OS 级窗口枚举 + 截图。本机(Linux 容器)编译不过:xcap 传递依赖
 # gdk-sys/gtk 等系统库(pkg-config 找不到 gdk-3.0.pc,容器内未装 GTK dev 包),
 # `cargo check` 直接 build-script 失败。降级为 optional + `computer-os` feature
 # (默认关):有 GUI 系统库的机器(开发者本机/CI 打包机)手动开启即可编译出真实后端,
 # 无该 feature 时 `computer::backend()` 返回恒 Unsupported 的 stub,绝不阻塞默认构建。
 xcap = { version = "0.9.7", optional = true }
-# 鼠标/键盘输入注入(issue #160 M2)。同上 xcap 的容器编译问题:Linux 下走 X11,
+# 鼠标/键盘输入注入。同上 xcap 的容器编译问题:Linux 下走 X11,
 # 传递依赖系统库本机同样缺失。同挂 `computer-os` feature(默认关),不影响默认构建。
 enigo = { version = "0.6", optional = true }
 sha2 = "0.10"
-# Session-scoped `/computer/:thread/:dir/mcp` auth token (issue #160 round-11
+# Session-scoped `/computer/:thread/:dir/mcp` auth token (HMAC bearer,
 # P1 #A): HMAC-SHA256(process secret, "{thread}/{dir}"), verified constant-
 # time via `Mac::verify_slice`. sha2 is already a dependency (see above); a
 # proper HMAC construction (not a hand-rolled sha256(secret||msg)) avoids a
 # length-extension footgun for the small cost of this one crate.
 hmac = "0.12"
 
-# issue #160 round-18 P1 (Codex inject.rs:500): owner-only ACL for the
+# owner-only ACL for the
 # bearer-bearing opencode.json on Windows — see `bus::inject::
 # restrict_handle_to_owner`. Windows-only (this whole block is ignored on unix
 # targets, so it never touches the Linux/macOS build or CI), and pinned to the
@@ -122,7 +122,7 @@ windows = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
 ] }
 
-# issue #160 round-18 P2 (Codex os.rs:418): in-process X11 window activation
+# in-process X11 window activation
 # (the EWMH `_NET_ACTIVE_WINDOW` client message) so a clean Linux desktop no
 # longer needs `wmctrl`/`xdotool` separately installed just to focus a window
 # before input — see `computer::os::activate_window_x11`. Optional + only in

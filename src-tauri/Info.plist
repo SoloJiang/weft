@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <!--
-    issue #160 round-25 P1 (Codex computer/os.rs:210): declare Apple Events
+    declare Apple Events
     usage so macOS TCC can present the Automation consent prompt instead of
     silently rejecting the automation. Every approved computer-use input action
     activates its target window via an `osascript` call to System Events (see
@@ -16,10 +16,10 @@
     so this adds only the automation string without disturbing the rest.
 
     Real-machine verification of the resulting Automation prompt is tracked in
-    issue #160 §9 (the real-machine checklist) — it cannot run in CI, which
+    the real-machine checklist — it cannot run in CI, which
     builds and tests but never packages a signed macOS bundle.
 
-    issue #160 round-28 P1 (Codex Info.plist:23): this copy is LOCALIZED, and
+    this copy is LOCALIZED, and
     the i18n catalogs stay authoritative (CLAUDE.md: user-facing strings only
     through src/i18n/{en,zh}.ts). macOS renders the consent prompt itself —
     never the webview — so the catalogs' `settings.

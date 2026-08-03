@@ -1,4 +1,4 @@
-//! Real platform backend (issue #160 M1 window enumeration/capture via
+//! Real platform backend (window enumeration/capture via
 //! `xcap`, M2 mouse/keyboard input injection via `enigo`). Only compiled
 //! with the `computer-os` cargo feature (default off; see the dependency
 //! comments on `xcap`/`enigo` in `Cargo.toml` for why). Runtime failures
@@ -29,7 +29,7 @@ impl ComputerBackend for OsBackend {
             .iter()
             .find(|w| matches!(w.id(), Ok(wid) if wid == id))
             .ok_or_else(|| ComputerError::CaptureFailed(format!("window {id} is no longer visible")))?;
-        // issue #160 round-32 P1 (Codex os.rs:30): this is a THIRD independent
+        // this is a THIRD independent
         // enumeration — the caller's resolve-and-verify ran against an earlier
         // one, and an OS window id is reusable, so selecting by `id` alone
         // could capture whatever unrelated (or deliberately excluded) window
@@ -92,7 +92,7 @@ impl ComputerBackend for OsBackend {
         let mut enigo = new_enigo()?;
         // Press each modifier in order, but track exactly how many
         // succeeded (`pressed`) instead of using `?` to bail out on the
-        // first failure (issue #160 review R1 #4): a `?` on a LATER
+        // first failure: a `?` on a LATER
         // modifier's press would abandon every EARLIER modifier physically
         // held on the real keyboard with nothing left to release it. Every
         // failure path below — a modifier press failing partway through, OR
@@ -173,7 +173,7 @@ impl ComputerBackend for OsBackend {
     }
 }
 
-/// issue #160 round-34 P2 (Codex computer_srv.rs:2986): re-verify `target`'s
+/// re-verify `target`'s
 /// full identity (`app`/`title`, not the reusable numeric id alone) on a
 /// FRESH enumeration immediately before an activation that addresses the
 /// window by id — the same discipline `capture_window` applies before
@@ -204,7 +204,7 @@ fn verify_window_identity(target: &WindowInfo) -> Result<(), ComputerError> {
     Ok(())
 }
 
-// —— window activation (issue #160 round-4 P1 §2) ——
+// —— window activation ——
 //
 // Neither `xcap` (window enumeration/capture) nor `enigo` (input injection —
 // this module's other dependency) exposes a "raise/focus this window" API,
@@ -226,7 +226,7 @@ fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
     // multi-window app without the Accessibility (AX) API's own window
     // handle, which `xcap` does not expose — so this activates at the APP
     // level first (`NSRunningApplication`/System Events process
-    // activation), the best-effort approximation the round-4 review's own
+    // activation), the best-effort approximation the earlier review's own
     // "NSRunningApplication ... 或 CGWindow 层激活" guidance calls for.
     // Resolves `id`'s owning pid via `xcap` (the SAME window list this
     // module's own `list_windows`/`capture_window` already re-fetch on every
@@ -237,10 +237,10 @@ fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
     // this crate cannot verify compile *or* run in this container (see this
     // module's own build-time note).
     //
-    // issue #160 round-5 review P1 §7 (issue #160 #2): app-level frontmost
+    // app-level frontmost
     // alone does NOT guarantee THIS window — as opposed to some OTHER window
     // of the same multi-window app — ends up the one actually raised to the
-    // front; that was Codex's own finding on round-4's fix. So this now
+    // front; that gap survived the app-level-only fix. So this now
     // ALSO attempts a per-window raise on top of the app-level activation —
     // see `raise_specific_window`'s own doc for the fail-closed policy that
     // governs it.
@@ -249,7 +249,7 @@ fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
         .iter()
         .find(|w| matches!(w.id(), Ok(wid) if wid == id))
         .ok_or_else(|| ComputerError::CaptureFailed(format!("window {id} is no longer visible")))?;
-    // issue #160 round-34 P2 (Codex computer_srv.rs:2986): verify the full
+    // verify the full
     // identity on the EXACT handle the owning pid is about to be resolved
     // from — an id reused by a different application would otherwise have
     // that replacement raised/focused under the original approval (the
@@ -284,11 +284,11 @@ fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
 }
 
 /// Appended to a macOS activation failure that most likely stems from
-/// missing Accessibility permission (issue #160 round-6 review P2 #5): the
+/// missing Accessibility permission: the
 /// System Events automation this module shells out to requires it to
 /// control other apps' windows at all, so an `osascript` call failing here
 /// is, in practice, almost always that rather than a transient error.
-/// Replaces round-4's own Linux-only "grant this window an Always approval
+/// Replaces the earlier Linux-only "grant this window an Always approval
 /// to avoid needing focus reclaim at all" suggestion — that advice stopped
 /// being true once every input action (Auto-approved ones included) started
 /// calling `activate_window` unconditionally (see
@@ -301,8 +301,7 @@ const MACOS_ACCESSIBILITY_HINT: &str =
      System Settings → Privacy & Security → Accessibility so System Events can activate other apps' windows";
 
 /// Best-effort, FAIL-CLOSED per-window raise on top of the app-level
-/// `frontmost` activation above (issue #160 round-5 review P1 §7 / issue
-/// #160 #2 — Codex's own finding that app-level activation doesn't pick a
+/// `frontmost` activation above (app-level activation doesn't pick a
 /// SPECIFIC window within a multi-window app). Matches by TITLE — the only
 /// window handle `xcap::Window` exposes; there is no AXUIElement/window-id
 /// bridge between `xcap`'s id space and System Events' own accessibility
@@ -402,7 +401,7 @@ fn raise_specific_window(pid: u32, target: &xcap::Window) -> Result<(), Computer
 }
 
 /// Escape a string for embedding as an AppleScript double-quoted string
-/// literal (issue #160 round-5 review P1 §7): a window TITLE is arbitrary,
+/// literal: a window TITLE is arbitrary,
 /// attacker-influenceable text (whatever the target app chose to display),
 /// so it must never be spliced into the script unescaped — a title
 /// containing `"` would otherwise close the literal early and inject
@@ -416,7 +415,7 @@ fn applescript_string_literal(s: &str) -> String {
 
 #[cfg(target_os = "windows")]
 fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
-    // issue #160 round-34 P2: identity check first — see `verify_window_identity`.
+    // identity check first — see `verify_window_identity`.
     verify_window_identity(target)?;
     let id = target.id;
     // Direct `user32.dll` FFI rather than a new Cargo dependency on the
@@ -465,10 +464,10 @@ fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
 
 #[cfg(target_os = "linux")]
 fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
-    // issue #160 round-34 P2: identity check first — see `verify_window_identity`.
+    // identity check first — see `verify_window_identity`.
     verify_window_identity(target)?;
     let id = target.id;
-    // issue #160 round-18 P2 (Codex os.rs:418): activate IN-PROCESS first —
+    // activate IN-PROCESS first —
     // post the EWMH `_NET_ACTIVE_WINDOW` client message ourselves through
     // `x11rb`, the same pure-Rust X protocol layer `xcap`'s own Linux backend
     // already speaks (see `xcap::linux::impl_window`; we deliberately avoid
@@ -489,7 +488,7 @@ fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
     // `_NET_ACTIVE_WINDOW` message addressed by `0x`-prefixed hex id;
     // `xdotool windowactivate` is the next fallback. Any failure is
     // `Unsupported`, never a panic or a silent no-op.
-    // issue #160 round-35 P1 (Codex os.rs:495): a fallback command's
+    // a fallback command's
     // successful EXIT only proves its request was SENT — wmctrl posts the
     // same asynchronous EWMH message the in-process path did, and a window
     // manager that refused that one refuses this one identically. Confirm
@@ -518,7 +517,7 @@ fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
     ))
 }
 
-/// In-process X11 window activation (issue #160 round-18 P2, Codex os.rs:418):
+/// In-process X11 window activation:
 /// connect via `$DISPLAY`, intern `_NET_ACTIVE_WINDOW`, and post the EWMH
 /// client message that asks the window manager to raise + focus window `id`,
 /// addressed to the screen root with the SubstructureRedirect/Notify event
@@ -560,21 +559,21 @@ fn activate_window_x11(id: u32) -> Result<(), ComputerError> {
     .map_err(|e| err(e.to_string()))?;
     conn.flush().map_err(|e| err(e.to_string()))?;
 
-    // issue #160 round-19 P1 (Codex os.rs:414): transport success is NOT
+    // transport success is NOT
     // activation. A compliant window manager processes the request
     // ASYNCHRONOUSLY and MAY refuse a focus-stealing activation outright.
     // Reporting `Ok` on send-success alone would let a click land on whatever
     // app is really foreground while the input arms' identity re-resolve still
     // passes (it checks the target's identity, never the ACTIVE window). So
     // confirm the target actually became `_NET_ACTIVE_WINDOW` on the root —
-    // shared with the CLI fallbacks since round-35 P1 (see
+    // shared with the CLI fallbacks (see
     // `confirm_x11_active`); if it never does, return `Err` so
     // `activate_window_impl` falls back to the CLI tools and, failing those,
     // fails closed — never injecting into an unconfirmed foreground.
     confirm_x11_active(id)
 }
 
-/// issue #160 round-35 P1 (Codex os.rs:495): the round-19 "transport success
+/// the earlier "transport success
 /// is NOT activation" confirmation, shared by the in-process X11 path AND
 /// the `wmctrl`/`xdotool` fallbacks — a fallback command's successful exit
 /// only proves the asynchronous EWMH request was sent, and a window manager

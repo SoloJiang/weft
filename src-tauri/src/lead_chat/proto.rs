@@ -109,7 +109,7 @@ pub enum ChatEvent {
         /// agentMessage)靠它各自成行,不再交错拼进同一个气泡。exec/claude 方言是
         /// 单串行流 → None(引擎的匿名单槽,行为与历史一致)。
         item: Option<String>,
-        /// RAW app-server `threadId` this event arrived on (issue #99) — the
+        /// RAW app-server `threadId` this event arrived on — the
         /// conversation/agent that produced it, main narration and every collab
         /// sub-agent alike. NOT yet "is this a branch": the engine (which alone
         /// knows the session's OWN thread id) compares this against it to decide
@@ -393,7 +393,7 @@ fn codex_tool_call(item: &Value) -> ToolCall {
         // envelope has no thread id on any OTHER item for a child's rows to ever
         // be tagged with (see codex_app_server.rs's notification_to_event doc) —
         // capturing it here would be dead data nothing could ever match. Left
-        // empty; only the app-server dialect populates this (issue #99).
+        // empty; only the app-server dialect populates this.
         collab_threads: Vec::new(),
         // exec item.started never carries a result yet — see ToolCall::images.
         images: Vec::new(),
@@ -597,15 +597,15 @@ pub(crate) fn cap_output(s: String) -> String {
 /// one-line note to its output text when `dropped_count > 0` (see
 /// [`note_omitted_images`]).
 ///
-/// issue #160 round-13 P2 (Codex Rea): this used to be two separate
+/// this used to be two separate
 /// functions — claude's own `cap_images(Vec<String>)`, whose caller
 /// (`tool_result_images`) had to `format!` EVERY image block in a tool result
 /// into an owned `data:` URI and collect them ALL before a single one was
-/// ever dropped, and ACP's streaming capper, added in round-10 P2 #6
+/// ever dropped, and ACP's streaming capper, added
 /// specifically to close that exact hole on the ACP side only. A
 /// malicious/broken MCP tool result carrying hundreds of near-2MB image
 /// blocks could still allocate hundreds of MB via the claude path before
-/// this round — same bug shape as round-10, just a different dialect. Both
+/// this change — same bug shape, just a different dialect. Both
 /// dialects now call this ONE streaming implementation instead of keeping
 /// two near-identical copies: claude passes [`claude_image_block_fields`],
 /// ACP (`acp::map`) passes its own `image_block_fields` — `resolve` borrows a
@@ -622,7 +622,7 @@ pub(crate) fn cap_output(s: String) -> String {
 /// nothing beyond the 4th survivor is ever allocated, regardless of how many
 /// (or how large) more blocks the source holds.
 ///
-/// issue #160 round-13 P2 (Codex Red): once the count cap was already full,
+/// once the count cap was already full,
 /// this used to count `blocks.len()` — literally every remaining block,
 /// INCLUDING plain text/other non-image blocks and repeats of an
 /// already-kept image — as "an omitted image". A result with 4 images
@@ -634,7 +634,7 @@ pub(crate) fn cap_output(s: String) -> String {
 /// seen (kept, dropped-as-oversized, or already counted earlier in the
 /// remainder) is skipped too — the exact same "a duplicate silently
 /// collapses, never counted" rule the loop above already applies to the
-/// first `MAX_COUNT` survivors. This trades away the round-10 "never even
+/// first `MAX_COUNT` survivors. This trades away the earlier "never even
 /// `.next()` the remainder" property for the COUNTING phase — unavoidable,
 /// since text can't be told from an image without looking at it — while
 /// keeping the property that actually matters: nothing past the 4th
@@ -671,7 +671,7 @@ where
     // candidates count as "omitted" — text/other blocks were never images to
     // begin with, and a block repeating one already in `seen` is exactly as
     // redundant here as it is above, so neither inflates `dropped` (issue
-    // #160 round-13 P2, Codex Red).
+    // the ACP dialect's capper).
     for block in blocks {
         if let Some(fields) = resolve(block) {
             if seen.insert(fields) {
@@ -687,7 +687,7 @@ where
 /// block — the claude-dialect counterpart to ACP's own `image_block_fields`
 /// (`acp::map`), resolving WITHOUT allocating so [`cap_and_dedup_images`] can
 /// dedup/size-check every block before ever formatting the eventual owned
-/// data URI string (issue #160 round-13 P2). Accepts both `media_type`
+/// data URI string. Accepts both `media_type`
 /// (claude's own key) and `mimeType` (seen on some MCP tool passthroughs).
 fn claude_image_block_fields(block: &Value) -> Option<(&str, &str)> {
     if block["type"] != "image" {
@@ -873,7 +873,7 @@ pub fn parse_line(line: &str) -> ChatEvent {
                 .unwrap_or(&[])
             {
                 if b["type"] == "tool_result" {
-                    // issue #160 round-13 P2 (Codex Rea): claude now shares the
+                    // claude now shares the
                     // SAME streaming capper the ACP dialect uses instead of
                     // first formatting every image block in the result into an
                     // owned data URI via the old `tool_result_images` — see
@@ -1235,7 +1235,7 @@ mod tests {
         serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":data}})
     }
 
-    /// issue #160 round-13 P2 (Codex Rea): `cap_and_dedup_images` is now the
+    /// `cap_and_dedup_images` is now the
     /// ONE streaming capper shared by both dialects — the claude-specific
     /// half of this coverage exercises it directly via
     /// [`claude_image_block_fields`], the same resolve fn `parse_line` uses.
@@ -1281,9 +1281,9 @@ mod tests {
         assert_eq!(dropped, 0);
     }
 
-    /// (d) issue #160 round-13 P2 (Codex Red): once the 4-image cap is
+    /// (d) once the 4-image cap is
     /// already full, trailing TEXT blocks are not images and must not
-    /// inflate `dropped` — this is the exact bug the round-13 fix closes
+    /// inflate `dropped` — this is the exact bug the earlier fix closes
     /// (the old code counted `blocks.len()`, which conflated every leftover
     /// block, images or not, with an omitted image).
     #[test]
@@ -1300,7 +1300,7 @@ mod tests {
     }
 
     /// The counterpart to (d): a genuine EXCESS image sitting among the
-    /// trailing text blocks must still be counted — round-13 fixes the false
+    /// trailing text blocks must still be counted — this fixes the false
     /// positive above without introducing a false negative here.
     #[test]
     fn cap_and_dedup_images_still_counts_a_genuine_excess_image_among_trailing_text() {

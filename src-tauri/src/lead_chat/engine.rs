@@ -1315,7 +1315,7 @@ fn merge_tool_result_content(content: &mut serde_json::Value, item: &super::prot
     };
     obj.insert("output".into(), item.output.clone().into());
     obj.insert("is_error".into(), item.is_error.into());
-    // issue #99: a `spawnAgent` collab call's `receiverThreadIds` is empty at
+    // a `spawnAgent` collab call's `receiverThreadIds` is empty at
     // item/started (captured — emptily — into this row's content by
     // persist_tool_calls) and only becomes known HERE, at item/completed.
     // Merge it in now so the frontend can still anchor that thread's branch to
@@ -1334,7 +1334,7 @@ fn merge_tool_result_content(content: &mut serde_json::Value, item: &super::prot
     }
 }
 
-/// issue #160 round-10 P1 #9 (Codex 1062): how many of a session's most
+/// how many of a session's most
 /// recent tool-result rows may keep their inline screenshot data URIs in
 /// `content.images` at once. Screenshot data URIs run from a few hundred KB
 /// to a couple MB each (see `lead_chat::proto::cap_and_dedup_images`'s own
@@ -1345,12 +1345,12 @@ fn merge_tool_result_content(content: &mut serde_json::Value, item: &super::prot
 /// result) does nothing to stop that ACROSS calls, and `history` load then
 /// hands the whole accumulated payload to the frontend on every reload. Kept
 /// SMALL: an older screenshot is still reachable by its file path, which
-/// lives in the SAME row's `output` text (issue #160 M3-B's own "text path
+/// lives in the SAME row's `output` text (the "text path
 /// is never dropped" rule) — this cap only prunes the redundant INLINE
 /// base64 copy once it's no longer among the most recent few, never the
 /// on-disk file or the row's own text, and never the CURRENT call's own
-/// inline image (see `merge_tool_results`'s own doc). issue #160 round-13
-/// P2 (Codex Rec): this cap is enforced per-SESSION (see
+/// inline image (see `merge_tool_results`'s own doc). The
+/// P2: this cap is enforced per-SESSION (see
 /// `enforce_durable_inline_image_cap_db`'s own doc) — a thread's several
 /// lead/worker timelines each get their own `MAX_INLINE_IMAGE_ROWS` budget,
 /// not one shared across all of them.
@@ -1381,12 +1381,12 @@ fn track_inline_image_row(
     (rows, evicted)
 }
 
-/// issue #160 round-12 P2 #3: the DURABLE, restart-safe half of the inline-
+/// the DURABLE, restart-safe half of the inline-
 /// image retention cap. `inner.inline_image_rows` above only ever sees rows
 /// written during THIS process's own lifetime — a restart starts that queue
 /// empty, so a session that keeps napping computer-use screenshots across
 /// restarts could silently re-accumulate past `MAX_INLINE_IMAGE_ROWS` inline
-/// images in SQLite forever: nothing before this round closed the gap
+/// images in SQLite forever: nothing before this change closed the gap
 /// between "capped for one process's lifetime" and "capped, full stop", and
 /// `history` loads read straight off the store (`repo::list_lead_messages`,
 /// the SAME query this uses), so an unbounded on-disk backlog was handed to
@@ -1414,7 +1414,7 @@ fn track_inline_image_row(
 /// call actually stripped and durably rewrote, so the wrapper can push each
 /// as a `Push::ToolResult` after this returns.
 ///
-/// issue #160 round-13 P2 (Codex Rec): `session_id` scopes the candidate rows
+/// `session_id` scopes the candidate rows
 /// to ONE session's own timeline — `None` for the lead, `Some(id)` for a
 /// chat-mode worker — mirroring how every other per-timeline read in this
 /// module (e.g. `rewind`'s own `filter(|m| m.session_id == snap.session_id)`)
@@ -1430,7 +1430,7 @@ async fn enforce_durable_inline_image_cap_db(
     thread_id: i32,
     session_id: Option<i32>,
 ) -> Vec<(i32, String, String)> {
-    // issue #160 round-26 P2 (Codex engine.rs:1162): query ONLY this session's
+    // query ONLY this session's
     // image-candidate tool rows — the old whole-thread `list_lead_messages`
     // load re-scanned every session's entire history on each new screenshot,
     // quadratic as the timeline grows, on the engine-consumer path.
@@ -1442,7 +1442,7 @@ async fn enforce_durable_inline_image_cap_db(
     // tool row that STILL carries an inline image, scoped to THIS session
     // alone (`session_id` above), paired with its already-parsed JSON.
     //
-    // issue #160 round-18 P2 (Codex engine.rs:1172): a row counts toward the
+    // a row counts toward the
     // retention limit ONLY when its parsed JSON has a genuine TOP-LEVEL
     // `images` collection — NOT merely a `"images"` substring somewhere in the
     // serialized content. A tool result can legitimately mention `"images"`
@@ -1489,7 +1489,7 @@ async fn enforce_durable_inline_image_cap_db(
 /// a `Push::ToolResult` for each row it actually stripped, so an open
 /// frontend timeline reflects the durable trim immediately rather than only
 /// on the next reload. `session_id` is threaded straight through to scope the
-/// cap to the calling session's own timeline (issue #160 round-13 P2, Codex
+/// cap to the calling session's own timeline (the
 /// Rec — see [`enforce_durable_inline_image_cap_db`]'s own doc for why).
 async fn enforce_durable_inline_image_cap(
     app: &AppHandle,
@@ -1507,7 +1507,7 @@ async fn enforce_durable_inline_image_cap(
 /// Merge tool results into their running rows (claude tool_result / codex
 /// item.completed); a result for an untracked row is dropped.
 ///
-/// issue #160 round-10 P1 #9: a result carrying inline images is tracked in
+/// a result carrying inline images is tracked in
 /// `inner.inline_image_rows` (bounded, in-memory, this engine's own
 /// lifetime) AFTER it persists — [`track_inline_image_row`] then reports any
 /// OLDER row that must be pruned to stay at the cap, and each one has its
@@ -1515,7 +1515,7 @@ async fn enforce_durable_inline_image_cap(
 /// right here. This never touches the CURRENT item's own `content` (already
 /// written above, images intact) — M3-B's "this screenshot inlines for a
 /// capable engine" contract is unaffected; only OLDER rows' accumulated
-/// history is pruned. issue #160 round-12 P2 #3: the AUTHORITATIVE cap is no
+/// history is pruned. the AUTHORITATIVE cap is no
 /// longer this in-memory pass — see [`enforce_durable_inline_image_cap`],
 /// called right after it, for the restart-safe, DB-sourced enforcement that
 /// now bounds this regardless of how many times the app has restarted since.
@@ -1568,11 +1568,11 @@ async fn merge_tool_results(
                     );
                 }
             }
-            // issue #160 round-12 P2 #3: the DB-write-path cap runs on every
+            // the DB-write-path cap runs on every
             // new inline image regardless of the in-memory pass above — see
             // `enforce_durable_inline_image_cap`'s own doc for why this one,
-            // not the in-memory queue, is the authoritative bound. issue #160
-            // round-13 P2 (Codex Rec): `inner.session_id` scopes it to THIS
+            // not the in-memory queue, is the authoritative bound.
+            // `inner.session_id` scopes it to THIS
             // session's own timeline so a different session sharing the same
             // thread can't have ITS most-recent inline images stripped by an
             // unrelated session's screenshot volume.
@@ -2141,7 +2141,7 @@ pub struct EngineInner {
     pub extra_args: Vec<String>,
     /// Environment variables set on every spawned tool child alongside
     /// `extra_args`. Two producers today: the codex computer-use bearer
-    /// (issue #160 round-15 P1, Codex inject.rs:364 — must ride the child's
+    /// (the bearer must ride the child's
     /// environment, owner-only readable, instead of `-c` argv which is
     /// world-readable via process listings), and OpenCode's session-scoped
     /// inline MCP config (OPENCODE_CONFIG_CONTENT — keeping it on the engine
@@ -2267,7 +2267,7 @@ pub struct EngineInner {
     /// its persisted `kind:"tool"` row id and content JSON, so the out-of-band
     /// result merges its output without re-reading the row. Cleared per turn.
     pub tool_rows: std::collections::HashMap<String, (i32, serde_json::Value)>,
-    /// issue #160 round-10 P1 #9: this session's most recent completed
+    /// this session's most recent completed
     /// tool-result rows that currently carry inline screenshot data URIs in
     /// their persisted `content.images` — oldest first, `(row_id, is_error,
     /// content)`. Capped at `MAX_INLINE_IMAGE_ROWS` by `merge_tool_results`,
@@ -2849,7 +2849,7 @@ async fn ensure_running_locked(
         .args(build_args(inner))
         .current_dir(&inner.cwd)
         .env("PATH", crate::detect::tool_path())
-        // issue #160 round-15 P1: injection-supplied env (the codex computer
+        // injection-supplied env (the codex computer
         // bearer travels here, never argv — see `EngineInner::extra_env`).
         .envs(inner.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::piped())
@@ -3640,9 +3640,9 @@ fn advance_dequeued_turn(inner: &mut EngineInner, next: &Option<Outgoing>) {
         .filter(|tag| hidden_delivery_id_from_tag(Some(tag)).is_none());
 }
 
-/// issue #160 round-8 P1 #2: a process-local, unpredictable nonce appended to
+/// a process-local, unpredictable nonce appended to
 /// the codex app-server attachment spill's own file name (`send`'s image-spill
-/// loop, below) — mirrors round-7 P1's identical fix for the per-hook-call
+/// loop, below) — mirrors the identical fix for the per-hook-call
 /// attachment path. `AtomicU64`, not per-call randomness: cheap, monotonic,
 /// and unique for the life of this process, which is all "a co-resident
 /// process can't pre-place a same-named symlink before this write runs"
@@ -3651,7 +3651,7 @@ fn advance_dequeued_turn(inner: &mut EngineInner, next: &Option<Outgoing>) {
 /// itself infeasible in the first place.
 static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// issue #160 round-19 P2 (Codex engine.rs:3214): a per-PROCESS random nonce
+/// a per-PROCESS random nonce
 /// folded into codex app-server attachment file names. `ATTACH_SEQ` above is
 /// monotonic and unique only WITHIN one process — two concurrent Weft
 /// processes sharing the OS temp dir (an installed app plus `tauri dev`, which
@@ -3668,11 +3668,11 @@ fn attach_process_nonce() -> u64 {
     *NONCE.get_or_init(rand::random::<u64>)
 }
 
-/// issue #160 round-8 P1 #2: write a codex app-server image attachment to `p`
+/// write a codex app-server image attachment to `p`
 /// guarded against a pre-placed symlink/existing file at that exact path —
 /// mirrors `computer::screenshot_window`'s own no-follow/exclusive/owner-only
 /// write for the identical "a background process on this account swaps the
-/// target the instant before Weft writes it" hazard (round-7 P1 fixed the
+/// target the instant before Weft writes it" hazard (the same fix landed for the
 /// analogous per-hook-call attachment path the same way). `create_new`
 /// (O_EXCL) refuses to write through anything already at `p` (the caller's
 /// own `ATTACH_SEQ` nonce means this never spuriously collides with a prior,
@@ -3685,8 +3685,8 @@ fn attach_process_nonce() -> u64 {
 /// the whole chat turn, it just means that one attachment doesn't make it
 /// into this turn.
 ///
-/// RESIDUAL (documented, not closed here — mirrors round-7 P1's own note, and
-/// issue #160 §9's broader TOCTOU tracking): after this call returns and the
+/// RESIDUAL (documented, not closed here — mirrors the attachment-write note,
+/// and the broader TOCTOU tracking): after this call returns and the
 /// file handle closes, a SAME-UID process can still `readdir` the (shared)
 /// spill directory, discover the real (nonce-bearing) file name, and swap it
 /// for a symlink before the codex app-server PROCESS ITSELF later opens
@@ -3718,14 +3718,14 @@ fn write_attachment_no_follow(p: &std::path::Path, bytes: &[u8]) -> bool {
     std::fs::write(p, bytes).is_ok()
 }
 
-/// issue #160 round-10 P1 #C: write a PER-TURN dialect's image attachment to
-/// `p` guarded against a pre-placed symlink, EXTENDING round-8 P1 #2's
+/// write a PER-TURN dialect's image attachment to
+/// `p` guarded against a pre-placed symlink, EXTENDING the earlier
 /// no-follow defense (see [`write_attachment_no_follow`]'s own doc) to every
-/// spill branch, not just codex app-server. Round-8 scoped the hardened
+/// spill branch, not just codex app-server. An earlier fix scoped the hardened
 /// write to app-server alone, reasoning that every OTHER per-turn dialect
 /// only ever lists the spilled path in TEXT for the agent to read itself —
 /// a materially lower-severity exposure than app-server's own first-class
-/// `localImage` turn/start input. Codex's round-9 review found that
+/// `localImage` turn/start input. The hazard:
 /// reasoning incomplete: the vulnerable step is this WRITE itself, not what
 /// happens to the path afterward — plain `std::fs::write` (what this
 /// replaces for every non-app-server branch) follows a symlink and
@@ -3746,7 +3746,7 @@ fn write_attachment_no_follow(p: &std::path::Path, bytes: &[u8]) -> bool {
 /// permits overwriting an ordinary pre-existing file (our own prior write),
 /// while `O_NOFOLLOW` still refuses the kernel-level `open(2)` outright
 /// (`ELOOP`) the instant the leaf is a symlink — closing exactly the vector
-/// Codex's round-9 review named, without reopening round-8's own replay
+/// named above, without reopening the earlier replay
 /// concern. `mode(0o600)` keeps this owner-only from creation, matching
 /// every other attachment/screenshot write this codebase already hardens
 /// this way.
@@ -3759,7 +3759,7 @@ fn write_attachment_no_follow(p: &std::path::Path, bytes: &[u8]) -> bool {
 /// it's linked to. Closing that fully needs either `create_new` (which
 /// breaks the replay case above) or moving spilled attachments into a
 /// directory no other account/process can write into at all; tracked as a
-/// follow-up (issue #160 §9), not required to close the SYMLINK vector this
+/// follow-up, not required to close the SYMLINK vector this
 /// round's fix targets.
 #[cfg(unix)]
 fn write_attachment_no_follow_allow_overwrite(p: &std::path::Path, bytes: &[u8]) -> bool {
@@ -4090,7 +4090,7 @@ pub async fn send(
         use base64::Engine as _;
         let dir = std::env::temp_dir().join("weft-attachments");
         let _ = std::fs::create_dir_all(&dir);
-        // issue #160 round-19 P1 (Codex engine.rs:3189): refuse a SYMLINK
+        // refuse a SYMLINK
         // planted at the shared spill dir. `create_dir_all` FOLLOWS a symlink
         // already sitting at this path, and the `set_permissions` below would
         // then chmod — and every spill write would traverse — whatever it
@@ -4103,7 +4103,7 @@ pub async fn send(
         let dir_is_real = std::fs::symlink_metadata(&dir)
             .map(|m| m.file_type().is_dir())
             .unwrap_or(false);
-        // issue #160 round-8 P1 #2: best-effort tighten the shared spill
+        // best-effort tighten the shared spill
         // directory to owner-only — defense in depth alongside the per-file
         // hardening below, for the identical "shared tmp dir, permissive
         // process umask" hazard `computer::screenshot_window` also closes.
@@ -4124,7 +4124,7 @@ pub async fn send(
         let spill: &[(String, String)] = if dir_is_real { &images } else { &[] };
         for (i, (mt, data)) in spill.iter().enumerate() {
             let ext = mt.rsplit('/').next().unwrap_or("png");
-            // issue #160 round-8 P1 #2: ONLY the codex app-server branch gets
+            // ONLY the codex app-server branch gets
             // a NONCE-bearing name — that's the ONLY transport that later
             // hands this exact path to the agent as a first-class
             // `localImage` turn/start input (`is_codex_appserver` branch just
@@ -4134,17 +4134,17 @@ pub async fn send(
             // persisted-`dispatched`-field stamping (see this function's own
             // "Persist the EXACT dispatched text" comment below).
             //
-            // issue #160 round-10 P1 #C: EVERY branch now gets a no-follow
+            // EVERY branch now gets a no-follow
             // guarded write, not just app-server — see
             // `write_attachment_no_follow_allow_overwrite`'s own doc for why
-            // Codex's round-9 review found the OLD app-server-only scoping
+            // The OLD app-server-only scoping
             // incomplete: a plain `std::fs::write` at a predictable name
             // follows a symlink and truncates whatever it points at,
             // regardless of whether any agent later reads the resulting
             // path — the vulnerable step is THIS write, not the later read.
             let p = if is_codex_appserver {
                 let seq = ATTACH_SEQ.fetch_add(1, Ordering::SeqCst);
-                // issue #160 round-19 P2 (Codex engine.rs:3214): the per-process
+                // the per-process
                 // nonce disjoins this name from any OTHER Weft process's spill
                 // (which could share `row_id`/`seq` with an independent counter)
                 // — see `attach_process_nonce`'s own doc. Only the app-server
@@ -4750,7 +4750,7 @@ async fn spawn_acp_turn(
             i.tool.clone(),
             i.command.clone(),
             i.ask_dir.clone(),
-            // issue #160 round-2 P2 §5: this worker's own worktree id, already
+            // this worker's own worktree id, already
             // resolved at engine-build time (`EngineInner::worktree_id`'s own
             // doc) — reused here to pin `weft_computer`'s `?wt=` query param
             // instead of the multi-repo-direction "first worktree" fallback.
@@ -4769,7 +4769,7 @@ async fn spawn_acp_turn(
         .try_state::<crate::BusBase>()
         .map(|b| b.0.clone())
         .unwrap_or_default();
-    // issue #160 round-12 P2 #7: `weft_computer` is now injected
+    // `weft_computer` is now injected
     // UNCONDITIONALLY for every issue-lead/worker engine (concierge/curator
     // still never get it) — the setting/kill-switch is enforced dynamically,
     // server-side, on every single call by `bus::computer_srv::run_action`'s
@@ -4788,8 +4788,8 @@ async fn spawn_acp_turn(
     let mcp = if base.is_empty() {
         vec![]
     } else if sid.is_none() {
-        // Lead-kind engine: choose MCP from thread kind. issue #160 round-22 P1
-        // (Codex engine.rs:3902): a TRANSIENT `get_thread` failure must fail
+        // Lead-kind engine: choose MCP from thread kind.
+        // : a TRANSIENT `get_thread` failure must fail
         // CLOSED — the old `.ok().flatten()...unwrap_or_default()` collapsed an
         // error into `""`, which the `_` arm below classifies as an issue lead
         // and injects `weft_computer` into, even for a concierge/curator lead
@@ -4819,7 +4819,7 @@ async fn spawn_acp_turn(
                     None,
                 ),
                 // Issue lead: planner + bus + computer (always injected, gated
-                // server-side). No worktree of its own (issue #160 round-2 P2
+                // server-side). No worktree of its own (see
                 // §5) — always `None`, and no persisted session id either.
                 _ => crate::bus::inject::acp_mcp_servers(
                     &base,
@@ -4837,8 +4837,8 @@ async fn spawn_acp_turn(
         }
     } else {
         // Worker: bus under direction id + computer pinned to this worker's
-        // OWN worktree (issue #160 round-2 P2 §5). issue #160 round-26 P1
-        // (Codex engine.rs:3916): computer ONLY with a POSITIVELY resolved
+        // OWN worktree.
+        // : computer ONLY with a POSITIVELY resolved
         // worktree — `EngineInner::worktree_id` collapses a missing row or a
         // failed lookup to `None`, and the absent-`wt` URL shape is legitimate
         // ONLY for the lead lane; server-side it deliberately resolves to the
@@ -4846,7 +4846,7 @@ async fn spawn_acp_turn(
         // bearer for (and write audit/screenshots under) a SIBLING session's
         // identity in a multi-repo direction. Identity fails closed instead:
         // no computer server at all until a rebuild resolves the worktree —
-        // mirroring the non-ACP rebuild path's round-17 P2 guard.
+        // mirroring the non-ACP rebuild path's identical guard.
         crate::bus::inject::acp_mcp_servers(
             &base,
             thread_id_i,
@@ -5472,7 +5472,7 @@ fn acp_permission_risk(
         // ReadOnly, injected input is Write, anything unrecognized stays
         // Unknown. Same closed word list the weft_computer MCP path uses.
         PermissionIntent::Gui { action } => crate::ask::classify_gui_action(action),
-        // issue #160 round-29 P1: defensive only — the ACP consumer replies
+        // defensive only — the ACP consumer replies
         // AllowOnce for this intent before any risk is ever computed (see the
         // handler's own carve-out), so this arm is never reached in
         // production. The honest tier is still the action word's own, same as
@@ -5487,7 +5487,7 @@ fn acp_permission_risk(
     }
 }
 
-/// issue #160 round-12 P1 #A: whether an ACP permission `intent` is OMP's
+/// whether an ACP permission `intent` is OMP's
 /// own native `computer`/`browser` tool (see `acp::permission::
 /// PermissionIntent::Gui`'s own doc) — the ONE question `acp_consumer`'s
 /// `SessionEvent::Permission` arm now asks before it does ANYTHING else with
@@ -5495,11 +5495,11 @@ fn acp_permission_risk(
 ///
 /// Superseding rounds 7/9/10 entirely (`gui_or_ordinary_auto_decision`,
 /// `gui_kill_switch_denies`, `permission_reply_must_reject`,
-/// `computer_enabled_for_acp` — all deleted by this round, none had any
+/// `computer_enabled_for_acp` — all deleted by this change, none had any
 /// other caller): those rounds still let a native GUI request run through
 /// the SAME auto-grant/human-card machinery an ordinary permission gets,
 /// gated only by `computer::enabled`. That design is what produced every
-/// one of this round's own findings, because OMP's native `computer`/
+/// one of this change's own findings, because OMP's native `computer`/
 /// `browser` tool executes the OS action ITSELF — Weft never sees the call
 /// happen, so it cannot fit its control lease, global Escape, completion
 /// guard, or coordinate model around an action some OTHER process already
@@ -5508,16 +5508,16 @@ fn acp_permission_risk(
 /// all — it is rejected outright, unconditionally, before anything else
 /// runs:
 ///  - no card is ever shown, so a native `type` action's literal keystrokes
-///    never reach an IM card's `detail` (Codex 4904, "原生 type 进 IM");
+///    never reach an IM card's `detail`;
 ///  - no Always/Full grant is ever written, so the plaintext-carrying
 ///    `grant_id` this arm folds into `action_key` a few lines below never
 ///    reaches the durable grants store for a GUI intent (review 4858,
 ///    "原生授权键含明文");
 ///  - the reply always lands before any DB/lease await, needs no lease, and
 ///    answers to Stop the same way the pre-existing `reject_now` teardown
-///    check above already does (Codex 4992, "原生不经租约").
+///    check above already does.
 ///
-/// Depth-in-depth note: `ask::AskRegistry::cancel_gui_asks` (round-12 P1 #B)
+/// Depth-in-depth note: `ask::AskRegistry::cancel_gui_asks`
 /// still generalizes emergency-stop cancellation to any GUI-marked
 /// `action_key`, so a future path that somehow DID register a GUI-shaped
 /// card would still be reachable by Stop — but THIS check's job is to make
@@ -5528,7 +5528,7 @@ fn acp_permission_risk(
 /// rejection: ACP's `session/request_permission` reply is a bare
 /// `{outcome:{outcome:"selected", optionId}}` (see `acp::permission::
 /// selected_outcome`) with no field for one, and `acp::permission`/
-/// `acp::runtime` are outside this round's file scope — the reply reuses
+/// `acp::runtime` are outside this change's file scope — the reply reuses
 /// the EXACT SAME channel the pre-existing `reject_now` teardown check
 /// above already replies through. The guidance belongs here, in this
 /// module's own doc trail, and in whatever an agent's own UI shows for a
@@ -5544,7 +5544,7 @@ fn is_gui_intent(intent: &crate::acp::permission::PermissionIntent) -> bool {
     matches!(intent, crate::acp::permission::PermissionIntent::Gui { .. })
 }
 
-/// issue #160 round-29 P1 (Codex permission.rs:173): whether this permission
+/// whether this permission
 /// request is for weft's OWN injected `weft_computer` MCP tool — see
 /// `permission::PermissionIntent::WeftComputerMcp`'s doc (and
 /// `is_weft_computer_mcp_call`'s, for the strict title recognition and its
@@ -5914,7 +5914,7 @@ async fn acp_consumer(
                         .await;
                     continue;
                 }
-                // issue #160 round-29 P1 (Codex permission.rs:173): weft's
+                // weft's
                 // OWN injected `weft_computer` MCP tool is auto-allowed,
                 // BEFORE the native-GUI rejection below (whose broadened
                 // `rawInput.action` match would otherwise swallow it) — the
@@ -5927,13 +5927,13 @@ async fn acp_consumer(
                         .await;
                     continue;
                 }
-                // issue #160 round-12 P1 #A: every ACP GUI intent (OMP's own
+                // every ACP GUI intent (OMP's own
                 // native `computer`/`browser` tool) is rejected outright,
                 // unconditionally — no card, no grant lookup, no kill-switch
                 // consultation, no lease — BEFORE anything below builds a
                 // card or persists a grant for it. See `is_gui_intent`'s own
                 // doc for the full rationale and the specific findings this
-                // converges (Codex 4992/4904, review 4858).
+                // converges.
                 if is_gui_intent(&intent) {
                     client
                         .reply_permission(&request_id, &options, crate::acp::Want::RejectOnce)
@@ -6033,9 +6033,9 @@ async fn acp_consumer(
                 // the wire as an allow — queued ahead of `session/cancel`,
                 // starting a tool after the user had stopped the turn.
                 //
-                // issue #160 round-12 P1 #A note: a GUI intent never reaches
+                // Note: a GUI intent never reaches
                 // this point at all (rejected above, before any await) — the
-                // round-10 P1 #E/#8 "recheck computer::enabled a second time
+                // the "recheck computer::enabled a second time
                 // after the human-review await" machinery this gate used to
                 // also carry is gone with it: `computer::enabled` and Stop's
                 // interaction with a native GUI request are no longer this
@@ -6945,7 +6945,7 @@ async fn spawn_turn(
         .args(&args)
         .current_dir(&inner.cwd)
         .env("PATH", crate::detect::tool_path())
-        // issue #160 round-15 P1: injection-supplied env (the codex computer
+        // injection-supplied env (the codex computer
         // bearer travels here, never argv — see `EngineInner::extra_env`).
         .envs(inner.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::null())
@@ -9844,7 +9844,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
 mod tests {
     use super::*;
 
-    // —— issue #160 round-8 P1 #2: hardened codex app-server attachment write ——
+    // —— hardened codex app-server attachment write ——
 
     /// The happy path: a brand-new path (nothing there yet) writes normally.
     #[cfg(unix)]
@@ -9900,7 +9900,7 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"already here");
     }
 
-    // —— issue #160 round-10 P1 #C: hardened write for EVERY OTHER per-turn
+    // —— hardened write for EVERY OTHER per-turn
     // dialect's predictable-name attachment spill ——
 
     /// The happy path: a brand-new predictable path writes normally, owner-only.
@@ -9916,7 +9916,7 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600, "must be created owner-only");
     }
 
-    /// The exact vector Codex's round-9 review named: a co-resident process
+    /// The exact vector: a co-resident process
     /// pre-places a symlink at the predictable `msg<row_id>-<i>.<ext>` path,
     /// pointing at an arbitrary file elsewhere. `O_NOFOLLOW` must refuse to
     /// follow it — the call fails closed and the symlink's target is left
@@ -10187,14 +10187,14 @@ mod tests {
         );
     }
 
-    // —— issue #160 round-12 P1 #A: every ACP GUI intent is rejected
+    // —— every ACP GUI intent is rejected
     // outright, unconditionally, before any card or grant — superseding
     // rounds 7/9/10's own "GUI intent still goes through auto-decision, just
     // gated by computer::enabled" design entirely ——
 
     /// `is_gui_intent` recognizes every GUI action regardless of WHICH action
     /// it names — `type` included, closing the exact leak (a native `type`
-    /// action's literal keystrokes reaching an IM card) round-12 P1 #A
+    /// action's literal keystrokes reaching an IM card)
     /// converges by never letting ANY GUI intent build a card at all.
     #[test]
     fn is_gui_intent_recognizes_every_gui_action() {
@@ -10221,14 +10221,14 @@ mod tests {
         assert!(!is_gui_intent(&PermissionIntent::Write { paths: Vec::new() }));
         assert!(!is_gui_intent(&PermissionIntent::Network));
         assert!(!is_gui_intent(&PermissionIntent::Other { kind: "think".into() }));
-        // issue #160 round-29 P1: the injected weft_computer MCP intent must
+        // the injected weft_computer MCP intent must
         // NEVER hit the native-GUI rejection — it has its own auto-allow arm.
         assert!(!is_gui_intent(&PermissionIntent::WeftComputerMcp {
             action: "left_click".into()
         }));
     }
 
-    /// issue #160 round-29 P1 (Codex permission.rs:173): the auto-allow
+    /// the auto-allow
     /// carve-out matches EXACTLY the injected-MCP intent variant — every other
     /// intent (the native Gui one above all) keeps its existing handling.
     #[test]
@@ -11070,7 +11070,7 @@ mod tests {
         assert!(content.get("images").is_none());
     }
 
-    // —— issue #160 round-10 P1 #9: bounded inline-image-row retention ——
+    // —— bounded inline-image-row retention ——
 
     fn inline_row(id: i32) -> (i32, bool, serde_json::Value) {
         (id, false, serde_json::json!({"images": [format!("data:image/png;base64,img{id}")]}))
@@ -11110,7 +11110,7 @@ mod tests {
         assert_eq!(rows.len(), MAX_INLINE_IMAGE_ROWS);
     }
 
-    /// issue #160 round-12 P2 #3: the DB-write-path cap is what actually
+    /// the DB-write-path cap is what actually
     /// bounds persisted inline images — unlike `inner.inline_image_rows`
     /// (this engine's own in-memory queue, empty again on every restart),
     /// `enforce_durable_inline_image_cap_db` is called with NO in-memory
@@ -11118,7 +11118,7 @@ mod tests {
     /// fresh engine (empty queue) running after every single write — i.e. a
     /// "restart" between every screenshot. The persisted count must still
     /// never exceed `MAX_INLINE_IMAGE_ROWS`. All rows here are the lead's own
-    /// (`session_id: None`) — see the round-13 P2 test below for the
+    /// (`session_id: None`) — see the earlier P2 test below for the
     /// multi-session scoping this now enforces.
     #[tokio::test]
     async fn enforce_durable_inline_image_cap_db_bounds_persisted_inline_images_across_a_simulated_restart() {
@@ -11183,7 +11183,7 @@ mod tests {
         );
     }
 
-    /// issue #160 round-18 P2 (Codex engine.rs:1172): a tool row that merely
+    /// a tool row that merely
     /// MENTIONS `"images"` below the top level (here inside its serialized
     /// `input`) must NOT count toward the retention limit. Before the fix, the
     /// bare-substring count inflated `keep_from` and could strip a genuine
@@ -11250,7 +11250,7 @@ mod tests {
         );
     }
 
-    /// issue #160 round-13 P2 (Codex Rec): a thread hosting TWO sessions —
+    /// a thread hosting TWO sessions —
     /// the lead (`session_id: None`) and a chat-mode worker (`session_id:
     /// Some(7)`) — each writing more than `MAX_INLINE_IMAGE_ROWS` inline
     /// screenshots, must keep each session's OWN cap independently. Before
