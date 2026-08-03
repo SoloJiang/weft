@@ -2399,6 +2399,34 @@ impl AskRegistry {
         }
     }
 
+    /// [`Self::cancel_gui_asks`] scoped to ONE `(thread, dir)` route — issue
+    /// #160 round-35 P1 (Codex commands.rs:2389): `delete_repo` removing a
+    /// SESSION-ONLY worker (a worktree contributed to a direction OWNED BY
+    /// ANOTHER repo) deletes no direction, so the direction-keyed permission
+    /// purge leaves that worker's already-open computer card answerable —
+    /// and an `Ask` carries only `(thread, dir)`, so a Full/Always answer to
+    /// the stale card would mint a standing grant at the SHARED scope,
+    /// silently authorizing the surviving sibling worker off a request whose
+    /// session no longer exists. Cancelling by `(thread, dir)` may also sweep
+    /// a sibling's own open card (asks carry no `wt` to distinguish them) —
+    /// deliberate and safe: the sibling's in-flight call fails closed with a
+    /// cancellation and simply re-asks, while the alternative leaves a
+    /// deleted session's card minting shared grants. GUI-keyed asks only,
+    /// same filter as the emergency-stop sweep above.
+    pub fn cancel_gui_asks_for(&self, thread: i32, dir: &str) {
+        let ids: Vec<u64> = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.open
+                .iter()
+                .filter(|a| a.thread == thread && a.dir == dir && action_key_is_gui(&a.action_key))
+                .map(|a| a.id)
+                .collect()
+        };
+        for id in ids {
+            self.cancel(id);
+        }
+    }
+
     /// Install the transcript-trail consumer's channel (called once at startup,
     /// independent of the IM bridge's `set_notifier`). No snapshot: the trail
     /// only records future resolutions, never replays still-open asks.

@@ -2401,7 +2401,16 @@ async fn delete_repo_after_fence(
     // `computer/<thread>/<dir>/wt-<id>` until the whole thread is deleted.
     // Worktree-precise, so the direction's surviving sibling worktrees keep
     // their own subtrees.
+    // issue #160 round-35 P1 (Codex commands.rs:2389): ALSO cancel the doomed
+    // sessions' open GUI cards — the direction-keyed purge above only covers
+    // removed directions, and a card left answerable after this delete could
+    // be answered Full/Always into a standing grant at the SHARED
+    // `(thread, dir)` scope (asks carry no `wt`), silently authorizing the
+    // surviving sibling worker off a deleted session's request. See
+    // `AskRegistry::cancel_gui_asks_for`'s doc for why sweeping the shared
+    // route (a sibling's own open card included) is the safe direction.
     for (thread, direction, wt) in &doomed_sessions {
+        asks.cancel_gui_asks_for(*thread, &direction.to_string());
         crate::bus::computer_srv::remove_computer_output_for_worktree(
             *thread,
             &direction.to_string(),

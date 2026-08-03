@@ -786,6 +786,14 @@ function AutomationSettings() {
   // started since — the same generational guard `ComputerControlBanner`'s
   // `tickSeqRef` uses for its own reordering hazard.
   const computerUseGenRef = useRef(0);
+  // issue #160 round-35 P2 (Codex SettingsDialog.tsx:809): single-flight for
+  // the poll itself — the generation guard only orders polls around LOCAL
+  // toggles, so two overlapping polls straddling an EXTERNAL Emergency Stop
+  // could still apply out of order (the older `true` overwriting the newer
+  // `false`, showing the toggle re-enabled until the next tick). At most one
+  // poll in flight rules the reordering out — the same shape as
+  // `ComputerControlBanner`'s `tickInFlightRef`.
+  const computerUsePollInFlightRef = useRef(false);
 
   // issue #160 round-28 P2 (Codex SettingsDialog.tsx:796): Emergency Stop
   // (the banner's Stop button or the global Esc shortcut) flips
@@ -803,17 +811,24 @@ function AutomationSettings() {
     let alive = true;
     const h = setInterval(() => {
       if (computerUseToggleInFlightRef.current) return;
+      // round-35 P2: single-flight — skip the tick if the previous poll
+      // hasn't resolved; see `computerUsePollInFlightRef`'s doc.
+      if (computerUsePollInFlightRef.current) return;
+      computerUsePollInFlightRef.current = true;
       // round-33 P2: capture the toggle generation BEFORE issuing the read —
       // see `computerUseGenRef`'s doc for the stale-overwrite this closes.
       const gen = computerUseGenRef.current;
       api.getComputerUseEnabled().then(
         (enabled) => {
+          computerUsePollInFlightRef.current = false;
           if (!alive || computerUseToggleInFlightRef.current) return;
           if (gen !== computerUseGenRef.current) return;
           setComputerUseState(enabled);
           setComputerUseLoaded(true);
         },
-        () => {},
+        () => {
+          computerUsePollInFlightRef.current = false;
+        },
       );
     }, 3000);
     return () => {

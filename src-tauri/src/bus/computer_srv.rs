@@ -84,6 +84,17 @@ fn text_result(s: String) -> Value {
     json!({ "content": [{ "type": "text", "text": s }] })
 }
 
+/// A FAILED `tools/call`'s result — the same text content, plus the MCP
+/// `isError: true` flag (issue #160 round-35 P2, Codex computer_srv.rs:551).
+/// Without it, a denied permission / disabled setting / lost lease / backend
+/// failure came back as an ordinary content-only result: MCP clients report
+/// the call as successful and the tool-result pipeline persists/renders a
+/// COMPLETED row, so error-aware behavior in the calling agent never fires
+/// even though no requested action occurred.
+fn error_result(s: String) -> Value {
+    json!({ "content": [{ "type": "text", "text": s }], "isError": true })
+}
+
 /// A `screenshot` result whose owning session's engine is known to accept an
 /// inline MCP `image` content block (see [`engine_accepts_mcp_image`]) —
 /// `s` is the SAME confirmation text [`text_result`] alone would carry,
@@ -548,15 +559,19 @@ async fn call_computer(
     // even if that ever stops being true.
     match (outcome.is_ok(), screenshot_image_b64) {
         (true, Some(image_b64)) => text_and_image_result(outcome_text, image_b64),
-        _ => text_result(outcome_text),
+        (true, None) => text_result(outcome_text),
+        // issue #160 round-35 P2 (Codex computer_srv.rs:551): a failed call
+        // carries `isError: true` — see [`error_result`]'s doc.
+        (false, _) => error_result(outcome_text),
     }
 }
 
 /// Every action's dispatch, `Ok(confirmation text)` or `Err(error text)` —
-/// the SAME `Value` shape either way is what the calling agent sees (this
-/// server never sets an MCP `isError` flag, matching M1); the `Result` split
-/// exists so [`call_computer`] can report an honest `"ok"`-or-not outcome to
-/// the audit log without re-deriving it from the text.
+/// the text reaches the calling agent either way, but since issue #160
+/// round-35 P2 an `Err` is marked with the MCP `isError: true` flag (see
+/// [`error_result`]); the `Result` split also lets [`call_computer`] report
+/// an honest `"ok"`-or-not outcome to the audit log without re-deriving it
+/// from the text.
 async fn run_action(
     db: &Db,
     asks: &AskRegistry,

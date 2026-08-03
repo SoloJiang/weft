@@ -489,9 +489,16 @@ fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
     // `_NET_ACTIVE_WINDOW` message addressed by `0x`-prefixed hex id;
     // `xdotool windowactivate` is the next fallback. Any failure is
     // `Unsupported`, never a panic or a silent no-op.
+    // issue #160 round-35 P1 (Codex os.rs:495): a fallback command's
+    // successful EXIT only proves its request was SENT — wmctrl posts the
+    // same asynchronous EWMH message the in-process path did, and a window
+    // manager that refused that one refuses this one identically. Confirm
+    // `_NET_ACTIVE_WINDOW` actually became the target after EACH fallback,
+    // exactly like the in-process path (see `confirm_x11_active`), or fall
+    // through — never report an unconfirmed foreground as activated.
     let hex_id = format!("0x{id:08x}");
     if let Ok(output) = std::process::Command::new("wmctrl").args(["-i", "-a", &hex_id]).output() {
-        if output.status.success() {
+        if output.status.success() && confirm_x11_active(id).is_ok() {
             return Ok(());
         }
     }
@@ -499,7 +506,7 @@ fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
         .args(["windowactivate", "--sync", &id.to_string()])
         .output()
     {
-        if output.status.success() {
+        if output.status.success() && confirm_x11_active(id).is_ok() {
             return Ok(());
         }
     }
@@ -559,10 +566,44 @@ fn activate_window_x11(id: u32) -> Result<(), ComputerError> {
     // Reporting `Ok` on send-success alone would let a click land on whatever
     // app is really foreground while the input arms' identity re-resolve still
     // passes (it checks the target's identity, never the ACTIVE window). So
-    // confirm the target actually became `_NET_ACTIVE_WINDOW` on the root,
-    // with a bounded poll; if it never does, return `Err` so
+    // confirm the target actually became `_NET_ACTIVE_WINDOW` on the root —
+    // shared with the CLI fallbacks since round-35 P1 (see
+    // `confirm_x11_active`); if it never does, return `Err` so
     // `activate_window_impl` falls back to the CLI tools and, failing those,
     // fails closed — never injecting into an unconfirmed foreground.
+    confirm_x11_active(id)
+}
+
+/// issue #160 round-35 P1 (Codex os.rs:495): the round-19 "transport success
+/// is NOT activation" confirmation, shared by the in-process X11 path AND
+/// the `wmctrl`/`xdotool` fallbacks — a fallback command's successful exit
+/// only proves the asynchronous EWMH request was sent, and a window manager
+/// that refused the in-process attempt refuses the CLI's identically, which
+/// used to read as `Ok` and let `type`/`key` reach whatever application was
+/// really foreground (and pointer actions hit an obscuring window). Bounded
+/// poll of `_NET_ACTIVE_WINDOW` on the root; opens its own `$DISPLAY`
+/// connection — if even that fails, activation is UNCONFIRMABLE and this
+/// fails closed rather than assuming success.
+#[cfg(target_os = "linux")]
+fn confirm_x11_active(id: u32) -> Result<(), ComputerError> {
+    use std::time::Duration;
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+
+    let err = |e: String| ComputerError::Unsupported(e);
+    let (conn, screen_num) = x11rb::connect(None).map_err(|e| err(e.to_string()))?;
+    let root = conn
+        .setup()
+        .roots
+        .get(screen_num)
+        .ok_or_else(|| err("no X screen for the current display".into()))?
+        .root;
+    let atom = conn
+        .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+        .map_err(|e| err(e.to_string()))?
+        .reply()
+        .map_err(|e| err(e.to_string()))?
+        .atom;
     for _ in 0..25 {
         let reply = conn
             .get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)
