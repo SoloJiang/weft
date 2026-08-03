@@ -750,7 +750,15 @@ async fn run_action(
         return Err(ComputerError::Disabled.to_string());
     }
     if name != "computer" {
-        return Err(format!("unknown tool: {name}"));
+        // NON-ECHOING: the caller-supplied `name` (from `/params/name`) is
+        // NEVER interpolated into this error. `call_computer` persists an
+        // action's outcome text verbatim into the durable audit log, and the
+        // argument-redaction that scrubs secrets from logged params can't
+        // touch a value that arrived as the tool NAME — so echoing a
+        // secret-bearing name here would leak it straight past redaction into
+        // the audit file. This server exposes exactly one tool; a request for
+        // any other name is refused without ever repeating what was asked.
+        return Err("unknown tool — this endpoint exposes only the 'computer' tool".to_string());
     }
     // run ALL pure,
     // side-effect-free schema validation for THIS action BEFORE the approval
@@ -1705,6 +1713,25 @@ const MAX_OPEN_OBSERVE_ASKS: usize = 3;
 /// resolve inside a separate `bind_approved_window` step anymore, so there
 /// is no "resolve once for the key, resolve again to bind" drift left to
 /// reopen.
+/// The `Ask.summary` for a `weft_computer` action — data tokens ONLY, no
+/// translatable prose (see [`approve`]'s own call site for why). The
+/// protocol `action` identifier, plus `@ <window>` when a window is
+/// targeted. Shared by BOTH the server-side gate ([`approve`]) and the
+/// hook-path summarizer (`bus::server::summarize`) so the two can never
+/// drift onto two different label shapes for the same call.
+///
+/// `#[doc(hidden)] pub` so `bus::server` (a sibling module) builds the
+/// SAME label without re-deriving it — the identical single-source-of-truth
+/// reasoning as [`computer_session_token`]'s own visibility.
+#[doc(hidden)]
+pub fn computer_ask_summary(action: &str, window: &str) -> String {
+    if window.is_empty() {
+        action.to_string()
+    } else {
+        format!("{action} @ {window}")
+    }
+}
+
 async fn approve(
     asks: &AskRegistry,
     thread: i32,
@@ -1715,11 +1742,17 @@ async fn approve(
 ) -> Result<Option<ApprovedWindow>, String> {
     let window_query = window_arg(args);
     let risk = crate::ask::classify_gui_action(action);
-    let summary = if window_query.is_empty() {
-        format!("computer: {action}")
-    } else {
-        format!("computer: {action} @ {window_query}")
-    };
+    // NO English prose is constructed here (CLAUDE.md: user-facing strings
+    // only via i18n). The visible framing — "<Tool> wants permission …" — is
+    // built from the i18n catalogs at each presentation surface (the local
+    // Needs-you card prepends the localized tool name + `needs.wantsPermission`;
+    // the IM cards render their own localized copy around it). `summary`
+    // therefore carries ONLY data tokens the surfaces interpolate verbatim:
+    // the protocol `action` identifier (the literal computer-use API verb —
+    // `left_click`/`type`/… — a wire token, not translatable prose) and, when
+    // present, the target window's own title (user content). No locale can
+    // leave this in the wrong language because there is no language in it.
+    let summary = computer_ask_summary(action, &window_query);
     let digest = args_digest(args);
     // resolve the window's identity FIRST, before
     // `action_key` is even built — see this function's own doc comment above
@@ -3259,32 +3292,37 @@ fn recheck_stop_and_lease_before_backend(
 ///  2. [`recheck_stop_and_lease_before_backend`] — a kill switch tripped
 ///     during the sleep (or the queue wait before it) is honored before the
 ///     activation SIDE EFFECT below, not merely before the injection.
-///  3. [`activate_target`] on `activation_target` (the arm's pre-pacing
+///  3. `asks.has_open` — BEFORE the activation side effect below, not
+///     after: raising/focusing a window while a Needs-you card is open can
+///     throw that window over the card the human is being asked to read.
+///     A card can open during the pacing sleep or the blocking-pool queue,
+///     both of which land after the caller's own [`recheck_after_guard`].
+///  4. [`activate_target`] on `activation_target` (the arm's pre-pacing
 ///     resolve) — reclaim the foreground for the target. Activation itself
 ///     re-verifies the full identity against the live desktop (see its
 ///     doc), so a target replaced during the sleep fails closed here rather
 ///     than raising the replacement.
-///  4. The post-activation recheck — activation is a slow OS shell-out a
-///     Stop can land during, so this mirrors [`recheck_after_guard`]'s
-///     sync-checkable concerns: `asks.has_open` (a brand-new card opened
-///     meanwhile suspends this injection rather than being clicked
-///     through), then [`computer::renew_lease_after_queue`] (stop latch +
+///  5. [`computer::renew_lease_after_queue`] — activation is a slow OS
+///     shell-out a Stop/Escape can land during: stop latch +
 ///     doomed/foreign/expired holder, renewing a still-rightful holder
 ///     whose lease lapsed during the wait, exactly like the post-
-///     flight-guard checkpoint). The `enabled`-flag and route-revocation
-///     halves of `recheck_after_guard` are async (db reads) and cannot run
+///     flight-guard checkpoint. The `enabled`-flag and route-revocation
+///     halves of [`recheck_after_guard`] are async (db reads) and cannot run
 ///     on this thread — deliberately fine: every disable path trips the
 ///     stop latch and every route-teardown path clears the lease (see
-///     [`recheck_stop_and_lease_before_backend`]'s own doc), so the two
+///     [`recheck_stop_and_lease_before_backend`]'s own doc), so the
 ///     sync checks here already fail closed for both.
-///  5. [`resolve_and_verify_target`] — the AUTHORITATIVE fresh resolve the
+///  6. [`resolve_and_verify_target`] — the AUTHORITATIVE fresh resolve the
 ///     arm's `tail` maps/checks against, recorded into `window_id_out`
 ///     (even on a verify failure, so the audit line still names the window
 ///     that was targeted) and verified byte-for-byte against `approved`.
-///  6. [`recheck_stop_and_lease_before_backend`] once more — the resolve
+///  7. [`recheck_stop_and_lease_before_backend`] once more — the resolve
 ///     above is itself an OS enumeration; this keeps the final stop/lease
 ///     read at the last possible instant before the backend call.
-///  7. `tail(&fresh)` — the arm's own coordinate mapping (pure in-memory
+///  8. `asks.has_open` a FINAL time — the resolve at step 6 is a blocking
+///     enumeration a brand-new card can open during, and no injection may
+///     land while one is pending (`check_suspended`'s rule).
+///  9. `tail(&fresh)` — the arm's own coordinate mapping (pure in-memory
 ///     lookups) or focus-freshness check, then the backend injection,
 ///     against the fresh resolve ONLY — never the pre-pacing snapshot.
 ///
@@ -3316,10 +3354,22 @@ async fn pace_activate_verify_and_inject<T: Send + 'static>(
         let mut id = None;
         let result = (|| {
             recheck_stop_and_lease_before_backend(thread, &dir_owned, wt, auth_gen)?;
-            activate_target(&activation_target)?;
+            // BEFORE activation, not after: `activate_target` is itself a
+            // desktop side effect — it RAISES and FOCUSES the target
+            // application — so running it while a Needs-you card is open can
+            // throw that window over the very card the human is being asked
+            // to read, and can pull focus away from it. A card can open
+            // during the pacing sleep above or while this closure sat queued
+            // for a blocking thread, both of which land after the caller's
+            // own `recheck_after_guard`. `check_suspended`'s rule ("no
+            // desktop-facing action while a card is pending") therefore has
+            // to be re-checked here, ahead of the side effect, exactly like
+            // the stop/lease recheck immediately above it. Lock-only, so it
+            // costs nothing to check at the last instant.
             if asks.has_open(thread, &dir_owned) {
                 return Err(ComputerError::SuspendedPendingAsk.to_string());
             }
+            activate_target(&activation_target)?;
             match computer::renew_lease_after_queue(thread, &dir_owned, wt) {
                 computer::LeaseCheckOutcome::Authorized => {}
                 computer::LeaseCheckOutcome::Busy { thread, dir } => {
@@ -3335,6 +3385,19 @@ async fn pace_activate_verify_and_inject<T: Send + 'static>(
             }
             let fresh = resolve_and_verify_target(&window_query, &approved, &mut id)?;
             recheck_stop_and_lease_before_backend(thread, &dir_owned, wt, auth_gen)?;
+            // one FINAL pending-ask check, immediately before `tail` runs the
+            // backend injection. The `has_open` check above ran BEFORE
+            // `resolve_and_verify_target`, whose window enumeration is itself a
+            // blocking OS call — a brand-new Needs-you card for this same
+            // `(thread, dir)` (an unrelated permission request racing in
+            // through the engine's hook) can open DURING that enumeration, and
+            // without this check `tail` would click/type/scroll while that card
+            // is still on screen: exactly the "inject through the card" hazard
+            // `check_suspended`/`recheck_after_guard` guard everywhere else.
+            // Cheap (one lock-only lookup) and the last thing before the input.
+            if asks.has_open(thread, &dir_owned) {
+                return Err(ComputerError::SuspendedPendingAsk.to_string());
+            }
             let out = tail(&fresh)?;
             Ok((out, fresh))
         })();
@@ -9499,6 +9562,181 @@ mod tests {
         );
 
         computer::clear_emergency_stop(computer::stop_generation());
+    }
+
+    /// A Needs-you card that opens DURING the paced closure's own
+    /// `resolve_and_verify_target` enumeration — AFTER the closure's first
+    /// `has_open` check has already passed — must still suspend the
+    /// injection: the FINAL `has_open` check, run immediately before `tail`,
+    /// catches it and `tail` never touches the backend. Isolates that
+    /// second check specifically by driving the helper directly (one
+    /// resolve) with NO card open at entry, then opening one from inside
+    /// `list_windows` via `on_list_windows` — the enumeration-time analogue
+    /// of the `on_activate` hook.
+    #[tokio::test]
+    async fn a_card_opening_during_the_in_closure_resolve_suspends_the_injection() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let target = computer::WindowInfo {
+            id: 906_601,
+            app: "Bar".into(),
+            title: "Bar".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(vec![target.clone()]);
+
+        let asks = AskRegistry::new();
+        let thread = 906_601;
+        let dir = "lead";
+        // The helper's post-activation `renew_lease_after_queue` requires
+        // THIS (thread, dir) to still hold the lease — take it so the closure
+        // reaches the resolve (and thus the final has_open check) rather than
+        // failing at the lease gate first.
+        computer::acquire_control(thread, dir, None).unwrap();
+
+        // No card is open at entry — the closure's FIRST has_open check (right
+        // after activation) passes. The hook then opens one from inside the
+        // in-closure resolve's `list_windows`, so ONLY the final check can
+        // catch it. One-shot: clear the hook the first time it fires so the
+        // resolve itself still returns a window set on that same call.
+        let asks_hook = asks.clone();
+        // One-shot via an atomic flag, NOT by clearing `on_list_windows` from
+        // inside the hook: `list_windows` invokes the hook while still holding
+        // that very mutex, so re-locking it here would deadlock (std `Mutex`
+        // is not reentrant).
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *mock.on_list_windows.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Box::new(move || {
+                if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                // an UNRELATED permission request racing in for this same
+                // (thread, dir) during the enumeration. The returned waiter
+                // is dropped — the OPEN ask (what `has_open` sees) is what
+                // matters here, not its eventual answer.
+                let _ = asks_hook.request(thread, dir, "bash", "Run: rm -rf /", "rm -rf /", crate::ask::RiskLevel::Write, "k");
+            }));
+
+        let mut window_id_out = None;
+        let tail_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tail_flag = tail_ran.clone();
+        let err = pace_activate_verify_and_inject(
+            &asks,
+            thread,
+            dir,
+            None,
+            session_token_generation(thread, dir, None),
+            "Bar",
+            &None,
+            target,
+            &mut window_id_out,
+            move |_| {
+                tail_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a card opening during the resolve must suspend the injection");
+
+        assert!(
+            err.contains("waiting on your input") || err.to_lowercase().contains("suspend") || err.contains("pending"),
+            "expected the suspended-pending-ask rejection, got: {err}"
+        );
+        assert!(
+            !tail_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the injection tail must never run while a Needs-you card is open"
+        );
+        assert!(
+            !mock.actions.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|a| a.starts_with("type ") || a.starts_with("click ")),
+            "the backend must receive no input once a card is open"
+        );
+
+        *mock.on_list_windows.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        computer::clear_control();
+    }
+
+    /// A Needs-you card that is already open when the paced closure runs
+    /// must stop it BEFORE `activate_target` — raising/focusing the target
+    /// application would throw a window over the very card the human is
+    /// being asked to read (and pull focus off it), which is the same
+    /// "no desktop-facing action while a card is pending" rule
+    /// `check_suspended` enforces everywhere else. Proven by asserting the
+    /// backend recorded NO `activate` action at all.
+    #[tokio::test]
+    async fn a_pending_card_stops_the_paced_closure_before_it_activates_anything() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *mock.on_list_windows.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let target = computer::WindowInfo {
+            id: 906_701,
+            app: "Bar".into(),
+            title: "Bar".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(vec![target.clone()]);
+
+        let asks = AskRegistry::new();
+        let thread = 906_701;
+        let dir = "lead";
+        computer::acquire_control(thread, dir, None).unwrap();
+        // A card is already open for this (thread, dir) — standing in for one
+        // that opened during the pacing sleep or the blocking-pool queue.
+        let _pending = asks.request(
+            thread, dir, "bash", "Run: rm -rf /", "rm -rf /", crate::ask::RiskLevel::Write, "k",
+        );
+
+        let mut window_id_out = None;
+        let tail_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tail_flag = tail_ran.clone();
+        let err = pace_activate_verify_and_inject(
+            &asks,
+            thread,
+            dir,
+            None,
+            session_token_generation(thread, dir, None),
+            "Bar",
+            &None,
+            target,
+            &mut window_id_out,
+            move |_| {
+                tail_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a pending card must stop the closure");
+
+        let actions = mock.actions.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !actions.iter().any(|a| a.starts_with("activate")),
+            "the target window must NEVER be raised/focused while a card is open: {actions:?}"
+        );
+        drop(actions);
+        assert!(
+            !tail_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the injection tail must never run while a card is open"
+        );
+        assert!(err.contains("permission card"), "{err}");
+
+        computer::clear_control();
     }
 
     /// grant-less OBSERVE

@@ -507,7 +507,7 @@ fn hook_decision(decision: &str, reason: &str) -> Response {
 /// tool action. Tool-agnostic across claude (Bash / file_path) and opencode
 /// (bash / filePath, lowercase names): a command reads as "Run: …", a file op
 /// as "<tool> <file>". `weft_computer`'s single `computer` MCP tool reads as
-/// "computer: <action>" (M2-B) — see the dedicated branch below.
+/// a data-token GUI label (M2-B) — see the dedicated branch below.
 ///
 /// KNOWN LIMITATION shared with the rest of this function's MCP recognition:
 /// the `computer` branch keys off `split_internal_tool`, which parses ONLY
@@ -579,11 +579,12 @@ pub(crate) fn summarize(
             action: &action,
             window: &window,
         });
-        let summary = if window.is_empty() {
-            format!("computer: {action}")
-        } else {
-            format!("computer: {action} @ {window}")
-        };
+        // Data tokens only — the same shared, prose-free label the
+        // server-side gate builds; the localized "<Tool> wants permission"
+        // framing is added at each presentation surface, never here (CLAUDE.md:
+        // user-facing strings only via i18n). See
+        // `computer_srv::computer_ask_summary`'s own doc.
+        let summary = crate::bus::computer_srv::computer_ask_summary(&action, &window);
         return (summary, detail, risk, action_key);
     }
     if let Some(cmd) = s("command") {
@@ -3227,7 +3228,7 @@ mod tests {
         let input = json!({"action": "screenshot", "window": "Safari"});
         let (summary, detail, risk, action_key) =
             summarize("mcp__weft_computer__computer", Some(&input));
-        assert_eq!(summary, "computer: screenshot @ Safari");
+        assert_eq!(summary, "screenshot @ Safari");
         assert_eq!(risk, RiskLevel::ReadOnly);
         assert!(detail.contains("screenshot"));
         assert!(action_key.contains("screenshot"));
@@ -3238,7 +3239,7 @@ mod tests {
         let input = json!({"action": "left_click", "window": "Safari"});
         let (summary, _detail, risk, _action_key) =
             summarize("mcp__weft_computer__computer", Some(&input));
-        assert_eq!(summary, "computer: left_click @ Safari");
+        assert_eq!(summary, "left_click @ Safari");
         assert_eq!(risk, RiskLevel::Write);
     }
 
@@ -3249,7 +3250,7 @@ mod tests {
         let input = json!({"action": "list_windows"});
         let (summary, _detail, risk, _action_key) =
             summarize("mcp__weft_computer__computer", Some(&input));
-        assert_eq!(summary, "computer: list_windows");
+        assert_eq!(summary, "list_windows");
         assert_eq!(risk, RiskLevel::ReadOnly);
     }
 
@@ -3262,7 +3263,7 @@ mod tests {
     fn summarize_does_not_misfire_on_an_unrelated_server_sharing_the_bare_tool_name() {
         let input = json!({"action": "left_click"});
         let (summary, ..) = summarize("mcp__some_other_server__computer", Some(&input));
-        assert_ne!(summary, "computer: left_click");
+        assert_ne!(summary, "left_click");
     }
 
     /// The opencode-flattened literal must NOT be recognized as weft's own
@@ -3276,7 +3277,7 @@ mod tests {
         let input = json!({"action": "left_click"});
         let (summary, _detail, _risk, _action_key) = summarize("weft_computer_computer", Some(&input));
         assert_ne!(
-            summary, "computer: left_click",
+            summary, "left_click",
             "the ambiguous flat name must fall through to the generic MCP branch"
         );
         assert!(

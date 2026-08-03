@@ -67,6 +67,22 @@ pub struct MockBackend {
     /// (a second `recheck_after_guard`) runs. `None` (the `Default` value)
     /// is a no-op, identical to every other test's plain activation.
     pub on_activate: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Run synchronously from INSIDE `list_windows`, right before it returns
+    /// its window set — the enumeration-time analogue of [`Self::on_activate`].
+    /// Lets a test simulate "a new Needs-you card opened WHILE the blocking
+    /// window enumeration was in flight" deterministically: `resolve_window`
+    /// (and thus `resolve_and_verify_target`) is backed by this call, so a
+    /// closure that opens an ask here stands in for a permission request
+    /// racing in during that resolve. `None` (the `Default` value) is a
+    /// no-op. Like `on_activate` it runs on the SAME task that called
+    /// `list_windows`, so its effect is guaranteed visible by the time the
+    /// enumeration returns.
+    ///
+    /// CONSTRAINT: the closure is invoked while THIS field's own mutex is
+    /// held, so it must never lock `on_list_windows` again — `std::sync::
+    /// Mutex` is not reentrant and doing so deadlocks. A one-shot hook uses
+    /// its own `AtomicBool`, never `*on_list_windows.lock() = None`.
+    pub on_list_windows: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 impl MockBackend {
@@ -80,6 +96,9 @@ impl MockBackend {
 
 impl ComputerBackend for MockBackend {
     fn list_windows(&self) -> Result<Vec<WindowInfo>, ComputerError> {
+        if let Some(hook) = self.on_list_windows.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            hook();
+        }
         // Sequence entries win while any remain — see `windows_sequence`'s doc.
         if let Some(next) = self
             .windows_sequence

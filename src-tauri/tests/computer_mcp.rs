@@ -870,7 +870,12 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     let call = spawn_computer_call(&base, gate_thread, gate_dir_s.clone(), "left_click", "notes");
     let card = wait_for_card(&asks_handle, "left_click with no standing grant").await;
     assert_eq!(card.tool, "computer", "the gate's own card must self-identify as \"computer\", not an engine name");
-    assert_eq!(card.summary, "computer: left_click @ notes");
+    // DATA TOKENS ONLY — the protocol action identifier plus the target
+    // window, never translatable prose. The visible "<Tool> wants permission
+    // …" framing is built from each surface's own i18n catalog around
+    // `tool`+`summary` (CLAUDE.md: user-facing strings only via i18n), so no
+    // English may be baked in here.
+    assert_eq!(card.summary, "left_click @ notes");
     // only `action == "type"` ever carries a
     // `detail_redacted` — a `left_click`'s detail (a coordinate) has nothing
     // this module considers secret, so the IM bridge falls back to the full
