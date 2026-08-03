@@ -29,7 +29,17 @@ pub enum MouseButton {
 /// never rescales.
 pub trait ComputerBackend: Send + Sync {
     fn list_windows(&self) -> Result<Vec<WindowInfo>, ComputerError>;
-    fn capture_window(&self, id: u32) -> Result<CapturedImage, ComputerError>;
+    /// Capture `target`, verifying its FULL identity — `id` AND `app`/`title`
+    /// — on the exact window about to be captured (issue #160 round-32 P1,
+    /// Codex os.rs:30). This method performs its own enumeration to find the
+    /// window handle, and an OS window id is reusable: selecting by `id`
+    /// alone let a window that closed after the caller's own
+    /// resolve-and-verify be silently replaced by whatever unrelated (or
+    /// deliberately excluded) window inherited its number in the gap, its
+    /// pixels then saved/previewed/returned under the ORIGINAL approval. An
+    /// identity mismatch fails closed with `CaptureFailed`, disclosing
+    /// nothing about the replacement.
+    fn capture_window(&self, target: &WindowInfo) -> Result<CapturedImage, ComputerError>;
     /// Click at a physical `(x, y)`, `count` times in a row (2 = double,
     /// 3 = triple) — the caller does NOT need to move the cursor there
     /// first, this moves it as part of the click.
@@ -109,7 +119,7 @@ impl ComputerBackend for StubBackend {
         ))
     }
 
-    fn capture_window(&self, _id: u32) -> Result<CapturedImage, ComputerError> {
+    fn capture_window(&self, _target: &WindowInfo) -> Result<CapturedImage, ComputerError> {
         Err(ComputerError::Unsupported(
             "built without computer-os feature".into(),
         ))

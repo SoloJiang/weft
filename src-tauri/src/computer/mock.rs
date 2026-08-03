@@ -96,10 +96,30 @@ impl ComputerBackend for MockBackend {
         }
     }
 
-    /// Ignores `id` — tests configure at most one canned image per
-    /// `MockBackend`, which is all the current test matrix needs (matching
-    /// already narrowed to exactly one window before this is called).
-    fn capture_window(&self, _id: u32) -> Result<CapturedImage, ComputerError> {
+    /// Returns the one canned `image` — after mirroring the REAL backend's
+    /// capture-time identity verification (issue #160 round-32 P1, Codex
+    /// os.rs:30): `target` must still be present, with matching id AND
+    /// app/title, in the CURRENTLY visible set. `windows_sequence` is
+    /// deliberately NOT popped here — its entries feed `list_windows` calls
+    /// by index (see its doc), and consuming one from a capture would
+    /// desynchronize a test's choreography; the override/base set is what
+    /// "currently visible" means at capture time.
+    fn capture_window(&self, target: &WindowInfo) -> Result<CapturedImage, ComputerError> {
+        let visible: Vec<WindowInfo> = {
+            let over = self.windows_override.lock().unwrap_or_else(|e| e.into_inner());
+            match over.as_ref() {
+                Some(w) => w.clone(),
+                None => self.windows.clone(),
+            }
+        };
+        let same_identity = visible
+            .iter()
+            .any(|w| w.id == target.id && w.app == target.app && w.title == target.title);
+        if !same_identity {
+            return Err(ComputerError::CaptureFailed(
+                "window no longer matches the approved application/title".into(),
+            ));
+        }
         self.image
             .clone()
             .ok_or_else(|| ComputerError::CaptureFailed("mock backend has no image configured".into()))

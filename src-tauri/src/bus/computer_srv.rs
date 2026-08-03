@@ -699,7 +699,7 @@ async fn run_action(
                 if computer::stop_latched() {
                     return Err(ComputerError::Disabled.to_string());
                 }
-                if route_revoked_sync(thread, &dir_owned) {
+                if route_revoked_sync(thread, &dir_owned, wt) {
                     return Err(SESSION_GONE_MSG.to_string());
                 }
                 computer::visible_windows(b.as_ref()).map_err(|e| e.to_string())
@@ -890,7 +890,7 @@ async fn run_action(
                 // identity or recreate the just-pruned output subtree. Direction-
                 // precise, so a `delete_repo` that left THIS direction live (only
                 // a sibling was removed) is unaffected.
-                if route_revoked_sync(thread, &dir_owned) {
+                if route_revoked_sync(thread, &dir_owned, wt) {
                     return (resolved_id, Err(SESSION_GONE_MSG.to_string()));
                 }
                 let shot = match computer::screenshot_resolved(b.as_ref(), &w, &out_dir) {
@@ -1005,7 +1005,7 @@ async fn run_action(
             // that already created directories is cleaned up the same way.
             {
                 let _revocation_txn = revocation_txn_lock().lock().await;
-                if route_revoked_sync(thread, dir) {
+                if route_revoked_sync(thread, dir, wt) {
                     remove_recreated_screenshot_output(&out_dir_cleanup);
                     return Err(SESSION_GONE_MSG.to_string());
                 }
@@ -1375,7 +1375,7 @@ async fn run_action(
                 // global stop latch, so a standing-granted `cursor_position`
                 // would otherwise still read live desktop cursor state under a
                 // revoked identity.
-                if route_revoked_sync(thread, &dir_owned) {
+                if route_revoked_sync(thread, &dir_owned, wt) {
                     return Err(SESSION_GONE_MSG.to_string());
                 }
                 b.cursor_position().map_err(|e| e.to_string())
@@ -1601,7 +1601,7 @@ async fn approve(
                 if computer::stop_latched() {
                     return Err(ComputerError::Disabled.to_string());
                 }
-                if route_revoked_sync(thread, &dir_recheck) {
+                if route_revoked_sync(thread, &dir_recheck, wt) {
                     return Err(SESSION_GONE_MSG.to_string());
                 }
                 computer::resolve_window(b.as_ref(), &wq).map_err(|e| match e {
@@ -3201,15 +3201,63 @@ fn reject_unsafe_key_combo(tokens: &[computer::KeyToken]) -> Result<(), String> 
                 .to_string(),
         );
     }
-    match tokens {
-        [computer::KeyToken::Named(computer::NamedKey::Escape)] => Err(
-            "`escape` can't be injected through the `key` action — a bare Escape collides with \
-             weft's global emergency-stop shortcut and could trip the kill switch instead of \
-             reaching the target window"
+    // issue #160 round-20 P2 (Codex computer_srv.rs:1189) + round-32 P2
+    // (Codex mod.rs:2037): reject any chord that would inject an UNMODIFIED
+    // Escape press — judged semantically by [`chord_injects_bare_escape`],
+    // not by the exact bare-`escape` slice, which the same duplicate-token
+    // dodge round-31 closed for printable chords slipped past
+    // (`escape+escape` pressed-and-held a bare Escape while missing
+    // `[Named(Escape)]`).
+    if chord_injects_bare_escape(tokens) {
+        return Err(
+            "`escape` can't be injected through the `key` action unless modified (e.g. \
+             `shift+escape`) — an unmodified Escape press collides with weft's global \
+             emergency-stop shortcut and could trip the kill switch instead of reaching the \
+             target window"
                 .to_string(),
-        ),
-        _ => Ok(()),
+        );
     }
+    Ok(())
+}
+
+/// issue #160 round-32 P2 (Codex mod.rs:2037): would executing this chord
+/// press Escape with NO real modifier held — the exact event the OS-level
+/// global emergency-stop shortcut is registered for? On global-hotkey
+/// backends that observe synthesized input, such an injected press is
+/// swallowed as Emergency Stop (tripping the latch, cancelling GUI asks,
+/// disabling Computer Use) instead of reaching the target window — a
+/// self-DoS the agent can also fire deliberately.
+///
+/// The executor holds every token but the last, in order, then clicks the
+/// last (see `os.rs`'s `key`). So:
+///  - an Escape anywhere in the HELD prefix is pressed while, at best, only
+///    EARLIER prefix tokens are down — ordering is caller-controlled, so any
+///    held Escape fails closed (`escape+escape`, `escape+a`);
+///  - Escape as the CLICKED key is modified only if at least one REAL
+///    modifier (meta/ctrl/alt/shift) is among the held tokens — a held
+///    NON-modifier (`tab+escape`) leaves the modifier state empty, so the
+///    bare-Escape hotkey still matches. `shift+escape` / `ctrl+escape` (the
+///    deliberately-allowed modified chords) stay accepted.
+fn chord_injects_bare_escape(tokens: &[computer::KeyToken]) -> bool {
+    let is_escape = |t: &computer::KeyToken| {
+        matches!(t, computer::KeyToken::Named(computer::NamedKey::Escape))
+    };
+    let is_real_modifier = |t: &computer::KeyToken| {
+        matches!(
+            t,
+            computer::KeyToken::Meta
+                | computer::KeyToken::Control
+                | computer::KeyToken::Alt
+                | computer::KeyToken::Shift
+        )
+    };
+    let Some((last, held)) = tokens.split_last() else {
+        return false;
+    };
+    if held.iter().any(is_escape) {
+        return true;
+    }
+    is_escape(last) && !held.iter().any(is_real_modifier)
 }
 
 /// issue #160 round-31 P1 (Codex computer_srv.rs:3162): the SEMANTIC
@@ -3303,7 +3351,7 @@ async fn append_audit(db: &Db, thread: i32, dir: &str, wt: Option<i32>, entry: &
     // `audit_write_lock` (inside `write_audit_line_locked`), and the delete
     // flows never take `audit_write_lock` at all, so no cycle exists.
     let _revocation_txn = revocation_txn_lock().lock().await;
-    if route_revoked_sync(thread, dir) {
+    if route_revoked_sync(thread, dir, wt) {
         return;
     }
     let Some(parent) = path.parent() else { return };
@@ -3726,6 +3774,32 @@ pub(crate) fn remove_computer_output_for_direction(thread: i32, dir: &str) {
     }
 }
 
+/// issue #160 round-32 P2 (Codex commands.rs:2354): remove ONE session-only
+/// worker's output subtree — `<weft_home>/computer/<thread>/<dir>/wt-<wt>/`
+/// (see [`session_root`]'s worker layout) — for `commands::delete_repo`
+/// removing a worktree whose direction is OWNED BY ANOTHER repo and survives.
+/// [`remove_computer_output_for_direction`] would wrongly sweep the surviving
+/// direction's OTHER worktrees; this prunes only the deleted worktree's own
+/// namespace, which [`session_root`] can never resolve again once the worktree
+/// row is gone. Same bounds and no-follow ancestor walk as the other removers
+/// (round-26): `dir` must be a plain direction id, `wt` is a plain integer,
+/// and a refused/symlinked chain just skips the best-effort cleanup.
+pub(crate) fn remove_computer_output_for_worktree(thread: i32, dir: &str, wt: i32) {
+    if dir.parse::<i32>().is_err() {
+        return;
+    }
+    let Ok(home) = crate::paths::weft_home() else {
+        return;
+    };
+    let leaf = format!("wt-{wt}");
+    let Ok(path) = refuse_symlinks(&home, &["computer", &thread.to_string(), dir, &leaf]) else {
+        return;
+    };
+    if path.exists() {
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
 /// issue #160 round-30 P2 (Codex computer_srv.rs:893): undo THIS call's own
 /// screenshot write after the post-capture revocation recheck found the route
 /// revoked — the capture closure's `create_dir_all(out_dir)` + PNG save can
@@ -3828,9 +3902,24 @@ enum RouteRevocation {
     /// Whole thread gone (`delete_thread` / `delete_workspace`): every direction
     /// and the lead lane are revoked.
     Whole,
-    /// Only specific worker directions gone (`delete_repo` removed the repo that
-    /// owned them). Keyed by the route `dir` string (`direction_id.to_string()`).
-    Directions(std::collections::HashSet<String>),
+    /// Only parts of the thread gone (`delete_repo`, which leaves the thread
+    /// itself alive):
+    ///  - `dirs` — worker directions the deleted repo OWNED, keyed by the route
+    ///    `dir` string (`direction_id.to_string()`); every lane/worktree of such
+    ///    a direction is revoked.
+    ///  - `worktrees` — issue #160 round-32 P1 (Codex commands.rs:2315):
+    ///    `(dir, wt)` pairs for SESSION-ONLY workers — a worktree/session the
+    ///    deleted repo contributed to a direction OWNED BY ANOTHER repo. The
+    ///    direction (and its other repos' sibling worktrees) survive, so a
+    ///    dir-level revocation would be wrong — but the deleted worktree's own
+    ///    bearer is bound to exactly `(thread, dir, wt)` and must stop working,
+    ///    or a surviving child holding it could keep driving the desktop
+    ///    (silently, under a standing Full/Always grant) after its session rows
+    ///    and worktree are gone.
+    Partial {
+        dirs: std::collections::HashSet<String>,
+        worktrees: std::collections::HashSet<(String, i32)>,
+    },
 }
 
 fn revoked_computer_routes(
@@ -3859,13 +3948,44 @@ pub(crate) fn revoke_computer_route_dir(thread: i32, dir: String) {
         .unwrap_or_else(|e| e.into_inner());
     match map.get_mut(&thread) {
         Some(RouteRevocation::Whole) => {}
-        Some(RouteRevocation::Directions(dirs)) => {
+        Some(RouteRevocation::Partial { dirs, .. }) => {
             dirs.insert(dir);
         }
         None => {
             let mut dirs = std::collections::HashSet::new();
             dirs.insert(dir);
-            map.insert(thread, RouteRevocation::Directions(dirs));
+            map.insert(
+                thread,
+                RouteRevocation::Partial { dirs, worktrees: std::collections::HashSet::new() },
+            );
+        }
+    }
+}
+
+/// Revoke ONE session-only worker `(thread, dir, wt)` — issue #160 round-32 P1
+/// (Codex commands.rs:2315): `commands::delete_repo` removing a worktree whose
+/// direction is OWNED BY ANOTHER repo and survives. Adds to (never downgrades)
+/// the thread's entry, exactly like [`revoke_computer_route_dir`]. Recording
+/// the entry also flips [`computer_routes_revoked`] for the thread, so the
+/// async entry gate starts paying the [`session_is_live`] DB check — which
+/// fails closed for the deleted worktree row while the direction's surviving
+/// sibling worktrees keep passing it.
+pub(crate) fn revoke_computer_route_session(thread: i32, dir: String, wt: i32) {
+    let mut map = revoked_computer_routes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match map.get_mut(&thread) {
+        Some(RouteRevocation::Whole) => {}
+        Some(RouteRevocation::Partial { worktrees, .. }) => {
+            worktrees.insert((dir, wt));
+        }
+        None => {
+            let mut worktrees = std::collections::HashSet::new();
+            worktrees.insert((dir, wt));
+            map.insert(
+                thread,
+                RouteRevocation::Partial { dirs: std::collections::HashSet::new(), worktrees },
+            );
         }
     }
 }
@@ -3928,18 +4048,25 @@ fn computer_routes_revoked(thread: i32) -> bool {
         .contains_key(&thread)
 }
 
-/// Sync + direction-precise: is THIS exact `(thread, dir)` route revoked? Used
+/// Sync + route-precise: is THIS exact `(thread, dir, wt)` route revoked? Used
 /// inside a blocking-pool closure (the screenshot capture) where an async
 /// [`session_is_live`] can't run but a coarse thread-level refuse would be wrong
-/// — `delete_repo` leaves the thread's sibling directions live.
-fn route_revoked_sync(thread: i32, dir: &str) -> bool {
+/// — `delete_repo` leaves the thread's sibling directions live. `wt` joined the
+/// key in round-32 P1 (Codex commands.rs:2315): a SESSION-ONLY worker deletion
+/// revokes one exact `(dir, wt)` while the direction's surviving sibling
+/// worktrees (and its `wt`-less lead-style resolution) stay live, so the check
+/// has to be worktree-precise where a worktree identity exists at all.
+fn route_revoked_sync(thread: i32, dir: &str, wt: Option<i32>) -> bool {
     match revoked_computer_routes()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&thread)
     {
         Some(RouteRevocation::Whole) => true,
-        Some(RouteRevocation::Directions(dirs)) => dirs.contains(dir),
+        Some(RouteRevocation::Partial { dirs, worktrees }) => {
+            dirs.contains(dir)
+                || wt.is_some_and(|w| worktrees.iter().any(|(d, rw)| d == dir && *rw == w))
+        }
         None => false,
     }
 }
@@ -4540,6 +4667,26 @@ mod tests {
         assert!(pure_validate("key", &key("enter")).is_ok());
         assert!(pure_validate("key", &key("ctrl+c")).is_ok());
         assert!(pure_validate("key", &key("shift+escape")).is_ok());
+    }
+
+    /// issue #160 round-32 P2 (Codex mod.rs:2037): any chord that would press
+    /// Escape UNMODIFIED is rejected semantically — a held Escape
+    /// (`escape+escape`, `escape+a`) or an Escape clicked with only
+    /// non-modifier keys held (`tab+escape`) collides with the global
+    /// emergency-stop shortcut exactly like the bare `escape` round-20
+    /// rejected, while genuinely modified chords stay accepted.
+    #[test]
+    fn unmodified_escape_chords_are_rejected_semantically() {
+        let key = |text: &str| json!({"action": "key", "window": "notes", "text": text});
+        for chord in ["escape+escape", "escape+a", "tab+escape"] {
+            assert!(
+                pure_validate("key", &key(chord)).is_err(),
+                "{chord} injects an unmodified Escape press — must be rejected"
+            );
+        }
+        // Real-modifier chords keep Escape's press modified — still accepted.
+        assert!(pure_validate("key", &key("shift+escape")).is_ok());
+        assert!(pure_validate("key", &key("ctrl+escape")).is_ok());
     }
 
     /// issue #160 round-26 P1 (Codex computer_srv.rs:2962): a SHIFT-ONLY
@@ -6429,6 +6576,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
+    /// issue #160 round-32 P2 (Codex commands.rs:2354): deleting a SESSION-ONLY
+    /// worker (a secondary repo's worktree under a SURVIVING direction) prunes
+    /// exactly `computer/<thread>/<dir>/wt-<id>` — the direction's sibling
+    /// worktree, its own other content, and the lead lane are untouched, and a
+    /// malformed dir never touches the filesystem.
+    #[test]
+    fn remove_computer_output_for_worktree_drops_only_that_worktree() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let weft_home =
+            std::env::temp_dir().join(format!("weft-computer-srv-rm-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let root = crate::paths::computer_output_root().unwrap();
+        let thread = "78";
+        // The deleted secondary worktree (wt-5) and its surviving sibling
+        // (wt-6) under the SAME surviving direction.
+        let doomed = root.join(thread).join("20").join("wt-5").join("screenshots");
+        std::fs::create_dir_all(&doomed).unwrap();
+        std::fs::write(doomed.join("shot.png"), b"x").unwrap();
+        let sibling = root.join(thread).join("20").join("wt-6");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("shot.png"), b"y").unwrap();
+        let lead = root.join(thread).join(crate::bus::LEAD);
+        std::fs::create_dir_all(&lead).unwrap();
+
+        remove_computer_output_for_worktree(78, "20", 5);
+        assert!(
+            !root.join(thread).join("20").join("wt-5").exists(),
+            "the deleted worktree's subtree is gone"
+        );
+        assert!(
+            sibling.join("shot.png").exists(),
+            "the surviving sibling worktree of the SAME direction is untouched"
+        );
+        assert!(lead.exists(), "the lead lane is untouched");
+
+        // A non-integer dir is bounded out — never joined, never a path escape.
+        remove_computer_output_for_worktree(78, "../evil", 5);
+        assert!(sibling.join("shot.png").exists(), "a malformed dir touches nothing");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     /// issue #160 round-19 P1 (Codex computer_srv.rs:403): a request under a
     /// deleted thread/direction is refused — `session_is_live` is the admission
     /// gate that revokes the route once the delete cascade runs.
@@ -6483,25 +6675,60 @@ mod tests {
         let restore = snapshot_revocations(&[whole, repo_thread, untouched]);
 
         assert!(!computer_routes_revoked(untouched), "a never-deleted thread is not revoked");
-        assert!(!route_revoked_sync(untouched, "5"), "…and no direction is sync-revoked");
+        assert!(!route_revoked_sync(untouched, "5", None), "…and no direction is sync-revoked");
 
         // Whole-thread revoke: coarse gate fires and EVERY dir is sync-revoked.
         revoke_computer_routes(whole);
         assert!(computer_routes_revoked(whole));
-        assert!(route_revoked_sync(whole, "5"), "a whole-thread delete revokes every worker dir");
-        assert!(route_revoked_sync(whole, crate::bus::LEAD), "…and the lead lane");
+        assert!(route_revoked_sync(whole, "5", None), "a whole-thread delete revokes every worker dir");
+        assert!(route_revoked_sync(whole, crate::bus::LEAD, None), "…and the lead lane");
 
         // Per-direction revoke: coarse gate fires (so `session_is_live` runs) but
         // ONLY the removed direction is sync-revoked — siblings and lead survive.
         revoke_computer_route_dir(repo_thread, "10".to_string());
         assert!(computer_routes_revoked(repo_thread), "coarse gate fires so session_is_live runs");
-        assert!(route_revoked_sync(repo_thread, "10"), "the removed direction is refused");
-        assert!(!route_revoked_sync(repo_thread, "11"), "a surviving sibling direction is NOT refused");
-        assert!(!route_revoked_sync(repo_thread, crate::bus::LEAD), "the lead lane survives a repo delete");
+        assert!(route_revoked_sync(repo_thread, "10", None), "the removed direction is refused");
+        assert!(!route_revoked_sync(repo_thread, "11", None), "a surviving sibling direction is NOT refused");
+        assert!(!route_revoked_sync(repo_thread, crate::bus::LEAD, None), "the lead lane survives a repo delete");
 
         restore_revocations(restore);
         assert!(!computer_routes_revoked(whole), "cleanup restored the empty baseline");
         assert!(!computer_routes_revoked(repo_thread));
+    }
+
+    /// issue #160 round-32 P1 (Codex commands.rs:2315): a SESSION-ONLY worker
+    /// revocation — repo B's worktree deleted while the direction (owned by
+    /// repo A) survives — refuses exactly `(dir, wt_b)`: the coarse gate fires
+    /// (so `session_is_live` runs for every request of the thread), the doomed
+    /// worktree is sync-revoked, and the direction's surviving sibling
+    /// worktree, its `wt`-less resolution, and the lead lane all stay live.
+    /// Composes with a dir-level revocation on the SAME thread without either
+    /// clobbering the other.
+    #[test]
+    fn revocation_map_supports_session_only_worker_revocation() {
+        let thread = 917_020;
+        let restore = snapshot_revocations(&[thread]);
+
+        revoke_computer_route_session(thread, "30".to_string(), 7);
+        assert!(computer_routes_revoked(thread), "coarse gate fires so session_is_live runs");
+        assert!(route_revoked_sync(thread, "30", Some(7)), "the deleted worktree's route is refused");
+        assert!(
+            !route_revoked_sync(thread, "30", Some(8)),
+            "a surviving sibling worktree of the SAME direction is NOT refused"
+        );
+        assert!(
+            !route_revoked_sync(thread, "30", None),
+            "the direction's wt-less resolution is not dir-revoked by a session revocation"
+        );
+        assert!(!route_revoked_sync(thread, crate::bus::LEAD, None), "the lead lane survives");
+
+        // A dir-level revocation merges into the same Partial entry.
+        revoke_computer_route_dir(thread, "31".to_string());
+        assert!(route_revoked_sync(thread, "31", None), "the dir revocation lands alongside");
+        assert!(route_revoked_sync(thread, "30", Some(7)), "…without dropping the session one");
+
+        restore_revocations(restore);
+        assert!(!computer_routes_revoked(thread));
     }
 
     /// issue #160 round-24 P2 (Codex commands.rs:803): a failed cascade's
@@ -6514,16 +6741,16 @@ mod tests {
 
         // An earlier repo delete already revoked direction "20".
         revoke_computer_route_dir(thread, "20".to_string());
-        assert!(route_revoked_sync(thread, "20"));
+        assert!(route_revoked_sync(thread, "20", None));
 
         // A later repo delete snapshots, revokes "21", then FAILS and restores.
         let undo = snapshot_revocations(&[thread]);
         revoke_computer_route_dir(thread, "21".to_string());
-        assert!(route_revoked_sync(thread, "21"));
+        assert!(route_revoked_sync(thread, "21", None));
         restore_revocations(undo);
 
-        assert!(route_revoked_sync(thread, "20"), "a pre-existing revocation must survive the rollback");
-        assert!(!route_revoked_sync(thread, "21"), "the failed op's own revocation is rolled back");
+        assert!(route_revoked_sync(thread, "20", None), "a pre-existing revocation must survive the rollback");
+        assert!(!route_revoked_sync(thread, "21", None), "the failed op's own revocation is rolled back");
 
         restore_revocations(cleanup);
         assert!(!computer_routes_revoked(thread));

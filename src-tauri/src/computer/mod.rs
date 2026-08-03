@@ -1031,16 +1031,19 @@ pub fn screenshot_window(
 /// window closing and a same-query replacement appearing between those two
 /// enumerations would be captured under an approval shown only for the
 /// original. Taking the verified [`WindowInfo`] instead pins the capture to
-/// the exact id the caller verified: there is no re-resolution left to
-/// drift, and if that window is gone by capture time,
-/// `backend.capture_window(id)` fails closed rather than falling back to a
-/// lookalike.
+/// the exact identity the caller verified: there is no re-resolution left to
+/// drift, and if that window is gone — or its numeric id was REUSED by a
+/// different window (issue #160 round-32 P1, Codex os.rs:30: the backend's
+/// own capture-time enumeration now re-verifies `app`/`title` on the exact
+/// handle it is about to capture, not the id alone) — by capture time,
+/// `backend.capture_window(matched)` fails closed rather than falling back
+/// to a lookalike.
 pub fn screenshot_resolved(
     backend: &dyn backend::ComputerBackend,
     matched: &WindowInfo,
     out_dir: &Path,
 ) -> Result<Screenshot, ComputerError> {
-    let captured = backend.capture_window(matched.id)?;
+    let captured = backend.capture_window(matched)?;
     // round-7 P2: derive the recorded scale from THIS frame (`captured`), not
     // from `matched`'s own pre-capture geometry — see this function's own doc
     // comment for the resize-in-the-gap race this closes.

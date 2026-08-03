@@ -138,6 +138,19 @@ fn clear_control_if_route_doomed(doomed_routes: &std::collections::HashSet<(i32,
     }
 }
 
+/// Worktree-precise counterpart of [`clear_control_if_route_doomed`] — issue
+/// #160 round-32 P1 (Codex commands.rs:2315): a `delete_repo` that removes a
+/// SESSION-ONLY worker (a worktree contributed to a direction OWNED BY ANOTHER
+/// repo) dooms exactly `(thread, dir, wt)`; the direction — and any sibling
+/// worktree's lease — survives, so the route-level clear above must not fire.
+/// `release_control` is already a no-op unless the exact `(thread, dir, wt)`
+/// triple holds the lease, which is precisely the required scope.
+fn clear_control_if_session_doomed(doomed_sessions: &[(i32, i32, i32)]) {
+    for (thread, direction, wt) in doomed_sessions {
+        crate::computer::release_control(*thread, &direction.to_string(), Some(*wt));
+    }
+}
+
 async fn delete_workspace_after_fence(app: tauri::AppHandle, db: &Db, workspace_id: i32) -> R<()> {
     let action_cleanups = lock_repo_action_cleanups(
         db,
@@ -2313,8 +2326,30 @@ async fn delete_repo_after_fence(
         .iter()
         .map(|d| (d.thread_id, d.id.to_string()))
         .collect();
+    // issue #160 round-32 P1 (Codex commands.rs:2315): this repo can ALSO have
+    // contributed worktrees/sessions to directions OWNED BY OTHER repos (a
+    // multi-repo direction's secondary checkout). The cascade below deletes
+    // those worktree+session rows while the DIRECTION survives, so the
+    // dir-level fence above them installs nothing — yet each such session's
+    // bearer is bound to exactly `(thread, dir, wt)` and stays valid for the
+    // process lifetime. Fence them worktree-precisely: `(thread, direction,
+    // worktree)` triples, resolved WHILE the rows still exist. Directions the
+    // repo owns are excluded — the dir-level revocation already covers every
+    // worktree under them.
+    let doomed_direction_ids: std::collections::HashSet<i32> =
+        doomed_directions.iter().map(|d| d.id).collect();
+    let mut doomed_sessions: Vec<(i32, i32, i32)> = Vec::new();
+    for wt in repo::list_worktrees(db, None).await.map_err(e)? {
+        if wt.repo_id != repo_id || doomed_direction_ids.contains(&wt.direction_id) {
+            continue;
+        }
+        if let Some(d) = repo::get_direction(db, wt.direction_id).await.map_err(e)? {
+            doomed_sessions.push((d.thread_id, d.id, wt.id));
+        }
+    }
     let doomed_threads: Vec<i32> = {
         let mut threads: Vec<i32> = doomed_directions.iter().map(|d| d.thread_id).collect();
+        threads.extend(doomed_sessions.iter().map(|(thread, ..)| *thread));
         threads.sort_unstable();
         threads.dedup();
         threads
@@ -2326,7 +2361,15 @@ async fn delete_repo_after_fence(
             direction.id.to_string(),
         );
     }
+    for (thread, direction, wt) in &doomed_sessions {
+        crate::bus::computer_srv::revoke_computer_route_session(
+            *thread,
+            direction.to_string(),
+            *wt,
+        );
+    }
     clear_control_if_route_doomed(&doomed_routes);
+    clear_control_if_session_doomed(&doomed_sessions);
     let effects = match repo::delete_repo_cascade_with_human_cancellations(db, repo_id).await {
         Ok(effects) => effects,
         Err(err) => {
@@ -2351,6 +2394,19 @@ async fn delete_repo_after_fence(
     // pruned. Best-effort, after the rows are gone.
     for (thread_id, dir) in &doomed_routes {
         crate::bus::computer_srv::remove_computer_output_for_direction(*thread_id, dir);
+    }
+    // issue #160 round-32 P2 (Codex commands.rs:2354): a SESSION-ONLY worker's
+    // output lives under a SURVIVING direction — the per-direction loop above
+    // never touches it, so without this it would sit under
+    // `computer/<thread>/<dir>/wt-<id>` until the whole thread is deleted.
+    // Worktree-precise, so the direction's surviving sibling worktrees keep
+    // their own subtrees.
+    for (thread, direction, wt) in &doomed_sessions {
+        crate::bus::computer_srv::remove_computer_output_for_worktree(
+            *thread,
+            &direction.to_string(),
+            *wt,
+        );
     }
     drop(lifecycle_guards);
     drop(feedback_locks);

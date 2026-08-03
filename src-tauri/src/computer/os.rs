@@ -22,13 +22,31 @@ impl ComputerBackend for OsBackend {
         Ok(windows.iter().filter_map(|w| window_info(w).ok()).collect())
     }
 
-    fn capture_window(&self, id: u32) -> Result<CapturedImage, ComputerError> {
+    fn capture_window(&self, target: &WindowInfo) -> Result<CapturedImage, ComputerError> {
+        let id = target.id;
         let windows = xcap::Window::all().map_err(|e| ComputerError::Unsupported(e.to_string()))?;
-        let target = windows
+        let found = windows
             .iter()
             .find(|w| matches!(w.id(), Ok(wid) if wid == id))
             .ok_or_else(|| ComputerError::CaptureFailed(format!("window {id} is no longer visible")))?;
-        let image = target
+        // issue #160 round-32 P1 (Codex os.rs:30): this is a THIRD independent
+        // enumeration — the caller's resolve-and-verify ran against an earlier
+        // one, and an OS window id is reusable, so selecting by `id` alone
+        // could capture whatever unrelated (or deliberately excluded) window
+        // inherited the number in the gap. Verify `app`/`title` on the EXACT
+        // handle about to be captured, from the same accessors `window_info`
+        // maps, and fail closed on any drift — without disclosing the
+        // replacement's own identity (the same redaction discipline the
+        // authorization-time resolve applies to ambiguity errors).
+        let same_identity = matches!(found.app_name(), Ok(app) if app == target.app)
+            && matches!(found.title(), Ok(title) if title == target.title);
+        if !same_identity {
+            return Err(ComputerError::CaptureFailed(format!(
+                "window {id} no longer matches the approved application/title — it may have \
+                 closed and had its id reused; take a fresh screenshot to re-resolve"
+            )));
+        }
+        let image = found
             .capture_image()
             .map_err(|e| ComputerError::CaptureFailed(e.to_string()))?;
         let width = image.width();
