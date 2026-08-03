@@ -809,7 +809,7 @@ function AutomationSettings() {
   // Stop flips this one.
   useEffect(() => {
     let alive = true;
-    const h = setInterval(() => {
+    const tick = () => {
       if (computerUseToggleInFlightRef.current) return;
       // Single-flight — skip the tick if the previous poll
       // hasn't resolved; see `computerUsePollInFlightRef`'s doc.
@@ -830,7 +830,15 @@ function AutomationSettings() {
           computerUsePollInFlightRef.current = false;
         },
       );
-    }, 3000);
+    };
+    // The mount-time read is THIS SAME guarded tick, not a separate bare
+    // `getComputerUseEnabled` call in the one-shot effect below: a read
+    // outside the in-flight/generation guards can resolve after the first
+    // interval poll already made the toggle interactive, and then overwrite
+    // a newer Emergency Stop or user toggle with its stale value — neither
+    // guard could reject it because it participated in neither.
+    tick();
+    const h = setInterval(tick, 3000);
     return () => {
       alive = false;
       clearInterval(h);
@@ -854,10 +862,8 @@ function AutomationSettings() {
       setAutoMergeState(enabled);
       setAutoMergeLoaded(true);
     });
-    void api.getComputerUseEnabled().then((enabled) => {
-      setComputerUseState(enabled);
-      setComputerUseLoaded(true);
-    });
+    // Computer Use is deliberately absent here: its initial read rides the
+    // guarded poll tick above (see that effect's own comment).
   }, []);
 
   async function toggleRemoteStandby(on: boolean) {

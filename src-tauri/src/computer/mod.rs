@@ -1808,6 +1808,52 @@ pub fn lease_check_for_injection(thread: i32, dir: &str, wt: Option<i32>) -> Lea
     }
 }
 
+/// The post-queue lease revalidation every input arm runs the moment it
+/// acquires [`input_flight_guard`] (via `bus::computer_srv`'s
+/// `recheck_after_guard`) — judged on the RAW monotonic deadline, never
+/// [`holder_is_live`]'s in-flight override. That override exists so an
+/// injection ALREADY past its final recheck keeps the Stop surfaces alive
+/// while it runs — but the `INPUT_IN_FLIGHT` flag it reads is set by
+/// whichever call just acquired the guard, so at THIS checkpoint the flag
+/// is the caller's own and would bless the caller's own lease even if its
+/// deadline lapsed while it sat queued behind another call's long backend
+/// hold. Chained same-session calls could then hold desktop control
+/// indefinitely on a lease none of them refreshed after its queue wait.
+///
+/// A matching, un-doomed, ESCAPE-CONFIRMED holder whose deadline lapsed
+/// only in the queue is RENEWED here rather than refused: nobody else could
+/// have acquired in that window (the in-flight override kept the holder
+/// live to every other session's `acquire_control`, which returns `Busy`),
+/// so renewal grants nothing a fresh re-acquire wouldn't — while refusal
+/// would make every legitimately queued call flaky for zero security gain.
+/// A lease someone else DID take (the queue can drain between one call's
+/// guard drop and the next acquisition) lands in the `Busy` arm; a doomed,
+/// unconfirmed, or absent holder — or a tripped stop latch, checked inside
+/// the same lock for atomicity against [`trip_stop_latch`] — is `Lost`.
+/// The renewal also re-covers the rest of this call's own pre-backend
+/// pipeline (activation, resolution), shrinking the unrenewed span from
+/// "unbounded queue wait" to the pipeline's own bounded latency.
+pub fn renew_lease_after_queue(thread: i32, dir: &str, wt: Option<i32>) -> LeaseCheckOutcome {
+    let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    if stop_latched() {
+        return LeaseCheckOutcome::Lost;
+    }
+    let now = std::time::Instant::now();
+    match guard.as_mut() {
+        None => LeaseCheckOutcome::Lost,
+        Some(h) if h.doomed => LeaseCheckOutcome::Lost,
+        Some(h) if h.thread == thread && h.dir == dir && h.wt == wt => {
+            if !h.escape_ready {
+                return LeaseCheckOutcome::Lost;
+            }
+            h.expires_at = lease_deadline(now);
+            h.expires_at_ms = now_ms().saturating_add(CONTROL_LEASE_MS);
+            LeaseCheckOutcome::Authorized
+        }
+        Some(h) => LeaseCheckOutcome::Busy { thread: h.thread, dir: h.dir.clone() },
+    }
+}
+
 /// Release the lease early — a no-op unless `(thread, dir, wt)` is the CURRENT
 /// holder (an already-expired/released lease, or one some other session
 /// since took over, is left alone rather than clobbered). Used by
@@ -4191,6 +4237,58 @@ mod tests {
             "a fresh, un-doomed holder must survive an uneventful flight cycle"
         );
         clear_control();
+    }
+
+    /// A call whose lease deadline lapsed while it sat queued on the flight
+    /// mutex must not have its own `INPUT_IN_FLIGHT` flag bless that expired
+    /// lease: the post-queue revalidation judges the RAW deadline, renews a
+    /// still-rightful holder, and refuses a doomed one or a wrong triple —
+    /// see [`renew_lease_after_queue`]'s own doc.
+    #[tokio::test]
+    async fn a_queue_lapsed_lease_is_renewed_for_the_exact_holder_and_refused_otherwise() {
+        let _lock = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_control();
+
+        acquire_control(41, "410", None).unwrap();
+        // The queue lapse: force the monotonic deadline into the past while
+        // the flight guard is held (exactly the dequeue state — the flag is
+        // OURS, and would make `holder_is_live` read the lapsed lease live).
+        let flight = input_flight_guard().await;
+        {
+            let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(h) = guard.as_mut() {
+                h.expires_at = expired_deadline();
+            }
+        }
+
+        // A wrong triple is a DIFFERENT would-be holder — refused, no renewal.
+        assert!(
+            matches!(
+                renew_lease_after_queue(41, "410", Some(9)),
+                LeaseCheckOutcome::Busy { thread: 41, .. }
+            ),
+            "a non-matching triple must be refused as Busy, never renewed"
+        );
+        // The exact holder is renewed back to a live deadline.
+        assert!(
+            matches!(renew_lease_after_queue(41, "410", None), LeaseCheckOutcome::Authorized),
+            "the exact queue-lapsed holder must be renewed"
+        );
+        assert!(
+            matches!(lease_check_for_injection(41, "410", None), LeaseCheckOutcome::Authorized),
+            "after renewal the pre-backend check must see a live, authorized lease"
+        );
+
+        // A doomed holder is never renewed — a clear that landed mid-flight
+        // must win over the queued call.
+        clear_control();
+        assert!(
+            matches!(renew_lease_after_queue(41, "410", None), LeaseCheckOutcome::Lost),
+            "a doomed holder must be Lost at the post-queue checkpoint"
+        );
+
+        drop(flight);
+        assert!(control_state().is_none(), "the doomed holder drains at flight end");
     }
 
     /// the property this change exists for — while

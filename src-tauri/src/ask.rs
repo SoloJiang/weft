@@ -2056,15 +2056,26 @@ impl AskRegistry {
     }
 
     /// Toggle Dangerous mode (global): every incoming ask auto-allows. Turning it
-    /// ON also releases the whole existing backlog — every already-open ask
-    /// resolves to Allow, so agents currently blocked on a prompt unblock at once.
+    /// ON also releases the existing backlog — every already-open ask resolves
+    /// to Allow, so agents currently blocked on a prompt unblock at once —
+    /// EXCEPT GUI/computer-use asks ([`action_key_is_gui`]), which stay open.
+    /// Dangerous mode's user-facing promise is worktree-scoped ("act freely
+    /// inside their worktrees"), so it must not silently authorize desktop
+    /// control: `auto_decision_gui` already excludes the Dangerous shortcut
+    /// for GUI calls arriving AFTER the toggle, and this backlog release is
+    /// the same decision for the cards already open at that instant — a
+    /// queued screenshot/click/type card must keep waiting on the human, not
+    /// ride the bulk unblock into an approval the mode never promised.
     pub fn set_dangerous(&self, on: bool) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.dangerous = on;
         if !on {
             return;
         }
-        let cleared: Vec<Ask> = std::mem::take(&mut g.open);
+        let (kept, cleared): (Vec<Ask>, Vec<Ask>) = std::mem::take(&mut g.open)
+            .into_iter()
+            .partition(|a| action_key_is_gui(&a.action_key));
+        g.open = kept;
         for ask in cleared {
             if let Some(tx) = g.waiters.remove(&ask.id) {
                 let _ = tx.send(Decision::Allow);
@@ -4731,6 +4742,46 @@ mod tests {
         got.sort();
         assert_eq!(got, vec![id1, id2]);
         assert!(r.open().is_empty());
+    }
+
+    /// Turning Dangerous mode ON must release the ordinary backlog but leave
+    /// GUI/computer-use cards OPEN — the mode's promise is worktree-scoped,
+    /// and `auto_decision_gui` already refuses the Dangerous shortcut for
+    /// GUI calls arriving AFTER the toggle; a card already open at the
+    /// toggle instant is the same decision and must not ride the bulk
+    /// release into an approval the mode never covered.
+    #[tokio::test]
+    async fn dangerous_backlog_release_skips_open_gui_asks() {
+        let r = AskRegistry::new();
+        let (id_plain, mut rx_plain) =
+            r.request(1, "10", "claude", "run", "run", RiskLevel::Write, "[\"bash\",\"x\"]");
+        let (id_gui, mut rx_gui) = r.request(
+            1,
+            "10",
+            "computer",
+            "computer: left_click @ notes",
+            "{}",
+            RiskLevel::Write,
+            "[\"gui\",\"left_click\",\"notes\",\"d\"]",
+        );
+
+        r.set_dangerous(true);
+
+        assert_eq!(
+            rx_plain.try_recv().ok(),
+            Some(Decision::Allow),
+            "the ordinary ask must be released by the backlog drain"
+        );
+        assert!(
+            rx_gui.try_recv().is_err(),
+            "the GUI ask must NOT be resolved by Dangerous mode"
+        );
+        let open: Vec<u64> = r.open().iter().map(|a| a.id).collect();
+        assert_eq!(open, vec![id_gui], "only the GUI card stays open (plain {id_plain} drained)");
+
+        // The surviving card still resolves normally by an explicit answer.
+        assert!(r.answer(id_gui, Answer::Deny));
+        r.set_dangerous(false);
     }
 
     #[test]

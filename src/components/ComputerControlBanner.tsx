@@ -274,7 +274,15 @@ export function ComputerControlBanner() {
         stopInFlightRef.current = false;
         setStopping(false);
         setLocalStopFailed(false);
-        setState(null);
+        // Deliberately NOT clearing `state` here: a Stop that lands while a
+        // synchronous input backend call is still in flight leaves the
+        // backend's holder VISIBLE (marked doomed) until that injection
+        // actually finishes — the banner and its window-level Escape
+        // handler are kill-switch surfaces and must outlive the injection,
+        // not vanish on this optimistic clear only to flicker back if the
+        // next poll still sees the draining holder. The poll (which only
+        // ever applies CONFIRMED server state) hides the banner the moment
+        // the backend reports the holder truly gone.
       },
       () => {
         stopInFlightRef.current = false;

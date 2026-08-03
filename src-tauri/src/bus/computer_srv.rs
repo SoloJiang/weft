@@ -232,14 +232,28 @@ impl WtParam {
 /// secret (invalidating every previously-issued token, which is fine: a
 /// fresh process re-injects fresh URLs with fresh tokens for every session it
 /// spawns — nothing here needs to survive a restart).
-fn computer_endpoint_secret() -> &'static [u8; 32] {
+///
+/// `None` when the OS RNG cannot provide entropy: `try_fill_bytes` instead
+/// of `fill_bytes`, whose failure path PANICS — this is a production path
+/// (every token mint/verify lands here), and a host with a broken/exhausted
+/// entropy source must degrade to "computer-use auth refused" (both callers
+/// fail closed on `None`), never to tearing the whole app down. The failure
+/// is deliberately NOT cached: only a SUCCESSFUL draw is stored, so a
+/// transient RNG failure heals on the next call instead of disabling
+/// computer use for the process's remaining lifetime.
+fn computer_endpoint_secret() -> Option<&'static [u8; 32]> {
     static SECRET: OnceLock<[u8; 32]> = OnceLock::new();
-    SECRET.get_or_init(|| {
-        use rand::RngCore;
-        let mut buf = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut buf);
-        buf
-    })
+    if let Some(secret) = SECRET.get() {
+        return Some(secret);
+    }
+    use rand::RngCore;
+    let mut buf = [0u8; 32];
+    if rand::rngs::OsRng.try_fill_bytes(&mut buf).is_err() {
+        return None;
+    }
+    // A concurrent first call may have won the race — `get_or_init` keeps
+    // exactly one secret either way.
+    Some(SECRET.get_or_init(|| buf))
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -247,17 +261,17 @@ type HmacSha256 = Hmac<Sha256>;
 /// The ONE place this module's HMAC key material gets constructed — shared by
 /// both [`computer_session_token`] (mint) and [`verify_computer_token`]
 /// (verify), so the two can never drift onto two different derivations of
-/// "the MAC for this (thread, dir)". Returns `Err` only if `HmacSha256::
-/// new_from_slice` itself rejects the key — HMAC accepts a key of ANY length
-/// (including this fixed 32-byte CSPRNG buffer), so this is a can't-happen
-/// path in practice; matched explicitly (never `.expect()`/`.unwrap()`) per
-/// CLAUDE.md's ban on panicking in a production path.
-fn computer_token_mac(
-    thread: i32,
-    dir: &str,
-    wt: Option<i32>,
-) -> Result<HmacSha256, hmac::digest::InvalidLength> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(computer_endpoint_secret())?;
+/// "the MAC for this (thread, dir)". `None` when the OS RNG could not
+/// provide the process secret (see [`computer_endpoint_secret`] — retried on
+/// a later call, refused fail-closed on this one) or if `HmacSha256::
+/// new_from_slice` itself rejects the key — the latter is a can't-happen
+/// path in practice (HMAC accepts a key of ANY length, including this fixed
+/// 32-byte CSPRNG buffer); both are matched explicitly (never
+/// `.expect()`/`.unwrap()`) per CLAUDE.md's ban on panicking in a
+/// production path.
+fn computer_token_mac(thread: i32, dir: &str, wt: Option<i32>) -> Option<HmacSha256> {
+    let secret = computer_endpoint_secret()?;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).ok()?;
     // the
     // MAC binds the EXACT worktree this URL carries, not just `(thread, dir)`.
     // Sibling worker sessions of one multi-repo direction share a single
@@ -275,7 +289,7 @@ fn computer_token_mac(
         None => "none".to_string(),
     };
     mac.update(format!("{thread}/{dir}/{wt_repr}").as_bytes());
-    Ok(mac)
+    Some(mac)
 }
 
 /// The per-session token [`inject::computer_url`] appends as `&key=<token>`
@@ -292,18 +306,19 @@ fn computer_token_mac(
 /// and `tests/computer_mcp.rs` is a separate integration-test crate that needs
 /// to build the SAME token to drive the real endpoint — mirrors `args_digest`/
 /// `MAX_TYPE_CHARS`'s own doc comments on why a cross-module/cross-crate
-/// test-and-production-shared item is exposed this way. On the can't-happen
-/// HMAC-construction failure (see [`computer_token_mac`]'s own doc), this
-/// returns a fixed sentinel string that is not valid hex and therefore can
-/// NEVER equal a legitimately hex-encoded `key=` a caller could ever supply —
-/// keeping mint/verify symmetric (both go through the identical fallback) and
-/// fail-closed even in this can't-happen case, rather than silently minting
-/// (or accepting) an empty/predictable token.
+/// test-and-production-shared item is exposed this way. When no MAC can be
+/// built (an OS RNG that cannot provide the process secret, or the
+/// can't-happen HMAC-construction failure — see [`computer_token_mac`]'s own
+/// doc), this returns a fixed sentinel string that is not valid hex and
+/// therefore can NEVER equal a legitimately hex-encoded `key=` a caller
+/// could ever supply — keeping mint/verify symmetric (both go through the
+/// identical fallback) and fail-closed, rather than silently minting (or
+/// accepting) an empty/predictable token.
 #[doc(hidden)]
 pub fn computer_session_token(thread: i32, dir: &str, wt: Option<i32>) -> String {
     match computer_token_mac(thread, dir, wt) {
-        Ok(mac) => hex::encode(mac.finalize().into_bytes()),
-        Err(_) => "hmac-init-failed-not-valid-hex".to_string(),
+        Some(mac) => hex::encode(mac.finalize().into_bytes()),
+        None => "token-mac-unavailable-not-valid-hex".to_string(),
     }
 }
 
@@ -322,8 +337,8 @@ fn verify_computer_token(thread: i32, dir: &str, wt: Option<i32>, supplied: &str
         return false;
     };
     match computer_token_mac(thread, dir, wt) {
-        Ok(mac) => mac.verify_slice(&supplied_bytes).is_ok(),
-        Err(_) => false,
+        Some(mac) => mac.verify_slice(&supplied_bytes).is_ok(),
+        None => false,
     }
 }
 
@@ -2914,11 +2929,15 @@ fn acquire_and_throttle(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), S
 /// hold sees the world as it is NOW, not as it was when it first queued.
 ///
 /// `Ok` requires ALL THREE: no OTHER ask now open for this `(thread, dir)`,
-/// [`computer::enabled`] still true, AND [`computer::control_state`] naming
-/// this EXACT `(thread, dir)` as the current holder — a DIFFERENT holder, or
-/// no holder at all (an expired or force-cleared lease), both fail closed
-/// rather than let a call that no longer holds the lease it thinks it does
-/// reach the backend anyway.
+/// [`computer::enabled`] still true, AND
+/// [`computer::renew_lease_after_queue`] confirming this EXACT
+/// `(thread, dir, wt)` still rightfully holds the lease — judged on the raw
+/// monotonic deadline (see that function's doc for why the in-flight
+/// liveness override must not apply at this checkpoint) and renewed on
+/// success. A DIFFERENT holder, a doomed one, or no holder at all (an
+/// expired or force-cleared lease) all fail closed rather than let a call
+/// that no longer holds the lease it thinks it does reach the backend
+/// anyway.
 ///
 /// this used to check only enabled+lease — but a
 /// call queued on `input_flight_guard` can have a
@@ -2962,15 +2981,22 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
     if computer_routes_revoked(thread) && !session_is_live(db, thread, dir, wt).await {
         return Err(SESSION_GONE_MSG.to_string());
     }
-    // compare `wt` too, so a
-    // SIBLING worker (same `(thread, dir)`) that legitimately took the lease
-    // after THIS call's own lease expired while it sat queued is recognized as
-    // a different holder here — not mistaken for "I still hold it" and waved
+    // `renew_lease_after_queue`, not `control_state`: this checkpoint runs
+    // with the flight guard ALREADY held, so the in-flight override that
+    // `control_state`'s liveness consults is this caller's own flag and
+    // would bless the caller's own queue-lapsed (or doomed) lease. The
+    // dedicated helper judges the raw monotonic deadline under one lock,
+    // renews a still-rightful holder, and compares `wt` too — a SIBLING
+    // worker (same `(thread, dir)`) that legitimately took the lease after
+    // THIS call's own lease expired while it sat queued is recognized as a
+    // different holder, not mistaken for "I still hold it" and waved
     // through to inject.
-    match computer::control_state() {
-        Some(holder) if holder.thread == thread && holder.dir == dir && holder.wt == wt => Ok(()),
-        Some(holder) => Err(ComputerError::Busy { thread: holder.thread, dir: holder.dir }.to_string()),
-        None => Err(
+    match computer::renew_lease_after_queue(thread, dir, wt) {
+        computer::LeaseCheckOutcome::Authorized => Ok(()),
+        computer::LeaseCheckOutcome::Busy { thread, dir } => {
+            Err(ComputerError::Busy { thread, dir }.to_string())
+        }
+        computer::LeaseCheckOutcome::Lost => Err(
             "the control lease was lost while this call was queued (it may have expired, or been \
              cleared by a kill switch) — retry"
                 .to_string(),
