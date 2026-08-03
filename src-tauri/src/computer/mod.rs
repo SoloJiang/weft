@@ -1733,16 +1733,35 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
     Ok(())
 }
 
-/// Release the lease early — a no-op unless `(thread, dir)` is the CURRENT
+/// Release the lease early — a no-op unless `(thread, dir, wt)` is the CURRENT
 /// holder (an already-expired/released lease, or one some other session
-/// since took over, is left alone rather than clobbered). Not required
-/// anywhere today (see [`acquire_control`]'s doc comment on why expiry alone
-/// is sufficient); this exists for a caller that knows it's done and wants
-/// the next session unblocked sooner than the full 30s lease.
+/// since took over, is left alone rather than clobbered). Used by
+/// `commands::clear_control_if_session_doomed` (round-32) to drop exactly one
+/// doomed session's lease during a repo delete; also available to any caller
+/// that knows it's done and wants the next session unblocked sooner than the
+/// full 30s lease.
+///
+/// issue #160 round-33 P2 (Codex mod.rs:1746): a successful release also
+/// syncs the OS-level global Escape shortcut — OUTSIDE the lock, the same
+/// decide-unlock-act shape as [`clear_control`] and [`control_state`]'s
+/// lazy-expiry path (see [`sync_shortcut_state`]'s own doc for the race that
+/// shape closes). Without it, releasing the last holder left bare Escape
+/// globally intercepted indefinitely: `control_state` thereafter sees `None`
+/// (not an expired holder), so its own repair path never fires, the banner
+/// disappears, and pressing Escape could still trip Emergency Stop with no
+/// active controller.
 pub fn release_control(thread: i32, dir: &str, wt: Option<i32>) {
-    let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
-    if matches!(guard.as_ref(), Some(h) if h.thread == thread && h.dir == dir && h.wt == wt) {
-        *guard = None;
+    let released;
+    {
+        let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        released =
+            matches!(guard.as_ref(), Some(h) if h.thread == thread && h.dir == dir && h.wt == wt);
+        if released {
+            *guard = None;
+        }
+    }
+    if released {
+        sync_shortcut_state();
     }
 }
 

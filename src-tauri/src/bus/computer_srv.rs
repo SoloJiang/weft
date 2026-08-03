@@ -1062,6 +1062,16 @@ async fn run_action(
             // is ever activated or clicked (`resolve_and_verify_target`
             // does both: resolve, record `window_id_out`, verify).
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
+            // issue #160 round-33 P2 (Codex computer_srv.rs:1074): PREFLIGHT
+            // the coordinate mapping against the pre-activation window — a
+            // call whose prerequisite is already missing (no recorded
+            // screenshot for this window, or an out-of-bounds coordinate)
+            // must fail BEFORE activation raises and focuses the target
+            // application, not after that side effect already stole the
+            // foreground. Advisory only: the AUTHORITATIVE mapping still runs
+            // against the post-activation `w2` below, unchanged (freshness —
+            // the window can move/resize during the blocking activation).
+            let _ = map_input_coord(thread, dir, wt, &w, cx, cy)?;
             // issue #160 round-4 P1 §2 (broadened round-5 review P1 §6): reclaim
             // the foreground BEFORE this click reaches the OS, not after — see
             // `activate_target`'s own doc for why even the click family (not
@@ -1132,6 +1142,9 @@ async fn run_action(
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir, wt).await?;
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
+            // issue #160 round-33 P2: preflight before activation — see the
+            // click-family arm above.
+            let _ = map_input_coord(thread, dir, wt, &w, cx, cy)?;
             activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             // issue #160 round-10 P1 #B: see the click-family arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
@@ -1174,6 +1187,10 @@ async fn run_action(
             // after activation — see the click-family arm above — and BOTH
             // endpoints are mapped against the SECOND (post-activation) `w2`.
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
+            // issue #160 round-33 P2: preflight BOTH endpoints before
+            // activation — see the click-family arm above.
+            let _ = map_input_coord(thread, dir, wt, &w, sx, sy)?;
+            let _ = map_input_coord(thread, dir, wt, &w, ex, ey)?;
             activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let from = map_input_coord(thread, dir, wt, &w2, sx, sy)?;
@@ -1210,6 +1227,9 @@ async fn run_action(
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir, wt).await?;
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
+            // issue #160 round-33 P2: preflight before activation — see the
+            // click-family arm above.
+            let _ = map_input_coord(thread, dir, wt, &w, cx, cy)?;
             activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             // issue #160 round-10 P1 #B: see the click-family arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
@@ -1258,6 +1278,13 @@ async fn run_action(
             // `require_recent_focus`'s doc — just now checked against a
             // freshly-resolved id rather than a possibly-stale one.
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
+            // issue #160 round-33 P2 (Codex computer_srv.rs:1074): PREFLIGHT
+            // the focus-freshness prerequisite against the pre-activation
+            // window — a `type` with no recent click on this window is doomed
+            // anyway, so it must fail BEFORE activation raises and focuses
+            // the target application. Advisory only; the AUTHORITATIVE check
+            // against the post-activation `w2` below is unchanged.
+            require_recent_focus(thread, dir, &w)?;
             activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             // issue #160 round-10 P1 #B: re-resolve/re-verify AFTER
             // activation, same as every other input arm — and check focus-
@@ -1319,6 +1346,9 @@ async fn run_action(
             recheck_after_guard(db, asks, thread, dir, wt).await?;
             // See the matching comment in the "type" arm above.
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
+            // issue #160 round-33 P2: preflight the focus prerequisite before
+            // activation — see the "type" arm above.
+            require_recent_focus(thread, dir, &w)?;
             activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             // issue #160 round-10 P1 #B: see the "type" arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
@@ -2171,6 +2201,24 @@ fn redact_audit_args(action: &str, args: &Value) -> Value {
     let Some(obj) = redacted.as_object_mut() else {
         return redacted;
     };
+    // issue #160 round-33 P1 (Codex computer_srv.rs:3090): strip every key
+    // outside the action's [`allowed_args`] allowlist WHOLESALE — both the
+    // key name and its value are request-author-chosen and can carry smuggled
+    // content, so neither may persist. `reject_unknown_args` already refuses
+    // such a request before any card, but the REJECTED attempt is audited
+    // too; only the count survives, as `unrecognized_args_redacted`.
+    let allowed = allowed_args(action);
+    let unknown: Vec<String> = obj
+        .keys()
+        .filter(|key| !allowed.iter().any(|a| *a == key.as_str()))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        for key in &unknown {
+            obj.remove(key);
+        }
+        obj.insert("unrecognized_args_redacted".to_string(), json!(unknown.len()));
+    }
     // Only redact when `text` is ACTUALLY present as a string — a malformed
     // call missing it entirely (rejected by `required_text` before it ever
     // reaches the backend, see the "type"/"key" arms of `run_action`) must not
@@ -3088,23 +3136,15 @@ fn pure_validate(action: &str, args: &Value) -> Result<(), String> {
     if !VALID_ACTIONS.iter().any(|a| *a == action) {
         return Err(unknown_action_error(action));
     }
-    // issue #160 round-31 P1 (Codex computer_srv.rs:2158): `text` is the ONE
-    // secret-classified argument this tool takes (literal keystrokes), and
-    // only `type` and `key` consume it — every other action REJECTS a present
-    // `text` outright, before any card is built. The shared tool schema
-    // accepts the field for every action, so a payload smuggled onto e.g. a
-    // `screenshot` used to ride through untouched: ignored by dispatch but
-    // carried VERBATIM on the approval card (`detail_redacted` only covered
-    // `type`) and into the durable audit (`redact_audit_args` likewise) —
-    // both now also redact defensively, but rejecting the malformed request
-    // here keeps a misleading card from ever opening at all, same as the
-    // round-30 `window` rule below.
-    if action != "type" && action != "key" && args.get("text").is_some() {
-        return Err(format!(
-            "'{action}' takes no 'text' argument — only `type` and `key` accept one; remove the \
-             argument and retry"
-        ));
-    }
+    // issue #160 round-33 P1 (Codex computer_srv.rs:3090): reject EVERY
+    // argument outside the action's closed allowlist — see
+    // [`reject_unknown_args`]. Generalizes (and replaces) the round-30
+    // windowless-`window` and round-31 non-typing-`text` one-offs: those
+    // closed two named fields, but the tool schema permits additional
+    // properties, so ANY unrecognized key (`password`, …) could still ride a
+    // schema-valid request onto the approval card and into the durable audit
+    // verbatim.
+    reject_unknown_args(action, args)?;
     match action {
         "left_click" | "right_click" | "double_click" | "triple_click" | "mouse_move" => {
             required_window(args)?;
@@ -3133,38 +3173,60 @@ fn pure_validate(action: &str, args: &Value) -> Result<(), String> {
             required_window(args)?;
         }
         "wait" => {
-            reject_unconsumed_window(action, args)?;
             parse_duration_ms(args)?;
         }
-        // Windowless observation actions: no arguments to PARSE, but a
-        // smuggled `window` is rejected — see `reject_unconsumed_window`.
-        "list_windows" | "cursor_position" => {
-            reject_unconsumed_window(action, args)?;
-        }
+        // list_windows / cursor_position: nothing to parse — the allowlist
+        // check above already rejected everything but `action` itself.
         _ => {}
     }
     Ok(())
 }
 
-/// issue #160 round-30 P2 (Codex computer_srv.rs:1491): windowless actions
-/// REJECT a `window` argument outright instead of silently ignoring it.
-/// `approve`'s card summary folds any nonempty window query into the line the
-/// human triages (`computer: list_windows @ Calculator`), but the dispatch
-/// arms for these actions never consume the argument — `list_windows` returns
-/// EVERY visible application's name and title regardless — so an
-/// accepted-but-ignored `window` let a card LOOK scoped to one application
-/// while actually authorizing desktop-wide enumeration (and `wait`'s card,
-/// window-bound input it never performs). Rejected here, at pure-validation
-/// time, so the misleading card can never be built at all — the same
-/// before-any-card bar every other shape check in [`pure_validate`] holds to.
-/// Any present `window` key is rejected, not just a nonempty string: a
-/// non-string value would render no `@` segment, but the request is
-/// malformed either way and an honest error beats a silent drop.
-fn reject_unconsumed_window(action: &str, args: &Value) -> Result<(), String> {
-    if args.get("window").is_some() {
+/// The closed per-action argument allowlist (issue #160 round-33 P1, Codex
+/// computer_srv.rs:3090) — exactly the keys each dispatch arm actually
+/// consumes, plus the discriminant `action` itself. One table serving BOTH
+/// [`reject_unknown_args`] (request-time rejection) and
+/// [`redact_audit_args`] (audit-time stripping), so the two boundaries can
+/// never disagree about what an action legitimately carries.
+fn allowed_args(action: &str) -> &'static [&'static str] {
+    match action {
+        "left_click" | "right_click" | "double_click" | "triple_click" | "mouse_move" => {
+            &["action", "window", "coordinate"]
+        }
+        "left_click_drag" => &["action", "window", "start_coordinate", "coordinate"],
+        "scroll" => &["action", "window", "coordinate", "scroll_direction", "scroll_amount"],
+        "type" | "key" => &["action", "window", "text"],
+        "screenshot" => &["action", "window"],
+        "wait" => &["action", "duration_ms"],
+        // list_windows / cursor_position take nothing beyond the action.
+        _ => &["action"],
+    }
+}
+
+/// issue #160 round-33 P1 (Codex computer_srv.rs:3090): reject any argument
+/// outside [`allowed_args`], BEFORE a card is built or anything is logged.
+/// The tool schema permits additional properties, so a schema-valid request
+/// could smuggle arbitrary content under an unrecognized key (`password`,
+/// …) — ignored by dispatch, but carried verbatim onto the approval card and
+/// into the durable audit. Generalizes the round-30 windowless-`window` and
+/// round-31 non-typing-`text` rules: unconsumed fields are rejected as a
+/// class, not one named field at a time.
+///
+/// The offending KEY is deliberately NOT echoed in the error: the error
+/// string becomes the call's audited outcome, and a key name is as
+/// attacker-chosen as a value — echoing it would persist the very content
+/// this rejection exists to keep out of the log.
+fn reject_unknown_args(action: &str, args: &Value) -> Result<(), String> {
+    let allowed = allowed_args(action);
+    let Some(obj) = args.as_object() else {
+        // Non-object args carry no smuggleable keys; each arm's own parse
+        // rejects the malformed shape with its specific message.
+        return Ok(());
+    };
+    if obj.keys().any(|key| !allowed.iter().any(|a| a == key)) {
         return Err(format!(
-            "'{action}' takes no 'window' argument — it is not scoped to a window; remove the \
-             argument and retry"
+            "'{action}' was given an argument it does not take — allowed arguments: {}",
+            allowed.join(", ")
         ));
     }
     Ok(())
@@ -4574,26 +4636,31 @@ mod tests {
         for (action, args) in cases {
             let err = pure_validate(action, &args)
                 .expect_err("a non-typing action must reject a smuggled text argument");
-            assert!(err.contains("takes no 'text'"), "{action}: {err}");
+            assert!(err.contains("does not take"), "{action}: {err}");
         }
         // The two consumers still accept it.
         assert!(pure_validate("type", &json!({"action": "type", "window": "n", "text": "hi"})).is_ok());
         assert!(pure_validate("key", &json!({"action": "key", "window": "n", "text": "ctrl+c"})).is_ok());
     }
 
-    /// issue #160 round-31 P1 (Codex computer_srv.rs:2158): the audit line
-    /// redacts a present `text` on EVERY action — the request is rejected
-    /// (see the pure_validate test above), but rejected calls are audited
-    /// too, and the smuggled payload must not land verbatim in the durable
-    /// log. An UNPARSEABLE `key` payload is redacted for the same reason: it
-    /// is not a command chord forensics needs, and could be anything.
+    /// issue #160 round-31 P1 (Codex computer_srv.rs:2158): a `text` smuggled
+    /// onto a non-typing action never reaches the durable log — the request
+    /// is rejected (see the pure_validate test above), but rejected calls are
+    /// audited too. Since round-33 P1 the allowlist strips the pair WHOLESALE
+    /// (it is an unrecognized argument for that action — stronger than the
+    /// original char-count redaction). An UNPARSEABLE `key` payload — where
+    /// `text` IS the consumed field — keeps the round-31 char-count
+    /// redaction: it is not a command chord forensics needs.
     #[test]
     fn redact_audit_args_redacts_smuggled_text_on_any_action() {
         let args = json!({"action": "screenshot", "window": "notes", "text": "hunter2"});
         let redacted = redact_audit_args("screenshot", &args);
-        assert_eq!(redacted["text"]["text_redacted"], true);
-        assert_eq!(redacted["text"]["text_chars"], 7);
-        assert_eq!(redacted["window"], "notes", "non-text keys pass through");
+        assert!(
+            redacted.get("text").is_none(),
+            "an unconsumed text is stripped wholesale since round-33: {redacted}"
+        );
+        assert_eq!(redacted["unrecognized_args_redacted"], 1);
+        assert_eq!(redacted["window"], "notes", "allowlisted keys pass through");
         assert!(
             !redacted.to_string().contains("hunter2"),
             "the raw smuggled text must never reach the audit: {redacted}"
@@ -4648,13 +4715,44 @@ mod tests {
         for action in ["list_windows", "cursor_position"] {
             let err = pure_validate(action, &json!({"action": action, "window": "Calculator"}))
                 .expect_err("a windowless action must reject a window argument");
-            assert!(err.contains("takes no 'window'"), "{err}");
+            assert!(err.contains("does not take"), "{err}");
             assert!(pure_validate(action, &json!({"action": action})).is_ok());
         }
         let err = pure_validate("wait", &json!({"action": "wait", "duration_ms": 5, "window": "x"}))
             .expect_err("wait must reject a window argument");
-        assert!(err.contains("takes no 'window'"), "{err}");
+        assert!(err.contains("does not take"), "{err}");
         assert!(pure_validate("wait", &json!({"action": "wait", "duration_ms": 5})).is_ok());
+    }
+
+    /// issue #160 round-33 P1 (Codex computer_srv.rs:3090): EVERY argument
+    /// outside the action's closed allowlist is rejected before any card, the
+    /// error never echoes the smuggled key or value (it becomes the audited
+    /// outcome), and the rejected attempt's own audit line strips the pair
+    /// wholesale — only a count survives.
+    #[test]
+    fn pure_validate_rejects_unrecognized_arguments_and_the_audit_strips_them() {
+        let args = json!({"action": "screenshot", "window": "Notes", "password": "hunter2"});
+        let err =
+            pure_validate("screenshot", &args).expect_err("an unknown argument must be rejected");
+        assert!(
+            !err.contains("password") && !err.contains("hunter2"),
+            "the error must not echo the smuggled key or value: {err}"
+        );
+
+        let redacted = redact_audit_args("screenshot", &args);
+        assert!(redacted.get("password").is_none(), "{redacted}");
+        assert_eq!(redacted["unrecognized_args_redacted"], 1);
+        assert_eq!(redacted["window"], "Notes", "allowlisted keys pass through");
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("hunter2") && !rendered.contains("password"),
+            "neither the smuggled key nor its value may persist: {rendered}"
+        );
+
+        // A fully-allowlisted request is untouched by both boundaries.
+        let clean = json!({"action": "screenshot", "window": "Notes"});
+        assert!(pure_validate("screenshot", &clean).is_ok());
+        assert_eq!(redact_audit_args("screenshot", &clean), clean);
     }
 
     #[test]
@@ -6964,9 +7062,17 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_lowercase().contains("screenshot"), "{err}");
+        // issue #160 round-33 P2 (Codex computer_srv.rs:1074): the missing
+        // prerequisite is now PREFLIGHTED before activation, so the doomed
+        // call must not have raised/focused the target window either — not
+        // just skipped the click.
         assert!(
-            mock.actions.lock().unwrap_or_else(|e| e.into_inner()).iter().all(|a| !a.starts_with("click")),
-            "a fail-closed coordinate mapping must never let the click itself reach the backend"
+            mock.actions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .all(|a| !a.starts_with("click") && !a.starts_with("activate")),
+            "a fail-closed coordinate mapping must reach neither the click NOR the activation"
         );
         computer::clear_control();
     }

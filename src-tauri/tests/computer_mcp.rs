@@ -95,12 +95,20 @@ fn spawn_computer_call(
 ) -> tokio::task::JoinHandle<String> {
     let base = base.to_string();
     tokio::spawn(async move {
+        // issue #160 round-33 P1: `coordinate` only rides actions that consume
+        // it — `pure_validate`'s per-action allowlist now rejects unrecognized
+        // arguments outright, before any card.
+        let arguments = if action == "screenshot" {
+            json!({"action": action, "window": window})
+        } else {
+            json!({"action": action, "window": window, "coordinate": [1, 1]})
+        };
         rpc(
             &base,
             thread,
             &dir,
             json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                "params":{"name":"computer","arguments":{"action":action,"window":window,"coordinate":[1,1]}}}),
+                "params":{"name":"computer","arguments": arguments}}),
         )
         .await
     })

@@ -775,6 +775,17 @@ function AutomationSettings() {
   // toggle's own optimistic set + backend call is in flight, so the refresh
   // poll below never clobbers it with a stale pre-toggle read racing back.
   const computerUseToggleInFlightRef = useRef(false);
+  // issue #160 round-33 P2 (Codex SettingsDialog.tsx:798): generation counter
+  // bumped every time a toggle STARTS. The in-flight flag alone left a
+  // gap: a poll's read could be issued before the toggle began, and by the
+  // time it resolved the toggle had already finished and cleared the flag —
+  // the stale pre-toggle result then overwrote the freshly committed value
+  // until the next poll (making a successful disable look re-enabled, and
+  // the next click send the wrong operation). Each poll captures the
+  // generation before its invoke and applies the result only if no toggle
+  // started since — the same generational guard `ComputerControlBanner`'s
+  // `tickSeqRef` uses for its own reordering hazard.
+  const computerUseGenRef = useRef(0);
 
   // issue #160 round-28 P2 (Codex SettingsDialog.tsx:796): Emergency Stop
   // (the banner's Stop button or the global Esc shortcut) flips
@@ -792,9 +803,13 @@ function AutomationSettings() {
     let alive = true;
     const h = setInterval(() => {
       if (computerUseToggleInFlightRef.current) return;
+      // round-33 P2: capture the toggle generation BEFORE issuing the read —
+      // see `computerUseGenRef`'s doc for the stale-overwrite this closes.
+      const gen = computerUseGenRef.current;
       api.getComputerUseEnabled().then(
         (enabled) => {
           if (!alive || computerUseToggleInFlightRef.current) return;
+          if (gen !== computerUseGenRef.current) return;
           setComputerUseState(enabled);
           setComputerUseLoaded(true);
         },
@@ -889,6 +904,9 @@ function AutomationSettings() {
 
   async function toggleComputerUse(on: boolean) {
     const prev = computerUse;
+    // round-33 P2: invalidate every poll read issued BEFORE this toggle —
+    // their results are stale the instant the user acts.
+    computerUseGenRef.current += 1;
     computerUseToggleInFlightRef.current = true;
     setComputerUseState(on);
     try {
