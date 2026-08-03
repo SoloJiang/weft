@@ -211,6 +211,13 @@ impl WtParam {
 // needs nothing more than recomputing the SAME HMAC from the SAME path values
 // — no lookup table to keep in sync, no secret to ever write to disk.
 //
+// The token additionally binds a per-identity GENERATION rotated at every
+// fresh injection (see [`session_token_generations`]): a worker rerun,
+// resumed under a new persisted session, or switched to another engine gets
+// a NEW bearer, and the child it replaced — which would otherwise share the
+// same `(thread, dir, wt)` MAC forever — stops verifying the moment the
+// replacement is minted.
+//
 // KNOWN, ACCEPTED residual (not eliminated this change): a SAME-UID local
 // process can still read a legitimate worker's own MCP config file / process
 // environment / launch args and recover this SAME token from there — this
@@ -258,6 +265,53 @@ fn computer_endpoint_secret() -> Option<&'static [u8; 32]> {
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Monotonic per-identity token generation, folded into
+/// [`computer_token_mac`] — the revocation half of the bearer scheme. Each
+/// fresh injection for a `(thread, dir, wt)` identity rotates its generation
+/// ([`rotate_computer_session_token`], called by `bus::inject`'s minting
+/// paths right before the new token is rendered), and verification always
+/// recomputes the MAC under the CURRENT generation — so the moment a worker
+/// is rerun, resumed as a new persisted session, or switched to a different
+/// engine, the replacement's own injection invalidates every token minted
+/// for the child it replaces. The old child (or any process that kept its
+/// injected config) gets a bare 401 at [`handle_computer`]'s entry gate,
+/// BEFORE the liveness check, the control lease, or any standing
+/// Full/Always grant is ever consulted — a stale-session bearer can no
+/// longer ride shared grants into desktop actions alongside its
+/// replacement. In-memory only, like the HMAC secret itself: a process
+/// restart resets generations AND mints a fresh secret, so no pre-restart
+/// token survives either way, and an identity never injected in this
+/// process verifies at the default generation its own mint used.
+fn session_token_generations() -> &'static Mutex<HashMap<(i32, String, Option<i32>), u64>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<(i32, String, Option<i32>), u64>>> = OnceLock::new();
+    GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The CURRENT generation for one identity — read by
+/// [`computer_token_mac`] on every mint AND every verify, never bumped here.
+fn session_token_generation(thread: i32, dir: &str, wt: Option<i32>) -> u64 {
+    session_token_generations()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(thread, dir.to_string(), wt))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Invalidate every previously-minted bearer for `(thread, dir, wt)` — see
+/// [`session_token_generations`]. Called by each injection path
+/// (`bus::inject::inject_computer` and the ACP `acp_mcp_servers` computer
+/// arm) immediately before it renders the replacement session's token.
+/// `#[doc(hidden)] pub` for the same sibling-module/cross-crate-test reason
+/// as [`computer_session_token`].
+#[doc(hidden)]
+pub fn rotate_computer_session_token(thread: i32, dir: &str, wt: Option<i32>) {
+    let mut generations =
+        session_token_generations().lock().unwrap_or_else(|e| e.into_inner());
+    let slot = generations.entry((thread, dir.to_string(), wt)).or_insert(0);
+    *slot = slot.wrapping_add(1);
+}
+
 /// The ONE place this module's HMAC key material gets constructed — shared by
 /// both [`computer_session_token`] (mint) and [`verify_computer_token`]
 /// (verify), so the two can never drift onto two different derivations of
@@ -288,7 +342,12 @@ fn computer_token_mac(thread: i32, dir: &str, wt: Option<i32>) -> Option<HmacSha
         Some(id) => format!("wt{id}"),
         None => "none".to_string(),
     };
-    mac.update(format!("{thread}/{dir}/{wt_repr}").as_bytes());
+    // The identity's CURRENT token generation is part of the MAC input: a
+    // token minted before the latest [`rotate_computer_session_token`] call
+    // for this identity no longer recomputes, so a replaced session's bearer
+    // dies at the entry gate — see [`session_token_generations`].
+    let generation = session_token_generation(thread, dir, wt);
+    mac.update(format!("{thread}/{dir}/{wt_repr}/g{generation}").as_bytes());
     Some(mac)
 }
 
@@ -3201,8 +3260,9 @@ fn check_type_length(text: &str) -> Result<(), String> {
 }
 
 /// `scroll_direction` (required) + `scroll_amount` (optional, default 3,
-/// capped at 30 — never rejected for being too large, just clamped) into a
-/// `(dx, dy)` delta `backend::ComputerBackend::scroll` understands.
+/// capped at 30 — never rejected for being too large, just clamped; a
+/// NEGATIVE amount is rejected outright, see below) into a `(dx, dy)` delta
+/// `backend::ComputerBackend::scroll` understands.
 fn parse_scroll(args: &Value) -> Result<(i32, i32), String> {
     let direction = args.get("scroll_direction").and_then(|v| v.as_str()).unwrap_or("");
     // distinguish an
@@ -3226,7 +3286,22 @@ fn parse_scroll(args: &Value) -> Result<(i32, i32), String> {
             }
         },
     };
-    let amount = amount.clamp(0, 30) as i32;
+    // A negative amount is rejected, not clamped: direction already lives in
+    // `scroll_direction`, so a negative number is at best a sign confusion —
+    // and silently clamping it to 0 turned the call into a successful no-op
+    // that still activated the target and moved the cursor, while the human
+    // approved a card showing the raw negative value. The requested and
+    // executed operations must match, so this fails in `pure_validate`,
+    // before any card ever opens. The HIGH end keeps the documented
+    // clamp-at-30 (a too-large scroll is the same gesture, just shorter).
+    if amount < 0 {
+        return Err(
+            "'scroll_amount' must not be negative — use 'scroll_direction' to choose the \
+             direction"
+                .to_string(),
+        );
+    }
+    let amount = amount.min(30) as i32;
     match direction {
         "up" => Ok((0, -amount)),
         "down" => Ok((0, amount)),
@@ -4512,6 +4587,31 @@ mod tests {
         assert_ne!(t7, t_none);
     }
 
+    /// Rotating an identity's token generation (what every fresh injection
+    /// does before minting) must invalidate the bearer minted before it —
+    /// the replaced session's old child gets a bare 401 at the entry gate —
+    /// while a sibling identity's own bearer stays untouched.
+    #[test]
+    fn rotating_the_session_token_generation_invalidates_the_prior_bearer() {
+        let old = computer_session_token(933_001, "70", Some(1));
+        assert!(verify_computer_token(933_001, "70", Some(1), &old), "current render verifies");
+        let sibling = computer_session_token(933_001, "70", Some(2));
+
+        rotate_computer_session_token(933_001, "70", Some(1));
+
+        assert!(
+            !verify_computer_token(933_001, "70", Some(1), &old),
+            "the pre-rotation bearer must be refused once the identity was re-injected"
+        );
+        let fresh = computer_session_token(933_001, "70", Some(1));
+        assert_ne!(old, fresh, "the replacement session's bearer is a different token");
+        assert!(verify_computer_token(933_001, "70", Some(1), &fresh), "only the fresh one verifies");
+        assert!(
+            verify_computer_token(933_001, "70", Some(2), &sibling),
+            "a sibling worktree's own bearer must survive the rotation"
+        );
+    }
+
     #[test]
     fn audit_line_is_one_json_object_per_line() {
         let args = json!({"action": "left_click", "coordinate": [1, 2]});
@@ -4569,6 +4669,12 @@ mod tests {
         );
         assert!(parse_scroll(&json!({"scroll_direction": "sideways"})).is_err());
         assert!(parse_scroll(&json!({})).is_err());
+        // A NEGATIVE amount is rejected, never clamped to a silent no-op: the
+        // human's card shows the requested value, so the executed operation
+        // must be the requested one or nothing at all.
+        let err = parse_scroll(&json!({"scroll_direction": "down", "scroll_amount": -5}))
+            .expect_err("a negative scroll_amount must be rejected before approval");
+        assert!(err.contains("must not be negative"), "{err}");
     }
 
     /// an ABSENT

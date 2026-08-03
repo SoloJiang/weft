@@ -3334,15 +3334,29 @@ pub async fn set_computer_use_enabled_inner(
         asks.cancel_gui_asks();
         return crate::computer::persist_stop(db, my_gen).await;
     }
-    // held for this ENTIRE function — read gen,
-    // write the setting, reconcile — so a second overlapping enable request
-    // can never interleave with this one's own (possibly compensating)
-    // write. See `computer::enable_serialize_mutex`'s own doc for the
-    // enable-vs-enable race this originally closed.
+    // The generation snapshot is taken BEFORE waiting on the serialize
+    // mutex — it timestamps this enable's INTENT, not its turn in the write
+    // queue. Reading it after the lock reopened the exact inversion the
+    // generation check exists to prevent: an enable parked behind another
+    // persistence operation while a human hit Stop would only read the
+    // POST-Stop generation once it finally acquired the lock, so its
+    // `clear_emergency_stop` matched the current generation and cleared the
+    // NEWER Stop's latch — and Stop's own queued `persist_stop`, finding the
+    // latch already cleared, skipped writing `"false"`, leaving the later
+    // Stop fully undone by the earlier enable. Snapshotting at entry means
+    // any Stop that lands while this request queues bumps past the snapshot,
+    // `clear_emergency_stop` refuses, and `reconcile_enable_after_write`
+    // compensates — the later Stop wins, in both memory and on disk.
+    let gen = crate::computer::stop_generation();
+    // Held for the REST of this function — write the setting, reconcile — so
+    // a second overlapping enable request can never interleave with this
+    // one's own (possibly compensating) write. See
+    // `computer::enable_serialize_mutex`'s own doc for the enable-vs-enable
+    // race this originally closed.
     //
-    // this is now the SAME lock
-    // `computer::persist_stop` also holds across ITS OWN write — before this
-    // round, Stop's persisted write ran completely outside this queue, so a
+    // This is the SAME lock
+    // `computer::persist_stop` also holds across ITS OWN write — without
+    // that, Stop's persisted write ran completely outside this queue, so a
     // slower Stop write could still land AFTER a newer, explicit enable's
     // write and silently revert it (this function's own `"true"` clobbered
     // back to `"false"`, with no trace beyond the setting itself). Sharing
@@ -3353,7 +3367,6 @@ pub async fn set_computer_use_enabled_inner(
     // PERSISTED write is — so a human's Stop still cuts in immediately,
     // exactly as before.
     let _serialize = crate::computer::enable_serialize_mutex().lock().await;
-    let gen = crate::computer::stop_generation();
     repo::set_setting(db, crate::computer::K_COMPUTER_USE_ENABLED, "true")
         .await
         .map_err(e)?;
@@ -9044,6 +9057,56 @@ mod tests {
              overwritten by stop's own earlier-queued write landing after it"
         );
         assert!(crate::computer::enabled(&db).await, "the re-enable must actually take effect");
+
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+    }
+
+    /// The mirror ordering: an enable request QUEUED BEHIND the lock when a
+    /// Stop lands must not undo that newer Stop. The enable snapshots the
+    /// stop generation at ENTRY (before waiting on the lock), so the Stop's
+    /// bump invalidates it: `clear_emergency_stop` refuses, the latch stays
+    /// tripped, and the compensating write leaves the disk at `"false"` —
+    /// the later Stop wins even though the enable was issued first and only
+    /// got its turn at the lock afterward.
+    #[tokio::test]
+    async fn a_stop_landing_while_an_enable_is_queued_is_not_undone_by_that_enable() {
+        let _guard = crate::computer::process_state_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::computer::clear_emergency_stop(crate::computer::stop_generation());
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        let held = crate::computer::enable_serialize_mutex().lock().await;
+
+        // The enable is issued FIRST — it snapshots the pre-Stop generation
+        // at entry, then parks on the held lock.
+        let db_enable = db.clone();
+        let enable_handle = tokio::spawn(async move {
+            set_computer_use_enabled_inner(&db_enable, &crate::ask::AskRegistry::new(), true).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!enable_handle.is_finished(), "the enable must be parked on the held lock");
+
+        // The Stop lands while the enable is still queued: the latch trips
+        // and the generation moves past the enable's snapshot immediately.
+        let my_gen = crate::computer::trip_stop_latch();
+        let db_stop = db.clone();
+        let stop_handle =
+            tokio::spawn(async move { crate::computer::persist_stop(&db_stop, my_gen).await });
+
+        drop(held);
+        enable_handle.await.unwrap().unwrap();
+        stop_handle.await.unwrap().unwrap();
+
+        assert!(
+            !crate::computer::enabled(&db).await,
+            "the newer Stop's latch must survive the earlier-issued enable"
+        );
+        assert_eq!(
+            repo::get_setting(&db, crate::computer::K_COMPUTER_USE_ENABLED).await.unwrap().as_deref(),
+            Some("false"),
+            "the disk must reflect the later Stop — the queued enable's write must be compensated"
+        );
 
         crate::computer::clear_emergency_stop(crate::computer::stop_generation());
     }

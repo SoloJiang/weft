@@ -237,6 +237,12 @@ pub fn acp_mcp_servers(
         });
     }
     if include_computer {
+        // An ACP session establishment replaces this identity's previous
+        // child — rotating BEFORE minting invalidates every bearer issued to
+        // the predecessor (see
+        // `computer_srv::rotate_computer_session_token`), same as
+        // `inject_computer` does for the non-ACP engines.
+        crate::bus::computer_srv::rotate_computer_session_token(thread, dir, computer_wt);
         out.push(crate::acp::McpServerSpec {
             name: "weft_computer".into(),
             url: computer_url(base, thread, dir, computer_wt),
@@ -567,6 +573,13 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, wt: Optio
         // same rule `inject_mcp` applies for every other server.
         return Injection::none();
     }
+    // This injection belongs to a NEW child for `(thread, dir, wt)` — a
+    // spawn, a rerun, a resume under a new persisted session, or an engine
+    // switch. Rotating BEFORE minting renders the replacement's token under
+    // a fresh generation, which invalidates every token issued to the child
+    // it replaces (see `computer_srv::rotate_computer_session_token`) — the
+    // old process's bearer gets a bare 401 from then on.
+    crate::bus::computer_srv::rotate_computer_session_token(thread, dir, wt);
     let url = computer_url(base, thread, dir, wt);
     match tool {
         "claude" => inject_computer_claude(thread, dir, wt, &url),
@@ -1169,7 +1182,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", None);
+        let inj = inject_computer("http://127.0.0.1:9", 601, "10", "claude", None);
         assert_eq!(inj.args[0], "--mcp-config");
         let cfg_path = std::path::PathBuf::from(&inj.args[1]);
         assert!(
@@ -1181,12 +1194,13 @@ mod tests {
             "must never write anything computer-related inside cwd at all"
         );
         let cfg = std::fs::read_to_string(&cfg_path).unwrap();
-        assert!(cfg.contains("weft_computer") && cfg.contains("/computer/1/10/mcp"));
+        assert!(cfg.contains("weft_computer") && cfg.contains("/computer/601/10/mcp"));
         // the injected URL still carries the
         // EXACT per-session bearer `computer_session_token` would mint for
-        // this same (thread, dir).
+        // this same (thread, dir) — recomputed AFTER the inject, which
+        // rotated this identity's token generation.
         assert!(
-            cfg.contains(&format!("key={}", crate::bus::computer_srv::computer_session_token(1, "10", None))),
+            cfg.contains(&format!("key={}", crate::bus::computer_srv::computer_session_token(601, "10", None))),
             "{cfg}"
         );
         #[cfg(unix)]
@@ -1326,13 +1340,17 @@ mod tests {
     /// the codex child alone.
     #[test]
     fn computer_codex_uses_config_override_with_the_bearer_in_env_not_argv() {
-        let token = crate::bus::computer_srv::computer_session_token(1, "10", None);
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", None);
+        // Captured AFTER the inject (which rotates this identity's token
+        // generation) — the env token must match the CURRENT render. A
+        // thread id no other test injects for, so parallel tests can't
+        // rotate it mid-assertion.
+        let inj = inject_computer("http://127.0.0.1:9", 611, "10", "codex", None);
+        let token = crate::bus::computer_srv::computer_session_token(611, "10", None);
         assert_eq!(
             inj.args,
             vec![
                 "-c".to_string(),
-                "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp".to_string(),
+                "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/611/10/mcp".to_string(),
                 "-c".to_string(),
                 format!("mcp_servers.weft_computer.bearer_token_env_var={COMPUTER_TOKEN_ENV_VAR}"),
             ]
@@ -1358,15 +1376,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
         std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
 
-        let key = crate::bus::computer_srv::computer_session_token(1, "10", Some(42));
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-wt-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "claude", Some(42));
+        let inj = inject_computer("http://127.0.0.1:9", 612, "10", "claude", Some(42));
+        // Recomputed AFTER the inject — each injection rotates the identity's
+        // token generation, so only the current render matches.
+        let key = crate::bus::computer_srv::computer_session_token(612, "10", Some(42));
         assert_eq!(inj.args[0], "--mcp-config");
         let cfg_path = std::path::PathBuf::from(&inj.args[1]);
         assert!(!cfg_path.starts_with(&dir), "must live outside the worktree, got {cfg_path:?}");
         let cfg = std::fs::read_to_string(&cfg_path).unwrap();
-        assert!(cfg.contains("/computer/1/10/mcp?wt=42"), "{cfg}");
+        assert!(cfg.contains("/computer/612/10/mcp?wt=42"), "{cfg}");
         assert!(cfg.contains(&format!("&key={key}")), "{cfg}");
 
         std::env::remove_var("WEFT_HOME");
@@ -1376,12 +1396,14 @@ mod tests {
         // codex: the `?wt=` pin stays in the argv URL
         // (a worktree id is not a secret) but the bearer rides env, minted for
         // this EXACT `wt`.
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "codex", Some(42));
+        let inj = inject_computer("http://127.0.0.1:9", 612, "10", "codex", Some(42));
+        // The codex inject rotated the generation again — recompute.
+        let key = crate::bus::computer_srv::computer_session_token(612, "10", Some(42));
         assert_eq!(
             inj.args,
             vec![
                 "-c".to_string(),
-                "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/1/10/mcp?wt=42".to_string(),
+                "mcp_servers.weft_computer.url=http://127.0.0.1:9/computer/612/10/mcp?wt=42".to_string(),
                 "-c".to_string(),
                 format!("mcp_servers.weft_computer.bearer_token_env_var={COMPUTER_TOKEN_ENV_VAR}"),
             ]
@@ -1429,10 +1451,9 @@ mod tests {
 
     #[test]
     fn acp_mcp_servers_include_computer_toggles_weft_computer() {
-        let key = crate::bus::computer_srv::computer_session_token(1, "10", None);
         let with_computer = acp_mcp_servers(
             "http://127.0.0.1:9",
-            1,
+            631,
             "10",
             None,
             true,
@@ -1442,12 +1463,15 @@ mod tests {
             true,
             None,
         );
+        // Captured AFTER the call — the computer arm rotates this identity's
+        // token generation before minting, so only the current render matches.
+        let key = crate::bus::computer_srv::computer_session_token(631, "10", None);
         assert!(with_computer.iter().any(|s| s.name == "weft_computer"
-            && s.url == format!("http://127.0.0.1:9/computer/1/10/mcp?key={key}")));
+            && s.url == format!("http://127.0.0.1:9/computer/631/10/mcp?key={key}")));
 
         let without_computer = acp_mcp_servers(
             "http://127.0.0.1:9",
-            1,
+            631,
             "10",
             None,
             true,
@@ -1464,10 +1488,9 @@ mod tests {
     /// `weft_computer` URL's `?wt=` query param for an ACP worker.
     #[test]
     fn acp_mcp_servers_computer_wt_pins_the_worktree_query_param() {
-        let key = crate::bus::computer_srv::computer_session_token(1, "10", Some(7));
         let with_wt = acp_mcp_servers(
             "http://127.0.0.1:9",
-            1,
+            632,
             "10",
             None,
             true,
@@ -1477,8 +1500,47 @@ mod tests {
             true,
             Some(7),
         );
+        // Captured AFTER the call — the computer arm rotates the identity's
+        // token generation before minting.
+        let key = crate::bus::computer_srv::computer_session_token(632, "10", Some(7));
         assert!(with_wt.iter().any(|s| s.name == "weft_computer"
-            && s.url == format!("http://127.0.0.1:9/computer/1/10/mcp?wt=7&key={key}")));
+            && s.url == format!("http://127.0.0.1:9/computer/632/10/mcp?wt=7&key={key}")));
+    }
+
+    /// Re-injecting for the SAME `(thread, dir, wt)` — a rerun, a resume
+    /// under a new persisted session, or an engine switch — must invalidate
+    /// the bearer minted for the child it replaces: only the LATEST
+    /// injection's token matches the current render, so a process that kept
+    /// its old config gets a bare 401 at the endpoint's entry gate.
+    #[test]
+    fn each_computer_injection_invalidates_the_previous_sessions_bearer() {
+        let first = inject_computer("http://127.0.0.1:9", 641, "10", "codex", Some(3));
+        let first_token = first.env[0].1.clone();
+        assert_eq!(
+            first_token,
+            crate::bus::computer_srv::computer_session_token(641, "10", Some(3)),
+            "the freshly-injected token must be the current render"
+        );
+
+        let second = inject_computer("http://127.0.0.1:9", 641, "10", "codex", Some(3));
+        let second_token = second.env[0].1.clone();
+        assert_ne!(first_token, second_token, "a re-injection must mint a DIFFERENT bearer");
+        let current = crate::bus::computer_srv::computer_session_token(641, "10", Some(3));
+        assert_eq!(second_token, current, "the replacement's token is the current render");
+        assert_ne!(first_token, current, "the replaced session's token no longer recomputes");
+
+        // A sibling worker (same thread/dir, different wt) is untouched by
+        // the rotation — its own identity has its own generation.
+        let sibling = inject_computer("http://127.0.0.1:9", 641, "10", "codex", Some(4));
+        assert_eq!(
+            sibling.env[0].1,
+            crate::bus::computer_srv::computer_session_token(641, "10", Some(4)),
+        );
+        assert_eq!(
+            crate::bus::computer_srv::computer_session_token(641, "10", Some(3)),
+            current,
+            "rotating the sibling must not disturb this identity's generation"
+        );
     }
 
     #[test]
@@ -1920,17 +1982,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let inj = inject_computer("http://127.0.0.1:9", 1, "10", "opencode", None);
+        let inj = inject_computer("http://127.0.0.1:9", 621, "10", "opencode", None);
         assert!(inj.args.is_empty(), "opencode has no launch-flag injection");
         assert_eq!(inj.env.len(), 1);
         assert_eq!(inj.env[0].0, "OPENCODE_CONFIG_CONTENT");
         let inline: serde_json::Value = serde_json::from_str(&inj.env[0].1).unwrap();
         let url = inline["mcp"]["weft_computer"]["url"].as_str().unwrap();
-        assert!(url.contains("/computer/1/10/mcp"), "{url}");
+        assert!(url.contains("/computer/621/10/mcp"), "{url}");
         assert!(
             url.contains(&format!(
                 "key={}",
-                crate::bus::computer_srv::computer_session_token(1, "10", None)
+                crate::bus::computer_srv::computer_session_token(621, "10", None)
             )),
             "the per-session bearer must ride the env-carried URL: {url}"
         );
