@@ -1185,52 +1185,37 @@ async fn run_action(
             // against the post-activation `w2` below, unchanged (freshness —
             // the window can move/resize during the blocking activation).
             let _ = map_input_coord(thread, dir, wt, &w, cx, cy)?;
-            // Reclaim
-            // the foreground BEFORE this click reaches the OS, not after — see
-            // `activate_target`'s own doc for why even the click family (not
-            // just type/key) needs this, UNCONDITIONALLY (Auto approvals
-            // included): an Interactive approval card can cover the target
-            // window's real on-screen position, so an ABSOLUTE-coordinate
-            // click risks landing on Weft's own card instead of the target —
-            // and an Auto approval offers no guarantee the target still holds
-            // the real OS foreground either.
-            activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
-            // `activate_target` (inside the call
-            // above) shells out to a potentially slow, blocking OS call
-            // (osascript/wmctrl/`xdotool --sync`) — the window can move,
-            // resize, close, or have its id reused by an unrelated window
-            // WHILE that call runs. Re-resolve/re-verify AFTER it returns,
-            // and map/inject against THIS fresh state — never the
-            // pre-activation `w`, which may already be stale by now.
-            let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            let (px, py) = map_input_coord(thread, dir, wt, &w2, cx, cy)?;
-            // the injection itself moves
-            // onto tokio's blocking pool too (`enigo` is a synchronous OS
-            // call — see `on_blocking`'s own doc). No extra concurrency cap
-            // is needed here the way `list_windows`/`screenshot` needed one:
-            // `input_flight_guard`, acquired above, already serializes the
-            // ENTIRE process to one in-flight input action at a time — every
-            // OTHER input arm below shares this same reasoning without
-            // repeating it.
-            // the final
-            // stop/lease recheck runs INSIDE the closure, on the blocking
-            // thread, right before the backend call — see
-            // `recheck_stop_and_lease_before_backend`'s own doc for the gap
-            // (the `w2` resolve + the blocking-pool queue) it closes.
+            // Everything TARGET-facing from here on — reclaiming the
+            // foreground (see `activate_target`'s own doc for why even the
+            // click family needs that, UNCONDITIONALLY, Auto approvals
+            // included: an Interactive approval card can cover the target's
+            // real on-screen position, and an Auto approval offers no
+            // guarantee the target still holds the real OS foreground), the
+            // authoritative fresh re-resolve/re-verify, the coordinate
+            // mapping, and the click itself — runs inside ONE paced blocking
+            // closure, back-to-back with the backend call: see
+            // `pace_activate_verify_and_inject`'s own doc for why no await/
+            // queue/sleep gap may separate any of those steps from the
+            // injection. `dir` and the backend handle cross into the
+            // `'static` closure as owned values.
             let dir_owned = dir.to_string();
             let b = backend::backend();
-            on_blocking(move || {
-                // pace the
-                // ACTUAL dispatch — admission throttling alone lets calls that
-                // queued behind a slow flight-guard holder burst back-to-back
-                // once it releases. Sleep out the remaining gap FIRST, then run
-                // the final stop/lease recheck, so a kill switch tripped during
-                // the pacing sleep is still honored before the backend call.
-                computer::pace_backend_dispatch();
-                recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
-                b.click(px, py, button, count).map_err(|e| e.to_string())
-            })
-            .await??;
+            let ((px, py), w2) = pace_activate_verify_and_inject(
+                asks,
+                thread,
+                dir,
+                wt,
+                window_query,
+                &approved,
+                w,
+                window_id_out,
+                move |fresh| {
+                    let (px, py) = map_input_coord(thread, &dir_owned, wt, fresh, cx, cy)?;
+                    b.click(px, py, button, count).map_err(|e| e.to_string())?;
+                    Ok((px, py))
+                },
+            )
+            .await?;
             // A click that actually reached the OS is presumed to have
             // handed this window OS focus — see `recent_clicks`'s doc. Only
             // AFTER the backend call succeeds: a rejected/failed click never
@@ -1249,36 +1234,33 @@ async fn run_action(
             acquire_and_throttle(thread, dir, wt)?;
             // See the click-family arm above for why this guard is held
             // across the backend call itself, and why window resolution/
-            // coordinate mapping now happen AFTER it, TWICE — once before
-            // activation, once after.
+            // coordinate mapping happen AFTER it.
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir, wt).await?;
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             // preflight before activation — see the
             // click-family arm above.
             let _ = map_input_coord(thread, dir, wt, &w, cx, cy)?;
-            activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
-            // see the click-family arm above.
-            let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            let (px, py) = map_input_coord(thread, dir, wt, &w2, cx, cy)?;
-            // see the click-family arm
-            // above.
-            // final in-closure stop/lease recheck —
-            // see the click-family arm above.
+            // one paced closure for activation, the fresh resolve, mapping,
+            // and the injection — see the click-family arm above.
             let dir_owned = dir.to_string();
             let b = backend::backend();
-            on_blocking(move || {
-                // pace the
-                // ACTUAL dispatch — admission throttling alone lets calls that
-                // queued behind a slow flight-guard holder burst back-to-back
-                // once it releases. Sleep out the remaining gap FIRST, then run
-                // the final stop/lease recheck, so a kill switch tripped during
-                // the pacing sleep is still honored before the backend call.
-                computer::pace_backend_dispatch();
-                recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
-                b.move_cursor(px, py).map_err(|e| e.to_string())
-            })
-            .await??;
+            let ((px, py), w2) = pace_activate_verify_and_inject(
+                asks,
+                thread,
+                dir,
+                wt,
+                window_query,
+                &approved,
+                w,
+                window_id_out,
+                move |fresh| {
+                    let (px, py) = map_input_coord(thread, &dir_owned, wt, fresh, cx, cy)?;
+                    b.move_cursor(px, py).map_err(|e| e.to_string())?;
+                    Ok((px, py))
+                },
+            )
+            .await?;
             Ok(format!(
                 "mouse_move to ({px}, {py}) in window {} done — take a screenshot to verify",
                 w2.id
@@ -1292,39 +1274,35 @@ async fn run_action(
             acquire_and_throttle(thread, dir, wt)?;
             let _flight = computer::input_flight_guard().await;
             recheck_after_guard(db, asks, thread, dir, wt).await?;
-            // BOTH endpoints are remapped
-            // against the SAME freshly-resolved window — a drag has two
-            // coordinates, but only one window to go stale. That resolve
-            // happens TWICE, before and
-            // after activation — see the click-family arm above — and BOTH
-            // endpoints are mapped against the SECOND (post-activation) `w2`.
+            // BOTH endpoints are mapped against the SAME freshly-resolved
+            // window — a drag has two coordinates, but only one window to go
+            // stale — and that authoritative resolve happens inside the paced
+            // closure, right before the injection (see the click-family arm
+            // above).
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             // preflight BOTH endpoints before
             // activation — see the click-family arm above.
             let _ = map_input_coord(thread, dir, wt, &w, sx, sy)?;
             let _ = map_input_coord(thread, dir, wt, &w, ex, ey)?;
-            activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
-            let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            let from = map_input_coord(thread, dir, wt, &w2, sx, sy)?;
-            let to = map_input_coord(thread, dir, wt, &w2, ex, ey)?;
-            // see the click-family arm
-            // above.
-            // final in-closure stop/lease recheck —
-            // see the click-family arm above.
             let dir_owned = dir.to_string();
             let b = backend::backend();
-            on_blocking(move || {
-                // pace the
-                // ACTUAL dispatch — admission throttling alone lets calls that
-                // queued behind a slow flight-guard holder burst back-to-back
-                // once it releases. Sleep out the remaining gap FIRST, then run
-                // the final stop/lease recheck, so a kill switch tripped during
-                // the pacing sleep is still honored before the backend call.
-                computer::pace_backend_dispatch();
-                recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
-                b.drag(from, to).map_err(|e| e.to_string())
-            })
-            .await??;
+            let ((from, to), w2) = pace_activate_verify_and_inject(
+                asks,
+                thread,
+                dir,
+                wt,
+                window_query,
+                &approved,
+                w,
+                window_id_out,
+                move |fresh| {
+                    let from = map_input_coord(thread, &dir_owned, wt, fresh, sx, sy)?;
+                    let to = map_input_coord(thread, &dir_owned, wt, fresh, ex, ey)?;
+                    b.drag(from, to).map_err(|e| e.to_string())?;
+                    Ok((from, to))
+                },
+            )
+            .await?;
             Ok(format!(
                 "left_click_drag from ({}, {}) to ({}, {}) in window {} done — take a screenshot to verify",
                 from.0, from.1, to.0, to.1, w2.id
@@ -1342,28 +1320,26 @@ async fn run_action(
             // preflight before activation — see the
             // click-family arm above.
             let _ = map_input_coord(thread, dir, wt, &w, cx, cy)?;
-            activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
-            // see the click-family arm above.
-            let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            let (px, py) = map_input_coord(thread, dir, wt, &w2, cx, cy)?;
-            // see the click-family arm
-            // above.
-            // final in-closure stop/lease recheck —
-            // see the click-family arm above.
+            // one paced closure for activation, the fresh resolve, mapping,
+            // and the injection — see the click-family arm above.
             let dir_owned = dir.to_string();
             let b = backend::backend();
-            on_blocking(move || {
-                // pace the
-                // ACTUAL dispatch — admission throttling alone lets calls that
-                // queued behind a slow flight-guard holder burst back-to-back
-                // once it releases. Sleep out the remaining gap FIRST, then run
-                // the final stop/lease recheck, so a kill switch tripped during
-                // the pacing sleep is still honored before the backend call.
-                computer::pace_backend_dispatch();
-                recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
-                b.scroll(px, py, dx, dy).map_err(|e| e.to_string())
-            })
-            .await??;
+            let ((px, py), w2) = pace_activate_verify_and_inject(
+                asks,
+                thread,
+                dir,
+                wt,
+                window_query,
+                &approved,
+                w,
+                window_id_out,
+                move |fresh| {
+                    let (px, py) = map_input_coord(thread, &dir_owned, wt, fresh, cx, cy)?;
+                    b.scroll(px, py, dx, dy).map_err(|e| e.to_string())?;
+                    Ok((px, py))
+                },
+            )
+            .await?;
             Ok(format!(
                 "scroll at ({px}, {py}) dx={dx} dy={dy} in window {} done — take a screenshot to verify",
                 w2.id
@@ -1397,35 +1373,31 @@ async fn run_action(
             // the target application. Advisory only; the AUTHORITATIVE check
             // against the post-activation `w2` below is unchanged.
             require_recent_focus(thread, dir, wt, &w)?;
-            activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
-            // re-resolve/re-verify AFTER
-            // activation, same as every other input arm — and check focus-
-            // freshness against THIS fresh id (`w2.id`), not the
-            // pre-activation one: the window `require_recent_focus` guards
-            // is the SAME one about to receive the keystrokes.
-            let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            require_recent_focus(thread, dir, wt, &w2)?;
             let char_count = text.chars().count();
+            // `text_owned` crosses into the blocking closure since `text`
+            // itself is borrowed from `args`, not `'static`. The
+            // AUTHORITATIVE focus-freshness check runs inside the paced
+            // closure against the fresh post-activation resolve — the window
+            // it guards is the SAME one about to receive the keystrokes —
+            // right before the injection (see the click-family arm above).
             let text_owned = text.to_string();
-            // see the click-family arm
-            // above — `text_owned` crosses into the blocking closure since
-            // `text` itself is borrowed from `args`, not `'static`.
-            // final in-closure stop/lease recheck —
-            // see the click-family arm above.
             let dir_owned = dir.to_string();
             let b = backend::backend();
-            on_blocking(move || {
-                // pace the
-                // ACTUAL dispatch — admission throttling alone lets calls that
-                // queued behind a slow flight-guard holder burst back-to-back
-                // once it releases. Sleep out the remaining gap FIRST, then run
-                // the final stop/lease recheck, so a kill switch tripped during
-                // the pacing sleep is still honored before the backend call.
-                computer::pace_backend_dispatch();
-                recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
-                b.type_text(&text_owned).map_err(|e| e.to_string())
-            })
-            .await??;
+            let (_, w2) = pace_activate_verify_and_inject(
+                asks,
+                thread,
+                dir,
+                wt,
+                window_query,
+                &approved,
+                w,
+                window_id_out,
+                move |fresh| {
+                    require_recent_focus(thread, &dir_owned, wt, fresh)?;
+                    b.type_text(&text_owned).map_err(|e| e.to_string())
+                },
+            )
+            .await?;
             Ok(format!(
                 "typed {char_count} char(s) in window {} done — take a screenshot to verify",
                 w2.id
@@ -1461,29 +1433,27 @@ async fn run_action(
             // preflight the focus prerequisite before
             // activation — see the "type" arm above.
             require_recent_focus(thread, dir, wt, &w)?;
-            activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
-            // see the "type" arm above.
-            let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            require_recent_focus(thread, dir, wt, &w2)?;
             let combo_owned = combo.to_string();
-            // see the click-family arm
-            // above.
-            // final in-closure stop/lease recheck —
-            // see the click-family arm above.
+            // one paced closure for activation, the fresh resolve, the
+            // authoritative focus check, and the injection — see the "type"
+            // arm above.
             let dir_owned = dir.to_string();
             let b = backend::backend();
-            on_blocking(move || {
-                // pace the
-                // ACTUAL dispatch — admission throttling alone lets calls that
-                // queued behind a slow flight-guard holder burst back-to-back
-                // once it releases. Sleep out the remaining gap FIRST, then run
-                // the final stop/lease recheck, so a kill switch tripped during
-                // the pacing sleep is still honored before the backend call.
-                computer::pace_backend_dispatch();
-                recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
-                b.key(&combo_owned).map_err(|e| e.to_string())
-            })
-            .await??;
+            let (_, w2) = pace_activate_verify_and_inject(
+                asks,
+                thread,
+                dir,
+                wt,
+                window_query,
+                &approved,
+                w,
+                window_id_out,
+                move |fresh| {
+                    require_recent_focus(thread, &dir_owned, wt, fresh)?;
+                    b.key(&combo_owned).map_err(|e| e.to_string())
+                },
+            )
+            .await?;
             Ok(format!(
                 "key {combo} in window {} done — take a screenshot to verify",
                 w2.id
@@ -2088,7 +2058,7 @@ impl From<computer::WindowInfo> for ApprovedWindow {
 
 /// the execution-time check every input arm of
 /// [`run_action`] runs right after its OWN fresh `resolve_window` (and right
-/// BEFORE `activate_and_recheck`/the actual backend injection) — the target
+/// BEFORE target activation/the actual backend injection) — the target
 /// this call is about to drive must be BYTE-FOR-BYTE the same window
 /// [`approve`] itself bound at authorization time (`id`+`app`+`title` all
 /// three — see [`ApprovedWindow`]'s own doc for why `id` alone isn't
@@ -2120,22 +2090,25 @@ fn verify_approved_target(
 /// the very next [`verify_approved_target`] check fails, so the audit log
 /// still names which window was TARGETED, not only ones that actually
 /// received input — then verify it against `approved`. Every input arm of
-/// [`run_action`] calls this TWICE now: once before [`activate_and_recheck`]
-/// (purely to get an id to activate, plus an early identity check), and
-/// again immediately after it returns.
+/// [`run_action`] resolves TWICE: once BEFORE the paced dispatch closure
+/// (via [`resolve_and_verify_target_blocking`] — purely to get a target to
+/// activate, plus an early fail-fast identity check and the arm's advisory
+/// preflight), and again INSIDE
+/// [`pace_activate_verify_and_inject`]'s closure, immediately after
+/// activation and immediately before the backend call.
 ///
-/// Why twice: `activate_target` (inside `activate_and_recheck`) shells out to
-/// a potentially slow, blocking OS call (`osascript`/`wmctrl`/`xdotool
-/// --sync`) — the window can move, resize, close, or have its id reused by an
-/// entirely unrelated window WHILE that call is in flight. A coordinate
-/// mapped, or a focus-freshness check made, against the PRE-activation
+/// Why twice: the pacing sleep and `activate_target` (a potentially slow,
+/// blocking OS shell-out — `osascript`/`wmctrl`/`xdotool --sync`) both take
+/// real wall-clock time — the window can move, resize, close, or have its
+/// id reused by an entirely unrelated window WHILE they run. A coordinate
+/// mapped, or a focus-freshness check made, against the PRE-pacing
 /// resolve could then land outside the window that's actually there once
 /// activation finishes, or silently target a replacement window that reused
 /// the same id — with no re-check that it's still the one `approve` bound at
-/// authorization time. The SECOND call's `WindowInfo` is what every arm
-/// actually maps coordinates against / checks focus-freshness against /
-/// injects into; the first call exists only to obtain an id for activation
-/// and an early fail-fast identity check.
+/// authorization time. The SECOND (in-closure) call's `WindowInfo` is what
+/// every arm actually maps coordinates against / checks focus-freshness
+/// against / injects into; the first call exists only to obtain a target
+/// for activation and an early fail-fast identity check.
 fn resolve_and_verify_target(
     window_query: &str,
     approved: &Option<ApprovedWindow>,
@@ -2149,10 +2122,13 @@ fn resolve_and_verify_target(
 
 /// the on-blocking-pool wrapper every
 /// input arm of [`run_action`] calls (instead of [`resolve_and_verify_
-/// target`] directly) both times it resolves a target window — window
+/// target`] directly) for its PRE-pacing resolve — window
 /// enumeration (`computer::resolve_window`, inside the wrapped call) is a
 /// synchronous OS call that must not run straight on the async worker (see
-/// [`on_blocking`]'s own doc for why). [`resolve_and_verify_target`] itself
+/// [`on_blocking`]'s own doc for why); the AUTHORITATIVE second resolve
+/// happens inside [`pace_activate_verify_and_inject`]'s own blocking
+/// closure, which calls the sync fn directly since it is already on the
+/// blocking pool. [`resolve_and_verify_target`] itself
 /// takes `window_id_out` as `&mut Option<u32>` — a reference into the
 /// CALLER's own stack frame, which can't cross into a `'static` blocking
 /// closure — so this runs it against a throwaway LOCAL `Option<u32>` inside
@@ -2561,16 +2537,16 @@ fn require_recent_focus(
 /// click family, `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`
 /// (replacing the click-replay
 /// hack — see the focus-freshness section's own doc comment above for why
-/// that hack was unsafe and insufficient). Called via [`activate_and_recheck`]
-/// — NOT this function directly — from every input arm of [`run_action`]:
-/// AFTER the FIRST [`recheck_after_guard`] (right after acquiring
-/// `input_flight_guard`) and the arm's own fresh window resolution,
-/// and immediately followed by a SECOND
-/// `recheck_after_guard` call before the action-specific backend call
-/// itself — see [`activate_and_recheck`]'s own doc for why THIS call, being
-/// a potentially slow, blocking OS call (`osascript`/`wmctrl`/`xdotool`),
-/// needed its own dedicated recheck rather than trusting the one already
-/// taken before it started.
+/// that hack was unsafe and insufficient). Called via
+/// [`pace_activate_verify_and_inject`] — NOT this function directly — from
+/// every input arm of [`run_action`]: inside the paced dispatch closure,
+/// AFTER the pacing sleep and its stop/lease recheck, and immediately
+/// followed by the post-activation recheck + the authoritative fresh
+/// resolve before the action-specific backend call itself — see that
+/// function's own doc for why THIS call, being a potentially slow, blocking
+/// OS call (`osascript`/`wmctrl`/`xdotool`), needs its own dedicated
+/// recheck after it rather than trusting the one already taken before it
+/// started.
 ///
 /// An earlier shape ran this ONLY for an Interactive approval (a card that
 /// actually rendered, so a human clicking Weft's own UI to answer it just
@@ -2611,8 +2587,8 @@ fn require_recent_focus(
 /// like [`require_recent_focus`]'s own doc says about the freshness
 /// heuristic it complements. This residual is scoped to third-party focus
 /// theft specifically — a human hitting Stop DURING this call is a
-/// DIFFERENT, now-closed hazard: see [`activate_and_recheck`]'s own doc for
-/// the second `recheck_after_guard` that closes it.
+/// DIFFERENT, now-closed hazard: see [`pace_activate_verify_and_inject`]'s
+/// own doc for the post-activation recheck that closes it.
 fn activate_target(target: &computer::WindowInfo) -> Result<(), String> {
     // the FULL verified
     // identity crosses this boundary now, not the bare id — the backend
@@ -2913,8 +2889,10 @@ fn window_arg(args: &Value) -> String {
 /// checks — they depend on the live desktop's current state, which can have
 /// changed while this call sat queued on `input_flight_guard` behind another
 /// session's in-flight action. Those now run AFTER `input_flight_guard`/the
-/// first [`recheck_after_guard`] instead, immediately followed by
-/// [`activate_and_recheck`] — see that function's own doc, and each input
+/// first [`recheck_after_guard`] instead — an advisory preflight against a
+/// pre-pacing resolve, then authoritatively inside
+/// [`pace_activate_verify_and_inject`]'s paced dispatch closure — see that
+/// function's own doc, and each input
 /// arm of `run_action`, for the full ordering this section now describes.
 ///
 /// Both halves run AFTER [`approve`] in [`run_action`]'s dispatch, never
@@ -2988,13 +2966,14 @@ fn acquire_and_throttle(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), S
     Ok(())
 }
 
-/// A gate every input branch of [`run_action`] clears TWICE now
-/// : once immediately after acquiring
+/// A gate every input branch of [`run_action`] clears
+/// immediately after acquiring
 /// `computer::input_flight_guard()` (before that branch's own fresh window
-/// resolution/coordinate mapping/focus check), and again via
-/// [`activate_and_recheck`] right after `activate_target` — see that
-/// function's own doc for why a second call is needed on top of the first.
-/// Either call re-verifies the kill switch AND that the control lease this
+/// resolution/coordinate mapping/focus check); its sync-checkable concerns
+/// are re-run inside [`pace_activate_verify_and_inject`]'s paced closure
+/// right after `activate_target` — see that
+/// function's own doc for why a second pass is needed on top of the first.
+/// Either pass re-verifies the kill switch AND that the control lease this
 /// call took in [`acquire_and_throttle`] is STILL held by THIS EXACT
 /// `(thread, dir)`.
 ///
@@ -3090,27 +3069,27 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
     }
 }
 
-/// the FINAL, purely
-/// SYNCHRONOUS kill-switch + control-lease recheck, run INSIDE an input arm's
-/// [`on_blocking`] closure — on the very blocking-pool thread that is about to
-/// call the OS injection backend, as its first statement immediately before
-/// the backend call.
+/// the purely SYNCHRONOUS kill-switch + control-lease recheck, run INSIDE
+/// [`pace_activate_verify_and_inject`]'s paced dispatch closure — on the
+/// very blocking-pool thread that is about to call the OS injection backend
+/// — at two points: right after the pacing sleep (before the activation
+/// side effect), and again right after the authoritative in-closure resolve
+/// (immediately before the backend call).
 ///
-/// Every input arm already clears [`recheck_after_guard`] twice (after the
-/// flight guard, and again inside [`activate_and_recheck`] right after
-/// activation). But BOTH of those run BEFORE this arm's final
-/// `resolve_and_verify_target_blocking` — itself an awaited OS enumeration
-/// scheduled onto the blocking pool — and before the injection closure below
-/// waits its own turn for a blocking-pool thread. A human hitting Emergency
+/// Every input arm already clears [`recheck_after_guard`] once, after the
+/// flight guard. But that runs BEFORE the arm's pre-pacing
+/// `resolve_and_verify_target_blocking` — an awaited OS enumeration
+/// scheduled onto the blocking pool — before the dispatch closure waits its
+/// own turn for a blocking-pool thread, and before the pacing sleep and the
+/// in-closure activation/resolve themselves. A human hitting Emergency
 /// Stop (which trips [`computer::stop_latched`]) or global Escape (which
-/// clears the control lease) DURING that final resolve, or while the
-/// injection closure sits queued for a blocking thread, would otherwise go
+/// clears the control lease) DURING any of those, would otherwise go
 /// unseen and the click/type/key would still reach their real desktop AFTER
 /// the kill switch fired. Reading the stop latch and the control-lease holder
 /// are both lock-only, no `.await`/no db, so this can run at the last possible
 /// instant on the same thread as the backend call, closing that residual gap
-/// completely. Callers `?` this at the head of the closure and never fall
-/// through to the backend call on an `Err`.
+/// completely. Callers `?` this and never fall
+/// through to activation/the backend call on an `Err`.
 fn recheck_stop_and_lease_before_backend(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), String> {
     if computer::stop_latched() {
         return Err(ComputerError::Disabled.to_string());
@@ -3146,62 +3125,117 @@ fn recheck_stop_and_lease_before_backend(thread: i32, dir: &str, wt: Option<i32>
     }
 }
 
-/// The shared "reactivate, then recheck the kill switch/lease a SECOND
-/// time" tail every input branch of [`run_action`] runs, immediately after
-/// its own branch-specific fresh window resolution (and, for the mouse
-/// family, coordinate remap / for `type`/`key`, focus-freshness check) and
-/// right before the actual backend call.
+/// The shared post-queue tail every input arm of [`run_action`] dispatches
+/// through: ONE blocking closure that paces, re-guards, RECLAIMS the
+/// approved target, re-resolves/re-verifies it fresh, and only then runs the
+/// arm's own `tail` (coordinate mapping / focus-freshness check plus the
+/// actual backend injection) — all back-to-back on the SAME blocking-pool
+/// thread, with no await point, queue wait, or sleep between any of those
+/// steps and the backend call.
 ///
-/// `activate_target` shells out to a blocking OS call (`osascript`/
-/// `wmctrl`/`xdotool` — see its own doc) that can itself take a real amount
-/// of wall-clock time. The FIRST `recheck_after_guard`, right after
-/// acquiring `input_flight_guard`, only proves the kill switch/lease were
-/// still fine at the INSTANT the guard was acquired — a human hitting Stop
-/// DURING the activation call that follows would otherwise go unnoticed,
-/// and the backend call right after `activate_target` returns would inject
-/// input anyway even though the lease is gone and the latch is tripped.
-/// This re-runs the identical check one more time, right after activation
-/// returns, so a Stop that lands mid-activation is still honored before the
-/// backend ever sees the injection — the caller must `?` this and never
-/// fall through to its own backend call on an `Err` here.
+/// Why one closure: the pacing sleep (`computer::pace_backend_dispatch`)
+/// and the blocking-pool queue wait are both real wall-clock gaps. When
+/// activation, the authoritative resolve, and the coordinate mapping ran
+/// BEFORE them, the target could move, close, lose the foreground, or be
+/// replaced (its id reused) DURING those gaps — and the backend call would
+/// still inject at the stale coordinates, or into whatever now owns them,
+/// with only a stop/lease recheck (which never looks at the TARGET) in
+/// between. Running the whole target-facing sequence AFTER the pacing sleep
+/// closes that: what gets activated/verified/mapped is the desktop as it is
+/// immediately before injection, not as it was before the sleep. No extra
+/// concurrency cap is needed for the OS work in here: `input_flight_guard`,
+/// held by every calling arm across this entire call, already serializes
+/// the process to one in-flight input action at a time.
 ///
-/// `activate_target` — the blocking
-/// shell-out this function's own doc above describes — now runs via
-/// [`on_blocking`] rather than directly on the async worker (see that
-/// helper's own doc for why: a slow/wedged activation call must never risk
-/// starving the Stop/Escape kill switch's own scheduling). `recheck_after_
-/// guard` stays a plain `.await` on the runtime, unchanged — it only touches
-/// `db`/in-memory registries, nothing OS-facing.
-async fn activate_and_recheck(
-    db: &Db,
+/// In-closure order, each step fail-closed (`?`):
+///  1. `computer::pace_backend_dispatch()` — sleep out the pacing gap
+///     FIRST, so everything below sees the post-sleep world.
+///  2. [`recheck_stop_and_lease_before_backend`] — a kill switch tripped
+///     during the sleep (or the queue wait before it) is honored before the
+///     activation SIDE EFFECT below, not merely before the injection.
+///  3. [`activate_target`] on `activation_target` (the arm's pre-pacing
+///     resolve) — reclaim the foreground for the target. Activation itself
+///     re-verifies the full identity against the live desktop (see its
+///     doc), so a target replaced during the sleep fails closed here rather
+///     than raising the replacement.
+///  4. The post-activation recheck — activation is a slow OS shell-out a
+///     Stop can land during, so this mirrors [`recheck_after_guard`]'s
+///     sync-checkable concerns: `asks.has_open` (a brand-new card opened
+///     meanwhile suspends this injection rather than being clicked
+///     through), then [`computer::renew_lease_after_queue`] (stop latch +
+///     doomed/foreign/expired holder, renewing a still-rightful holder
+///     whose lease lapsed during the wait, exactly like the post-
+///     flight-guard checkpoint). The `enabled`-flag and route-revocation
+///     halves of `recheck_after_guard` are async (db reads) and cannot run
+///     on this thread — deliberately fine: every disable path trips the
+///     stop latch and every route-teardown path clears the lease (see
+///     [`recheck_stop_and_lease_before_backend`]'s own doc), so the two
+///     sync checks here already fail closed for both.
+///  5. [`resolve_and_verify_target`] — the AUTHORITATIVE fresh resolve the
+///     arm's `tail` maps/checks against, recorded into `window_id_out`
+///     (even on a verify failure, so the audit line still names the window
+///     that was targeted) and verified byte-for-byte against `approved`.
+///  6. [`recheck_stop_and_lease_before_backend`] once more — the resolve
+///     above is itself an OS enumeration; this keeps the final stop/lease
+///     read at the last possible instant before the backend call.
+///  7. `tail(&fresh)` — the arm's own coordinate mapping (pure in-memory
+///     lookups) or focus-freshness check, then the backend injection,
+///     against the fresh resolve ONLY — never the pre-pacing snapshot.
+///
+/// Returns the tail's value together with the fresh [`computer::WindowInfo`]
+/// it ran against, so arms can name the actually-injected window in their
+/// result text (and the click family can seed focus-freshness for it).
+async fn pace_activate_verify_and_inject<T: Send + 'static>(
     asks: &AskRegistry,
     thread: i32,
     dir: &str,
     wt: Option<i32>,
-    target: &computer::WindowInfo,
-) -> Result<(), String> {
-    // run the SAME
-    // synchronous latch/lease recheck the final injection closures run,
-    // INSIDE this closure, immediately before the activation call. Activation
-    // is itself a desktop-control side effect — it raises and FOCUSES the
-    // target application — and the only checks before it (the caller's
-    // `recheck_after_guard` after acquiring `input_flight_guard`) ran before
-    // this closure was scheduled: an Emergency Stop, route deletion (which
-    // clears the lease), or lease expiry landing while the
-    // preceding resolution or THIS closure sat queued on the blocking pool
-    // would otherwise still let a stopped/deleted session steal foreground
-    // focus, with only the LATER post-activation recheck stopping the
-    // click/type that follows. `recheck_stop_and_lease_before_backend` is
-    // lock-only/synchronous, so it runs at the last instant on the same
-    // thread as the activation call itself.
+    window_query: &str,
+    approved: &Option<ApprovedWindow>,
+    activation_target: computer::WindowInfo,
+    window_id_out: &mut Option<u32>,
+    tail: impl FnOnce(&computer::WindowInfo) -> Result<T, String> + Send + 'static,
+) -> Result<(T, computer::WindowInfo), String> {
+    let asks = asks.clone();
     let dir_owned = dir.to_string();
-    let target_owned = target.clone();
-    on_blocking(move || {
-        recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
-        activate_target(&target_owned)
+    let window_query = window_query.to_string();
+    let approved = approved.clone();
+    // `window_id_out` is a reference into the caller's stack frame, which
+    // can't cross into a `'static` closure — same local-then-write-back
+    // shape as `resolve_and_verify_target_blocking`, preserving the
+    // "record the id even when verification fails" semantics.
+    let (id, result) = on_blocking(move || {
+        computer::pace_backend_dispatch();
+        let mut id = None;
+        let result = (|| {
+            recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
+            activate_target(&activation_target)?;
+            if asks.has_open(thread, &dir_owned) {
+                return Err(ComputerError::SuspendedPendingAsk.to_string());
+            }
+            match computer::renew_lease_after_queue(thread, &dir_owned, wt) {
+                computer::LeaseCheckOutcome::Authorized => {}
+                computer::LeaseCheckOutcome::Busy { thread, dir } => {
+                    return Err(ComputerError::Busy { thread, dir }.to_string());
+                }
+                computer::LeaseCheckOutcome::Lost => {
+                    return Err(
+                        "the control lease was lost during target activation (it may have \
+                         expired, or been cleared by a kill switch) — retry"
+                            .to_string(),
+                    );
+                }
+            }
+            let fresh = resolve_and_verify_target(&window_query, &approved, &mut id)?;
+            recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
+            let out = tail(&fresh)?;
+            Ok((out, fresh))
+        })();
+        (id, result)
     })
-    .await??;
-    recheck_after_guard(db, asks, thread, dir, wt).await
+    .await?;
+    *window_id_out = id;
+    result
 }
 
 /// `arr[0]`/`arr[1]` must each fit `u32` — this
@@ -3846,22 +3880,56 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
     // even an instant under a permissive `WEFT_HOME` inherited ACL that
     // would expose window titles/actions/coordinates/outcomes to other
     // local accounts, and there is no post-create stamp another account's
-    // pre-held handle could survive. An already-existing file keeps the ACL
-    // its own creation (through this same primitive) stamped. Fail-CLOSED:
-    // when the owner-only creation fails, this one line goes unlogged
-    // (the caller's best-effort contract) rather than writing through a
-    // permissive ACL.
+    // pre-held handle could survive. But `OPEN_ALWAYS` only stamps that
+    // DACL when it actually CREATES — a file already sitting at this path
+    // (one created before this primitive existed, or by anything else)
+    // keeps whatever ACL it has, so every open VALIDATES the live DACL of
+    // the handle it got (`file_dacl_is_owner_only`): a file this primitive
+    // created passes trivially; a permissive pre-existing one is set aside
+    // to a `.insecure` sibling (its bytes were already exposed — preserved
+    // for inspection, never appended to again) and the path is re-created
+    // owner-only, re-validated once. Fail-CLOSED at every step: an
+    // unverifiable DACL, a failed set-aside (the permissive file still
+    // occupies the path), or a still-not-owner-only recreation (something
+    // raced a new file in) all leave this line unlogged (the caller's
+    // best-effort contract) rather than writing through a permissive ACL.
     #[cfg(windows)]
     {
-        return match crate::bus::inject::create_file_owner_only(
-            path,
-            crate::bus::inject::OwnerOnlyCreate::AppendOrCreate,
-        ) {
-            Some(file) => Ok(tokio::fs::File::from_std(file)),
-            None => Err(std::io::Error::other(
-                "audit file owner-only creation failed — refusing to write through a permissive ACL",
-            )),
+        use crate::bus::inject::{
+            create_file_owner_only, file_dacl_is_owner_only, set_aside_insecure, OwnerOnlyCreate,
         };
+        let deny = || {
+            Err(std::io::Error::other(
+                "audit file owner-only open failed — refusing to write through a permissive ACL",
+            ))
+        };
+        let Some(file) = create_file_owner_only(path, OwnerOnlyCreate::AppendOrCreate) else {
+            return deny();
+        };
+        let verdict = file_dacl_is_owner_only(&file);
+        if verdict == Some(true) {
+            return Ok(tokio::fs::File::from_std(file));
+        }
+        // `None` (couldn't judge) fails closed WITHOUT setting the file
+        // aside — rotating on an unproven verdict could churn a perfectly
+        // good audit file to the sidecar on every append.
+        if verdict.is_none() {
+            return deny();
+        }
+        // Proven permissive: close our handle first (the move needs the
+        // path free of this process's own open handle), set the file
+        // aside, re-create owner-only, and re-validate the result once.
+        drop(file);
+        if !set_aside_insecure(path) {
+            return deny();
+        }
+        let Some(file) = create_file_owner_only(path, OwnerOnlyCreate::AppendOrCreate) else {
+            return deny();
+        };
+        if file_dacl_is_owner_only(&file) == Some(true) {
+            return Ok(tokio::fs::File::from_std(file));
+        }
+        return deny();
     }
     #[cfg(not(windows))]
     {
@@ -5716,9 +5784,9 @@ mod tests {
 
     /// `activate_target` shells out to a
     /// (potentially slow, blocking) OS call. A Stop that lands WHILE that
-    /// call is running must still be honored: the SECOND
-    /// `recheck_after_guard` (run via `activate_and_recheck`, right after
-    /// activation) must reject, and the backend must NEVER receive the
+    /// call is running must still be honored: the post-activation recheck
+    /// (inside `pace_activate_verify_and_inject`'s paced closure, right
+    /// after activation) must reject, and the backend must NEVER receive the
     /// `type_text` call. Reproduced deterministically via
     /// `MockBackend::on_activate`, which runs synchronously from INSIDE the
     /// mock's own `activate_window` — standing in for "a human's Stop
@@ -9056,11 +9124,12 @@ mod tests {
         *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
-    /// `activate_and_
-    /// recheck` re-runs the synchronous stop/lease recheck INSIDE its blocking
-    /// closure, immediately before the activation call — a Stop that lands
-    /// while the closure sits queued must prevent the target window from ever
-    /// being raised/focused, not merely the click/type that would follow.
+    /// `pace_activate_verify_and_inject` re-runs the synchronous stop/lease
+    /// recheck INSIDE its paced closure, immediately before the activation
+    /// call — a Stop that lands while the closure sits queued (or during the
+    /// pacing sleep) must prevent the target window from ever being
+    /// raised/focused, not merely the click/type that would follow — and its
+    /// `tail` (the arm's mapping + backend injection) must never run either.
     #[tokio::test]
     async fn activation_fails_closed_after_stop_without_raising_the_target_window() {
         let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -9069,7 +9138,6 @@ mod tests {
         *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
         mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
         computer::clear_emergency_stop(computer::stop_generation());
-        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let asks = AskRegistry::new();
 
         computer::trip_stop_latch();
@@ -9082,13 +9150,33 @@ mod tests {
             width: 800,
             height: 600,
         };
-        let err = activate_and_recheck(&db, &asks, 904_502, "lead", None, &target)
-            .await
-            .expect_err("a tripped stop latch must fail activation closed");
+        let mut window_id_out = None;
+        let tail_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tail_flag = tail_ran.clone();
+        let err = pace_activate_verify_and_inject(
+            &asks,
+            904_502,
+            "lead",
+            None,
+            "notes",
+            &None,
+            target,
+            &mut window_id_out,
+            move |_| {
+                tail_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a tripped stop latch must fail activation closed");
         assert!(err.contains("disabled"), "expected the disabled rejection, got: {err}");
         assert!(
             mock.actions.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "the closure must refuse BEFORE activate_window raises/focuses anything"
+        );
+        assert!(
+            !tail_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the injection tail must never run once the stop latch is tripped"
         );
 
         computer::clear_emergency_stop(computer::stop_generation());

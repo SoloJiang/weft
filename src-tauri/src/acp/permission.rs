@@ -195,17 +195,22 @@ fn is_gui_tool_call(tc: &Value) -> bool {
 /// `weft_computer` call rejected by the native-GUI gate before weft's own
 /// server-side permission chain ever saw it.
 ///
-/// Recognized STRICTLY by the two server-qualified tool-name forms this repo
-/// can vouch for — claude-style `mcp__weft_computer__computer` (unambiguous
-/// `__` delimiters) and the one vouched flattened literal
-/// `weft_computer_computer` — mirroring `bus::server::split_internal_tool`'s
-/// exact rule AND its documented limitation: an agent whose MCP tool naming
-/// differs (unconfirmed for omp today, exactly like codex there) is NOT
-/// matched, so its computer calls keep the fail-closed native rejection until
-/// the real shape is confirmed on a live transcript and added here. That
-/// asymmetry is deliberate: an unrecognized form breaks the feature LOUDLY (a
-/// rejected call the agent reports), while a guessed form could quietly
-/// wave through something that isn't the weft server at all.
+/// Recognized STRICTLY by the ONE provenance-bearing tool-name form this
+/// repo can vouch for — claude-style `mcp__weft_computer__computer`, whose
+/// `__` delimiters make the (server, tool) split unambiguous — mirroring
+/// `bus::server::split_internal_tool`'s exact rule. The FLATTENED literal
+/// `weft_computer_computer` is deliberately NOT matched: a repository or
+/// plugin can expose a foreign tool (server `weft`, tool
+/// `computer_computer`) whose flattened title is the identical string, and
+/// that tool never reaches weft's server-side gate — classifying it as
+/// `WeftComputerMcp` would auto-allow repo-controlled behavior outside every
+/// lease/Stop/approval check. An agent runtime that reports only flattened
+/// titles therefore keeps the fail-closed native rejection for computer
+/// calls (unconfirmed shapes like codex's are in the same boat) until a
+/// provenance-bearing signal exists. That asymmetry is deliberate: an
+/// unrecognized form breaks the feature LOUDLY (a rejected call the agent
+/// reports), while an ambiguous form could quietly wave through something
+/// that isn't the weft server at all.
 ///
 /// Trust note: the title is authored by the agent RUNTIME describing its own
 /// tool call (the model picks tools/arguments; it does not name them), which
@@ -217,7 +222,7 @@ fn is_gui_tool_call(tc: &Value) -> bool {
 fn is_weft_computer_mcp_call(tc: &Value) -> bool {
     matches!(
         tc.get("title").and_then(|t| t.as_str()),
-        Some("mcp__weft_computer__computer") | Some("weft_computer_computer")
+        Some("mcp__weft_computer__computer")
     )
 }
 
@@ -981,7 +986,7 @@ mod tests {
     /// instead of being rejected before weft's own server ever sees the call.
     #[test]
     fn a_weft_computer_mcp_titled_call_classifies_as_mcp_not_gui() {
-        for title in ["mcp__weft_computer__computer", "weft_computer_computer"] {
+        for title in ["mcp__weft_computer__computer"] {
             let params = json!({
                 "toolCall": {
                     "title": title,
@@ -1027,11 +1032,18 @@ mod tests {
     }
 
     /// Exact-name recognition only — near-miss titles (another server whose
-    /// name embeds `weft_computer`, or a bare `weft_computer`) keep the
-    /// fail-closed native-GUI rejection their `rawInput.action` earns them.
+    /// name embeds `weft_computer`, a bare `weft_computer`) AND the ambiguous
+    /// flattened literal (spoofable by a foreign server `weft` + tool
+    /// `computer_computer`) keep the fail-closed native-GUI rejection their
+    /// `rawInput.action` earns them.
     #[test]
     fn a_near_miss_weft_computer_title_stays_native_gui() {
-        for title in ["weft_computer", "mcp__weft_computer2__computer", "my_weft_computer_computer"] {
+        for title in [
+            "weft_computer",
+            "mcp__weft_computer2__computer",
+            "my_weft_computer_computer",
+            "weft_computer_computer",
+        ] {
             let params = json!({
                 "toolCall": {
                     "title": title,

@@ -832,6 +832,47 @@ fn windows_replace_existing(from: &Path, to: &Path) -> bool {
     }
 }
 
+/// The current process user's raw `TOKEN_USER` buffer — the shared SID
+/// source for [`owner_only_dacl`] (which grants to this SID) and
+/// [`file_dacl_is_owner_only`] (which compares against it). The SID inside
+/// points INTO the returned Vec, so the Vec must stay alive for as long as
+/// the SID pointer is used. `None` on ANY failure.
+#[cfg(windows)]
+fn current_user_token_buf() -> Option<Vec<u8>> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // SAFETY: the token handle is closed on every path; the two-call idiom
+    // first sizes the TOKEN_USER buffer, then fills it.
+    unsafe {
+        let mut token = HANDLE(core::ptr::null_mut());
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return None;
+        }
+        let mut needed: u32 = 0;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        if needed == 0 {
+            let _ = CloseHandle(token);
+            return None;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let filled = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            needed,
+            &mut needed,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        if !filled {
+            return None;
+        }
+        Some(buf)
+    }
+}
+
 /// Build a DACL granting full control to ONLY the current process user's
 /// SID — the shared core of [`create_file_owner_only`]. The returned ACL is
 /// self-contained (`SetEntriesInAclW` copies the SID into it) and MUST be
@@ -839,41 +880,16 @@ fn windows_replace_existing(from: &Path, to: &Path) -> bool {
 #[cfg(windows)]
 unsafe fn owner_only_dacl() -> Option<*mut windows::Win32::Security::ACL> {
     use windows::core::PWSTR;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::Authorization::{
         SetEntriesInAclW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS, TRUSTEE_IS_SID,
         TRUSTEE_IS_USER, TRUSTEE_W,
     };
-    use windows::Win32::Security::{GetTokenInformation, TokenUser, ACE_FLAGS, ACL, PSID, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::Security::{ACE_FLAGS, ACL, PSID, TOKEN_USER};
     use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    let mut token = HANDLE(core::ptr::null_mut());
-    if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
-        return None;
-    }
-    // Two-call idiom: first sizes the TOKEN_USER buffer, then fills it.
-    let mut needed: u32 = 0;
-    let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
-    if needed == 0 {
-        let _ = CloseHandle(token);
-        return None;
-    }
-    let mut buf = vec![0u8; needed as usize];
-    let filled = GetTokenInformation(
-        token,
-        TokenUser,
-        Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
-        needed,
-        &mut needed,
-    )
-    .is_ok();
-    let _ = CloseHandle(token);
-    if !filled {
-        return None;
-    }
     // The SID points INTO `buf`, which must stay alive until after
     // `SetEntriesInAclW` copies it into the new ACL below.
+    let buf = current_user_token_buf()?;
     let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
     let sid: PSID = token_user.User.Sid;
     if sid.0.is_null() {
@@ -911,8 +927,11 @@ pub(crate) enum OwnerOnlyCreate {
     /// Fail if the path already exists — the secret-config temp and the
     /// screenshot writers, mirroring unix `create_new`.
     CreateNew,
-    /// Append, creating if absent — the audit log. An already-existing file
-    /// keeps the ACL its OWN creation (through this same primitive) stamped.
+    /// Append, creating if absent — the audit log. `OPEN_ALWAYS` only stamps
+    /// the creation DACL when it actually CREATES: an already-existing file
+    /// keeps whatever ACL it has, which is why that caller validates the
+    /// opened handle with [`file_dacl_is_owner_only`] and sets a permissive
+    /// pre-existing file aside instead of appending through it.
     AppendOrCreate,
 }
 
@@ -940,13 +959,14 @@ pub(crate) fn create_file_owner_only(path: &Path, mode: OwnerOnlyCreate) -> Opti
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{GENERIC_WRITE, LocalFree, HLOCAL};
     use windows::Win32::Security::{
-        InitializeSecurityDescriptor, SetSecurityDescriptorDacl, ACL, PSECURITY_DESCRIPTOR,
-        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_REVISION,
+        InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+        ACL, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, CREATE_NEW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE,
         FILE_SHARE_READ, OPEN_ALWAYS,
     };
+    use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 
     // SAFETY: every pointer below is a stack local (or the `LocalFree`-owned
     // ACL) kept alive for the duration of the call that reads it; the ACL is
@@ -960,8 +980,15 @@ pub(crate) fn create_file_owner_only(path: &Path, mode: OwnerOnlyCreate) -> Opti
         };
         let mut sd = SECURITY_DESCRIPTOR::default();
         let psd = PSECURITY_DESCRIPTOR(&mut sd as *mut SECURITY_DESCRIPTOR as *mut core::ffi::c_void);
+        // SE_DACL_PROTECTED: an explicit creation DACL alone does not stop
+        // INHERITABLE ACEs from a permissive parent directory being merged
+        // into the new file's security — the protected bit is what severs
+        // inheritance, so the file's DACL is EXACTLY the owner-only one and
+        // nothing more, under precisely the permissive-parent scenario this
+        // primitive exists for.
         if InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION).is_err()
             || SetSecurityDescriptorDacl(psd, true, Some(dacl as *const ACL), false).is_err()
+            || SetSecurityDescriptorControl(psd, SE_DACL_PROTECTED, SE_DACL_PROTECTED).is_err()
         {
             free_dacl();
             return None;
@@ -991,6 +1018,122 @@ pub(crate) fn create_file_owner_only(path: &Path, mode: OwnerOnlyCreate) -> Opti
             Err(_) => None,
         }
     }
+}
+
+/// Whether `file`'s LIVE DACL grants access to ONLY the current process
+/// user — the read-side complement of [`create_file_owner_only`], for the
+/// one opener shape whose security attributes can silently NOT apply:
+/// `OPEN_ALWAYS` only stamps the creation DACL when it actually CREATES,
+/// so an already-existing file opened through it keeps whatever ACL it
+/// had. A caller that must never write secrets/metadata through a
+/// permissive pre-existing file (the audit log —
+/// `bus::computer_srv::open_audit_file_for_append`) validates the opened
+/// handle with this and reacts to a mismatch itself.
+///
+/// `Some(true)` — the DACL is exactly the owner-only shape this module
+/// stamps: at least one ACE, and EVERY ACE a plain `ACCESS_ALLOWED` entry
+/// for this process user's own SID. `Some(false)` — anything else: a NULL
+/// DACL (unrestricted access for everyone), an EMPTY DACL (access for no
+/// one — not this primitive's shape either), any deny/audit/object ACE
+/// kind, or any ACE for a foreign SID. `None` — the query machinery itself
+/// failed, so no judgment is possible (callers treat that as "not proven
+/// owner-only" and fail closed).
+#[cfg(windows)]
+pub(crate) fn file_dacl_is_owner_only(file: &std::fs::File) -> Option<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        EqualSid, GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, TOKEN_USER,
+    };
+    use windows::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+
+    // `my_sid` points INTO `buf` — keep it alive across every use below.
+    let buf = current_user_token_buf()?;
+    // SAFETY: `buf` is a filled TOKEN_USER; the security descriptor returned
+    // by `GetSecurityInfo` (which owns the ACL it hands back) is released
+    // with `LocalFree` on every path after a successful query; every ACE
+    // pointer is read only while the descriptor is alive.
+    unsafe {
+        let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let my_sid: PSID = token_user.User.Sid;
+        if my_sid.0.is_null() {
+            return None;
+        }
+
+        let handle = HANDLE(file.as_raw_handle() as _);
+        let mut dacl: *mut ACL = core::ptr::null_mut();
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        let got = GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            Some(&mut psd),
+        );
+        if got != ERROR_SUCCESS {
+            return None;
+        }
+        let free_sd = || {
+            let _ = LocalFree(Some(HLOCAL(psd.0)));
+        };
+        if dacl.is_null() {
+            free_sd();
+            return Some(false);
+        }
+        let count = u32::from((*dacl).AceCount);
+        if count == 0 {
+            free_sd();
+            return Some(false);
+        }
+        for i in 0..count {
+            let mut pace: *mut core::ffi::c_void = core::ptr::null_mut();
+            if GetAce(dacl, i, &mut pace).is_err() || pace.is_null() {
+                free_sd();
+                return None;
+            }
+            let header = &*(pace as *const ACE_HEADER);
+            if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
+                free_sd();
+                return Some(false);
+            }
+            // For ACCESS_ALLOWED_ACE the SID is stored INLINE starting at
+            // `SidStart` (documented Win32 layout).
+            let ace = &*(pace as *const ACCESS_ALLOWED_ACE);
+            let ace_sid = PSID(core::ptr::addr_of!(ace.SidStart) as *mut core::ffi::c_void);
+            // `EqualSid` maps to `Err` both for "not equal" and for an
+            // invalid SID — either way this ACE is not proven to be ours.
+            if EqualSid(my_sid, ace_sid).is_err() {
+                free_sd();
+                return Some(false);
+            }
+        }
+        free_sd();
+        Some(true)
+    }
+}
+
+/// Best-effort move of `path` to a `<name>.insecure` sibling so a fresh,
+/// owner-only file can take the path — the reaction
+/// [`file_dacl_is_owner_only`]'s audit-log caller applies to a pre-existing
+/// PERMISSIVE file: its bytes were already exposed under the old ACL (moving
+/// preserves them for the human to inspect rather than destroying evidence),
+/// but nothing new may ever be appended through it. `MOVEFILE_REPLACE_
+/// EXISTING` keeps the newest quarantined copy when this fires more than
+/// once. Returns whether the move succeeded — a caller must fail closed
+/// (write nothing) on `false`, since the permissive file still occupies the
+/// path.
+#[cfg(windows)]
+pub(crate) fn set_aside_insecure(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let aside = path.with_file_name(format!("{name}.insecure"));
+    windows_replace_existing(path, &aside)
 }
 
 /// Claude's computer-use MCP config.
@@ -1038,21 +1181,56 @@ fn inject_computer_claude(thread: i32, dir: &str, wt: Option<i32>, url: &str) ->
     // — and since spawning doesn't guarantee the first child has already parsed
     // `--mcp-config`, that worker could start with its sibling's URL (and thus
     // its `wt`), routing screenshots/audit into the wrong worktree namespace.
-    // A per-`wt` filename gives each worker its own stable config file.
     let wt_suffix = match wt {
         Some(id) => format!("-wt{id}"),
         None => String::new(),
     };
-    let file = mcp_dir.join(format!(
-        "{thread}-{}{wt_suffix}.mcp.json",
-        sanitize_filename_component(dir)
-    ));
+    // ... and a LAUNCH-unique sequence on top: two overlapping launches for
+    // the SAME identity (a rerun/rebuild racing the engine it replaces) must
+    // never share a file either — with one stable path, the second launch's
+    // write lands before either child is guaranteed to have parsed the file,
+    // so the OLD child could read the REPLACEMENT's current-generation bearer
+    // and stay authorized alongside it, defeating the rotation. A per-launch
+    // filename means each child can only ever read the exact token its own
+    // launch minted (already dead the moment a newer launch rotates).
+    let launch = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAUNCH_SEQ: AtomicU64 = AtomicU64::new(1);
+        LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed)
+    };
+    let ident = format!("{thread}-{}{wt_suffix}", sanitize_filename_component(dir));
+    let file = mcp_dir.join(format!("{ident}-L{launch}.mcp.json"));
     let json = serde_json::json!({
         "mcpServers": { "weft_computer": { "type": "http", "url": url } }
     });
     let bytes = serde_json::to_vec_pretty(&json).unwrap_or_default();
     if !write_owner_only_atomic(&file, &bytes) {
         return Injection::none();
+    }
+    // Best-effort prune of THIS identity's EARLIER launches (and the legacy
+    // stable-name file): their bearers are already dead, and without pruning
+    // the directory grows one file per launch forever. Never touches another
+    // identity's files (the exact-structure match below), and a failure here
+    // only leaves a stale file behind — the fresh injection above stands.
+    if let Ok(entries) = std::fs::read_dir(&mcp_dir) {
+        let legacy = format!("{ident}.mcp.json");
+        let launch_prefix = format!("{ident}-L");
+        let ours = format!("{ident}-L{launch}.mcp.json");
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name == ours {
+                continue;
+            }
+            let is_legacy = name == legacy;
+            let is_earlier_launch = name
+                .strip_prefix(&launch_prefix)
+                .and_then(|rest| rest.strip_suffix(".mcp.json"))
+                .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()));
+            if is_legacy || is_earlier_launch {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
     Injection::args_only(vec!["--mcp-config".into(), file.to_string_lossy().to_string()])
 }
@@ -1287,21 +1465,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// Re-injection (the SAME
-    /// `(thread, dir, wt)` writing this SAME path again — a resumed/rerun
-    /// session) must land via [`write_owner_only_atomic`]'s temp-then-`rename`
-    /// path, not silently fall back to a wider-mode write because the file
-    /// already exists. Runs the injection TWICE for the identical
-    /// `(thread, dir, wt)` and asserts the SECOND write is still exactly
-    /// `0600`, the content reflects the newer URL, and no
-    /// `.weft-tmp` sibling is left behind (the atomic rename consumes it on
-    /// success). the config
-    /// filename now includes `wt`, so a re-injection with a DIFFERENT `wt` is a
-    /// DIFFERENT file by design — this test therefore holds `wt` fixed and
-    /// varies the base URL to prove the same-path rewrite; the distinct-`wt`
-    /// case is asserted separately at the end.
+    /// A SECOND launch for the SAME `(thread, dir, wt)` must get its OWN
+    /// launch-unique config path — never rewrite the earlier launch's file in
+    /// place, where the old child (not guaranteed to have parsed
+    /// `--mcp-config` yet) could read the replacement's fresh bearer — and
+    /// the earlier launch's file, plus the legacy stable-name file, is pruned
+    /// best-effort. The new file still lands via
+    /// [`write_owner_only_atomic`]: exactly `0600` on unix, no `.weft-tmp`
+    /// sibling left behind. A DIFFERENT `wt` (or the absent-wt lead case) is
+    /// a DIFFERENT identity whose files the prune must never touch.
     #[test]
-    fn computer_claude_config_reinjection_stays_owner_only_and_atomic() {
+    fn computer_claude_relaunch_gets_a_fresh_path_and_prunes_stale_configs() {
         let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let weft_home =
             std::env::temp_dir().join(format!("weft-inj-comp-reinject-home-{}", std::process::id()));
@@ -1311,59 +1485,77 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-reinject-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
-        let first = inject_computer("http://127.0.0.1:9", 5, "50", "claude", Some(7));
-        let cfg_path = std::path::PathBuf::from(&first.args[1]);
-        assert!(cfg_path.exists(), "the first injection must write the config");
+        // Plant a LEGACY stable-name file for this identity (the pre-launch-
+        // suffix naming) and a config belonging to a DIFFERENT identity: the
+        // next injection's prune must remove the former and never touch the
+        // latter.
+        let mcp_dir = weft_home.join("computer-mcp");
+        std::fs::create_dir_all(&mcp_dir).unwrap();
+        let legacy = mcp_dir.join("5-50-wt7.mcp.json");
+        std::fs::write(&legacy, b"stale-legacy").unwrap();
+        let foreign = mcp_dir.join("99-77-L1.mcp.json");
+        std::fs::write(&foreign, b"another-identity").unwrap();
 
-        // A second injection for the SAME (thread, dir, wt) but a DIFFERENT
-        // base URL — standing in for a resumed/rerun session hitting the SAME
-        // predictable path; the newer content must win.
+        let first = inject_computer("http://127.0.0.1:9", 5, "50", "claude", Some(7));
+        let first_path = std::path::PathBuf::from(&first.args[1]);
+        assert!(first_path.exists(), "the first injection must write the config");
+        assert!(!legacy.exists(), "the legacy stable-name file must be pruned on injection");
+        assert!(foreign.exists(), "another identity's config must never be pruned");
+
+        // A second launch for the SAME (thread, dir, wt) with a DIFFERENT
+        // base URL — a rerun racing the engine it replaces. It must get its
+        // OWN file and prune the first launch's.
         let second = inject_computer("http://127.0.0.1:8", 5, "50", "claude", Some(7));
-        assert_eq!(
-            std::path::PathBuf::from(&second.args[1]),
-            cfg_path,
-            "re-injection for the same (thread, dir, wt) must reuse the same predictable path"
+        let second_path = std::path::PathBuf::from(&second.args[1]);
+        assert_ne!(
+            second_path, first_path,
+            "each launch must get its own config path, never rewrite the prior launch's in place"
         );
-        let cfg = std::fs::read_to_string(&cfg_path).unwrap();
-        assert!(cfg.contains("127.0.0.1:8"), "the SECOND write's content must win: {cfg}");
+        assert!(!first_path.exists(), "the earlier launch's config must be pruned");
+        let cfg = std::fs::read_to_string(&second_path).unwrap();
+        assert!(cfg.contains("127.0.0.1:8"), "the new launch's content must be its own: {cfg}");
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(&second_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(
                 mode, 0o600,
-                "re-injection must remain exactly 0600, never a wider mode surviving from a stale \
-                 create, got {mode:o}"
+                "every launch's config must be exactly 0600, got {mode:o}"
             );
         }
 
         // The atomic rename consumes the temp on success — no
         // `.weft-tmp` sibling may linger next to the real config.
-        let mcp_dir = cfg_path.parent().unwrap();
-        let leftover: Vec<_> = std::fs::read_dir(mcp_dir)
+        let leftover: Vec<_> = std::fs::read_dir(&mcp_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains("weft-tmp"))
             .collect();
         assert!(leftover.is_empty(), "no temp file may be left behind: {leftover:?}");
 
-        // a DIFFERENT wt for the
-        // SAME (thread, dir) is a DIFFERENT config file — two workers of one
-        // multi-repo direction must never clobber each other's config — and the
-        // absent-wt case is distinct from any explicit wt too.
+        // A DIFFERENT wt for the SAME (thread, dir) — and the absent-wt lead
+        // case — are DIFFERENT identities: their filenames carry their own
+        // identity prefix and their injections must not prune this one's file.
         let other_wt = inject_computer("http://127.0.0.1:9", 5, "50", "claude", Some(8));
-        assert_ne!(
-            std::path::PathBuf::from(&other_wt.args[1]),
-            cfg_path,
-            "a different wt must produce a different config path"
+        let other_name = std::path::PathBuf::from(&other_wt.args[1]);
+        let other_name = other_name.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            other_name.starts_with("5-50-wt8-L"),
+            "a different wt must be a different identity, got {other_name}"
         );
         let absent_wt = inject_computer("http://127.0.0.1:9", 5, "50", "claude", None);
-        assert_ne!(
-            std::path::PathBuf::from(&absent_wt.args[1]),
-            cfg_path,
-            "the absent-wt config path must differ from an explicit wt's"
+        let absent_name = std::path::PathBuf::from(&absent_wt.args[1]);
+        let absent_name = absent_name.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            absent_name.starts_with("5-50-L"),
+            "the absent-wt identity must differ from any explicit wt's, got {absent_name}"
         );
+        assert!(
+            second_path.exists(),
+            "another identity's injection must never prune this identity's config"
+        );
+        assert!(foreign.exists(), "the planted foreign config must still be untouched");
 
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&dir);

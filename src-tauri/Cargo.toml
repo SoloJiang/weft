@@ -108,11 +108,13 @@ sha2 = "0.10"
 hmac = "0.12"
 
 # owner-only ACL for the
-# bearer-bearing opencode.json on Windows — see `bus::inject::
-# restrict_handle_to_owner`. Windows-only (this whole block is ignored on unix
+# bearer-bearing config files on Windows — see `bus::inject::
+# create_file_owner_only`. Windows-only (this whole block is ignored on unix
 # targets, so it never touches the Linux/macOS build or CI), and pinned to the
 # `0.61` line already resolved transitively (tauri/keyring), so it adds no new
-# crate version. Only the handful of Win32 modules the ACL calls need.
+# crate version. Only the handful of Win32 modules the ACL calls need
+# (`Win32_System_SystemServices` carries `SECURITY_DESCRIPTOR_REVISION` and
+# the ACE-type constants the DACL validator checks against).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
@@ -120,6 +122,7 @@ windows = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
 ] }
 
 # in-process X11 window activation
