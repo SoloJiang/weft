@@ -280,7 +280,7 @@ fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
         )));
     }
 
-    raise_specific_window(pid, target)
+    raise_specific_window(pid, found)
 }
 
 /// Appended to a macOS activation failure that most likely stems from
