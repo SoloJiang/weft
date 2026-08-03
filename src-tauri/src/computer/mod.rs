@@ -1602,6 +1602,22 @@ pub fn acquire_control(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), Co
     let sync_needed;
     {
         let mut guard = control_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        // issue #160 round-34 P2 (Codex computer_srv.rs:2800): refuse any
+        // acquisition — fresh hold or renewal — while the stop latch is set,
+        // checked INSIDE this lock so it is atomic against
+        // [`trip_stop_latch`]'s own set-latch-then-`clear_control` sequence:
+        // either this check sees the latch (refused, nothing installed), or
+        // the acquisition completes first and the trip's `clear_control`
+        // (which takes this same mutex) sweeps the just-installed lease.
+        // No interleaving leaves a post-Stop lease standing — before this, a
+        // stale already-approved request racing the kill switch could
+        // install a fresh 30s lease AFTER a successful Stop, resurrecting
+        // the control banner and the global Escape interception with nothing
+        // actually running (its own action was rejected downstream, but
+        // nothing released the lease it left behind).
+        if stop_latched() {
+            return Err(ComputerError::Disabled);
+        }
         match guard.as_ref() {
             Some(holder) => {
                 // issue #160 round-25 P1 (Codex mod.rs:1552): `wt` is part of
@@ -4170,6 +4186,29 @@ mod tests {
             "a same-holder renewal must succeed once escape_ready is true"
         );
 
+        clear_control();
+    }
+
+    /// issue #160 round-34 P2 (Codex computer_srv.rs:2800): no lease can be
+    /// installed while the stop latch is set — a stale already-approved
+    /// request racing Emergency Stop must not resurrect the control banner
+    /// and global Escape interception after a successful Stop. Normal
+    /// acquisition resumes once the latch is cleared.
+    #[test]
+    fn acquire_control_refuses_while_the_stop_latch_is_set() {
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_control();
+        let my_gen = trip_stop_latch();
+
+        let err = acquire_control(920_401, "post-stop", None).unwrap_err();
+        assert!(matches!(err, ComputerError::Disabled), "{err:?}");
+        assert!(control_state().is_none(), "no lease may be installed after Stop");
+
+        assert!(clear_emergency_stop(my_gen));
+        assert!(
+            acquire_control(920_401, "post-stop", None).is_ok(),
+            "acquisition resumes normally once the latch is cleared"
+        );
         clear_control();
     }
 

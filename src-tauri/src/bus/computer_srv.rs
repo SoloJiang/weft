@@ -1081,7 +1081,7 @@ async fn run_action(
             // click risks landing on Weft's own card instead of the target —
             // and an Auto approval offers no guarantee the target still holds
             // the real OS foreground either.
-            activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
+            activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
             // issue #160 round-10 P1 #B: `activate_target` (inside the call
             // above) shells out to a potentially slow, blocking OS call
             // (osascript/wmctrl/`xdotool --sync`) — the window can move,
@@ -1123,7 +1123,7 @@ async fn run_action(
             // AFTER the backend call succeeds: a rejected/failed click never
             // touched the real window and must not seed a false freshness
             // record for a later `type`/`key`.
-            record_click_focus(thread, dir, &w2);
+            record_click_focus(thread, dir, wt, &w2);
             Ok(format!(
                 "{action} at ({px}, {py}) in window {} done — take a screenshot to verify",
                 w2.id
@@ -1145,7 +1145,7 @@ async fn run_action(
             // issue #160 round-33 P2: preflight before activation — see the
             // click-family arm above.
             let _ = map_input_coord(thread, dir, wt, &w, cx, cy)?;
-            activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
+            activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
             // issue #160 round-10 P1 #B: see the click-family arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let (px, py) = map_input_coord(thread, dir, wt, &w2, cx, cy)?;
@@ -1191,7 +1191,7 @@ async fn run_action(
             // activation — see the click-family arm above.
             let _ = map_input_coord(thread, dir, wt, &w, sx, sy)?;
             let _ = map_input_coord(thread, dir, wt, &w, ex, ey)?;
-            activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
+            activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let from = map_input_coord(thread, dir, wt, &w2, sx, sy)?;
             let to = map_input_coord(thread, dir, wt, &w2, ex, ey)?;
@@ -1230,7 +1230,7 @@ async fn run_action(
             // issue #160 round-33 P2: preflight before activation — see the
             // click-family arm above.
             let _ = map_input_coord(thread, dir, wt, &w, cx, cy)?;
-            activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
+            activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
             // issue #160 round-10 P1 #B: see the click-family arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             let (px, py) = map_input_coord(thread, dir, wt, &w2, cx, cy)?;
@@ -1284,15 +1284,15 @@ async fn run_action(
             // anyway, so it must fail BEFORE activation raises and focuses
             // the target application. Advisory only; the AUTHORITATIVE check
             // against the post-activation `w2` below is unchanged.
-            require_recent_focus(thread, dir, &w)?;
-            activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
+            require_recent_focus(thread, dir, wt, &w)?;
+            activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
             // issue #160 round-10 P1 #B: re-resolve/re-verify AFTER
             // activation, same as every other input arm — and check focus-
             // freshness against THIS fresh id (`w2.id`), not the
             // pre-activation one: the window `require_recent_focus` guards
             // is the SAME one about to receive the keystrokes.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            require_recent_focus(thread, dir, &w2)?;
+            require_recent_focus(thread, dir, wt, &w2)?;
             let char_count = text.chars().count();
             let text_owned = text.to_string();
             // issue #160 round-16 P1 (Codex 605): see the click-family arm
@@ -1348,11 +1348,11 @@ async fn run_action(
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             // issue #160 round-33 P2: preflight the focus prerequisite before
             // activation — see the "type" arm above.
-            require_recent_focus(thread, dir, &w)?;
-            activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
+            require_recent_focus(thread, dir, wt, &w)?;
+            activate_and_recheck(db, asks, thread, dir, wt, &w).await?;
             // issue #160 round-10 P1 #B: see the "type" arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            require_recent_focus(thread, dir, &w2)?;
+            require_recent_focus(thread, dir, wt, &w2)?;
             let combo_owned = combo.to_string();
             // issue #160 round-16 P1 (Codex 605): see the click-family arm
             // above.
@@ -1849,6 +1849,21 @@ async fn approve(
         asks.cancel(id);
         return Err(ComputerError::Disabled.to_string());
     }
+    // issue #160 round-34 P2 (Codex computer_srv.rs:1848): the SAME straddler
+    // shape, for route revocation — a thread/repo delete whose `asks` purge
+    // ran between this call's entry check and the insert above misses THIS
+    // card, which would otherwise sit answerable for the full ask timeout
+    // after its session's rows are gone (an Always/Full answer minting a
+    // grant for a deleted identity). The delete publishes its revocation
+    // BEFORE its purge (round-23), so program order guarantees one side sees
+    // the other: either the purge ran after our insert (and swept the card),
+    // or this check — after the insert — sees the already-published
+    // revocation and cancels our own card. `route_revoked_sync` is lock-only
+    // and sync, same as the latch check above.
+    if route_revoked_sync(thread, dir, wt) {
+        asks.cancel(id);
+        return Err(SESSION_GONE_MSG.to_string());
+    }
 
     match tokio::time::timeout(crate::bus::server::ASK_WAIT, rx).await {
         // issue #160 round-10 P1 #A: same `resolved` value, reused here too —
@@ -2326,31 +2341,44 @@ const FOCUS_FRESHNESS_SECS: u64 = FOCUS_FRESHNESS_MS / 1000;
 /// would then activate and inject into it with neither a card nor a genuine
 /// click. Identity comparison fails that closed, same as the preview and
 /// shot-dims registries already do.
-fn recent_clicks() -> &'static Mutex<HashMap<(i32, String), (VerifiedWindowIdentity, std::time::Instant)>> {
+/// Keyed by `(thread, dir, wt)` — the worktree id included since issue #160
+/// round-34 P2 (Codex computer_srv.rs:2329): sibling workers of ONE
+/// multi-repo direction share `(thread, dir)` but are distinct sessions, so
+/// worker A's successful click must never satisfy worker B's `type`/`key`
+/// focus prerequisite — under a shared Full grant that meant silently
+/// injecting keystrokes on another session's clicked window. The same
+/// widening the bearer, lease, shot-dims, and preview registries already got.
+fn recent_clicks(
+) -> &'static Mutex<HashMap<(i32, String, Option<i32>), (VerifiedWindowIdentity, std::time::Instant)>> {
     static CLICKS: OnceLock<
-        Mutex<HashMap<(i32, String), (VerifiedWindowIdentity, std::time::Instant)>>,
+        Mutex<HashMap<(i32, String, Option<i32>), (VerifiedWindowIdentity, std::time::Instant)>>,
     > = OnceLock::new();
     CLICKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Record a SUCCESSFUL click on `window_id` for `(thread, dir)` — called
+/// Record a SUCCESSFUL click on `window_id` for `(thread, dir, wt)` — called
 /// ONLY from the click-family arm of [`run_action`], and ONLY after the
 /// backend call itself returned `Ok`: a rejected/failed click never actually
 /// touched the real window, so it must not seed a false freshness record for
 /// a later `type`/`key`.
-fn record_click_focus(thread: i32, dir: &str, w: &computer::WindowInfo) {
+fn record_click_focus(thread: i32, dir: &str, wt: Option<i32>, w: &computer::WindowInfo) {
     let mut g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
     g.insert(
-        (thread, dir.to_string()),
+        (thread, dir.to_string(), wt),
         (VerifiedWindowIdentity::from_window(w), std::time::Instant::now()),
     );
 }
 
 /// `type`/`key`'s pre-execution gate: reject unless a click on THIS EXACT
-/// resolved `window_id`, for THIS `(thread, dir)`, landed within the last
+/// resolved `window_id`, for THIS `(thread, dir, wt)`, landed within the last
 /// [`FOCUS_FRESHNESS_MS`] — see this section's own doc comment for what this
 /// is (and is not) verifying.
-fn require_recent_focus(thread: i32, dir: &str, w: &computer::WindowInfo) -> Result<(), String> {
+fn require_recent_focus(
+    thread: i32,
+    dir: &str,
+    wt: Option<i32>,
+    w: &computer::WindowInfo,
+) -> Result<(), String> {
     let g = recent_clicks().lock().unwrap_or_else(|e| e.into_inner());
     let target = VerifiedWindowIdentity::from_window(w);
     // issue #160 round-15 P2: `Instant::elapsed` is monotonic — a wall-clock
@@ -2358,7 +2386,7 @@ fn require_recent_focus(thread: i32, dir: &str, w: &computer::WindowInfo) -> Res
     // round-17 P2: the FULL identity must match, not just the id (see
     // [`recent_clicks`]'s own doc for the id-reuse hazard).
     let fresh = matches!(
-        g.get(&(thread, dir.to_string())),
+        g.get(&(thread, dir.to_string(), wt)),
         Some((clicked, ts)) if *clicked == target
             && ts.elapsed() <= std::time::Duration::from_millis(FOCUS_FRESHNESS_MS)
     );
@@ -2431,8 +2459,15 @@ fn require_recent_focus(thread: i32, dir: &str, w: &computer::WindowInfo) -> Res
 /// DIFFERENT, now-closed hazard: see [`activate_and_recheck`]'s own doc for
 /// the second `recheck_after_guard` that closes it (issue #160 round-6
 /// review P1 #2).
-fn activate_target(target_id: u32) -> Result<(), String> {
-    backend::backend().activate_window(target_id).map_err(|e| {
+fn activate_target(target: &computer::WindowInfo) -> Result<(), String> {
+    // issue #160 round-34 P2 (Codex computer_srv.rs:2986): the FULL verified
+    // identity crosses this boundary now, not the bare id — the backend
+    // re-verifies app/title as close to the raise as the platform allows
+    // (see `ComputerBackend::activate_window`'s doc), so an id reused while
+    // the activation closure sat queued can no longer have the REPLACEMENT
+    // application raised/focused under the original approval.
+    let target_id = target.id;
+    backend::backend().activate_window(target).map_err(|e| {
         format!(
             "window {target_id} couldn't be activated before this input action ({e}) — answer \
              from weft's own desktop UI instead, where the foreground never has anywhere else to go"
@@ -2866,7 +2901,15 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
     // `handle_computer` entry gate. Gated on the revocation set: a thread that
     // was never deleted (every synthetic-identity test, and normal operation)
     // pays only the lock-only lookup, never the `session_is_live` DB check.
-    if computer_routes_revoked(thread) && !session_is_live(db, thread, dir, None).await {
+    // issue #160 round-34 P1 (Codex computer_srv.rs:2869): the request's OWN
+    // `wt` is passed through — this used to hardcode `None`, which
+    // `session_is_live` reads as "no worktree pinned, direction row is
+    // enough": a SESSION-ONLY worker whose worktree a repo delete removed
+    // (direction surviving) read as live here merely because the shared
+    // direction still existed, and — having acquired a fresh lease AFTER the
+    // delete's clear found nothing to clear — sailed through every later
+    // lease check to inject under its deleted identity.
+    if computer_routes_revoked(thread) && !session_is_live(db, thread, dir, wt).await {
         return Err(SESSION_GONE_MSG.to_string());
     }
     // issue #160 round-25 P1 (Codex mod.rs:1552): compare `wt` too, so a
@@ -2964,7 +3007,7 @@ async fn activate_and_recheck(
     thread: i32,
     dir: &str,
     wt: Option<i32>,
-    window_id: u32,
+    target: &computer::WindowInfo,
 ) -> Result<(), String> {
     // issue #160 round-29 P2 (Codex computer_srv.rs:2871): run the SAME
     // synchronous latch/lease recheck the final injection closures run,
@@ -2981,9 +3024,10 @@ async fn activate_and_recheck(
     // lock-only/synchronous, so it runs at the last instant on the same
     // thread as the activation call itself.
     let dir_owned = dir.to_string();
+    let target_owned = target.clone();
     on_blocking(move || {
         recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
-        activate_target(window_id)
+        activate_target(&target_owned)
     })
     .await??;
     recheck_after_guard(db, asks, thread, dir, wt).await
@@ -5114,14 +5158,14 @@ mod tests {
     #[test]
     fn require_recent_focus_passes_right_after_a_click_on_the_same_window() {
         let thread = 900_001;
-        record_click_focus(thread, "lead", &focus_win(7));
-        assert!(require_recent_focus(thread, "lead", &focus_win(7)).is_ok());
+        record_click_focus(thread, "lead", None, &focus_win(7));
+        assert!(require_recent_focus(thread, "lead", None, &focus_win(7)).is_ok());
     }
 
     #[test]
     fn require_recent_focus_rejects_with_no_prior_click_at_all() {
         let thread = 900_002;
-        let err = require_recent_focus(thread, "lead", &focus_win(7)).unwrap_err();
+        let err = require_recent_focus(thread, "lead", None, &focus_win(7)).unwrap_err();
         assert!(err.contains("focus"), "{err}");
         assert!(err.contains("click"), "{err}");
     }
@@ -5129,8 +5173,8 @@ mod tests {
     #[test]
     fn require_recent_focus_rejects_a_click_on_a_different_window() {
         let thread = 900_003;
-        record_click_focus(thread, "lead", &focus_win(7)); // clicked window A (id 7)
-        let err = require_recent_focus(thread, "lead", &focus_win(8)).unwrap_err(); // typing into B (id 8)
+        record_click_focus(thread, "lead", None, &focus_win(7)); // clicked window A (id 7)
+        let err = require_recent_focus(thread, "lead", None, &focus_win(8)).unwrap_err(); // typing into B (id 8)
         assert!(err.contains("8"), "error should name the window that lacks focus: {err}");
     }
 
@@ -5140,27 +5184,47 @@ mod tests {
     #[test]
     fn require_recent_focus_rejects_a_reused_id_with_a_different_identity() {
         let thread = 900_007;
-        record_click_focus(thread, "lead", &focus_win(7));
+        record_click_focus(thread, "lead", None, &focus_win(7));
         let mut imposter = focus_win(7);
         imposter.app = "Mail".into();
         imposter.title = "inbox".into();
         assert!(
-            require_recent_focus(thread, "lead", &imposter).is_err(),
+            require_recent_focus(thread, "lead", None, &imposter).is_err(),
             "the SAME id with a different app/title must not read as recently clicked"
         );
         // The genuine identity still passes.
-        assert!(require_recent_focus(thread, "lead", &focus_win(7)).is_ok());
+        assert!(require_recent_focus(thread, "lead", None, &focus_win(7)).is_ok());
     }
 
     #[test]
     fn require_recent_focus_is_scoped_per_thread_dir() {
         let thread_a = 900_004;
         let thread_b = 900_005;
-        record_click_focus(thread_a, "lead", &focus_win(7));
+        record_click_focus(thread_a, "lead", None, &focus_win(7));
         // A click recorded for a DIFFERENT (thread, dir) must not satisfy
         // this one's focus check — the registry is per-session, not global.
-        assert!(require_recent_focus(thread_b, "lead", &focus_win(7)).is_err());
-        assert!(require_recent_focus(thread_a, "10", &focus_win(7)).is_err());
+        assert!(require_recent_focus(thread_b, "lead", None, &focus_win(7)).is_err());
+        assert!(require_recent_focus(thread_a, "10", None, &focus_win(7)).is_err());
+    }
+
+    /// issue #160 round-34 P2 (Codex computer_srv.rs:2329): sibling workers of
+    /// one multi-repo direction share `(thread, dir)` but are distinct
+    /// sessions keyed by `wt` — worker A's click must never satisfy worker
+    /// B's `type`/`key` focus prerequisite, nor the lead-style `None`
+    /// resolution's; the owner still passes.
+    #[test]
+    fn require_recent_focus_is_isolated_per_worktree_for_sibling_workers() {
+        let thread = 900_007;
+        record_click_focus(thread, "40", Some(1), &focus_win(7));
+        assert!(
+            require_recent_focus(thread, "40", Some(2), &focus_win(7)).is_err(),
+            "a sibling worker differing only by wt must not inherit the click"
+        );
+        assert!(
+            require_recent_focus(thread, "40", None, &focus_win(7)).is_err(),
+            "the wt-less resolution must not inherit a worker's click either"
+        );
+        assert!(require_recent_focus(thread, "40", Some(1), &focus_win(7)).is_ok());
     }
 
     #[test]
@@ -5182,11 +5246,11 @@ mod tests {
         {
             let mut g = recent_clicks().lock().unwrap();
             g.insert(
-                (thread, "lead".to_string()),
+                (thread, "lead".to_string(), None),
                 (VerifiedWindowIdentity::from_window(&focus_win(7)), stale),
             );
         }
-        assert!(require_recent_focus(thread, "lead", &focus_win(7)).is_err());
+        assert!(require_recent_focus(thread, "lead", None, &focus_win(7)).is_err());
     }
 
     // —— issue #160 round-4 P1 §2, broadened round-5 review P1 §6: activate_target ——
@@ -5231,9 +5295,22 @@ mod tests {
         mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
         *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
         mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // issue #160 round-34 P2: activation verifies the FULL identity
+        // against the currently visible set, so the target must be visible.
+        let target = computer::WindowInfo {
+            id: 7,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(vec![target.clone()]);
 
         // Every call activates the EXACT target window id, unconditionally.
-        assert!(activate_target(7).is_ok());
+        assert!(activate_target(&target).is_ok());
         {
             let actions = mock.actions.lock().unwrap();
             assert_eq!(actions.len(), 1, "{actions:?}");
@@ -5242,15 +5319,39 @@ mod tests {
 
         // A second call activates again — this is no longer gated on
         // "did a card actually appear", so repeated calls each activate.
-        assert!(activate_target(7).is_ok());
+        assert!(activate_target(&target).is_ok());
         assert_eq!(mock.actions.lock().unwrap().len(), 2);
+
+        // issue #160 round-34 P2 (Codex computer_srv.rs:2986): the SAME
+        // numeric id now belonging to a DIFFERENT application (id reuse while
+        // the activation closure sat queued) is refused BEFORE any raise —
+        // no new action recorded.
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(vec![computer::WindowInfo {
+                id: 7,
+                app: "Imposter".into(),
+                title: "imposter".into(),
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            }]);
+        let err = activate_target(&target).unwrap_err();
+        assert!(err.contains('7'), "{err}");
+        assert_eq!(
+            mock.actions.lock().unwrap().len(),
+            2,
+            "an id-reuse mismatch must refuse before the raise, recording nothing"
+        );
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(vec![target.clone()]);
 
         // Fail-closed: the backend can't activate the window at all
         // (`Unsupported`) — must propagate an `Err` naming the window,
         // never silently proceed. No NEW action is recorded (the count
         // stays at 2, from the two successful activations above).
         mock.fail_activate.store(true, std::sync::atomic::Ordering::SeqCst);
-        let err = activate_target(7).unwrap_err();
+        let err = activate_target(&target).unwrap_err();
         assert!(err.contains('7'), "{err}");
         assert_eq!(
             mock.actions.lock().unwrap().len(),
@@ -5430,7 +5531,7 @@ mod tests {
         // window first (see `require_recent_focus`) — seed it directly
         // rather than driving a real `left_click` through the whole gate a
         // second time just to satisfy this precondition.
-        record_click_focus(thread, dir, &computer::WindowInfo {
+        record_click_focus(thread, dir, None, &computer::WindowInfo {
             id: 906_201,
             app: "Bar".into(),
             title: "Bar".into(),
@@ -5616,7 +5717,7 @@ mod tests {
             full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
             always: Vec::new(),
         });
-        record_click_focus(thread, dir, &computer::WindowInfo {
+        record_click_focus(thread, dir, None, &computer::WindowInfo {
             id: 910_501,
             app: "Swappy".into(),
             title: "swappy window".into(),
@@ -6474,6 +6575,63 @@ mod tests {
         // The actual holder (wt=2) still passes.
         assert!(recheck_stop_and_lease_before_backend(thread, dir, Some(2)).is_ok());
         computer::clear_control();
+    }
+
+    /// issue #160 round-34 P1 (Codex computer_srv.rs:2869): the post-queue
+    /// liveness recheck validates the request's OWN `wt` — a session-only
+    /// worker whose worktree a repo delete removed (direction SURVIVING) must
+    /// be refused here even though it holds a freshly-acquired lease, while
+    /// the direction's surviving sibling worktree still passes.
+    #[tokio::test]
+    async fn recheck_after_guard_rejects_a_deleted_secondary_worktree_session() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        computer::clear_control();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_a =
+            repo::add_repo_ref(&db, ws.id, "a", &tmp.path().to_string_lossy(), "main", "", true)
+                .await
+                .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let direction = repo::create_direction(
+            &db, thread.id, "task", "claude", repo_a.id, "why", "impl-only", "main",
+        )
+        .await
+        .unwrap();
+        // The SURVIVING sibling worktree (repo A's own).
+        let wt_a =
+            repo::record_worktree(&db, repo_a.id, direction.id, "b1", "/tmp/weft-wt-a", true, true, "")
+                .await
+                .unwrap();
+        // Repo B's worktree was deleted — no row exists for this id, and the
+        // round-32 fence published a session-only revocation for it.
+        let wt_b_id = wt_a.id + 991;
+        let dir_s = direction.id.to_string();
+        let restore = snapshot_revocations(&[thread.id]);
+        revoke_computer_route_session(thread.id, dir_s.clone(), wt_b_id);
+
+        // The stale request acquired a fresh lease AFTER the delete (nothing
+        // existed to clear at delete time) — exactly the reported scenario.
+        computer::acquire_control(thread.id, &dir_s, Some(wt_b_id)).unwrap();
+        let asks = AskRegistry::new();
+        let err = recheck_after_guard(&db, &asks, thread.id, &dir_s, Some(wt_b_id))
+            .await
+            .expect_err("a deleted secondary worktree's session must be refused, lease or not");
+        assert!(err.contains("no longer exists"), "{err}");
+        computer::clear_control();
+
+        // The surviving sibling passes the same checkpoint with its own lease.
+        computer::acquire_control(thread.id, &dir_s, Some(wt_a.id)).unwrap();
+        assert!(
+            recheck_after_guard(&db, &asks, thread.id, &dir_s, Some(wt_a.id)).await.is_ok(),
+            "the surviving sibling worktree must not be caught by the session revocation"
+        );
+        computer::clear_control();
+        restore_revocations(restore);
     }
 
     /// issue #160 round-18 P2 (Codex paths.rs:89): deleting a thread removes
@@ -8433,6 +8591,38 @@ mod tests {
         computer::clear_emergency_stop(computer::stop_generation());
     }
 
+    /// issue #160 round-34 P2 (Codex computer_srv.rs:1848): the SAME straddler
+    /// property for route revocation — a card inserted AFTER a delete's asks
+    /// purge already swept must be self-cancelled by the post-insert
+    /// revocation recheck, never left answerable (Always/Full into a deleted
+    /// identity) for the full ask timeout.
+    #[tokio::test]
+    async fn approve_self_cancels_a_card_published_after_route_revocation() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        let asks = AskRegistry::new(); // no grant → would otherwise open a card
+        let thread = 904_405;
+        let restore = snapshot_revocations(&[thread]);
+        revoke_computer_routes(thread);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            approve(&asks, thread, "lead", None, "wait", &json!({"duration_ms": 5})),
+        )
+        .await
+        .expect("the post-insert revocation check must fail fast, never block on the card");
+
+        let err = result.expect_err("a revoked route must self-cancel its own card");
+        assert!(err.contains("no longer exists"), "{err}");
+        assert!(
+            asks.open().is_empty(),
+            "the straddler's card must be self-cancelled, not left open: {:?}",
+            asks.open()
+        );
+
+        restore_revocations(restore);
+    }
+
     /// issue #160 round-28 P2 (Codex computer_srv.rs:1559): the authorization-
     /// time window resolve rechecks the stop latch (and route revocation)
     /// INSIDE its blocking closure — a windowed request that was parked on the
@@ -8509,7 +8699,16 @@ mod tests {
         let asks = AskRegistry::new();
 
         computer::trip_stop_latch();
-        let err = activate_and_recheck(&db, &asks, 904_502, "lead", None, 42)
+        let target = computer::WindowInfo {
+            id: 42,
+            app: "Notes".into(),
+            title: "notes".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let err = activate_and_recheck(&db, &asks, 904_502, "lead", None, &target)
             .await
             .expect_err("a tripped stop latch must fail activation closed");
         assert!(err.contains("disabled"), "expected the disabled rejection, got: {err}");

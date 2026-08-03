@@ -168,9 +168,40 @@ impl ComputerBackend for OsBackend {
             .map_err(|e| ComputerError::Unsupported(e.to_string()))
     }
 
-    fn activate_window(&self, id: u32) -> Result<(), ComputerError> {
-        activate_window_impl(id)
+    fn activate_window(&self, target: &WindowInfo) -> Result<(), ComputerError> {
+        activate_window_impl(target)
     }
+}
+
+/// issue #160 round-34 P2 (Codex computer_srv.rs:2986): re-verify `target`'s
+/// full identity (`app`/`title`, not the reusable numeric id alone) on a
+/// FRESH enumeration immediately before an activation that addresses the
+/// window by id — the same discipline `capture_window` applies before
+/// capturing. Used by the platform impls whose raise mechanism performs no
+/// enumeration of its own (Windows' HWND FFI, Linux' EWMH message): there is
+/// no handle to inspect at the raise itself, so a just-before check is the
+/// closest available evidence; the remaining sub-millisecond gap between it
+/// and the raise is the same verify-then-act residual the capture boundary
+/// carries. The macOS impl verifies inline instead, on the very handle it
+/// resolves the owning pid from. Mismatch fails closed without disclosing
+/// the replacement's identity.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn verify_window_identity(target: &WindowInfo) -> Result<(), ComputerError> {
+    let id = target.id;
+    let windows = xcap::Window::all().map_err(|e| ComputerError::Unsupported(e.to_string()))?;
+    let found = windows
+        .iter()
+        .find(|w| matches!(w.id(), Ok(wid) if wid == id))
+        .ok_or_else(|| ComputerError::CaptureFailed(format!("window {id} is no longer visible")))?;
+    let same_identity = matches!(found.app_name(), Ok(app) if app == target.app)
+        && matches!(found.title(), Ok(title) if title == target.title);
+    if !same_identity {
+        return Err(ComputerError::CaptureFailed(format!(
+            "window {id} no longer matches the approved application/title — it may have closed \
+             and had its id reused; take a fresh screenshot to re-resolve"
+        )));
+    }
+    Ok(())
 }
 
 // —— window activation (issue #160 round-4 P1 §2) ——
@@ -189,7 +220,8 @@ impl ComputerBackend for OsBackend {
 // that id rather than threading a second identifier through.
 
 #[cfg(target_os = "macos")]
-fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
+fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
+    let id = target.id;
     // macOS has no public API to raise a SPECIFIC window within a
     // multi-window app without the Accessibility (AX) API's own window
     // handle, which `xcap` does not expose — so this activates at the APP
@@ -213,11 +245,25 @@ fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
     // see `raise_specific_window`'s own doc for the fail-closed policy that
     // governs it.
     let windows = xcap::Window::all().map_err(|e| ComputerError::Unsupported(e.to_string()))?;
-    let target = windows
+    let found = windows
         .iter()
         .find(|w| matches!(w.id(), Ok(wid) if wid == id))
         .ok_or_else(|| ComputerError::CaptureFailed(format!("window {id} is no longer visible")))?;
-    let pid = target.pid().map_err(|e| ComputerError::Unsupported(e.to_string()))?;
+    // issue #160 round-34 P2 (Codex computer_srv.rs:2986): verify the full
+    // identity on the EXACT handle the owning pid is about to be resolved
+    // from — an id reused by a different application would otherwise have
+    // that replacement raised/focused under the original approval (the
+    // post-activation resolve only stops the click/type that follows, after
+    // the foreground was already stolen). Same discipline as `capture_window`.
+    let same_identity = matches!(found.app_name(), Ok(app) if app == target.app)
+        && matches!(found.title(), Ok(title) if title == target.title);
+    if !same_identity {
+        return Err(ComputerError::CaptureFailed(format!(
+            "window {id} no longer matches the approved application/title — it may have closed \
+             and had its id reused; take a fresh screenshot to re-resolve"
+        )));
+    }
+    let pid = found.pid().map_err(|e| ComputerError::Unsupported(e.to_string()))?;
 
     let script = format!(
         "tell application \"System Events\" to set frontmost of (first process whose unix id is {pid}) to true"
@@ -369,7 +415,10 @@ fn applescript_string_literal(s: &str) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
+fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
+    // issue #160 round-34 P2: identity check first — see `verify_window_identity`.
+    verify_window_identity(target)?;
+    let id = target.id;
     // Direct `user32.dll` FFI rather than a new Cargo dependency on the
     // `windows` crate `xcap` itself uses internally but does not re-export
     // (see `xcap::lib`'s own `pub use` list) — `user32.dll` ships on every
@@ -415,7 +464,10 @@ fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
 }
 
 #[cfg(target_os = "linux")]
-fn activate_window_impl(id: u32) -> Result<(), ComputerError> {
+fn activate_window_impl(target: &WindowInfo) -> Result<(), ComputerError> {
+    // issue #160 round-34 P2: identity check first — see `verify_window_identity`.
+    verify_window_identity(target)?;
+    let id = target.id;
     // issue #160 round-18 P2 (Codex os.rs:418): activate IN-PROCESS first —
     // post the EWMH `_NET_ACTIVE_WINDOW` client message ourselves through
     // `x11rb`, the same pure-Rust X protocol layer `xcap`'s own Linux backend
@@ -529,7 +581,7 @@ fn activate_window_x11(id: u32) -> Result<(), ComputerError> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-fn activate_window_impl(_id: u32) -> Result<(), ComputerError> {
+fn activate_window_impl(_target: &WindowInfo) -> Result<(), ComputerError> {
     Err(ComputerError::Unsupported(
         "window activation isn't implemented for this platform".into(),
     ))

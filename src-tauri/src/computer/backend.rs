@@ -61,6 +61,14 @@ pub trait ComputerBackend: Send + Sync {
     /// (there is exactly one system cursor), so this never needs a window
     /// query.
     fn cursor_position(&self) -> Result<(i32, i32), ComputerError>;
+    /// Raise/focus `target`, verifying its FULL identity — `id` AND
+    /// `app`/`title` — as close to the raise as the platform allows (issue
+    /// #160 round-34 P2, Codex computer_srv.rs:2986): activation addresses
+    /// the window by its reusable numeric id, so an id-only boundary could
+    /// raise and focus whatever unrelated application inherited the number
+    /// after the caller's own resolve-and-verify — a foreground-steal side
+    /// effect the caller's post-activation re-resolve only catches AFTER it
+    /// happened. Same discipline as [`Self::capture_window`].
     /// Bring window `id` to the foreground and give it OS keyboard/mouse
     /// focus (issue #160 round-4 P1 §2) — the ONLY mechanism
     /// `bus::computer_srv::activate_if_interactive` uses to hand focus back
@@ -75,7 +83,7 @@ pub trait ComputerBackend: Send + Sync {
     /// on this platform) — callers fail closed on that, never falling
     /// through to drive input into a window that may not actually have the
     /// foreground.
-    fn activate_window(&self, id: u32) -> Result<(), ComputerError>;
+    fn activate_window(&self, target: &WindowInfo) -> Result<(), ComputerError>;
 }
 
 /// Test-only override, set at most once per process (see
@@ -167,7 +175,7 @@ impl ComputerBackend for StubBackend {
         ))
     }
 
-    fn activate_window(&self, _id: u32) -> Result<(), ComputerError> {
+    fn activate_window(&self, _target: &WindowInfo) -> Result<(), ComputerError> {
         Err(ComputerError::Unsupported(
             "window activation needs the computer-os backend".into(),
         ))

@@ -160,7 +160,28 @@ impl ComputerBackend for MockBackend {
         Ok(*self.cursor.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    fn activate_window(&self, id: u32) -> Result<(), ComputerError> {
+    fn activate_window(&self, target: &WindowInfo) -> Result<(), ComputerError> {
+        // issue #160 round-34 P2 (Codex computer_srv.rs:2986): mirror the real
+        // backend's raise-time identity verification — `target` must still be
+        // present, with matching id AND app/title, in the CURRENTLY visible
+        // set (same source rules as `capture_window` above; the sequence is
+        // not popped here either).
+        let visible: Vec<WindowInfo> = {
+            let over = self.windows_override.lock().unwrap_or_else(|e| e.into_inner());
+            match over.as_ref() {
+                Some(w) => w.clone(),
+                None => self.windows.clone(),
+            }
+        };
+        let same_identity = visible
+            .iter()
+            .any(|w| w.id == target.id && w.app == target.app && w.title == target.title);
+        if !same_identity {
+            return Err(ComputerError::CaptureFailed(
+                "window no longer matches the approved application/title".into(),
+            ));
+        }
+        let id = target.id;
         if self.fail_activate.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ComputerError::Unsupported(
                 "mock backend: activate_window forced to fail".into(),
