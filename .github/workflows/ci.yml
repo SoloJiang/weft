@@ -88,6 +88,7 @@ jobs:
             wget \
             file \
             libxdo-dev \
+            libpipewire-0.3-dev \
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
@@ -116,6 +117,15 @@ jobs:
       - name: Run Rust tests
         if: runner.os != 'Windows'
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # The release build ships with computer-os (xcap + enigo) enabled, but the
+      # test run above compiles without it — so a compile break inside the real
+      # capture/input backend would otherwise only surface at tag time. Check
+      # (not test: runners are headless) the feature here, on the same platforms
+      # the release matrix builds.
+      - name: Check computer-os feature compiles
+        if: runner.os != 'Windows'
+        run: cargo check --manifest-path src-tauri/Cargo.toml --features computer-os
 
       # On Windows the cargo test-harness binaries get no application manifest
       # (tauri-build only manifests the app bin), so rfd's static import of the

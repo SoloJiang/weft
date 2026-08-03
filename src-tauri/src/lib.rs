@@ -22,6 +22,9 @@ mod codex_app_server;
 mod codex_slash;
 pub mod commands;
 mod commands_backup;
+/// OS-level "computer use" core (observation only — window
+/// enumeration + screenshot, no input injection). See `computer/mod.rs`.
+pub mod computer;
 pub mod config;
 mod coordinator;
 mod curator;
@@ -169,7 +172,14 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build());
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // OS-level global Escape, so the kill
+        // switch reaches Weft even while keyboard focus is on the
+        // computer-use-controlled app, not Weft's own WebView — see
+        // `computer::acquire_control`/`clear_control` for the
+        // register/unregister lifecycle hook (only live while a control
+        // lease is actually held).
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
     #[cfg(debug_assertions)]
     if mcp_bridge_enabled() {
@@ -212,6 +222,14 @@ pub fn run() {
         })
         .setup(move |app| {
             let _ = APP_HANDLE.set(app.handle().clone());
+            // wire the app handle `computer::mod.rs`
+            // needs to register/unregister the OS-level global Escape
+            // shortcut. Safe to call here — the `tauri_plugin_global_shortcut`
+            // plugin registered above already ran its own `setup()` (and thus
+            // `app.manage(GlobalShortcut { .. })`) during `.build()`, which
+            // completes before this closure runs (it fires on the runtime's
+            // `Ready` event, inside `.run()`).
+            computer::set_app_handle(app.handle().clone());
             coordinator::run(app.handle().clone(), wake_rx);
             // Install the grant-persist consumer before boot revive restores
             // persisted-running tasks, so
@@ -364,6 +382,11 @@ pub fn run() {
             commands::set_default_tool,
             commands::get_automatic_engine_routing_enabled,
             commands::set_automatic_engine_routing_enabled,
+            commands::get_computer_use_enabled,
+            commands::set_computer_use_enabled,
+            commands::get_computer_control_state,
+            commands::computer_emergency_stop,
+            commands::get_computer_stop_persist_failed,
             commands::get_quota_failover_enabled,
             commands::set_quota_failover_enabled,
             commands::get_pr_auto_merge_enabled,

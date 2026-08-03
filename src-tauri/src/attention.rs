@@ -1199,6 +1199,8 @@ mod tests {
             tool: "codex".to_string(),
             summary: "Run tests".to_string(),
             detail: "cargo test".to_string(),
+            detail_redacted: None,
+            preview: None,
             risk: crate::ask::RiskLevel::Write,
             ts: 10,
             thread_title: "Issue".to_string(),

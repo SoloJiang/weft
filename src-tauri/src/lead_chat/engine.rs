@@ -10,6 +10,7 @@ use crate::store::entities::lead_message;
 use crate::store::{repo, Db};
 use dashmap::{DashMap, DashSet};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -238,6 +239,14 @@ pub struct Outgoing {
     /// True when the original send carried files or images (computed from the
     /// ORIGINAL inputs before per-turn image-spill clears out.images).
     pub has_attachments: bool,
+    /// Absolute paths of images already spilled to `$TMP/weft-attachments` by
+    /// the per-turn image-spill step (see `send()`), populated ONLY for the
+    /// codex app-server transport — exec keeps to its plain-text path listing
+    /// appended into `text` and never reads this field. `spawn_codex_turn`/
+    /// `codex_consumer`'s queue flush hand these to `Client::
+    /// start_turn_with_images` as `localImage` input items alongside the text.
+    /// Always empty for every other tool/transport.
+    pub local_image_paths: Vec<String>,
 }
 
 /// Busy/queue bookkeeping for one engine. Mirrors the TUI's own semantics:
@@ -307,6 +316,7 @@ impl TurnState {
                     origin_tag: None,
                     queue_id: None,
                     has_attachments: false,
+                    local_image_paths: Vec::new(),
                 })
             }
             // A message queued before the wake goes first; the wake slides up one.
@@ -1200,6 +1210,10 @@ fn tool_row_status(has_output: bool, trackable: bool, is_error: bool) -> &'stati
 /// knows about, so the frontend can anchor that thread's branch here. Neither
 /// key is present at all when empty/None, so an ordinary tool call's content
 /// is byte-identical to pre-#99 output — same contract as `text_row_content`.
+/// `images` (screenshot data URIs, if the call itself already carries any —
+/// see `proto::ToolCall::images`) follows the identical "present only when
+/// non-empty" rule, so an old persisted row with no `images` key and a fresh
+/// image-less row parse identically on the frontend (default empty array).
 /// Pure and DB-free by design: `persist_tool_calls` is the only caller in the
 /// live path, but keeping this separate lets it be unit-tested directly.
 fn tool_row_content(
@@ -1219,6 +1233,9 @@ fn tool_row_content(
         }
         if !call.collab_threads.is_empty() {
             obj.insert("collabThreads".into(), call.collab_threads.clone().into());
+        }
+        if !call.images.is_empty() {
+            obj.insert("images".into(), call.images.clone().into());
         }
     }
     content
@@ -1276,8 +1293,232 @@ async fn persist_tool_calls(
     }
 }
 
+/// Merge a `ToolResultItem` into its running row's already-persisted content —
+/// pure and DB-free by the same split as `tool_row_content` (its sibling
+/// assembly point), so it's unit-testable directly. `output`/`is_error` are
+/// UNCONDITIONALLY overwritten: the call-side row only ever held a running
+/// placeholder for them (empty string / false), so the result is the first and
+/// only authoritative value either field gets. `images` follows that SAME
+/// "result overrides the call side" rule — written (replacing whatever the
+/// call-side JSON held, if anything) when the result carries any, and the key
+/// removed otherwise, so a call-side stub can never survive stale into the
+/// terminal row. `collabThreads` is intentionally NOT symmetric with that: it
+/// keeps its own "merge when non-empty, otherwise leave whatever's already
+/// there untouched" rule (see the comment below) because a `spawnAgent`
+/// call's `receiverThreadIds` becoming known here is filling in a value the
+/// call side legitimately hadn't resolved yet — not a terminal result
+/// superseding the call's own claim, so an empty item-side list must never
+/// erase a real thread id the call side already recorded.
+fn merge_tool_result_content(content: &mut serde_json::Value, item: &super::proto::ToolResultItem) {
+    let Some(obj) = content.as_object_mut() else {
+        return;
+    };
+    obj.insert("output".into(), item.output.clone().into());
+    obj.insert("is_error".into(), item.is_error.into());
+    // a `spawnAgent` collab call's `receiverThreadIds` is empty at
+    // item/started (captured — emptily — into this row's content by
+    // persist_tool_calls) and only becomes known HERE, at item/completed.
+    // Merge it in now so the frontend can still anchor that thread's branch to
+    // this row once it re-renders — until then, the child's own rows (already
+    // tagged with agentThread) have no known anchor yet and correctly render
+    // top-level/flat (collabBranches.ts's groupTimeline is a stateless
+    // whole-array recompute, so this is an honest "not resolved yet", not a
+    // wrong guess: nothing is hidden, it just hasn't grouped yet).
+    if !item.collab_threads.is_empty() {
+        obj.insert("collabThreads".into(), item.collab_threads.clone().into());
+    }
+    if item.images.is_empty() {
+        obj.remove("images");
+    } else {
+        obj.insert("images".into(), item.images.clone().into());
+    }
+}
+
+/// how many of a session's most
+/// recent tool-result rows may keep their inline screenshot data URIs in
+/// `content.images` at once. Screenshot data URIs run from a few hundred KB
+/// to a couple MB each (see `lead_chat::proto::cap_and_dedup_images`'s own
+/// `MAX_CHARS`); an unthrottled screenshot loop — Full/Always-granted
+/// computer use, no per-call card left to slow it down — can otherwise
+/// persist hundreds of these into SQLite with NO bound at all: this
+/// module's own per-CALL cap (`cap_and_dedup_images`, ≤4 images per single
+/// result) does nothing to stop that ACROSS calls, and `history` load then
+/// hands the whole accumulated payload to the frontend on every reload. Kept
+/// SMALL: an older screenshot is still reachable by its file path, which
+/// lives in the SAME row's `output` text (the "text path
+/// is never dropped" rule) — this cap only prunes the redundant INLINE
+/// base64 copy once it's no longer among the most recent few, never the
+/// on-disk file or the row's own text, and never the CURRENT call's own
+/// inline image (see `merge_tool_results`'s own doc). The
+/// P2: this cap is enforced per-SESSION (see
+/// `enforce_durable_inline_image_cap_db`'s own doc) — a thread's several
+/// lead/worker timelines each get their own `MAX_INLINE_IMAGE_ROWS` budget,
+/// not one shared across all of them.
+const MAX_INLINE_IMAGE_ROWS: usize = 4;
+
+/// Push a newly-completed, image-bearing tool row onto `rows` (oldest first)
+/// and return the updated queue plus every entry that must be evicted to
+/// keep it at [`MAX_INLINE_IMAGE_ROWS`] or fewer (oldest evicted first).
+/// Pure/synchronous — no `Db`/`AppHandle` — so this exact retention decision
+/// is unit-testable directly; `merge_tool_results` is the only production
+/// caller, and owns applying each eviction as its own `repo::
+/// update_lead_message` rewrite (stripping `images` from that row's OWN
+/// already-persisted content, keeping its `output` text untouched).
+fn track_inline_image_row(
+    mut rows: std::collections::VecDeque<(i32, bool, serde_json::Value)>,
+    new_row: (i32, bool, serde_json::Value),
+) -> (
+    std::collections::VecDeque<(i32, bool, serde_json::Value)>,
+    Vec<(i32, bool, serde_json::Value)>,
+) {
+    rows.push_back(new_row);
+    let mut evicted = Vec::new();
+    while rows.len() > MAX_INLINE_IMAGE_ROWS {
+        if let Some(oldest) = rows.pop_front() {
+            evicted.push(oldest);
+        }
+    }
+    (rows, evicted)
+}
+
+/// the DURABLE, restart-safe half of the inline-
+/// image retention cap. `inner.inline_image_rows` above only ever sees rows
+/// written during THIS process's own lifetime — a restart starts that queue
+/// empty, so a session that keeps napping computer-use screenshots across
+/// restarts could silently re-accumulate past `MAX_INLINE_IMAGE_ROWS` inline
+/// images in SQLite forever: nothing before this change closed the gap
+/// between "capped for one process's lifetime" and "capped, full stop", and
+/// `history` loads read straight off the store (`repo::list_lead_messages`,
+/// the SAME query this uses), so an unbounded on-disk backlog was handed to
+/// the frontend on every reload regardless of how recently the app itself
+/// restarted.
+///
+/// Queries this thread's OWN persisted `kind:"tool"` rows fresh — ascending
+/// by id/seq, matching `history`'s own order — every time a NEW inline image
+/// is about to be written, and strips `images` from every row beyond the
+/// `MAX_INLINE_IMAGE_ROWS` most recent, DURABLY, in the SAME store `history`
+/// reads from. Since the row just written is always the newest by id order,
+/// it can never itself land in the stripped slice as long as the cap is at
+/// least 1 — nothing here needs to special-case "never touch the row this
+/// very call just wrote". `inner.inline_image_rows`'s in-memory pass (in
+/// `merge_tool_results`, right after this call) stays as an additional
+/// (redundant but harmless — stripping an already-stripped row's absent
+/// `images` key is a no-op) fast path; THIS is now the authoritative one.
+///
+/// Split from the `&AppHandle`-taking wrapper below ([`enforce_durable_
+/// inline_image_cap`]) purely so this exact DB-mutating decision is
+/// unit-testable directly: this crate's `AppHandle` is the concrete `Wry`
+/// runtime with no `tauri::test::mock_app` path (see `post_stall_notice_via`'s
+/// own doc for the identical wall), so a function taking `&AppHandle` is
+/// unreachable from any test. Returns every `(row_id, content, status)` this
+/// call actually stripped and durably rewrote, so the wrapper can push each
+/// as a `Push::ToolResult` after this returns.
+///
+/// `session_id` scopes the candidate rows
+/// to ONE session's own timeline — `None` for the lead, `Some(id)` for a
+/// chat-mode worker — mirroring how every other per-timeline read in this
+/// module (e.g. `rewind`'s own `filter(|m| m.session_id == snap.session_id)`)
+/// treats `lead_message.session_id` as the timeline key, NOT `thread_id`
+/// alone. A thread can host several lead/worker sessions at once, each with
+/// its OWN chat history; before this fix, `list_lead_messages(db, thread_id)`
+/// pulled every session's tool rows into ONE shared retention queue, so a
+/// screenshot-heavy worker in repo A could strip the most-recent inline
+/// images off a DIFFERENT worker's (repo B's) timeline, leaving B under the
+/// `MAX_INLINE_IMAGE_ROWS` cap it's entitled to on its own.
+async fn enforce_durable_inline_image_cap_db(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Vec<(i32, String, String)> {
+    // query ONLY this session's
+    // image-candidate tool rows — the old whole-thread `list_lead_messages`
+    // load re-scanned every session's entire history on each new screenshot,
+    // quadratic as the timeline grows, on the engine-consumer path.
+    let Ok(messages) = repo::list_session_image_tool_messages(db, thread_id, session_id).await
+    else {
+        return Vec::new();
+    };
+    // Oldest-first (matches the query's own order) every persisted
+    // tool row that STILL carries an inline image, scoped to THIS session
+    // alone (`session_id` above), paired with its already-parsed JSON.
+    //
+    // a row counts toward the
+    // retention limit ONLY when its parsed JSON has a genuine TOP-LEVEL
+    // `images` collection — NOT merely a `"images"` substring somewhere in the
+    // serialized content. A tool result can legitimately mention `"images"`
+    // below the top level (e.g. nested inside its own serialized input), and
+    // the strip below already refuses to touch such a row; but COUNTING it
+    // still inflated `keep_from` and could push a genuine older screenshot
+    // into the stripped slice even while fewer than `MAX_INLINE_IMAGE_ROWS`
+    // real image rows existed. Parsing up front and requiring a top-level key
+    // makes the boundary reflect real image rows only. The cheap `.contains`
+    // pre-check stays purely as a parse-avoidance fast path (this session's
+    // non-image rows never pay for a parse), NOT as the counting predicate.
+    let image_bearing: Vec<(&lead_message::Model, serde_json::Value)> = messages
+        .iter()
+        .filter_map(|m| {
+            let value = serde_json::from_str::<serde_json::Value>(&m.content).ok()?;
+            let has_top_level_images = value
+                .as_object()
+                .is_some_and(|obj| obj.contains_key("images"));
+            has_top_level_images.then_some((m, value))
+        })
+        .collect();
+    let keep_from = image_bearing.len().saturating_sub(MAX_INLINE_IMAGE_ROWS);
+    let mut stripped = Vec::new();
+    for (m, mut value) in image_bearing.into_iter().take(keep_from) {
+        // Guaranteed an object with a top-level `images` key — that is exactly
+        // the filter `image_bearing` was built from — so `remove` here always
+        // strips a real inline-image collection.
+        let Some(obj) = value.as_object_mut() else { continue };
+        if obj.remove("images").is_none() {
+            continue;
+        }
+        let content_str = value.to_string();
+        if repo::update_lead_message(db, m.id, &content_str, &m.status)
+            .await
+            .is_ok()
+        {
+            stripped.push((m.id, content_str, m.status.clone()));
+        }
+    }
+    stripped
+}
+
+/// The live wrapper: runs [`enforce_durable_inline_image_cap_db`] and pushes
+/// a `Push::ToolResult` for each row it actually stripped, so an open
+/// frontend timeline reflects the durable trim immediately rather than only
+/// on the next reload. `session_id` is threaded straight through to scope the
+/// cap to the calling session's own timeline (the
+/// Rec — see [`enforce_durable_inline_image_cap_db`]'s own doc for why).
+async fn enforce_durable_inline_image_cap(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) {
+    for (message_id, content, status) in
+        enforce_durable_inline_image_cap_db(db, thread_id, session_id).await
+    {
+        let _ = app.emit(EVENT, Push::ToolResult { thread_id, message_id, content, status });
+    }
+}
+
 /// Merge tool results into their running rows (claude tool_result / codex
 /// item.completed); a result for an untracked row is dropped.
+///
+/// a result carrying inline images is tracked in
+/// `inner.inline_image_rows` (bounded, in-memory, this engine's own
+/// lifetime) AFTER it persists — [`track_inline_image_row`] then reports any
+/// OLDER row that must be pruned to stay at the cap, and each one has its
+/// `images` key stripped from its ALREADY-persisted content and rewritten,
+/// right here. This never touches the CURRENT item's own `content` (already
+/// written above, images intact) — M3-B's "this screenshot inlines for a
+/// capable engine" contract is unaffected; only OLDER rows' accumulated
+/// history is pruned. the AUTHORITATIVE cap is no
+/// longer this in-memory pass — see [`enforce_durable_inline_image_cap`],
+/// called right after it, for the restart-safe, DB-sourced enforcement that
+/// now bounds this regardless of how many times the app has restarted since.
 async fn merge_tool_results(
     app: &AppHandle,
     db: &Db,
@@ -1289,23 +1530,7 @@ async fn merge_tool_results(
         let Some((row_id, mut content)) = inner.tool_rows.remove(&item.id) else {
             continue;
         };
-        if let Some(obj) = content.as_object_mut() {
-            obj.insert("output".into(), item.output.into());
-            obj.insert("is_error".into(), item.is_error.into());
-            // issue #99: a `spawnAgent` collab call's `receiverThreadIds` is
-            // empty at item/started (captured — emptily — into this row's
-            // content by persist_tool_calls) and only becomes known HERE, at
-            // item/completed. Merge it in now so the frontend can still anchor
-            // that thread's branch to this row once it re-renders — until
-            // then, the child's own rows (already tagged with agentThread)
-            // have no known anchor yet and correctly render top-level/flat
-            // (collabBranches.ts's groupTimeline is a stateless whole-array
-            // recompute, so this is an honest "not resolved yet", not a wrong
-            // guess: nothing is hidden, it just hasn't grouped yet).
-            if !item.collab_threads.is_empty() {
-                obj.insert("collabThreads".into(), item.collab_threads.clone().into());
-            }
-        }
+        merge_tool_result_content(&mut content, &item);
         let status = if item.is_error { "error" } else { "complete" };
         let content_str = content.to_string();
         let _ = repo::update_lead_message(db, row_id, &content_str, status).await;
@@ -1318,6 +1543,41 @@ async fn merge_tool_results(
                 status: status.into(),
             },
         );
+        if !item.images.is_empty() {
+            let rows = std::mem::take(&mut inner.inline_image_rows);
+            let (rows, evicted) = track_inline_image_row(rows, (row_id, item.is_error, content));
+            inner.inline_image_rows = rows;
+            for (old_row_id, old_is_error, mut old_content) in evicted {
+                if let Some(obj) = old_content.as_object_mut() {
+                    obj.remove("images");
+                }
+                let old_status = if old_is_error { "error" } else { "complete" };
+                let old_content_str = old_content.to_string();
+                if repo::update_lead_message(db, old_row_id, &old_content_str, old_status)
+                    .await
+                    .is_ok()
+                {
+                    let _ = app.emit(
+                        EVENT,
+                        Push::ToolResult {
+                            thread_id,
+                            message_id: old_row_id,
+                            content: old_content_str,
+                            status: old_status.into(),
+                        },
+                    );
+                }
+            }
+            // the DB-write-path cap runs on every
+            // new inline image regardless of the in-memory pass above — see
+            // `enforce_durable_inline_image_cap`'s own doc for why this one,
+            // not the in-memory queue, is the authoritative bound.
+            // `inner.session_id` scopes it to THIS
+            // session's own timeline so a different session sharing the same
+            // thread can't have ITS most-recent inline images stripped by an
+            // unrelated session's screenshot volume.
+            enforce_durable_inline_image_cap(app, db, thread_id, inner.session_id).await;
+        }
     }
 }
 
@@ -1449,6 +1709,7 @@ async fn apply_lead_sentinels(
                         origin_tag: None,
                         queue_id: None,
                         has_attachments: false,
+                        local_image_paths: Vec::new(),
                     };
                     queue_hidden_delivery(app, inner, out);
                 }
@@ -1878,9 +2139,14 @@ pub struct EngineInner {
     pub cwd: std::path::PathBuf,
     /// Ask-hook + MCP injection args, appended to every spawn.
     pub extra_args: Vec<String>,
-    /// Per-engine environment injected at spawn. OpenCode uses this for a
-    /// session-scoped inline MCP config; keeping it on the engine prevents two
-    /// sessions sharing one worktree from overwriting each other's bus URL.
+    /// Environment variables set on every spawned tool child alongside
+    /// `extra_args`. Two producers today: the codex computer-use bearer
+    /// (the bearer must ride the child's
+    /// environment, owner-only readable, instead of `-c` argv which is
+    /// world-readable via process listings), and OpenCode's session-scoped
+    /// inline MCP config (OPENCODE_CONFIG_CONTENT — keeping it on the engine
+    /// prevents two sessions sharing one worktree from overwriting each
+    /// other's bus URL). See `bus::inject::Injection::env`.
     pub extra_env: Vec<(String, String)>,
     pub system_prompt: String,
     pub native_id: Option<String>,
@@ -2001,6 +2267,19 @@ pub struct EngineInner {
     /// its persisted `kind:"tool"` row id and content JSON, so the out-of-band
     /// result merges its output without re-reading the row. Cleared per turn.
     pub tool_rows: std::collections::HashMap<String, (i32, serde_json::Value)>,
+    /// this session's most recent completed
+    /// tool-result rows that currently carry inline screenshot data URIs in
+    /// their persisted `content.images` — oldest first, `(row_id, is_error,
+    /// content)`. Capped at `MAX_INLINE_IMAGE_ROWS` by `merge_tool_results`,
+    /// which evicts the OLDEST entry's inline images (stripping `images`
+    /// from THAT row's own already-persisted content, keeping its `output`
+    /// text — the screenshot's file path — untouched) the moment a NEW
+    /// image-bearing row would push this past the cap. In-memory only,
+    /// scoped to THIS engine's own lifetime — see `merge_tool_results`'s own
+    /// doc for why that is an accepted, disclosed limitation rather than a
+    /// durable migration. Never cleared per-turn (unlike `tool_rows`): the
+    /// retention window spans the whole session, not one turn.
+    pub inline_image_rows: std::collections::VecDeque<(i32, bool, serde_json::Value)>,
     /// Explicit user/guard stop. Hidden plumbing must not resurrect stopped
     /// engines; explicit sends/ensure clear this and restart as needed.
     pub stopped: bool,
@@ -2570,7 +2849,9 @@ async fn ensure_running_locked(
         .args(build_args(inner))
         .current_dir(&inner.cwd)
         .env("PATH", crate::detect::tool_path())
-        .envs(inner.extra_env.iter().cloned())
+        // injection-supplied env (the codex computer
+        // bearer travels here, never argv — see `EngineInner::extra_env`).
+        .envs(inner.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -3045,6 +3326,7 @@ async fn admit_pending_durable_batch_admitted(
             origin_tag: Some(hidden_delivery_tag(row.id)),
             queue_id: None,
             has_attachments: false,
+            local_image_paths: vec![],
         };
         match delivery {
             HiddenDelivery::Noop => {
@@ -3358,6 +3640,150 @@ fn advance_dequeued_turn(inner: &mut EngineInner, next: &Option<Outgoing>) {
         .filter(|tag| hidden_delivery_id_from_tag(Some(tag)).is_none());
 }
 
+/// a process-local, unpredictable nonce appended to
+/// the codex app-server attachment spill's own file name (`send`'s image-spill
+/// loop, below) — mirrors the identical fix for the per-hook-call
+/// attachment path. `AtomicU64`, not per-call randomness: cheap, monotonic,
+/// and unique for the life of this process, which is all "a co-resident
+/// process can't pre-place a same-named symlink before this write runs"
+/// needs — the write itself also goes through `create_new` (O_EXCL), so even
+/// a GUESSED name would still be refused; the nonce just makes guessing
+/// itself infeasible in the first place.
+static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// a per-PROCESS random nonce
+/// folded into codex app-server attachment file names. `ATTACH_SEQ` above is
+/// monotonic and unique only WITHIN one process — two concurrent Weft
+/// processes sharing the OS temp dir (an installed app plus `tauri dev`, which
+/// use SEPARATE databases and can therefore mint the SAME `row_id`) both start
+/// that counter at 0 and generate identical `msg<row>-<i>-<seq>` paths. The
+/// app-server branch writes with `create_new` (O_EXCL), so whichever process
+/// loses that collision silently drops the human's image from
+/// `local_image_paths` while its text turn proceeds. A random component that is
+/// stable for THIS process's lifetime (but disjoint from any other process's)
+/// makes the two processes' paths never collide, without disturbing the
+/// PREDICTABLE non-app-server names `rewind::dispatched_text` reconstructs.
+fn attach_process_nonce() -> u64 {
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NONCE.get_or_init(rand::random::<u64>)
+}
+
+/// write a codex app-server image attachment to `p`
+/// guarded against a pre-placed symlink/existing file at that exact path —
+/// mirrors `computer::screenshot_window`'s own no-follow/exclusive/owner-only
+/// write for the identical "a background process on this account swaps the
+/// target the instant before Weft writes it" hazard (the same fix landed for the
+/// analogous per-hook-call attachment path the same way). `create_new`
+/// (O_EXCL) refuses to write through anything already at `p` (the caller's
+/// own `ATTACH_SEQ` nonce means this never spuriously collides with a prior,
+/// legitimate attachment of this process's own); `O_NOFOLLOW` refuses to
+/// follow a symlink leaf even if one raced into place after `create_dir_all`
+/// but before this call. `mode(0o600)` keeps the file owner-only from the
+/// moment of creation. Returns `false` (never panics) on ANY failure —
+/// best-effort, mirroring the plain `std::fs::write(...).is_ok()` this
+/// replaces for the codex app-server branch: a skipped image must never fail
+/// the whole chat turn, it just means that one attachment doesn't make it
+/// into this turn.
+///
+/// RESIDUAL (documented, not closed here — mirrors the attachment-write note,
+/// and the broader TOCTOU tracking): after this call returns and the
+/// file handle closes, a SAME-UID process can still `readdir` the (shared)
+/// spill directory, discover the real (nonce-bearing) file name, and swap it
+/// for a symlink before the codex app-server PROCESS ITSELF later opens
+/// `local_image_paths` to build its own `turn/start` payload — this closes
+/// the window up through THIS write, not the separate one between this write
+/// and codex's own later read. Fully closing that needs codex itself to
+/// either accept raw bytes (never a path at all) or open with its own
+/// `O_NOFOLLOW` — neither is in this codebase's control.
+#[cfg(unix)]
+fn write_attachment_no_follow(p: &std::path::Path, bytes: &[u8]) -> bool {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opt = std::fs::OpenOptions::new();
+    opt.write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    match opt.open(p) {
+        Ok(mut f) => f.write_all(bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Non-unix fallback: the pre-existing plain write — owner-only/no-follow
+/// hardening is a unix-only concept this crate can portably act on (see this
+/// function's own `#[cfg(unix)]` sibling above).
+#[cfg(not(unix))]
+fn write_attachment_no_follow(p: &std::path::Path, bytes: &[u8]) -> bool {
+    std::fs::write(p, bytes).is_ok()
+}
+
+/// write a PER-TURN dialect's image attachment to
+/// `p` guarded against a pre-placed symlink, EXTENDING the earlier
+/// no-follow defense (see [`write_attachment_no_follow`]'s own doc) to every
+/// spill branch, not just codex app-server. An earlier fix scoped the hardened
+/// write to app-server alone, reasoning that every OTHER per-turn dialect
+/// only ever lists the spilled path in TEXT for the agent to read itself —
+/// a materially lower-severity exposure than app-server's own first-class
+/// `localImage` turn/start input. The hazard:
+/// reasoning incomplete: the vulnerable step is this WRITE itself, not what
+/// happens to the path afterward — plain `std::fs::write` (what this
+/// replaces for every non-app-server branch) follows a symlink and
+/// TRUNCATES its target, so a same-UID process that predicts the next
+/// `msg<row_id>-<i>.<ext>` name and pre-plants a symlink to an arbitrary
+/// user-writable file gets it clobbered by Weft's own write the instant a
+/// human's next image attachment lands — regardless of whether any agent
+/// ever reads the resulting path.
+///
+/// Unlike [`write_attachment_no_follow`], this does NOT use `create_new`
+/// (O_EXCL): these branches use a PREDICTABLE name (`msg<row_id>-<i>.<ext>`,
+/// no `ATTACH_SEQ` nonce), and a rewind can re-dispatch the SAME user row —
+/// same `row_id`, same predictable path — a second time. `create_new` would
+/// then spuriously refuse Weft's own earlier, legitimate write sitting at
+/// that exact path, breaking replay (`rewind::dispatched_text`'s own
+/// persisted-`dispatched`-field fallback aside, this write must still be
+/// ABLE to happen a second time). `create(true).truncate(true)` instead
+/// permits overwriting an ordinary pre-existing file (our own prior write),
+/// while `O_NOFOLLOW` still refuses the kernel-level `open(2)` outright
+/// (`ELOOP`) the instant the leaf is a symlink — closing exactly the vector
+/// named above, without reopening the earlier replay
+/// concern. `mode(0o600)` keeps this owner-only from creation, matching
+/// every other attachment/screenshot write this codebase already hardens
+/// this way.
+///
+/// RESIDUAL (documented, not closed here — same shape as
+/// [`write_attachment_no_follow`]'s own note): a same-UID process using a
+/// HARD LINK instead of a symlink at the predictable path is not caught by
+/// `O_NOFOLLOW` (which only ever refuses a symlink leaf) — `truncate(true)`
+/// would still write through a hard-linked file, corrupting whatever else
+/// it's linked to. Closing that fully needs either `create_new` (which
+/// breaks the replay case above) or moving spilled attachments into a
+/// directory no other account/process can write into at all; tracked as a
+/// follow-up, not required to close the SYMLINK vector this
+/// round's fix targets.
+#[cfg(unix)]
+fn write_attachment_no_follow_allow_overwrite(p: &std::path::Path, bytes: &[u8]) -> bool {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opt = std::fs::OpenOptions::new();
+    opt.write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    match opt.open(p) {
+        Ok(mut f) => f.write_all(bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Non-unix fallback — see [`write_attachment_no_follow`]'s own sibling for
+/// why owner-only/no-follow hardening is unix-only here.
+#[cfg(not(unix))]
+fn write_attachment_no_follow_allow_overwrite(p: &std::path::Path, bytes: &[u8]) -> bool {
+    std::fs::write(p, bytes).is_ok()
+}
+
 /// Send a human message: optimistic-persist + either write through or queue.
 /// `images` ride the outbound message as base64 blocks; `files` are appended
 /// as plain paths (the agent reads them with its own tools).
@@ -3653,19 +4079,103 @@ pub async fn send(
             outbound.push_str(&format!("- {f}\n"));
         }
     }
+    // Hoisted above the spill loop (rather than computed only at Phase 3 below,
+    // as it used to be) so the loop can tell app-server codex apart from every
+    // other per-turn dialect/transport while it's spilling.
+    let is_codex_appserver = ctx.tool == "codex" && codex_appserver_enabled();
     // Per-turn dialects take no inline image blocks: spill pasted images to
     // temp files and hand over paths — every agent can read those itself.
+    let mut local_image_paths: Vec<String> = Vec::new();
     let images = if per_turn(&ctx.tool) && !images.is_empty() {
         use base64::Engine as _;
         let dir = std::env::temp_dir().join("weft-attachments");
         let _ = std::fs::create_dir_all(&dir);
-        outbound.push_str("\n\nAttached images (read them as needed):\n");
-        for (i, (mt, data)) in images.iter().enumerate() {
+        // refuse a SYMLINK
+        // planted at the shared spill dir. `create_dir_all` FOLLOWS a symlink
+        // already sitting at this path, and the `set_permissions` below would
+        // then chmod — and every spill write would traverse — whatever it
+        // points to; the per-file `O_NOFOLLOW` writes only guard the LEAF file
+        // name, never this parent. Verify the dir itself is a real directory
+        // via `symlink_metadata`; if it is not, spill NOTHING (iterate an empty
+        // slice below) rather than write through an attacker-substituted
+        // parent — the human's text turn still goes out, just without inline
+        // images.
+        let dir_is_real = std::fs::symlink_metadata(&dir)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
+        // best-effort tighten the shared spill
+        // directory to owner-only — defense in depth alongside the per-file
+        // hardening below, for the identical "shared tmp dir, permissive
+        // process umask" hazard `computer::screenshot_window` also closes.
+        // Best-effort: a failure here (already-wrong ownership, a read-only
+        // mount, non-unix) never blocks the spill itself.
+        #[cfg(unix)]
+        {
+            if dir_is_real {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        if dir_is_real {
+            outbound.push_str("\n\nAttached images (read them as needed):\n");
+        }
+        // A symlinked/unsafe spill dir yields an empty iteration — no image is
+        // written through it, and `local_image_paths` stays empty.
+        let spill: &[(String, String)] = if dir_is_real { &images } else { &[] };
+        for (i, (mt, data)) in spill.iter().enumerate() {
             let ext = mt.rsplit('/').next().unwrap_or("png");
-            let p = dir.join(format!("msg{row_id}-{i}.{ext}"));
+            // ONLY the codex app-server branch gets
+            // a NONCE-bearing name — that's the ONLY transport that later
+            // hands this exact path to the agent as a first-class
+            // `localImage` turn/start input (`is_codex_appserver` branch just
+            // below); every OTHER per-turn dialect keeps the PREDICTABLE
+            // `msg<row_id>-<i>.<ext>` name `rewind::dispatched_text`'s own
+            // fallback reconstruction relies on for rows that predate its
+            // persisted-`dispatched`-field stamping (see this function's own
+            // "Persist the EXACT dispatched text" comment below).
+            //
+            // EVERY branch now gets a no-follow
+            // guarded write, not just app-server — see
+            // `write_attachment_no_follow_allow_overwrite`'s own doc for why
+            // The OLD app-server-only scoping
+            // incomplete: a plain `std::fs::write` at a predictable name
+            // follows a symlink and truncates whatever it points at,
+            // regardless of whether any agent later reads the resulting
+            // path — the vulnerable step is THIS write, not the later read.
+            let p = if is_codex_appserver {
+                let seq = ATTACH_SEQ.fetch_add(1, Ordering::SeqCst);
+                // the per-process
+                // nonce disjoins this name from any OTHER Weft process's spill
+                // (which could share `row_id`/`seq` with an independent counter)
+                // — see `attach_process_nonce`'s own doc. Only the app-server
+                // branch: the `else` branch's name stays PREDICTABLE for
+                // `rewind::dispatched_text`'s reconstruction.
+                dir.join(format!("msg{row_id}-{i}-{}-{seq}.{ext}", attach_process_nonce()))
+            } else {
+                dir.join(format!("msg{row_id}-{i}.{ext}"))
+            };
             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
-                if std::fs::write(&p, bytes).is_ok() {
+                let written = if is_codex_appserver {
+                    // Nonce-named — never collides with a prior write of our
+                    // own, so `create_new` (O_EXCL) is both safe and stricter.
+                    write_attachment_no_follow(&p, &bytes)
+                } else {
+                    // Predictable name — a rewind can re-dispatch the SAME
+                    // row a second time, landing on this SAME path, so this
+                    // must still allow overwriting our own prior write (see
+                    // `write_attachment_no_follow_allow_overwrite`'s own doc)
+                    // while still refusing a symlink leaf.
+                    write_attachment_no_follow_allow_overwrite(&p, &bytes)
+                };
+                if written {
                     outbound.push_str(&format!("- {}\n", p.display()));
+                    // app-server transport ALSO gets these as first-class
+                    // `localImage` input items on turn/start (codex_app_server::
+                    // turn_start_params_with_images) — not just a path listed in
+                    // the text. exec has no such channel, so it stays text-only.
+                    if is_codex_appserver {
+                        local_image_paths.push(p.display().to_string());
+                    }
                 }
             }
         }
@@ -3706,13 +4216,13 @@ pub async fn send(
         origin_tag: ctx.origin_tag.clone(),
         queue_id: if ctx.direct { None } else { Some(row_id) },
         has_attachments,
+        local_image_paths,
     };
 
     // Phase 3: re-acquire the lock and COMMIT against CURRENT state — deliver,
     // enqueue, promote, or abort is decided here, not enforced from the Phase-1
     // snapshot (which only decided the row's optimistic status). The lock drops
     // before any turn-spawning awaits.
-    let is_codex_appserver = ctx.tool == "codex" && codex_appserver_enabled();
     let is_acp = is_acp_tool(&ctx.tool);
     let is_connection = is_codex_appserver || is_acp;
     let spawn_now = ctx.direct && per_turn(&ctx.tool) && !is_connection;
@@ -3972,7 +4482,7 @@ async fn spawn_codex_turn(
     out: Outgoing,
     expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
-    let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing, program) = {
+    let (native, cwd, sid, thread_id_i, system_prompt, extra_args, extra_env, existing, program) = {
         let i = eng.lock().await;
         // Atomic with the snapshot: don't start a codex turn for a stopped engine
         // (a stop racing the send's Phase-3-to-spawn window, which is widest on the
@@ -3992,6 +4502,7 @@ async fn spawn_codex_turn(
             i.thread_id,
             i.system_prompt.clone(),
             i.extra_args.clone(),
+            i.extra_env.clone(),
             i.codex_client.clone(),
             // Effective codex binary for THIS session: a per-session pin wins over
             // the global override, so a pinned (opt-out) codex session keeps its
@@ -4015,6 +4526,7 @@ async fn spawn_codex_turn(
             let c = crate::codex_app_server::Client::connect_session(
                 &program,
                 &extra_args,
+                &extra_env,
                 &cwd,
                 owner,
             )
@@ -4108,7 +4620,9 @@ async fn spawn_codex_turn(
     // the prompt is prepended to the FIRST turn of a brand-new thread; a resumed
     // thread already carries it in conversation history.
     let first_text = codex_first_turn_text(&system_prompt, &out.text, had_native);
-    let turn = client.start_turn(&thread, &first_text).await?;
+    let turn = client
+        .start_turn_with_images(&thread, &first_text, &out.local_image_paths)
+        .await?;
     client.set_active_turn(&thread, &turn).await;
     // The turn is in flight, so the thread is real and carries the system prompt:
     // now it's safe to persist the native id (a later resume reuses this rollout).
@@ -4216,7 +4730,7 @@ async fn spawn_acp_turn(
     out: Outgoing,
     expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
-    let (native, cwd, sid, thread_id_i, system_prompt, tool, command, ask_dir) = {
+    let (native, cwd, sid, thread_id_i, system_prompt, tool, command, ask_dir, worktree_id) = {
         let i = eng.lock().await;
         // `tearing_down` included as defence in depth: the hidden path already
         // refuses, but this is the one gate every ACP turn passes through.
@@ -4236,6 +4750,12 @@ async fn spawn_acp_turn(
             i.tool.clone(),
             i.command.clone(),
             i.ask_dir.clone(),
+            // this worker's own worktree id, already
+            // resolved at engine-build time (`EngineInner::worktree_id`'s own
+            // doc) — reused here to pin `weft_computer`'s `?wt=` query param
+            // instead of the multi-repo-direction "first worktree" fallback.
+            // `None` for the lead lane (a lead has no worktree at all).
+            i.worktree_id,
         )
     };
     let backend =
@@ -4249,53 +4769,84 @@ async fn spawn_acp_turn(
         .try_state::<crate::BusBase>()
         .map(|b| b.0.clone())
         .unwrap_or_default();
+    // `weft_computer` is now injected
+    // UNCONDITIONALLY for every issue-lead/worker engine (concierge/curator
+    // still never get it) — the setting/kill-switch is enforced dynamically,
+    // server-side, on every single call by `bus::computer_srv::run_action`'s
+    // own `computer::enabled` gate (fail-closed with a "disabled in weft
+    // settings" result). This used to re-check `computer::enabled(&db)` here
+    // and pass that as `include_computer`, which meant an engine spawned (or
+    // an ACP session opened) BEFORE the human turned the setting on would
+    // simply never present the tool at all on this per-turn path either.
+    // Always injecting means the human flipping the setting takes effect
+    // immediately, on the NEXT tool call, without needing to rebuild
+    // anything — see `lead_chat::commands.rs`'s own three non-ACP injection
+    // points for the identical change, and `bus::inject::inject_computer`'s
+    // doc for why the endpoint itself was always designed to be always-safe
+    // to hand out (the description also says it needs enabling in Settings,
+    // and the server denies every call otherwise).
     let mcp = if base.is_empty() {
         vec![]
     } else if sid.is_none() {
         // Lead-kind engine: choose MCP from thread kind.
-        let kind = repo::get_thread(&db, thread_id_i)
-            .await
-            .ok()
-            .flatten()
-            .map(|th| th.kind)
-            .unwrap_or_default();
-        match kind.as_str() {
-            // Concierge: weft_global only (never bus).
-            "concierge" => crate::bus::inject::acp_mcp_servers(
-                &base,
-                thread_id_i,
-                "lead",
-                None,
-                false,
-                false,
-                true,
-                false,
-            ),
-            // Curator: curator MCP + bus under LEAD identity.
-            "curator" => crate::bus::inject::acp_mcp_servers(
-                &base,
-                thread_id_i,
-                crate::bus::LEAD,
-                None,
-                true,
-                false,
-                false,
-                true,
-            ),
-            // Issue lead: planner + bus.
-            _ => crate::bus::inject::acp_mcp_servers(
-                &base,
-                thread_id_i,
-                crate::bus::LEAD,
-                None,
-                true,
-                true,
-                false,
-                false,
-            ),
+        // : a TRANSIENT `get_thread` failure must fail
+        // CLOSED — the old `.ok().flatten()...unwrap_or_default()` collapsed an
+        // error into `""`, which the `_` arm below classifies as an issue lead
+        // and injects `weft_computer` into, even for a concierge/curator lead
+        // that must NEVER receive it (and whose bearer would then work once the
+        // DB recovers, an existing Full grant authorizing input with no card).
+        // On a lookup ERROR inject NO MCP servers at all this open (the turn
+        // still runs; it simply gets no injected server, and definitely not
+        // computer-use); a genuine `Ok(None)` keeps the prior default.
+        match repo::get_thread(&db, thread_id_i).await {
+            Err(_) => vec![],
+            Ok(row) => match row.map(|th| th.kind).unwrap_or_default().as_str() {
+                // Concierge: weft_global only (never bus, never computer).
+                "concierge" => crate::bus::inject::acp_mcp_servers(
+                    &base, thread_id_i, "lead", None, false, false, true, false, false, None,
+                ),
+                // Curator: curator MCP + bus under LEAD identity (never computer).
+                "curator" => crate::bus::inject::acp_mcp_servers(
+                    &base,
+                    thread_id_i,
+                    crate::bus::LEAD,
+                    None,
+                    true,
+                    false,
+                    false,
+                    true,
+                    false,
+                    None,
+                ),
+                // Issue lead: planner + bus + computer (always injected, gated
+                // server-side). No worktree of its own (see
+                // §5) — always `None`, and no persisted session id either.
+                _ => crate::bus::inject::acp_mcp_servers(
+                    &base,
+                    thread_id_i,
+                    crate::bus::LEAD,
+                    None,
+                    true,
+                    true,
+                    false,
+                    false,
+                    true,
+                    None,
+                ),
+            },
         }
     } else {
-        // Worker: bus only under direction id.
+        // Worker: bus under direction id + computer pinned to this worker's
+        // OWN worktree.
+        // : computer ONLY with a POSITIVELY resolved
+        // worktree — `EngineInner::worktree_id` collapses a missing row or a
+        // failed lookup to `None`, and the absent-`wt` URL shape is legitimate
+        // ONLY for the lead lane; server-side it deliberately resolves to the
+        // direction's FIRST worktree, so an unresolved ACP worker would mint a
+        // bearer for (and write audit/screenshots under) a SIBLING session's
+        // identity in a multi-repo direction. Identity fails closed instead:
+        // no computer server at all until a rebuild resolves the worktree —
+        // mirroring the non-ACP rebuild path's identical guard.
         crate::bus::inject::acp_mcp_servers(
             &base,
             thread_id_i,
@@ -4305,6 +4856,8 @@ async fn spawn_acp_turn(
             false,
             false,
             false,
+            worktree_id.is_some(),
+            worktree_id,
         )
     };
 
@@ -4914,6 +5467,17 @@ fn acp_permission_risk(
         // establishes mutation, so the verb-derived tier is the honest floor.
         PermissionIntent::Write { paths } => file_risk("Edit", paths, crate::ask::RiskLevel::Write),
         PermissionIntent::Network => crate::ask::classify_risk(crate::ask::RiskSignal::Network),
+        // GUI computer-use requests (omp's native `computer`/`browser` tools):
+        // the action word alone decides the tier — observation actions are
+        // ReadOnly, injected input is Write, anything unrecognized stays
+        // Unknown. Same closed word list the weft_computer MCP path uses.
+        PermissionIntent::Gui { action } => crate::ask::classify_gui_action(action),
+        // defensive only — the ACP consumer replies
+        // AllowOnce for this intent before any risk is ever computed (see the
+        // handler's own carve-out), so this arm is never reached in
+        // production. The honest tier is still the action word's own, same as
+        // the Gui arm above, so nothing downstream could ever under-tier it.
+        PermissionIntent::WeftComputerMcp { action } => crate::ask::classify_gui_action(action),
         PermissionIntent::Other { kind } => {
             crate::ask::classify_risk(crate::ask::RiskSignal::Other {
                 tool_name: kind,
@@ -4921,6 +5485,84 @@ fn acp_permission_risk(
             })
         }
     }
+}
+
+/// whether an ACP permission `intent` is OMP's
+/// own native `computer`/`browser` tool (see `acp::permission::
+/// PermissionIntent::Gui`'s own doc) — the ONE question `acp_consumer`'s
+/// `SessionEvent::Permission` arm now asks before it does ANYTHING else with
+/// the request.
+///
+/// Superseding rounds 7/9/10 entirely (`gui_or_ordinary_auto_decision`,
+/// `gui_kill_switch_denies`, `permission_reply_must_reject`,
+/// `computer_enabled_for_acp` — all deleted by this change, none had any
+/// other caller): those rounds still let a native GUI request run through
+/// the SAME auto-grant/human-card machinery an ordinary permission gets,
+/// gated only by `computer::enabled`. That design is what produced every
+/// one of this change's own findings, because OMP's native `computer`/
+/// `browser` tool executes the OS action ITSELF — Weft never sees the call
+/// happen, so it cannot fit its control lease, global Escape, completion
+/// guard, or coordinate model around an action some OTHER process already
+/// ran; there is no completion guard Weft could wrap around a process it
+/// doesn't own. So a GUI intent is no longer a permission DECISION at
+/// all — it is rejected outright, unconditionally, before anything else
+/// runs:
+///  - no card is ever shown, so a native `type` action's literal keystrokes
+///    never reach an IM card's `detail`;
+///  - no Always/Full grant is ever written, so the plaintext-carrying
+///    `grant_id` this arm folds into `action_key` a few lines below never
+///    reaches the durable grants store for a GUI intent (review 4858,
+///    "原生授权键含明文");
+///  - the reply always lands before any DB/lease await, needs no lease, and
+///    answers to Stop the same way the pre-existing `reject_now` teardown
+///    check above already does.
+///
+/// Depth-in-depth note: `ask::AskRegistry::cancel_gui_asks`
+/// still generalizes emergency-stop cancellation to any GUI-marked
+/// `action_key`, so a future path that somehow DID register a GUI-shaped
+/// card would still be reachable by Stop — but THIS check's job is to make
+/// sure that future path never exists for OMP's native tool in the first
+/// place.
+///
+/// No wire-level "use `weft_computer` instead" hint travels with the
+/// rejection: ACP's `session/request_permission` reply is a bare
+/// `{outcome:{outcome:"selected", optionId}}` (see `acp::permission::
+/// selected_outcome`) with no field for one, and `acp::permission`/
+/// `acp::runtime` are outside this change's file scope — the reply reuses
+/// the EXACT SAME channel the pre-existing `reject_now` teardown check
+/// above already replies through. The guidance belongs here, in this
+/// module's own doc trail, and in whatever an agent's own UI shows for a
+/// rejected native tool call: use the injected `weft_computer` MCP tool
+/// instead — it has a permission card, the control lease, and the
+/// emergency stop.
+///
+/// Pure and synchronous so this exact decision is unit-testable without the
+/// surrounding async ACP event loop, which needs a live
+/// `acp::runtime::ClientHandle` and isn't itself practical to drive from a
+/// plain `#[test]`.
+fn is_gui_intent(intent: &crate::acp::permission::PermissionIntent) -> bool {
+    matches!(intent, crate::acp::permission::PermissionIntent::Gui { .. })
+}
+
+/// whether this permission
+/// request is for weft's OWN injected `weft_computer` MCP tool — see
+/// `permission::PermissionIntent::WeftComputerMcp`'s doc (and
+/// `is_weft_computer_mcp_call`'s, for the strict title recognition and its
+/// trust argument). The ACP consumer auto-ALLOWS these, checked BEFORE the
+/// `is_gui_intent` rejection above would match the same `rawInput.action`
+/// shape: the call's real side effect is an HTTP request to weft's own
+/// `bus::computer_srv` gate chain (enabled check, approval card, control
+/// lease, throttle, Stop, audit), so rejecting it broke every omp-side
+/// computer-use action that omp permission-gates, and carding it here would
+/// double-card what that server already cards — the same reasoning
+/// `bus::server::AUTO_APPROVED_INTERNAL_TOOLS` records for this exact tool
+/// on the claude/opencode hook path. Pure and synchronous for the same
+/// unit-testability reason as `is_gui_intent` above.
+fn is_weft_computer_mcp_intent(intent: &crate::acp::permission::PermissionIntent) -> bool {
+    matches!(
+        intent,
+        crate::acp::permission::PermissionIntent::WeftComputerMcp { .. }
+    )
 }
 
 /// How much of the reasoning stream the busy-line chip shows.
@@ -5272,6 +5914,32 @@ async fn acp_consumer(
                         .await;
                     continue;
                 }
+                // weft's
+                // OWN injected `weft_computer` MCP tool is auto-allowed,
+                // BEFORE the native-GUI rejection below (whose broadened
+                // `rawInput.action` match would otherwise swallow it) — the
+                // server-side gate chain owns the real approval. See
+                // `is_weft_computer_mcp_intent`'s doc for the full rationale
+                // and the strict provenance recognition behind the intent.
+                if is_weft_computer_mcp_intent(&intent) {
+                    client
+                        .reply_permission(&request_id, &options, crate::acp::Want::AllowOnce)
+                        .await;
+                    continue;
+                }
+                // every ACP GUI intent (OMP's own
+                // native `computer`/`browser` tool) is rejected outright,
+                // unconditionally — no card, no grant lookup, no kill-switch
+                // consultation, no lease — BEFORE anything below builds a
+                // card or persists a grant for it. See `is_gui_intent`'s own
+                // doc for the full rationale and the specific findings this
+                // converges.
+                if is_gui_intent(&intent) {
+                    client
+                        .reply_permission(&request_id, &options, crate::acp::Want::RejectOnce)
+                        .await;
+                    continue;
+                }
                 // Precise Always key (issue #89): ACP family + session intent +
                 // the canonical action identity, so two different actions never
                 // share a grant. NOT `detail`: that is the stringified
@@ -5279,6 +5947,7 @@ async fn acp_consumer(
                 // whose only difference lives in `toolCall.locations` — the
                 // very field the risk classifier reads first. `grant_id`
                 // folds every named location in; see `permission::grant_identity`.
+                // `intent` is guaranteed non-GUI past the check above.
                 let action_key = crate::ask::action_key(&["Acp", &intent_key, &grant_id]);
                 // Clone the registry BEFORE any await — State guards are !Send.
                 let asks = app
@@ -5363,9 +6032,21 @@ async fn acp_consumer(
                 // `reject_now` sample and the `auto_decision` verdict reached
                 // the wire as an allow — queued ahead of `session/cancel`,
                 // starting a tool after the user had stopped the turn.
+                //
+                // Note: a GUI intent never reaches
+                // this point at all (rejected above, before any await) — the
+                // the "recheck computer::enabled a second time
+                // after the human-review await" machinery this gate used to
+                // also carry is gone with it: `computer::enabled` and Stop's
+                // interaction with a native GUI request are no longer this
+                // gate's problem, because a native GUI request can no longer
+                // reach a human-review await in the first place.
                 let want = {
-                    let g = eng.lock().await;
-                    if g.stopped || g.interrupting || g.reset_epoch != start_epoch {
+                    let teardown = {
+                        let g = eng.lock().await;
+                        g.stopped || g.interrupting || g.reset_epoch != start_epoch
+                    };
+                    if teardown {
                         crate::acp::Want::RejectOnce
                     } else {
                         want
@@ -5880,7 +6561,10 @@ async fn codex_consumer(
                     if let Some(qid) = n.queue_id {
                         snapshot_turn_checkpoint(&app, &db, session_id, turn_id, qid).await;
                     }
-                    match client.start_turn(&thread, &n.text).await {
+                    match client
+                        .start_turn_with_images(&thread, &n.text, &n.local_image_paths)
+                        .await
+                    {
                         Ok(t) => {
                             mark_queued_delivered(&app, &db, thread_id, session_id, &n).await;
                             client.set_active_turn(&thread, &t).await;
@@ -6261,7 +6945,9 @@ async fn spawn_turn(
         .args(&args)
         .current_dir(&inner.cwd)
         .env("PATH", crate::detect::tool_path())
-        .envs(inner.extra_env.iter().cloned())
+        // injection-supplied env (the codex computer
+        // bearer travels here, never argv — see `EngineInner::extra_env`).
+        .envs(inner.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         // stderr → app log: a per-turn CLI that dies prints its reason there.
@@ -6832,6 +7518,7 @@ async fn send_hidden_inner(
         origin_tag: hidden_delivery_id.map(hidden_delivery_tag),
         queue_id: None,
         has_attachments: false,
+        local_image_paths: Vec::new(),
     };
 
     match hidden_delivery(
@@ -7636,6 +8323,7 @@ async fn rewind_reserved(
             tool: inner.tool.clone(),
             command: inner.command.clone(),
             extra_args: inner.extra_args.clone(),
+            extra_env: inner.extra_env.clone(),
             cwd: inner.cwd.clone(),
             native_id: inner.native_id.clone(),
             system_prompt: inner.system_prompt.clone(),
@@ -8305,6 +8993,7 @@ struct RewindSnap {
     tool: String,
     command: Option<String>,
     extra_args: Vec<String>,
+    extra_env: Vec<(String, String)>,
     cwd: std::path::PathBuf,
     native_id: Option<String>,
     /// The prepend the FIRST ACP user turn carries (`{system}\n\n{user}`).
@@ -8340,6 +9029,7 @@ async fn fork_codex_thread(
     let c = crate::codex_app_server::Client::connect_session(
         &program,
         &snap.extra_args,
+        &snap.extra_env,
         &snap.cwd,
         owner,
     )
@@ -9135,6 +9825,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         probe_committed: 0,
         current_origin_tag: None,
         tool_rows: std::collections::HashMap::new(),
+        inline_image_rows: std::collections::VecDeque::new(),
         stopped: false,
         codex_client: None,
         acp_client: None,
@@ -9152,6 +9843,118 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // —— hardened codex app-server attachment write ——
+
+    /// The happy path: a brand-new path (nothing there yet) writes normally.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_writes_a_fresh_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("msg1-0-123.png");
+        assert!(write_attachment_no_follow(&p, b"hello"));
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::symlink_metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "must be created owner-only");
+    }
+
+    /// The exact race this fix exists to close: something (a co-resident
+    /// process, standing in for an attacker) has ALREADY placed a symlink at
+    /// the exact path this function is about to write to, pointing at an
+    /// unrelated file elsewhere. `create_new` + `O_NOFOLLOW` must refuse to
+    /// write through it — the call must fail closed (return `false`) and the
+    /// symlink's target must be left untouched, never overwritten with the
+    /// attacker's chosen bytes appearing to have been "written by weft".
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_refuses_a_preexisting_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("victim.png");
+        std::fs::write(&target, b"original").unwrap();
+        let p = tmp.path().join("msg1-0-456.png");
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+
+        let ok = write_attachment_no_follow(&p, b"attacker-controlled");
+        assert!(!ok, "a pre-placed symlink must make this fail, not follow it");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"original",
+            "the symlink's target must never be overwritten"
+        );
+    }
+
+    /// A plain, pre-existing (non-symlink) file at the target path must also
+    /// be refused — `create_new` (O_EXCL) is what closes this, distinct from
+    /// the symlink case above but the same "never write through something
+    /// already there" discipline.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_refuses_an_existing_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("msg1-0-789.png");
+        std::fs::write(&p, b"already here").unwrap();
+
+        let ok = write_attachment_no_follow(&p, b"new bytes");
+        assert!(!ok, "an already-existing file must make this fail, not overwrite it");
+        assert_eq!(std::fs::read(&p).unwrap(), b"already here");
+    }
+
+    // —— hardened write for EVERY OTHER per-turn
+    // dialect's predictable-name attachment spill ——
+
+    /// The happy path: a brand-new predictable path writes normally, owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_allow_overwrite_writes_a_fresh_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("msg7-0.png");
+        assert!(write_attachment_no_follow_allow_overwrite(&p, b"hello"));
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::symlink_metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "must be created owner-only");
+    }
+
+    /// The exact vector: a co-resident process
+    /// pre-places a symlink at the predictable `msg<row_id>-<i>.<ext>` path,
+    /// pointing at an arbitrary file elsewhere. `O_NOFOLLOW` must refuse to
+    /// follow it — the call fails closed and the symlink's target is left
+    /// untouched, never truncated/overwritten by Weft's own write.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_allow_overwrite_refuses_a_preexisting_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("victim.png");
+        std::fs::write(&target, b"original").unwrap();
+        let p = tmp.path().join("msg7-0.png");
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+
+        let ok = write_attachment_no_follow_allow_overwrite(&p, b"attacker-controlled");
+        assert!(!ok, "a pre-placed symlink must make this fail, not follow it");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"original",
+            "the symlink's target must never be overwritten"
+        );
+    }
+
+    /// UNLIKE the app-server helper: a plain, pre-existing (non-symlink) file
+    /// at the predictable path — standing in for a rewind re-dispatching the
+    /// SAME user row a second time — must be OVERWRITTEN, not refused. This is
+    /// the deliberate difference from `write_attachment_no_follow`'s own
+    /// `create_new` behavior: predictable names must survive replay.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_allow_overwrite_overwrites_an_existing_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("msg7-0.png");
+        std::fs::write(&p, b"already here").unwrap();
+
+        let ok = write_attachment_no_follow_allow_overwrite(&p, b"new bytes");
+        assert!(ok, "an ordinary pre-existing file (our own prior write) must be overwritable");
+        assert_eq!(std::fs::read(&p).unwrap(), b"new bytes");
+    }
 
     /// Stop must actually stop. `interrupt()` sets `interrupting` without
     /// bumping the epoch, so a Stop landing between `on_turn_end` promoting a
@@ -9382,6 +10185,67 @@ mod tests {
             crate::ask::RiskLevel::Unknown,
             "an unauditable read must not be auto-released as read-only"
         );
+    }
+
+    // —— every ACP GUI intent is rejected
+    // outright, unconditionally, before any card or grant — superseding
+    // rounds 7/9/10's own "GUI intent still goes through auto-decision, just
+    // gated by computer::enabled" design entirely ——
+
+    /// `is_gui_intent` recognizes every GUI action regardless of WHICH action
+    /// it names — `type` included, closing the exact leak (a native `type`
+    /// action's literal keystrokes reaching an IM card)
+    /// converges by never letting ANY GUI intent build a card at all.
+    #[test]
+    fn is_gui_intent_recognizes_every_gui_action() {
+        use crate::acp::permission::PermissionIntent;
+
+        for action in ["screenshot", "left_click", "type", "scroll", "key", "some_future_action"] {
+            assert!(
+                is_gui_intent(&PermissionIntent::Gui { action: action.into() }),
+                "GUI action {action:?} must be recognized regardless of which action it names"
+            );
+        }
+    }
+
+    /// Every non-GUI intent variant is unaffected — `is_gui_intent` is a
+    /// precise, exhaustive discriminator, never a loose heuristic that could
+    /// accidentally also catch an ordinary command/file/network/other
+    /// intent.
+    #[test]
+    fn is_gui_intent_never_matches_a_non_gui_intent() {
+        use crate::acp::permission::PermissionIntent;
+
+        assert!(!is_gui_intent(&PermissionIntent::Command("rm -rf /".into())));
+        assert!(!is_gui_intent(&PermissionIntent::Read { paths: Vec::new() }));
+        assert!(!is_gui_intent(&PermissionIntent::Write { paths: Vec::new() }));
+        assert!(!is_gui_intent(&PermissionIntent::Network));
+        assert!(!is_gui_intent(&PermissionIntent::Other { kind: "think".into() }));
+        // the injected weft_computer MCP intent must
+        // NEVER hit the native-GUI rejection — it has its own auto-allow arm.
+        assert!(!is_gui_intent(&PermissionIntent::WeftComputerMcp {
+            action: "left_click".into()
+        }));
+    }
+
+    /// the auto-allow
+    /// carve-out matches EXACTLY the injected-MCP intent variant — every other
+    /// intent (the native Gui one above all) keeps its existing handling.
+    #[test]
+    fn is_weft_computer_mcp_intent_matches_only_its_own_variant() {
+        use crate::acp::permission::PermissionIntent;
+
+        assert!(is_weft_computer_mcp_intent(&PermissionIntent::WeftComputerMcp {
+            action: "screenshot".into()
+        }));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Gui {
+            action: "screenshot".into()
+        }));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Command("echo".into())));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Read { paths: Vec::new() }));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Write { paths: Vec::new() }));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Network));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Other { kind: "think".into() }));
     }
 
     /// An image-only message is addressable in ACP and not in claude, and the
@@ -10078,6 +10942,7 @@ mod tests {
             output: None,
             is_error: false,
             collab_threads,
+            images: Vec::new(),
         }
     }
 
@@ -10092,6 +10957,23 @@ mod tests {
         assert_eq!(v["name"], "read_file");
         assert!(v.get("agentThread").is_none());
         assert!(v.get("collabThreads").is_none());
+        // Same "present only when non-empty" contract for images.
+        assert!(v.get("images").is_none());
+    }
+
+    /// A call that already carries images (no current dialect populates
+    /// `ToolCall::images`, but `tool_row_content` must still honor it — the
+    /// symmetric counterpart to `merge_tool_result_content_*` below) gets an
+    /// `images` key; an image-less call gets none at all, matching
+    /// `collabThreads`'s own "present only when non-empty" contract.
+    #[test]
+    fn tool_row_content_carries_images_when_the_call_has_any() {
+        let call = super::super::proto::ToolCall {
+            images: vec!["data:image/png;base64,QUJD".to_string()],
+            ..test_tool_call("read_file", Vec::new())
+        };
+        let v = tool_row_content(&call, None);
+        assert_eq!(v["images"], serde_json::json!(["data:image/png;base64,QUJD"]));
     }
 
     #[test]
@@ -10114,6 +10996,379 @@ mod tests {
         let v = tool_row_content(&call, None);
         assert!(v.get("agentThread").is_none());
         assert_eq!(v["collabThreads"], serde_json::json!(["sub-1", "sub-2"]));
+    }
+
+    fn test_tool_result(images: Vec<String>) -> super::super::proto::ToolResultItem {
+        super::super::proto::ToolResultItem {
+            id: "call_1".into(),
+            output: "the output".into(),
+            is_error: false,
+            collab_threads: Vec::new(),
+            images,
+        }
+    }
+
+    /// `merge_tool_result_content`'s images half: a result carrying images
+    /// writes the `images` key (present-only-when-non-empty, same contract as
+    /// `tool_row_content`'s own images/collabThreads keys).
+    #[test]
+    fn merge_tool_result_content_writes_images_when_the_result_has_any() {
+        let mut content = tool_row_content(&test_tool_call("Bash", Vec::new()), None);
+        assert!(content.get("images").is_none(), "no images before merge");
+        let item = test_tool_result(vec!["data:image/png;base64,QUJD".to_string()]);
+        merge_tool_result_content(&mut content, &item);
+        assert_eq!(content["output"], "the output");
+        assert_eq!(content["images"], serde_json::json!(["data:image/png;base64,QUJD"]));
+    }
+
+    /// The result's images OVERRIDE the call side, exactly like `output` does
+    /// — never appended/merged, and an empty result REMOVES whatever the call
+    /// side had, so a stale call-side stub can't survive into the terminal
+    /// row. This is the deliberately asymmetric choice vs. `collabThreads`
+    /// (see `merge_tool_result_content`'s doc for why the two differ).
+    #[test]
+    fn merge_tool_result_content_images_override_not_append_and_clear_when_empty() {
+        // The call side already had an image (hypothetical — no current dialect
+        // populates ToolCall::images, but the row's content JSON can still carry
+        // a stale key from some other source).
+        let mut content = serde_json::json!({
+            "name": "Bash",
+            "output": "",
+            "is_error": false,
+            "images": ["data:image/png;base64,STALE"],
+        });
+        // A result with a DIFFERENT image replaces it — not appends.
+        let replaced = test_tool_result(vec!["data:image/png;base64,NEW".to_string()]);
+        merge_tool_result_content(&mut content, &replaced);
+        assert_eq!(content["images"], serde_json::json!(["data:image/png;base64,NEW"]));
+
+        // A subsequent empty-images result (e.g. a different call id's row that
+        // never had a real screenshot) clears the key entirely rather than
+        // leaving the previous result's images stranded on it.
+        let empty = test_tool_result(Vec::new());
+        merge_tool_result_content(&mut content, &empty);
+        assert!(content.get("images").is_none());
+    }
+
+    /// Pre-existing merge behavior (output/is_error/collabThreads) must be
+    /// unchanged by the images work — regression guard for the refactor into
+    /// `merge_tool_result_content`.
+    #[test]
+    fn merge_tool_result_content_keeps_existing_output_and_collab_threads_behavior() {
+        let mut content = tool_row_content(&test_tool_call("collabAgentToolCall", Vec::new()), None);
+        let item = super::super::proto::ToolResultItem {
+            id: "call_1".into(),
+            output: "done".into(),
+            is_error: true,
+            collab_threads: vec!["sub-1".into()],
+            images: Vec::new(),
+        };
+        merge_tool_result_content(&mut content, &item);
+        assert_eq!(content["output"], "done");
+        assert_eq!(content["is_error"], true);
+        assert_eq!(content["collabThreads"], serde_json::json!(["sub-1"]));
+        assert!(content.get("images").is_none());
+    }
+
+    // —— bounded inline-image-row retention ——
+
+    fn inline_row(id: i32) -> (i32, bool, serde_json::Value) {
+        (id, false, serde_json::json!({"images": [format!("data:image/png;base64,img{id}")]}))
+    }
+
+    /// Pushing one row past the cap evicts exactly the OLDEST one, in FIFO
+    /// order — the surviving queue holds the `MAX_INLINE_IMAGE_ROWS` most
+    /// recent rows, oldest-of-survivors first.
+    #[test]
+    fn track_inline_image_row_evicts_the_oldest_once_over_the_cap() {
+        let mut rows = std::collections::VecDeque::new();
+        let mut evicted_ids = Vec::new();
+        for i in 0..(MAX_INLINE_IMAGE_ROWS as i32 + 2) {
+            let (next_rows, evicted) = track_inline_image_row(rows, inline_row(i));
+            rows = next_rows;
+            evicted_ids.extend(evicted.into_iter().map(|(id, _, _)| id));
+        }
+        assert_eq!(rows.len(), MAX_INLINE_IMAGE_ROWS);
+        assert_eq!(evicted_ids, vec![0, 1], "the two oldest (ids 0 and 1) must be evicted, in order");
+        let surviving_ids: Vec<i32> = rows.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(
+            surviving_ids,
+            (2..(MAX_INLINE_IMAGE_ROWS as i32 + 2)).collect::<Vec<_>>(),
+            "survivors are the MOST RECENT rows, in insertion order"
+        );
+    }
+
+    /// Under the cap, nothing is evicted at all.
+    #[test]
+    fn track_inline_image_row_evicts_nothing_under_the_cap() {
+        let mut rows = std::collections::VecDeque::new();
+        for i in 0..MAX_INLINE_IMAGE_ROWS as i32 {
+            let (next_rows, evicted) = track_inline_image_row(rows, inline_row(i));
+            rows = next_rows;
+            assert!(evicted.is_empty(), "must not evict while at or under the cap");
+        }
+        assert_eq!(rows.len(), MAX_INLINE_IMAGE_ROWS);
+    }
+
+    /// the DB-write-path cap is what actually
+    /// bounds persisted inline images — unlike `inner.inline_image_rows`
+    /// (this engine's own in-memory queue, empty again on every restart),
+    /// `enforce_durable_inline_image_cap_db` is called with NO in-memory
+    /// state carried between iterations here at all, standing in for a
+    /// fresh engine (empty queue) running after every single write — i.e. a
+    /// "restart" between every screenshot. The persisted count must still
+    /// never exceed `MAX_INLINE_IMAGE_ROWS`. All rows here are the lead's own
+    /// (`session_id: None`) — see the earlier P2 test below for the
+    /// multi-session scoping this now enforces.
+    #[tokio::test]
+    async fn enforce_durable_inline_image_cap_db_bounds_persisted_inline_images_across_a_simulated_restart() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+
+        let n = MAX_INLINE_IMAGE_ROWS + 2;
+        for i in 0..n {
+            let content = serde_json::json!({
+                "name": "computer",
+                "summary": "screenshot",
+                "input": {},
+                "output": format!("/tmp/shot-{i}.png"),
+                "is_error": false,
+                "images": [format!("data:image/png;base64,img{i}")],
+            });
+            repo::insert_lead_message(
+                &db,
+                t.id,
+                None,
+                1,
+                "assistant",
+                "tool",
+                &content.to_string(),
+                "complete",
+            )
+            .await
+            .unwrap();
+            // No in-memory queue passed in at all — each call here is as
+            // independent as if a brand-new engine (empty `inline_image_rows`)
+            // ran after every single write, i.e. a "restart" in between each.
+            enforce_durable_inline_image_cap_db(&db, t.id, None).await;
+        }
+
+        let messages = repo::list_lead_messages(&db, t.id).await.unwrap();
+        assert_eq!(messages.len(), n, "no row is ever deleted, only its images key stripped");
+        let with_images: Vec<&lead_message::Model> =
+            messages.iter().filter(|m| m.content.contains("\"images\"")).collect();
+        assert_eq!(
+            with_images.len(),
+            MAX_INLINE_IMAGE_ROWS,
+            "persisted inline images must stay at the cap no matter how many restarts happen in between"
+        );
+        // The most recent write must still carry its own inline image.
+        let last = messages.last().unwrap();
+        assert!(
+            last.content.contains("\"images\""),
+            "the current call's own screenshot must stay inline: {}",
+            last.content
+        );
+        // An older, evicted row keeps its `output` path text intact — only
+        // the inline data URI is stripped, never the on-disk reference.
+        let first = &messages[0];
+        assert!(!first.content.contains("\"images\""));
+        assert!(
+            first.content.contains("shot-0.png"),
+            "the path reference must survive the strip: {}",
+            first.content
+        );
+    }
+
+    /// a tool row that merely
+    /// MENTIONS `"images"` below the top level (here inside its serialized
+    /// `input`) must NOT count toward the retention limit. Before the fix, the
+    /// bare-substring count inflated `keep_from` and could strip a genuine
+    /// older screenshot even while fewer than `MAX_INLINE_IMAGE_ROWS` real
+    /// image rows existed.
+    #[tokio::test]
+    async fn enforce_durable_inline_image_cap_db_ignores_non_top_level_images_mentions() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+
+        // Exactly MAX_INLINE_IMAGE_ROWS genuine screenshots (top-level
+        // `images`) — all belong under the cap and must be kept.
+        for i in 0..MAX_INLINE_IMAGE_ROWS {
+            let content = serde_json::json!({
+                "name": "computer",
+                "summary": "screenshot",
+                "input": {},
+                "output": format!("/tmp/real-{i}.png"),
+                "is_error": false,
+                "images": [format!("data:image/png;base64,real{i}")],
+            });
+            repo::insert_lead_message(&db, t.id, None, 1, "assistant", "tool", &content.to_string(), "complete")
+                .await
+                .unwrap();
+        }
+        // Two LATER rows that only MENTION "images" inside their `input` — no
+        // top-level `images` key, nothing to strip. Under the old substring
+        // count these padded the total to 6 → `keep_from` = 2 → the two OLDEST
+        // genuine screenshots got stripped even though only 4 real ones exist.
+        for i in 0..2 {
+            let content = serde_json::json!({
+                "name": "some_tool",
+                "summary": "unrelated",
+                "input": { "images": [format!("query-mention-{i}")] },
+                "output": "done",
+                "is_error": false,
+            });
+            repo::insert_lead_message(&db, t.id, None, 1, "assistant", "tool", &content.to_string(), "complete")
+                .await
+                .unwrap();
+        }
+
+        enforce_durable_inline_image_cap_db(&db, t.id, None).await;
+
+        let messages = repo::list_lead_messages(&db, t.id).await.unwrap();
+        let genuine_screenshots_kept = messages
+            .iter()
+            .filter(|m| {
+                serde_json::from_str::<serde_json::Value>(&m.content)
+                    .ok()
+                    .and_then(|v| v.as_object().map(|o| o.contains_key("images")))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            genuine_screenshots_kept, MAX_INLINE_IMAGE_ROWS,
+            "no genuine screenshot may be stripped when only non-top-level \"images\" mentions padded the count"
+        );
+        // The mention rows are left entirely untouched.
+        assert!(
+            messages.iter().any(|m| m.content.contains("query-mention-0")),
+            "a non-image row's own content must be left intact"
+        );
+    }
+
+    /// a thread hosting TWO sessions —
+    /// the lead (`session_id: None`) and a chat-mode worker (`session_id:
+    /// Some(7)`) — each writing more than `MAX_INLINE_IMAGE_ROWS` inline
+    /// screenshots, must keep each session's OWN cap independently. Before
+    /// this fix, `enforce_durable_inline_image_cap_db` pooled every
+    /// session's tool rows into ONE shared retention queue keyed only by
+    /// `thread_id`, so calling it while enforcing the lead's cap could strip
+    /// images off the untouched worker's timeline (and vice versa). Here,
+    /// only the worker's cap is ever invoked — the lead's rows must come out
+    /// with every inline image still intact.
+    #[tokio::test]
+    async fn enforce_durable_inline_image_cap_db_scopes_the_cap_to_one_session() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+        // Post-merge with main's workspace-fence governance,
+        // `insert_lead_message` refuses a session with no writable
+        // thread/direction/repo owner — so the worker session must be REAL
+        // rows, not a synthetic id.
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "api", "/tmp/img-cap-repo", "main", "", true)
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            &db,
+            t.id,
+            "impl",
+            "claude",
+            repo_ref.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = repo::create_session(&db, direction.id, repo_ref.id, "claude", "/tmp/img-cap-wt")
+            .await
+            .unwrap();
+
+        let worker_session_id = Some(session.id);
+        let n = MAX_INLINE_IMAGE_ROWS + 2;
+
+        // The lead writes its own screenshots first — session_id: None.
+        for i in 0..n {
+            let content = serde_json::json!({
+                "name": "computer",
+                "summary": "screenshot",
+                "input": {},
+                "output": format!("/tmp/lead-shot-{i}.png"),
+                "is_error": false,
+                "images": [format!("data:image/png;base64,lead-img{i}")],
+            });
+            repo::insert_lead_message(
+                &db,
+                t.id,
+                None,
+                1,
+                "assistant",
+                "tool",
+                &content.to_string(),
+                "complete",
+            )
+            .await
+            .unwrap();
+        }
+
+        // The worker (session_id: Some(7)) then writes its own screenshots,
+        // enforcing ONLY its own cap after each one — the lead's cap is never
+        // invoked here at all.
+        for i in 0..n {
+            let content = serde_json::json!({
+                "name": "computer",
+                "summary": "screenshot",
+                "input": {},
+                "output": format!("/tmp/worker-shot-{i}.png"),
+                "is_error": false,
+                "images": [format!("data:image/png;base64,worker-img{i}")],
+            });
+            repo::insert_lead_message(
+                &db,
+                t.id,
+                worker_session_id,
+                1,
+                "assistant",
+                "tool",
+                &content.to_string(),
+                "complete",
+            )
+            .await
+            .unwrap();
+            enforce_durable_inline_image_cap_db(&db, t.id, worker_session_id).await;
+        }
+
+        let messages = repo::list_lead_messages(&db, t.id).await.unwrap();
+        assert_eq!(messages.len(), 2 * n, "no row is ever deleted, only its images key stripped");
+
+        let lead_rows: Vec<&lead_message::Model> =
+            messages.iter().filter(|m| m.session_id.is_none()).collect();
+        let worker_rows: Vec<&lead_message::Model> = messages
+            .iter()
+            .filter(|m| m.session_id == worker_session_id)
+            .collect();
+        assert_eq!(lead_rows.len(), n);
+        assert_eq!(worker_rows.len(), n);
+
+        let lead_with_images = lead_rows.iter().filter(|m| m.content.contains("\"images\"")).count();
+        assert_eq!(
+            lead_with_images, n,
+            "the lead's timeline was never touched by the worker's cap enforcement — \
+             every one of its inline images must survive intact"
+        );
+
+        let worker_with_images =
+            worker_rows.iter().filter(|m| m.content.contains("\"images\"")).count();
+        assert_eq!(
+            worker_with_images, MAX_INLINE_IMAGE_ROWS,
+            "the worker's OWN cap still applies to its own rows"
+        );
     }
 
     /// PersistedMeta roundtrip + tolerance: apply restores every last_* field,
@@ -10248,6 +11503,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         };
         let mut turn = TurnState::default();
         assert!(!has_pending_user_test_update(&turn));
@@ -10270,6 +11526,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         let next = t.on_turn_end();
         assert_eq!(next.map(|o| o.text).as_deref(), Some("second"));
@@ -10351,6 +11608,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         t.request_bus_read(); // wake lands AFTER "earlier" was queued
                               // "earlier" preceded the wake, so it drains first, then the read.
@@ -10374,6 +11632,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         // The wake arrived before "later", so the inbox read comes first — the
         // agent can't answer the newer prompt without seeing the bus message.
@@ -11748,6 +13007,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         let turn_id = mark_hidden_turn_started_with_delivery(&mut inner, Some(9));
         assert_eq!(inner.turn_user_row, Some(-9));
@@ -11808,6 +13068,7 @@ mod tests {
             origin_tag: None,
             queue_id: Some(99),
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
 
         let drain = reset_ignored_cancel_turn(&mut inner, 5).expect("same turn, still busy");
@@ -12007,6 +13268,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         };
 
         let err = write_user(&mut inner, &out).await.unwrap_err();
@@ -12310,6 +13572,7 @@ mod tests {
             probe_committed: 0,
             current_origin_tag: None,
             tool_rows: std::collections::HashMap::new(),
+            inline_image_rows: std::collections::VecDeque::new(),
             stopped: false,
             codex_client: None,
             acp_client: None,

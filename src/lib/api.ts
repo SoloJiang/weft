@@ -293,7 +293,7 @@ export const api = {
   revokeAuthGrant: (thread: number, dir: string | null, actionKey: string | null) =>
     invoke<void>("revoke_auth_grant", { thread, dir, actionKey }),
 
-  // Read-only auto-allow grants (issue #103) — in-memory only, NEVER persisted
+  // Read-only auto-allow grants — in-memory only, NEVER persisted
   // (contrast the Full/Always grants above): a live snapshot, not something
   // restored at boot.
   readOnlyGrants: () => invoke<ReadOnlyGrants>("read_only_grants"),
@@ -342,7 +342,24 @@ export const api = {
     invoke<boolean>("get_automatic_engine_routing_enabled"),
   setAutomaticEngineRoutingEnabled: (enabled: boolean) =>
     invoke<void>("set_automatic_engine_routing_enabled", { enabled }),
-  // issue #97: auto fail-over to the fallback engine on a quota-exceeded turn.
+  // OS-level computer use (window enumeration + screenshot of a
+  // named app window) for visual verification. Opt-in — off by default.
+  getComputerUseEnabled: () => invoke<boolean>("get_computer_use_enabled"),
+  setComputerUseEnabled: (enabled: boolean) =>
+    invoke<void>("set_computer_use_enabled", { enabled }),
+  // who (if anyone) currently holds the computer-use control
+  // mutex, for the global control banner + kill switch.
+  getComputerControlState: () =>
+    invoke<{ thread: number; dir: string; wt: number | null; expires_at_ms: number } | null>(
+      "get_computer_control_state",
+    ),
+  computerEmergencyStop: () => invoke<void>("computer_emergency_stop"),
+  // whether the most recent emergency stop
+  // (button OR the OS-level global Escape shortcut) failed to persist the
+  // disabled setting to disk — the kill switch itself still took effect
+  // in-memory either way; see `ComputerControlBanner`'s own doc.
+  getComputerStopPersistFailed: () => invoke<boolean>("get_computer_stop_persist_failed"),
+  // auto fail-over to the fallback engine on a quota-exceeded turn.
   // Opt-in — off by default, since switching engines mid-task ships that
   // engine's own history digest to a DIFFERENT provider.
   getQuotaFailoverEnabled: () => invoke<boolean>("get_quota_failover_enabled"),
@@ -421,7 +438,7 @@ export const api = {
     openNeeds?: boolean | null;
     openCurator?: boolean | null;
   }) => invoke<void>("os_notify_send", { req }),
-  // Local-runtime resource dashboard (issue #112): read-only aggregate of
+  // Local-runtime resource dashboard: read-only aggregate of
   // process_quota / proc_registry / session_gate. Polled while the Settings →
   // Resources page is open; no new sampling happens on the backend for this.
   resourceDashboardSnapshot: () =>

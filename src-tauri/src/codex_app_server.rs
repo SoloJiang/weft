@@ -104,6 +104,30 @@ pub fn turn_start_params(thread_id: &str, text: &str) -> Value {
     })
 }
 
+/// turn/start with one `localImage` input item per path, appended after the
+/// text item — the app-server counterpart to exec's plain-text image-path
+/// listing (engine.rs's per-turn image spill only lists paths in the message
+/// body for exec; the app-server transport ALSO hands them over as proper
+/// input items here, in addition to that same text listing).
+///
+/// Wire shape verified live against source: openai/codex
+/// `codex-rs/app-server-protocol/src/protocol/v2/turn.rs`, `UserInput` enum —
+/// `#[serde(tag = "type", rename_all = "camelCase")]` with a
+/// `LocalImage { detail: Option<ImageDetail>, path: PathBuf }` variant. The tag
+/// transform turns the variant name into `"localImage"`; `path` serializes as
+/// a plain string. `detail` carries `#[serde(default)]` with NO
+/// `skip_serializing_if`, so the server tolerates it being entirely absent on
+/// deserialize (missing → `None`) — omitted here, matching this function's own
+/// sibling above, which likewise omits `text`'s equally-defaulted
+/// `textElements` field rather than emit a value the server will supply itself.
+pub fn turn_start_params_with_images(thread_id: &str, text: &str, image_paths: &[String]) -> Value {
+    let mut input = vec![json!({ "type": "text", "text": text })];
+    for p in image_paths {
+        input.push(json!({ "type": "localImage", "path": p }));
+    }
+    json!({ "threadId": thread_id, "input": input })
+}
+
 /// turn/interrupt requires BOTH threadId and turnId (turnId is load-bearing —
 /// omitting it fails to deserialize server-side).
 pub fn turn_interrupt_params(thread_id: &str, turn_id: &str) -> Value {
@@ -236,7 +260,7 @@ pub fn is_elicitation_request(method: &str) -> bool {
 /// `item/started` and its result on `item/completed`; agent text streams via
 /// deltas; `thread/tokenUsage/updated` carries the current-context usage.
 ///
-/// Every notification's `threadId` (issue #99) is read here and carried RAW into
+/// Every notification's `threadId` is read here and carried RAW into
 /// `ChatEvent::agent_thread` — the conversation/agent that produced this event,
 /// main narration and every collab sub-agent's own activity alike (app-server
 /// forwards a spawned sub-agent's events over this SAME connection, per-thread
@@ -388,7 +412,7 @@ pub fn turn_reports_quota_exceeded(params: &Value) -> bool {
 
 /// A codex app-server `RateLimitSnapshot` (the `rateLimits` field of an
 /// `account/rateLimits/updated` notification, or of an `account/rateLimits/read`
-/// response) → an [`crate::engine_quota::QuotaSnapshot`] for "codex" (issue #97).
+/// response) → an [`crate::engine_quota::QuotaSnapshot`] for "codex".
 ///
 /// Ground truth: openai/codex `codex-rs/app-server-protocol/src/protocol/v2/account.rs`.
 /// `primary`/`secondary` are independent rolling windows (`usedPercent`: 0-100
@@ -445,10 +469,13 @@ fn appserver_tool_call(item: &Value) -> crate::lead_chat::proto::ToolCall {
         output: None,
         is_error: false,
         collab_threads: appserver_collab_threads(item),
+        // A call's own start never carries a result yet — see
+        // `proto::ToolCall::images`.
+        images: Vec::new(),
     }
 }
 
-/// A `collabAgentToolCall` item's known sub-agent thread ids (issue #99):
+/// A `collabAgentToolCall` item's known sub-agent thread ids:
 /// `receiverThreadIds` — "the newly spawned agent" for a spawn call, or the
 /// existing target agent for a send/wait call. Empty for a spawn's own
 /// `item/started` (the child doesn't exist yet) and for every non-collab item —
@@ -477,6 +504,9 @@ fn appserver_tool_result(item: &Value) -> crate::lead_chat::proto::ToolResultIte
         output: appserver_tool_output(item),
         is_error: appserver_tool_is_error(item),
         collab_threads: appserver_collab_threads(item),
+        // app-server's item.completed inbound image content isn't parsed yet
+        // (only claude's tool_result and the ACP dialect are, so far).
+        images: Vec::new(),
     }
 }
 
@@ -669,12 +699,13 @@ impl Client {
     pub async fn connect_session(
         program: &str,
         extra_args: &[String],
+        extra_env: &[(String, String)],
         cwd: &std::path::Path,
         owner: crate::proc_registry::Owner,
     ) -> anyhow::Result<Client> {
         let client = Client(Arc::new(Mutex::new(None)));
         client
-            .spawn_inner(program, extra_args, Some(cwd), owner)
+            .spawn_inner(program, extra_args, extra_env, Some(cwd), owner)
             .await?;
         Ok(client)
     }
@@ -752,6 +783,7 @@ impl Client {
         self.spawn_inner(
             &crate::tool_command::command_for("codex"),
             &[],
+            &[],
             None,
             crate::proc_registry::Owner::global_app_server(),
         )
@@ -762,6 +794,7 @@ impl Client {
         &self,
         program: &str,
         extra_args: &[String],
+        extra_env: &[(String, String)],
         cwd: Option<&std::path::Path>,
         owner: crate::proc_registry::Owner,
     ) -> anyhow::Result<()> {
@@ -779,6 +812,11 @@ impl Client {
         // Resolve nvm/fnm/volta CLIs from a GUI launch's minimal PATH without
         // mutating the global env (see detect::tool_path).
         command.env("PATH", crate::detect::tool_path());
+        // injection-supplied env —
+        // the codex computer-use bearer rides the child's environment (readable
+        // only by its own uid), never `-c` argv (world-readable via ps). See
+        // `bus::inject::Injection::env`.
+        command.envs(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -878,7 +916,7 @@ impl Client {
         Ok(())
     }
 
-    /// Best-effort `account/rateLimits/read` → the engine_quota hub (issue #97).
+    /// Best-effort `account/rateLimits/read` → the engine_quota hub.
     /// Errors (older codex without this endpoint, a transient hiccup) are
     /// swallowed: this is a proactive nice-to-have, never load-bearing for the
     /// connection or a turn — the notification path (`read_loop`'s
@@ -920,7 +958,7 @@ impl Client {
                                             item: None,
                                             // A sub-agent's OWN turn can fail too — tag
                                             // it like any other event on this thread
-                                            // (issue #99) so the error lands in its
+                                            //  so the error lands in its
                                             // branch, not as spurious mainline text.
                                             agent_thread: tid.clone(),
                                         },
@@ -1150,6 +1188,25 @@ impl Client {
             .await?;
         turn_id_of(&r).ok_or_else(|| anyhow::anyhow!("turn/start: no turn.id"))
     }
+    /// Like [`start_turn`](Self::start_turn) but also hands over `image_paths`
+    /// as `localImage` input items (engine.rs's codex attachment spill, for
+    /// the app-server transport only — exec keeps its plain-text path listing).
+    /// An empty slice is identical to `start_turn` (plain params, no images key
+    /// churn on the wire for the common no-attachment turn).
+    pub async fn start_turn_with_images(
+        &self,
+        thread_id: &str,
+        text: &str,
+        image_paths: &[String],
+    ) -> anyhow::Result<String> {
+        let params = if image_paths.is_empty() {
+            turn_start_params(thread_id, text)
+        } else {
+            turn_start_params_with_images(thread_id, text, image_paths)
+        };
+        let r = self.request("turn/start", params).await?;
+        turn_id_of(&r).ok_or_else(|| anyhow::anyhow!("turn/start: no turn.id"))
+    }
     pub async fn interrupt(&self, thread_id: &str, turn_id: &str) -> anyhow::Result<()> {
         self.request("turn/interrupt", turn_interrupt_params(thread_id, turn_id))
             .await
@@ -1244,6 +1301,40 @@ mod tests {
         assert!(v.get("jsonrpc").is_none()); // codex envelope has no jsonrpc field
     }
 
+    /// turn_start_params_with_images: the text item stays first (unchanged
+    /// shape from the plain `turn_start_params`), followed by one `localImage`
+    /// item per path, `path` riding as a plain string with no `detail` key
+    /// (see the function's own doc for the source-verified wire shape).
+    #[test]
+    fn encodes_turn_start_with_local_image_input_items() {
+        let params = turn_start_params_with_images(
+            "t_1",
+            "look at this",
+            &["/tmp/weft-attachments/msg1-0.png".to_string(), "/tmp/weft-attachments/msg1-1.jpg".to_string()],
+        );
+        let line = encode_request(7, "turn/start", params);
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["params"]["threadId"], "t_1");
+        let input = v["params"]["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[0]["text"], "look at this");
+        assert_eq!(input[1]["type"], "localImage");
+        assert_eq!(input[1]["path"], "/tmp/weft-attachments/msg1-0.png");
+        // No `detail` key at all — the server's field is `#[serde(default)]`
+        // (no `skip_serializing_if`), so omitting it entirely is valid on the
+        // wire and matches this function's existing `text`/`textElements`
+        // convention of not emitting server-defaultable fields.
+        assert!(input[1].get("detail").is_none());
+        assert_eq!(input[2]["type"], "localImage");
+        assert_eq!(input[2]["path"], "/tmp/weft-attachments/msg1-1.jpg");
+
+        // An empty path list degenerates to exactly the plain params (no
+        // `localImage` items, no dangling empty array quirks).
+        let plain = turn_start_params_with_images("t_1", "hi", &[]);
+        assert_eq!(plain, turn_start_params("t_1", "hi"));
+    }
+
     #[test]
     fn interrupt_carries_both_ids() {
         let v: Value = serde_json::from_str(
@@ -1335,7 +1426,7 @@ mod tests {
                 // Deltas carry their item id: parallel streams (collab sub-agents)
                 // key their own rows instead of interleaving into one bubble.
                 assert_eq!(item.as_deref(), Some("i"));
-                // The envelope's threadId (issue #99) rides along RAW — the engine,
+                // The envelope's threadId rides along RAW — the engine,
                 // not this mapper, decides mainline vs a sub-agent branch.
                 assert_eq!(agent_thread.as_deref(), Some("t"));
             }
@@ -1730,7 +1821,7 @@ mod tests {
 
     #[test]
     fn collab_tool_call_carries_receiver_thread_ids() {
-        // issue #99: `receiverThreadIds` is the minimal backend signal the
+        // `receiverThreadIds` is the minimal backend signal the
         // frontend groups on — verified against the real `CollabAgentToolCall`
         // ThreadItem shape (codex-rs app-server-protocol/src/protocol/v2/item.rs).
         // A spawn's item/started has no receiver yet (the child doesn't exist).

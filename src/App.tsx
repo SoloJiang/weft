@@ -9,6 +9,7 @@ import { NeedsYouView } from "./board/NeedsYouView";
 import { WorkerConversation } from "./session/WorkerConversation";
 import { DangerToast } from "./components/DangerToast";
 import { ProcessQuotaBar } from "./components/ProcessQuotaBar";
+import { ComputerControlBanner } from "./components/ComputerControlBanner";
 import { Toasts } from "./components/Toast";
 import { FileMenu, useCmdAffordance } from "./components/FileMenu";
 import { CommandPalette } from "./components/CommandPalette";
@@ -117,6 +118,7 @@ function Shell() {
     return (
       <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg text-ink">
         <ProcessQuotaBar inSettings />
+        <ComputerControlBanner />
         <div className="min-h-0 flex-1 overflow-hidden [&>section]:h-full">
           <SettingsScreen />
         </div>
@@ -139,6 +141,7 @@ function Shell() {
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <AppTopBar />
         <ProcessQuotaBar />
+        <ComputerControlBanner />
         {showDock && <NeedsDock />}
         <ErrorBoundary key={routeKey}>
           <div className="flex min-h-0 min-w-0 flex-1 flex-col weft-screen-in">

@@ -18,6 +18,13 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-notification = "2"
+# OS-level Escape: computer use's control lease can
+# put keyboard focus on the CONTROLLED app, not weft's own WebView, so the
+# WebView-only Esc keydown handler never sees it — this plugin's global
+# shortcut fires regardless of which app has focus. Registered only while a
+# control lease is actually held (see `computer::acquire_control`/
+# `clear_control`), not app-wide for the whole process lifetime.
+tauri-plugin-global-shortcut = "2.3.2"
 user-notify = "0.4.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -74,7 +81,64 @@ fs2 = "0.4"
 # rustls refuse to auto-pick and panics at the first TLS handshake. Pin the
 # choice once at startup (lib.rs `run()`).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# main 侧引入:host/automerge 的进程输出捕获用常规文件(tempfile::tempfile)替代
+# 管道(见其注释),属生产路径,故归 [dependencies](测试的 tempdir 一并可用)。
 tempfile = "3"
+# computer/mod.rs 的截图缩放 + PNG 落盘用它;MockBackend 测试路径也吃这个,故是常规
+# 依赖(不随 computer-os feature 门控)。xcap 本身也依赖 image,复用编译成本。
+# `jpeg`:`encode_jpeg_data_uri` 把截图编码成 MCP image content /
+# Ask 卡预览的 `data:image/jpeg;base64,...`——PNG 对照片级截图偏大,JPEG 在这个
+# 用途(有损、丢给模型/人眼看,不是存档)上明显更省 token/带宽。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# OS 级窗口枚举 + 截图。本机(Linux 容器)编译不过:xcap 传递依赖
+# gdk-sys/gtk 等系统库(pkg-config 找不到 gdk-3.0.pc,容器内未装 GTK dev 包),
+# `cargo check` 直接 build-script 失败。降级为 optional + `computer-os` feature
+# (默认关):有 GUI 系统库的机器(开发者本机/CI 打包机)手动开启即可编译出真实后端,
+# 无该 feature 时 `computer::backend()` 返回恒 Unsupported 的 stub,绝不阻塞默认构建。
+xcap = { version = "0.9.7", optional = true }
+# 鼠标/键盘输入注入。同上 xcap 的容器编译问题:Linux 下走 X11,
+# 传递依赖系统库本机同样缺失。同挂 `computer-os` feature(默认关),不影响默认构建。
+enigo = { version = "0.6", optional = true }
+sha2 = "0.10"
+# Session-scoped `/computer/:thread/:dir/mcp` auth token (HMAC bearer,
+# P1 #A): HMAC-SHA256(process secret, "{thread}/{dir}"), verified constant-
+# time via `Mac::verify_slice`. sha2 is already a dependency (see above); a
+# proper HMAC construction (not a hand-rolled sha256(secret||msg)) avoids a
+# length-extension footgun for the small cost of this one crate.
+hmac = "0.12"
+
+# owner-only ACL for the
+# bearer-bearing config files on Windows — see `bus::inject::
+# create_file_owner_only`. Windows-only (this whole block is ignored on unix
+# targets, so it never touches the Linux/macOS build or CI), and pinned to the
+# `0.61` line already resolved transitively (tauri/keyring), so it adds no new
+# crate version. Only the handful of Win32 modules the ACL calls need
+# (`Win32_System_SystemServices` carries `SECURITY_DESCRIPTOR_REVISION` and
+# the ACE-type constants the DACL validator checks against).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+] }
+
+# in-process X11 window activation
+# (the EWMH `_NET_ACTIVE_WINDOW` client message) so a clean Linux desktop no
+# longer needs `wmctrl`/`xdotool` separately installed just to focus a window
+# before input — see `computer::os::activate_window_x11`. Optional + only in
+# `computer-os` (default off) and Linux-only, so it adds nothing to the default
+# build. `x11rb` is already resolved transitively via `xcap`'s own X11 backend,
+# so this pins to that same line and pulls no new crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", optional = true }
+
+[features]
+# 见上面 xcap/enigo 依赖注释。默认关闭,不影响任何现有构建/CI。
+# x11rb (Linux 进程内窗口激活)同挂本 feature,仅在 Linux 目标存在,其余平台为空操作。
+computer-os = ["dep:xcap", "dep:enigo", "dep:x11rb"]
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

@@ -21,4 +21,4 @@ export { ShellSnippet } from "./ShellSnippet";
 export { Shimmer } from "./Shimmer";
 export { OnboardingCue, SuggestionChips } from "./Suggestion";
 export { StackTrace } from "./StackTrace";
-export { Tool, ToolActivity, type AiToolStatus } from "./Tool";
+export { Tool, ToolActivity, type AiToolStatus, type ToolImage } from "./Tool";
