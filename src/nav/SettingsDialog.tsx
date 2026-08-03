@@ -933,8 +933,10 @@ function AutomationSettings() {
   async function toggleComputerUse(on: boolean) {
     const prev = computerUse;
     // Invalidate every poll read issued BEFORE this toggle —
-    // their results are stale the instant the user acts.
-    computerUseGenRef.current += 1;
+    // their results are stale the instant the user acts — and CLAIM this
+    // toggle's generation, so this call can tell later whether it is still
+    // the newest one.
+    const myGen = (computerUseGenRef.current += 1);
     computerUseToggleInFlightRef.current += 1;
     setComputerUseState(on);
     try {
@@ -947,10 +949,24 @@ function AutomationSettings() {
       // every call rejects, and clicking it would send another disable). Refresh
       // the real enabled state from the backend; fall back to `prev` only if
       // that read also fails.
-      try {
-        setComputerUseState(await api.getComputerUseEnabled());
-      } catch {
-        setComputerUseState(prev);
+      //
+      // Every write below is generation-guarded: with two toggles
+      // overlapping, an OLDER one failing must not clobber a NEWER one's
+      // state. (A failed disable reading `false` while a later enable is
+      // still pending would otherwise leave the switch off while the backend
+      // ends up on, and the next click would send the wrong operation.) The
+      // guard is re-checked AFTER the recovery read too — a newer toggle can
+      // start during that await.
+      if (myGen === computerUseGenRef.current) {
+        let recovered: boolean | null = null;
+        try {
+          recovered = await api.getComputerUseEnabled();
+        } catch {
+          recovered = null;
+        }
+        if (myGen === computerUseGenRef.current) {
+          setComputerUseState(recovered ?? prev);
+        }
       }
       throw err;
     } finally {
