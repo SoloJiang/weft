@@ -1634,31 +1634,6 @@ pub(crate) async fn chat_open_worker_impl(
     extra.extend(inj.args);
     let mut extra_env = ask.env;
     extra_env.extend(inj.env);
-    // computer-use MCP is now injected
-    // UNCONDITIONALLY for workers too, same as the lead branch above — the
-    // setting/kill-switch is enforced dynamically, server-side, on every
-    // call (see that branch's own doc for why).
-    // keep BOTH halves of the computer injection —
-    // args on argv, the codex bearer via the child's env (see
-    // `bus::inject::Injection::env`).
-    let comp = crate::bus::inject::inject_computer(
-        &base,
-        dir.thread_id,
-        &direction_id.to_string(),
-        &session_tool,
-        // this worker's OWN worktree
-        // (`wt`, resolved above for this EXACT direction+repo pair)
-        // — not "the first worktree of this direction" a
-        // multi-repo direction would otherwise fall back to.
-        Some(wt.id),
-    );
-    extra.extend(comp.args);
-    extra_env.extend(comp.env);
-    // An opencode worker's session bus AND computer server BOTH ride
-    // OPENCODE_CONFIG_CONTENT — deep-merge the duplicate entries or
-    // `Command::envs`' last-wins drops the bus (see
-    // `bus::inject::coalesce_env`).
-    let extra_env = crate::bus::inject::coalesce_env(extra_env);
     push_model_arg(&mut extra, sess.model.as_deref());
 
     let key = sess.id as i64;
@@ -1667,9 +1642,52 @@ pub(crate) async fn chat_open_worker_impl(
     if admitted_dir.thread_id != dir.thread_id {
         anyhow::bail!("worker direction changed threads before engine registration");
     }
+    // Construction rides the SAME per-key surface gate the senders and
+    // `worker_engine` use, in the canonical gate -> global-read order (the
+    // read this function held so far is dropped first — see the
+    // head-of-function comment on why this path holds it early). Without
+    // this, a concurrent constructor for the same session could interleave
+    // between the bearer mint below and the installation it belongs to,
+    // leaving the engine that actually stays resident holding a bearer some
+    // LOSING constructor's later mint already rotated dead.
+    _engine_admission = None;
+    let _construction_gate = engine::admission_gate_for_key(key).lock_owned().await;
+    let _registry_read = state.engine_admission_read().await;
     let eng = match state.get(key) {
         Some(e) => e,
         None => {
+            // computer-use MCP is injected UNCONDITIONALLY for workers too,
+            // same as the lead branch (the setting/kill-switch is enforced
+            // dynamically, server-side, on every call), keeping BOTH halves
+            // — args on argv, the codex bearer via the child's env (see
+            // `bus::inject::Injection::env`).
+            //
+            // Minted ONLY on this branch — the one that actually INSTALLS a
+            // new engine. `inject_computer`'s mint ROTATES the session's
+            // token generation, so minting before the resident-engine check
+            // meant a plain reopen of a running worker rotated first and
+            // then threw the fresh config away on finding the resident
+            // engine — instantly 401-ing the bearer that still-running
+            // child holds, cutting off its computer access until a real
+            // rebuild.
+            let comp = crate::bus::inject::inject_computer(
+                &base,
+                dir.thread_id,
+                &direction_id.to_string(),
+                &session_tool,
+                // this worker's OWN worktree
+                // (`wt`, resolved above for this EXACT direction+repo pair)
+                // — not "the first worktree of this direction" a
+                // multi-repo direction would otherwise fall back to.
+                Some(wt.id),
+            );
+            extra.extend(comp.args);
+            extra_env.extend(comp.env);
+            // An opencode worker's session bus AND computer server BOTH ride
+            // OPENCODE_CONFIG_CONTENT — deep-merge the duplicate entries or
+            // `Command::envs`' last-wins drops the bus (see
+            // `bus::inject::coalesce_env`).
+            let extra_env = crate::bus::inject::coalesce_env(extra_env);
             let mut inner = engine::EngineInner {
                 thread_id: dir.thread_id,
                 tool: session_tool.clone(),
@@ -1728,7 +1746,8 @@ pub(crate) async fn chat_open_worker_impl(
             state.get_or_insert(key, e)
         }
     };
-    drop(_engine_admission);
+    drop(_registry_read);
+    drop(_construction_gate);
     if let Err(err) = engine::ensure_running(app, db, &eng).await {
         if let Some(stale) = state.remove_if_same(key, &eng) {
             let _ = engine::teardown_for_switch(app, &stale).await;
@@ -1782,6 +1801,15 @@ pub(crate) async fn chat_open_worker_impl(
 /// survives app restarts the same way the lead does: sending resumes it.
 async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Result<EngineRef> {
     let state = app.state::<LeadChatState>();
+    // Same construction serialization as `lead_engine`/`chat_open_worker_impl`
+    // (and the same canonical gate -> global-read order): this constructor's
+    // computer-bearer mint ROTATES the session's token generation, so two
+    // unserialized constructors for one session could each mint, with
+    // `get_or_insert` keeping only one engine — the loser's later mint
+    // silently 401-ing the bearer the kept engine's child actually holds.
+    let _construction_gate = engine::admission_gate_for_key(session_id as i64)
+        .lock_owned()
+        .await;
     let _engine_admission = state.engine_admission_read().await;
     let sess = repo::get_session(db, session_id)
         .await?

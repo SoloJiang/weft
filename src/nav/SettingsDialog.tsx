@@ -771,10 +771,17 @@ function AutomationSettings() {
   // no other consumer.
   const [computerUse, setComputerUseState] = useState(false);
   const [computerUseLoaded, setComputerUseLoaded] = useState(false);
-  // true while a
-  // toggle's own optimistic set + backend call is in flight, so the refresh
-  // poll below never clobbers it with a stale pre-toggle read racing back.
-  const computerUseToggleInFlightRef = useRef(false);
+  // COUNT of toggle
+  // invokes currently in flight, so the refresh poll below never clobbers an
+  // optimistic set with a stale read racing back. A count, not a boolean:
+  // with two overlapping toggles, the FIRST one's `finally` would clear a
+  // shared boolean while the second still awaits — a poll could then slip
+  // in and apply an intermediate backend read over the second's optimistic
+  // value (its generation already matches, so that guard alone can't reject
+  // it), leaving the switch opposite the state the backend settles on and
+  // making the next click send the wrong operation. The poll stays
+  // suppressed until EVERY in-flight toggle has settled.
+  const computerUseToggleInFlightRef = useRef(0);
   // generation counter
   // bumped every time a toggle STARTS. The in-flight flag alone left a
   // gap: a poll's read could be issued before the toggle began, and by the
@@ -810,7 +817,7 @@ function AutomationSettings() {
   useEffect(() => {
     let alive = true;
     const tick = () => {
-      if (computerUseToggleInFlightRef.current) return;
+      if (computerUseToggleInFlightRef.current > 0) return;
       // Single-flight — skip the tick if the previous poll
       // hasn't resolved; see `computerUsePollInFlightRef`'s doc.
       if (computerUsePollInFlightRef.current) return;
@@ -821,7 +828,7 @@ function AutomationSettings() {
       api.getComputerUseEnabled().then(
         (enabled) => {
           computerUsePollInFlightRef.current = false;
-          if (!alive || computerUseToggleInFlightRef.current) return;
+          if (!alive || computerUseToggleInFlightRef.current > 0) return;
           if (gen !== computerUseGenRef.current) return;
           setComputerUseState(enabled);
           setComputerUseLoaded(true);
@@ -928,7 +935,7 @@ function AutomationSettings() {
     // Invalidate every poll read issued BEFORE this toggle —
     // their results are stale the instant the user acts.
     computerUseGenRef.current += 1;
-    computerUseToggleInFlightRef.current = true;
+    computerUseToggleInFlightRef.current += 1;
     setComputerUseState(on);
     try {
       await api.setComputerUseEnabled(on);
@@ -947,7 +954,7 @@ function AutomationSettings() {
       }
       throw err;
     } finally {
-      computerUseToggleInFlightRef.current = false;
+      computerUseToggleInFlightRef.current -= 1;
     }
   }
 

@@ -419,13 +419,60 @@ pub fn computer_session_token(thread: i32, dir: &str, wt: Option<i32>) -> String
 /// (`hex::decode` error) — there is no valid token shape it could be
 /// mistaken for.
 fn verify_computer_token(thread: i32, dir: &str, wt: Option<i32>, supplied: &str) -> bool {
+    verify_computer_token_at_current_generation(thread, dir, wt, supplied).is_some()
+}
+
+/// [`verify_computer_token`] PLUS the capture the in-flight staleness checks
+/// need: on success, returns the exact generation the supplied bearer
+/// verified at. Read and verify happen against ONE generation value (read
+/// first, MAC'd explicitly at it) — verifying at "current" and then reading
+/// "current" again as the capture would race a rotation in between, blessing
+/// a stale bearer with the replacement's generation. Every later
+/// [`verify_bearer_generation`] checkpoint compares this captured value
+/// against the identity's then-current generation.
+fn verify_computer_token_at_current_generation(
+    thread: i32,
+    dir: &str,
+    wt: Option<i32>,
+    supplied: &str,
+) -> Option<u64> {
+    let auth_gen = session_token_generation(thread, dir, wt);
     let Ok(supplied_bytes) = hex::decode(supplied) else {
-        return false;
+        return None;
     };
-    match computer_token_mac(thread, dir, wt) {
-        Some(mac) => mac.verify_slice(&supplied_bytes).is_ok(),
-        None => false,
+    let mac = computer_token_mac_at(thread, dir, wt, auth_gen)?;
+    if mac.verify_slice(&supplied_bytes).is_ok() {
+        return Some(auth_gen);
     }
+    None
+}
+
+/// The in-flight bearer-staleness check: `auth_gen` is the generation this
+/// request's bearer verified at on entry
+/// ([`verify_computer_token_at_current_generation`]); a rotation — a
+/// replacement child's injection for the SAME `(thread, dir, wt)` — bumps
+/// the identity's current generation, and from that instant the superseded
+/// child must stop ACTING, not merely fail its NEXT request's entry gate: a
+/// request already inside can sit parked on an approval card, the input
+/// flight guard, a capture-semaphore queue, or a blocking-pool queue for
+/// far longer than a relaunch takes, and would otherwise still drive the
+/// desktop (or consume a human's card answer) under an identity a newer
+/// child now owns. Lock-only and synchronous, so it can run at every
+/// post-wait checkpoint, including inside blocking-pool closures.
+fn verify_bearer_generation(
+    thread: i32,
+    dir: &str,
+    wt: Option<i32>,
+    auth_gen: u64,
+) -> Result<(), String> {
+    if session_token_generation(thread, dir, wt) == auth_gen {
+        return Ok(());
+    }
+    Err(
+        "this session's bearer was superseded while the call was in flight (a newer session now \
+         owns this identity) — the call was not executed"
+            .to_string(),
+    )
 }
 
 // `thread`/`dir` come from the URL path (same identity-can't-be-spoofed
@@ -486,9 +533,16 @@ pub async fn handle_computer(
         Ok(w) => w,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    if !verify_computer_token(thread, &dir, wt, supplied_key) {
+    // The generation this bearer verified at rides along into the dispatch
+    // path: the entry gate only ever 401s NEW requests, so every later
+    // long-wait checkpoint re-compares this captured value against the
+    // identity's then-current generation (see [`verify_bearer_generation`])
+    // to stop a request that outlived the child it authenticated for.
+    let Some(auth_gen) =
+        verify_computer_token_at_current_generation(thread, &dir, wt, supplied_key)
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
     // a still-valid token is
     // refused once its owning thread has been deleted — `delete_thread` revokes
     // the route. Fast path is a lock-only set lookup (live sessions and the
@@ -520,7 +574,7 @@ pub async fn handle_computer(
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            call_computer(&db, &asks, thread, &dir, wt, name, &args).await
+            call_computer(&db, &asks, thread, &dir, wt, auth_gen, name, &args).await
         }
         _ => json!({}),
     };
@@ -599,6 +653,7 @@ async fn call_computer(
     thread: i32,
     dir: &str,
     wt: Option<i32>,
+    auth_gen: u64,
     name: &str,
     args: &Value,
 ) -> Value {
@@ -616,6 +671,7 @@ async fn call_computer(
         thread,
         dir,
         wt,
+        auth_gen,
         name,
         &action,
         args,
@@ -679,6 +735,7 @@ async fn run_action(
     thread: i32,
     dir: &str,
     wt: Option<i32>,
+    auth_gen: u64,
     name: &str,
     action: &str,
     args: &Value,
@@ -755,6 +812,12 @@ async fn run_action(
     if !computer::enabled(db).await {
         return Err(ComputerError::Disabled.to_string());
     }
+    // ALSO re-check the bearer's generation after the approval await, for
+    // the same reason as the kill-switch recheck above: a replacement launch
+    // can rotate this identity's token generation while this call's card sat
+    // in Needs-you, and the superseded child must not get to act on (or
+    // consume) the human's answer — see `verify_bearer_generation`'s doc.
+    verify_bearer_generation(thread, dir, wt, auth_gen)?;
     match action {
         "list_windows" => {
             // acquire the SAME semaphore
@@ -818,6 +881,9 @@ async fn run_action(
                 if route_revoked_sync(thread, &dir_owned, wt) {
                     return Err(SESSION_GONE_MSG.to_string());
                 }
+                // and the bearer-staleness check — a rotation landing while
+                // this closure sat queued must stop the enumeration too.
+                verify_bearer_generation(thread, &dir_owned, wt, auth_gen)?;
                 computer::visible_windows(b.as_ref()).map_err(|e| e.to_string())
             })
             .await?
@@ -915,6 +981,10 @@ async fn run_action(
             if !computer::enabled(db).await {
                 return Err(ComputerError::Disabled.to_string());
             }
+            // and the bearer-staleness check after the same queueing awaits
+            // — a capture must never fire for a child a relaunch's rotation
+            // already superseded (see `verify_bearer_generation`).
+            verify_bearer_generation(thread, dir, wt, auth_gen)?;
             // re-resolve + re-verify identity
             // AGAIN, after EVERY await this arm takes since the first check
             // above (`screenshot_out_dir`, the capture semaphore itself, then
@@ -1007,6 +1077,12 @@ async fn run_action(
                 // a sibling was removed) is unaffected.
                 if route_revoked_sync(thread, &dir_owned, wt) {
                     return (resolved_id, Err(SESSION_GONE_MSG.to_string()));
+                }
+                // and the bearer-staleness check on this same blocking
+                // thread — a rotation landing while this closure sat queued
+                // must stop the capture too (see `verify_bearer_generation`).
+                if let Err(e) = verify_bearer_generation(thread, &dir_owned, wt, auth_gen) {
+                    return (resolved_id, Err(e));
                 }
                 let shot = match computer::screenshot_resolved(b.as_ref(), &w, &out_dir) {
                     Ok(s) => s,
@@ -1157,7 +1233,7 @@ async fn run_action(
             // in concurrently must serialize here rather than interleave its
             // own click on the human's real desktop.
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir, wt).await?;
+            recheck_after_guard(db, asks, thread, dir, wt, auth_gen).await?;
             // resolve the window AND map
             // the coordinate FRESH here, after the flight guard — not
             // before it, as this used to. A call that queued on the guard
@@ -1205,6 +1281,7 @@ async fn run_action(
                 thread,
                 dir,
                 wt,
+                auth_gen,
                 window_query,
                 &approved,
                 w,
@@ -1236,7 +1313,7 @@ async fn run_action(
             // across the backend call itself, and why window resolution/
             // coordinate mapping happen AFTER it.
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir, wt).await?;
+            recheck_after_guard(db, asks, thread, dir, wt, auth_gen).await?;
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             // preflight before activation — see the
             // click-family arm above.
@@ -1250,6 +1327,7 @@ async fn run_action(
                 thread,
                 dir,
                 wt,
+                auth_gen,
                 window_query,
                 &approved,
                 w,
@@ -1273,7 +1351,7 @@ async fn run_action(
             check_suspended(asks, thread, dir)?;
             acquire_and_throttle(thread, dir, wt)?;
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir, wt).await?;
+            recheck_after_guard(db, asks, thread, dir, wt, auth_gen).await?;
             // BOTH endpoints are mapped against the SAME freshly-resolved
             // window — a drag has two coordinates, but only one window to go
             // stale — and that authoritative resolve happens inside the paced
@@ -1291,6 +1369,7 @@ async fn run_action(
                 thread,
                 dir,
                 wt,
+                auth_gen,
                 window_query,
                 &approved,
                 w,
@@ -1315,7 +1394,7 @@ async fn run_action(
             check_suspended(asks, thread, dir)?;
             acquire_and_throttle(thread, dir, wt)?;
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir, wt).await?;
+            recheck_after_guard(db, asks, thread, dir, wt, auth_gen).await?;
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             // preflight before activation — see the
             // click-family arm above.
@@ -1329,6 +1408,7 @@ async fn run_action(
                 thread,
                 dir,
                 wt,
+                auth_gen,
                 window_query,
                 &approved,
                 w,
@@ -1355,7 +1435,7 @@ async fn run_action(
             check_suspended(asks, thread, dir)?;
             acquire_and_throttle(thread, dir, wt)?;
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir, wt).await?;
+            recheck_after_guard(db, asks, thread, dir, wt, auth_gen).await?;
             // Resolve the window (and,
             // right below, check focus-freshness against it) AFTER the
             // flight guard now too — a queued `type` used to resolve the
@@ -1388,6 +1468,7 @@ async fn run_action(
                 thread,
                 dir,
                 wt,
+                auth_gen,
                 window_query,
                 &approved,
                 w,
@@ -1427,7 +1508,7 @@ async fn run_action(
             check_suspended(asks, thread, dir)?;
             acquire_and_throttle(thread, dir, wt)?;
             let _flight = computer::input_flight_guard().await;
-            recheck_after_guard(db, asks, thread, dir, wt).await?;
+            recheck_after_guard(db, asks, thread, dir, wt, auth_gen).await?;
             // See the matching comment in the "type" arm above.
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             // preflight the focus prerequisite before
@@ -1444,6 +1525,7 @@ async fn run_action(
                 thread,
                 dir,
                 wt,
+                auth_gen,
                 window_query,
                 &approved,
                 w,
@@ -1490,6 +1572,9 @@ async fn run_action(
                 if route_revoked_sync(thread, &dir_owned, wt) {
                     return Err(SESSION_GONE_MSG.to_string());
                 }
+                // and the bearer-staleness check — same rationale as the
+                // list_windows closure's.
+                verify_bearer_generation(thread, &dir_owned, wt, auth_gen)?;
                 b.cursor_position().map_err(|e| e.to_string())
             })
             .await?
@@ -3021,7 +3106,18 @@ fn acquire_and_throttle(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), S
 /// text [`check_suspended`] itself returns — from the calling agent's point
 /// of view, this is indistinguishable from having queued behind that check
 /// in the first place.
-async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str, wt: Option<i32>) -> Result<(), String> {
+async fn recheck_after_guard(
+    db: &Db,
+    asks: &AskRegistry,
+    thread: i32,
+    dir: &str,
+    wt: Option<i32>,
+    auth_gen: u64,
+) -> Result<(), String> {
+    // The bearer-staleness check first — a request that queued on the flight
+    // guard across a relaunch's rotation no longer represents the child that
+    // now owns this identity, whatever the lease/asks say.
+    verify_bearer_generation(thread, dir, wt, auth_gen)?;
     if asks.has_open(thread, dir) {
         return Err(ComputerError::SuspendedPendingAsk.to_string());
     }
@@ -3090,10 +3186,20 @@ async fn recheck_after_guard(db: &Db, asks: &AskRegistry, thread: i32, dir: &str
 /// instant on the same thread as the backend call, closing that residual gap
 /// completely. Callers `?` this and never fall
 /// through to activation/the backend call on an `Err`.
-fn recheck_stop_and_lease_before_backend(thread: i32, dir: &str, wt: Option<i32>) -> Result<(), String> {
+fn recheck_stop_and_lease_before_backend(
+    thread: i32,
+    dir: &str,
+    wt: Option<i32>,
+    auth_gen: u64,
+) -> Result<(), String> {
     if computer::stop_latched() {
         return Err(ComputerError::Disabled.to_string());
     }
+    // The bearer-staleness check rides every one of this helper's call
+    // points too (lock-only, like the rest): the pacing sleep, activation,
+    // and the in-closure resolve are exactly the kind of long gaps a
+    // relaunch's rotation can land inside — see `verify_bearer_generation`.
+    verify_bearer_generation(thread, dir, wt, auth_gen)?;
     // The "session deleted after recheck_after_guard, while the final
     // resolve/injection was queued" gap is closed at ITS ROOT rather than
     // here — the delete paths CLEAR the control lease for any route they
@@ -3190,6 +3296,7 @@ async fn pace_activate_verify_and_inject<T: Send + 'static>(
     thread: i32,
     dir: &str,
     wt: Option<i32>,
+    auth_gen: u64,
     window_query: &str,
     approved: &Option<ApprovedWindow>,
     activation_target: computer::WindowInfo,
@@ -3208,7 +3315,7 @@ async fn pace_activate_verify_and_inject<T: Send + 'static>(
         computer::pace_backend_dispatch();
         let mut id = None;
         let result = (|| {
-            recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
+            recheck_stop_and_lease_before_backend(thread, &dir_owned, wt, auth_gen)?;
             activate_target(&activation_target)?;
             if asks.has_open(thread, &dir_owned) {
                 return Err(ComputerError::SuspendedPendingAsk.to_string());
@@ -3227,7 +3334,7 @@ async fn pace_activate_verify_and_inject<T: Send + 'static>(
                 }
             }
             let fresh = resolve_and_verify_target(&window_query, &approved, &mut id)?;
-            recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
+            recheck_stop_and_lease_before_backend(thread, &dir_owned, wt, auth_gen)?;
             let out = tail(&fresh)?;
             Ok((out, fresh))
         })();
@@ -3869,10 +3976,15 @@ fn rotate_audit_at_size(path: &std::path::Path, max_bytes: u64) {
 /// machine. The screenshot files themselves were already `0o600` (see
 /// `computer::screenshot_window`); this brings the audit log to the SAME
 /// owner-only bar. Mode is only consulted by `open(2)` when it actually
-/// CREATES a new file (`O_CREAT` with no existing inode) — appending to an
-/// already-existing, already-lenient file from before this change keeps
-/// whatever mode it already had; only fresh files (and rotated-away originals
-/// — see `rotate_if_full`) get the tightened default.
+/// CREATES a new file (`O_CREAT` with no existing inode) — which is why the
+/// unix branch now ALSO validates the mode+owner of the file it actually
+/// opened (`fstat` on the handle, so no path race) and reacts to a
+/// permissive or foreign-owned pre-existing file exactly like the Windows
+/// branch does for a permissive ACL: set it aside, re-create owner-only,
+/// re-validate once, fail closed otherwise. A mere in-place `chmod` would
+/// NOT do: another account's already-open read fd survives a chmod and
+/// keeps reading every appended line, so the file must stop receiving
+/// appends entirely.
 async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
     // On Windows the owner-only DACL rides the CREATION call itself
     // (`create_file_owner_only`) — a freshly created audit file (the first
@@ -3939,7 +4051,66 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
         options.custom_flags(libc::O_NOFOLLOW);
         #[cfg(unix)]
         options.mode(0o600);
-        options.open(path).await
+        let file = options.open(path).await?;
+        // The unix mirror of the Windows DACL validation above: `mode` only
+        // applies when `open(2)` CREATES, so a pre-existing group/world-
+        // readable file (or one another account owns) would keep receiving
+        // appends. Validate the OPENED handle (fstat — immune to path
+        // swaps), and on a violation set the file aside and re-create
+        // owner-only, re-validated once; any failure refuses to log this
+        // line rather than write through a permissive mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            use std::os::unix::fs::PermissionsExt as _;
+            let deny = || {
+                Err(std::io::Error::other(
+                    "audit file owner-only open failed — refusing to write through a permissive \
+                     mode",
+                ))
+            };
+            // SAFETY: geteuid has no failure mode and touches no memory.
+            let my_uid = unsafe { libc::geteuid() };
+            let owner_only =
+                |m: &std::fs::Metadata| m.permissions().mode() & 0o077 == 0 && m.uid() == my_uid;
+            let Ok(meta) = file.metadata().await else {
+                return deny();
+            };
+            if owner_only(&meta) {
+                return Ok(file);
+            }
+            // Close our handle, set the permissive file aside (bytes were
+            // already exposed under the old mode — preserved for inspection,
+            // never appended to again), and take the path fresh.
+            // `create_new` (O_EXCL): if something raced yet another file in,
+            // fail closed this round instead of looping.
+            drop(file);
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                return deny();
+            };
+            let aside = path.with_file_name(format!("{name}.insecure"));
+            if tokio::fs::rename(path, &aside).await.is_err() {
+                return deny();
+            }
+            let mut fresh_options = tokio::fs::OpenOptions::new();
+            fresh_options
+                .create_new(true)
+                .append(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(0o600);
+            let fresh = fresh_options.open(path).await?;
+            let Ok(meta) = fresh.metadata().await else {
+                return deny();
+            };
+            if owner_only(&meta) {
+                return Ok(fresh);
+            }
+            return deny();
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(file)
+        }
     }
 }
 
@@ -5739,7 +5910,7 @@ mod tests {
             let mut window_id_out = None;
             let mut image_out = None;
             run_action(
-                &db_bg, &asks_bg, thread, dir, None, "computer", "left_click",
+                &db_bg, &asks_bg, thread, dir, None, session_token_generation(thread, dir, None), "computer", "left_click",
                 &json!({"window": "Baz", "coordinate": [100, 50]}),
                 &mut window_id_out, &mut image_out,
             )
@@ -5849,7 +6020,7 @@ mod tests {
         let mut window_id_out = None;
         let mut image_out = None;
         let err = run_action(
-            &db, &asks, thread, dir, None, "computer", "type",
+            &db, &asks, thread, dir, None, session_token_generation(thread, dir, None), "computer", "type",
             &json!({"window": "Bar", "text": "hello"}),
             &mut window_id_out, &mut image_out,
         )
@@ -5869,6 +6040,106 @@ mod tests {
         drop(actions);
 
         // Leave clean for the next test sharing this mock instance.
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        computer::clear_control();
+    }
+
+    /// The entry capture returns exactly the generation the bearer verified
+    /// at, and a later rotation makes both the old bearer (entry gate) and
+    /// the old CAPTURED generation (in-flight checkpoints) fail.
+    #[test]
+    fn the_entry_capture_binds_a_request_to_the_generation_its_bearer_verified_at() {
+        let thread = 933_201;
+        let token = rotate_and_mint_computer_session_token(thread, "lead", None);
+        let auth_gen = verify_computer_token_at_current_generation(thread, "lead", None, &token)
+            .expect("a freshly minted bearer must verify");
+        assert_eq!(auth_gen, session_token_generation(thread, "lead", None));
+        assert!(verify_bearer_generation(thread, "lead", None, auth_gen).is_ok());
+
+        // A replacement launch rotates: the old bearer no longer verifies at
+        // the entry gate, and the old captured generation now fails every
+        // in-flight checkpoint with the superseded message.
+        let _replacement = rotate_and_mint_computer_session_token(thread, "lead", None);
+        assert!(
+            verify_computer_token_at_current_generation(thread, "lead", None, &token).is_none(),
+            "the superseded bearer must 401 at the entry gate"
+        );
+        let err = verify_bearer_generation(thread, "lead", None, auth_gen).unwrap_err();
+        assert!(err.contains("superseded"), "{err}");
+    }
+
+    /// A replacement launch's rotation landing while a call is ALREADY in
+    /// flight (here: during the blocking activation shell-out, standing in
+    /// for any of the long post-entry waits) must stop the injection — the
+    /// entry gate only ever 401s NEW requests, so the in-flight
+    /// checkpoints have to catch the superseded bearer themselves.
+    /// Deterministic via `MockBackend::on_activate`, exactly like the
+    /// lease-loss twin above.
+    #[tokio::test]
+    async fn type_is_rejected_when_the_bearer_is_superseded_during_activation() {
+        let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        computer::clear_emergency_stop(computer::stop_generation());
+        computer::clear_control();
+        let mock = shared_mock();
+        mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
+        mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+            id: 906_401,
+            app: "Bar".into(),
+            title: "Bar".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
+        let asks = AskRegistry::new();
+        let thread = 906_401;
+        let dir = "lead";
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant { thread, dir: dir.to_string() }],
+            always: Vec::new(),
+        });
+        record_click_focus(thread, dir, None, &computer::WindowInfo {
+            id: 906_401,
+            app: "Bar".into(),
+            title: "Bar".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        });
+        let _ = computer::throttle_input();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        // The request authenticated at THIS generation...
+        let auth_gen = session_token_generation(thread, dir, None);
+        // ...and a replacement launch rotates it while the activation
+        // shell-out is running.
+        *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+            let _ = rotate_and_mint_computer_session_token(906_401, "lead", None);
+        }));
+
+        let mut window_id_out = None;
+        let mut image_out = None;
+        let err = run_action(
+            &db, &asks, thread, dir, None, auth_gen, "computer", "type",
+            &json!({"window": "Bar", "text": "hello"}),
+            &mut window_id_out, &mut image_out,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("superseded"), "{err}");
+        let actions = mock.actions.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !actions.iter().any(|a| a.starts_with("type ")),
+            "the backend must never receive the type call once the bearer is superseded: {actions:?}"
+        );
+        drop(actions);
+
         *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
         computer::clear_control();
     }
@@ -5956,7 +6227,7 @@ mod tests {
         let mut window_id_out = None;
         let mut image_out = None;
         let result = run_action(
-            &db, &asks, thread, dir, None, "computer", "left_click",
+            &db, &asks, thread, dir, None, session_token_generation(thread, dir, None), "computer", "left_click",
             &json!({"window": "moving", "coordinate": [10, 10]}),
             &mut window_id_out, &mut image_out,
         )
@@ -6044,7 +6315,7 @@ mod tests {
         let mut window_id_out = None;
         let mut image_out = None;
         let err = run_action(
-            &db, &asks, thread, dir, None, "computer", "type",
+            &db, &asks, thread, dir, None, session_token_generation(thread, dir, None), "computer", "type",
             &json!({"window": "swappy", "text": "hello"}),
             &mut window_id_out, &mut image_out,
         )
@@ -6126,7 +6397,7 @@ mod tests {
             let mut window_id_out = None;
             let mut image_out = None;
             run_action(
-                &db_bg, &asks_bg, thread, dir, None, "computer", "left_click",
+                &db_bg, &asks_bg, thread, dir, None, session_token_generation(thread, dir, None), "computer", "left_click",
                 &json!({"window": "shifty", "coordinate": [10, 10]}),
                 &mut window_id_out, &mut image_out,
             )
@@ -6225,7 +6496,7 @@ mod tests {
         let mut window_id_out = None;
         let mut image_out = None;
         let result = run_action(
-            &db, &asks, thread, dir, None, "computer", "left_click",
+            &db, &asks, thread, dir, None, session_token_generation(thread, dir, None), "computer", "left_click",
             &json!({"window": "steady", "coordinate": [5, 5]}),
             &mut window_id_out, &mut image_out,
         )
@@ -6666,7 +6937,7 @@ mod tests {
             let mut window_id_out = None;
             let mut image_out = None;
             run_action(
-                &db_bg, &asks_bg, thread, dir, None, "computer", "screenshot",
+                &db_bg, &asks_bg, thread, dir, None, session_token_generation(thread, dir, None), "computer", "screenshot",
                 &json!({"window": "shifty"}), &mut window_id_out, &mut image_out,
             )
             .await
@@ -6818,26 +7089,26 @@ mod tests {
         computer::acquire_control(thread, dir, None).unwrap();
         // Latch clear AND this exact (thread, dir) holds the lease — the only
         // combination allowed to reach the injection backend.
-        assert!(recheck_stop_and_lease_before_backend(thread, dir, None).is_ok());
+        assert!(recheck_stop_and_lease_before_backend(thread, dir, None, session_token_generation(thread, dir, None)).is_ok());
 
         // Emergency Stop landing after the last async recheck (during the final
         // resolve, or while the closure sat queued for a blocking thread) trips
         // the latch — deny with the disabled message. `trip_stop_latch` ALSO
         // clears the lease, so the stop check firing first is what this asserts.
         let stop_gen = computer::trip_stop_latch();
-        let err = recheck_stop_and_lease_before_backend(thread, dir, None).unwrap_err();
+        let err = recheck_stop_and_lease_before_backend(thread, dir, None, session_token_generation(thread, dir, None)).unwrap_err();
         assert!(err.to_lowercase().contains("disabled"), "{err}");
         assert!(computer::clear_emergency_stop(stop_gen));
 
         // Latch clear, but the lease is gone (Escape cleared it / it expired in
         // that same window) — deny, and NOT with the disabled message.
         computer::clear_control();
-        let err = recheck_stop_and_lease_before_backend(thread, dir, None).unwrap_err();
+        let err = recheck_stop_and_lease_before_backend(thread, dir, None, session_token_generation(thread, dir, None)).unwrap_err();
         assert!(!err.to_lowercase().contains("disabled"), "{err}");
 
         // A DIFFERENT (thread, dir) now holds the lease — deny (busy).
         computer::acquire_control(999_999, "someone-else", None).unwrap();
-        let err = recheck_stop_and_lease_before_backend(thread, dir, None).unwrap_err();
+        let err = recheck_stop_and_lease_before_backend(thread, dir, None, session_token_generation(thread, dir, None)).unwrap_err();
         assert!(err.contains("999999") || err.contains("someone-else"), "{err}");
         computer::clear_control();
     }
@@ -6862,14 +7133,14 @@ mod tests {
 
         // Worker wt=1's final recheck must NOT pass — a busy/lease rejection,
         // not a stop (the latch is clear).
-        let err = recheck_stop_and_lease_before_backend(thread, dir, Some(1)).unwrap_err();
+        let err = recheck_stop_and_lease_before_backend(thread, dir, Some(1), session_token_generation(thread, dir, Some(1))).unwrap_err();
         assert!(
             !err.to_lowercase().contains("disabled"),
             "must be a busy/lease rejection, not a stop: {err}"
         );
 
         // The actual holder (wt=2) still passes.
-        assert!(recheck_stop_and_lease_before_backend(thread, dir, Some(2)).is_ok());
+        assert!(recheck_stop_and_lease_before_backend(thread, dir, Some(2), session_token_generation(thread, dir, Some(2))).is_ok());
         computer::clear_control();
     }
 
@@ -6914,7 +7185,7 @@ mod tests {
         // existed to clear at delete time) — exactly the reported scenario.
         computer::acquire_control(thread.id, &dir_s, Some(wt_b_id)).unwrap();
         let asks = AskRegistry::new();
-        let err = recheck_after_guard(&db, &asks, thread.id, &dir_s, Some(wt_b_id))
+        let err = recheck_after_guard(&db, &asks, thread.id, &dir_s, Some(wt_b_id), session_token_generation(thread.id, &dir_s, Some(wt_b_id)))
             .await
             .expect_err("a deleted secondary worktree's session must be refused, lease or not");
         assert!(err.contains("no longer exists"), "{err}");
@@ -6923,7 +7194,7 @@ mod tests {
         // The surviving sibling passes the same checkpoint with its own lease.
         computer::acquire_control(thread.id, &dir_s, Some(wt_a.id)).unwrap();
         assert!(
-            recheck_after_guard(&db, &asks, thread.id, &dir_s, Some(wt_a.id)).await.is_ok(),
+            recheck_after_guard(&db, &asks, thread.id, &dir_s, Some(wt_a.id), session_token_generation(thread.id, &dir_s, Some(wt_a.id))).await.is_ok(),
             "the surviving sibling worktree must not be caught by the session revocation"
         );
         computer::clear_control();
@@ -7333,7 +7604,7 @@ mod tests {
         // Disabled setting denies regardless of the lease.
         repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "false").await.unwrap();
         computer::clear_control();
-        let err = recheck_after_guard(&db, &asks, thread, dir, None).await.unwrap_err();
+        let err = recheck_after_guard(&db, &asks, thread, dir, None, session_token_generation(thread, dir, None)).await.unwrap_err();
         assert!(err.to_lowercase().contains("disabled"), "{err}");
 
         // Enabled, but nobody holds the lease at all (it expired, or was
@@ -7341,21 +7612,21 @@ mod tests {
         // not silently allowed just because the setting itself reads true.
         repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
         computer::clear_control();
-        let err = recheck_after_guard(&db, &asks, thread, dir, None).await.unwrap_err();
+        let err = recheck_after_guard(&db, &asks, thread, dir, None, session_token_generation(thread, dir, None)).await.unwrap_err();
         assert!(!err.to_lowercase().contains("disabled"), "{err}");
 
         // Enabled, but a DIFFERENT (thread, dir) now holds the lease
         // (preempted while this call was queued behind the flight guard) —
         // denied.
         computer::acquire_control(999_999, "someone-else", None).unwrap();
-        let err = recheck_after_guard(&db, &asks, thread, dir, None).await.unwrap_err();
+        let err = recheck_after_guard(&db, &asks, thread, dir, None, session_token_generation(thread, dir, None)).await.unwrap_err();
         assert!(err.contains("999999") || err.contains("someone-else"), "{err}");
         computer::clear_control();
 
         // Enabled AND this exact (thread, dir) still holds the lease —
         // passes.
         computer::acquire_control(thread, dir, None).unwrap();
-        assert!(recheck_after_guard(&db, &asks, thread, dir, None).await.is_ok());
+        assert!(recheck_after_guard(&db, &asks, thread, dir, None, session_token_generation(thread, dir, None)).await.is_ok());
 
         // a brand-new, unrelated ask opening
         // for this EXACT (thread, dir) — simulating one that opened WHILE this
@@ -7367,18 +7638,18 @@ mod tests {
         let (other_id, _rx) =
             asks.request(thread, "some-other-dir", "tool", "summary", "detail", crate::ask::RiskLevel::Unknown, "[]");
         assert!(
-            recheck_after_guard(&db, &asks, thread, dir, None).await.is_ok(),
+            recheck_after_guard(&db, &asks, thread, dir, None, session_token_generation(thread, dir, None)).await.is_ok(),
             "a DIFFERENT (thread, dir)'s open ask must not affect this one"
         );
         assert!(asks.answer(other_id, crate::ask::Answer::Deny));
 
         let (id, _rx) = asks.request(thread, dir, "tool", "summary", "detail", crate::ask::RiskLevel::Unknown, "[]");
-        let err = recheck_after_guard(&db, &asks, thread, dir, None).await.unwrap_err();
+        let err = recheck_after_guard(&db, &asks, thread, dir, None, session_token_generation(thread, dir, None)).await.unwrap_err();
         assert!(err.contains("permission card"), "{err}");
 
         // Once answered, the recheck passes again.
         assert!(asks.answer(id, crate::ask::Answer::Deny));
-        assert!(recheck_after_guard(&db, &asks, thread, dir, None).await.is_ok());
+        assert!(recheck_after_guard(&db, &asks, thread, dir, None, session_token_generation(thread, dir, None)).await.is_ok());
 
         computer::clear_control();
     }
@@ -7429,7 +7700,7 @@ mod tests {
             let mut window_id_out = None;
             let mut image_out = None;
             run_action(
-                &db_bg, &asks_bg, thread, dir, None, "computer", "left_click", &args,
+                &db_bg, &asks_bg, thread, dir, None, session_token_generation(thread, dir, None), "computer", "left_click", &args,
                 &mut window_id_out, &mut image_out,
             )
             .await
@@ -7507,7 +7778,7 @@ mod tests {
         let mut window_id_out = None;
         let mut image_out = None;
         let err = run_action(
-            &db, &asks, thread, dir, None, "computer", "left_click",
+            &db, &asks, thread, dir, None, session_token_generation(thread, dir, None), "computer", "left_click",
             &json!({"window": "fresh", "coordinate": [1, 1]}),
             &mut window_id_out, &mut image_out,
         )
@@ -7601,7 +7872,7 @@ mod tests {
         let mut image_out = None;
         // (640, 400) is the exact midpoint of the 1280x800 screenshot.
         let result = run_action(
-            &db, &asks, thread, dir, None, "computer", "left_click",
+            &db, &asks, thread, dir, None, session_token_generation(thread, dir, None), "computer", "left_click",
             &json!({"window": "resizable", "coordinate": [640, 400]}),
             &mut window_id_out, &mut image_out,
         )
@@ -7743,7 +8014,7 @@ mod tests {
             let mut window_id_out = None;
             let mut image_out = None;
             run_action(
-                &db_bg, &asks_bg, thread, dir, None, "computer", "screenshot",
+                &db_bg, &asks_bg, thread, dir, None, session_token_generation(thread, dir, None), "computer", "screenshot",
                 &json!({"window": "queued"}), &mut window_id_out, &mut image_out,
             )
             .await
@@ -7848,7 +8119,7 @@ mod tests {
             let mut window_id_out = None;
             let mut image_out = None;
             run_action(
-                &db_bg, &asks_bg, thread, dir, None, "computer", "list_windows",
+                &db_bg, &asks_bg, thread, dir, None, session_token_generation(thread, dir, None), "computer", "list_windows",
                 &json!({}), &mut window_id_out, &mut image_out,
             )
             .await
@@ -8198,6 +8469,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A pre-existing audit file with a PERMISSIVE mode (the `open(2)` mode
+    /// argument only applies on creation, so an old lenient file would keep
+    /// receiving appends) must be set aside to a `.insecure` sibling —
+    /// preserving its already-exposed bytes for inspection, never appending
+    /// through it — and the path re-created owner-only. A chmod-in-place
+    /// would not do: an already-open foreign read fd survives a chmod.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_audit_file_for_append_sets_aside_a_permissive_preexisting_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("weft-audit-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let leaf = base.join("computer-audit.jsonl");
+        std::fs::write(&leaf, b"already-exposed-lines").unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let file = open_audit_file_for_append(&leaf).await.unwrap();
+        drop(file);
+
+        let mode = std::fs::symlink_metadata(&leaf).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the re-created live file must be owner-only");
+        assert_eq!(
+            std::fs::read(&leaf).unwrap(),
+            b"",
+            "the live path must be a FRESH file, not the permissive original"
+        );
+        let aside = base.join("computer-audit.jsonl.insecure");
+        assert_eq!(
+            std::fs::read(&aside).unwrap(),
+            b"already-exposed-lines",
+            "the permissive original's bytes must be preserved on the sidecar"
+        );
+
+        // An already-owner-only file keeps receiving appends in place — no
+        // churn to the sidecar on every open.
+        let file = open_audit_file_for_append(&leaf).await.unwrap();
+        drop(file);
+        assert_eq!(
+            std::fs::read(&aside).unwrap(),
+            b"already-exposed-lines",
+            "a compliant live file must never be rotated aside"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // —— bounded audit-log rotation ——
 
     /// The core property: a file already AT (or over) the threshold gets
@@ -8540,7 +8858,7 @@ mod tests {
         let mut window_id_out = None;
         let mut image_out = None;
         let err = run_action(
-            &db, &asks, thread, dir, None, "computer", "left_click",
+            &db, &asks, thread, dir, None, session_token_generation(thread, dir, None), "computer", "left_click",
             &json!({"window": "notes"}),
             &mut window_id_out, &mut image_out,
         )
@@ -8634,7 +8952,7 @@ mod tests {
         let mut window_id_out = None;
         let mut image_out = None;
         let err = run_action(
-            &db, &asks, thread, dir, None, "computer", "type",
+            &db, &asks, thread, dir, None, session_token_generation(thread, dir, None), "computer", "type",
             &json!({"window": "notes", "text": over_limit}),
             &mut window_id_out, &mut image_out,
         )
@@ -8695,7 +9013,7 @@ mod tests {
         let mut window_id_out = None;
         let mut image_out = None;
         let err = run_action(
-            &db, &asks, thread, dir, None, "computer", "key",
+            &db, &asks, thread, dir, None, session_token_generation(thread, dir, None), "computer", "key",
             &json!({"window": "notes", "text": "ctrl+a+b"}),
             &mut window_id_out, &mut image_out,
         )
@@ -8763,7 +9081,7 @@ mod tests {
         let mut window_id_out = None;
         let mut image_out = None;
         let err = run_action(
-            &db, &asks, thread, dir, None, "computer", "left_click",
+            &db, &asks, thread, dir, None, session_token_generation(thread, dir, None), "computer", "left_click",
             &json!({"window": "notes", "coordinate": [1, 1]}),
             &mut window_id_out, &mut image_out,
         )
@@ -8827,7 +9145,7 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             run_action(
-                &db, &asks, thread, dir, None, "computer", "left_click",
+                &db, &asks, thread, dir, None, session_token_generation(thread, dir, None), "computer", "left_click",
                 &json!({"window": "notes"}), // no `coordinate`
                 &mut window_id_out, &mut image_out,
             ),
@@ -9158,6 +9476,7 @@ mod tests {
             904_502,
             "lead",
             None,
+            session_token_generation(904_502, "lead", None),
             "notes",
             &None,
             target,

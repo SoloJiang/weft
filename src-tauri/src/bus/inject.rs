@@ -964,7 +964,7 @@ pub(crate) fn create_file_owner_only(path: &Path, mode: OwnerOnlyCreate) -> Opti
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, CREATE_NEW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE,
-        FILE_SHARE_READ, OPEN_ALWAYS,
+        FILE_SHARE_READ, OPEN_ALWAYS, READ_CONTROL,
     };
     use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 
@@ -999,9 +999,19 @@ pub(crate) fn create_file_owner_only(path: &Path, mode: OwnerOnlyCreate) -> Opti
             bInheritHandle: false.into(),
         };
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // AppendOrCreate also requests READ_CONTROL: its one caller
+        // immediately validates the opened handle's DACL
+        // (`file_dacl_is_owner_only` → `GetSecurityInfo`), and querying a
+        // handle's security REQUIRES that right on the handle itself —
+        // append-only access would make the validation fail unconditionally,
+        // and with it (fail-closed) every audit append. Reading one's own
+        // security descriptor grants nothing write-ward; the handle still
+        // cannot modify the ACL (that would need WRITE_DAC).
         let (access, share, disposition) = match mode {
             OwnerOnlyCreate::CreateNew => (GENERIC_WRITE.0, FILE_SHARE_MODE(0), CREATE_NEW),
-            OwnerOnlyCreate::AppendOrCreate => (FILE_APPEND_DATA.0, FILE_SHARE_READ, OPEN_ALWAYS),
+            OwnerOnlyCreate::AppendOrCreate => {
+                (FILE_APPEND_DATA.0 | READ_CONTROL.0, FILE_SHARE_READ, OPEN_ALWAYS)
+            }
         };
         let created = CreateFileW(
             PCWSTR(wide.as_ptr()),
@@ -1207,11 +1217,24 @@ fn inject_computer_claude(thread: i32, dir: &str, wt: Option<i32>, url: &str) ->
     if !write_owner_only_atomic(&file, &bytes) {
         return Injection::none();
     }
-    // Best-effort prune of THIS identity's EARLIER launches (and the legacy
+    // Best-effort prune of THIS identity's OTHER launches (and the legacy
     // stable-name file): their bearers are already dead, and without pruning
     // the directory grows one file per launch forever. Never touches another
     // identity's files (the exact-structure match below), and a failure here
     // only leaves a stale file behind — the fresh injection above stands.
+    //
+    // AGE-GATED: only files quiet for longer than any plausible
+    // spawn-to-config-parse window are removed. An OVERLAPPING sibling
+    // launch's config is necessarily fresh — deleting it before its child
+    // parses `--mcp-config` would strip that child's computer server
+    // entirely, and removal order isn't launch order (an earlier-sequence
+    // launch finishing its write last could otherwise even delete the
+    // NEWEST config). A file still sitting here past the window means its
+    // launch parsed it long ago (a started child reads the file within
+    // moments of spawn) or never came up at all — and the bearer inside is
+    // rotated-dead either way, so removing it reclaims only disk, never a
+    // live child's configuration.
+    const PRUNE_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(600);
     if let Ok(entries) = std::fs::read_dir(&mcp_dir) {
         let legacy = format!("{ident}.mcp.json");
         let launch_prefix = format!("{ident}-L");
@@ -1223,11 +1246,22 @@ fn inject_computer_claude(thread: i32, dir: &str, wt: Option<i32>, url: &str) ->
                 continue;
             }
             let is_legacy = name == legacy;
-            let is_earlier_launch = name
+            let is_other_launch = name
                 .strip_prefix(&launch_prefix)
                 .and_then(|rest| rest.strip_suffix(".mcp.json"))
                 .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()));
-            if is_legacy || is_earlier_launch {
+            if !(is_legacy || is_other_launch) {
+                continue;
+            }
+            // An unreadable mtime keeps the file — prune is best-effort and
+            // must never guess a file old.
+            let old_enough = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= PRUNE_MIN_AGE);
+            if old_enough {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -1468,12 +1502,15 @@ mod tests {
     /// A SECOND launch for the SAME `(thread, dir, wt)` must get its OWN
     /// launch-unique config path — never rewrite the earlier launch's file in
     /// place, where the old child (not guaranteed to have parsed
-    /// `--mcp-config` yet) could read the replacement's fresh bearer — and
-    /// the earlier launch's file, plus the legacy stable-name file, is pruned
-    /// best-effort. The new file still lands via
-    /// [`write_owner_only_atomic`]: exactly `0600` on unix, no `.weft-tmp`
-    /// sibling left behind. A DIFFERENT `wt` (or the absent-wt lead case) is
-    /// a DIFFERENT identity whose files the prune must never touch.
+    /// `--mcp-config` yet) could read the replacement's fresh bearer. Pruning
+    /// of this identity's other files is AGE-GATED: a FRESH sibling config
+    /// (an overlapping launch whose child may not have parsed it yet) must
+    /// survive, while files older than the parse window — a backdated prior
+    /// launch, the legacy stable-name file — are removed. The new file still
+    /// lands via [`write_owner_only_atomic`]: exactly `0600` on unix, no
+    /// `.weft-tmp` sibling left behind. A DIFFERENT `wt` (or the absent-wt
+    /// lead case) is a DIFFERENT identity whose files the prune must never
+    /// touch, fresh or stale.
     #[test]
     fn computer_claude_relaunch_gets_a_fresh_path_and_prunes_stale_configs() {
         let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1485,35 +1522,60 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weft-inj-comp-reinject-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
+        // Backdate a file far past the prune window, standing in for "its
+        // launch is long gone".
+        let backdate = |p: &std::path::Path| {
+            let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            f.set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
+        };
+
         // Plant a LEGACY stable-name file for this identity (the pre-launch-
-        // suffix naming) and a config belonging to a DIFFERENT identity: the
-        // next injection's prune must remove the former and never touch the
-        // latter.
+        // suffix naming, backdated: genuinely stale) and a STALE config
+        // belonging to a DIFFERENT identity: the next injection's prune must
+        // remove the former and never touch the latter, age notwithstanding.
         let mcp_dir = weft_home.join("computer-mcp");
         std::fs::create_dir_all(&mcp_dir).unwrap();
         let legacy = mcp_dir.join("5-50-wt7.mcp.json");
         std::fs::write(&legacy, b"stale-legacy").unwrap();
+        backdate(&legacy);
         let foreign = mcp_dir.join("99-77-L1.mcp.json");
         std::fs::write(&foreign, b"another-identity").unwrap();
+        backdate(&foreign);
 
         let first = inject_computer("http://127.0.0.1:9", 5, "50", "claude", Some(7));
         let first_path = std::path::PathBuf::from(&first.args[1]);
         assert!(first_path.exists(), "the first injection must write the config");
-        assert!(!legacy.exists(), "the legacy stable-name file must be pruned on injection");
-        assert!(foreign.exists(), "another identity's config must never be pruned");
+        assert!(!legacy.exists(), "the stale legacy stable-name file must be pruned on injection");
+        assert!(foreign.exists(), "another identity's config must never be pruned, even stale");
 
         // A second launch for the SAME (thread, dir, wt) with a DIFFERENT
         // base URL — a rerun racing the engine it replaces. It must get its
-        // OWN file and prune the first launch's.
+        // OWN file, and the first launch's FRESH file must survive: that
+        // child may not have parsed `--mcp-config` yet, and deleting the
+        // file would strip its computer server entirely.
         let second = inject_computer("http://127.0.0.1:8", 5, "50", "claude", Some(7));
         let second_path = std::path::PathBuf::from(&second.args[1]);
         assert_ne!(
             second_path, first_path,
             "each launch must get its own config path, never rewrite the prior launch's in place"
         );
-        assert!(!first_path.exists(), "the earlier launch's config must be pruned");
+        assert!(
+            first_path.exists(),
+            "a FRESH sibling launch's config must never be pruned — its child may not have \
+             parsed it yet"
+        );
         let cfg = std::fs::read_to_string(&second_path).unwrap();
         assert!(cfg.contains("127.0.0.1:8"), "the new launch's content must be its own: {cfg}");
+
+        // Once the first launch's file is genuinely old, the next injection
+        // prunes it — and only it (the second launch's file stays fresh).
+        backdate(&first_path);
+        let third = inject_computer("http://127.0.0.1:7", 5, "50", "claude", Some(7));
+        let third_path = std::path::PathBuf::from(&third.args[1]);
+        assert!(!first_path.exists(), "a stale prior launch's config must be pruned");
+        assert!(second_path.exists(), "a still-fresh sibling config must survive the prune");
+        assert!(third_path.exists());
 
         #[cfg(unix)]
         {
