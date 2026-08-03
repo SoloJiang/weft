@@ -724,8 +724,8 @@ pub fn map_screenshot_coord(
 /// across separate calls (see [`shot_dims_for`]'s own doc for the honest
 /// residual this leaves, and why it is recorded but deliberately NOT folded
 /// into that function's own pass/fail gate).
-fn recent_shot_dims() -> &'static Mutex<std::collections::HashMap<(i32, String, u32), ShotDimsEntry>> {
-    static DIMS: OnceLock<Mutex<std::collections::HashMap<(i32, String, u32), ShotDimsEntry>>> = OnceLock::new();
+fn recent_shot_dims() -> &'static Mutex<std::collections::HashMap<(i32, String, Option<i32>, u32), ShotDimsEntry>> {
+    static DIMS: OnceLock<Mutex<std::collections::HashMap<(i32, String, Option<i32>, u32), ShotDimsEntry>>> = OnceLock::new();
     DIMS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -761,7 +761,7 @@ const MAX_SHOT_DIMS: usize = 128;
 /// already at capacity — same shape as [`evict_oldest_if_full`] above, kept
 /// as its own function (rather than reusing that one) since the key/value
 /// shapes differ (a `window_id`-widened key, no preview payload).
-fn evict_oldest_shot_dims_if_full(map: &mut std::collections::HashMap<(i32, String, u32), ShotDimsEntry>) {
+fn evict_oldest_shot_dims_if_full(map: &mut std::collections::HashMap<(i32, String, Option<i32>, u32), ShotDimsEntry>) {
     if map.len() < MAX_SHOT_DIMS {
         return;
     }
@@ -771,8 +771,14 @@ fn evict_oldest_shot_dims_if_full(map: &mut std::collections::HashMap<(i32, Stri
 }
 
 /// Record a SAVED screenshot's own dimensions AND the window identity +
-/// geometry it was captured against, for `(thread, dir, window_id)`,
-/// refreshing whatever was on file for that exact triple (issue #160
+/// geometry it was captured against, for `(thread, dir, wt, window_id)`,
+/// refreshing whatever was on file for that exact key. `wt` (issue #160
+/// round-26 P2, Codex mod.rs:797) isolates SIBLING worker sessions of one
+/// multi-repo direction — same `(thread, dir)`, different worktree — so one
+/// sibling's fresh screenshot can never overwrite the dimensions another
+/// sibling's approved input is about to map coordinates against (a
+/// wrong-geometry click on a resized window), matching the wt-precise
+/// bearer and control lease (issue #160
 /// round-11 P1 #D; `app`/`title` added round-12 P1 #2, geometry added
 /// round-12 P1 #C — see [`shot_dims_for`]'s own doc for both). `w` is the
 /// window `screenshot_window` actually captured against, resolved as close
@@ -792,9 +798,9 @@ fn evict_oldest_shot_dims_if_full(map: &mut std::collections::HashMap<(i32, Stri
 /// test-visible item is `#[doc(hidden)] pub` rather than
 /// `pub(crate)`/`#[cfg(test)]`.
 #[doc(hidden)]
-pub fn record_shot_dims(thread: i32, dir: &str, window_id: u32, shot_width: u32, shot_height: u32, w: &WindowInfo) {
+pub fn record_shot_dims(thread: i32, dir: &str, wt: Option<i32>, window_id: u32, shot_width: u32, shot_height: u32, w: &WindowInfo) {
     let mut g = recent_shot_dims().lock().unwrap_or_else(|e| e.into_inner());
-    let key = (thread, dir.to_string(), window_id);
+    let key = (thread, dir.to_string(), wt, window_id);
     if !g.contains_key(&key) {
         evict_oldest_shot_dims_if_full(&mut g);
     }
@@ -870,9 +876,9 @@ pub fn record_shot_dims(thread: i32, dir: &str, window_id: u32, shot_width: u32,
 /// protocol-aware fix (or for audit/forensic use) without regressing either
 /// tested tolerance today.
 #[doc(hidden)]
-pub fn shot_dims_for(thread: i32, dir: &str, w: &WindowInfo) -> Option<(u32, u32)> {
+pub fn shot_dims_for(thread: i32, dir: &str, wt: Option<i32>, w: &WindowInfo) -> Option<(u32, u32)> {
     let g = recent_shot_dims().lock().unwrap_or_else(|e| e.into_inner());
-    let entry = g.get(&(thread, dir.to_string(), w.id))?;
+    let entry = g.get(&(thread, dir.to_string(), wt, w.id))?;
     if entry.app == w.app && entry.title == w.title {
         Some((entry.shot_width, entry.shot_height))
     } else {
@@ -892,9 +898,9 @@ pub fn shot_dims_for(thread: i32, dir: &str, w: &WindowInfo) -> Option<(u32, u32
 /// tolerances (round-10 P1 #B, round-11 P1 #D) that keep this deliberately
 /// unwired from the coordinate-mapping path today.
 #[doc(hidden)]
-pub fn shot_geometry_for(thread: i32, dir: &str, w: &WindowInfo) -> Option<(i32, i32, u32, u32)> {
+pub fn shot_geometry_for(thread: i32, dir: &str, wt: Option<i32>, w: &WindowInfo) -> Option<(i32, i32, u32, u32)> {
     let g = recent_shot_dims().lock().unwrap_or_else(|e| e.into_inner());
-    let entry = g.get(&(thread, dir.to_string(), w.id))?;
+    let entry = g.get(&(thread, dir.to_string(), wt, w.id))?;
     if entry.app == w.app && entry.title == w.title {
         Some((entry.x, entry.y, entry.width, entry.height))
     } else {
@@ -2224,6 +2230,45 @@ pub fn throttle_input() -> Result<(), ComputerError> {
     Ok(())
 }
 
+/// The instant the last input action was actually DISPATCHED to the OS
+/// backend — a separate clock from [`throttle_mutex`], which records
+/// ADMISSION time (issue #160 round-26 P2, Codex computer_srv.rs:1006).
+fn dispatch_pace_mutex() -> &'static Mutex<Option<Instant>> {
+    static PACE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    PACE.get_or_init(|| Mutex::new(None))
+}
+
+/// Enforce the [`THROTTLE_MS`] gap at DISPATCH time, on the blocking thread
+/// that is about to call the OS backend (issue #160 round-26 P2, Codex
+/// computer_srv.rs:1006). The admission throttle ([`throttle_input`]) alone
+/// cannot hold the advertised ~2-actions/second promise: while one slow
+/// action holds the flight guard, later calls can be ADMITTED ≥500ms apart,
+/// queue on the mutex, and then — once the slow holder releases — execute
+/// back-to-back with no gap at all. This paces the actual injections: it
+/// SLEEPS out whatever remains of the gap since the last dispatch (bounded
+/// by `THROTTLE_MS`, on the blocking pool where sleeping is fine — the
+/// flight guard already serializes input end-to-end, so pacing here is the
+/// pacing of the whole pipeline), then records this dispatch. Callers run
+/// their final stop/lease recheck AFTER this returns, so a kill switch
+/// tripped during the sleep is still honored before the backend is touched.
+pub fn pace_backend_dispatch() {
+    let sleep_needed = {
+        let guard = dispatch_pace_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let min_gap = Duration::from_millis(THROTTLE_MS);
+        match *guard {
+            Some(last) => min_gap.checked_sub(last.elapsed()),
+            None => None,
+        }
+        // Lock released before sleeping — a Stop/Escape path must never queue
+        // behind a pacing sleep.
+    };
+    if let Some(wait) = sleep_needed {
+        std::thread::sleep(wait);
+    }
+    let mut guard = dispatch_pace_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(Instant::now());
+}
+
 /// Process-wide input mutex serializing input-action calls END TO END
 /// (issue #160 review R1 #3). [`acquire_control`] only blocks a DIFFERENT
 /// `(thread, dir)` from taking over the lease — it does nothing to stop the
@@ -3210,31 +3255,54 @@ mod tests {
 
     #[test]
     fn shot_dims_round_trips_what_was_recorded_and_is_isolated_per_window_id() {
-        record_shot_dims(920_001, "lead", 7, 1280, 800, &shot_win(7, "Notes", "Untitled"));
-        record_shot_dims(920_001, "lead", 8, 640, 480, &shot_win(8, "Other", "Untitled"));
-        assert_eq!(shot_dims_for(920_001, "lead", &shot_win(7, "Notes", "Untitled")), Some((1280, 800)));
-        assert_eq!(shot_dims_for(920_001, "lead", &shot_win(8, "Other", "Untitled")), Some((640, 480)));
+        record_shot_dims(920_001, "lead", None, 7, 1280, 800, &shot_win(7, "Notes", "Untitled"));
+        record_shot_dims(920_001, "lead", None, 8, 640, 480, &shot_win(8, "Other", "Untitled"));
+        assert_eq!(shot_dims_for(920_001, "lead", None, &shot_win(7, "Notes", "Untitled")), Some((1280, 800)));
+        assert_eq!(shot_dims_for(920_001, "lead", None, &shot_win(8, "Other", "Untitled")), Some((640, 480)));
         // A DIFFERENT (thread, dir, window_id) triple that was never recorded
         // must fail closed with `None` — never fall back to some other
         // window's dims.
         assert_eq!(
-            shot_dims_for(920_001, "lead", &shot_win(9, "Notes", "Untitled")),
+            shot_dims_for(920_001, "lead", None, &shot_win(9, "Notes", "Untitled")),
             None,
             "no record for window 9 must be None"
         );
         assert_eq!(
-            shot_dims_for(920_002, "lead", &shot_win(7, "Notes", "Untitled")),
+            shot_dims_for(920_002, "lead", None, &shot_win(7, "Notes", "Untitled")),
             None,
             "a different thread must not see thread 920_001's record"
         );
     }
 
+    /// issue #160 round-26 P2 (Codex mod.rs:797): SIBLING worker sessions of
+    /// one multi-repo direction — same `(thread, dir)`, different `wt` — keep
+    /// SEPARATE dimension records for the same window. Worker A screenshotting
+    /// after a resize must never overwrite the dims worker B's approved input
+    /// is about to map coordinates against.
+    #[test]
+    fn shot_dims_are_isolated_per_worktree_for_sibling_workers() {
+        let w = || shot_win(21, "Notes", "shared window");
+        record_shot_dims(920_010, "44", Some(1), 21, 1280, 800, &w());
+        record_shot_dims(920_010, "44", Some(2), 21, 640, 480, &w());
+        assert_eq!(
+            shot_dims_for(920_010, "44", Some(1), &w()),
+            Some((1280, 800)),
+            "worker A's dims survive worker B's later screenshot of the same window"
+        );
+        assert_eq!(shot_dims_for(920_010, "44", Some(2), &w()), Some((640, 480)));
+        assert_eq!(
+            shot_dims_for(920_010, "44", None, &w()),
+            None,
+            "the absent-wt (lead-shaped) key is a DISTINCT record, never a fallback"
+        );
+    }
+
     #[test]
     fn shot_dims_refreshing_the_same_window_overwrites_rather_than_duplicates() {
-        record_shot_dims(920_003, "lead", 1, 1280, 800, &shot_win(1, "Steady", "steady window"));
-        record_shot_dims(920_003, "lead", 1, 640, 480, &shot_win(1, "Steady", "steady window"));
+        record_shot_dims(920_003, "lead", None, 1, 1280, 800, &shot_win(1, "Steady", "steady window"));
+        record_shot_dims(920_003, "lead", None, 1, 640, 480, &shot_win(1, "Steady", "steady window"));
         assert_eq!(
-            shot_dims_for(920_003, "lead", &shot_win(1, "Steady", "steady window")),
+            shot_dims_for(920_003, "lead", None, &shot_win(1, "Steady", "steady window")),
             Some((640, 480)),
             "a second screenshot of the SAME window must replace the earlier dims, not stack"
         );
@@ -3246,18 +3314,18 @@ mod tests {
     /// the OLD window's saved geometry.
     #[test]
     fn shot_dims_for_fails_closed_when_the_window_id_was_reused_by_a_different_window() {
-        record_shot_dims(920_004, "lead", 5, 1280, 800, &shot_win(5, "Original App", "Original Title"));
+        record_shot_dims(920_004, "lead", None, 5, 1280, 800, &shot_win(5, "Original App", "Original Title"));
         // Same (thread, dir, id) — a DIFFERENT app+title, standing in for the
         // OS reusing a closed window's id for an unrelated new window.
         let replaced = shot_win(5, "Different App", "Different Title");
         assert_eq!(
-            shot_dims_for(920_004, "lead", &replaced),
+            shot_dims_for(920_004, "lead", None, &replaced),
             None,
             "an id reused by a different window must never return the old window's dims"
         );
         // The ORIGINAL identity still hits, unaffected by the check above.
         assert_eq!(
-            shot_dims_for(920_004, "lead", &shot_win(5, "Original App", "Original Title")),
+            shot_dims_for(920_004, "lead", None, &shot_win(5, "Original App", "Original Title")),
             Some((1280, 800))
         );
     }
@@ -3280,8 +3348,8 @@ mod tests {
             width: 800,
             height: 600,
         };
-        record_shot_dims(921_001, "lead", 11, 1280, 800, &w);
-        assert_eq!(shot_geometry_for(921_001, "lead", &w), Some((50, 60, 800, 600)));
+        record_shot_dims(921_001, "lead", None, 11, 1280, 800, &w);
+        assert_eq!(shot_geometry_for(921_001, "lead", None, &w), Some((50, 60, 800, 600)));
     }
 
     /// `shot_geometry_for` shares `shot_dims_for`'s own app/title identity
@@ -3298,11 +3366,11 @@ mod tests {
             width: 800,
             height: 600,
         };
-        record_shot_dims(921_002, "lead", 12, 1280, 800, &original);
+        record_shot_dims(921_002, "lead", None, 12, 1280, 800, &original);
         let replaced = shot_win(12, "Different", "different window");
-        assert_eq!(shot_geometry_for(921_002, "lead", &replaced), None);
+        assert_eq!(shot_geometry_for(921_002, "lead", None, &replaced), None);
         assert_eq!(
-            shot_geometry_for(921_002, "lead", &original),
+            shot_geometry_for(921_002, "lead", None, &original),
             Some((10, 20, 800, 600)),
             "the original identity's recorded geometry is unaffected by the check above"
         );
@@ -3328,7 +3396,7 @@ mod tests {
             width: 1280,
             height: 800,
         };
-        record_shot_dims(921_003, "lead", 13, 1280, 800, &at_capture);
+        record_shot_dims(921_003, "lead", None, 13, 1280, 800, &at_capture);
 
         // A DIFFERENT geometry under the SAME id+app+title — standing in
         // for either a legitimate move/resize OR a coincidentally identical
@@ -3345,7 +3413,7 @@ mod tests {
             height: 600,
         };
         assert_eq!(
-            shot_dims_for(921_003, "lead", &moved),
+            shot_dims_for(921_003, "lead", None, &moved),
             Some((1280, 800)),
             "id+app+title still match — shot_dims_for must not regress round-10/round-11's \
              resize/move tolerance"
@@ -3354,7 +3422,7 @@ mod tests {
         // to reason about it (audit, or a future stricter check) can see it
         // changed.
         assert_eq!(
-            shot_geometry_for(921_003, "lead", &moved),
+            shot_geometry_for(921_003, "lead", None, &moved),
             Some((0, 0, 1280, 800)),
             "the RECORDED (capture-time) geometry, not the queried window's current one"
         );

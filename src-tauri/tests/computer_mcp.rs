@@ -851,6 +851,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     computer::record_shot_dims(
         gate_thread,
         &gate_dir_s,
+        None,
         1,
         width,
         height,
@@ -985,6 +986,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     computer::record_shot_dims(
         focus_thread,
         &focus_dir_s,
+        None,
         1,
         width,
         height,
@@ -1077,6 +1079,7 @@ async fn enabled_lead_screenshot_via_mock_backend_saves_a_png() {
     computer::record_shot_dims(
         refocus_thread,
         &refocus_dir_s,
+        None,
         1,
         width,
         height,

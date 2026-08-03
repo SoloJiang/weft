@@ -1430,10 +1430,15 @@ async fn enforce_durable_inline_image_cap_db(
     thread_id: i32,
     session_id: Option<i32>,
 ) -> Vec<(i32, String, String)> {
-    let Ok(messages) = repo::list_lead_messages(db, thread_id).await else {
+    // issue #160 round-26 P2 (Codex engine.rs:1162): query ONLY this session's
+    // image-candidate tool rows — the old whole-thread `list_lead_messages`
+    // load re-scanned every session's entire history on each new screenshot,
+    // quadratic as the timeline grows, on the engine-consumer path.
+    let Ok(messages) = repo::list_session_image_tool_messages(db, thread_id, session_id).await
+    else {
         return Vec::new();
     };
-    // Oldest-first (matches `list_lead_messages`'s own order) every persisted
+    // Oldest-first (matches the query's own order) every persisted
     // tool row that STILL carries an inline image, scoped to THIS session
     // alone (`session_id` above), paired with its already-parsed JSON.
     //
@@ -1451,7 +1456,6 @@ async fn enforce_durable_inline_image_cap_db(
     // non-image rows never pay for a parse), NOT as the counting predicate.
     let image_bearing: Vec<(&lead_message::Model, serde_json::Value)> = messages
         .iter()
-        .filter(|m| m.kind == "tool" && m.session_id == session_id && m.content.contains("\"images\""))
         .filter_map(|m| {
             let value = serde_json::from_str::<serde_json::Value>(&m.content).ok()?;
             let has_top_level_images = value
@@ -4832,10 +4836,28 @@ async fn spawn_acp_turn(
             },
         }
     } else {
-        // Worker: bus under direction id + computer (always injected,
-        // pinned to this worker's OWN worktree — issue #160 round-2 P2 §5).
+        // Worker: bus under direction id + computer pinned to this worker's
+        // OWN worktree (issue #160 round-2 P2 §5). issue #160 round-26 P1
+        // (Codex engine.rs:3916): computer ONLY with a POSITIVELY resolved
+        // worktree — `EngineInner::worktree_id` collapses a missing row or a
+        // failed lookup to `None`, and the absent-`wt` URL shape is legitimate
+        // ONLY for the lead lane; server-side it deliberately resolves to the
+        // direction's FIRST worktree, so an unresolved ACP worker would mint a
+        // bearer for (and write audit/screenshots under) a SIBLING session's
+        // identity in a multi-repo direction. Identity fails closed instead:
+        // no computer server at all until a rebuild resolves the worktree —
+        // mirroring the non-ACP rebuild path's round-17 P2 guard.
         crate::bus::inject::acp_mcp_servers(
-            &base, thread_id_i, &ask_dir, sid, true, false, false, false, true, worktree_id,
+            &base,
+            thread_id_i,
+            &ask_dir,
+            sid,
+            true,
+            false,
+            false,
+            false,
+            worktree_id.is_some(),
+            worktree_id,
         )
     };
 

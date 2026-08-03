@@ -180,6 +180,11 @@ async fn delete_workspace_after_fence(app: tauri::AppHandle, db: &Db, workspace_
     // would drop a revocation an earlier successful delete already published.
     // round-23 P1 (computer_srv.rs:2608): also clear the control lease if a
     // doomed route holds it, so the final lease recheck fails closed.
+    // issue #160 round-26 P1 (Codex commands.rs:832): serialize the whole
+    // revocation transaction (snapshot -> publish -> cascade -> restore-or-
+    // commit) against every other delete flow — see `computer_srv::
+    // revocation_txn_lock`'s doc for the overlapping-deletes rollback hazard.
+    let _revocation_txn = crate::bus::computer_srv::revocation_txn_lock().lock().await;
     let doomed_threads: Vec<i32> = scope.thread_ids.iter().copied().collect();
     let revocation_undo = crate::bus::computer_srv::snapshot_revocations(&doomed_threads);
     for thread_id in &doomed_threads {
@@ -2298,6 +2303,11 @@ async fn delete_repo_after_fence(
     // directions. round-24 P2 (commands.rs:803): snapshot prior revocation state
     // so a failed cascade restores EXACTLY what was there. round-23 P1
     // (computer_srv.rs:2608): clear the control lease if a doomed route holds it.
+    // issue #160 round-26 P1 (Codex commands.rs:832): serialize the whole
+    // revocation transaction (snapshot -> publish -> cascade -> restore-or-
+    // commit) against every other delete flow — see `computer_srv::
+    // revocation_txn_lock`'s doc for the overlapping-deletes rollback hazard.
+    let _revocation_txn = crate::bus::computer_srv::revocation_txn_lock().lock().await;
     let doomed_directions = repo::directions_for_repo(db, repo_id).await.map_err(e)?;
     let doomed_routes: std::collections::HashSet<(i32, String)> = doomed_directions
         .iter()
@@ -3085,6 +3095,11 @@ async fn delete_thread_after_fence(app: tauri::AppHandle, db: &Db, thread_id: i3
     // rows are gone. Roll back if the cascade fails so a still-live session
     // isn't fail-closed forever. round-23 P1 (computer_srv.rs:2608): also clear
     // the control lease if this doomed route holds it.
+    // issue #160 round-26 P1 (Codex commands.rs:832): serialize the whole
+    // revocation transaction (snapshot -> publish -> cascade -> restore-or-
+    // commit) against every other delete flow — see `computer_srv::
+    // revocation_txn_lock`'s doc for the overlapping-deletes rollback hazard.
+    let _revocation_txn = crate::bus::computer_srv::revocation_txn_lock().lock().await;
     let revocation_undo =
         crate::bus::computer_srv::snapshot_revocations(std::slice::from_ref(&thread_id));
     crate::bus::computer_srv::revoke_computer_routes(thread_id);

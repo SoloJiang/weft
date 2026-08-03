@@ -6279,6 +6279,38 @@ pub async fn list_lead_messages(db: &Db, thread_id: i32) -> Result<Vec<lead_mess
         .await?)
 }
 
+/// Only the tool rows of ONE session that can possibly carry an inline-image
+/// collection (`content` mentions `"images"`), oldest-first — the narrow
+/// candidate set `lead_chat::engine::enforce_durable_inline_image_cap_db`
+/// prunes over. issue #160 round-26 P2 (Codex engine.rs:1162): that function
+/// used to load the thread's ENTIRE message history on every image-bearing
+/// tool result and filter in memory — a screenshot-heavy session repeatedly
+/// re-scanned all historical content (other sessions included), quadratic as
+/// the timeline grows, on the engine-consumer path. The `LIKE` filter is the
+/// same cheap substring pre-check the in-memory filter applied (a
+/// parse-avoidance fast path, not the counting predicate — the caller still
+/// parses and requires a genuine top-level `images` key).
+pub async fn list_session_image_tool_messages(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Result<Vec<lead_message::Model>> {
+    use sea_orm::Order;
+    let session_filter = match session_id {
+        Some(id) => lead_message::Column::SessionId.eq(id),
+        None => lead_message::Column::SessionId.is_null(),
+    };
+    Ok(lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("tool"))
+        .filter(session_filter)
+        .filter(lead_message::Column::Content.like("%\"images\"%"))
+        .order_by(Expr::cust("COALESCE(seq, id)"), Order::Asc)
+        .order_by_asc(lead_message::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
 pub async fn get_lead_message(db: &Db, message_id: i32) -> Result<Option<lead_message::Model>> {
     Ok(lead_message::Entity::find_by_id(message_id)
         .one(&db.0)

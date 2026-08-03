@@ -954,7 +954,7 @@ async fn run_action(
                 // on every successful capture, regardless of which engine is
                 // asking — matches `store_screenshot_preview`'s own "refresh
                 // every successful screenshot" rule right above.
-                computer::record_shot_dims(thread, &dir_owned, shot.window_id, shot.width, shot.height, &w);
+                computer::record_shot_dims(thread, &dir_owned, wt, shot.window_id, shot.width, shot.height, &w);
                 // The MCP `image` content block is engine-gated — see
                 // `engine_accepts_mcp_image`'s doc table; `want_mcp_image`
                 // was already decided on the runtime, above, before this
@@ -1040,7 +1040,7 @@ async fn run_action(
             // and map/inject against THIS fresh state — never the
             // pre-activation `w`, which may already be stale by now.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
+            let (px, py) = map_input_coord(thread, dir, wt, &w2, cx, cy)?;
             // issue #160 round-16 P1 (Codex 605): the injection itself moves
             // onto tokio's blocking pool too (`enigo` is a synchronous OS
             // call — see `on_blocking`'s own doc). No extra concurrency cap
@@ -1057,6 +1057,13 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
+                // issue #160 round-26 P2 (Codex computer_srv.rs:1006): pace the
+                // ACTUAL dispatch — admission throttling alone lets calls that
+                // queued behind a slow flight-guard holder burst back-to-back
+                // once it releases. Sleep out the remaining gap FIRST, then run
+                // the final stop/lease recheck, so a kill switch tripped during
+                // the pacing sleep is still honored before the backend call.
+                computer::pace_backend_dispatch();
                 recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
                 b.click(px, py, button, count).map_err(|e| e.to_string())
             })
@@ -1088,7 +1095,7 @@ async fn run_action(
             activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             // issue #160 round-10 P1 #B: see the click-family arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
+            let (px, py) = map_input_coord(thread, dir, wt, &w2, cx, cy)?;
             // issue #160 round-16 P1 (Codex 605): see the click-family arm
             // above.
             // issue #160 round-18 P1: final in-closure stop/lease recheck —
@@ -1096,6 +1103,13 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
+                // issue #160 round-26 P2 (Codex computer_srv.rs:1006): pace the
+                // ACTUAL dispatch — admission throttling alone lets calls that
+                // queued behind a slow flight-guard holder burst back-to-back
+                // once it releases. Sleep out the remaining gap FIRST, then run
+                // the final stop/lease recheck, so a kill switch tripped during
+                // the pacing sleep is still honored before the backend call.
+                computer::pace_backend_dispatch();
                 recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
                 b.move_cursor(px, py).map_err(|e| e.to_string())
             })
@@ -1122,8 +1136,8 @@ async fn run_action(
             let w = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
             activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            let from = map_input_coord(thread, dir, &w2, sx, sy)?;
-            let to = map_input_coord(thread, dir, &w2, ex, ey)?;
+            let from = map_input_coord(thread, dir, wt, &w2, sx, sy)?;
+            let to = map_input_coord(thread, dir, wt, &w2, ex, ey)?;
             // issue #160 round-16 P1 (Codex 605): see the click-family arm
             // above.
             // issue #160 round-18 P1: final in-closure stop/lease recheck —
@@ -1131,6 +1145,13 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
+                // issue #160 round-26 P2 (Codex computer_srv.rs:1006): pace the
+                // ACTUAL dispatch — admission throttling alone lets calls that
+                // queued behind a slow flight-guard holder burst back-to-back
+                // once it releases. Sleep out the remaining gap FIRST, then run
+                // the final stop/lease recheck, so a kill switch tripped during
+                // the pacing sleep is still honored before the backend call.
+                computer::pace_backend_dispatch();
                 recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
                 b.drag(from, to).map_err(|e| e.to_string())
             })
@@ -1152,7 +1173,7 @@ async fn run_action(
             activate_and_recheck(db, asks, thread, dir, wt, w.id).await?;
             // issue #160 round-10 P1 #B: see the click-family arm above.
             let w2 = resolve_and_verify_target_blocking(window_query, &approved, window_id_out).await?;
-            let (px, py) = map_input_coord(thread, dir, &w2, cx, cy)?;
+            let (px, py) = map_input_coord(thread, dir, wt, &w2, cx, cy)?;
             // issue #160 round-16 P1 (Codex 605): see the click-family arm
             // above.
             // issue #160 round-18 P1: final in-closure stop/lease recheck —
@@ -1160,6 +1181,13 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
+                // issue #160 round-26 P2 (Codex computer_srv.rs:1006): pace the
+                // ACTUAL dispatch — admission throttling alone lets calls that
+                // queued behind a slow flight-guard holder burst back-to-back
+                // once it releases. Sleep out the remaining gap FIRST, then run
+                // the final stop/lease recheck, so a kill switch tripped during
+                // the pacing sleep is still honored before the backend call.
+                computer::pace_backend_dispatch();
                 recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
                 b.scroll(px, py, dx, dy).map_err(|e| e.to_string())
             })
@@ -1208,6 +1236,13 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
+                // issue #160 round-26 P2 (Codex computer_srv.rs:1006): pace the
+                // ACTUAL dispatch — admission throttling alone lets calls that
+                // queued behind a slow flight-guard holder burst back-to-back
+                // once it releases. Sleep out the remaining gap FIRST, then run
+                // the final stop/lease recheck, so a kill switch tripped during
+                // the pacing sleep is still honored before the backend call.
+                computer::pace_backend_dispatch();
                 recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
                 b.type_text(&text_owned).map_err(|e| e.to_string())
             })
@@ -1256,6 +1291,13 @@ async fn run_action(
             let dir_owned = dir.to_string();
             let b = backend::backend();
             on_blocking(move || {
+                // issue #160 round-26 P2 (Codex computer_srv.rs:1006): pace the
+                // ACTUAL dispatch — admission throttling alone lets calls that
+                // queued behind a slow flight-guard holder burst back-to-back
+                // once it releases. Sleep out the remaining gap FIRST, then run
+                // the final stop/lease recheck, so a kill switch tripped during
+                // the pacing sleep is still honored before the backend call.
+                computer::pace_backend_dispatch();
                 recheck_stop_and_lease_before_backend(thread, &dir_owned, wt)?;
                 b.key(&combo_owned).map_err(|e| e.to_string())
             })
@@ -1276,16 +1318,25 @@ async fn run_action(
             // for what THAT protects against: buffered capture memory, not a
             // quick position query).
             let b = backend::backend();
+            let dir_owned = dir.to_string();
             on_blocking(move || {
                 // issue #160 round-24 P2 (Codex computer_srv.rs:1265): recheck
                 // the Stop latch on THIS blocking thread, immediately before the
                 // OS read. The post-approval `enabled` check ran BEFORE this
                 // closure was scheduled; a Stop landing while it sat queued would
-                // otherwise still return desktop state. `cursor_position` holds
-                // no lease and no window, so only the latch applies — matching
-                // the `list_windows` / screenshot closures.
+                // otherwise still return desktop state.
                 if computer::stop_latched() {
                     return Err(ComputerError::Disabled.to_string());
+                }
+                // issue #160 round-26 P2 (Codex computer_srv.rs:1290): ALSO
+                // recheck the direction-precise route revocation here, exactly
+                // like the screenshot capture closure — a thread/direction
+                // deleted while this closure sat queued does NOT trip the
+                // global stop latch, so a standing-granted `cursor_position`
+                // would otherwise still read live desktop cursor state under a
+                // revoked identity.
+                if route_revoked_sync(thread, &dir_owned) {
+                    return Err(SESSION_GONE_MSG.to_string());
                 }
                 b.cursor_position().map_err(|e| e.to_string())
             })
@@ -1852,14 +1903,14 @@ async fn resolve_and_verify_target_blocking(
 /// against at all — this ALSO happens to enforce "screenshot before you
 /// click", a good practice this round is happy to require outright rather
 /// than merely encourage.
-fn map_input_coord(thread: i32, dir: &str, w: &computer::WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), String> {
+fn map_input_coord(thread: i32, dir: &str, wt: Option<i32>, w: &computer::WindowInfo, cx: u32, cy: u32) -> Result<(i32, i32), String> {
     // issue #160 round-12 P1 #2: `shot_dims_for` (not the old id-only
     // `shot_dims`) also verifies `w`'s CURRENT app+title against whatever was
     // recorded at capture time — an id the OS reused for a different window
     // since that screenshot now reads as no record at all, the same
     // fail-closed message below, rather than a stale hit against the OLD
     // window's saved geometry. See that function's own doc.
-    let (shot_w, shot_h) = computer::shot_dims_for(thread, dir, w).ok_or_else(|| {
+    let (shot_w, shot_h) = computer::shot_dims_for(thread, dir, wt, w).ok_or_else(|| {
         format!(
             "no recent screenshot of window {} to map this coordinate against — take a screenshot of \
              it first, then read coordinates off THAT screenshot",
@@ -2040,16 +2091,19 @@ fn redact_audit_args(action: &str, args: &Value) -> Value {
         return redacted;
     };
     // `type` always redacts (bulk keystrokes are content). issue #160 round-20
-    // (Codex computer_srv.rs:1475): `key` redacts ONLY a BARE single printable
+    // (Codex computer_srv.rs:1475): `key` redacts a BARE single printable
     // character — the sensitive char-by-char case `pure_validate`/
     // `reject_unsafe_key_combo` reject; redacting it HERE too means even the
-    // rejected attempt's audit line never records the raw character. A real
-    // combo (`cmd+s`, `ctrl+c`, `enter`) is NOT content and stays in the audit
-    // for forensics.
+    // rejected attempt's audit line never records the raw character. round-26
+    // P1 (Codex computer_srv.rs:2962): a SHIFT-ONLY printable chord
+    // (`shift+h` = `H`) is the same content case one shift away and is
+    // redacted identically. A real command combo (`cmd+s`, `ctrl+c`, `enter`)
+    // is NOT content and stays in the audit for forensics.
     let redact = action == "type"
         || matches!(
             computer::parse_key_combo(text).as_deref(),
             Ok([computer::KeyToken::Unicode(_)])
+                | Ok([computer::KeyToken::Shift, computer::KeyToken::Unicode(_)])
         );
     if redact {
         let chars = text.chars().count();
@@ -2948,8 +3002,16 @@ fn pure_validate(action: &str, args: &Value) -> Result<(), String> {
 ///    does not match the bare-Escape shortcut and is deliberately left alone.
 fn reject_unsafe_key_combo(tokens: &[computer::KeyToken]) -> Result<(), String> {
     match tokens {
-        [computer::KeyToken::Unicode(_)] => Err(
-            "send a single printable character with the `type` action, not `key` — `key` is for \
+        // issue #160 round-26 P1 (Codex computer_srv.rs:2962): a SHIFT-ONLY
+        // printable chord (`shift+h` → holds Shift, clicks `h` → enters `H`)
+        // is the same char-by-char TEXT entry as the bare case below — Shift
+        // merely selects the upper/shifted glyph, unlike ctrl/alt/meta chords
+        // which are commands, not content. Left unrejected it reopened the
+        // round-20 disclosure one shift away: uppercase or shifted sensitive
+        // text entered character by character through `key`, unredacted in
+        // both the outbound card and the durable audit.
+        [computer::KeyToken::Unicode(_)] | [computer::KeyToken::Shift, computer::KeyToken::Unicode(_)] => Err(
+            "send printable characters with the `type` action, not `key` — `key` is for \
              named keys and modifier shortcuts (e.g. `enter`, `tab`, `ctrl+c`)"
                 .to_string(),
         ),
@@ -3358,10 +3420,20 @@ async fn session_root(db: &Db, thread: i32, dir: &str, wt: Option<i32>) -> Optio
 /// plain integer with no path-separator/`..` component, so there is nothing to
 /// escape [`crate::paths::computer_output_root`] with.
 pub(crate) fn remove_computer_output_for_thread(thread: i32) {
-    let Ok(root) = crate::paths::computer_output_root() else {
+    // issue #160 round-26 P1 (Codex computer_srv.rs:3366): walk every
+    // component from `weft_home` down WITHOUT following symlinks before the
+    // recursive delete — `computer_output_root`'s own `create_dir_all` happily
+    // follows a pre-planted symlink at `computer/`, and `remove_dir_all`
+    // through one would delete `<target>/<thread>` OUTSIDE Weft-managed
+    // storage. Same anchored walk as the write path's
+    // [`refuse_symlinked_output`]; a refused chain just skips the best-effort
+    // cleanup (never gates the delete).
+    let Ok(home) = crate::paths::weft_home() else {
         return;
     };
-    let dir = root.join(thread.to_string());
+    let Ok(dir) = refuse_symlinks(&home, &["computer", &thread.to_string()]) else {
+        return;
+    };
     if dir.exists() {
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3385,10 +3457,16 @@ pub(crate) fn remove_computer_output_for_direction(thread: i32, dir: &str) {
     if dir.parse::<i32>().is_err() {
         return;
     }
-    let Ok(root) = crate::paths::computer_output_root() else {
+    // issue #160 round-26 P1 (Codex computer_srv.rs:3366): same no-follow
+    // ancestor walk as [`remove_computer_output_for_thread`] — a symlinked
+    // `computer/` or `<thread>/` ancestor must never be traversed into a
+    // recursive delete outside Weft-managed storage.
+    let Ok(home) = crate::paths::weft_home() else {
         return;
     };
-    let path = root.join(thread.to_string()).join(dir);
+    let Ok(path) = refuse_symlinks(&home, &["computer", &thread.to_string(), dir]) else {
+        return;
+    };
     if path.exists() {
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -3485,6 +3563,24 @@ pub(crate) fn revoke_computer_route_dir(thread: i32, dir: String) {
 /// revocation that an EARLIER successful delete already published for the same
 /// thread, re-opening that stale route's bearer.
 pub(crate) struct RevocationSnapshot(Vec<(i32, Option<RouteRevocation>)>);
+
+/// Serializes every delete flow's revocation TRANSACTION — snapshot → publish →
+/// cascade → restore-or-commit — issue #160 round-26 P1 (Codex commands.rs:832).
+/// Without it, two overlapping deletes touching routes of the SAME thread can
+/// both snapshot the prior map before either publishes; if one cascade succeeds
+/// and the other later fails, the failing operation's restore replaces the
+/// whole thread entry with its STALE snapshot, erasing the successful delete's
+/// revocation — whose route's still-valid bearer then resumes desktop calls
+/// (the request gate only runs its liveness query while a revocation entry
+/// exists). Deletes are rare, human-initiated operations already serialized on
+/// heavier locks (the engine-admission write fence), so one more coarse
+/// transaction lock is the simplest correct shape — held by `commands`'
+/// delete flows from before their [`snapshot_revocations`] until their
+/// restore-or-commit point.
+pub(crate) fn revocation_txn_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 pub(crate) fn snapshot_revocations(threads: &[i32]) -> RevocationSnapshot {
     let map = revoked_computer_routes()
@@ -4035,6 +4131,32 @@ mod tests {
         assert!(pure_validate("key", &key("shift+escape")).is_ok());
     }
 
+    /// issue #160 round-26 P1 (Codex computer_srv.rs:2962): a SHIFT-ONLY
+    /// printable chord (`shift+h` = `H`) is char-by-char TEXT entry one shift
+    /// away from the bare case above — rejected (use `type`) AND redacted in
+    /// the audit line, while command chords (`ctrl+h`, `shift+tab`,
+    /// `ctrl+shift+t`) stay accepted and unredacted for forensics.
+    #[test]
+    fn shift_only_printable_key_is_rejected_and_redacted_like_bare_text() {
+        let key = |text: &str| json!({"action": "key", "window": "notes", "text": text});
+        assert!(
+            pure_validate("key", &key("shift+h")).is_err(),
+            "shift+printable is text entry — must be rejected toward `type`"
+        );
+        // Non-shift modifier chords and shift+NAMED-key chords still pass.
+        assert!(pure_validate("key", &key("ctrl+h")).is_ok());
+        assert!(pure_validate("key", &key("shift+tab")).is_ok());
+        assert!(pure_validate("key", &key("ctrl+shift+t")).is_ok());
+
+        // Audit redaction mirrors the same boundary: even the rejected
+        // attempt's audit line never records the raw shifted character.
+        let redacted = redact_audit_args("key", &key("shift+h"));
+        assert_eq!(redacted["text"]["text_redacted"], true, "{redacted}");
+        // A command chord stays readable in the audit.
+        let combo = redact_audit_args("key", &key("ctrl+shift+t"));
+        assert_eq!(combo["text"], "ctrl+shift+t", "{combo}");
+    }
+
     #[test]
     fn redact_audit_args_leaves_a_missing_text_key_missing() {
         // A malformed `type` call missing `text` entirely never reaches the
@@ -4533,6 +4655,7 @@ mod tests {
         computer::record_shot_dims(
             thread,
             dir,
+            None,
             906_301,
             800,
             600,
@@ -4744,6 +4867,7 @@ mod tests {
         computer::record_shot_dims(
             thread,
             dir,
+            None,
             910_401,
             800,
             600,
@@ -5027,6 +5151,7 @@ mod tests {
         computer::record_shot_dims(
             thread,
             dir,
+            None,
             907_501,
             800,
             600,
@@ -5528,6 +5653,7 @@ mod tests {
             computer::shot_dims_for(
                 thread,
                 dir,
+                None,
                 &computer::WindowInfo {
                     id: 911_102,
                     app: "Different App".into(),
@@ -5723,6 +5849,49 @@ mod tests {
 
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// issue #160 round-26 P1 (Codex computer_srv.rs:3366): the recursive
+    /// cleanup helpers must never delete THROUGH a symlinked ancestor — a
+    /// pre-planted symlink at `computer/` would otherwise redirect
+    /// `remove_dir_all` into `<target>/<thread>` OUTSIDE Weft-managed storage.
+    /// A refused chain skips the best-effort cleanup; the symlink's target
+    /// survives untouched.
+    #[cfg(unix)]
+    #[test]
+    fn remove_computer_output_refuses_a_symlinked_computer_ancestor() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let weft_home =
+            std::env::temp_dir().join(format!("weft-rm-symanc-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("weft-rm-symanc-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&weft_home).unwrap();
+        // The would-be victim: real content under the symlink's TARGET.
+        std::fs::create_dir_all(outside.join("42")).unwrap();
+        std::fs::write(outside.join("42").join("audit.jsonl"), b"{}").unwrap();
+        std::fs::create_dir_all(outside.join("7").join("10")).unwrap();
+        std::fs::write(outside.join("7").join("10").join("shot.png"), b"x").unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        // `computer/` itself is a symlink pointing outside weft-managed storage.
+        std::os::unix::fs::symlink(&outside, weft_home.join("computer")).unwrap();
+
+        remove_computer_output_for_thread(42);
+        remove_computer_output_for_direction(7, "10");
+
+        assert!(
+            outside.join("42").join("audit.jsonl").exists(),
+            "a symlinked computer/ ancestor must refuse the thread cleanup, not delete the target"
+        );
+        assert!(
+            outside.join("7").join("10").join("shot.png").exists(),
+            "…and the direction cleanup likewise"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&weft_home);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// issue #160 round-24 P2 (Codex commands.rs:794): a repo delete prunes ONLY
@@ -6125,6 +6294,7 @@ mod tests {
         computer::record_shot_dims(
             thread,
             dir,
+            None,
             912_101,
             1280,
             800,
@@ -6305,6 +6475,7 @@ mod tests {
             computer::shot_dims_for(
                 thread,
                 dir,
+                None,
                 &computer::WindowInfo {
                     id: 913_302,
                     app: "Different App".into(),
