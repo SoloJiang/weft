@@ -677,6 +677,7 @@ async fn run_action(
                 return Err(SESSION_GONE_MSG.to_string());
             }
             let b = backend::backend();
+            let dir_owned = dir.to_string();
             // issue #160 round-16 P1 (Codex 605): the enumeration itself
             // moves onto tokio's blocking pool — see `on_blocking`'s own doc
             // for why every OS-touching call here now does.
@@ -687,10 +688,19 @@ async fn run_action(
                 // Stop landing while THIS closure sat QUEUED for a blocking
                 // thread must fail closed here, exactly as the screenshot/input
                 // closures already do via `recheck_stop_and_lease_before_backend`.
-                // `list_windows` holds no control lease, so only the stop latch
-                // applies (there is no thread/dir-scoped lease to re-verify).
+                // `list_windows` holds no control lease, so no lease re-verify —
+                // but the stop latch AND (round-27 P2, Codex computer_srv.rs:695)
+                // the direction-precise route revocation both apply: a thread/
+                // direction deleted while this closure sat queued does not trip
+                // the global latch, and a standing-granted `list_windows` would
+                // otherwise still enumerate app names and window titles under a
+                // revoked identity — the same boundary the screenshot and
+                // cursor closures already recheck.
                 if computer::stop_latched() {
                     return Err(ComputerError::Disabled.to_string());
+                }
+                if route_revoked_sync(thread, &dir_owned) {
+                    return Err(SESSION_GONE_MSG.to_string());
                 }
                 computer::visible_windows(b.as_ref()).map_err(|e| e.to_string())
             })
@@ -1533,16 +1543,30 @@ async fn approve(
         // narrow-your-query message. Other resolution errors (e.g. WindowNotFound)
         // disclose nothing about OTHER windows and pass through unchanged; the
         // full candidate list still reaches the human on the approval card.
-        let window = match on_blocking(move || computer::resolve_window(b.as_ref(), &wq)).await? {
-            Ok(w) => w,
-            Err(ComputerError::AmbiguousWindow { .. }) => {
-                return Err(
-                    "the window query matched more than one window — narrow it to a unique \
-                     application name or window title"
-                        .to_string(),
-                );
+        // issue #160 round-27 P2 (Codex computer_srv.rs:1536): bound THIS
+        // authorization-time enumeration too. It runs BEFORE the screenshot
+        // semaphore or the open-approval cap is ever acquired, so a burst of
+        // concurrent requests (standing grant or not) could otherwise fan out
+        // hundreds of simultaneous xcap enumerations onto tokio's blocking
+        // pool. The permit is scoped to this block alone — dropped the moment
+        // the resolve returns, NEVER held across the human approval wait
+        // below (which can last up to the full ask timeout).
+        let window = {
+            let _observe_permit = screenshot_semaphore()
+                .acquire()
+                .await
+                .map_err(|e| e.to_string())?;
+            match on_blocking(move || computer::resolve_window(b.as_ref(), &wq)).await? {
+                Ok(w) => w,
+                Err(ComputerError::AmbiguousWindow { .. }) => {
+                    return Err(
+                        "the window query matched more than one window — narrow it to a unique \
+                         application name or window title"
+                            .to_string(),
+                    );
+                }
+                Err(other) => return Err(other.to_string()),
             }
-            Err(other) => return Err(other.to_string()),
         };
         Some(window)
     } else {
@@ -3065,6 +3089,19 @@ async fn append_audit(db: &Db, thread: i32, dir: &str, wt: Option<i32>, entry: &
     let Some(path) = audit_log_path(db, thread, dir, wt).await else {
         return;
     };
+    // issue #160 round-27 P2 (Codex computer_srv.rs:3069): recheck the
+    // direction-precise route revocation immediately before creating/writing
+    // the path. `audit_log_path` can resolve while the session's rows still
+    // exist, a concurrent delete can then remove the whole computer-output
+    // subtree, and the `create_dir_all` below would RECREATE it for a deleted
+    // session — output regained after cleanup. The delete paths publish their
+    // revocation BEFORE the destructive cascade (round-23), so an append that
+    // reaches this check after deletion began is refused here; the lead lane
+    // is covered too (`RouteRevocation::Whole` matches every lane). Best-effort
+    // like the rest of this function — a refused line just goes unlogged.
+    if route_revoked_sync(thread, dir) {
+        return;
+    }
     let Some(parent) = path.parent() else { return };
     if tokio::fs::create_dir_all(parent).await.is_err() {
         return;
@@ -3282,10 +3319,23 @@ async fn open_audit_file_for_append(path: &std::path::Path) -> std::io::Result<t
     #[cfg(windows)]
     if is_new {
         use std::os::windows::io::AsRawHandle;
-        // Best-effort, matching this function's own contract: a failure to lock
-        // the file down does not fail the audit append (unlike the secret-config
-        // writer, which fails closed — an audit line is not itself a secret).
-        let _ = crate::bus::inject::restrict_handle_to_owner(file.as_raw_handle());
+        // issue #160 round-27 P2 (Codex computer_srv.rs:3288): fail CLOSED
+        // when the owner-only ACL cannot be applied — matching the screenshot
+        // and secret-config writers, and superseding the earlier best-effort
+        // stance. The audit records window titles, actions, coordinates and
+        // outcomes; on a shared machine a filesystem that rejects the DACL
+        // operation would otherwise leave those readable to other accounts
+        // through the permissive ACL inherited from `WEFT_HOME`, despite the
+        // documented owner-only protection. Close and remove the freshly
+        // created file so no permissive-ACL artifact survives; the caller's
+        // best-effort contract turns this into "this one line goes unlogged".
+        if !crate::bus::inject::restrict_handle_to_owner(file.as_raw_handle()) {
+            drop(file);
+            let _ = tokio::fs::remove_file(path).await;
+            return Err(std::io::Error::other(
+                "audit file ACL restriction failed — refusing to write through a permissive ACL",
+            ));
+        }
     }
     Ok(file)
 }
@@ -6387,19 +6437,24 @@ mod tests {
     }
 
     /// issue #160 round-12 P1 #I: the identity re-verification round-12 P1 #5's
-    /// OWN capture semaphore reopened. With every `SCREENSHOT_CONCURRENCY`
-    /// permit already held (so this call's own `screenshot_semaphore().
-    /// acquire().await` must queue for a while), the ORIGINAL window can
-    /// close and a same-query REPLACEMENT take its place WHILE the call sits
-    /// queued — `approve` and the arm's own FIRST `resolve_and_verify_target`
-    /// (both run before the permit is ever touched) only ever saw the
-    /// ORIGINAL window. A Full grant (not a fresh card) isolates this from
-    /// round-11 P1 #C's own pre-approval gap: authorization already landed
-    /// before the call is even queued, so the ONLY window this test
-    /// exercises is the post-approval, pre-capture one the semaphore reopens.
-    /// Without the round-12 P1 #I re-check, `screenshot_window`'s own
-    /// internal re-resolve would silently capture the REPLACEMENT the
-    /// instant a permit frees up.
+    /// OWN capture semaphore reopened. The ORIGINAL window can close and a
+    /// same-query REPLACEMENT take its place while a call sits queued on the
+    /// capture semaphore — `approve` and the arm's own FIRST
+    /// `resolve_and_verify_target` only ever saw the ORIGINAL window. A Full
+    /// grant (not a fresh card) isolates this from round-11 P1 #C's own
+    /// pre-approval gap. Without the round-12 P1 #I re-check,
+    /// `screenshot_window`'s own internal re-resolve would silently capture
+    /// the REPLACEMENT the instant a permit frees up.
+    ///
+    /// round-27 P2 gave `approve`'s OWN resolve a semaphore permit too, so a
+    /// drained semaphore now parks the call at APPROVE — before any
+    /// resolution — and a wall-clock "swap while queued" would land before
+    /// the FIRST resolve (where capturing the replacement would be CORRECT:
+    /// authorization would have bound it). The swap is therefore sequenced
+    /// by CALL INDEX instead (`windows_sequence`): resolve #1 (approve) and
+    /// #2 (first verify) see the original, resolve #3 (the post-queue
+    /// re-verify this test exists for) sees the replacement — deterministic
+    /// wherever the queueing happens.
     #[tokio::test]
     async fn screenshot_re_verifies_after_the_capture_semaphore_queue_before_capturing() {
         let _guard = computer::process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -6407,7 +6462,7 @@ mod tests {
         mock.fail_activate.store(false, std::sync::atomic::Ordering::SeqCst);
         *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = None;
         mock.actions.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
+        let original = computer::WindowInfo {
             id: 913_301,
             app: "Queued".into(),
             title: "queued window".into(),
@@ -6415,7 +6470,23 @@ mod tests {
             y: 0,
             width: 800,
             height: 600,
-        }]);
+        };
+        let replacement = computer::WindowInfo {
+            id: 913_302,
+            app: "Different App".into(),
+            title: "queued window".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(vec![replacement.clone()]);
+        *mock.windows_sequence.lock().unwrap_or_else(|e| e.into_inner()) =
+            std::collections::VecDeque::from(vec![
+                vec![original.clone()],
+                vec![original.clone()],
+            ]);
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         repo::set_setting(&db, computer::K_COMPUTER_USE_ENABLED, "true").await.unwrap();
@@ -6445,23 +6516,14 @@ mod tests {
             .await
         });
 
-        // Give the spawned call time to clear approval + its own first
-        // verify and queue on the drained semaphore.
+        // The call queues on the drained semaphore (round-27: at `approve`'s
+        // own authorization-time resolve, the FIRST permit acquisition on the
+        // path). The window "swap" itself needs no timing at all — the mock's
+        // `windows_sequence` (seeded above) hands the original to resolves #1
+        // and #2 and the replacement to resolve #3, wherever the queueing
+        // happened.
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         assert!(!handle.is_finished(), "the call must still be queued on the drained capture semaphore");
-
-        // The window is REPLACED while queued: the SAME query still
-        // matches, but a DIFFERENT id/app — standing in for the original
-        // closing and an unrelated one taking its place during the wait.
-        *mock.windows_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![computer::WindowInfo {
-            id: 913_302,
-            app: "Different App".into(),
-            title: "queued window".into(),
-            x: 0,
-            y: 0,
-            width: 800,
-            height: 600,
-        }]);
 
         // Free exactly one permit so the queued call proceeds.
         held.pop();

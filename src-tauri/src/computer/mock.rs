@@ -23,6 +23,18 @@ pub struct MockBackend {
     /// `None` (the `Default` value) behaves exactly like every existing
     /// test's plain `windows` field — most tests never need this at all.
     pub windows_override: Mutex<Option<Vec<WindowInfo>>>,
+    /// When non-empty, each `list_windows` call POPS AND RETURNS the front
+    /// entry, falling back to `windows_override`/`windows` once drained
+    /// (issue #160 round-27) — a call-count-deterministic way to make "the
+    /// Nth resolution of this query sees a DIFFERENT window set" without any
+    /// sleep/timing choreography. Needed once round-27 P2 gave `approve`'s
+    /// own authorization-time resolve a screenshot-semaphore permit: a test
+    /// that drains the semaphore now parks the call at APPROVE (before any
+    /// resolution), so a wall-clock "swap while queued" lands before the
+    /// FIRST resolve instead of between verify and capture — sequencing by
+    /// call index puts the swap exactly where the scenario needs it
+    /// regardless of where the queueing happens.
+    pub windows_sequence: Mutex<std::collections::VecDeque<Vec<WindowInfo>>>,
     pub image: Option<CapturedImage>,
     /// One line per input method call (issue #160 M2), in call order — e.g.
     /// `"click 100,200 Left x1"`. Lets a test assert an action actually
@@ -68,6 +80,15 @@ impl MockBackend {
 
 impl ComputerBackend for MockBackend {
     fn list_windows(&self) -> Result<Vec<WindowInfo>, ComputerError> {
+        // Sequence entries win while any remain — see `windows_sequence`'s doc.
+        if let Some(next) = self
+            .windows_sequence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+        {
+            return Ok(next);
+        }
         let over = self.windows_override.lock().unwrap_or_else(|e| e.into_inner());
         match over.as_ref() {
             Some(w) => Ok(w.clone()),

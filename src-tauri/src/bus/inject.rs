@@ -1053,7 +1053,22 @@ fn merge_opencode_config(cwd: &Path, server: &str, url: &str, secret: bool) {
     // Best-effort: only hides opencode.json from git when the sub-repo does NOT
     // track it. If the repo ships a tracked opencode.json, the merge still shows
     // as a modification — an accepted limitation of the worktree-local merge.
-    crate::git::git_exclude(cwd, "opencode.json");
+    //
+    // issue #160 round-27 P1 (Codex inject.rs:960): but NEVER from a LINKED
+    // worktree (`.git` is a gitfile, not a directory). A linked worktree's
+    // `git rev-parse --git-path info/exclude` resolves to the CANONICAL
+    // repository's shared `.git/info/exclude` (worktrees share one gitdir's
+    // `info/` directory — the exact mechanism `paths::computer_output_root`'s
+    // round-10 doc records for the identical `.weft/` leak), so excluding here
+    // would permanently hide `opencode.json` in the user's REAL checkout and
+    // every sibling worktree — a hard violation of "never write cross-repo
+    // wiring into canonical repositories" (CLAUDE.md). The cost of skipping is
+    // only cosmetic: `opencode.json` shows as untracked dirty state inside the
+    // Weft-managed worktree, which is exactly the "worktree-local ignored
+    // files" tradeoff that constraint's own menu sanctions.
+    if !cwd.join(".git").is_file() {
+        crate::git::git_exclude(cwd, "opencode.json");
+    }
 }
 
 #[cfg(test)]

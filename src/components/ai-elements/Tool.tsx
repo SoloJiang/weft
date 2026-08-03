@@ -140,8 +140,13 @@ export function Tool({
           {images && images.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {images.map((image, imageIndex) => (
+                // Key by position only — `image.src` is a data URI that can run
+                // to ~2MB per screenshot, and folding it into the key makes
+                // React scan/escape multi-megabyte strings on every timeline
+                // rerender. The list is append-only per tool result (never
+                // reordered), so the index is a stable identity here.
                 <Attachment
-                  key={`${image.src}-${imageIndex}`}
+                  key={imageIndex}
                   kind="image"
                   label={image.label}
                   src={image.src}
