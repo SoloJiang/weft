@@ -184,6 +184,20 @@ export function ComputerControlBanner() {
   // above for the failure this closes.
   const tickInFlightRef = useRef(false);
   const tickSeqRef = useRef(0);
+  // issue #160 round-30 P2 (Codex ComputerControlBanner.tsx:262): true while
+  // a Stop invoke is in flight. The BUTTON already can't overlap (disabled on
+  // `stopping`), but the Escape KEYDOWN handler calls `stop` directly and
+  // `stopping` is async React state — repeated Esc presses started
+  // overlapping `computerEmergencyStop` invokes, and their completions can
+  // land in any order: an OLDER call resolving Ok AFTER a newer call's
+  // persist failure would clear `localStopFailed`/hide the banner even
+  // though the latest Stop left the backend's persist-failure flag set
+  // (until the next poll restored it — a window with no kill-switch warning
+  // showing). A ref (synchronous, unlike state) makes Stop single-flight:
+  // with at most one invoke ever in flight, there is no stale completion
+  // left to misreport. Same belt as `tickInFlightRef` above, for the same
+  // reordering hazard.
+  const stopInFlightRef = useRef(false);
 
   useEffect(() => {
     let alive = true;
@@ -250,14 +264,20 @@ export function ComputerControlBanner() {
   }, []);
 
   const stop = useCallback(() => {
+    // round-30 P2: single-flight — see `stopInFlightRef`'s doc. Guarded on
+    // the ref, not `stopping` state, so the Esc path is covered too.
+    if (stopInFlightRef.current) return;
+    stopInFlightRef.current = true;
     setStopping(true);
     api.computerEmergencyStop().then(
       () => {
+        stopInFlightRef.current = false;
         setStopping(false);
         setLocalStopFailed(false);
         setState(null);
       },
       () => {
+        stopInFlightRef.current = false;
         setStopping(false);
         setLocalStopFailed(true);
       },

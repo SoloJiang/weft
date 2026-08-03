@@ -842,6 +842,9 @@ async fn run_action(
             let window_query_owned = window_query.to_string();
             let approved_for_capture = approved.clone();
             let dir_owned = dir.to_string();
+            // Kept for the round-30 post-write recheck below — `out_dir`
+            // itself moves into the capture closure.
+            let out_dir_cleanup = out_dir.clone();
             let b = backend::backend();
             let (resolved_id, capture) = on_blocking(move || {
                 let mut resolved_id: Option<u32> = None;
@@ -980,6 +983,33 @@ async fn run_action(
             })
             .await?;
             *window_id_out = resolved_id;
+            // issue #160 round-30 P2 (Codex computer_srv.rs:893): re-check the
+            // route revocation AFTER the capture/save, under the SAME
+            // [`revocation_txn_lock`] the delete flows hold from before they
+            // publish revocation until after their output removal — the
+            // closure's own pre-capture check is check-then-act across the
+            // whole blocking capture, so a delete could interleave and the
+            // save's `create_dir_all(out_dir)` would recreate the deleted
+            // session's subtree (exactly the append_audit gap round-28
+            // closed, on the screenshot write path). Two outcomes only:
+            // either this check (which waits out any in-flight delete
+            // transaction) sees the revocation — then THIS call's own
+            // recreated output is removed and the call fails with the same
+            // SESSION_GONE the pre-capture check returns — or the delete
+            // starts after this check released the lock, and its own removal
+            // then sweeps the file with the rest of the tree. The lock is
+            // NOT held across the capture itself: a multi-hundred-ms OS
+            // capture must never stall every delete and audit append behind
+            // a global mutex, so the recheck runs after, paying cleanup only
+            // in the raced case. Runs before `capture?` so a failed capture
+            // that already created directories is cleaned up the same way.
+            {
+                let _revocation_txn = revocation_txn_lock().lock().await;
+                if route_revoked_sync(thread, dir) {
+                    remove_recreated_screenshot_output(&out_dir_cleanup);
+                    return Err(SESSION_GONE_MSG.to_string());
+                }
+            }
             let (text, image_b64) = capture?;
             if let Some(b64) = image_b64 {
                 *screenshot_image_b64_out = Some(b64);
@@ -3066,10 +3096,39 @@ fn pure_validate(action: &str, args: &Value) -> Result<(), String> {
             required_window(args)?;
         }
         "wait" => {
+            reject_unconsumed_window(action, args)?;
             parse_duration_ms(args)?;
         }
-        // list_windows / cursor_position take no arguments to validate.
+        // Windowless observation actions: no arguments to PARSE, but a
+        // smuggled `window` is rejected — see `reject_unconsumed_window`.
+        "list_windows" | "cursor_position" => {
+            reject_unconsumed_window(action, args)?;
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+/// issue #160 round-30 P2 (Codex computer_srv.rs:1491): windowless actions
+/// REJECT a `window` argument outright instead of silently ignoring it.
+/// `approve`'s card summary folds any nonempty window query into the line the
+/// human triages (`computer: list_windows @ Calculator`), but the dispatch
+/// arms for these actions never consume the argument — `list_windows` returns
+/// EVERY visible application's name and title regardless — so an
+/// accepted-but-ignored `window` let a card LOOK scoped to one application
+/// while actually authorizing desktop-wide enumeration (and `wait`'s card,
+/// window-bound input it never performs). Rejected here, at pure-validation
+/// time, so the misleading card can never be built at all — the same
+/// before-any-card bar every other shape check in [`pure_validate`] holds to.
+/// Any present `window` key is rejected, not just a nonempty string: a
+/// non-string value would render no `@` segment, but the request is
+/// malformed either way and an honest error beats a silent drop.
+fn reject_unconsumed_window(action: &str, args: &Value) -> Result<(), String> {
+    if args.get("window").is_some() {
+        return Err(format!(
+            "'{action}' takes no 'window' argument — it is not scoped to a window; remove the \
+             argument and retry"
+        ));
     }
     Ok(())
 }
@@ -3600,6 +3659,65 @@ pub(crate) fn remove_computer_output_for_direction(thread: i32, dir: &str) {
     };
     if path.exists() {
         let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+/// issue #160 round-30 P2 (Codex computer_srv.rs:893): undo THIS call's own
+/// screenshot write after the post-capture revocation recheck found the route
+/// revoked — the capture closure's `create_dir_all(out_dir)` + PNG save can
+/// RECREATE a session subtree a concurrent delete already removed (the
+/// closure's pre-capture revocation check is check-then-act across the whole
+/// blocking capture). Removes the screenshots subtree the save (re)created,
+/// then prunes now-empty ancestor directories deepest-first, stopping at the
+/// shared `<weft_home>/computer` root (which outlives any one session) or at
+/// the first non-empty directory — the pruning uses non-recursive
+/// `std::fs::remove_dir`, which fails on a non-empty directory and ends the
+/// walk, so a surviving sibling session's tree can never be swept.
+///
+/// Symlink containment (round-26 doctrine): the path is re-walked from
+/// `weft_home` with the same no-follow [`refuse_symlinks`] verification the
+/// delete-side removers use, re-checked HERE (not trusted from resolution
+/// time) because a component could have been swapped for a symlink since —
+/// any refused chain, a path outside `<weft_home>/computer`, or any
+/// non-normal component (`..`, a root) just skips this best-effort cleanup.
+fn remove_recreated_screenshot_output(out_dir: &std::path::Path) {
+    let Ok(home) = crate::paths::weft_home() else {
+        return;
+    };
+    let Ok(rel) = out_dir.strip_prefix(&home) else {
+        return;
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(c) => match c.to_str() {
+                Some(s) => parts.push(s),
+                None => return,
+            },
+            _ => return,
+        }
+    }
+    if parts.first() != Some(&"computer") || parts.len() < 2 {
+        return;
+    }
+    let Ok(checked) = refuse_symlinks(&home, &parts) else {
+        return;
+    };
+    if checked.exists() {
+        let _ = std::fs::remove_dir_all(&checked);
+    }
+    let Ok(stop) = refuse_symlinks(&home, &["computer"]) else {
+        return;
+    };
+    let mut cur = checked.parent().map(std::path::Path::to_path_buf);
+    while let Some(p) = cur {
+        if p == stop || !p.starts_with(&stop) {
+            break;
+        }
+        if std::fs::remove_dir(&p).is_err() {
+            break;
+        }
+        cur = p.parent().map(std::path::Path::to_path_buf);
     }
 }
 
@@ -4250,6 +4368,25 @@ mod tests {
     /// issue #160 round-20 (Codex computer_srv.rs:1189 + :1475): the `key`
     /// action rejects a bare printable character (use `type`) and a bare Escape
     /// (kill-switch collision), but still accepts named keys and modifier chords.
+    /// issue #160 round-30 P2 (Codex computer_srv.rs:1491): windowless actions
+    /// reject a smuggled `window` argument BEFORE any card is built — an
+    /// accepted-but-ignored one let the card summary read as scoped
+    /// (`computer: list_windows @ Calculator`) while dispatch enumerated the
+    /// whole desktop.
+    #[test]
+    fn pure_validate_rejects_a_window_argument_on_windowless_actions() {
+        for action in ["list_windows", "cursor_position"] {
+            let err = pure_validate(action, &json!({"action": action, "window": "Calculator"}))
+                .expect_err("a windowless action must reject a window argument");
+            assert!(err.contains("takes no 'window'"), "{err}");
+            assert!(pure_validate(action, &json!({"action": action})).is_ok());
+        }
+        let err = pure_validate("wait", &json!({"action": "wait", "duration_ms": 5, "window": "x"}))
+            .expect_err("wait must reject a window argument");
+        assert!(err.contains("takes no 'window'"), "{err}");
+        assert!(pure_validate("wait", &json!({"action": "wait", "duration_ms": 5})).is_ok());
+    }
+
     #[test]
     fn pure_validate_rejects_bare_printable_and_bare_escape_key() {
         let key = |text: &str| json!({"action": "key", "window": "notes", "text": text});
@@ -6018,6 +6155,92 @@ mod tests {
         assert!(
             outside.join("7").join("10").join("shot.png").exists(),
             "…and the direction cleanup likewise"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&weft_home);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// issue #160 round-30 P2 (Codex computer_srv.rs:893): the post-capture
+    /// cleanup removes exactly what THIS call's save recreated — the
+    /// screenshots subtree plus any now-empty ancestors — while a surviving
+    /// sibling direction's tree stops the ancestor pruning (non-recursive
+    /// `remove_dir` fails on non-empty), and the shared `computer/` root
+    /// always survives.
+    #[test]
+    fn remove_recreated_screenshot_output_prunes_own_chain_but_not_siblings() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let weft_home =
+            std::env::temp_dir().join(format!("weft-rm-recreated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let root = crate::paths::computer_output_root().unwrap();
+        let out_dir = root.join("81").join("10").join("wt-1").join("screenshots");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("shot.png"), b"x").unwrap();
+        // A surviving sibling direction under the same thread.
+        let sibling = root.join("81").join("11");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("keep.txt"), b"k").unwrap();
+
+        remove_recreated_screenshot_output(&out_dir);
+
+        assert!(!out_dir.exists(), "the recreated screenshots subtree must be removed");
+        assert!(!root.join("81").join("10").exists(), "empty ancestors are pruned");
+        assert!(
+            root.join("81").exists(),
+            "the thread dir survives — the sibling keeps it non-empty"
+        );
+        assert!(sibling.join("keep.txt").exists(), "a sibling direction's tree is untouched");
+        assert!(root.exists(), "the shared computer/ root always survives");
+
+        // With no sibling left, the whole chain up to computer/ goes.
+        let out2 = root.join("82").join("10").join("wt-1").join("screenshots");
+        std::fs::create_dir_all(&out2).unwrap();
+        remove_recreated_screenshot_output(&out2);
+        assert!(!root.join("82").exists(), "a fully-empty chain prunes up to computer/");
+        assert!(root.exists());
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// Same round-26 symlink doctrine for the round-30 cleanup: a symlinked
+    /// `computer/` ancestor refuses the removal outright (the target
+    /// survives), and an `out_dir` outside `<weft_home>` is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn remove_recreated_screenshot_output_refuses_symlinked_or_foreign_paths() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let weft_home =
+            std::env::temp_dir().join(format!("weft-rm-recreated-sym-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("weft-rm-recreated-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&weft_home).unwrap();
+        let victim = outside.join("9").join("10").join("screenshots");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("shot.png"), b"x").unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        std::os::unix::fs::symlink(&outside, weft_home.join("computer")).unwrap();
+
+        // Through the symlinked ancestor: refused, target intact.
+        remove_recreated_screenshot_output(
+            &weft_home.join("computer").join("9").join("10").join("screenshots"),
+        );
+        assert!(
+            victim.join("shot.png").exists(),
+            "a symlinked computer/ ancestor must refuse the cleanup, not delete the target"
+        );
+
+        // An out_dir not under weft_home at all: never touched.
+        remove_recreated_screenshot_output(&victim);
+        assert!(
+            victim.join("shot.png").exists(),
+            "a path with no weft_home prefix is refused outright"
         );
 
         std::env::remove_var("WEFT_HOME");

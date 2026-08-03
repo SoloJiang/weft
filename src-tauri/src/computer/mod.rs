@@ -1514,7 +1514,9 @@ fn control_mutex() -> &'static Mutex<Option<ControlHolderState>> {
 /// or in `bus::computer_srv`'s separate one — that touches ANY process-wide,
 /// un-keyed static this module owns ([`control_mutex`], [`throttle_mutex`],
 /// `shortcut_mutex`/the `SHORTCUT_*_ATTEMPTS` counters, [`stop_state`],
-/// [`STOP_PERSIST_FAILED`]) must acquire this lock for its own duration. `cargo test`'s default
+/// [`STOP_PERSIST_FAILED`], and `INPUT_IN_FLIGHT` — set for as long as any
+/// [`input_flight_guard`] guard lives, and read by every lease-liveness
+/// judgment) must acquire this lock for its own duration. `cargo test`'s default
 /// parallel test threads would otherwise interleave two such tests' own
 /// acquire/clear/store calls against the exact SAME global state — several of
 /// this file's own pre-existing test doc comments already named this exact
@@ -3906,6 +3908,14 @@ mod tests {
         use std::sync::atomic::AtomicU32;
         use std::sync::Arc;
 
+        // Holding the guard sets the process-wide `INPUT_IN_FLIGHT` static,
+        // which `holder_is_live` consults — an unlocked run of this test
+        // (which keeps the flag raised across two 20ms sleeps) made every
+        // CONCURRENT lease-expiry assertion in the suite read a lapsed lease
+        // as still live (observed as a real one-off failure of
+        // `lease_liveness_ignores_the_wall_clock_mirror`). Exactly the
+        // un-keyed-static rule `process_state_test_lock`'s own doc states.
+        let _guard = process_state_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let concurrent = Arc::new(AtomicU32::new(0));
         let max_concurrent = Arc::new(AtomicU32::new(0));
 
