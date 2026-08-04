@@ -65,6 +65,7 @@ pub mod profile;
 /// issue #112 本地资源仪表盘:只读聚合 proc_registry / process_quota /
 /// session_gate 已有的采样,不新增采样、不碰任何安全网写路径。
 mod resource_dashboard;
+pub mod readiness;
 mod session_gate;
 mod session_meta;
 mod sidecar;
@@ -274,6 +275,7 @@ pub fn run() {
             commands::delete_repo,
             commands::update_repo_profile,
             commands::list_directions,
+            commands::issue_readiness,
             commands::set_task_status,
             commands::worktree_diff,
             commands::worktree_diff_target,

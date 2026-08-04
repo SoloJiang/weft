@@ -2327,6 +2327,9 @@ pub struct ThreadOverview {
     pub thread_id: i32,
     pub title: String,
     pub kind: String,
+    /// Durable plan state used by the board's readiness refresh key. `None`
+    /// means this thread has never stored a plan.
+    pub plan_status: Option<String>,
     pub direction_ids: Vec<i32>,
     /// Stored lifecycle status of each direction (same order as direction_ids),
     /// so the workspace board derives the thread's phase deterministically.
@@ -2348,6 +2351,10 @@ pub async fn workspace_overview(db: State<'_, Db>, workspace_id: i32) -> R<Vec<T
     let mut out = Vec::new();
     for t in threads {
         let dirs = repo::list_directions(&db, t.id).await.map_err(e)?;
+        let plan_status = repo::get_plan(&db, t.id)
+            .await
+            .map_err(e)?
+            .map(|plan| plan.status);
         let mut seen = std::collections::BTreeMap::<i32, String>::new();
         for d in &dirs {
             if let Some(r) = repo::direction_repo_of(&db, d.id).await.map_err(e)? {
@@ -2358,6 +2365,7 @@ pub async fn workspace_overview(db: State<'_, Db>, workspace_id: i32) -> R<Vec<T
             thread_id: t.id,
             title: t.title,
             kind: t.kind,
+            plan_status,
             direction_ids: dirs.iter().map(|d| d.id).collect(),
             statuses: dirs.iter().map(|d| d.status.clone()).collect(),
             write_repos: seen
@@ -2380,6 +2388,19 @@ pub async fn list_directions(
     thread_id: i32,
 ) -> R<Vec<entities::direction::Model>> {
     repo::list_directions(&db, thread_id).await.map_err(e)
+}
+
+/// One fail-closed, derived delivery verdict for an issue and its active lanes.
+/// It reads current local/host evidence but never writes a readiness snapshot.
+#[tauri::command]
+pub async fn issue_readiness(
+    db: State<'_, Db>,
+    bus: State<'_, crate::bus::BusRegistry>,
+    thread_id: i32,
+) -> R<crate::readiness::IssueReadinessDto> {
+    crate::readiness::collect(&db, &bus, thread_id)
+        .await
+        .map_err(e)
 }
 
 /// The lead's proposed decomposition for a thread, resolved against the

@@ -296,6 +296,48 @@ export interface RepoChecks {
   checks: CheckResult[];
 }
 
+/** Derived delivery verdicts from the backend readiness state machine. */
+export type LaneReadiness = "review_ready" | "blocked" | "needs_you" | "unknown" | "failed";
+export type IssueReadiness = LaneReadiness;
+
+export type ReadinessReasonCode =
+  | "no_active_lanes"
+  | "upstream_unmet"
+  | "evidence_missing"
+  | "remote_unknown"
+  | "execution_drifted"
+  | "policy_gate_pending"
+  | "open_need"
+  | "checks_failing"
+  | "checks_unknown"
+  | "worker_failed"
+  | "in_progress"
+  | "pr_ci_pending"
+  | "pr_ci_failing"
+  | "pr_review_changes_requested"
+  | "pr_threads_unresolved"
+  | "pr_conflict"
+  | "pr_closed_unmerged";
+
+export interface ReadinessReason {
+  code: ReadinessReasonCode;
+  direction_id: number | null;
+}
+
+export interface LaneReadinessDto {
+  direction_id: number;
+  name: string;
+  readiness: LaneReadiness;
+  reasons: ReadinessReason[];
+}
+
+export interface IssueReadinessDto {
+  readiness: IssueReadiness;
+  reasons: ReadinessReason[];
+  active_lane_count: number;
+  lanes: LaneReadinessDto[];
+}
+
 /** One row in a chat timeline (lead console / chat-mode workers). */
 export interface LeadMessage {
   id: number;
@@ -738,6 +780,8 @@ export interface ThreadOverview {
   thread_id: number;
   title: string;
   kind: string;
+  /** Durable plan status for readiness refresh; null when no plan exists. */
+  plan_status: string | null;
   direction_ids: number[];
   /** stored lifecycle status per direction (same order as direction_ids). */
   statuses: string[];

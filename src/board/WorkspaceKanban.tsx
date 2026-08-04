@@ -1,22 +1,39 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { Layers, Plus, SquarePen, X } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
 import { attentionThreadId, useStore } from "../state/store";
 import { selectThreadActivity } from "../state/threadActivity";
-import type { AttentionItem, ThreadOverview } from "../lib/types";
+import type { AttentionItem, IssueReadinessDto, ThreadOverview } from "../lib/types";
+import { api } from "../lib/api";
 import { Button } from "../components/ui/Button";
 import { ThreadActivity } from "../components/ui/ThreadActivity";
+import { ReadinessChip } from "../components/ReadinessChip";
 import { CreateThreadDialog, CreateWorkspaceDialog } from "../nav/dialogs";
 import { InheritedAccessChip } from "../components/InheritedAccessChip";
 import { ReadOnlyTrustChip } from "../components/ReadOnlyTrustChip";
 import { inheritedAccessOf } from "../lib/grants";
 import { cn } from "../lib/cn";
+import {
+  beginReadinessRefresh,
+  buildReadinessKey,
+  isReadinessResponseApplicable,
+  selectVisibleReadiness,
+  type StoredReadiness,
+} from "../lib/readinessKey";
 
 type Phase = "planning" | "working" | "review" | "done";
+type PrChangedEvent = { thread_id: number };
 
 function threadAttentionCount(o: ThreadOverview, items: AttentionItem[]): number {
   return items.filter((item) => attentionThreadId(item) === o.thread_id).length;
+}
+
+function threadAttentionIds(o: ThreadOverview, items: AttentionItem[]): string[] {
+  return items
+    .filter((item) => attentionThreadId(item) === o.thread_id)
+    .map((item) => item.id);
 }
 
 function progressBarColor(attention: number, failing: number): string {
@@ -41,10 +58,20 @@ export function WorkspaceKanban() {
     selectThread,
   } = useStore();
   const { t } = useTranslation();
+  const [readinessPollRevision, setReadinessPollRevision] = useState(0);
 
   useEffect(() => {
     void refreshOverview();
   }, [refreshOverview]);
+
+  useEffect(() => {
+    const poll = setInterval(() => {
+      setReadinessPollRevision((revision) => revision + 1);
+    }, 60_000);
+    return () => {
+      clearInterval(poll);
+    };
+  }, []);
 
   // Phase from the stored direction statuses — deterministic across restarts
   // (no dependency on in-memory sessions). Needs-you is a tag on the card, not
@@ -105,6 +132,7 @@ export function WorkspaceKanban() {
                       key={o.thread_id}
                       o={o}
                       onOpen={() => void selectThread(o.thread_id)}
+                      readinessPollRevision={readinessPollRevision}
                     />
                   ))}
                   {cards.length === 0 && (
@@ -156,10 +184,116 @@ function EmptyBoard() {
   );
 }
 
-function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
-  const { sessions, attentionItems, checksByDirection, openNeeds, leadTurn, authGrants, readOnlyGrants } =
-    useStore();
+function ThreadCard({
+  o,
+  onOpen,
+  readinessPollRevision,
+}: {
+  o: ThreadOverview;
+  onOpen: () => void;
+  readinessPollRevision: number;
+}) {
+  const {
+    sessions,
+    attentionItems,
+    checksByDirection,
+    openNeeds,
+    leadTurn,
+    authGrants,
+    readOnlyGrants,
+    worktreesByDirection,
+  } = useStore();
   const { t } = useTranslation();
+  const [storedReadiness, setStoredReadiness] = useState<StoredReadiness<IssueReadinessDto> | null>(
+    null,
+  );
+  const [prReadinessRevision, setPrReadinessRevision] = useState(0);
+  const threadIdRef = useRef(o.thread_id);
+  const readinessRequestRevisionRef = useRef(0);
+  threadIdRef.current = o.thread_id;
+  const readinessKey = buildReadinessKey({
+    directions: o.direction_ids.map((id, index) => ({
+      id,
+      status: o.statuses[index] ?? "",
+    })),
+    attentionIds: threadAttentionIds(o, attentionItems),
+    worktrees: o.direction_ids.map((directionId) => ({
+      directionId,
+      exists: (worktreesByDirection[directionId] ?? []).some((worktree) => worktree.exists),
+    })),
+    planStatus: o.plan_status,
+    prRevision: prReadinessRevision,
+  });
+  const readiness = selectVisibleReadiness(storedReadiness, o.thread_id, readinessKey);
+
+  useEffect(() => {
+    const request = {
+      threadId: o.thread_id,
+      revision: readinessRequestRevisionRef.current + 1,
+    };
+    const requestKey = readinessKey;
+    readinessRequestRevisionRef.current = request.revision;
+    setStoredReadiness({
+      threadId: request.threadId,
+      key: requestKey,
+      dto: beginReadinessRefresh(),
+    });
+    let cancelled = false;
+    const storeResponse = (dto: IssueReadinessDto | null) => {
+      setStoredReadiness((current) => {
+        if (
+          !isReadinessResponseApplicable(
+            request,
+            threadIdRef.current,
+            readinessRequestRevisionRef.current,
+          )
+        ) {
+          return current;
+        }
+        return { threadId: request.threadId, key: requestKey, dto };
+      });
+    };
+    void api
+      .issueReadiness(request.threadId)
+      .then((next) => {
+        if (cancelled) {
+          return;
+        }
+        storeResponse(next);
+      })
+      .catch(() => {
+        if (cancelled) {
+          return;
+        }
+        storeResponse(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [o.thread_id, readinessKey, readinessPollRevision]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void listen<PrChangedEvent>("pr://changed", (event) => {
+      if (!cancelled && event.payload.thread_id === threadIdRef.current) {
+        setPrReadinessRevision((revision) => revision + 1);
+      }
+    })
+      .then((nextUnlisten) => {
+        if (cancelled) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   const activity = selectThreadActivity({
     workerSessions: Object.values(sessions),
     directionIds: o.direction_ids,
@@ -228,6 +362,11 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
             +{o.write_repos.length - 3}
           </span>
         )}
+        <ReadinessChip
+          readiness={readiness?.readiness}
+          reasons={readiness?.reasons}
+          className="max-w-full"
+        />
         {inherited && <InheritedAccessChip threadId={o.thread_id} />}
         {readOnlyTrusted && <ReadOnlyTrustChip threadId={o.thread_id} />}
       </div>
