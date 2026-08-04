@@ -20,7 +20,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { attentionDirectionId, useStore } from "../state/store";
+import { attentionDirectionId, attentionThreadId, useStore } from "../state/store";
 import type {
   Direction,
   IssueReadinessDto,
@@ -107,8 +107,11 @@ export function ThreadBoard() {
   const readinessRequestRevisionRef = useRef(0);
   activeThreadIdRef.current = activeThreadId;
   const activeDirections = activeThreadId == null ? [] : directionsByThread[activeThreadId] ?? [];
+  // Include issue/lead attention too. It has no materialized direction card,
+  // but the backend represents it as a virtual readiness lane and must be
+  // refreshed immediately rather than waiting for the poll.
   const attentionIds = attentionItems
-    .filter((item) => activeDirections.some((direction) => attentionDirectionId(item) === direction.id))
+    .filter((item) => attentionThreadId(item) === activeThreadId)
     .map((item) => item.id);
   const worktreeSignatures = activeDirections.map((direction) => ({
     directionId: direction.id,

@@ -289,6 +289,29 @@ test("readiness key includes direction statuses, attention identities, worktrees
   );
 });
 
+test("readiness key changes when a lead-scoped attention item appears", async () => {
+  const { buildReadinessKey } = await loadReadinessKey();
+  const base = {
+    directions: [{ id: 17, status: "review" }],
+    worktrees: [{ directionId: 17, exists: true }],
+    workerSessions: [],
+    planStatus: null,
+    prRevision: 0,
+  };
+  const withoutLeadAttention = buildReadinessKey({ ...base, attentionIds: [] });
+  const withLeadAttention = buildReadinessKey({
+    ...base,
+    attentionIds: ["lead-open-ask"],
+  });
+
+  assert.notEqual(
+    withoutLeadAttention,
+    withLeadAttention,
+    "a thread-owned attention identity with no direction mapping invalidates readiness",
+  );
+  assert.match(withLeadAttention, /attention:lead-open-ask/);
+});
+
 test("worktree removal synchronously hides an otherwise ready verdict", async () => {
   const { buildReadinessKey, selectVisibleReadiness } = await loadReadinessKey();
   const liveKey = buildReadinessKey({

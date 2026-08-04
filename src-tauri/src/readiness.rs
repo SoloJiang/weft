@@ -73,7 +73,7 @@
 //! | tracked PR conflict state is unknown | Unknown | RemoteUnknown |
 //! | tracked PR has only passing/non-configured CI, approved/awaiting review, clear/unchecked threads, and clean conflict state | continue | — |
 //! | local reconciliation is unknown | Unknown | RemoteUnknown |
-//! | checks were never produced for a claimed-complete lane | Unknown | ChecksUnknown |
+//! | checks were never produced for a claimed-complete lane (including an inferred zero-rung suite or a cache-only read with no fresh entry) | Unknown | ChecksUnknown |
 //! | direction status is `review` or `done` | ReviewReady | — |
 //! | direction status is `queued`, `planning`, or `working` | Unknown | InProgress |
 //!
@@ -100,6 +100,8 @@
 //! target for build/test work. This retains check.rs's
 //! worker-done-means-checks-green contract without turning ordinary in-progress
 //! work into automatic build/test execution.
+//! An inferred zero-rung suite is `NotProduced`, never `Passed`: no configured
+//! check is missing verification evidence rather than proof of delivery.
 //!
 //! Readiness checks reuse `check::infer_checks`, but run each inferred rung in
 //! a kill-on-drop Tokio child with a 120-second per-rung deadline. On Unix each
@@ -119,7 +121,15 @@
 //! result. Requests that observed the same dirty signature while its one
 //! execution is still in flight share that execution only; its result is
 //! discarded as soon as the flight completes. HEAD and dirty-state sampling are
-//! performed in a blocking task, never on a Tokio executor worker.
+//! performed in a blocking task, never on a Tokio executor worker. Branch
+//! reconciliation uses the same blocking-task boundary for its read-only Git
+//! probe.
+//!
+//! The desktop `issue_readiness` command collects with `RunAllowed`. The
+//! read-only global `issue_status` bus tool instead uses `CachedOnly`: it may
+//! consume a matching, unexpired check-flight memo, but it never starts or
+//! waits for a runner. Without that memo its check evidence is `NotProduced`,
+//! so the answer stays fail-closed.
 //!
 //! Upstream evidence is collected from the established
 //! `repo::upstream_merge_state` contract:
@@ -265,9 +275,20 @@ pub struct ReadinessReason {
 pub enum CheckEvidence {
     /// Checks are intentionally not run until a lane claims completion.
     NotApplicable,
+    /// Applicable verification has no usable result. This includes an inferred
+    /// zero-rung suite and a cache-only collection without fresh evidence.
     NotProduced,
     Passed,
     Failing,
+}
+
+/// Whether this collection caller may start readiness verification commands.
+/// Read-only tool surfaces can consume existing evidence without gaining an
+/// implicit build/test execution capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckExecution {
+    RunAllowed,
+    CachedOnly,
 }
 
 /// The durable single-predecessor result normalized for lane readiness.
@@ -884,6 +905,33 @@ impl CheckFlight {
         (paths, heads, dirty)
     }
 
+    fn sort_targets(targets: &mut [CheckTarget]) {
+        targets.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.head_sha.cmp(&right.head_sha))
+                .then(left.dirty.cmp(&right.dirty))
+        });
+    }
+
+    fn matching_cached_evidence(
+        entry: &CachedCheckEvidence,
+        path_signature: &[String],
+        head_signature: &[String],
+        dirty_signature: &[bool],
+        ttl: Duration,
+    ) -> Option<CheckEvidence> {
+        let is_fresh = Instant::now().saturating_duration_since(entry.collected_at) < ttl;
+        if entry.path_signature == path_signature
+            && entry.head_signature == head_signature
+            && entry.dirty_signature == dirty_signature
+            && is_fresh
+        {
+            return Some(entry.evidence);
+        }
+        None
+    }
+
     fn cached(&self, direction_id: i32, targets: &[CheckTarget]) -> Result<Option<CheckEvidence>> {
         let mut cache = self
             .cache
@@ -900,15 +948,41 @@ impl CheckFlight {
         let Some(entry) = cache.get(&direction_id) else {
             return Ok(None);
         };
-        let is_fresh = Instant::now().saturating_duration_since(entry.collected_at) < self.ttl;
-        if entry.path_signature == path_signature
-            && entry.head_signature == head_signature
-            && entry.dirty_signature == dirty_signature
-            && is_fresh
-        {
-            return Ok(Some(entry.evidence));
+        Ok(Self::matching_cached_evidence(
+            entry,
+            &path_signature,
+            &head_signature,
+            &dirty_signature,
+            self.ttl,
+        ))
+    }
+
+    /// A read-only cache lookup for tools whose authority excludes starting or
+    /// invalidating verification work. A dirty target simply cannot match;
+    /// unlike `cached`, this leaves the process cache untouched.
+    fn cached_read_only(
+        &self,
+        direction_id: i32,
+        targets: &[CheckTarget],
+    ) -> Result<Option<CheckEvidence>> {
+        let cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("readiness check cache lock poisoned"))?;
+        let (path_signature, head_signature, dirty_signature) = Self::signatures(targets);
+        if dirty_signature.iter().any(|dirty| *dirty) {
+            return Ok(None);
         }
-        Ok(None)
+        let Some(entry) = cache.get(&direction_id) else {
+            return Ok(None);
+        };
+        Ok(Self::matching_cached_evidence(
+            entry,
+            &path_signature,
+            &head_signature,
+            &dirty_signature,
+            self.ttl,
+        ))
     }
 
     fn claim_inflight(
@@ -1033,12 +1107,7 @@ impl CheckFlight {
         F: FnOnce(Vec<String>) -> Fut,
         Fut: Future<Output = Result<CheckEvidence>>,
     {
-        targets.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then(left.head_sha.cmp(&right.head_sha))
-                .then(left.dirty.cmp(&right.dirty))
-        });
+        Self::sort_targets(&mut targets);
         if let Some(evidence) = self.cached(direction_id, &targets)? {
             return Ok(evidence);
         }
@@ -1129,12 +1198,7 @@ async fn reconciliation_for(
 
     let mut unknown = false;
     for worktree in worktrees {
-        let path = Path::new(&worktree.path);
-        if !path.is_dir() {
-            unknown = true;
-            continue;
-        }
-        match crate::git::current_branch(path) {
+        match reconciliation_branch_for_worktree(worktree.path).await {
             Ok(branch) => {
                 if branch != direction.branch {
                     return Ok(ExecutionReconciliation::Drifted);
@@ -1148,6 +1212,24 @@ async fn reconciliation_for(
         return Ok(ExecutionReconciliation::Unknown);
     }
     Ok(ExecutionReconciliation::Matched)
+}
+
+/// `git::current_branch` is synchronous. Worktree existence and branch
+/// sampling therefore share one blocking task so board refreshes cannot block
+/// a Tokio executor worker on a slow filesystem.
+async fn reconciliation_branch_for_worktree(worktree_path: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || {
+        let path = PathBuf::from(worktree_path);
+        if !path.is_dir() {
+            return Err(anyhow!(
+                "readiness worktree is unavailable at {}",
+                path.display()
+            ));
+        }
+        crate::git::current_branch(path.as_path())
+    })
+    .await
+    .map_err(|error| anyhow!("readiness branch reconciliation task failed: {error}"))?
 }
 
 /// Read the inexpensive tracked/untracked worktree signal used by the check
@@ -1201,6 +1283,7 @@ async fn checks_for_with_runner<F, Fut>(
     db: &Db,
     direction: &direction::Model,
     flight: &CheckFlight,
+    execution: CheckExecution,
     runner: F,
 ) -> Result<CheckEvidence>
 where
@@ -1232,7 +1315,31 @@ where
         return Ok(CheckEvidence::NotProduced);
     }
 
-    flight.get_or_run(direction.id, targets, runner).await
+    checks_for_targets_with_runner(flight, execution, direction.id, targets, runner).await
+}
+
+/// Apply the caller's authority boundary after the inexpensive target facts
+/// have been gathered. Cached-only callers deliberately do not wait on an
+/// in-flight runner: a pending execution is not persisted verification
+/// evidence for a read-only request.
+async fn checks_for_targets_with_runner<F, Fut>(
+    flight: &CheckFlight,
+    execution: CheckExecution,
+    direction_id: i32,
+    mut targets: Vec<CheckTarget>,
+    runner: F,
+) -> Result<CheckEvidence>
+where
+    F: FnOnce(Vec<String>) -> Fut,
+    Fut: Future<Output = Result<CheckEvidence>>,
+{
+    CheckFlight::sort_targets(&mut targets);
+    match execution {
+        CheckExecution::RunAllowed => flight.get_or_run(direction_id, targets, runner).await,
+        CheckExecution::CachedOnly => Ok(flight
+            .cached_read_only(direction_id, &targets)?
+            .unwrap_or(CheckEvidence::NotProduced)),
+    }
 }
 
 /// A single, bounded combined stdout/stderr tail. Readers append as bytes
@@ -1487,6 +1594,12 @@ async fn run_checks_with_timeout(
     checks: &[crate::check::Check],
     timeout: Duration,
 ) -> Result<CheckEvidence> {
+    if checks.is_empty() {
+        // `infer_checks` deliberately declines to invent a runner. That is no
+        // verification evidence for a claimed-complete lane, not a vacuous
+        // passing suite.
+        return Ok(CheckEvidence::NotProduced);
+    }
     let mut saw_not_produced = false;
     let mut saw_failure = false;
     for check in checks {
@@ -1533,10 +1646,18 @@ async fn run_readiness_checks(paths: Vec<String>, timeout: Duration) -> Result<C
     Ok(CheckEvidence::Passed)
 }
 
-async fn checks_for(db: &Db, direction: &direction::Model) -> Result<CheckEvidence> {
-    checks_for_with_runner(db, direction, check_flight(), |paths| async move {
-        run_readiness_checks(paths, READINESS_CHECK_TIMEOUT).await
-    })
+async fn checks_for(
+    db: &Db,
+    direction: &direction::Model,
+    execution: CheckExecution,
+) -> Result<CheckEvidence> {
+    checks_for_with_runner(
+        db,
+        direction,
+        check_flight(),
+        execution,
+        |paths| async move { run_readiness_checks(paths, READINESS_CHECK_TIMEOUT).await },
+    )
     .await
 }
 
@@ -1624,6 +1745,7 @@ async fn collect_lane(
     policy: PolicyDecision,
     open_ask_direction_ids: &[i32],
     open_pr_snapshot_freshness: OpenPrSnapshotFreshness,
+    check_execution: CheckExecution,
 ) -> Result<LaneFacts> {
     let active = direction_is_active(direction);
     if !active || policy == PolicyDecision::Denied {
@@ -1660,7 +1782,7 @@ async fn collect_lane(
         reconciliation,
         &pull_requests,
         open_pr_snapshot_freshness,
-        || checks_for(db, direction),
+        || checks_for(db, direction, check_execution),
     )
     .await?;
     Ok(LaneFacts {
@@ -1721,6 +1843,18 @@ async fn collect_unbound_pr_lane(
 /// function performs no writes and deliberately reuses the existing local
 /// check runner and host parsers rather than inventing parallel semantics.
 pub async fn collect(db: &Db, bus: &BusRegistry, thread_id: i32) -> Result<IssueReadinessDto> {
+    collect_with_check_execution(db, bus, thread_id, CheckExecution::RunAllowed).await
+}
+
+/// Collect one issue with an explicit verification execution boundary. The
+/// desktop command is allowed to refresh verification evidence; read-only
+/// callers can only consume a matching, fresh memo.
+pub async fn collect_with_check_execution(
+    db: &Db,
+    bus: &BusRegistry,
+    thread_id: i32,
+    check_execution: CheckExecution,
+) -> Result<IssueReadinessDto> {
     if repo::get_thread(db, thread_id).await?.is_none() {
         return Err(anyhow!("thread {thread_id} not found"));
     }
@@ -1758,6 +1892,7 @@ pub async fn collect(db: &Db, bus: &BusRegistry, thread_id: i32) -> Result<Issue
                         PolicyDecision::AllowedByPolicy,
                         &open_ask_direction_ids,
                         open_pr_snapshot_freshness,
+                        check_execution,
                     )
                     .await?,
                 );
@@ -1772,6 +1907,7 @@ pub async fn collect(db: &Db, bus: &BusRegistry, thread_id: i32) -> Result<Issue
                         PolicyDecision::NeedsGate,
                         &open_ask_direction_ids,
                         open_pr_snapshot_freshness,
+                        check_execution,
                     )
                     .await?,
                 );
@@ -1847,6 +1983,7 @@ pub async fn collect(db: &Db, bus: &BusRegistry, thread_id: i32) -> Result<Issue
                         policy,
                         &open_ask_direction_ids,
                         open_pr_snapshot_freshness,
+                        check_execution,
                     )
                     .await?,
                 );
@@ -1863,6 +2000,7 @@ pub async fn collect(db: &Db, bus: &BusRegistry, thread_id: i32) -> Result<Issue
                         PolicyDecision::AllowedByPolicy,
                         &open_ask_direction_ids,
                         open_pr_snapshot_freshness,
+                        check_execution,
                     )
                     .await?,
                 );
@@ -2705,6 +2843,72 @@ mod tests {
             assert_eq!(evidence, CheckEvidence::Passed);
         }
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_only_checks_never_start_a_runner_and_reuse_a_fresh_memo() {
+        let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let without_cache_runs = Arc::clone(&runs);
+        let without_cache = checks_for_targets_with_runner(
+            &flight,
+            CheckExecution::CachedOnly,
+            57,
+            check_targets("/tmp/cached-only", "head-a"),
+            move |_| {
+                without_cache_runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok(CheckEvidence::Failing) }
+            },
+        )
+        .await
+        .expect("cached-only check without memo");
+        assert_eq!(without_cache, CheckEvidence::NotProduced);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+
+        let initial_runs = Arc::clone(&runs);
+        let initial = checks_for_targets_with_runner(
+            &flight,
+            CheckExecution::RunAllowed,
+            57,
+            check_targets("/tmp/cached-only", "head-a"),
+            move |_| {
+                initial_runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok(CheckEvidence::Passed) }
+            },
+        )
+        .await
+        .expect("allowed check primes memo");
+        assert_eq!(initial, CheckEvidence::Passed);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        let cached_runs = Arc::clone(&runs);
+        let cached = checks_for_targets_with_runner(
+            &flight,
+            CheckExecution::CachedOnly,
+            57,
+            check_targets("/tmp/cached-only", "head-a"),
+            move |_| {
+                cached_runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok(CheckEvidence::Failing) }
+            },
+        )
+        .await
+        .expect("cached-only check reuses fresh memo");
+        assert_eq!(cached, CheckEvidence::Passed);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn zero_rung_check_suite_is_not_produced() {
+        let root = tempfile::tempdir().expect("temporary no-rung fixture");
+        let evidence = run_readiness_checks(
+            vec![root.path().display().to_string()],
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("no-rung readiness check");
+
+        assert_eq!(evidence, CheckEvidence::NotProduced);
     }
 
     #[tokio::test]

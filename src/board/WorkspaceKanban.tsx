@@ -34,6 +34,8 @@ function threadAttentionCount(o: ThreadOverview, items: AttentionItem[]): number
 }
 
 function threadAttentionIds(o: ThreadOverview, items: AttentionItem[]): string[] {
+  // Keep lead/issue-level attention in the refresh signature even though it
+  // maps to no direction card; backend readiness models it as a virtual lane.
   return items
     .filter((item) => attentionThreadId(item) === o.thread_id)
     .map((item) => item.id);

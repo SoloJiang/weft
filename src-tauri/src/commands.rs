@@ -2398,9 +2398,14 @@ pub async fn issue_readiness(
     bus: State<'_, crate::bus::BusRegistry>,
     thread_id: i32,
 ) -> R<crate::readiness::IssueReadinessDto> {
-    crate::readiness::collect(&db, &bus, thread_id)
-        .await
-        .map_err(e)
+    crate::readiness::collect_with_check_execution(
+        &db,
+        &bus,
+        thread_id,
+        crate::readiness::CheckExecution::RunAllowed,
+    )
+    .await
+    .map_err(e)
 }
 
 /// The lead's proposed decomposition for a thread, resolved against the

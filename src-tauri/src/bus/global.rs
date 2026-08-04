@@ -362,7 +362,13 @@ async fn issue_status(
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread {tid} not found"))?;
     let open_asks = asks.open_in(tid).len();
-    let readiness = crate::readiness::collect(db, bus, tid).await?;
+    let readiness = crate::readiness::collect_with_check_execution(
+        db,
+        bus,
+        tid,
+        crate::readiness::CheckExecution::CachedOnly,
+    )
+    .await?;
     Ok(json!({
         "issue_id": t.id,
         "title": t.title,

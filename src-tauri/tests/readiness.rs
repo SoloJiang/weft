@@ -8,7 +8,7 @@ use tempfile::TempDir;
 use weft::bus::BusRegistry;
 use weft::host::{CiStatus, ConflictStatus, ReviewStatus, ThreadStatus, UpstreamStatus};
 use weft::materialize::materialize_direction;
-use weft::readiness::{IssueReadiness, LaneReadiness, ReasonCode};
+use weft::readiness::{CheckExecution, IssueReadiness, LaneReadiness, ReasonCode};
 use weft::store::{
     entities::{direction, pull_request, worktree},
     repo, Db,
@@ -95,6 +95,31 @@ fn make_repo(root: &Path) -> PathBuf {
     std::fs::write(path.join("README.md"), "# readiness fixture\n").expect("fixture readme");
     git(&path, &["add", "README.md"]);
     git(&path, &["commit", "-q", "-m", "fixture"]);
+    path
+}
+
+fn make_repo_with_counting_passing_check(root: &Path) -> PathBuf {
+    let path = make_repo(root);
+    std::fs::write(
+        path.join("readiness-check.sh"),
+        "#!/bin/sh\nprintf 'run\\n' >> .readiness-check-count\n",
+    )
+    .expect("counting check script");
+    std::fs::write(
+        path.join(".gitignore"),
+        ".readiness-check-count\nnode_modules/\n",
+    )
+    .expect("counter ignore rule");
+    std::fs::write(
+        path.join("package.json"),
+        r#"{"scripts":{"build":"sh ./readiness-check.sh"}}"#,
+    )
+    .expect("counting check package manifest");
+    git(
+        &path,
+        &["add", "readiness-check.sh", ".gitignore", "package.json"],
+    );
+    git(&path, &["commit", "-q", "-m", "add readiness check"]);
     path
 }
 
@@ -218,6 +243,22 @@ async fn add_failing_build_script(fixture: &Fixture) {
         r#"{"scripts":{"build":"exit 1"}}"#,
     )
     .expect("failing build fixture");
+}
+
+async fn add_passing_build_script_for_direction(fixture: &Fixture, direction_id: i32) {
+    let registered = repo::list_worktrees(&fixture.db, Some(direction_id))
+        .await
+        .expect("registered worktrees");
+    assert_eq!(registered.len(), 1, "fixture has one registered worktree");
+    std::fs::write(
+        Path::new(&registered[0].path).join("package.json"),
+        r#"{"scripts":{"build":"exit 0"}}"#,
+    )
+    .expect("passing build fixture");
+}
+
+async fn add_passing_build_script(fixture: &Fixture) {
+    add_passing_build_script_for_direction(fixture, fixture.direction_id).await;
 }
 
 async fn add_counting_build_script(fixture: &Fixture) -> PathBuf {
@@ -425,15 +466,16 @@ async fn zero_lanes_is_unknown_not_review_ready() {
 }
 
 #[tokio::test]
-async fn single_review_lane_is_review_ready_without_a_pr() {
+async fn review_lane_without_inferred_checks_is_unknown() {
     let fixture = fixture(None).await;
     let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
         .await
         .expect("readiness");
 
-    assert_eq!(result.readiness, IssueReadiness::ReviewReady);
+    assert_eq!(result.readiness, IssueReadiness::Unknown);
     assert_eq!(result.active_lane_count, 1);
-    assert_eq!(result.lanes[0].readiness, LaneReadiness::ReviewReady);
+    assert_eq!(result.lanes[0].readiness, LaneReadiness::Unknown);
+    assert_eq!(result.lanes[0].reasons[0].code, ReasonCode::ChecksUnknown);
 }
 
 #[tokio::test]
@@ -472,6 +514,7 @@ async fn tool_error_does_not_fail_a_worker_turn_with_completed_assistant_text() 
     )
     .await
     .expect("completed assistant row");
+    add_passing_build_script(&fixture).await;
 
     let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
         .await
@@ -653,6 +696,70 @@ async fn concurrent_board_collects_share_one_real_check_run() {
 }
 
 #[tokio::test]
+async fn cached_only_collection_never_runs_without_a_memo_and_reuses_a_fresh_one() {
+    let temp = tempfile::tempdir().expect("temporary cached-only fixture root");
+    let repo_path = make_repo_with_counting_passing_check(temp.path());
+    let fixture = fixture_for_repo(temp, repo_path, None).await;
+    let registered = repo::list_worktrees(&fixture.db, Some(fixture.direction_id))
+        .await
+        .expect("registered worktree");
+    assert_eq!(registered.len(), 1, "fixture has one registered worktree");
+    let counter = Path::new(&registered[0].path).join(".readiness-check-count");
+
+    // This is the same policy used by the read-only global `issue_status`
+    // tool. An empty cache must be fail-closed without starting the package
+    // script.
+    let without_memo = tokio::time::timeout(
+        Duration::from_millis(500),
+        weft::readiness::collect_with_check_execution(
+            &fixture.db,
+            &fixture.bus,
+            fixture.thread_id,
+            CheckExecution::CachedOnly,
+        ),
+    )
+    .await
+    .expect("cached-only collection must not run the check")
+    .expect("cached-only readiness");
+    assert_eq!(without_memo.readiness, IssueReadiness::Unknown);
+    assert_eq!(without_memo.reasons[0].code, ReasonCode::ChecksUnknown);
+    assert!(
+        !counter.exists(),
+        "cached-only collection must not execute a rung"
+    );
+
+    let primed = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+        .await
+        .expect("allowed collection primes the memo");
+    assert_eq!(primed.readiness, IssueReadiness::ReviewReady);
+    assert_eq!(
+        std::fs::read_to_string(&counter)
+            .expect("allowed runner writes counter")
+            .lines()
+            .count(),
+        1
+    );
+
+    let cached = weft::readiness::collect_with_check_execution(
+        &fixture.db,
+        &fixture.bus,
+        fixture.thread_id,
+        CheckExecution::CachedOnly,
+    )
+    .await
+    .expect("cached-only collection reuses fresh memo");
+    assert_eq!(cached.readiness, IssueReadiness::ReviewReady);
+    assert_eq!(
+        std::fs::read_to_string(&counter)
+            .expect("counter remains available")
+            .lines()
+            .count(),
+        1,
+        "cached-only collection must reuse the memo rather than run a second check"
+    );
+}
+
+#[tokio::test]
 async fn mixed_lanes_aggregate_to_the_open_ask_verdict() {
     let fixture = fixture(None).await;
     let second = repo::create_direction(
@@ -738,6 +845,7 @@ async fn unmapped_open_ask_scope_is_issue_wide_fail_closed() {
 #[tokio::test]
 async fn confirmed_policy_allows_readiness() {
     let fixture = fixture(Some("confirmed")).await;
+    add_passing_build_script(&fixture).await;
     let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
         .await
         .expect("readiness");
@@ -759,6 +867,7 @@ async fn proposed_policy_needs_gate() {
 #[tokio::test]
 async fn withdrawn_plan_uses_the_legacy_direction_path() {
     let fixture = fixture(Some("withdrawn")).await;
+    add_passing_build_script(&fixture).await;
     let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
         .await
         .expect("readiness");
@@ -935,6 +1044,7 @@ async fn unreferenced_direction_in_a_parseable_proposal_remains_legacy_allowed()
         vec![proposed_lane("unmaterialized approved lane", "approved", 0)],
     )
     .await;
+    add_passing_build_script(&fixture).await;
 
     let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
         .await
@@ -1008,6 +1118,7 @@ async fn duplicate_proposal_reference_with_denial_excludes_the_direction() {
 async fn persisted_merged_upstream_releases_the_consumer() {
     let (fixture, host) = fixture_with_origin(None).await;
     let upstream = add_review_direction(&fixture, "upstream implementation").await;
+    add_passing_build_script(&fixture).await;
     repo::set_direction_upstream(&fixture.db, fixture.direction_id, upstream.id)
         .await
         .expect("persisted upstream edge");
@@ -1066,6 +1177,7 @@ async fn persisted_pending_or_unregistered_upstream_blocks_the_consumer() {
 async fn merged_tracked_pr_outranks_an_unmet_upstream() {
     let (fixture, _) = fixture_with_origin(None).await;
     let upstream = add_review_direction(&fixture, "upstream implementation").await;
+    add_passing_build_script_for_direction(&fixture, upstream.id).await;
     repo::set_direction_upstream(&fixture.db, fixture.direction_id, upstream.id)
         .await
         .expect("persisted upstream edge");
@@ -1158,6 +1270,7 @@ async fn never_probed_pr_with_last_error_is_remote_unknown() {
 #[tokio::test]
 async fn unbound_failing_pr_blocks_an_otherwise_ready_issue() {
     let fixture = fixture(None).await;
+    add_passing_build_script(&fixture).await;
     let checked_at = unix_secs();
     insert_unbound_pr(&fixture, 801, "open", CiStatus::Failing, &checked_at).await;
 
@@ -1206,6 +1319,7 @@ async fn stale_unbound_pr_is_remote_unknown() {
 #[tokio::test]
 async fn merged_clear_unbound_pr_does_not_change_ready_issue() {
     let fixture = fixture(None).await;
+    add_passing_build_script(&fixture).await;
     insert_unbound_pr(&fixture, 803, "merged", CiStatus::Passing, "").await;
 
     let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
