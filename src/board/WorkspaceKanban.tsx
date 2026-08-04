@@ -17,6 +17,7 @@ import { inheritedAccessOf } from "../lib/grants";
 import { cn } from "../lib/cn";
 import {
   beginReadinessRefresh,
+  buildReadinessWorktreeSignatures,
   buildReadinessKey,
   completeReadinessRefresh,
   failReadinessRefresh,
@@ -216,16 +217,14 @@ function ThreadCard({
   const threadIdRef = useRef(o.thread_id);
   const readinessRequestRevisionRef = useRef(0);
   threadIdRef.current = o.thread_id;
+  const readinessDirections = o.direction_ids.map((id, index) => ({
+    id,
+    status: o.statuses[index] ?? "",
+  }));
   const readinessKey = buildReadinessKey({
-    directions: o.direction_ids.map((id, index) => ({
-      id,
-      status: o.statuses[index] ?? "",
-    })),
+    directions: readinessDirections,
     attentionIds: threadAttentionIds(o, attentionItems),
-    worktrees: o.direction_ids.map((directionId) => ({
-      directionId,
-      exists: (worktreesByDirection[directionId] ?? []).some((worktree) => worktree.exists),
-    })),
+    worktrees: buildReadinessWorktreeSignatures(readinessDirections, worktreesByDirection),
     workerSessions: Object.values(sessions).map((session) => ({
       directionId: session.directionId,
       sessionId: session.info.session_id,

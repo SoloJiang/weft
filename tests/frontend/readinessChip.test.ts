@@ -10,6 +10,7 @@ import ts from "typescript";
 const require = createRequire(import.meta.url);
 const chipPath = new URL("../../src/components/ReadinessChip.tsx", import.meta.url);
 const readinessKeyPath = new URL("../../src/lib/readinessKey.ts", import.meta.url);
+const workspaceKanbanPath = new URL("../../src/board/WorkspaceKanban.tsx", import.meta.url);
 
 type ReadinessDto = {
   readiness: string;
@@ -410,6 +411,16 @@ test("reclaiming one of two worktrees invalidates readiness deterministically", 
     { kind: "loading" },
     "the old review-ready verdict is hidden while the reclaimed row refreshes",
   );
+});
+
+test("WorkspaceKanban uses the row-level worktree readiness signatures", () => {
+  const source = readFileSync(workspaceKanbanPath, "utf8");
+
+  assert.match(
+    source,
+    /worktrees:\s*buildReadinessWorktreeSignatures\(readinessDirections, worktreesByDirection\)/,
+  );
+  assert.doesNotMatch(source, /\.some\(\(worktree\) => worktree\.exists\)/);
 });
 
 test("plan status change synchronously hides an otherwise ready verdict", async () => {
