@@ -1938,7 +1938,9 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         extra_env,
         computer_args,
         computer_env,
-        computer_gen: comp_mint.map(|m| m.commit()),
+        // Left uncommitted until this engine is actually about to be
+        // registered — see the commit below.
+        computer_gen: None,
         acp_route_gen: None,
         system_prompt: String::new(),
         native_id: sess.native_session_id.clone(),
@@ -1996,6 +1998,12 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     if admitted_dir.thread_id != dir.thread_id {
         anyhow::bail!("worker direction changed threads before engine registration");
     }
+    // Committed HERE, not in the literal above: both failures between the two
+    // are exits that drop `inner` on the floor without ever registering it, and
+    // a committed generation on an unreachable engine is one nothing can revoke
+    // — no teardown will ever be handed that engine. Uncommitted, the guard
+    // falls out of scope with `inner` on those paths and revokes itself.
+    inner.computer_gen = comp_mint.map(|m| m.commit());
     let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(session_id as i64, e))
 }
