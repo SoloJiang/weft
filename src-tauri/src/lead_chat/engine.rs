@@ -4634,6 +4634,21 @@ async fn spawn_codex_turn(
             // assembles the pair the connection actually spawns with.
             let (spawn_args, spawn_pairs) = {
                 let mut i = eng.lock().await;
+                // Re-check cancellation under THIS lock, before minting. The
+                // `is_alive()` guard on the reuse arm above is an `.await`, so
+                // a Stop can acquire the engine lock and revoke this identity
+                // between the outer snapshot's check and here. Re-minting
+                // unconditionally would hand an ALREADY-STOPPED engine a
+                // fresh, VALID bearer — undoing the very revoke that Stop just
+                // performed. Failing here matches the outer snapshot's own
+                // fail-closed shape (the caller rolls back or falls through to
+                // exec).
+                if i.stopped
+                    || i.interrupting
+                    || expected_epoch.is_some_and(|e| e != i.reset_epoch)
+                {
+                    return Err(anyhow::anyhow!("engine stopped; not starting a codex turn"));
+                }
                 refresh_computer_injection(&app, &mut i);
                 let mut args = extra_args.clone();
                 args.extend(i.computer_args.iter().cloned());
@@ -4706,7 +4721,7 @@ async fn spawn_codex_turn(
     // the epoch — tear the freshly connected client down and abort rather than
     // starting a turn the user canceled. (The early snapshot check only covers
     // stops that happened before the connect.)
-    let stop_won = {
+    let (stop_won, revoke_ident) = {
         // Check AND publish under ONE lock acquisition: a stop landing between a
         // separate check and a later publish would register a client for a turn
         // the user just canceled. Once published atomically here, a later stop
@@ -4717,7 +4732,9 @@ async fn spawn_codex_turn(
         if !won && freshly_connected {
             g.codex_client = Some(client.clone());
         }
-        won
+        // Carried out of the lock so the teardown below can revoke the bearer
+        // this task minted — see its own comment.
+        (won, (g.thread_id, g.ask_dir.clone(), g.worktree_id))
     };
     if stop_won {
         // Never touch the registry here: a restarted send may have published a
@@ -4726,6 +4743,17 @@ async fn spawn_codex_turn(
         // connection THIS task made; a reused registered client was already shut
         // down by the stop itself (stop_quiet takes it).
         if freshly_connected {
+            // This task minted a bearer for the connection it is now tearing
+            // down. The stop that won this race revoked the generation that
+            // existed BEFORE that mint, so ours would otherwise outlive the
+            // child it was issued to — exactly the orphan-keeps-a-live-token
+            // shape the revoke exists to close. Revoke before the shutdown so
+            // there is no window where the child is dying with a valid token.
+            crate::bus::computer_srv::revoke_computer_session_tokens(
+                revoke_ident.0,
+                &revoke_ident.1,
+                revoke_ident.2,
+            );
             client.shutdown_and_reap().await;
         }
         return Err(anyhow::anyhow!(
@@ -9694,6 +9722,28 @@ fn spawn_reader(
         // long-lived claude process it means a crash/kill — history stays, the
         // next send resumes.
         let mut inner = eng.lock().await;
+        // The child this reader was attached to is GONE, so its computer bearer
+        // must die with it — the same rule the teardown chokepoint enforces,
+        // applied to the exit paths that never pass through it: a per-turn
+        // dialect's normal end-of-turn EOF, and a resident claude child's crash
+        // or interrupt. Without this the generation stays current while the
+        // session's rows keep `session_is_live` true, so an orphaned descendant
+        // that retained the token could go on using a standing Full/Always
+        // grant after its parent is gone.
+        //
+        // Runs BEFORE the queued-turn dispatch below: that respawn goes through
+        // `spawn_turn`, which re-mints, so the next child gets a live bearer.
+        //
+        // Guarded on `generation` for the same reason both branches below are:
+        // a mismatch means a respawn already superseded this reader, and that
+        // NEWER child holds a newer bearer this stale reader must not revoke.
+        if inner.generation == generation {
+            crate::bus::computer_srv::revoke_computer_session_tokens(
+                inner.thread_id,
+                &inner.ask_dir,
+                inner.worktree_id,
+            );
+        }
         if inner.generation == generation && per_turn(&inner.tool) {
             let status = if inner.interrupting {
                 "interrupted"

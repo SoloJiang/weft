@@ -5005,6 +5005,26 @@ mod tests {
         );
     }
 
+    /// A revoke that lands between a caller's liveness snapshot and its own
+    /// re-mint must not be undone by that mint. The dispatch path re-checks
+    /// cancellation under the same lock before re-minting, and revokes again
+    /// when the post-connect check rejects the client — this pins the token-
+    /// level property both rely on: the LAST operation wins, so a revoke after
+    /// a mint leaves nothing valid behind.
+    #[test]
+    fn a_revoke_after_a_mint_leaves_no_valid_bearer() {
+        let minted = rotate_and_mint_computer_session_token(933_401, "70", Some(3));
+        assert!(verify_computer_token(933_401, "70", Some(3), &minted));
+
+        // The doomed child's connection is torn down: revoke what we minted.
+        revoke_computer_session_tokens(933_401, "70", Some(3));
+
+        assert!(
+            !verify_computer_token(933_401, "70", Some(3), &minted),
+            "a bearer minted for a child that is then torn down must not survive it"
+        );
+    }
+
     /// Revoking an identity that never had a token is harmless — the entry is
     /// created at the bumped generation and the first injection mints against
     /// it. Guards the `stop` path for engines constructed without computer use
